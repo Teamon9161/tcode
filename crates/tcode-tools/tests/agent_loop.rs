@@ -9,10 +9,19 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    Agent, AgentEvent, Approval, ApprovalDecision, Approver, CacheStrategy, ContentBlock, Entry,
-    EventStream, PermissionMode, PermissionRules, Provider, ProviderError, Request, Session,
-    StopReason, StreamEvent, ToolCtx, Usage,
+    ActiveModel, Agent, AgentEvent, Approval, ApprovalDecision, Approver, CacheStrategy,
+    ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules, Provider,
+    ProviderError, Request, Session, StopReason, StreamEvent, ToolCtx, Usage,
 };
+
+fn cell(provider: Arc<MockProvider>) -> ModelCell {
+    ModelCell::new(ActiveModel {
+        provider,
+        max_tokens: 1024,
+        context_window: 200_000,
+        effort: None,
+    })
+}
 
 struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
@@ -73,7 +82,13 @@ impl ScriptedApprover {
 
 #[async_trait]
 impl Approver for ScriptedApprover {
-    async fn ask(&self, _tool: &str, _summary: &str, descriptor: &str) -> Approval {
+    async fn ask(
+        &self,
+        _tool: &str,
+        _summary: &str,
+        descriptor: &str,
+        _input: &serde_json::Value,
+    ) -> Approval {
         self.asked.lock().unwrap().push(descriptor.to_string());
         self.response.clone()
     }
@@ -107,11 +122,9 @@ fn text_done(text: &str) -> Vec<StreamEvent> {
 
 fn agent(provider: Arc<MockProvider>) -> Agent {
     Agent {
-        provider,
+        model: cell(provider),
         tools: tcode_tools::builtin_tools(),
         system: "test".into(),
-        max_tokens: 1024,
-        context_window: 200_000,
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),
     }
@@ -295,7 +308,7 @@ async fn interrupt_contract_pairs_results_and_explains_state() {
         r#"{"path":"a.txt","content":"hi"}"#,
     )]);
     let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     let cancel = CancellationToken::new();
@@ -351,7 +364,7 @@ async fn shell_tool_runs_and_reports_exit_code() {
         text_done("done"),
     ]);
     let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "ping").await;
@@ -371,7 +384,7 @@ async fn oversized_tool_output_is_gated_with_paging_handle() {
         text_done("done"),
     ]);
     let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "read the log").await;
@@ -415,10 +428,8 @@ async fn explore_sub_agent_returns_only_the_report() {
         text_done("report: lib.rs defines f()"),
     ]);
     let task = tcode_tools::TaskTool::new(
-        provider,
+        cell(provider),
         WatchdogConfig::default(),
-        1024,
-        200_000,
         2000,
         dir.path().to_path_buf(),
     );
@@ -456,7 +467,7 @@ async fn post_tool_hook_failure_reaches_the_model() {
         command: cmd.into(),
         timeout_secs: 10,
     }]);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "write it").await;
@@ -489,7 +500,7 @@ async fn pre_tool_hook_blocks_the_call() {
         command: cmd.into(),
         timeout_secs: 10,
     }]);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "write it").await;
@@ -510,7 +521,7 @@ async fn agent_checkpoints_files_before_mutating_tools() {
         text_done("done"),
     ]);
     let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Auto);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
     session.checkpoints =
         tcode_core::CheckpointStore::new(dir.path().join(".ckpts"));
     // The write tool demands a prior read before overwriting.

@@ -3,10 +3,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
+use crate::types::Usage;
 
 pub use crate::permission::{Approval, ApprovalDecision, Approver};
 
@@ -46,6 +48,13 @@ pub enum PermissionRequest {
         /// File mutation — auto-allowed in accept-edits mode.
         is_edit: bool,
     },
+    /// A model-facing question that must always reach the human, including in
+    /// unsafe mode. It is not an authorization request and can never become a
+    /// persistent allow rule.
+    UserInput {
+        descriptor: String,
+        summary: String,
+    },
 }
 
 /// Shared context handed to every tool invocation.
@@ -53,6 +62,10 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     pub freshness: Mutex<FreshnessTracker>,
     pub blobs: Mutex<BlobStore>,
+    /// A parent agent installs this only while a tool is running. Nested
+    /// agents use it to report their own billable usage without pretending it
+    /// occupies the parent's context window.
+    usage_reporter: Mutex<Option<mpsc::UnboundedSender<Usage>>>,
 }
 
 impl ToolCtx {
@@ -61,6 +74,7 @@ impl ToolCtx {
             cwd,
             freshness: Mutex::new(FreshnessTracker::default()),
             blobs: Mutex::new(BlobStore::new(output_budget_tokens)),
+            usage_reporter: Mutex::new(None),
         }
     }
 
@@ -72,6 +86,23 @@ impl ToolCtx {
         } else {
             self.cwd.join(p)
         }
+    }
+
+    pub fn set_usage_reporter(&self, reporter: mpsc::UnboundedSender<Usage>) {
+        *self.usage_reporter.lock().expect("usage reporter lock") = Some(reporter);
+    }
+
+    pub fn clear_usage_reporter(&self) {
+        *self.usage_reporter.lock().expect("usage reporter lock") = None;
+    }
+
+    /// Returns a clone so a nested task can forward usage from its own event
+    /// drain without holding this mutex across awaits.
+    pub fn usage_reporter(&self) -> Option<mpsc::UnboundedSender<Usage>> {
+        self.usage_reporter
+            .lock()
+            .expect("usage reporter lock")
+            .clone()
     }
 }
 

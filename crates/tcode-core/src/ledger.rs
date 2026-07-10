@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::store::LogEvent;
 use crate::types::{ContentBlock, Message, Role};
@@ -17,12 +18,24 @@ pub enum Entry {
     Note(String),
     /// Product of a compaction; replaces everything before it.
     Summary(String),
+    /// Read-only visual history imported from another agent.  It is persisted
+    /// and replayed in the terminal, but intentionally never becomes prompt
+    /// content or a runnable tool call for the current model.
+    ImportedTool {
+        name: String,
+        /// A normalized tcode-shaped input used only for transcript display.
+        /// Old imported logs did not have it, so keep them resumable.
+        #[serde(default)]
+        input: Value,
+        content: String,
+    },
 }
 
 impl Entry {
     fn role(&self) -> Role {
         match self {
             Entry::Assistant(_) => Role::Assistant,
+            Entry::ImportedTool { .. } => Role::Assistant,
             _ => Role::User,
         }
     }
@@ -38,6 +51,7 @@ impl Entry {
                     "<conversation-summary>\nEarlier conversation was compacted. Summary:\n{text}\n</conversation-summary>"
                 ),
             }],
+            Entry::ImportedTool { .. } => Vec::new(),
         }
     }
 }
@@ -135,6 +149,12 @@ impl Ledger {
     pub fn as_messages(&self) -> Vec<Message> {
         let mut out: Vec<Message> = Vec::new();
         for e in &self.entries {
+            // Imported tool history is for the human transcript only. It is
+            // neither evidence the current model needs nor a tool request it
+            // may replay.
+            if matches!(e, Entry::ImportedTool { .. }) {
+                continue;
+            }
             let role = e.role();
             let blocks = e.blocks();
             match out.last_mut() {

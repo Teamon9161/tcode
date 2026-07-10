@@ -49,6 +49,8 @@ pub enum StoreError {
     Corrupt(#[from] serde_json::Error),
     #[error("no session found to resume")]
     NoSession,
+    #[error("external session: {0}")]
+    External(String),
 }
 
 /// Where all per-project state lives:
@@ -92,7 +94,60 @@ pub struct Resumed {
     pub checkpoints: Vec<(usize, String, Option<String>)>,
 }
 
+/// A resumable conversation in one project, suitable for a UI picker.
+#[derive(Debug, Clone)]
+pub struct SessionInfo {
+    pub id: String,
+    pub last_user_preview: String,
+}
+
 impl SessionStore {
+    /// List recent non-empty sessions in newest-first order. This is kept
+    /// separate from `resume`: starting tcode creates a fresh log first, and
+    /// that empty log must not hide the conversations a user can restore.
+    pub fn list(data_dir: &Path) -> Result<Vec<SessionInfo>, StoreError> {
+        let sessions = data_dir.join("sessions");
+        let mut files: Vec<PathBuf> = fs::read_dir(&sessions)
+            .map_err(|_| StoreError::NoSession)?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+            .collect();
+        files.sort();
+        files.reverse();
+
+        let mut result = Vec::new();
+        for path in files {
+            let id = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            // Reuse the normal replay path so `/clear` and rewind events
+            // are respected; scanning raw append events would resurrect
+            // conversations that were deliberately cleared.
+            let resumed = Self::resume(data_dir, Some(&id))?;
+            let last_user_preview = resumed.ledger.entries().iter().rev().find_map(|entry| {
+                let Entry::User(blocks) = entry else {
+                    return None;
+                };
+                blocks.iter().find_map(|b| match b {
+                    crate::types::ContentBlock::Text { text }
+                        if !text.starts_with("<tcode-status>") =>
+                    {
+                        text.lines().next().map(str::to_owned)
+                    }
+                    _ => None,
+                })
+            });
+            if let Some(last_user_preview) = last_user_preview {
+                result.push(SessionInfo {
+                    id: resumed.store.id,
+                    last_user_preview,
+                });
+            }
+        }
+        Ok(result)
+    }
+
     /// Start a new session log under `data_dir/sessions/`.
     pub fn create(data_dir: &Path, cwd: &Path) -> Result<Self, StoreError> {
         let sessions = data_dir.join("sessions");

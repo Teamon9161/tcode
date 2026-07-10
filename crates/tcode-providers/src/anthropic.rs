@@ -82,6 +82,24 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
+        // Effort → extended-thinking budget. "off" forces thinking off
+        // (some Anthropic-compatible backends, e.g. DeepSeek, think by
+        // default); None leaves the server default untouched.
+        match req.effort.as_deref() {
+            None => {}
+            Some("off") => body["thinking"] = json!({ "type": "disabled" }),
+            Some(effort) => {
+                let budget: u32 = match effort {
+                    "low" => 4096,
+                    "medium" => 12288,
+                    _ => 24576,
+                };
+                body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
+                // The API requires max_tokens > budget_tokens; keep the
+                // configured amount available for the answer itself.
+                body["max_tokens"] = json!(req.max_tokens.saturating_add(budget));
+            }
+        }
         body
     }
 }
@@ -228,6 +246,10 @@ impl Provider for AnthropicProvider {
                             )),
                             "thinking_delta" => yield Ok(StreamEvent::ThinkingDelta(
                                 delta["thinking"].as_str().unwrap_or_default().to_string(),
+                            )),
+                            // Required for replaying thinking blocks.
+                            "signature_delta" => yield Ok(StreamEvent::ThinkingSignature(
+                                delta["signature"].as_str().unwrap_or_default().to_string(),
                             )),
                             "input_json_delta" => yield Ok(StreamEvent::ToolUseInputDelta {
                                 index,

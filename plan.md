@@ -209,6 +209,16 @@ tokio, reqwest(rustls, stream), serde/serde_json, ratatui, crossterm, arboard, s
 
 v2 方向：MCP 客户端（Tool trait 天然容纳）、全屏渲染器、/branches 分支浏览、memory 深化、WASM 插件式 hooks。
 
+## 模型配置（已实现，2026-07）
+
+- **Profile 多模型**：`[profiles.X]` 下 `[[profiles.X.models]]` 列表，每个模型带 `context_window` / `efforts` / `default_effort`；`provider` 三种：`anthropic`（含所有 Anthropic 兼容端点如 DeepSeek）、`openai`（Chat Completions 兼容）、`chatgpt`（ChatGPT 订阅）。
+- **chatgpt provider**：走 Codex 后端 Responses API（`chatgpt.com/backend-api/codex/responses`），凭证直接复用 `~/.codex/auth.json`（401 自动 refresh 并写回）；模型列表运行时读 `~/.codex/models_cache.json`，Codex 更新即自动跟进。加密 reasoning item 原样存入 `Thinking.signature` 并回放（backend 硬性要求）。
+- **effort 统一语义**：`Request.effort` 字符串；anthropic 映射 thinking budget（off/low=4k/medium=12k/high=24k），openai 映射 `reasoning_effort`，chatgpt 映射 `reasoning.effort`。
+- **ModelCell**：Agent 与 TaskTool 共享的 RwLock 模型句柄，每 turn snapshot 一次；`/model` 热切换对运行中 turn 无影响。
+- **选择持久化**：`~/.tcode/state.toml`（profile/model/effort），程序只写这个文件，config.toml 永远手写。优先级：CLI flag > state > config 默认。
+- **首启向导**：无 config 时自动进入；探测 `~/.codex/auth.json` 与 `ANTHROPIC/OPENAI/DEEPSEEK_API_KEY`，预设 4 家 provider 多选 + key 输入 + 默认模型选择。非 TTY 场景写 env-based 默认配置。
+- **/model**：TUI 弹层 ↑↓ 选模型（跨 profile）、←→ 调 effort、Enter 生效；REPL 下 `/model <n|name> [effort]`。
+
 ## 验证方式（贯穿）
 
 - Ledger / 缓存断点 / 预算门 / Freshness Tracker：纯单元测试。

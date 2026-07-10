@@ -243,4 +243,20 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("fn main")));
         assert!(text.iter().any(|l| l.contains("• a")));
     }
+
+    #[test]
+    fn fenced_code_uses_syntax_colors_when_language_is_known() {
+        let lines = Renderer::default().render("```rust\nlet answer = 42;\n```");
+        let code = lines
+            .iter()
+            .find(|line| line.spans.iter().any(|span| span.content.contains("answer")))
+            .expect("code line");
+        // The first span is indentation; at least one code token must carry
+        // the colour emitted by syntect rather than the plain terminal style.
+        assert!(code
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style.fg.is_some()));
+    }
 }

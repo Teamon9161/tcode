@@ -1,5 +1,6 @@
 mod fs_tools;
 mod grounding;
+mod interaction;
 mod output;
 mod search;
 mod shell;
@@ -8,6 +9,7 @@ mod task;
 pub use grounding::project_map;
 pub use shell::ShellKind;
 pub use task::TaskTool;
+pub use interaction::{AddNoteTool, AskUserTool, UpdatePlanTool};
 
 use std::sync::Arc;
 

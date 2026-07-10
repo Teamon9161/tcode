@@ -74,6 +74,14 @@ impl OpenAiProvider {
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
+            body["parallel_tool_calls"] = json!(true);
+        }
+        // Reasoning models accept an effort dial; "off" means "send
+        // nothing" for endpoints without one.
+        if let Some(effort) = req.effort.as_deref() {
+            if effort != "off" {
+                body["reasoning_effort"] = json!(effort);
+            }
         }
         body
     }

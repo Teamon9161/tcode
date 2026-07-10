@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use serde_json::Value;
 use serde::{Deserialize, Serialize};
 
 use crate::tool::PermissionRequest;
@@ -13,8 +14,9 @@ pub enum PermissionMode {
     Default,
     /// File edits auto-approved; shell etc. still prompt.
     AcceptEdits,
-    /// Everything runs (deny rules still apply).
-    Auto,
+    /// Everything runs without asking (deny rules still apply).
+    #[serde(alias = "auto")]
+    Unsafe,
 }
 
 impl PermissionMode {
@@ -23,7 +25,7 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
             PermissionMode::Default => "default",
             PermissionMode::AcceptEdits => "accept-edits",
-            PermissionMode::Auto => "auto",
+            PermissionMode::Unsafe => "unsafe",
         }
     }
 
@@ -31,8 +33,8 @@ impl PermissionMode {
         match self {
             PermissionMode::Default => PermissionMode::AcceptEdits,
             PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Auto,
-            PermissionMode::Auto => PermissionMode::Default,
+            PermissionMode::Plan => PermissionMode::Unsafe,
+            PermissionMode::Unsafe => PermissionMode::Default,
         }
     }
 }
@@ -55,6 +57,9 @@ pub enum Decision {
 
 impl PermissionRules {
     pub fn decide(&self, mode: PermissionMode, request: &PermissionRequest) -> Decision {
+        if matches!(request, PermissionRequest::UserInput { .. }) {
+            return Decision::Ask;
+        }
         let PermissionRequest::Ask {
             descriptor,
             is_edit,
@@ -71,7 +76,7 @@ impl PermissionRules {
             PermissionMode::Plan => Decision::Deny(
                 "blocked: plan mode is active; only read-only tools may run".into(),
             ),
-            PermissionMode::Auto => Decision::Allow,
+            PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
             _ => {
                 if self.allow.iter().any(|r| pattern_match(r, descriptor)) {
@@ -119,7 +124,15 @@ pub enum ApprovalDecision {
 /// UI-side implementation of the interactive approval prompt.
 #[async_trait]
 pub trait Approver: Send + Sync {
-    async fn ask(&self, tool: &str, summary: &str, descriptor: &str) -> Approval;
+    /// `input` is included so an interactive front end can show the exact
+    /// file change before asking for consent.
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        input: &Value,
+    ) -> Approval;
 }
 
 #[cfg(test)]
@@ -150,7 +163,7 @@ mod tests {
             deny: vec!["shell(rm *)".into()],
         };
         assert!(matches!(
-            rules.decide(PermissionMode::Auto, &ask("shell(rm -rf x)", false)),
+            rules.decide(PermissionMode::Unsafe, &ask("shell(rm -rf x)", false)),
             Decision::Deny(_)
         ));
         assert_eq!(
@@ -176,7 +189,7 @@ mod tests {
             rules.decide(PermissionMode::Plan, &edit),
             Decision::Deny(_)
         ));
-        assert_eq!(rules.decide(PermissionMode::Auto, &shell), Decision::Allow);
+        assert_eq!(rules.decide(PermissionMode::Unsafe, &shell), Decision::Allow);
         assert_eq!(rules.decide(PermissionMode::Default, &shell), Decision::Ask);
     }
 }

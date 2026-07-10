@@ -8,8 +8,8 @@ use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::config::Config;
-use tcode_core::{Agent, AgentError, ContentBlock, PermissionRules, Session, ToolCtx};
+use tcode_core::config::{Config, ModelState, Selection};
+use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, PermissionRules, Session, ToolCtx};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -30,7 +30,111 @@ do not re-read.
 current permission mode. <harness-note> lines are trustworthy statements \
 from the harness about what happened (interrupts, approvals).
 - When the user declines an action, the reason (if given) is in the tool \
-result; adjust instead of retrying the same call.";
+result; adjust instead of retrying the same call.
+- For multi-step work, keep update_plan current. Use ask_user when a user \
+choice is required; do not guess. Use add_note for durable constraints.";
+
+const CONFIG_HEADER: &str = "\
+# tcode global configuration — created by the setup wizard.
+# Add profiles/models freely; the active choice lives in state.toml
+# (written by /model). Keys: prefer api_key_env over inline api_key.
+
+";
+
+/// Flatten every profile's models into the /model menu, wiring the
+/// switch action (rebuild provider + persist choice).
+fn build_menu(
+    config: &Config,
+    selection: &Selection,
+    _model_cell: ModelCell,
+) -> tcode_tui::ModelMenu {
+    let mut options = Vec::new();
+    let mut current = 0;
+    for (pname, profile) in &config.profiles {
+        for def in profile.model_defs() {
+            if pname == &selection.profile && def.name == selection.model.name {
+                current = options.len();
+            }
+            options.push(tcode_tui::ModelOption {
+                profile: pname.clone(),
+                def,
+            });
+        }
+    }
+    let cfg = config.clone();
+    let watchdog = config.watchdog.clone();
+    let switch: tcode_tui::SwitchFn = Box::new(move |opt, effort| {
+        let profile = cfg
+            .profiles
+            .get(&opt.profile)
+            .ok_or_else(|| format!("profile '{}' not found", opt.profile))?;
+        let sel = Selection {
+            profile: opt.profile.clone(),
+            model: opt.def.clone(),
+            effort: effort.map(String::from),
+        };
+        let active = tcode_providers::build_active(profile, &sel, &watchdog)
+            .map_err(|e| e.to_string())?;
+        ModelState {
+            profile: Some(opt.profile.clone()),
+            model: Some(opt.def.name.clone()),
+            effort: effort.map(String::from),
+        }
+        .save();
+        Ok(active)
+    });
+    tcode_tui::ModelMenu {
+        options,
+        current,
+        switch,
+    }
+}
+
+/// Plain-REPL `/model`: bare lists options, `/model <n|name> [effort]`
+/// switches.
+fn run_model_command(args: &str, menu: &tcode_tui::ModelMenu, cell: &ModelCell) {
+    if args.is_empty() {
+        let active = cell.snapshot();
+        for (i, opt) in menu.options.iter().enumerate() {
+            let mark = if opt.def.name == active.provider.model() {
+                "●"
+            } else {
+                " "
+            };
+            let efforts = if opt.def.efforts.is_empty() {
+                String::new()
+            } else {
+                format!("  [{}]", opt.def.efforts.join("/"))
+            };
+            println!("{DIM} {mark} {i}: {} · {}{efforts}{RESET}", opt.profile, opt.def.name);
+        }
+        println!("{DIM}usage: /model <number|name> [effort]{RESET}");
+        return;
+    }
+    let mut parts = args.split_whitespace();
+    let which = parts.next().unwrap_or_default();
+    let effort = parts.next();
+    let found = which
+        .parse::<usize>()
+        .ok()
+        .and_then(|i| menu.options.get(i))
+        .or_else(|| menu.options.iter().find(|o| o.def.name == which));
+    let Some(opt) = found else {
+        println!("{DIM}unknown model '{which}' — /model lists options{RESET}");
+        return;
+    };
+    match (menu.switch)(opt, effort) {
+        Ok(active) => {
+            println!(
+                "{DIM}model → {} · {}{RESET}",
+                active.provider.name(),
+                active.describe()
+            );
+            cell.swap(active);
+        }
+        Err(e) => println!("{DIM}cannot switch model: {e}{RESET}"),
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "tcode", version, about = "tcode — a terminal agent harness")]
@@ -44,7 +148,7 @@ struct Cli {
     /// One-shot prompt: run the full agent loop, print, exit
     #[arg(short = 'p', long)]
     prompt: Option<String>,
-    /// Start in a specific permission mode (plan/default/accept-edits/auto)
+    /// Start in a specific permission mode (plan/default/accept-edits/unsafe)
     #[arg(long)]
     mode: Option<String>,
     /// Continue the most recent session in this project
@@ -59,9 +163,40 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
+    let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+
+    // First run: no global config yet. Interactive terminals get the
+    // setup wizard; pipes/CI fall back to an env-key-based default.
+    if !Config::exists() {
+        if interactive && cli.prompt.is_none() {
+            match tcode_tui::wizard::run()? {
+                Some((config, state)) => {
+                    let path = config.write_global(CONFIG_HEADER)?;
+                    state.save();
+                    println!("{DIM}wrote {}{RESET}\n", path.display());
+                }
+                None => anyhow::bail!("setup cancelled — no config written"),
+            }
+        } else {
+            tcode_tui::wizard::default_config().write_global(CONFIG_HEADER)?;
+        }
+    }
+
     let config = Config::load(&cwd)?;
-    let (profile_name, profile) = config.profile(cli.profile.as_deref())?;
-    let provider = tcode_providers::build(&profile_name, profile, &config.watchdog, cli.model)?;
+    let state = ModelState::load();
+    let selection = config.select(cli.profile.as_deref(), cli.model.as_deref(), &state)?;
+    let profile = config
+        .profiles
+        .get(&selection.profile)
+        .context("selected profile disappeared")?;
+    let model_cell = ModelCell::new(tcode_providers::build_active(
+        profile,
+        &selection,
+        &config.watchdog,
+    )?);
+
+    // Everything /model can switch to, with the swap logic attached.
+    let menu = build_menu(&config, &selection, model_cell.clone());
 
     let system = format!(
         "{IDENTITY}\n\n{}",
@@ -69,19 +204,18 @@ async fn main() -> anyhow::Result<()> {
     );
     let mut tools = tcode_tools::builtin_tools();
     tools.push(Arc::new(tcode_tools::TaskTool::new(
-        provider.clone(),
+        model_cell.clone(),
         config.watchdog.clone(),
-        profile.max_tokens.unwrap_or(8192),
-        profile.context_window.unwrap_or(200_000),
         config.limits.tool_output_tokens,
         cwd.clone(),
     )));
+    tools.push(Arc::new(tcode_tools::UpdatePlanTool));
+    tools.push(Arc::new(tcode_tools::AskUserTool));
+    tools.push(Arc::new(tcode_tools::AddNoteTool));
     let agent = Agent {
-        provider,
+        model: model_cell.clone(),
         tools,
         system,
-        max_tokens: profile.max_tokens.unwrap_or(8192),
-        context_window: profile.context_window.unwrap_or(200_000),
         watchdog: config.watchdog.clone(),
         hooks: tcode_core::Hooks::new(config.hooks.clone()),
     };
@@ -89,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
     let mode = match cli.mode.as_deref() {
         Some("plan") => tcode_core::PermissionMode::Plan,
         Some("accept-edits") => tcode_core::PermissionMode::AcceptEdits,
-        Some("auto") => tcode_core::PermissionMode::Auto,
+        Some("unsafe") | Some("auto") => tcode_core::PermissionMode::Unsafe,
         Some("default") => tcode_core::PermissionMode::Default,
         Some(other) => anyhow::bail!("unknown mode '{other}'"),
         None => config.permissions.mode,
@@ -134,15 +268,16 @@ async fn main() -> anyhow::Result<()> {
 
     // Interactive: full TUI on a real terminal, plain line REPL otherwise
     // (pipes, CI, dumb terminals).
-    if std::io::stdout().is_terminal() && std::io::stdin().is_terminal() {
-        return tcode_tui::run(Arc::new(agent), session).await;
+    if interactive {
+        return tcode_tui::run(Arc::new(agent), session, menu).await;
     }
 
+    let snapshot = model_cell.snapshot();
     println!(
-        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /cost{RESET}",
+        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /cost{RESET}",
         env!("CARGO_PKG_VERSION"),
-        agent.provider.name(),
-        agent.provider.model(),
+        snapshot.provider.name(),
+        snapshot.describe(),
         session.mode.label(),
     );
     let stdin = std::io::stdin();
@@ -151,10 +286,17 @@ async fn main() -> anyhow::Result<()> {
         std::io::stdout().flush()?;
         let mut line = String::new();
         if stdin.read_line(&mut line)? == 0 {
+            eprintln!(
+                "{DIM}input closed — tcode needs an interactive terminal to keep the conversation open (for example, VS Code's Integrated Terminal rather than Debug Console).{RESET}"
+            );
             break;
         }
         let line = line.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/model") {
+            run_model_command(rest.trim(), &menu, &model_cell);
             continue;
         }
         match line.as_str() {

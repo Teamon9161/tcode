@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    Agent, Approval, ApprovalDecision, Approver, ContentBlock, Entry, PermissionMode,
-    PermissionRequest, PermissionRules, Provider, Session, Tool, ToolCtx, ToolOutput,
+    Agent, Approval, ApprovalDecision, Approver, ContentBlock, Entry, ModelCell, PermissionMode,
+    PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
 };
 
 const EXPLORE_SYSTEM: &str = "\
@@ -30,13 +30,19 @@ autonomously: you cannot ask the user anything. When done, summarize \
 what you did, what changed, and anything the caller must know. The \
 summary is all the caller will see.";
 
-/// Sub-agents run in Auto mode and must never prompt; this approver is
+/// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.
 struct NeverAsk;
 
 #[async_trait]
 impl Approver for NeverAsk {
-    async fn ask(&self, _tool: &str, _summary: &str, _descriptor: &str) -> Approval {
+    async fn ask(
+        &self,
+        _tool: &str,
+        _summary: &str,
+        _descriptor: &str,
+        _input: &serde_json::Value,
+    ) -> Approval {
         Approval {
             decision: ApprovalDecision::No,
             comment: Some("sub-agents cannot prompt the user".into()),
@@ -45,28 +51,23 @@ impl Approver for NeverAsk {
 }
 
 pub struct TaskTool {
-    provider: Arc<dyn Provider>,
+    /// Shared with the parent agent: sub-agents follow `/model` switches.
+    model: ModelCell,
     watchdog: WatchdogConfig,
-    max_tokens: u32,
-    context_window: u64,
     output_budget: usize,
     cwd: PathBuf,
 }
 
 impl TaskTool {
     pub fn new(
-        provider: Arc<dyn Provider>,
+        model: ModelCell,
         watchdog: WatchdogConfig,
-        max_tokens: u32,
-        context_window: u64,
         output_budget: usize,
         cwd: PathBuf,
     ) -> Self {
         Self {
-            provider,
+            model,
             watchdog,
-            max_tokens,
-            context_window,
             output_budget,
             cwd,
         }
@@ -123,7 +124,7 @@ impl Tool for TaskTool {
         }
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
         let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str())
         else {
             return ToolOutput::err("missing required parameters: agent, prompt");
@@ -139,27 +140,34 @@ impl Tool for TaskTool {
         };
 
         let agent = Agent {
-            provider: self.provider.clone(),
+            model: self.model.clone(),
             tools: self.sub_tools(kind),
             system: system.to_string(),
-            max_tokens: self.max_tokens,
-            context_window: self.context_window,
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
         };
         let mut session = Session::new(
             ToolCtx::new(self.cwd.clone(), self.output_budget),
-            PermissionMode::Auto,
+            PermissionMode::Unsafe,
             PermissionRules::default(),
         );
 
         // Drain sub-agent events; count tool calls for the stats line.
         let (tx, mut rx) = mpsc::channel(64);
+        let usage_reporter = ctx.usage_reporter();
         let counter = tokio::spawn(async move {
             let mut tools = 0usize;
             while let Some(ev) = rx.recv().await {
-                if matches!(ev, tcode_core::AgentEvent::ToolStart { .. }) {
-                    tools += 1;
+                match ev {
+                    tcode_core::AgentEvent::ToolStart { .. } => tools += 1,
+                    tcode_core::AgentEvent::Usage(usage) => {
+                        if let Some(reporter) = &usage_reporter {
+                            // It is a best-effort visual/statistical update;
+                            // losing it must never interrupt the sub-agent.
+                            let _ = reporter.send(usage);
+                        }
+                    }
+                    _ => {}
                 }
             }
             tools

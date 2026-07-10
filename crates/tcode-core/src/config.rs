@@ -22,6 +22,8 @@ pub enum ConfigError {
     UnknownProfile(String, String),
     #[error("profile '{profile}': environment variable {var} is not set")]
     MissingApiKey { profile: String, var: String },
+    #[error("profile '{0}' has no models configured")]
+    NoModels(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,30 +31,84 @@ pub enum ConfigError {
 pub enum ProviderKind {
     Anthropic,
     Openai,
+    /// ChatGPT subscription through the Codex backend (Responses API).
+    /// Credentials come from `~/.codex/auth.json`, not an API key.
+    Chatgpt,
+}
+
+/// One selectable model within a profile.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelDef {
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    /// Reasoning effort levels the model accepts, lowest → highest.
+    /// Empty = effort not adjustable. The selector always offers "auto"
+    /// (send nothing) in addition to these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+}
+
+impl ModelDef {
+    pub fn bare(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            label: None,
+            context_window: None,
+            max_tokens: None,
+            efforts: Vec::new(),
+            default_effort: None,
+        }
+    }
+
+    pub fn display(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
     pub provider: ProviderKind,
-    pub model: String,
+    /// Single-model shorthand; merged after `models` entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub models: Vec<ModelDef>,
+    /// Inline key. Prefer `api_key_env` if you don't want keys on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
-    /// Model context window in tokens; drives the context status line.
+    /// Fallback context window for models that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
 }
 
 impl Profile {
-    /// Resolve the API key from the environment; keys never live on disk.
+    /// Resolve the API key: inline value, then the configured (or
+    /// provider-default) environment variable. ChatGPT profiles don't
+    /// use API keys at all.
     pub fn api_key(&self, profile_name: &str) -> Result<String, ConfigError> {
+        if self.provider == ProviderKind::Chatgpt {
+            return Ok(String::new());
+        }
+        if let Some(key) = &self.api_key {
+            return Ok(key.clone());
+        }
         let var = self.api_key_env.clone().unwrap_or_else(|| {
             match self.provider {
                 ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-                ProviderKind::Openai => "OPENAI_API_KEY",
+                ProviderKind::Openai | ProviderKind::Chatgpt => "OPENAI_API_KEY",
             }
             .to_string()
         });
@@ -60,6 +116,22 @@ impl Profile {
             profile: profile_name.to_string(),
             var,
         })
+    }
+
+    /// All selectable models: `models` entries, plus the `model`
+    /// shorthand, plus (for ChatGPT profiles with nothing configured)
+    /// the list Codex has cached locally.
+    pub fn model_defs(&self) -> Vec<ModelDef> {
+        let mut defs = self.models.clone();
+        if let Some(name) = &self.model {
+            if !defs.iter().any(|d| &d.name == name) {
+                defs.push(ModelDef::bare(name.clone()));
+            }
+        }
+        if defs.is_empty() && self.provider == ProviderKind::Chatgpt {
+            defs = crate::codex::cached_models();
+        }
+        defs
     }
 }
 
@@ -127,63 +199,89 @@ pub struct Config {
     pub hooks: Vec<crate::hooks::HookDef>,
 }
 
-const DEFAULT_CONFIG: &str = r#"# tcode global configuration
-default_profile = "anthropic"
+/// The active (profile, model, effort) choice. `/model` writes it here so
+/// the hand-edited config.toml is never rewritten by the program.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ModelState {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
 
-[watchdog]
-idle_timeout_secs = 30
-max_retries = 3
-initial_backoff_ms = 1000
+impl ModelState {
+    fn path() -> Option<PathBuf> {
+        Config::global_path().ok().map(|d| d.join("state.toml"))
+    }
 
-[limits]
-tool_output_tokens = 2000
+    /// Missing or corrupt state is not an error; it just means defaults.
+    pub fn load() -> Self {
+        Self::path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| toml::from_str(&s).ok())
+            .unwrap_or_default()
+    }
 
-[permissions]
-mode = "default"
-allow = []
-deny = []
+    pub fn save(&self) {
+        let Some(path) = Self::path() else { return };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(text) = toml::to_string_pretty(self) {
+            let _ = std::fs::write(path, text);
+        }
+    }
+}
 
-[profiles.anthropic]
-provider = "anthropic"
-model = "claude-sonnet-5"
-api_key_env = "ANTHROPIC_API_KEY"
-# base_url = "https://api.anthropic.com"
-
-# Any OpenAI-compatible endpoint (OpenAI, DeepSeek, OpenRouter, local...).
-# Adjust model/base_url to your endpoint.
-[profiles.openai]
-provider = "openai"
-model = "gpt-5.1"
-api_key_env = "OPENAI_API_KEY"
-# base_url = "https://api.openai.com/v1"
-"#;
+/// A fully resolved model choice, ready to build a provider from.
+#[derive(Debug, Clone)]
+pub struct Selection {
+    pub profile: String,
+    pub model: ModelDef,
+    pub effort: Option<String>,
+}
 
 impl Config {
     pub fn global_path() -> Result<PathBuf, ConfigError> {
         Ok(dirs::home_dir().ok_or(ConfigError::NoHome)?.join(".tcode"))
     }
 
-    /// Load global config (creating a commented default on first run),
-    /// then overlay the project-level `.tcode/config.toml` if present.
+    pub fn global_file() -> Result<PathBuf, ConfigError> {
+        Ok(Self::global_path()?.join("config.toml"))
+    }
+
+    pub fn exists() -> bool {
+        Self::global_file().map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// Load global config, then overlay the project-level
+    /// `.tcode/config.toml` if present. Errors if no global config
+    /// exists — first-run setup (the wizard or `Config::write_global`)
+    /// must run before this.
     pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
-        let global_dir = Self::global_path()?;
-        let global_file = global_dir.join("config.toml");
-        if !global_file.exists() {
-            std::fs::create_dir_all(&global_dir).map_err(|e| ConfigError::Io {
-                path: global_dir.clone(),
-                source: e,
-            })?;
-            std::fs::write(&global_file, DEFAULT_CONFIG).map_err(|e| ConfigError::Io {
-                path: global_file.clone(),
-                source: e,
-            })?;
-        }
+        let global_file = Self::global_file()?;
         let mut config = Self::read_file(&global_file)?;
         let project_file = project_dir.join(".tcode").join("config.toml");
         if project_file.exists() {
             config.overlay(Self::read_file(&project_file)?);
         }
         Ok(config)
+    }
+
+    /// Serialize to the global config file (used by the setup wizard).
+    pub fn write_global(&self, header: &str) -> Result<PathBuf, ConfigError> {
+        let dir = Self::global_path()?;
+        std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Io {
+            path: dir.clone(),
+            source: e,
+        })?;
+        let file = dir.join("config.toml");
+        let body = toml::to_string_pretty(self).expect("config serializes");
+        std::fs::write(&file, format!("{header}{body}")).map_err(|e| ConfigError::Io {
+            path: file.clone(),
+            source: e,
+        })?;
+        Ok(file)
     }
 
     fn read_file(path: &Path) -> Result<Self, ConfigError> {
@@ -224,6 +322,213 @@ impl Config {
                     .collect::<Vec<_>>()
                     .join(", "),
             )),
+        }
+    }
+
+    /// Resolve the active model. Priority: CLI flags > saved state >
+    /// config defaults. A stale state file (profile or model no longer
+    /// configured) silently falls back.
+    pub fn select(
+        &self,
+        profile_flag: Option<&str>,
+        model_flag: Option<&str>,
+        state: &ModelState,
+    ) -> Result<Selection, ConfigError> {
+        // --model without --profile searches every profile for the name.
+        if let (None, Some(m)) = (profile_flag, model_flag) {
+            for (name, p) in &self.profiles {
+                if let Some(def) = p.model_defs().into_iter().find(|d| d.name == m) {
+                    return Ok(self.finish(name.clone(), def, None, state));
+                }
+            }
+        }
+
+        let state_usable = profile_flag.is_none()
+            && model_flag.is_none()
+            && state
+                .profile
+                .as_deref()
+                .is_some_and(|p| self.profiles.contains_key(p));
+        let (name, profile) = if state_usable {
+            self.profile(state.profile.as_deref())?
+        } else {
+            self.profile(profile_flag)?
+        };
+
+        let defs = profile.model_defs();
+        let wanted = model_flag.or(if state_usable {
+            state.model.as_deref()
+        } else {
+            None
+        });
+        let def = match wanted {
+            Some(m) => defs
+                .iter()
+                .find(|d| d.name == m)
+                .cloned()
+                // An unknown --model name is passed through verbatim: the
+                // endpoint may well know models we haven't configured.
+                .unwrap_or_else(|| ModelDef::bare(m)),
+            None => defs
+                .first()
+                .cloned()
+                .ok_or_else(|| ConfigError::NoModels(name.clone()))?,
+        };
+        Ok(self.finish(name, def, model_flag, state))
+    }
+
+    fn finish(
+        &self,
+        profile: String,
+        model: ModelDef,
+        model_flag: Option<&str>,
+        state: &ModelState,
+    ) -> Selection {
+        // Saved effort applies only if it's valid for the chosen model
+        // and no CLI override changed the model out from under it.
+        let effort = state
+            .effort
+            .as_deref()
+            .filter(|_| model_flag.is_none())
+            .filter(|e| model.efforts.iter().any(|x| x == e))
+            .map(String::from)
+            .or_else(|| model.default_effort.clone());
+        Selection {
+            profile,
+            model,
+            effort,
+        }
+    }
+}
+
+/// Built-in profile presets used by the first-run wizard (and handy as
+/// documentation of known-good endpoints).
+pub mod presets {
+    use super::{ModelDef, Profile, ProviderKind};
+
+    fn model(
+        name: &str,
+        label: &str,
+        ctx: u64,
+        efforts: &[&str],
+        default_effort: Option<&str>,
+    ) -> ModelDef {
+        ModelDef {
+            name: name.into(),
+            label: Some(label.into()),
+            context_window: Some(ctx),
+            max_tokens: None,
+            efforts: efforts.iter().map(|s| s.to_string()).collect(),
+            default_effort: default_effort.map(String::from),
+        }
+    }
+
+    pub fn anthropic(api_key: Option<String>) -> Profile {
+        Profile {
+            provider: ProviderKind::Anthropic,
+            model: None,
+            models: vec![
+                model(
+                    "claude-sonnet-5",
+                    "Claude Sonnet 5",
+                    200_000,
+                    &["off", "low", "medium", "high"],
+                    None,
+                ),
+                model(
+                    "claude-opus-4-8",
+                    "Claude Opus 4.8",
+                    200_000,
+                    &["off", "low", "medium", "high"],
+                    None,
+                ),
+                model(
+                    "claude-haiku-4-5-20251001",
+                    "Claude Haiku 4.5",
+                    200_000,
+                    &["off", "low", "medium", "high"],
+                    None,
+                ),
+            ],
+            api_key,
+            api_key_env: Some("ANTHROPIC_API_KEY".into()),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+        }
+    }
+
+    pub fn openai(api_key: Option<String>) -> Profile {
+        Profile {
+            provider: ProviderKind::Openai,
+            model: None,
+            models: vec![
+                model(
+                    "gpt-5.4",
+                    "GPT-5.4",
+                    272_000,
+                    &["low", "medium", "high", "xhigh"],
+                    Some("medium"),
+                ),
+                model(
+                    "gpt-5.4-mini",
+                    "GPT-5.4 mini",
+                    272_000,
+                    &["low", "medium", "high", "xhigh"],
+                    Some("medium"),
+                ),
+            ],
+            api_key,
+            api_key_env: Some("OPENAI_API_KEY".into()),
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+        }
+    }
+
+    /// ChatGPT subscription: models come from Codex's local cache at
+    /// runtime, so an empty list stays current automatically.
+    pub fn chatgpt() -> Profile {
+        Profile {
+            provider: ProviderKind::Chatgpt,
+            model: None,
+            models: Vec::new(),
+            api_key: None,
+            api_key_env: None,
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+        }
+    }
+
+    /// DeepSeek's Anthropic-compatible endpoint. The `[1m]` suffix
+    /// selects the 1M-context variants. Thinking is ON by default
+    /// server-side; "off" disables it.
+    pub fn deepseek(api_key: Option<String>) -> Profile {
+        Profile {
+            provider: ProviderKind::Anthropic,
+            model: None,
+            models: vec![
+                model(
+                    "deepseek-v4-pro[1m]",
+                    "DeepSeek V4 Pro (1M)",
+                    1_000_000,
+                    &["off", "low", "medium", "high"],
+                    None,
+                ),
+                model(
+                    "deepseek-v4-flash[1m]",
+                    "DeepSeek V4 Flash (1M)",
+                    1_000_000,
+                    &["off", "low", "medium", "high"],
+                    None,
+                ),
+            ],
+            api_key,
+            api_key_env: Some("DEEPSEEK_API_KEY".into()),
+            base_url: Some("https://api.deepseek.com/anthropic".into()),
+            max_tokens: None,
+            context_window: None,
         }
     }
 }

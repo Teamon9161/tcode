@@ -8,8 +8,11 @@ mod approval;
 mod diff;
 mod editor;
 mod markdown;
+mod model_picker;
 mod rewind;
+mod resume;
 mod theme;
+pub mod wizard;
 
 use std::io::stdout;
 use std::sync::Arc;
@@ -20,10 +23,11 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use tcode_core::{Agent, Session};
 
 pub use app::App;
+pub use model_picker::{ModelMenu, ModelOption, SwitchFn};
 
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
 /// the terminal is restored even if the app errors or panics.
-pub async fn run(agent: Arc<Agent>, session: Session) -> anyhow::Result<()> {
+pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow::Result<()> {
     enable_raw_mode()?;
     execute!(stdout(), EnableBracketedPaste)?;
 
@@ -34,7 +38,7 @@ pub async fn run(agent: Arc<Agent>, session: Session) -> anyhow::Result<()> {
         default_hook(info);
     }));
 
-    let result = match App::new(agent, session) {
+    let result = match App::new(agent, session, menu) {
         Ok(app) => app.run().await,
         Err(e) => Err(e),
     };

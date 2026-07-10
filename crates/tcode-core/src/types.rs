@@ -61,6 +61,19 @@ pub struct Usage {
     pub cache_write_tokens: u64,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RateLimit {
+    pub used_percent: f64,
+    pub window_minutes: u64,
+    pub resets_at: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct RateLimits {
+    pub primary: RateLimit,
+    pub secondary: Option<RateLimit>,
+}
+
 impl Usage {
     /// Streams may report the same counter several times (cumulatively);
     /// max-merge is correct for both one-shot and cumulative reporting.

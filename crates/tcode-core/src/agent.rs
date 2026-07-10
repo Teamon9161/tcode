@@ -1,6 +1,8 @@
+use std::collections::HashSet;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
-use futures::StreamExt;
+use futures::{future::join_all, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -11,9 +13,9 @@ use crate::ledger::{Entry, Ledger};
 use crate::permission::{
     ApprovalDecision, Approver, Decision, PermissionMode, PermissionRules,
 };
-use crate::provider::{Provider, ProviderError, Request, StreamEvent};
+use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{PermissionRequest, Tool, ToolCtx, ToolOutput};
-use crate::types::{ContentBlock, StopReason, Usage};
+use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 
 /// Hard ceiling on model round-trips per user turn; a runaway loop
 /// should never bill unbounded.
@@ -40,16 +42,32 @@ pub enum AgentEvent {
         /// Raw call input, e.g. for rendering edit diffs in the UI.
         input: Value,
     },
+    /// A concurrently-dispatched group. Individual results still arrive as
+    /// `ToolEnd` in call order, but UIs can avoid five identical headers.
+    ToolBatchStart {
+        label: String,
+        calls: Vec<(String, Value)>,
+    },
     ToolEnd {
         name: String,
         preview: String,
+        /// Complete gated output for UI detail views. The regular transcript
+        /// should keep showing only `preview`.
+        content: String,
         is_error: bool,
     },
     /// Per-step usage (one model request).
     Usage(Usage),
+    RateLimits(RateLimits),
+    /// Usage spent inside a delegated `task` sub-agent. It contributes to
+    /// cost/turn statistics, but not to the parent's context-window meter.
+    DelegatedUsage(Usage),
     /// Context grew past the auto-compact threshold; a summary request
     /// is running before the actual turn.
     Compacting,
+    /// A mutating call was declined without guidance. The turn is over so the
+    /// user can provide the missing direction instead of the model guessing.
+    AwaitingUserInput,
     Interrupted,
     TurnEnd,
 }
@@ -109,11 +127,10 @@ impl Session {
 }
 
 pub struct Agent {
-    pub provider: Arc<dyn Provider>,
+    /// Swappable model handle; each turn snapshots it once.
+    pub model: crate::provider::ModelCell,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
-    pub max_tokens: u32,
-    pub context_window: u64,
     pub watchdog: WatchdogConfig,
     pub hooks: crate::hooks::Hooks,
 }
@@ -137,20 +154,22 @@ impl Agent {
         approver: &dyn Approver,
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
+        let model = self.model.snapshot();
         // Auto-compact: pay the one-time cache invalidation before the
         // context overflows, not after.
-        if session.last_prompt_tokens > self.context_window * 85 / 100 {
+        if session.last_prompt_tokens > model.context_window * 85 / 100 {
             self.emit(events, AgentEvent::Compacting).await?;
             self.compact(session, &cancel).await?;
         }
-        if let Some(status) = session.status_block(self.context_window) {
+        if let Some(status) = session.status_block(model.context_window) {
             input.push(status);
         }
         session.ledger.append(Entry::User(input));
         session.turn_usage = Usage::default();
 
         for _step in 0..MAX_STEPS {
-            let (blocks, usage, stop) = self.stream_step(session, events, &cancel).await?;
+            let (blocks, usage, stop) =
+                self.stream_step(&model, session, events, &cancel).await?;
             session.last_prompt_tokens = usage.total_input() + usage.output_tokens;
             session.turn_usage.input_tokens += usage.input_tokens;
             session.turn_usage.output_tokens += usage.output_tokens;
@@ -189,6 +208,11 @@ impl Agent {
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
+            if outcome.awaiting_user_input {
+                self.emit(events, AgentEvent::AwaitingUserInput).await?;
+                self.emit(events, AgentEvent::TurnEnd).await?;
+                return Ok(());
+            }
         }
         Err(AgentError::StepLimit)
     }
@@ -218,14 +242,16 @@ the summary text.";
                 text: COMPACT_PROMPT.into(),
             }],
         });
+        let model = self.model.snapshot();
         let req = Request {
-            model: self.provider.model().to_string(),
+            model: model.provider.model().to_string(),
             system: self.system.clone(),
             messages,
             tools: Vec::new(),
-            max_tokens: self.max_tokens,
+            max_tokens: model.max_tokens,
+            effort: model.effort.clone(),
         };
-        let mut stream = self.provider.stream(req, cancel.clone()).await?;
+        let mut stream = model.provider.stream(req, cancel.clone()).await?;
         let mut acc = ResponseAccumulator::new();
         while let Some(item) = stream.next().await {
             acc.feed(&item?);
@@ -258,6 +284,7 @@ the summary text.";
     /// failed attempt is discarded (UI told via `Retrying`).
     async fn stream_step(
         &self,
+        model: &crate::provider::ActiveModel,
         session: &Session,
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
@@ -265,13 +292,14 @@ the summary text.";
         let mut attempt = 0u32;
         'retry: loop {
             let req = Request {
-                model: self.provider.model().to_string(),
+                model: model.provider.model().to_string(),
                 system: self.system.clone(),
                 messages: session.ledger.as_messages(),
                 tools: self.tool_defs(),
-                max_tokens: self.max_tokens,
+                max_tokens: model.max_tokens,
+                effort: model.effort.clone(),
             };
-            let mut stream = self.provider.stream(req, cancel.clone()).await?;
+            let mut stream = model.provider.stream(req, cancel.clone()).await?;
             let mut acc = ResponseAccumulator::new();
             while let Some(item) = stream.next().await {
                 match item {
@@ -286,6 +314,9 @@ the summary text.";
                             StreamEvent::ThinkingDelta(t) => {
                                 self.emit(events, AgentEvent::ThinkingDelta(t.clone()))
                                     .await?
+                            }
+                            StreamEvent::RateLimits(limits) => {
+                                self.emit(events, AgentEvent::RateLimits(*limits)).await?
                             }
                             _ => {}
                         }
@@ -321,10 +352,29 @@ the summary text.";
         approver: &dyn Approver,
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
+        if calls.len() > 1
+            && calls
+                .iter()
+                .all(|(_, name, _)| is_parallel_read_only_tool(name))
+        {
+            return self
+                .run_read_only_tools_parallel(session, calls, events, cancel)
+                .await;
+        }
+        // Edits to distinct files are the other safe parallel case.  Do not
+        // optimistically start any write: every permission prompt, hook and
+        // collision check completes first, so a declined sibling can never
+        // leave a partially-applied batch behind.
+        if calls.len() > 1 && self.is_parallel_file_mutation_batch(session, calls) {
+            return self
+                .run_file_mutations_parallel(session, calls, events, approver, cancel)
+                .await;
+        }
         let mut results: Vec<ContentBlock> = Vec::new();
         let mut notes: Vec<String> = Vec::new();
         let mut executed: Vec<String> = Vec::new();
         let mut declined = false;
+        let mut awaiting_user_input = false;
         let mut interrupted_at: Option<usize> = None;
 
         for (i, (id, name, input)) in calls.iter().enumerate() {
@@ -359,6 +409,7 @@ the summary text.";
 
             let request = tool.permission(input);
             let mut approval_note: Option<String> = None;
+            let is_user_question = matches!(request, PermissionRequest::UserInput { .. });
             match session.rules.decide(session.mode, &request) {
                 Decision::Allow => {}
                 Decision::Deny(reason) => {
@@ -366,30 +417,38 @@ the summary text.";
                     continue;
                 }
                 Decision::Ask => {
-                    let PermissionRequest::Ask {
-                        descriptor,
-                        summary,
-                        ..
-                    } = &request
-                    else {
-                        unreachable!("Ask decision implies Ask request");
+                    let (descriptor, summary) = match &request {
+                        PermissionRequest::Ask {
+                            descriptor, summary, ..
+                        }
+                        | PermissionRequest::UserInput {
+                            descriptor, summary,
+                        } => (descriptor, summary),
+                        PermissionRequest::None => unreachable!("Ask decision implies a prompt"),
                     };
-                    let approval = approver.ask(name, summary, descriptor).await;
+                    let approval = approver.ask(name, summary, descriptor, input).await;
                     match approval.decision {
                         ApprovalDecision::Yes => approval_note = approval.comment,
                         ApprovalDecision::YesAlways => {
-                            session.rules.allow.push(descriptor.clone());
+                            if !is_user_question {
+                                session.rules.allow.push(descriptor.clone());
+                            }
                             approval_note = approval.comment;
                         }
                         ApprovalDecision::No => {
                             declined = true;
-                            let reason = approval
-                                .comment
-                                .map(|c| format!(" Reason: {c}"))
-                                .unwrap_or_default();
+                            let Some(comment) = approval.comment else {
+                                awaiting_user_input = true;
+                                results.push(tool_result(
+                                    id,
+                                    "User declined this action without further guidance. Stop now and wait for the user's next instruction; do not guess an alternative.",
+                                    true,
+                                ));
+                                continue;
+                            };
                             results.push(tool_result(
                                 id,
-                                &format!("User declined this action.{reason}"),
+                                &format!("User declined this action. Reason: {comment}"),
                                 true,
                             ));
                             continue;
@@ -436,7 +495,22 @@ the summary text.";
                     session.ledger.record_aux(&ev);
                 }
             }
-            let mut output = tool.run(input.clone(), &session.tool_ctx, cancel).await;
+            let mut output = {
+                let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
+                session.tool_ctx.set_usage_reporter(usage_tx);
+                let run = tool.run(input.clone(), &session.tool_ctx, cancel);
+                tokio::pin!(run);
+                let output = loop {
+                    tokio::select! {
+                        Some(usage) = usage_rx.recv() => {
+                            self.emit(events, AgentEvent::DelegatedUsage(usage)).await?;
+                        }
+                        output = &mut run => break output,
+                    }
+                };
+                session.tool_ctx.clear_usage_reporter();
+                output
+            };
             // Post-tool hooks (e.g. a formatter after edit): their
             // failures are appended so the model sees them immediately.
             let post = self
@@ -458,6 +532,7 @@ the summary text.";
                 AgentEvent::ToolEnd {
                     name: name.clone(),
                     preview: preview(&output.content),
+                    content: output.content.clone(),
                     is_error: output.is_error,
                 },
             )
@@ -465,7 +540,11 @@ the summary text.";
             executed.push(name.clone());
             results.push(tool_result(id, &output.content, output.is_error));
             if let Some(note) = approval_note {
-                notes.push(format!("Note from the user when approving {name}: {note}"));
+                if is_user_question {
+                    notes.push(format!("User answered {name}: {note}"));
+                } else {
+                    notes.push(format!("Note from the user when approving {name}: {note}"));
+                }
             }
         }
 
@@ -480,9 +559,321 @@ the summary text.";
             self.commit_interrupt(session, &[], &cancelled, false);
             // Executed calls before the cut already have real results.
             let _ = executed;
-            return Ok(ToolsOutcome { interrupted: true });
+            return Ok(ToolsOutcome {
+                interrupted: true,
+                awaiting_user_input: false,
+            });
         }
-        Ok(ToolsOutcome { interrupted: false })
+        Ok(ToolsOutcome {
+            interrupted: false,
+            awaiting_user_input,
+        })
+    }
+
+    /// Models often request several independent reads/searches at once. Run
+    /// only this read-only subset concurrently; all mutating, shell, question
+    /// and sub-agent calls remain ordered so their approvals and side effects
+    /// are unambiguous. Results are still appended in model-call order.
+    async fn run_read_only_tools_parallel(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        events: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<ToolsOutcome, AgentError> {
+        let mut prepared = Vec::new();
+        let mut results = Vec::new();
+        let mut notes = Vec::new();
+        for (id, name, input) in calls {
+            let Some(tool) = self.tool(name).cloned() else {
+                results.push(tool_result(id, &format!("Unknown tool '{name}'"), true));
+                continue;
+            };
+            let pre = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PreToolUse,
+                    name,
+                    input,
+                    None,
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            notes.extend(pre.notes);
+            if let Some(reason) = pre.block {
+                results.push(tool_result(id, &format!("Blocked by pre-tool hook: {reason}"), true));
+                continue;
+            }
+            prepared.push((id.clone(), name.clone(), input.clone(), tool));
+        }
+
+        self.emit(
+            events,
+            AgentEvent::ToolBatchStart {
+                label: batch_label(&prepared),
+                calls: prepared
+                    .iter()
+                    .map(|(_, name, input, _)| (name.clone(), input.clone()))
+                    .collect(),
+            },
+        )
+        .await?;
+
+        let outputs = join_all(prepared.iter().map(|(_, _, input, tool)| {
+            tool.run(input.clone(), &session.tool_ctx, cancel)
+        }))
+        .await;
+        for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
+            let post = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PostToolUse,
+                    &name,
+                    &input,
+                    Some(&output.content),
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            for note in post.notes {
+                output.content.push_str(&format!("\n[hook] {note}"));
+            }
+            let output = self.gate(session, &name, output);
+            self.emit(
+                events,
+                AgentEvent::ToolEnd {
+                    name,
+                    preview: preview(&output.content),
+                    content: output.content.clone(),
+                    is_error: output.is_error,
+                },
+            )
+            .await?;
+            results.push(tool_result(&id, &output.content, output.is_error));
+        }
+        session.ledger.append(Entry::ToolResults(results));
+        for note in notes {
+            session.ledger.append(Entry::Note(note));
+        }
+        Ok(ToolsOutcome {
+            interrupted: cancel.is_cancelled(),
+            awaiting_user_input: false,
+        })
+    }
+
+    /// `edit`/`write` calls targeting different normalized paths can safely
+    /// share a turn.  This remains deliberately narrow: shell commands and
+    /// arbitrary tools keep their normal, ordered semantics.
+    fn is_parallel_file_mutation_batch(
+        &self,
+        session: &Session,
+        calls: &[(String, String, Value)],
+    ) -> bool {
+        let mut paths = HashSet::new();
+        calls.iter().all(|(_, name, input)| {
+            if !matches!(name.as_str(), "edit" | "write") {
+                return false;
+            }
+            let Some(tool) = self.tool(name) else {
+                return false;
+            };
+            let Some(path) = tool.touches(input) else {
+                return false;
+            };
+            paths.insert(normalize_path(session.tool_ctx.resolve(&path)))
+        })
+    }
+
+    /// Execute a preflighted, independent edit/write batch.  The preflight is
+    /// intentionally all-or-nothing: approval, pre-hook vetoes and snapshots
+    /// happen before the first file is touched.
+    async fn run_file_mutations_parallel(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        events: &mpsc::Sender<AgentEvent>,
+        approver: &dyn Approver,
+        cancel: &CancellationToken,
+    ) -> Result<ToolsOutcome, AgentError> {
+        let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
+        let mut notes = Vec::new();
+
+        for (id, name, input) in calls {
+            if cancel.is_cancelled() {
+                return self.cancel_unstarted_batch(session, calls, true);
+            }
+            // `is_parallel_file_mutation_batch` established this already.
+            let tool = self.tool(name).expect("preflighted tool").clone();
+            match session.rules.decide(session.mode, &tool.permission(input)) {
+                Decision::Allow => {}
+                Decision::Deny(reason) => {
+                    return self.abort_file_batch(session, calls, id, &reason, false);
+                }
+                Decision::Ask => {
+                    let PermissionRequest::Ask {
+                        descriptor, summary, ..
+                    } = tool.permission(input)
+                    else {
+                        unreachable!("file mutation needs an edit approval")
+                    };
+                    let approval = approver.ask(name, &summary, &descriptor, input).await;
+                    match approval.decision {
+                        ApprovalDecision::Yes => {
+                            if let Some(note) = approval.comment {
+                                notes.push(format!("Note from the user when approving {name}: {note}"));
+                            }
+                        }
+                        ApprovalDecision::YesAlways => {
+                            session.rules.allow.push(descriptor);
+                            if let Some(note) = approval.comment {
+                                notes.push(format!("Note from the user when approving {name}: {note}"));
+                            }
+                        }
+                        ApprovalDecision::No => {
+                            let (reason, awaiting_user_input) = match approval.comment {
+                                Some(comment) => (
+                                    format!("User declined this action. Reason: {comment}"),
+                                    false,
+                                ),
+                                None => (
+                                    "User declined this action without further guidance. Stop now and wait for the user's next instruction; do not guess an alternative.".to_string(),
+                                    true,
+                                ),
+                            };
+                            return self.abort_file_batch(
+                                session,
+                                calls,
+                                id,
+                                &reason,
+                                awaiting_user_input,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let pre = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PreToolUse,
+                    name,
+                    input,
+                    None,
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            if let Some(reason) = pre.block {
+                return self.abort_file_batch(
+                    session,
+                    calls,
+                    id,
+                    &format!("Blocked by pre-tool hook: {reason}"),
+                    false,
+                );
+            }
+            notes.extend(pre.notes);
+            prepared.push((id.clone(), name.clone(), input.clone(), tool));
+        }
+
+        // Save every original before a concurrent task gets a chance to
+        // change it. `touches` is guaranteed by the batch predicate.
+        for (_, _, input, tool) in &prepared {
+            let path = session.tool_ctx.resolve(&tool.touches(input).expect("preflighted path"));
+            let len = session.ledger.len();
+            if let Some(ev) = session.checkpoints.save(len, &path) {
+                session.ledger.record_aux(&ev);
+            }
+        }
+        self.emit(
+            events,
+            AgentEvent::ToolBatchStart {
+                label: batch_label(&prepared),
+                calls: prepared
+                    .iter()
+                    .map(|(_, name, input, _)| (name.clone(), input.clone()))
+                    .collect(),
+            },
+        )
+        .await?;
+
+        let outputs = join_all(prepared.iter().map(|(_, _, input, tool)| {
+            tool.run(input.clone(), &session.tool_ctx, cancel)
+        }))
+        .await;
+        let mut results = Vec::new();
+        for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
+            let post = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PostToolUse,
+                    &name,
+                    &input,
+                    Some(&output.content),
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            for note in post.notes {
+                output.content.push_str(&format!("\n[hook] {note}"));
+            }
+            let output = self.gate(session, &name, output);
+            self.emit(
+                events,
+                AgentEvent::ToolEnd {
+                    name,
+                    preview: preview(&output.content),
+                    content: output.content.clone(),
+                    is_error: output.is_error,
+                },
+            )
+            .await?;
+            results.push(tool_result(&id, &output.content, output.is_error));
+        }
+        session.ledger.append(Entry::ToolResults(results));
+        for note in notes {
+            session.ledger.append(Entry::Note(note));
+        }
+        Ok(ToolsOutcome {
+            interrupted: cancel.is_cancelled(),
+            awaiting_user_input: false,
+        })
+    }
+
+    fn abort_file_batch(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        declined_id: &str,
+        reason: &str,
+        awaiting_user_input: bool,
+    ) -> Result<ToolsOutcome, AgentError> {
+        let results = calls
+            .iter()
+            .map(|(id, _, _)| {
+                let message = if id == declined_id {
+                    reason.to_string()
+                } else {
+                    "Not executed: the independent edit batch was not fully approved.".to_string()
+                };
+                tool_result(id, &message, true)
+            })
+            .collect();
+        session.ledger.append(Entry::ToolResults(results));
+        Ok(ToolsOutcome {
+            interrupted: false,
+            awaiting_user_input,
+        })
+    }
+
+    fn cancel_unstarted_batch(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        interrupted: bool,
+    ) -> Result<ToolsOutcome, AgentError> {
+        self.commit_interrupt(session, calls, &[], false);
+        Ok(ToolsOutcome {
+            interrupted,
+            awaiting_user_input: false,
+        })
     }
 
     /// Interrupt contract: tell the model exactly what happened so it
@@ -528,8 +919,13 @@ the summary text.";
     /// Central token-budget gate for tool outputs.
     fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
         let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
+        let content = if output.is_error {
+            output.content
+        } else {
+            compact_successful_test_output(output.content)
+        };
         ToolOutput {
-            content: blobs.gate(tool, output.content),
+            content: blobs.gate(tool, content),
             is_error: output.is_error,
         }
     }
@@ -545,6 +941,50 @@ the summary text.";
 
 struct ToolsOutcome {
     interrupted: bool,
+    awaiting_user_input: bool,
+}
+
+fn is_parallel_read_only_tool(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "glob" | "read_output")
+}
+
+fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
+    let count = prepared.len();
+    let names: HashSet<&str> = prepared.iter().map(|(_, name, _, _)| name.as_str()).collect();
+    if names.len() == 1 {
+        let name = names.into_iter().next().unwrap_or("tool");
+        let display = match name {
+            "read" => "Read",
+            "write" => "Write",
+            "edit" => "Edit",
+            "grep" => "Search",
+            "glob" => "Find",
+            other => other,
+        };
+        format!("{display} {count} {}", if count == 1 { "file" } else { "files" })
+    } else {
+        format!("Run {count} tools")
+    }
+}
+
+/// Lexically normalize paths for the batch collision check.  We cannot rely
+/// on `canonicalize`: a `write` target may not exist yet.  Resolving relative
+/// paths against the session cwd first makes this conservative enough to spot
+/// aliases such as `src/../src/lib.rs` before concurrent execution.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = normalized.pop();
+            }
+            Component::Normal(segment) => normalized.push(segment),
+        }
+    }
+    normalized
 }
 
 /// An interrupted stream can leave a tool_use whose input JSON never
@@ -588,6 +1028,38 @@ fn preview(s: &str) -> String {
     line
 }
 
+/// Successful test runs often contain several nearly-identical target blocks
+/// (especially doctests and crates with zero tests).  Keep the evidence that
+/// matters to both the human and model while avoiding needless context use.
+/// Any error-like marker leaves the original output untouched for diagnosis.
+fn compact_successful_test_output(output: String) -> String {
+    if !(output.contains("test result: ok.")
+        && output.contains("running ")
+        && !output.contains("test result: FAILED")
+        && !output.contains("error:")
+        && !output.contains("failures:"))
+    {
+        return output;
+    }
+    let running: Vec<&str> = output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("running ") && line.contains(" tests"))
+        .collect();
+    let Some(first) = running
+        .iter()
+        .copied()
+        .find(|line| !line.contains("running 0 tests"))
+    else {
+        return output;
+    };
+    let passed = output
+        .lines()
+        .filter(|line| line.trim_start().starts_with("test result: ok."))
+        .find(|line| !line.contains("0 passed"))
+        .unwrap_or("test result: ok.");
+    format!("{first}\n… successful test output folded …\n{passed}")
+}
+
 /// One-line description of a call for the UI, e.g. `shell(cargo build)`.
 pub fn summarize_call(name: &str, input: &Value) -> String {
     let arg = ["command", "path", "pattern", "id", "agent"]
@@ -598,5 +1070,25 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
         name.to_string()
     } else {
         format!("{name}({arg})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compact_successful_test_output;
+
+    #[test]
+    fn folds_repeated_successful_test_blocks() {
+        let output = "running 24 tests\n........................\ntest result: ok. 24 passed; 0 failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed";
+        let folded = compact_successful_test_output(output.into());
+        assert!(folded.contains("running 24 tests"));
+        assert!(folded.contains("folded"));
+        assert!(!folded.contains("running 0 tests"));
+    }
+
+    #[test]
+    fn retains_failed_test_output() {
+        let output = "running 2 tests\ntest result: FAILED. 1 passed; 1 failed";
+        assert_eq!(compact_successful_test_output(output.into()), output);
     }
 }

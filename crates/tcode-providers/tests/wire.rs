@@ -107,6 +107,7 @@ fn request() -> Request {
         }],
         tools: vec![],
         max_tokens: 128,
+        effort: None,
     }
 }
 

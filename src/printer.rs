@@ -56,15 +56,28 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 }
                 println!("{CYAN}●{RESET} {summary}");
             }
+            AgentEvent::ToolBatchStart { label, calls } => {
+                if in_thinking {
+                    print!("{RESET}");
+                    in_thinking = false;
+                }
+                println!("{CYAN}●{RESET} {label}");
+                for (name, input) in calls {
+                    println!("  {DIM}├ {}{RESET}", tcode_core::agent::summarize_call(&name, &input));
+                }
+            }
             AgentEvent::ToolEnd {
                 preview, is_error, ..
             } => {
                 let color = if is_error { RED } else { DIM };
                 println!("  {color}⎿ {preview}{RESET}");
             }
-            AgentEvent::Usage(_) => {}
+            AgentEvent::Usage(_) | AgentEvent::DelegatedUsage(_) | AgentEvent::RateLimits(_) => {}
             AgentEvent::Compacting => {
                 println!("{YELLOW}[context near limit — compacting]{RESET}");
+            }
+            AgentEvent::AwaitingUserInput => {
+                println!("{YELLOW}[change declined — add guidance to continue]{RESET}");
             }
             AgentEvent::Interrupted => {
                 if in_thinking {

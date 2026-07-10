@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use std::io::Write as _;
 
 use tcode_core::{Approval, ApprovalDecision, Approver};
+use serde_json::Value;
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -15,8 +16,15 @@ pub struct LineApprover;
 
 #[async_trait]
 impl Approver for LineApprover {
-    async fn ask(&self, _tool: &str, summary: &str, descriptor: &str) -> Approval {
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        input: &Value,
+    ) -> Approval {
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
+        print_change_preview(tool, input);
         print!(
             "{DIM}  allow? y / a (always: {descriptor}) / n — append a note after y or n, e.g. \"y but use --dry-run\"{RESET}\n  > "
         );
@@ -49,5 +57,35 @@ impl Approver for LineApprover {
                 comment: rest,
             };
         }
+    }
+}
+
+/// Keep the non-TUI prompt safe too: approval must never be blind just
+/// because stdout is not a full-screen terminal.
+fn print_change_preview(tool: &str, input: &Value) {
+    match tool {
+        "edit" => {
+            let old = input["old_string"].as_str().unwrap_or("");
+            let new = input["new_string"].as_str().unwrap_or("");
+            println!("{DIM}  proposed replacement:{RESET}");
+            for line in old.lines() {
+                println!("{DIM}  - {line}{RESET}");
+            }
+            for line in new.lines() {
+                println!("{DIM}  + {line}{RESET}");
+            }
+        }
+        "write" => {
+            if let Some(content) = input["content"].as_str() {
+                println!("{DIM}  proposed file content:{RESET}");
+                for line in content.lines().take(20) {
+                    println!("{DIM}  + {line}{RESET}");
+                }
+                if content.lines().count() > 20 {
+                    println!("{DIM}  … additional lines omitted in line mode{RESET}");
+                }
+            }
+        }
+        _ => {}
     }
 }

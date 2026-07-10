@@ -35,6 +35,17 @@ impl ResponseAccumulator {
                     signature: None,
                 }),
             },
+            StreamEvent::ThinkingSignature(s) => match self.blocks.last_mut() {
+                Some(ContentBlock::Thinking { signature, .. }) => {
+                    *signature = Some(s.clone());
+                }
+                // Reasoning without any streamed summary text still
+                // needs a block to carry the replay payload.
+                _ => self.blocks.push(ContentBlock::Thinking {
+                    thinking: String::new(),
+                    signature: Some(s.clone()),
+                }),
+            },
             StreamEvent::ToolUseStart { index, id, name } => {
                 self.blocks.push(ContentBlock::ToolUse {
                     id: id.clone(),
@@ -50,6 +61,7 @@ impl ResponseAccumulator {
                 }
             }
             StreamEvent::Usage(u) => self.usage.merge_max(u),
+            StreamEvent::RateLimits(_) => {}
             StreamEvent::Done(reason) => self.stop_reason = Some(reason.clone()),
         }
     }
