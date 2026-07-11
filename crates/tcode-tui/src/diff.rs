@@ -44,15 +44,16 @@ pub fn render_change(tool: &str, input: &Value) -> Vec<Line<'static>> {
             .as_str()
             .unwrap_or("")
             .lines()
-            .take(MAX_DIFF_LINES)
-            .map(|line| code_line(path, "+ ", line, Some(theme::diff_add_bg())))
-            .chain(
-                if input["content"].as_str().unwrap_or("").lines().count() > MAX_DIFF_LINES {
-                    Some(Line::styled("    … (preview truncated)", theme::dim()))
-                } else {
-                    None
-                },
-            )
+            .enumerate()
+            .map(|(index, line)| {
+                code_line(
+                    path,
+                    "+ ",
+                    Some(index + 1),
+                    line,
+                    Some(theme::diff_add_bg()),
+                )
+            })
             .collect(),
         _ => Vec::new(),
     }
@@ -84,7 +85,7 @@ pub fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
             Some(b' ') => ("  ", &line[1..], None),
             _ => ("  ", line, None),
         };
-        lines.push(code_line(&path, marker, text, background));
+        lines.push(code_line(&path, marker, None, text, background));
     }
     if patch.lines().count() > MAX_DIFF_LINES {
         lines.push(Line::styled("    … (preview truncated)", theme::dim()));
@@ -92,23 +93,58 @@ pub fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Edit diffs render in full: the user is approving this exact change and
-/// must be able to see all of it. Only `write` previews are capped.
+/// Live edit/write diffs render in full: the user is approving this exact
+/// change and must be able to see all of it. Imported historical patches stay
+/// capped separately because they are only transcript context.
 fn diff_lines(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     let diff = similar::TextDiff::from_lines(old, new);
+    let mut old_line = edit_start_line(path, old);
+    let mut new_line = old_line;
     diff.iter_all_changes()
         .map(|change| {
             let text = change.value().trim_end_matches('\n');
             match change.tag() {
-                ChangeTag::Delete => code_line(path, "- ", text, Some(theme::diff_del_bg())),
-                ChangeTag::Insert => code_line(path, "+ ", text, Some(theme::diff_add_bg())),
-                ChangeTag::Equal => code_line(path, "  ", text, None),
+                ChangeTag::Delete => {
+                    let line = old_line;
+                    old_line += 1;
+                    code_line(path, "- ", Some(line), text, Some(theme::diff_del_bg()))
+                }
+                ChangeTag::Insert => {
+                    let line = new_line;
+                    new_line += 1;
+                    code_line(path, "+ ", Some(line), text, Some(theme::diff_add_bg()))
+                }
+                ChangeTag::Equal => {
+                    let line = old_line;
+                    old_line += 1;
+                    new_line += 1;
+                    code_line(path, "  ", Some(line), text, None)
+                }
             }
         })
         .collect()
 }
 
-fn code_line(path: &str, marker: &str, text: &str, background: Option<Color>) -> Line<'static> {
+fn edit_start_line(path: &str, old: &str) -> usize {
+    if old.is_empty() {
+        return 1;
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return 1;
+    };
+    let Some(byte_pos) = content.find(old) else {
+        return 1;
+    };
+    content[..byte_pos].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+fn code_line(
+    path: &str,
+    marker: &str,
+    line_number: Option<usize>,
+    text: &str,
+    background: Option<Color>,
+) -> Line<'static> {
     let highlighter = highlighter();
     let extension = std::path::Path::new(path)
         .extension()
@@ -135,7 +171,14 @@ fn code_line(path: &str, marker: &str, text: &str, background: Option<Color>) ->
             _ => theme::DIM,
         })
         .bg(background.unwrap_or(Color::Reset));
-    let mut spans = vec![Span::styled(format!("  {marker}"), marker_style)];
+    let line_no = line_number
+        .map(|n| format!("{n:>4}"))
+        .unwrap_or_else(|| "    ".to_string());
+    let mut spans = vec![
+        Span::styled(format!("  {marker}"), marker_style),
+        Span::styled(line_no, marker_style),
+        Span::styled(" │ ", marker_style),
+    ];
     match line_highlighter.highlight_line(text, &highlighter.syntaxes) {
         Ok(ranges) => spans.extend(ranges.into_iter().map(|(style, token)| {
             let foreground = style.foreground;
@@ -186,6 +229,24 @@ mod tests {
     }
 
     #[test]
+    fn live_diff_shows_left_gutter_line_numbers() {
+        let lines = render_change(
+            "edit",
+            &serde_json::json!({
+                "path": "missing.rs",
+                "old_string": "alpha\nbeta\n",
+                "new_string": "alpha\ngamma\n",
+            }),
+        );
+        let changed = lines
+            .iter()
+            .find(|line| line.spans[0].content.contains('-'))
+            .unwrap();
+        assert_eq!(changed.spans[1].content.as_ref(), "   2");
+        assert_eq!(changed.spans[2].content.as_ref(), " │ ");
+    }
+
+    #[test]
     fn approved_edit_diff_is_not_truncated() {
         let old = (0..81)
             .map(|line| format!("let value_{line} = 1;\n"))
@@ -199,6 +260,26 @@ mod tests {
                 "path": "src/main.rs",
                 "old_string": old,
                 "new_string": new,
+            }),
+        );
+
+        assert!(lines.len() > MAX_DIFF_LINES);
+        assert!(!lines.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("preview truncated"))));
+    }
+
+    #[test]
+    fn approved_write_diff_is_not_truncated() {
+        let content = (0..81)
+            .map(|line| format!("let value_{line} = 1;\n"))
+            .collect::<String>();
+        let lines = render_change(
+            "write",
+            &serde_json::json!({
+                "path": "src/main.rs",
+                "content": content,
             }),
         );
 

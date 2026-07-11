@@ -50,6 +50,12 @@ pub fn thinking() -> Style {
     Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
 }
 
+/// Text selection in the input box — matches the transcript's reversed
+/// selection so the two read as one selection model.
+pub fn selection() -> Style {
+    Style::default().add_modifier(Modifier::REVERSED)
+}
+
 /// Amber-tinted row background marking the rewind-navigation target.
 pub fn rewind_highlight_bg() -> Color {
     Color::Rgb(82, 62, 24)

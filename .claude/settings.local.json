@@ -13,7 +13,16 @@
       "Bash(sed -i 's/-> anyhow::Result<Option<\\(ProviderSelection, Vec<\\(String, Profile\\)>\\)>>/-> anyhow::Result<Option<\\(ProviderSelection, Vec<CustomProfile>\\)>>/' crates/tcode-tui/src/wizard.rs)",
       "Bash(sed -i 's/fn read_custom_provider\\(out: &mut std::io::Stdout\\) -> anyhow::Result<Option<\\(String, Profile\\)>>/fn read_custom_provider\\(out: \\\\&mut std::io::Stdout\\) -> anyhow::Result<Option<CustomProfile>>/' crates/tcode-tui/src/wizard.rs)",
       "Bash(cargo fmt *)",
-      "Bash(cargo build *)"
+      "Bash(cargo build *)",
+      "Bash(python3 *)",
+      "Bash(python *)",
+      "Bash(grep -iv \"//\")",
+      "PowerShell($p = Get-Process tcode -ErrorAction SilentlyContinue; if \\($p\\) { \"tcode running \\(PID $\\($p.Id\\)\\) — skipping binary link\" } else { \"no tcode process\" })",
+      "Bash(echo \"---exit $?---\")",
+      "Bash(awk '{print $5, $9}')",
+      "Bash(awk '{print $5,$NF}')",
+      "WebFetch(domain:parallel.ai)",
+      "WebFetch(domain:exa.ai)"
     ]
   }
 }

@@ -12,22 +12,42 @@ const DEFAULT_READ_LIMIT: usize = 2000;
 /// walking a file in 10-line slices costs a round-trip per slice.
 const MIN_READ_WINDOW: usize = 120;
 const MAX_LINE_CHARS: usize = 500;
+/// Files above this are never slurped into memory. A range read of a giant
+/// log/dataset belongs to grep or `sed -n`, not a full load.
+const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
+/// Cap the bytes a single read emits into context, independent of the line
+/// count — 2000 lines of long lines would otherwise be ~1 MB.
+const MAX_READ_OUTPUT_BYTES: usize = 128 * 1024;
 
 fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
     path.strip_prefix(cwd).unwrap_or(path)
 }
 
-fn numbered(lines: &[&str], start: usize) -> String {
+/// Render numbered lines until the line count runs out or the byte budget is
+/// hit. Returns the text and how many lines were actually emitted, so the
+/// caller can tell the model where to resume.
+fn numbered_capped(lines: &[&str], start: usize, budget: usize) -> (String, usize) {
     let mut out = String::new();
+    let mut emitted = 0;
     for (i, line) in lines.iter().enumerate() {
         let clipped: String = if line.chars().count() > MAX_LINE_CHARS {
             line.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
         } else {
             (*line).to_string()
         };
-        out.push_str(&format!("{:>6}\t{clipped}\n", start + i));
+        let row = format!("{:>6}\t{clipped}\n", start + i);
+        // Always emit at least one line so a single huge line still makes progress.
+        if emitted > 0 && out.len() + row.len() > budget {
+            break;
+        }
+        out.push_str(&row);
+        emitted += 1;
     }
-    out
+    (out, emitted)
+}
+
+fn numbered(lines: &[&str], start: usize) -> String {
+    numbered_capped(lines, start, usize::MAX).0
 }
 
 /// Self-healing ENOENT: show what IS there so the model can correct the
@@ -80,6 +100,11 @@ impl Tool for ReadTool {
         "read"
     }
 
+    // Self-paginating via offset/limit — never blob-gate.
+    fn gates_output(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Read a file with line numbers. Use offset/limit for large files; \
          limits under 120 lines are widened to 120, so read generous windows \
@@ -120,7 +145,15 @@ impl Tool for ReadTool {
             return ToolOutput::err("missing required parameter: path");
         };
         let path = ctx.resolve(path_str);
-        if path.is_dir() {
+        // Stat first so a huge file is rejected before it is loaded into memory.
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return ToolOutput::err(not_found_help(&path));
+            }
+            Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
+        };
+        if meta.is_dir() {
             let listing = std::fs::read_dir(&path)
                 .map(|rd| {
                     rd.flatten()
@@ -133,6 +166,14 @@ impl Tool for ReadTool {
             return ToolOutput::err(format!(
                 "{} is a directory, not a file. It contains: {listing}",
                 path.display()
+            ));
+        }
+        if meta.len() > MAX_READ_FILE_BYTES {
+            return ToolOutput::err(format!(
+                "{} is {:.1} MB — too large to load into context. Search it with \
+                 grep, or read a specific range via shell, e.g. `sed -n '2000,2100p'`.",
+                rel(&path, &ctx.cwd).display(),
+                meta.len() as f64 / (1024.0 * 1024.0),
             ));
         }
         let bytes = match std::fs::read(&path) {
@@ -176,6 +217,23 @@ impl Tool for ReadTool {
                 rel(&path, &ctx.cwd).display()
             ));
         }
+        // Overlapping re-read (e.g. same offset, wider window): return only
+        // the unseen slice so already-seen lines aren't re-appended to the
+        // ledger. Full reads and fragmented gaps fall through to the request.
+        let (mut view_start, mut view_end) = (start, end);
+        let mut overlap_note: Option<String> = None;
+        if status == ReadStatus::NewRange && !force {
+            if let Some((gs, ge)) = range.and_then(|r| freshness.uncovered_gap(&path, hash, r)) {
+                view_start = gs - 1;
+                view_end = ge;
+                overlap_note = Some(format!(
+                    "note: showing only the new lines {gs}-{ge}; the rest of the \
+                     requested range {}-{end} is already in your context from an \
+                     earlier read.\n",
+                    start + 1
+                ));
+            }
+        }
         freshness.record_read(&path, hash, range);
         drop(freshness);
 
@@ -183,12 +241,18 @@ impl Tool for ReadTool {
         if status == ReadStatus::ChangedOnDisk {
             out.push_str("note: this file changed on disk since you last read it.\n");
         }
-        out.push_str(&numbered(&lines[start..end], start + 1));
-        if end < total {
+        if let Some(note) = overlap_note {
+            out.push_str(&note);
+        }
+        let (body, emitted) =
+            numbered_capped(&lines[view_start..view_end], view_start + 1, MAX_READ_OUTPUT_BYTES);
+        out.push_str(&body);
+        let shown_end = view_start + emitted;
+        if shown_end < total {
             out.push_str(&format!(
-                "[showing lines {}-{end} of {total}; continue with offset={}]",
-                start + 1,
-                end + 1
+                "[showing lines {}-{shown_end} of {total}; continue with offset={}]",
+                view_start + 1,
+                shown_end + 1
             ));
         }
         if out.is_empty() {
@@ -298,7 +362,8 @@ impl Tool for EditTool {
 
     fn description(&self) -> &str {
         "Exact string replacement in a file. `old_string` must match the \
-         current content exactly (including whitespace) and be unique unless \
+         current content exactly (including whitespace; line endings may be \
+         LF/CRLF and are normalized to the file's style) and be unique unless \
          replace_all is set. Only edit text you have actually seen in this \
          session (read or grep output both count) and whose surroundings you \
          understand; if you are unsure of the exact content or the impact of \
@@ -369,28 +434,22 @@ impl Tool for EditTool {
         let seen = freshness.seen_current(&path, content_hash(&bytes));
         let text = String::from_utf8_lossy(&bytes).into_owned();
 
-        let count = text.matches(old).count();
-        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
-        match count {
-            0 => {
-                let mut msg = near_miss_help(&text, old);
-                if !seen {
-                    msg.push_str(
-                        "\nnote: you have not read the current version of this \
+        let Some(plan) = replacement_plan(&text, old, new) else {
+            let mut msg = near_miss_help(&text, old);
+            if !seen {
+                msg.push_str(
+                    "\nnote: you have not read the current version of this \
                          file; read it to get the exact text.",
-                    );
-                }
-                return ToolOutput::err(msg);
+                );
             }
+            return ToolOutput::err(msg);
+        };
+        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+        match plan.count {
+            0 => unreachable!("replacement_plan only returns matching needles"),
             1 => {}
             n if !replace_all => {
-                let occurrences: Vec<String> = text
-                    .lines()
-                    .enumerate()
-                    .filter(|(_, l)| l.contains(old.lines().next().unwrap_or(old)))
-                    .take(8)
-                    .map(|(i, l)| format!("  line {}: {}", i + 1, l.trim()))
-                    .collect();
+                let occurrences = occurrence_help(&text, &plan.old, 8);
                 return ToolOutput::err(format!(
                     "old_string appears {n} times; add surrounding context to make it \
                      unique, or set replace_all=true.\nOccurrences:\n{}",
@@ -401,9 +460,9 @@ impl Tool for EditTool {
         }
 
         let new_text = if replace_all {
-            text.replace(old, new)
+            text.replace(&plan.old, &plan.new)
         } else {
-            text.replacen(old, new, 1)
+            text.replacen(&plan.old, &plan.new, 1)
         };
         if let Err(e) = std::fs::write(&path, &new_text) {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
@@ -412,19 +471,136 @@ impl Tool for EditTool {
 
         // Show the edited region so the model sees the result without
         // re-reading the file.
-        let pos = new_text.find(new).unwrap_or(0);
+        let pos = new_text.find(&plan.new).unwrap_or(0);
         let line_no = new_text[..pos].lines().count().max(1);
         let lines: Vec<&str> = new_text.lines().collect();
         let start = line_no.saturating_sub(3).max(1);
-        let end = (line_no + new.lines().count() + 2).min(lines.len());
+        let end = (line_no + plan.new.lines().count() + 2).min(lines.len());
         let snippet = numbered(&lines[start - 1..end], start);
         ToolOutput::ok(format!(
             "edited {} ({} replacement{}). Result:\n{snippet}",
             rel(&path, &ctx.cwd).display(),
-            if replace_all { count } else { 1 },
-            if replace_all && count > 1 { "s" } else { "" },
+            if replace_all { plan.count } else { 1 },
+            if replace_all && plan.count > 1 {
+                "s"
+            } else {
+                ""
+            },
         ))
     }
+}
+
+struct ReplacementPlan {
+    old: String,
+    new: String,
+    count: usize,
+}
+
+fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan> {
+    let eol = dominant_line_ending(text);
+    let mut candidates = Vec::new();
+    candidates.push((old.to_string(), normalize_newlines(new, eol)));
+    if old.contains('\n') || old.contains('\r') {
+        candidates.push((normalize_newlines(old, eol), normalize_newlines(new, eol)));
+        candidates.push((normalize_newlines(old, "\n"), normalize_newlines(new, "\n")));
+        candidates.push((
+            normalize_newlines(old, "\r\n"),
+            normalize_newlines(new, "\r\n"),
+        ));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let exact = candidates.into_iter().find_map(|(old, new)| {
+        if !seen.insert(old.clone()) {
+            return None;
+        }
+        let count = text.match_indices(&old).count();
+        (count > 0).then_some(ReplacementPlan { old, new, count })
+    });
+    if exact.is_some() {
+        return exact;
+    }
+    // Last resort: models often emit typographic punctuation (– " " …) where
+    // the file has plain ASCII. Match with punctuation normalized, but splice
+    // the *actual* file bytes back in so nothing else is disturbed.
+    let orig = find_punct_normalized(text, old)?;
+    let count = text.match_indices(&orig).count();
+    (count > 0).then_some(ReplacementPlan {
+        old: orig,
+        new: normalize_newlines(new, eol),
+        count,
+    })
+}
+
+/// Map common typographic punctuation to its ASCII equivalent. Only 1-char →
+/// 1-char maps, so char positions stay aligned between original and normalized.
+fn normalize_punct(c: char) -> char {
+    match c {
+        '\u{2010}'..='\u{2015}' | '\u{2212}' => '-', // hyphens, dashes, minus
+        '\u{2018}' | '\u{2019}' | '\u{201B}' => '\'', // single quotes
+        '\u{201C}' | '\u{201D}' | '\u{201F}' => '"', // double quotes
+        _ => c,
+    }
+}
+
+/// Find `old` in `text` comparing with punctuation normalized, and return the
+/// exact original substring at that location (so the real bytes are replaced).
+/// Returns None when `old` has no typographic punctuation to normalize.
+fn find_punct_normalized(text: &str, old: &str) -> Option<String> {
+    let pat: Vec<char> = old.chars().map(normalize_punct).collect();
+    if pat.iter().copied().eq(old.chars()) {
+        return None; // nothing was normalized — the exact pass already tried this
+    }
+    let tchars: Vec<char> = text.chars().collect();
+    if pat.is_empty() || pat.len() > tchars.len() {
+        return None;
+    }
+    (0..=tchars.len() - pat.len()).find_map(|i| {
+        let window = &tchars[i..i + pat.len()];
+        window
+            .iter()
+            .copied()
+            .map(normalize_punct)
+            .eq(pat.iter().copied())
+            .then(|| window.iter().collect())
+    })
+}
+
+fn normalize_newlines(s: &str, eol: &str) -> String {
+    let lf = s.replace("\r\n", "\n").replace('\r', "\n");
+    if eol == "\n" {
+        lf
+    } else {
+        lf.replace('\n', eol)
+    }
+}
+
+fn dominant_line_ending(text: &str) -> &'static str {
+    let crlf = text.matches("\r\n").count();
+    let lf = text.matches('\n').count().saturating_sub(crlf);
+    if crlf > lf {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
+fn occurrence_help(text: &str, needle: &str, limit: usize) -> Vec<String> {
+    text.match_indices(needle)
+        .take(limit)
+        .map(|(byte, _)| {
+            let line = text[..byte].bytes().filter(|b| *b == b'\n').count() + 1;
+            let body = text[byte..]
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .chars()
+                .take(160)
+                .collect::<String>();
+            format!("  line {line}: {body}")
+        })
+        .collect()
 }
 
 /// Self-healing "old_string not found": locate the closest region so the
@@ -455,4 +631,46 @@ fn near_miss_help(text: &str, old: &str) -> String {
     }
     msg.push_str(" No similar line found — the content may differ more than expected; re-read the relevant range.");
     msg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn edit_match_accepts_lf_old_string_in_crlf_file() {
+        let text = "one\r\ntwo\r\nthree\r\n";
+        let plan = replacement_plan(text, "two\nthree\n", "deux\ntrois\n").unwrap();
+
+        assert_eq!(plan.old, "two\r\nthree\r\n");
+        assert_eq!(plan.new, "deux\r\ntrois\r\n");
+        assert_eq!(
+            text.replacen(&plan.old, &plan.new, 1),
+            "one\r\ndeux\r\ntrois\r\n"
+        );
+    }
+
+    #[test]
+    fn edit_matches_through_typographic_punctuation() {
+        // File has ASCII; model's old_string uses an en-dash and curly quotes.
+        let text = "let x = a - b; // \"note\"\n";
+        let old = "a \u{2013} b; // \u{201C}note\u{201D}";
+        let plan = replacement_plan(text, old, "a + b; // ok").unwrap();
+        assert_eq!(plan.count, 1);
+        assert_eq!(plan.old, "a - b; // \"note\"");
+        assert_eq!(
+            text.replacen(&plan.old, &plan.new, 1),
+            "let x = a + b; // ok\n"
+        );
+    }
+
+    #[test]
+    fn edit_occurrences_use_actual_match_line_not_first_probe_line() {
+        let text = "header\nalpha\nbeta\nalpha\nbeta\n";
+        let needle = "alpha\nbeta\n";
+        assert_eq!(
+            occurrence_help(text, needle, 8),
+            vec!["  line 2: alpha", "  line 4: alpha"]
+        );
+    }
 }

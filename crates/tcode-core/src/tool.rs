@@ -128,6 +128,14 @@ pub trait Tool: Send + Sync {
     fn is_mutating(&self) -> bool {
         false
     }
+    /// Whether this tool's output should pass through the token-budget blob
+    /// gate. Locating/content tools (`read`, `grep`, `glob`) return precise,
+    /// self-paginating output; gating them only forces `read_output` paging
+    /// of a result the model needed whole. Command/fetch tools (`shell`,
+    /// `web_fetch`) keep the gate so a 50KB log never floods the context.
+    fn gates_output(&self) -> bool {
+        true
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput;
 }
 

@@ -360,13 +360,15 @@ mod tests {
         assert!(native().native);
         assert!(!compatible().native);
         // An explicit first-party URL is still native.
-        assert!(AnthropicProvider::new(
-            "k".into(),
-            "m".into(),
-            Some("https://api.anthropic.com".into()),
-            watchdog(),
-        )
-        .native);
+        assert!(
+            AnthropicProvider::new(
+                "k".into(),
+                "m".into(),
+                Some("https://api.anthropic.com".into()),
+                watchdog(),
+            )
+            .native
+        );
     }
 
     #[test]

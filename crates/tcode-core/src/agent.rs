@@ -1031,7 +1031,7 @@ the summary text.";
         }
 
         let batch_label = format!(
-            "shell · Run {} {}",
+            "Run {} {}",
             prepared.len(),
             if prepared.len() == 1 {
                 "command"
@@ -1328,14 +1328,24 @@ the summary text.";
         memory.discover_for_paths(&paths).map(|update| update.note)
     }
 
-    /// Central token-budget gate for tool outputs.
+    /// Central token-budget gate for tool outputs. Locating/content tools
+    /// opt out (`gates_output` = false): their output is precise and
+    /// self-paginating, so blob-gating it would only force `read_output`
+    /// paging of a result the model needed whole.
     fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
-        let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
         let content = if output.is_error {
             output.content
         } else {
             compact_successful_test_output(output.content)
         };
+        let gates = self.tool(tool).is_none_or(|t| t.gates_output());
+        if !gates {
+            return ToolOutput {
+                content,
+                is_error: output.is_error,
+            };
+        }
+        let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
         ToolOutput {
             content: blobs.gate(tool, content),
             is_error: output.is_error,
@@ -1375,21 +1385,43 @@ fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
         .collect();
     if names.len() == 1 {
         let name = names.into_iter().next().unwrap_or("tool");
-        let display = match name {
-            "read" => "Read",
-            "write" => "Write",
-            "edit" => "Edit",
-            "grep" => "Search",
-            "glob" => "Find",
-            other => other,
+        return match name {
+            "read" => {
+                let unique_paths: HashSet<&str> = prepared
+                    .iter()
+                    .filter_map(|(_, _, input, _)| input["path"].as_str())
+                    .collect();
+                if unique_paths.len() < count {
+                    format!("Read {count} ranges")
+                } else {
+                    format!("Read {count} {}", if count == 1 { "file" } else { "files" })
+                }
+            }
+            "write" => format!(
+                "Write {count} {}",
+                if count == 1 { "file" } else { "files" }
+            ),
+            "edit" => format!("Edit {count} {}", if count == 1 { "file" } else { "files" }),
+            "grep" => format!(
+                "Search {count} {}",
+                if count == 1 { "pattern" } else { "patterns" }
+            ),
+            "glob" => format!(
+                "Find {count} {}",
+                if count == 1 { "pattern" } else { "patterns" }
+            ),
+            other => format!("{} {count} calls", title_case_tool(other)),
         };
-        format!(
-            "{display} {count} {}",
-            if count == 1 { "file" } else { "files" }
-        )
-    } else {
-        format!("Run {count} tools")
     }
+    format!("Run {count} tools")
+}
+
+fn title_case_tool(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().collect::<String>() + chars.as_str()
 }
 
 /// Lexically normalize paths for the batch collision check.  We cannot rely

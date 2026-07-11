@@ -43,6 +43,32 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
     h.finish()
 }
 
+/// Insert `(s, e)` into a sorted, non-overlapping range list, merging any
+/// ranges it touches (adjacent counts: `[1,50]` + `[51,80]` → `[1,80]`).
+fn insert_coalesced(ranges: &mut Vec<(usize, usize)>, (mut s, mut e): (usize, usize)) {
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len() + 1);
+    let mut inserted = false;
+    for &(rs, re) in ranges.iter() {
+        if re + 1 < s {
+            merged.push((rs, re)); // wholly before the new range
+        } else if e + 1 < rs {
+            if !inserted {
+                merged.push((s, e)); // new range slots in here
+                inserted = true;
+            }
+            merged.push((rs, re));
+        } else {
+            // Overlapping or adjacent: absorb into the growing new range.
+            s = s.min(rs);
+            e = e.max(re);
+        }
+    }
+    if !inserted {
+        merged.push((s, e));
+    }
+    *ranges = merged;
+}
+
 impl FreshnessTracker {
     pub fn check_read(&self, path: &Path, hash: u64, range: Option<(usize, usize)>) -> ReadStatus {
         let Some(rec) = self.files.get(path) else {
@@ -76,7 +102,52 @@ impl FreshnessTracker {
         }
         match range {
             None => rec.full = true,
-            Some(r) => rec.ranges.push(r),
+            // Coalesced so accumulated small reads combine into the union
+            // they cover — a later read spanning two prior windows is then
+            // correctly recognized as already seen.
+            Some(r) => insert_coalesced(&mut rec.ranges, r),
+        }
+    }
+
+    /// The single contiguous slice of `(s, e)` the model has not seen yet,
+    /// when the remainder is already covered. Returns `None` when the request
+    /// is wholly new, wholly seen, or its uncovered part is fragmented — the
+    /// caller reads the full requested range in those cases. Lets an
+    /// overlapping re-read (same offset, wider window) return only the delta
+    /// instead of re-appending already-seen lines to the ledger.
+    pub fn uncovered_gap(
+        &self,
+        path: &Path,
+        hash: u64,
+        (s, e): (usize, usize),
+    ) -> Option<(usize, usize)> {
+        let rec = self.files.get(path)?;
+        if rec.hash != hash || rec.full {
+            return None;
+        }
+        // ranges is sorted and coalesced; walk the gaps within [s, e].
+        let mut cursor = s;
+        let mut gaps: Vec<(usize, usize)> = Vec::new();
+        for &(rs, re) in &rec.ranges {
+            if re < cursor || rs > e {
+                continue;
+            }
+            if rs > cursor {
+                gaps.push((cursor, rs - 1));
+            }
+            cursor = cursor.max(re + 1);
+            if cursor > e {
+                break;
+            }
+        }
+        if cursor <= e {
+            gaps.push((cursor, e));
+        }
+        match gaps.as_slice() {
+            // A single gap strictly inside the request is a real trim; a lone
+            // gap equal to the whole request means nothing was covered.
+            [gap] if *gap != (s, e) => Some(*gap),
+            _ => None,
         }
     }
 
@@ -137,6 +208,30 @@ mod tests {
         t.record_read(p, 1, Some((1, 100)));
         t.record_read(p, 2, Some((1, 10)));
         assert_eq!(t.check_read(p, 2, Some((50, 60))), ReadStatus::NewRange);
+    }
+
+    #[test]
+    fn coalesced_ranges_recognize_the_union_as_seen() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        t.record_read(p, 1, Some((1, 50)));
+        t.record_read(p, 1, Some((51, 80))); // adjacent → merges into (1,80)
+                                             // A read spanning both prior windows is now fully covered.
+        assert_eq!(t.check_read(p, 1, Some((20, 70))), ReadStatus::Unchanged);
+    }
+
+    #[test]
+    fn uncovered_gap_returns_only_the_new_suffix() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        t.record_read(p, 1, Some((1300, 1449)));
+        // Same offset, wider window: only 1450-1479 is new.
+        assert_eq!(t.uncovered_gap(p, 1, (1300, 1479)), Some((1450, 1479)));
+        // A wholly-new range has no partial gap to trim.
+        assert_eq!(t.uncovered_gap(p, 1, (2000, 2100)), None);
+        // A fragmented request (hole in the middle already seen) reads whole.
+        t.record_read(p, 1, Some((1600, 1650)));
+        assert_eq!(t.uncovered_gap(p, 1, (1500, 1700)), None);
     }
 
     #[test]

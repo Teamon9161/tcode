@@ -200,53 +200,14 @@ loop {
 
 tokio, reqwest(rustls, stream), serde/serde_json, ratatui, crossterm, arboard, syntect, similar, grep-searcher, ignore, globset, clap, toml, tracing, uuid, dirs, sha2, anyhow, thiserror, async-trait, tokio-util, futures。
 
-## 里程碑（每个可运行、可验证）
+## 已实现（M0–M5 及计划外，2026-07；仅索引，细节见代码与 CLAUDE.md）
 
-1. ✅ **M0 骨架 + Provider**：workspace、config、双 Provider（SSE 解析、watchdog、重试）、行式 REPL 流式对话。→ 验证：两后端各跑对话；断网/挂代理验证 watchdog。
-2. ✅ **M1 工具 + loop**：Tool trait、六个工具（含自愈式错误信息）、ledger、agent loop、权限模式+规则（行式确认）、blob store 预算门、Freshness Tracker、中断契约、开局项目地图、尾部自知一行。→ 验证：真实任务"读→改→跑测试"；故意让 edit 失败观察模型无需额外 read 即修复；中断后观察模型不做无效验证；重复读同文件返回 stub。
-3. ✅ **M2 TUI**：inline 渲染器、markdown/高亮/diff、输入框、slash 命令、**权限选项+Tab 意见**、状态行（token 实时计数 + 缓存遥测）、图片/长文本粘贴。→ 验证：approve+意见流程；连续 turn 的 cache_read 占比接近前缀全长；贴图发给模型描述。
-4. ✅ **M3 持久化 + rewind + sub-agent + hooks**：JSONL 事件日志、`--continue`/`--resume`、双击 Esc rewind + 文件 checkpoint 回滚、task 工具 + explore agent、hooks、`/compact` + 自动 compact。→ 验证：resume 续任务；rewind 后文件恢复且缓存仍命中（看遥测）；edit 挂 formatter hook。
-5. ✅ **M4 打磨**：中断边角（半截 tool_use 合法化）、Windows Terminal/conhost 兼容、缓存回归哨兵、`/cost`、错误信息。
+- **M0–M2 基础**：双 Provider（Anthropic + OpenAI，SSE + watchdog + 重试）；Tool trait + agent loop；append-only ledger；权限模式+规则；blob 预算门；Freshness Tracker；中断契约；开局项目地图；尾部自知一行；inline TUI（markdown/高亮/diff、slash、权限 Tab 意见、图片/长文本粘贴、状态行 token+缓存遥测）。
+- **M3–M4**：JSONL 事件日志 + `--continue`/`--resume`；双击 Esc rewind + 文件 checkpoint 回滚；`task` sub-agent + `explore`；hooks；`/compact` + 自动 compact；缓存回归哨兵；`/cost`；半截 tool_use 合法化；Windows Terminal/conhost 兼容。
+- **计划外**：多模型 profile + chatgpt provider + 首启向导 + `/model`；交互工具 `update_plan`/`ask_user`/`add_note`；外部会话导入（Codex/Claude Code JSONL，只读复制，`Entry::ImportedTool` 只进转录不进 prompt）；OpenAI 限额进度条；Skills 发现（`.tcode`/`.claude` skills，含 200 字符/6k 预算降级）；project_map 预算防御（80 项/目录 20 子项/16 KiB）。
+- **M5**：后台任务（`run_in_background` + `background.rs` 注册表 + `read_output`/`kill_task` + 完成 `Entry::Note`）；`web_fetch`/`web_search`（见下 Web 节，已重写升级）；导入体验（相对时间、诚实映射）；MCP 客户端（stdio JSON-RPC 2025-06-18，`mcp__server__tool`）；`/export`（`export.rs` 纯函数）；Memory 2.0（**人维护指令 vs 模型维护自动记忆分离**，项目根→cwd 分层加载，`context_paths` 外部项目按需加载 + 首次外部写阻断重试，`/memory`）。
 
-## 计划外已实现（2026-07）
-
-- **多模型 profile + chatgpt provider + 首启向导 + /model**（见下节"模型配置"）。
-- **交互工具**：`update_plan`（TUI 常驻 plan 面板）、`ask_user`（结构化选项提问，复用审批对话框）、`add_note`。
-- **外部会话导入**：`/resume` 可列出并导入 Codex（`~/.codex/sessions`）与 Claude Code（`~/.claude/projects/<dir>`）的 JSONL 会话。设计决定：
-  - 导入是**只读复制**为新 tcode 会话，原文件不动；
-  - 工具调用/输出映射为 `Entry::ImportedTool`，**只进终端转录、不进 prompt**（不可回放、不占上下文）；`apply_patch` 按红绿 diff 渲染；
-  - 映射保持诚实：Codex `exec` → `shell(原命令)`，不再猜测 grep/read 等 tcode 工具名（假映射已删）；
-  - 导入尾部附 harness note 告知模型"历史为二手、工具输出已省略、文件可能已变"（零猜测原则）；
-  - 已评估 ACP：ACP 解决的是"把别的 agent 当引擎实时驱动"，不提供历史转录访问，对导入场景无帮助，维持 JSONL 解析方案。
-- **OpenAI 限额显示**：状态区 5h/周限额进度条。
-- **Skills**：发现 `<项目>/.tcode/skills`、`<项目>/.claude/skills`、`~/.tcode/skills`、`~/.claude/skills`（同名去重，项目 > 全局，.tcode > .claude 兼容位）；解析 SKILL.md YAML front matter（含 `description: |` 块标量折叠）。**context 预算**：每条描述截 200 字符、列表总预算 6k 字符（约 1.5k token，进缓存前缀），超出的 skill 降级为"仅名字"列出但仍可调用；调用时才读 SKILL.md 正文（过统一输出预算门）；名字错误的调用返回全部合法名字（自愈式错误）；无 skill 的项目不注册该工具，零 token 成本。
-- **project_map 预算防御**：目录树全局 80 项 + 每目录 20 子项上限（单个爆炸目录不再吃光预算），git status 只列 15 个文件、超出加 `+N more` 标记，项目指令总预算 16 KiB。
-
-## M5（下一步提案）
-
-1. ✅ **后台任务**（2026-07 实现）：`shell`/`bash` 加 `run_in_background` 参数（模型判定，工具描述给判定准则）。实现：`tcode-core/background.rs` 的 `BackgroundTasks` 注册表挂在 `ToolCtx`（与 blobs 同构）；子进程由 supervisor tokio task 持有（`kill_on_drop`，tcode 退出不留孤儿），stdout/stderr 按行流入共享缓冲；返回 `b1` 类 task id。完成时 agent loop 在两个安全边界（下一 turn 开头 / 当前工具批结束）append `Entry::Note` 通知模型（纯 append，缓存安全，`take_completion_notes` 保证恰好一次）；`read_output` 认 `b` 前缀 id 分页读实时输出（带状态头）；`kill_task` 工具停任务（幂等，杀已结束任务不算错）。运行中任务列在尾部 `<tcode-status>` 状态行。
-2. ✅ **工具差距补齐**（2026-07 实现）：`web_fetch` + `web_search`（`tcode-tools/web.rs`）。
-   - `web_fetch`：reqwest 直连（30s 超时、5MB 上限），HTML 经 `htmd` 转 markdown（跳过 script/style/nav 等），json pretty、text 原样、二进制报错；重定向手动跟（≤5 跳），**跨域重定向不自动跟**——返回目标 URL 让模型显式重调，保证按域审批（descriptor `web_fetch(host)`）诚实；输出过统一 blob 预算门。
-   - `web_search`：DuckDuckGo HTML 端点（`html.duckduckgo.com/html/`）scraper 解析（`div.result`/`a.result__a`/`.result__snippet`，解码 `uddg=` 重定向、跳广告），无需 API key、三家 provider 一律可用、不碰 wire 格式；descriptor 无参数（`web_search`），一次 always-allow 覆盖全部搜索。空结果与 bot-check 分开报错（自愈式）。
-   - workspace reqwest 加 `system-proxy` feature：Windows 系统代理（如 Clash `127.0.0.1:7890`）下 env 变量为空时请求也走代理，providers 同样受益。
-   - 测试：解析/转换纯单元测试；`tests/web_live.rs` 是 `#[ignore]` 的真实网络 smoke（`cargo test -p tcode-tools --test web_live -- --ignored` 手动跑）。
-   - `notebook_edit` 暂不做（用户场景少）；`multi_edit` 不做（Claude Code 已弃用，edit 循环即可）。
-3. ✅ **导入体验完善**（2026-07 实现）：两个 picker（本会话 + 外部导入）都显示相对修改时间（`SessionInfo`/`ExternalSessionInfo` 加 `modified`，渲染 "3h ago"）；Claude 导入解析 content 数组——tool_use → `Entry::ImportedTool`（保留 Claude 原始工具名与 input，不做假映射），tool_result → `output` 条目（复用 compact_output 折叠测试输出）；`summarize_call` 认识 `file_path`/`url`/`query` 键。
-4. ✅ **MCP 客户端**（2026-07 实现）：`tcode-tools/mcp.rs`，stdio 传输（newline-delimited JSON-RPC，协议版 2025-06-18）。`config.toml` 的 `[mcp_servers.名字]`（command/args/env，全局+项目级 overlay）；启动时 initialize → tools/list（含 nextCursor 分页），工具以 `mcp__server__tool` 注册进普通 Tool trait，该名字即权限 descriptor（规则可写 `mcp__server__*`）。Windows 经 `cmd /c` 解析 .cmd shim（npx 等）。server 挂掉/起不来只警告不阻塞启动；请求超时 init 30s / call 120s；进程 `kill_on_drop`，tcode 退出不留孤儿。测试：`tests/mcp_stdio.rs` 用脚本化 python fake server 打真协议（无 python 自动跳过）。
-5. ✅ **/export**（2026-07 实现）：`tcode-core/export.rs` 纯函数 `export_markdown(entries)`——ledger 是唯一事实源，导出只是又一个视图。User/Assistant 文本、工具调用摘要行、工具结果（`<details>` 折叠 + 自适应长度 code fence 防逃逸）、Note/Summary/ImportedTool 全覆盖；`<tcode-status>` 等 harness 管道内容不导出。TUI `/export [path]` + REPL 同名命令，默认文件名 `tcode-transcript-<unix>.md`。
-6. ✅ **Memory 2.0**（2026-07 实现；替换 `/remember` 盲追加方案）：参照 Claude Code 当前的两类记忆，但保留 tcode 对 `AGENTS.md` 的原生支持。核心区别必须建模清楚：**指令由人维护、可随仓库共享；自动记忆由模型维护、仅存本机**。二者不得写进同一个文件。
-   - **用户与项目指令**：`~/.tcode/AGENTS.md` 是用户级指令；项目内每层目录按 `.tcode/AGENTS.md > AGENTS.md > CLAUDE.md` 取第一个命中，多个目录层级不互相覆盖，而是按“项目根 → 目标目录”依次拼接，使更具体的指令最后出现。启动时加载项目根到 cwd；之后访问其他子目录时按需补载尚未出现的层级。
-   - **自动记忆**：每个项目使用 `~/.tcode/projects/<project-id>/memory/`，`MEMORY.md` 是精简索引，启动只注入前 200 行或 25 KiB（先到者为准）；详细内容放同目录 topic 文件，由模型按需 `read`。Git 项目的 `<project-id>` 基于 canonical git common dir，使同仓库的子目录和 worktree 共享记忆；非 Git 项目基于显式 `.tcode/config.toml` 项目根。自动记忆默认开启，system prompt 明确何时值得记录、不得保存秘密、优先更新而非重复追加。项目累计 20 个用户回合或距上次整理提醒满 7 天后，在下一次活跃 turn 注入一次维护提醒：整理重复/过期条目、把细节归档到 topic 文件，并记录仍有效的重要决策；模型成功写入当前项目自动记忆后重置周期。状态持久化，因此关闭后不会后台运行，重新使用项目时才继续计数和提醒。
-   - **项目边界**：启动项目根取最近的 `.git` 或 `.tcode/config.toml` 祖先；若都不存在，当前 cwd 自身就是临时项目根。访问 cwd 项目以外的路径时，只有目标祖先存在 `.git` 或 `.tcode/config.toml` 才视为另一个项目；单独的 `.tcode/AGENTS.md` 只是目录级指令，不重定义项目根。`home` 和文件系统根永不因附近存在 `AGENTS.md`/`CLAUDE.md` 被猜成项目。无显式标记的外部路径不加载额外项目记忆，只继承用户级指令。
-   - **外部项目按需加载**：`Tool` 增加声明式 `context_paths(input)`，由 `read`/`write`/`edit`/`grep`/`glob` 返回 path，`shell` 返回显式 `cwd`（未给则当前 cwd）；agent loop 在工具执行前统一解析目标项目并去重已加载的 canonical 指令路径。禁止解析 shell 命令字符串猜文件路径；MCP/第三方工具没有声明路径时不做隐式发现。
-   - **注入与执行顺序**：按需内容通过 append-only `Entry::Note` 进入 ledger，绝不改 system prompt 前缀。模型已经生成 tool call 后才发现新指令，因此首次 `write`/`edit` 或外部 `cwd` 的 `shell` 必须返回“已加载新指令，请据此重试”且不执行；只读工具可正常执行，并把新指令与 tool results 一起交给下一轮。这样不会在未知项目规则时先产生副作用，也不破坏 provider 要求的 tool-use/tool-result 相邻关系。并行批次先统一 preflight、合并并去重所有新指令，再决定执行或整体阻断。
-   - **命令语义（已确认）**：删除 `/remember <fact>`，改为 Claude Code 风格的自然语言“记住 X”，由模型维护自动记忆；新增 `/memory` 列出本会话已加载的用户/项目指令、自动记忆目录和开关状态，`/memory on|off` 显式切换，不暗中改记忆正文。
-   - **首期 non-goals**：不做 `@import`、`.tcode/rules`/path glob、会话结束自动建议、shell 脚本静态分析、无项目标记的外部目录猜测；这些没有真实需求前不增加解析器和状态。
-   - **预算与安全**：启动指令与自动记忆分别计量，项目指令总预算先维持 16 KiB，自动记忆独立 25 KiB/200 行；动态补载每文件和每次 turn 都有硬上限，截断必须列出来源。所有路径 canonicalize 后做去重和边界判断，读取失败只产生可见诊断，不阻断无关工具。
-   - **验收**：单测覆盖祖先顺序、同层优先级、home/root 排除、Git worktree identity、无 marker 外部路径、symlink/canonical 去重、预算 UTF-8 边界；agent-loop 集成测试覆盖只读按需加载、首次外部写阻断后重试、并行 read/edit preflight、resume/compact 后不重复注入；真实 smoke 覆盖从项目 A 读取并修改项目 B，确认 B 的规则在副作用前生效。
-7. **全屏渲染器** → 已升级为正式里程碑，见下节 M6。
-
-v2 方向（未变）：/branches 分支浏览、WASM 插件式 hooks。
+v2 方向：/branches 分支浏览、WASM 插件式 hooks。
 
 ## M6：自绘屏幕渲染器（2026-07 决策，进行中）
 
@@ -286,17 +247,17 @@ struct Transcript {
 - **ratatui 双缓冲 diff** 负责最小化终端写入；帧外再包 crossterm synchronized update 防撕裂。
 - 重绘按事件驱动 + 250ms tick 合并，不做无变化重绘。
 
-### 子里程碑（2026-07-11 全部实现，待真机验收）
-
-1. ✅ **M6a 核心替换**：`transcript.rs` + alternate screen 渲染循环；`bake`/`insert_before` 全部改写为 Transcript 追加；滚轮/PgUp/PgDn 滚动，新输出自动跟随（用户上滚时保持阅读位置，hint 行显示 `↑ viewing history`）；resize 全量 rewrap；alternate screen 退出即恢复原屏幕（"退出留空白"随之消失）。`KnownPosBackend`/`insert_before` 宽字符补丁等 inline 机制整体删除。
-2. ✅ **M6b 选择复制**：transcript 区域拖选高亮（REVERSED）→ 松开即复制（arboard，失败退 OSC 52）；软换行行复制时自动合并、行尾 padding 剔除；hint 行短暂显示 "copied N lines"。
-3. ✅ **M6c 块级交互**：统一为 `Block { head, detail }` 模型——工具输出 = head（`⎿ preview ▸`）+ 默认折叠的 detail；edit diff = 默认展开、固定 14 行、超出部分 footer 显示范围；**点击块 = 折叠/展开，悬停滚轮 = 区域内滚，拖动 = 选择**。审批对话框内嵌可滚动 diff（滚轮/PgUp/PgDn），拒绝只留 `⎿ declined` 一行——prebake/`previewed_changes` 机制删除，每个 tool call 恰好渲染一次（ToolStart），特殊情况消失。
-4. ✅ **M6d rewind 就地跳转**：用户输入 echo 块携带 ledger entry 标签；双击 Esc 进导航——transcript 跳转并高亮（琥珀底色）目标输入、编辑框预填原文，Esc/↑ 更早、↓ 更近（越过最新则退出），Enter 确认（ctrl+r = 同时回滚文件）；确认后 `truncate_from_entry` 让视觉与 ledger 同步截断。`rewind.rs` picker 已删除。
 
 ### 调研备注
 
 - 现成 crate 无法直接套：`tui-textarea`/`ratatui-code-editor` 的选择只针对编辑器组件；`tui-scrollview` 按内容总尺寸分配整块 buffer，长转录不可接受。自实现是正解。
 - Codex tui2 踩过的坑值得预防：滚轮/触控板事件在不同终端节奏差异大（iTerm2 连发），滚动步长需按事件序列自适应；alternate screen 下终端原生搜索不可用，后续可考虑 `/` 转录内搜索（暂列 v2，不进 M6）。
+
+
+### 澄清（排除误判）
+
+- `read` 默认 `limit = 2000` 行未变（`DEFAULT_READ_LIMIT`）；会话里的"200"是 `grep` 的 `head_limit` 默认值，两者无关。
+- tcode 的 `grep` **本就全量输出 `file:line: 内容`**（`search.rs`），无需新增"返回 file:line"的工具；P0 让该输出不被切即可等价于"Claude Code 式 Grep 全量返回"。
 
 
 ## 验证方式（贯穿）
@@ -306,11 +267,121 @@ struct Transcript {
 - 每里程碑用真实 API 跑端到端任务，盯状态行缓存命中数字（这本身就是对"省 token"的持续验收）。
 
 
-## 待解决问题（2026-07 已处理）
-1. ✅ **折叠交互与工具输出排版**：折叠指示器改为动态渲染在 head 末行——收起显示 `▸ N lines`（accent 色，明确可点击并告知隐藏多少），展开显示 `▾`（方向翻转）；展开体加左侧 `│ ` gutter bar 作为"框"分隔；消除首行重复（plain 输出跳过已在 preview 完整展示的第一行，被截断的除外）；markdown 类输出（`web_fetch`、`read` 到 `.md`）走 markdown 渲染器，其余保持字面但用默认前景色（不再一律 dim）改善可读性。（`transcript.rs::Block::row`、`app.rs::output_detail`/`path_is_markdown`）
-2. ✅ **模型配置 toml 化 + 去掉 `[1m]`**：新增内置 `crates/tcode-core/src/default.toml`（`Config::defaults()` 经 `include_str!` 解析），作为运行时 `load()` 的基础层；用户 `~/.tcode/config.toml` 按 profile key 合并、models 按 name 覆盖/增量（`Profile::merge`/`Config::overlay`）。默认层不落盘：`load_global()` 仍只读用户文件（setup 读写它），`load()` 才叠加 defaults。deepseek 用真实 id `deepseek-v4-pro`/`deepseek-v4-flash`（1M context 记在 `context_window`，不再是 `[1m]` 后缀）。**模型目录 2026-07 校准**（经 claude-api skill + web 搜索核实）：Anthropic Opus 4.8 / Sonnet 5 / Fable 5 均为 1M context（原 200K 是错的），Haiku 4.5 200K；OpenAI 换 gpt-5.6-sol/terra/luna（1.05M）；DeepSeek v4 1M。`/model` picker 过滤掉无凭证的默认 profile（`Profile::is_usable`，`build_menu`）。`presets` 改为从 defaults() 取，wizard 与运行时默认层不再各写一份。**`/provider` 自定义端点**：wizard 加 `c` 键定义 openai/anthropic 兼容 profile（名称/协议/base_url/模型/key，`read_custom_provider`）。
-3. ✅ **审批时完整 diff 进记录**：change 提案在审批对话框打开时即以完整（不截断）open diff 落入 transcript，滚轮滚动 transcript 可看全码；对话框只留选项。批准 → 该 diff 留存，后续 `ToolStart` 跳过重画（`change_prebake`）；拒绝 → 回撤该块只留一行 `⎿ declined`（`truncate_blocks`）；批量（`ToolBatchStart`）会撤销单条 pre-bake 再整体渲染。审批对话框内嵌 diff（`CHANGE_ROWS`/`scroll_change`）整套删除。
-4. ✅ **Anthropic provider 的 effort wire 迁移**（2026-07-11 实现）：`anthropic.rs::build_body` 的旧 `thinking:{type:"enabled",budget_tokens:N}` 会在新模型（Opus 4.8、Sonnet 5、Fable 5）上返回 400。修复按端点分流——`AnthropicProvider` 新增 `native` 字段（base_url 为 None 或含 `anthropic.com` 判为第一方；`api.deepseek.com/anthropic` 等兼容后端为 false）：
-   - **native**：`low/medium/high` → `thinking:{type:"adaptive"}` + `output_config:{effort:...}`（经 Anthropic 文档核实）；`off` → `thinking:{type:"disabled"}`；`None`（picker auto）省略 thinking。Fable 无 effort dial，只走 None 分支，天然省略 thinking，满足其"连 disabled 都拒"的要求。
-   - **兼容后端**（DeepSeek 等）：保持旧的 `enabled`+`budget_tokens`（DeepSeek 的 Anthropic 兼容端点仍吃这格式），行为不变。
-   - 单测覆盖 native/兼容 × None/off/low/medium/high 五档 wire（`anthropic.rs::tests`）。
+## 待解决问题
+
+> 已修复且无长期价值的细节（diff 行号、批次分组标题、Ctrl+O 移除、resume 工具输出/彩色 diff 恢复、鼠标 hitbox 赋值、freshness 用内容 hash 判断——后者已并入"三个贯穿全局的机制 #3"）已从本节删除；下面只留仍需守住的设计要点与未决项。
+
+### 设计要点（已固化，改动勿回退）
+- **折叠输出默认**：read/grep/glob/read_output 转录里默认只显示折叠摘要，不把输出首行铺开。
+- **wrap 必须展开 tab**：工具输出的 `行号\t内容` 里 tab 宽度测 0 却占 buffer cell，滚动会残留浮字；`transcript.rs::wrap_lines_flagged` 按 8 列制表位把 tab 展开成空格，每个显示 cell 都写到。勿改回保留裸 tab。
+- **token 两个量纲不可混**：context 表 = 单次请求的完整 prompt（system+tools+全部历史，缓存+未缓存一起）= 当前窗口占用；turn 汇总 = 本轮**未命中的 `input_tokens`**（新付全价量）+ cache%。曾用 `total_input()` 把缓存前缀按请求次数重复累加，更离谱，已回退。运行时状态行 `↓ ~N tok` 走 `token_count`。
+- **update_plan 不套骨架**：多数任务（局部改动、单文件编辑）不必 plan；要 plan 时步骤按真实结构、增量维护状态（同时只一个 in_progress，做完即标 completed）。
+- **工具加固（2026-07-11，对照 claude-code / codex 反编译源）**：起因是 `grep C:\Users\Teamon\.tcode` 命中 jsonl 单条巨行（710KB）经 `gates_output=false` 直灌 ledger 撑爆 context。已修（`search.rs`/`fs_tools.rs`）：grep 每行截 512B（对标 rg `--max-columns`）、`max_filesize=256KB`、`build_parallel()`+按 (path,line) 排序、`SEARCH_DEADLINE=10s` 兜底（超时给明确 partial 标记而非静默"无匹配"）、`PRUNE_DIRS` 剪 VCS/node_modules/target/各类缓存（补"离开 git 仓库就无 gitignore 剪枝"的洞）；grep/glob 改 `hidden(false)` 搜 dotfiles + `offset` 分页；read 先 `metadata` stat >10MB 拒读、输出 128KB 字节预算（`numbered_capped`）；edit `replacement_plan` 加末层标点归一模糊匹配（对标 codex `seek_sequence`）。
+
+### 未决
+- ⚠️ **输入框快捷键（待你实测）**：Ctrl/Alt+V（含 +Shift）已统一走 `paste_from_clipboard`；Ctrl+C 只做中断阶梯（取消→清空→退出），复制走 Ctrl+Shift+C / Alt+C / 鼠标松开。若仍"粘贴即发送"，属终端把粘贴换行当 Enter（bracketed paste 被吃），只能在终端层解决，应用层无法从单个 Enter 区分粘贴还是手敲。
+- ⬜ **UNC 路径未防护**（Windows）：read/write/grep 对 `\\server\share`、`//` 开头路径无拦截，`std::fs` 访问触发 SMB 认证、可能泄漏 NTLM 凭证。claude-code 在各工具 `validateInput` 显式跳过交权限层。tcode 应在 `ctx.resolve` 或工具入口加守卫。**与下面 web SSRF 同源**——都是"未校验目标地址就发起访问"，宜一并设计一个"出站目标白/黑名单"守卫。
+
+## Web 工具：现状、对照与改进（2026-07-11 调研）
+
+### 四方现状（谁都不自己爬 SERP）
+- **claude-code**：`web_search` = Anthropic 服务端 `web_search_20250305`（`server_tool_use`）。**无任何本地/客户端搜索实现，也无 DDG 兜底**——`WebSearchTool.isEnabled()` 只按 `getAPIProvider()`（firstParty/vertex/foundry）判定。`web_fetch` = 客户端抓取 → turndown markdown → **Haiku 子模型按 `prompt` 摘要**，只回摘要；15min URL LRU 缓存；二进制存盘；`validateURL` 做 SSRF 校验；www 增删/同源视为安全重定向自动跟。
+- **codex**：(a) **OpenAI Responses 服务端 hosted `web_search`**（`hosted_spec.rs`，模式 Cached/Indexed/Live，带 `user_location`/`filters`/`search_context_size`）；(b) 客户端 `web` 命名空间工具，命令 `search`/`open_page`/`find_in_page`，仍走 provider 的 `SearchClient`（非独立抓取），喂入近期对话上下文。
+- **opencode**：**本地工具调第三方托管搜索 API**——Exa（`mcp.exa.ai`）/ Parallel（`search.parallel.ai`），走 MCP over HTTP，按 `EXA_API_KEY`/`PARALLEL_API_KEY`，返回**"为 LLM 优化的 context 字符串"**（一次调用 = 搜索+抓取+抽取，`contextMaxCharacters` 控量）。源码注释明确区分"provider-independent 本地搜索"与"provider-hosted 搜索"。webfetch：turndown markdown / htmlparser2 纯文本 / **图片转 base64 attachment**、Cloudflare 403 challenge 换 UA 重试；`http-body.ts::collectBoundedResponseBody` 是**流式按字节截断**的参考实现（正是下面 P0-2 要抄的）。**opencode 也没做 SSRF 校验**——说明该防护是 claude-code 特有加固，非普遍共识。
+- **结论**：四家里 **tcode 是唯一自己解析 SERP HTML（DDG）的**。其余三家都不爬——要么委托给模型 provider 的服务端工具（claude-code/codex），要么调专门的搜索 API（opencode 的 Exa/Parallel）。
+
+### 为什么都不自己爬（服务端/托管搜索的优势）
+1. **搜索质量与排序**：真搜索要爬取+索引+排序的语料库。DDG HTML 抓取拿到的是被降级的 SERP（易 bot-block，你已处理 anomaly/challenge 即证其脆），Exa/provider 搜索是为程序化调用建的，相关性/时效性都强。
+2. **一次调用 = 搜索+抓取+抽取+压缩**：Exa/hosted 直接回"为 LLM 优化的干净文本"，省掉客户端 fetch→markdown→摘要 的整条流水线，token 与延迟双省（tcode 现在是 search 出 URL、再 web_fetch 整页、模型自己读，多轮往返）。
+3. **鲁棒**：抓 SERP 依赖 HTML 结构不变，markup 一改就崩；托管 API 有 SLA。
+4. **provider-hosted 特有**：搜索在模型 turn 内执行（`server_tool_use`），模型一轮内能多次搜、带 citation，无客户端往返，provider 维护。代价：只在你真连该 provider 一方端点时可用。
+
+### ANTHROPIC_BASE_URL 指向非 Anthropic 端点（如 DeepSeek 代理）时 claude-code 搜索调什么？
+- **web_search**：`getAPIProvider()` 只认 bedrock/vertex/foundry 三个 env flag，设 `ANTHROPIC_BASE_URL` 仍返回 `firstParty`，故 `isEnabled()` 仍 true——工具**名义上开着**。但它把 `web_search_20250305` 这个**服务端工具规格发给你配的那个端点**；DeepSeek 代理若没实现 Anthropic 服务端搜索，该 tool_use 要么报错、要么模型根本搜不了。**claude-code 没有任何本地兜底**，所以结论是：**指向 DeepSeek → web_search 实质不可用，且无退路**。（另有 `isFirstPartyAnthropicBaseUrl()` 能正确识别自定义 base_url，但只用于 model-capabilities/policy 等一方特性，未 gate web_search。）
+- **web_fetch**：抓取是客户端做的，能工作；但摘要步骤 `queryHaiku` 走**同一个配置端点**的小模型，摘要质量取决于该端点；且默认还有个打向 `api.anthropic.com/api/web/domain_info` 的域名预检（非一方 setup 需 `skipWebFetchPreflight` 关掉，否则每次 fetch 前的预检会失败）。
+- **对 tcode 的启示**：tcode 的 DDG 方案恰恰在"任意后端都能用"这点上胜过 claude-code——claude-code 一旦离开一方端点就没搜索。理想是 **hosted 优先 + 独立兜底**：能用原生 hosted（Anthropic/OpenAI）就用，否则回落到独立后端（DDG 或 Exa/Parallel 这类 API）。这是 tcode 相对 claude-code 的差异化机会，不是短板。
+
+### web_fetch 的两个真实洞（安全 / 正确性，P0）
+1. **SSRF**：`parse_url` 只校验 scheme，之后照单全收内网/环回/云元数据地址、URL 内嵌凭证、单段主机名（详见下节"SSRF 风险"）。修法：解析后拦截环回/私有/链路本地 IP、内嵌凭证、单段主机名。与 UNC 守卫同源，合并成一个出站目标守卫。
+2. **body 上限只在有 Content-Length 时生效**（`web.rs:201`）：chunked/流式响应无该头 → `resp.text()` 无界读入内存，5MB 上限形同虚设。修法：改 `bytes_stream()` 边读边累积，超 `MAX_BODY_BYTES` 立即中止，不信任 Content-Length。
+
+### 改造方案（2026-07-11 拍板，✅ 已实现）
+SSRF **不做**（四家里只有 claude-code 做，opencode/codex 都没做，非刚需；保持简单）。落地如下（`web.rs` 重写，8 单测 + 1 个 `#[ignore]` Exa live smoke 实测通过、clippy 0 警告）：
+
+**web_search — 可插拔后端（对标 opencode）**
+- **已实测**（2026-07-11，`curl` 裸 `tools/call` 无 key）：`https://mcp.exa.ai/mcp` **匿名可用**，直接返回真实"LLM 优化文本"（标题+URL+正文摘要）。opencode 正是靠这个匿名端点做到"不用注册 key"。**保留**：匿名端点限流未文档化（官方 20k/月是带账号的）、无 SLA、Exa 可随时改成要 key——best-effort。
+- 后端选择是 **harness 状态、不给模型选**（零猜测原则：模型无从判断 Exa/Parallel/DDG 优劣，暴露 `backend` 参数只会让它在无法推理的选择上浪费 token + 给缓存前缀加噪）。模型只调 `web_search(query)`；选哪个由 `search_chain()` 决定、失败自动向后兜底：
+  - 默认无 key：**Exa(匿名) → Parallel(匿名) → DDG**（两家托管都实测 keyless 可用、免费；DDG 最终兜底）。
+  - `EXA_API_KEY` / `PARALLEL_API_KEY` 存在：honor 该家（带 key 提限额）→ DDG，不静默乱撒到另一家。
+  - `TCODE_WEBSEARCH_BACKEND=ddg|exa|parallel` 人工显式覆盖（仍带 DDG 兜底，除非选 ddg）。
+  - 对比 opencode：它默认按 sessionID FNV-1a 哈希做 **50/50 A/B**（给自己收集对比数据用）、**无任何 fallback、无 DDG**，选中一家挂了就报错。tcode 的链式兜底更稳。Parallel 也实测 keyless（普通 UA 即可，非 opencode UA 鉴权）。
+- Exa/Parallel 走 **MCP over HTTP**（单发 JSON-RPC `tools/call`，不做 initialize 握手；`Accept: application/json, text/event-stream`；响应是 SSE，取 `data:` 行里 `result.content[].text`），照抄 opencode `mcp-websearch.ts` 的请求/响应形状（源码 + 实测双验证）。Exa 工具 `web_search_exa`（args `query/type/numResults/livecrawl/contextMaxCharacters`）、Parallel 工具 `web_search`（args `objective/search_queries`，Bearer 头）。
+- 关键收益：Exa 回的是**为 LLM 优化的 context 文本**（一次调用 = 搜索+抓取+抽取），省掉"search 出 URL → web_fetch 整页 → 模型自读"的多轮往返；DDG 仍只回标题/URL/snippet。
+- 响应流式按字节截断（`MAX_RESPONSE_BYTES`）；25s 超时。descriptor 仍无参数（一次 always-allow 覆盖）。
+- hosted 委托（Anthropic/OpenAI 服务端搜索）**暂不做**——需碰 wire 格式、且只在一方端点可用；Exa 免费层已能显著提质，性价比更高。留作后续。
+
+**web_fetch — 抄 opencode/claude-code 的成熟点**
+- **流式 body 截断**（P0，真实 bug）：弃用 `resp.content_length()` 信任，改 `bytes_stream()` 边读边累积、超 `MAX_BODY_BYTES` 立即中止。参考 opencode `http-body.ts::collectBoundedResponseBody`。
+- **find_in_page**（对标 codex）：web_fetch 加可选 `pattern`（正则）参数——给了就只回 markdown 里命中行 + 上下文（复用 grep 的 `cap_line`/截断），不 dump 整页。比 claude-code 的 Haiku 摘要更轻、零额外模型调用，契合省 context 原则。工具描述引导"找特定内容时带 pattern"。
+- **安全重定向放宽**：`example.com ↔ www.example.com`（去掉前导 `www.` 后同 host）视为安全、自动跟；仅真正异 host 才弹回模型。
+- **15min URL 缓存**（对标 claude-code）：`Mutex<HashMap<url, (Instant, rendered_text)>>`，TTL 15min、条目上限（超限逐旧）；缓存渲染后文本，`pattern` 过滤在缓存命中后再跑（同 URL 不同 pattern 复用抓取）。
+- **http→https 升级** + prompt 加一句"认证/私有 URL 会失败"。（便宜，顺手）
+
+**重构方式**：web.rs 拆出 `fetch_capped()`（流式截断，web_fetch/搜索后端共用）、`search`.rs 式的后端 trait 或 enum 分派；DDG 解析保留。测试：MCP 响应解析 + find_in_page 过滤 + 缓存 TTL 用纯单元测试；Exa/Parallel 真实网络走 `#[ignore]`。
+
+### SSRF 风险（Server-Side Request Forgery，暂不实现，仅存档）
+一句话：**工具让"服务器"（跑 tcode 的这台机器）去请求一个由模型/外部输入决定的 URL，攻击者借此把请求打向本不该被外部触达的内网目标。** 具体风险点：
+- **云厂商元数据端点**：`http://169.254.169.254/latest/meta-data/iam/security-credentials/`（AWS）、GCP/Azure 类似 → 直接吐出**临时 IAM 凭证**，最危险。
+- **环回 / 内网服务**：`http://127.0.0.1:*`、`http://localhost`、`http://[::1]`、`http://10.x/172.16.x/192.168.x` → 打到本机或内网未鉴权的管理端口（数据库、admin、调试接口）。
+- **URL 内嵌凭证**：`http://user:pass@host/` → 凭证进日志/转录。
+- **单段主机名 / 内网 DNS**：`http://internal-service/` → 解析到公司内网。
+- **链路本地**：`169.254.0.0/16`、`::ffff:` 映射绕过。
+触发面：web_fetch 每 host 要人确认看似有闸，但 `169.254.169.254` 这种裸 IP 用户很难看出是元数据端点就点了同意；prompt 注入（让模型读到"请 fetch 这个 URL"）可诱导。**防御**：DNS 解析后判定目标 IP 是否落在环回/私有/链路本地段，落入即拒（不能只按主机名字符串判断，要防 DNS rebinding —— 理想是解析到 IP 再校验、并对该 IP 发起连接）。
+
+## M7：待做工具（新 session 交接，2026-07-11）
+
+> **参考仓库不在项目内，需自行 clone**（调研时的 clone 在临时 scratchpad，路径每 session 不同）。仓库内**相对路径稳定**，按下面的相对路径定位即可。三家实现风格：claude-code = 反编译 TS（最全）、codex = Rust、opencode = TS/Effect（最接近"本地工具"心智）。
+
+### 参考仓库
+- **claude-code**（反编译 TS）：`git clone https://github.com/Teamon9161/claude-code.git`（源码在 `src/`）
+- **codex**（Rust）：`git clone --depth 1 https://github.com/openai/codex.git`（源码在 `codex-rs/`）
+- **opencode**（TS/Effect）：`git clone --depth 1 https://github.com/anomalyco/opencode.git`（源码在 `packages/`）
+
+### 1. `read` 支持图片 / PDF（P0，最划算）
+**动机**：三家的 read 都能把图片读进 context，tcode 的 `read` 直接拒二进制（`fs_tools.rs` 的 null-byte 检测）。有截图/图表/设计稿、以及浏览器自动化产物时很实用。
+**参考**：
+- opencode `packages/opencode/src/tool/read.ts`（`SUPPORTED_IMAGE_MIMES` = png/jpg/gif/webp，PDF，转 `data:<mime>;base64` attachment，约 300–321 行）——**最贴近，直接照抄形状**。
+- claude-code `src/tools/FileReadTool/{FileReadTool.ts,imageProcessor.ts,limits.ts}`（图片压缩到 token 预算：`detectImageFormatFromBuffer`、`compressImageBufferWithTokenLimit`）。
+- codex 也有 `view_image`（`codex-rs` 内搜 `view_image`）。
+**要做**：
+- 前置改动：tcode `ToolOutput` 现在**只承载文本**，需扩展成能带 **image content block**（tool_result 图片）。**先看 tcode 现有"剪贴板 Ctrl+V 粘贴图片 → image content block"那条路**（TUI 输入 + provider 消息构建处），复用它已有的 content-block 类型，别重造。
+- `read` 按 magic bytes / 扩展名识别：图片 + PDF → 返回 image block（大图先压到尺寸/token 上限，参考 claude-code `limits.ts`）；否则维持现有文本/二进制逻辑。
+- 两家 provider：Anthropic 原生支持 image block；OpenAI 若不支持 tool_result 图片则降级为"已保存路径 X、无法内联"并诚实标注。
+**验收**：read 一张本地 png，模型能描述内容；大图不超 token 预算；非图片二进制仍走原拒绝路径。
+
+### 2. LSP 插件系统（高价值，分两步做）
+**动机**：LSP 的**导航**（goToDefinition/findReferences/hover/symbols）远胜 grep（grep 命中同名字符串/注释/字面量），**诊断**（编译/lint 错误）在 edit 后自动注入 = 纯零猜测（模型不必跑 `cargo check` 再解析）。
+**架构决策（已确认方向）**：**做成插件，不全量附带**。claude-code 实证：**LSP server 只能经插件提供**（`src/services/lsp/config.ts:11` 原话 "LSP servers are only supported via plugins, not user/project settings"）。opencode 则是**自动探测**（`packages/opencode/src/lsp/server.ts:923` `which("rust-analyzer")`，按扩展名映射）——更省事但把服务器清单写死在内置。tcode 取 claude-code 路线：`/plugins` 里安装 rust-analyzer 这类 LSP 插件，不预装。
+
+**关于"做成 Tool trait 之类的"——架构建议**：**不要试图运行时加载 Rust `Tool` 实现**（需 dylib/ABI，unsafe 且跨版本脆）。tcode 的 `Tool` trait 是编译期的。运行时插件能暴露的实际单元都是**数据 / 外部进程声明**：LSP server（command+args，tcode 驱动协议）、MCP server（**tcode 已支持**，command+args，tcode 当 client）、hooks（外部命令）、skills（markdown）、slash commands。所以 **plugin = 一个 manifest，打包这些外部声明**，而非编译进来的 Rust 代码。claude-code 的插件正是这样：可暴露 `skills/hooks/mcpServers/commands/agents/lspServers`（见 `src/types/plugin.ts` 第 68 行 `lspServers?: Record<string, LspServerConfig>`；`LspServerConfig` = `command`(不含空格) + `args`，见 `src/utils/plugins/schemas.ts` 的 `LspServerConfigSchema`）。
+
+**Step 2a — 最小插件系统**：
+- 插件目录 `~/.tcode/plugins/<name>/`，manifest `plugin.toml`。v1 只实现 `[lsp_servers.<id>]`（`command`、`args`、`extensions`/`languages`、`root_markers`），但 manifest 设计成可扩展（未来加 `[[skills]]`/`[hooks]`/`[mcp_servers]`——这些 tcode 已有机制，插件只是打包层）。
+- `/plugins` 命令：列已装、从 git URL / 本地路径 / marketplace 索引安装。参考 claude-code `src/services/plugins/pluginOperations.ts`、`src/utils/plugins/lspPluginIntegration.ts`、`src/plugins/builtinPlugins.ts`。
+- 先只跑通 rust-analyzer 一个插件证明管路，再泛化。
+
+**Step 2b — LSP 客户端 + 两个模型面**：
+- LSP client：spawn 语言服务器（stdio JSON-RPC）——**复用/泛化 tcode 已有的 `tcode-tools/mcp.rs` JSON-RPC 传输**，别重写。`initialize` 握手 → `textDocument/didOpen|didChange|didSave` → 收 `publishDiagnostics`。按语言/根目录建实例。参考 claude-code `src/services/lsp/{LSPClient.ts,LSPServerManager.ts,LSPServerInstance.ts,LSPDiagnosticRegistry.ts,manager.ts}`；opencode `packages/opencode/src/lsp/server.ts` + `packages/core/src/lsp/`。
+- **面 a：edit 后诊断自动注入（最高价值，零猜测）**：edit/write 源文件后，推 didChange/didSave、收新诊断、以 `Entry::Note` append（缓存安全）。参考 claude-code `FileWriteTool.ts` 调 `lspManager.changeFile()/saveFile()` + `clearDeliveredDiagnosticsForFile`，及 `src/services/lsp/passiveFeedback.ts`。
+- **面 b：`lsp` 导航工具（按需）**：operations = goToDefinition / findReferences / hover / documentSymbol / workspaceSymbol / goToImplementation / callHierarchy（参数 1-based line/character）。参考 opencode `packages/opencode/src/tool/lsp.ts`（operation 清单 + 参数形状最清晰）、claude-code `src/tools/LSPTool/{LSPTool.ts,symbolContext.ts}`。
+**验收**：装 rust-analyzer 插件后，edit 一个引入编译错误的改动 → 下一 turn 模型直接看到诊断 Note（无需跑 cargo）；`lsp findReferences` 能跨文件列引用。
+
+### 3. code-mode / `execute`（v2 前瞻，先不做）
+**动机**：模型写一段受限脚本，在沙箱解释器里**编排多个工具调用**（循环/条件/工具间传数据）一次跑完，砍掉大量 round-trip。
+**参考**：opencode `packages/opencode/src/tool/code-mode.ts`（`execute` 工具，"Run a confined orchestration script with access to connected MCP tools"）；codex `codex-rs/{code-mode,code-mode-host,code-mode-protocol}/`。
+**为何缓**：需要沙箱解释器（rhai/lua/wasm 选型 + 工具桥接 + 安全边界），成本高。列 v2，待前两项落地且有真实需求再评估。
+
+### 附：read_output 折叠观察（可选简化，非新工具）
+opencode 没有独立 read_output——超限输出**写进文件、回预览 + "read 这个文件"提示**（`packages/opencode/src/tool/truncate.ts` + `truncation-dir.ts`，写 `<data>/tool-output/<id>`，MAX 2000 行/50KB，保留 7 天）。可考虑把 tcode **前台**截断折进 `read`（溢出写 `~/.tcode/projects/<hash>/tool-output/<id>`、回路径而非 `b1` 句柄）：净减一个工具概念、溢出还能被 grep/offset。**但 blob store 仍需保留**给后台任务的**实时流式**输出（文件快照抓不到还在增长的输出）。不紧急。
+
+## 疑问

@@ -44,3 +44,24 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     }
     tools
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Locating/content tools return precise, self-paginating output and must
+    /// bypass the blob gate; command/fetch tools keep it (unpredictable size).
+    #[test]
+    fn output_gating_is_scoped_to_command_tools() {
+        let tools = builtin_tools();
+        let gates: std::collections::HashMap<&str, bool> =
+            tools.iter().map(|t| (t.name(), t.gates_output())).collect();
+        for tool in ["read", "grep", "glob", "read_output", "web_search"] {
+            assert!(!gates[tool], "{tool} must not blob-gate its output");
+        }
+        // web_fetch is always present; the shell tool is named per platform.
+        assert!(gates["web_fetch"], "web_fetch must keep the blob gate");
+        let shell = gates.get("shell").or_else(|| gates.get("bash"));
+        assert_eq!(shell, Some(&true), "the shell tool must keep the blob gate");
+    }
+}

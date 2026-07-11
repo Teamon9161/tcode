@@ -168,7 +168,7 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>) {
                         .iter()
                         .filter_map(|p| p["text"].as_str())
                         .collect::<Vec<_>>()
-                        .join(""),
+                        .join("\n\n"),
                 )
             };
             out.push(json!({ "role": "user", "content": content }));

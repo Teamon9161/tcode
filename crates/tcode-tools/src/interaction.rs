@@ -15,7 +15,7 @@ impl Tool for UpdatePlanTool {
         "update_plan"
     }
     fn description(&self) -> &str {
-        "Record the current execution plan. Use a short ordered list; each item must have a step and status (pending, in_progress, or completed). Keep it current as work advances."
+        "Record and maintain the execution plan for genuinely multi-step work; skip it for simple or localized tasks. Use a short ordered list; each item has a step and a status (pending, in_progress, or completed). Update incrementally as work advances: keep exactly one step in_progress and mark it completed the moment it finishes — never leave everything pending and batch-complete at the end."
     }
     fn input_schema(&self) -> Value {
         json!({

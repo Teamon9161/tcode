@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,7 +25,7 @@ use tcode_core::{
 };
 
 use crate::approval::{Dialog, DialogResult};
-use crate::editor::Editor;
+use crate::editor::{Editor, Position};
 use crate::model_picker::{self, ModelMenu};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
@@ -35,8 +35,6 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 
 /// Lines scrolled per mouse-wheel event.
 const WHEEL_STEP: usize = 3;
-/// Visible rows of an open diff region before it scrolls internally.
-const DIFF_VIEW_ROWS: usize = 14;
 /// Visible rows of an expanded tool-output region.
 const OUTPUT_VIEW_ROWS: usize = 12;
 
@@ -127,15 +125,28 @@ enum Phase {
 /// The input's visual layout. The editor deliberately stores logical lines
 /// only; this is the terminal-width-aware projection used for rendering.
 struct EditorLayout {
-    lines: Vec<(bool, String)>,
+    lines: Vec<EditorVisualLine>,
     cursor_row: usize,
     cursor_col: usize,
 }
 
-struct ActivityEntry {
-    title: String,
+struct EditorVisualLine {
+    first_logical_line: bool,
+    text: String,
+    logical_row: usize,
+    start_col: usize,
+    end_col: usize,
+    selection: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy)]
+struct InputHitbox {
+    rect: Rect,
+    editor_start: usize,
+}
+
+struct PendingCall {
     detail: String,
-    expanded: bool,
 }
 
 struct PlanStep {
@@ -184,6 +195,8 @@ pub struct App {
 
     editor: Editor,
     attachments: Vec<Attachment>,
+    input_hitbox: Option<InputHitbox>,
+    input_mouse_active: bool,
     dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
     /// A change diff baked into the transcript while its approval dialog is
     /// open (so the full code is scrollable in the record, not cramped in
@@ -195,14 +208,10 @@ pub struct App {
     resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
     model_picker: Option<model_picker::Picker>,
-    activity: Vec<ActivityEntry>,
-    activity_open: bool,
-    activity_selected: usize,
-    activity_detail_scroll: usize,
-    pending_tool: Option<ActivityEntry>,
+    pending_tool: Option<PendingCall>,
     /// Entries belonging to a concurrent group, completed in model-call
-    /// order. Keeping them queued lets each result retain its own detail.
-    pending_batch: VecDeque<ActivityEntry>,
+    /// order. Keeping them queued lets each result retain its own input.
+    pending_batch: VecDeque<PendingCall>,
     plan: Vec<PlanStep>,
     last_esc: Option<Instant>,
     popup_index: usize,
@@ -275,16 +284,14 @@ impl App {
             approver: Arc::new(ChannelApprover { tx: ask_tx }),
             editor: Editor::new(),
             attachments: Vec::new(),
+            input_hitbox: None,
+            input_mouse_active: false,
             dialog: None,
             change_prebake: None,
             rewind_nav: None,
             resume_picker: None,
             menu,
             model_picker: None,
-            activity: Vec::new(),
-            activity_open: false,
-            activity_selected: 0,
-            activity_detail_scroll: 0,
             pending_tool: None,
             pending_batch: VecDeque::new(),
             plan: Vec::new(),
@@ -333,12 +340,7 @@ impl App {
                 Some(ev) = recv_opt(&mut self.events_rx) => {
                     self.on_agent_event(ev);
                     // Drain whatever is already queued to batch redraws.
-                    while let Some(rx) = self.events_rx.as_mut() {
-                        match rx.try_recv() {
-                            Ok(ev) => self.on_agent_event(ev),
-                            Err(_) => break,
-                        }
-                    }
+                    self.drain_agent_events();
                 }
                 Some(ask) = self.ask_rx.recv() => {
                     if self.user_wait_started.is_none() {
@@ -367,10 +369,10 @@ impl App {
                             self.change_prebake = Some(self.transcript.block_count());
                             let mut spans: Vec<Span> = colored_tool_summary(&call_summary);
                             spans.insert(0, Span::styled("● ", theme::accent()));
-                            let head = vec![Line::default(), Line::from(spans)];
-                            // Uncapped view_rows: show every line, no scroll footer.
-                            let rows = change.len().max(1);
-                            self.transcript.push_with_detail(head, change, true, rows);
+                            let mut lines = vec![Line::default(), Line::from(spans)];
+                            lines.extend(change);
+                            lines.push(Line::default());
+                            self.bake(lines);
                         }
                         // Diff lives in the transcript; the dialog carries only
                         // the choices.
@@ -497,6 +499,7 @@ impl App {
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_plan: Option<serde_json::Value> = None;
+        let mut tool_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
         for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
                 tcode_core::Entry::User(blocks) => {
@@ -536,7 +539,8 @@ impl App {
                                 lines.extend(self.md.render(text));
                                 lines.push(Line::default());
                             }
-                            ContentBlock::ToolUse { name, input, .. } => {
+                            ContentBlock::ToolUse { id, name, input } => {
+                                tool_calls.insert(id.clone(), (name.clone(), input.clone()));
                                 if name == "update_plan" {
                                     resumed_plan = Some(input.clone());
                                     continue;
@@ -547,6 +551,9 @@ impl App {
                                 let mut spans: Vec<Span> = colored_tool_summary(&summary);
                                 spans.insert(0, Span::styled("● ", theme::accent()));
                                 lines.push(Line::from(spans));
+                                // Replay edit/write diffs with the same colored
+                                // gutter a live turn shows; no-op for other tools.
+                                lines.extend(diff::render_change(name, input));
                             }
                             _ => {}
                         }
@@ -593,8 +600,38 @@ impl App {
                     }
                     lines.push(Line::default());
                 }
-                // Tool results and harness notes add noise on replay.
-                tcode_core::Entry::ToolResults(_) | tcode_core::Entry::Note(_) => {}
+                tcode_core::Entry::ToolResults(blocks) => {
+                    for block in blocks {
+                        let ContentBlock::ToolResult {
+                            tool_use_id,
+                            content,
+                            is_error,
+                        } = block
+                        else {
+                            continue;
+                        };
+                        let (name, input) = tool_calls
+                            .get(tool_use_id)
+                            .map(|(name, input)| (name.as_str(), Some(input)))
+                            .unwrap_or(("tool", None));
+                        let preview = result_preview(content);
+                        let style = if *is_error {
+                            ratatui::style::Style::default().fg(theme::ERROR)
+                        } else {
+                            theme::dim()
+                        };
+                        let detail = self.output_detail(name, input, &preview, content, *is_error);
+                        if detail.is_empty() {
+                            lines.push(Line::styled(format!("  ⎿ {preview}"), style));
+                        } else {
+                            let head = vec![self.output_head(name, &preview, content, *is_error)];
+                            self.transcript.push(std::mem::take(&mut lines));
+                            self.transcript
+                                .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+                        }
+                    }
+                }
+                tcode_core::Entry::Note(_) => {}
             }
         }
         lines.push(Line::styled("── resumed ──", theme::dim()));
@@ -656,6 +693,7 @@ impl App {
                 }
             }
         }
+        echo.push(Line::default());
         self.transcript.push_tagged(echo, entry_index);
         blocks.push(ContentBlock::Text { text: input });
 
@@ -721,6 +759,14 @@ impl App {
     }
 
     fn on_turn_done(&mut self, done: (Session, Result<(), AgentError>)) {
+        // The worker can finish before the UI select loop has received the
+        // final queued AgentEvents. Process them before dropping the receiver,
+        // otherwise a fast one-shot response (e.g. "hello") can vanish from
+        // the transcript even though the model answered.
+        self.drain_agent_events();
+        self.bake_live_text();
+        self.finish_thinking();
+
         let (mut session, result) = done;
         let elapsed = match &self.phase {
             Phase::Running { started, .. } => started
@@ -776,7 +822,19 @@ impl App {
         }
     }
 
-    // ---------------------------------------------------------- events
+    fn drain_agent_events(&mut self) {
+        loop {
+            let ev = match self.events_rx.as_mut() {
+                Some(rx) => rx.try_recv(),
+                None => break,
+            };
+            match ev {
+                Ok(ev) => self.on_agent_event(ev),
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => break,
+            }
+        }
+    }
 
     fn on_agent_event(&mut self, ev: AgentEvent) {
         match ev {
@@ -820,22 +878,20 @@ impl App {
                 ]);
                 self.pending_batch.clear();
                 for (name, input) in calls {
-                    let summary =
-                        self.display_summary(&tcode_core::agent::summarize_call(&name, &input));
-                    self.pending_batch.push_back(ActivityEntry {
-                        title: summary.clone(),
+                    let item = batch_item_summary(&name, &input, Some(&self.cwd));
+                    self.pending_batch.push_back(PendingCall {
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                        expanded: false,
                     });
-                    let mut spans: Vec<Span> = colored_tool_summary(&summary);
-                    spans.insert(0, Span::raw("  ├ "));
+                    let mut lines = vec![Line::from(vec![
+                        Span::raw("  ├ "),
+                        Span::styled(item, theme::dim()),
+                    ])];
                     let change = diff::render_change(&name, &input);
-                    self.transcript.push_with_detail(
-                        vec![Line::from(spans)],
-                        change,
-                        true,
-                        DIFF_VIEW_ROWS,
-                    );
+                    lines.extend(change);
+                    if lines.len() > 1 {
+                        lines.push(Line::default());
+                    }
+                    self.bake(lines);
                 }
                 self.state_label = format!("running: {label}");
             }
@@ -857,10 +913,12 @@ impl App {
                 let summary = self.display_summary(&summary);
                 self.bake_live_text();
                 self.finish_thinking();
-                self.pending_tool = Some(ActivityEntry {
-                    title: summary.clone(),
+                if !self.pending_batch.is_empty() {
+                    self.state_label = format!("running: {summary}");
+                    return;
+                }
+                self.pending_tool = Some(PendingCall {
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                    expanded: false,
                 });
                 // If this call's diff was already baked in full while its
                 // approval dialog was open, keep that block — don't render a
@@ -868,12 +926,13 @@ impl App {
                 if self.change_prebake.take().is_none() {
                     let mut spans: Vec<Span> = colored_tool_summary(&summary);
                     spans.insert(0, Span::styled("● ", theme::accent()));
-                    let head = vec![Line::default(), Line::from(spans)];
-                    // An approved/auto-allowed change renders as an open,
-                    // height-capped diff that a click folds away.
+                    let mut lines = vec![Line::default(), Line::from(spans)];
                     let change = diff::render_change(&name, &input);
-                    self.transcript
-                        .push_with_detail(head, change, true, DIFF_VIEW_ROWS);
+                    lines.extend(change);
+                    if lines.len() > 2 {
+                        lines.push(Line::default());
+                    }
+                    self.bake(lines);
                 }
                 self.state_label = format!("running: {summary}");
             }
@@ -900,7 +959,6 @@ impl App {
                 if let Some(mut entry) = entry {
                     entry.detail.push_str("\n\nresult:\n");
                     entry.detail.push_str(&content);
-                    self.activity.push(entry);
                 }
                 // The gated result is exactly what is appended to the next
                 // model request, so it belongs in the in-between estimate.
@@ -919,7 +977,7 @@ impl App {
                 if detail.is_empty() {
                     self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
                 } else {
-                    let head = vec![Line::styled(format!("  ⎿ {preview}"), style)];
+                    let head = vec![self.output_head(&name, &preview, &content, is_error)];
                     self.transcript
                         .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
                 }
@@ -1060,15 +1118,8 @@ impl App {
         if let Some(since) = self.thinking_since.take() {
             let secs = since.elapsed().as_secs().max(1);
             let title = format!("thought for {secs}s (~{} tok)", self.thinking_chars / 3);
-            self.activity.push(ActivityEntry {
-                title: title.clone(),
-                detail: std::mem::take(&mut self.thinking_text),
-                expanded: false,
-            });
-            self.bake(vec![Line::styled(
-                format!("✻ {title} · ctrl+o details"),
-                theme::thinking(),
-            )]);
+            self.bake(vec![Line::styled(format!("✻ {title}"), theme::thinking())]);
+            self.thinking_text.clear();
             self.thinking_chars = 0;
         }
     }
@@ -1084,6 +1135,26 @@ impl App {
         self.bake(lines);
     }
 
+    fn output_head(
+        &self,
+        name: &str,
+        preview: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Line<'static> {
+        let style = if is_error {
+            ratatui::style::Style::default().fg(theme::ERROR)
+        } else {
+            theme::dim()
+        };
+        if !is_error && suppress_output_preview(name) {
+            let lines = content.lines().count().max(1);
+            Line::styled(format!("  ⎿ {lines} output lines"), style)
+        } else {
+            Line::styled(format!("  ⎿ {preview}"), style)
+        }
+    }
+
     /// The foldable body of a tool result. Markdown-shaped output (a
     /// `web_fetch`, or a `read` of a `.md` file) is rendered; everything
     /// else stays literal. Either way a left gutter bar delineates the
@@ -1097,7 +1168,7 @@ impl App {
         content: &str,
         is_error: bool,
     ) -> Vec<Line<'static>> {
-        if content.trim() == preview.trim() {
+        if content.trim() == preview.trim() && (is_error || !suppress_output_preview(name)) {
             return Vec::new(); // nothing beyond the preview
         }
         let gutter = || Span::styled("  │ ", theme::dim());
@@ -1120,10 +1191,15 @@ impl App {
         } else {
             ratatui::style::Style::default()
         };
-        // The preview shows line 1 in full unless it was truncated (>120
-        // chars); when it wasn't, skip it here so it isn't shown twice.
+        // When the head shows the real preview, skip that first line in the
+        // foldout; quiet tools such as read/grep use a generic head, so the
+        // expanded body must include line 1.
         let first = content.lines().next().unwrap_or("");
-        let skip = usize::from(first.chars().count() <= 120 && content.lines().count() > 1);
+        let skip = usize::from(
+            !suppress_output_preview(name)
+                && first.chars().count() <= 120
+                && content.lines().count() > 1,
+        );
         content
             .lines()
             .skip(skip)
@@ -1149,13 +1225,21 @@ impl App {
                         .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    self.transcript.mouse_down(mouse.column, mouse.row)
+                    if !self.input_mouse_down(mouse.column, mouse.row) {
+                        self.transcript.mouse_down(mouse.column, mouse.row);
+                    }
                 }
                 MouseEventKind::Drag(MouseButton::Left) => {
-                    self.transcript.mouse_drag(mouse.column, mouse.row)
+                    if self.input_mouse_active {
+                        self.input_mouse_drag(mouse.column, mouse.row);
+                    } else {
+                        self.transcript.mouse_drag(mouse.column, mouse.row);
+                    }
                 }
                 MouseEventKind::Up(MouseButton::Left) => {
-                    if let Some(text) = self.transcript.mouse_up() {
+                    if self.input_mouse_active {
+                        self.input_mouse_up(mouse.column, mouse.row);
+                    } else if let Some(text) = self.transcript.mouse_up() {
                         self.copy_selection(text);
                     }
                 }
@@ -1169,32 +1253,6 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if self.activity_open {
-            match key.code {
-                KeyCode::Esc => self.activity_open = false,
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.activity_open = false
-                }
-                KeyCode::Up => self.activity_selected = self.activity_selected.saturating_sub(1),
-                KeyCode::Down => {
-                    self.activity_selected =
-                        (self.activity_selected + 1).min(self.activity.len().saturating_sub(1));
-                }
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    self.activity_detail_scroll = 0;
-                    if let Some(entry) = self.activity.get_mut(self.activity_selected) {
-                        entry.expanded = !entry.expanded;
-                    }
-                }
-                KeyCode::PageUp => {
-                    self.activity_detail_scroll = self.activity_detail_scroll.saturating_sub(12)
-                }
-                KeyCode::PageDown => self.activity_detail_scroll += 12,
-                _ => {}
-            }
-            return;
-        }
-
         // Model picker captures everything while open.
         if let Some(picker) = self.resume_picker.as_mut() {
             match picker.handle_key(key) {
@@ -1270,16 +1328,33 @@ impl App {
 
         let running = matches!(self.phase, Phase::Running { .. });
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl && key_char_eq(&key, 'a') {
+            self.editor.select_all();
+            return;
+        }
+        if (alt || (ctrl && shift)) && key_char_eq(&key, 'c') {
+            self.copy_editor_selection_or_prompt();
+            return;
+        }
+        if (alt || (ctrl && shift)) && key_char_eq(&key, 'x') {
+            self.cut_editor_selection_or_prompt();
+            return;
+        }
+        // Paste before the general Char handler: with Shift held the code is
+        // 'V', so a bare `Char('v')` arm would miss Ctrl+Shift+V and instead
+        // type a literal "V". key_char_eq is case-insensitive.
+        if (ctrl || alt) && key_char_eq(&key, 'v') {
+            self.paste_from_clipboard();
+            return;
+        }
         match key.code {
-            KeyCode::Char('o') if ctrl => {
-                if self.activity.is_empty() {
-                    self.bake(vec![Line::styled("no activity details yet", theme::dim())]);
-                } else {
-                    self.activity_open = true;
-                    self.activity_selected = self.activity.len() - 1;
-                }
-            }
             KeyCode::Char('c') if ctrl => {
+                // Ctrl+C is the single terminal-standard interrupt ladder:
+                // cancel a running turn, else clear the input, else exit.
+                // Copy lives on Ctrl+Shift+C / Alt+C and mouse-release, so
+                // this key never has to disambiguate copy vs interrupt.
                 if running {
                     self.cancel_turn();
                 } else if !self.editor.is_empty() || !self.attachments.is_empty() {
@@ -1303,9 +1378,6 @@ impl App {
                     self.attachments.clear();
                     self.last_esc = Some(Instant::now());
                 }
-            }
-            KeyCode::Char('v') if ctrl || key.modifiers.contains(KeyModifiers::ALT) => {
-                self.paste_from_clipboard();
             }
             KeyCode::Char('j') if ctrl => self.editor.newline(),
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.editor.newline(),
@@ -1694,7 +1766,6 @@ impl App {
                         .expect("freshness lock")
                         .clear();
                     self.prev_cache_ratio = None;
-                    self.activity.clear();
                     self.plan.clear();
                     self.pending_tool = None;
                     self.pending_batch.clear();
@@ -1711,8 +1782,10 @@ impl App {
                     ("esc", "cancel current turn / clear input"),
                     ("shift+tab", "cycle permission mode"),
                     ("ctrl+v / alt+v", "paste (images become attachments)"),
+                    ("ctrl+a", "select prompt · ctrl+c copy selection"),
+                    ("alt+c / alt+x", "copy / cut prompt"),
+                    ("mouse", "click prompt to move cursor · drag to copy"),
                     ("ctrl+c", "cancel / clear / exit"),
-                    ("ctrl+o", "activity details · enter expand"),
                 ] {
                     lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
                 }
@@ -1731,12 +1804,98 @@ impl App {
         }
     }
 
-    // ----------------------------------------------------------- paste
+    // ----------------------------------------------------------- input mouse
+
+    fn input_mouse_down(&mut self, x: u16, y: u16) -> bool {
+        let Some((row, col)) = self.input_position_at(x, y) else {
+            self.input_mouse_active = false;
+            return false;
+        };
+        self.input_mouse_active = true;
+        self.editor.start_selection_by_display_col(row, col);
+        self.popup_index = 0;
+        true
+    }
+
+    fn input_mouse_drag(&mut self, x: u16, y: u16) {
+        if let Some((row, col)) = self.input_position_at(x, y) {
+            self.editor.extend_selection_by_display_col(row, col);
+        }
+    }
+
+    fn input_mouse_up(&mut self, x: u16, y: u16) {
+        self.input_mouse_drag(x, y);
+        self.input_mouse_active = false;
+        if let Some(text) = self.editor.selected_text() {
+            self.copy_input_text(text);
+        }
+    }
+
+    fn input_position_at(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        let hit = self.input_hitbox?;
+        if x <= hit.rect.x
+            || x >= hit.rect.right().saturating_sub(1)
+            || y <= hit.rect.y
+            || y >= hit.rect.bottom().saturating_sub(1)
+        {
+            return None;
+        }
+        let layout = editor_layout(&self.editor, hit.rect.width);
+        if layout.lines.is_empty() {
+            return Some((0, 0));
+        }
+        let visual_row = hit.editor_start + (y - hit.rect.y - 1) as usize;
+        let visual_row = visual_row.min(layout.lines.len() - 1);
+        let line = &layout.lines[visual_row];
+        let content_x = x.saturating_sub(hit.rect.x + 3) as usize;
+        let display_col =
+            line.start_col + content_x.min(line.end_col.saturating_sub(line.start_col));
+        Some((line.logical_row, display_col))
+    }
+
+    // ----------------------------------------------------------- paste/copy
+
+    fn copy_input_text(&mut self, text: String) {
+        let lines = text.lines().count().max(1);
+        let what = if lines <= 1 {
+            "input".to_string()
+        } else {
+            format!("input {lines} lines")
+        };
+        self.copy_text(text, what);
+    }
+
+    fn copy_editor_selection_or_prompt(&mut self) {
+        if let Some(text) = self.editor.selected_text() {
+            self.copy_input_text(text);
+        } else if !self.editor.is_empty() {
+            self.copy_input_text(self.editor.text());
+        }
+    }
+
+    fn cut_editor_selection_or_prompt(&mut self) {
+        if let Some(text) = self.editor.selected_text() {
+            self.copy_input_text(text);
+            self.editor.delete_selection();
+        } else if !self.editor.is_empty() {
+            self.copy_input_text(self.editor.text());
+            self.editor.clear();
+        }
+    }
 
     /// Mouse-selection copy: system clipboard first (arboard), OSC 52 as
     /// the remote/SSH fallback where no local clipboard exists.
     fn copy_selection(&mut self, text: String) {
         let lines = text.lines().count();
+        let what = if lines <= 1 {
+            "selection".to_string()
+        } else {
+            format!("{lines} lines")
+        };
+        self.copy_text(text, what);
+    }
+
+    fn copy_text(&mut self, text: String, what: String) {
         let copied = arboard::Clipboard::new()
             .and_then(|mut clipboard| clipboard.set_text(text.clone()))
             .is_ok();
@@ -1748,11 +1907,6 @@ impl App {
             let _ = write!(out, "\x1b]52;c;{encoded}\x07");
             let _ = out.flush();
         }
-        let what = if lines <= 1 {
-            "selection".to_string()
-        } else {
-            format!("{lines} lines")
-        };
         self.notice = Some((format!("copied {what}"), Instant::now()));
     }
 
@@ -1873,7 +2027,6 @@ impl App {
                 self.context_tokens = session.last_prompt_tokens;
                 self.context_step_start = self.context_tokens;
                 self.context_estimated = !session.ledger.is_empty();
-                self.activity.clear();
                 self.plan.clear();
                 self.pending_tool = None;
                 self.pending_batch.clear();
@@ -1982,7 +2135,6 @@ impl App {
                 self.context_tokens = session.last_prompt_tokens;
                 self.context_step_start = self.context_tokens;
                 self.context_estimated = !session.ledger.is_empty();
-                self.activity.clear();
                 self.plan.clear();
                 self.pending_tool = None;
                 self.pending_batch.clear();
@@ -2005,46 +2157,6 @@ impl App {
                 ratatui::style::Style::default().fg(theme::ERROR),
             )]),
         }
-    }
-
-    fn activity_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::styled(
-            "activity details",
-            theme::bold().fg(theme::ACCENT),
-        )];
-        let start = self.activity_selected.saturating_sub(4);
-        for (index, entry) in self.activity.iter().enumerate().skip(start).take(5) {
-            let selected = index == self.activity_selected;
-            let marker = if selected { "▸ " } else { "  " };
-            let icon = if entry.title.starts_with("thought") {
-                "✻"
-            } else {
-                "●"
-            };
-            let style = if selected {
-                theme::accent()
-            } else {
-                theme::dim()
-            };
-            lines.push(Line::styled(
-                format!("  {marker}{icon} {}", entry.title),
-                style,
-            ));
-            if selected && entry.expanded {
-                let details: Vec<_> = entry.detail.lines().collect();
-                for detail in details.iter().skip(self.activity_detail_scroll).take(14) {
-                    lines.push(Line::styled(format!("    {detail}"), theme::dim()));
-                }
-                if details.len() > self.activity_detail_scroll + 14 {
-                    lines.push(Line::styled("    … pgdn for more", theme::dim()));
-                }
-            }
-        }
-        lines.push(Line::styled(
-            "  ↑↓ select · enter/space expand · pgup/pgdn scroll · ctrl+o/esc close",
-            theme::dim(),
-        ));
-        lines
     }
 
     fn update_plan(&mut self, input: &serde_json::Value) {
@@ -2128,9 +2240,9 @@ impl App {
             Vec::new()
         };
         let dialog_lines = self
-            .activity_open
-            .then(|| self.activity_lines())
-            .or_else(|| self.resume_picker.as_ref().map(|p| p.render()))
+            .resume_picker
+            .as_ref()
+            .map(|p| p.render())
             .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
             .or_else(|| {
                 self.dialog
@@ -2158,6 +2270,11 @@ impl App {
 
         use ratatui::widgets::{Block, BorderType};
 
+        // The input box geometry is only known during layout; capture it so
+        // mouse hit-testing (selection/copy in the prompt) can map screen
+        // coordinates back to editor positions. None when a dialog/picker
+        // replaces the input box.
+        let mut captured_input: Option<InputHitbox> = None;
         let transcript = &mut self.transcript;
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -2248,30 +2365,46 @@ impl App {
             // Input inside a rounded box, Claude Code style.
             // Show the cursor even when a long multi-line prompt exceeds
             // the six-row input box.
-            let visible_editor = editor.lines[editor_start..]
+            let inner: Vec<Line> = editor.lines[editor_start..]
                 .iter()
                 .take(6)
-                .collect::<Vec<_>>();
-            let inner: Vec<Line> = visible_editor
-                .iter()
-                .map(|(first_logical_line, l)| {
-                    Line::from(vec![
-                        Span::styled(
-                            if *first_logical_line { "› " } else { "  " },
-                            theme::user_prompt(),
-                        ),
-                        Span::raw(l.clone()),
-                    ])
+                .map(|vl| {
+                    let mut spans = vec![Span::styled(
+                        if vl.first_logical_line { "› " } else { "  " },
+                        theme::user_prompt(),
+                    )];
+                    match vl.selection {
+                        Some((from, to)) => {
+                            let chars: Vec<char> = vl.text.chars().collect();
+                            let pre: String = chars[..from].iter().collect();
+                            let mid: String = chars[from..to].iter().collect();
+                            let post: String = chars[to..].iter().collect();
+                            if !pre.is_empty() {
+                                spans.push(Span::raw(pre));
+                            }
+                            spans.push(Span::styled(mid, theme::selection()));
+                            if !post.is_empty() {
+                                spans.push(Span::raw(post));
+                            }
+                        }
+                        None => spans.push(Span::raw(vl.text.clone())),
+                    }
+                    Line::from(spans)
                 })
                 .collect();
             let box_y = y;
+            let input_rect = row(y, editor_h + 2);
+            captured_input = Some(InputHitbox {
+                rect: input_rect,
+                editor_start,
+            });
             frame.render_widget(
                 Paragraph::new(Text::from(inner)).block(
                     Block::bordered()
                         .border_type(BorderType::Rounded)
                         .border_style(theme::border()),
                 ),
-                row(y, editor_h + 2),
+                input_rect,
             );
             y += editor_h + 2;
             frame.set_cursor_position((
@@ -2322,6 +2455,7 @@ impl App {
 
             frame.render_widget(Paragraph::new(Line::styled(hint, theme::dim())), row(y, 1));
         })?;
+        self.input_hitbox = captured_input;
         Ok(())
     }
 
@@ -2340,7 +2474,10 @@ impl App {
             ),
             Span::styled(self.state_label.clone(), theme::accent()),
             Span::styled(
-                format!(" · {elapsed}s · ↓ ~{} tok · esc to cancel", self.out_tokens),
+                format!(
+                    " · {elapsed}s · ↓ ~{} tok · esc to cancel",
+                    token_count(self.out_tokens as u64)
+                ),
                 theme::dim(),
             ),
         ])
@@ -2387,28 +2524,98 @@ impl App {
     }
 }
 
-/// Split a tool summary like `shell(cargo test)` into colored spans:
-/// the tool name is green, the arguments are dim.
 /// Whether a `read` call targets a Markdown file (so its output is worth
-/// rendering rather than showing raw). Keyed on the tool's `file_path`.
+/// rendering rather than showing raw). Keyed on the tool's `path`/`file_path`.
 fn path_is_markdown(input: &serde_json::Value) -> bool {
-    input["file_path"]
+    input["path"]
         .as_str()
+        .or_else(|| input["file_path"].as_str())
         .map(|p| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase())
         .is_some_and(|ext| matches!(ext.as_str(), "md" | "markdown" | "mdx"))
 }
 
+fn display_tool_name(name: &str) -> String {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return String::new();
+    };
+    first.to_uppercase().collect::<String>() + chars.as_str()
+}
+
+fn result_preview(s: &str) -> String {
+    let mut line = s.lines().next().unwrap_or("").to_string();
+    if line.chars().count() > 120 {
+        line = line.chars().take(120).collect::<String>() + "…";
+    }
+    let extra = s.lines().count().saturating_sub(1);
+    if extra > 0 {
+        line.push_str(&format!(" (+{extra} lines)"));
+    }
+    line
+}
+
+fn suppress_output_preview(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "glob" | "read_output")
+}
+
+fn batch_item_summary(name: &str, input: &serde_json::Value, cwd: Option<&Path>) -> String {
+    match name {
+        "shell" | "bash" => input["command"].as_str().unwrap_or(name).to_string(),
+        "read" => {
+            let path = input_path(input)
+                .map(|path| shorten_path(path, cwd))
+                .unwrap_or_else(|| "<missing path>".into());
+            let offset = input["offset"].as_u64().unwrap_or(1);
+            match input["limit"].as_u64() {
+                Some(limit) => format!("{path} · lines {offset}+{limit}"),
+                None if offset > 1 => format!("{path} · from line {offset}"),
+                None => path,
+            }
+        }
+        "read_output" => {
+            let id = input["id"].as_str().unwrap_or("output");
+            let offset = input["offset"].as_u64().unwrap_or(1);
+            let limit = input["limit"].as_u64().unwrap_or(200);
+            format!("{id} · lines {offset}+{limit}")
+        }
+        "edit" | "write" => input_path(input)
+            .map(|path| shorten_path(path, cwd))
+            .unwrap_or_else(|| name.to_string()),
+        "grep" => input["pattern"].as_str().unwrap_or("grep").to_string(),
+        "glob" => input["pattern"].as_str().unwrap_or("glob").to_string(),
+        _ => shorten_summary_path(&tcode_core::agent::summarize_call(name, input), cwd),
+    }
+}
+
+fn input_path(input: &serde_json::Value) -> Option<&str> {
+    input["path"]
+        .as_str()
+        .or_else(|| input["file_path"].as_str())
+}
+
+fn shorten_path(path: &str, cwd: Option<&Path>) -> String {
+    let Some(cwd) = cwd else {
+        return path.to_string();
+    };
+    Path::new(path)
+        .strip_prefix(cwd)
+        .map(|relative| relative.display().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Split a tool summary like `shell(cargo test)` into colored spans:
+/// the title-cased tool name is green, the arguments are dim.
 fn colored_tool_summary(summary: &str) -> Vec<Span<'static>> {
     let s = summary.to_string();
     if let Some(paren) = s.find('(') {
-        let name = &s[..paren];
+        let name = display_tool_name(&s[..paren]);
         let args = &s[paren..];
         vec![
-            Span::styled(name.to_string(), theme::ok()),
+            Span::styled(name, theme::ok()),
             Span::styled(args.to_string(), theme::dim()),
         ]
     } else {
-        vec![Span::styled(s, theme::bold())]
+        vec![Span::styled(display_tool_name(&s), theme::bold())]
     }
 }
 
@@ -2530,8 +2737,13 @@ fn turn_summary_line(elapsed: f32, usage: Usage) -> Line<'static> {
         Span::styled("completed ", theme::dim()),
         Span::styled(format!("{elapsed:.1}s"), theme::bold()),
         Span::styled("  ·  ↑ ", theme::dim()),
+        // Uncached input only: the tokens this turn actually paid full price
+        // for. Summing total_input() across a multi-step turn would recount
+        // the cached prefix on every request; the cache figure below shows
+        // how much of the full prompt was reused. This is a turn receipt, not
+        // the window-occupancy figure the context meter reports.
         Span::styled(token_count(usage.input_tokens), theme::accent()),
-        Span::styled(" input", theme::dim()),
+        Span::styled(" new input", theme::dim()),
         Span::styled("  ·  ↓ ", theme::dim()),
         Span::styled(
             token_count(usage.output_tokens),
@@ -2628,46 +2840,81 @@ fn area_width(terminal: &Term) -> u16 {
 /// Wrap logical editor lines ourselves instead of leaving it to the terminal.
 /// That keeps soft wraps out of copied text, gives continuation lines a stable
 /// prefix, and makes the cursor/viewport agree with what is on screen.
+/// A display-width-bounded slice of a logical line. Tracks display columns
+/// (for mapping mouse clicks back to a cursor position) and char offsets
+/// (for slicing the selection highlight).
+struct LayoutChunk {
+    text: String,
+    start_col: usize,
+    end_col: usize,
+    char_start: usize,
+    char_end: usize,
+}
+
 fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
     use unicode_width::UnicodeWidthChar;
 
     // border + two-column prompt + one interior column on the right.
     let width = terminal_width.saturating_sub(4).max(1) as usize;
     let (cursor_line, cursor_col) = editor.cursor();
+    let selection = editor.selection_bounds();
     let mut lines = Vec::new();
     let mut visual_cursor = (0, 0);
 
     for (logical_row, text) in editor.lines().iter().enumerate() {
-        let mut chunks: Vec<(String, usize, usize)> = Vec::new();
+        let mut chunks: Vec<LayoutChunk> = Vec::new();
         let mut chunk = String::new();
-        let mut start = 0usize;
-        let mut end = 0usize;
+        let mut start_col = 0usize;
+        let mut end_col = 0usize;
+        let mut char_start = 0usize;
+        let mut char_index = 0usize;
         for c in text.chars() {
             let char_width = c.width().unwrap_or(0);
-            if !chunk.is_empty() && end - start + char_width > width {
-                chunks.push((std::mem::take(&mut chunk), start, end));
-                start = end;
+            if !chunk.is_empty() && end_col - start_col + char_width > width {
+                chunks.push(LayoutChunk {
+                    text: std::mem::take(&mut chunk),
+                    start_col,
+                    end_col,
+                    char_start,
+                    char_end: char_index,
+                });
+                start_col = end_col;
+                char_start = char_index;
             }
             chunk.push(c);
-            end += char_width;
+            end_col += char_width;
+            char_index += 1;
         }
         if !chunk.is_empty() || chunks.is_empty() {
-            chunks.push((chunk, start, end));
+            chunks.push(LayoutChunk {
+                text: chunk,
+                start_col,
+                end_col,
+                char_start,
+                char_end: char_index,
+            });
         }
 
         if logical_row == cursor_line {
             let cursor_chunk = chunks
                 .iter()
-                .position(|(_, start, end)| *start <= cursor_col && cursor_col <= *end)
+                .position(|c| c.start_col <= cursor_col && cursor_col <= c.end_col)
                 .unwrap_or(chunks.len() - 1);
-            let (_, start, _) = &chunks[cursor_chunk];
-            visual_cursor = (
-                lines.len() + cursor_chunk,
-                cursor_col.saturating_sub(*start),
-            );
+            let start = chunks[cursor_chunk].start_col;
+            visual_cursor = (lines.len() + cursor_chunk, cursor_col.saturating_sub(start));
         }
-        for (i, (chunk, _, _)) in chunks.into_iter().enumerate() {
-            lines.push((i == 0, chunk));
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let selection = selection.and_then(|(s, e)| {
+                selection_span(logical_row, chunk.char_start, chunk.char_end, s, e)
+            });
+            lines.push(EditorVisualLine {
+                first_logical_line: i == 0,
+                text: chunk.text,
+                logical_row,
+                start_col: chunk.start_col,
+                end_col: chunk.end_col,
+                selection,
+            });
         }
     }
     EditorLayout {
@@ -2675,6 +2922,30 @@ fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
         cursor_row: visual_cursor.0,
         cursor_col: visual_cursor.1,
     }
+}
+
+/// Char range within a wrapped chunk `[char_start, char_end)` that falls
+/// inside the selection `[start, end]` (both in logical row/char coords).
+/// Returns offsets relative to the chunk, or `None` if disjoint.
+fn selection_span(
+    row: usize,
+    char_start: usize,
+    char_end: usize,
+    start: Position,
+    end: Position,
+) -> Option<(usize, usize)> {
+    if row < start.row || row > end.row {
+        return None;
+    }
+    let sel_from = if row == start.row { start.col } else { 0 };
+    let sel_to = if row == end.row { end.col } else { usize::MAX };
+    let from = sel_from.max(char_start);
+    let to = sel_to.min(char_end);
+    (from < to).then(|| (from - char_start, to - char_start))
+}
+
+fn key_char_eq(key: &KeyEvent, target: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&target))
 }
 
 async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEvent> {
@@ -2731,11 +3002,26 @@ mod tests {
             layout
                 .lines
                 .iter()
-                .map(|(_, line)| line.as_str())
+                .map(|vl| vl.text.as_str())
                 .collect::<Vec<_>>(),
             ["abcdef", "ghi"]
         );
         assert_eq!((layout.cursor_row, layout.cursor_col), (1, 3));
+    }
+
+    #[test]
+    fn editor_layout_marks_selection_across_a_soft_wrap() {
+        let mut editor = Editor::new();
+        editor.insert_str("abcdefghi");
+        // Select chars 4..8 ("efgh"), which straddles the wrap at 6.
+        editor.set_cursor(0, 4);
+        editor.start_selection_by_display_col(0, 4);
+        editor.extend_selection_by_display_col(0, 8);
+        let layout = editor_layout(&editor, 10);
+        // First visual line "abcdef": tail "ef" (offsets 4..6) selected.
+        assert_eq!(layout.lines[0].selection, Some((4, 6)));
+        // Second visual line "ghi": head "gh" (offsets 0..2) selected.
+        assert_eq!(layout.lines[1].selection, Some((0, 2)));
     }
 
     #[test]
@@ -2747,7 +3033,7 @@ mod tests {
             layout
                 .lines
                 .iter()
-                .map(|(first, line)| (*first, line.as_str()))
+                .map(|vl| (vl.first_logical_line, vl.text.as_str()))
                 .collect::<Vec<_>>(),
             [(true, "abc"), (true, "def")]
         );
@@ -2802,7 +3088,7 @@ mod tests {
             .collect::<String>();
         assert_eq!(
             text,
-            "  ╰─ completed 2.5s  ·  ↑ 1.2k input  ·  ↓ 23 output  ·  cache 0%"
+            "  ╰─ completed 2.5s  ·  ↑ 1.2k new input  ·  ↓ 23 output  ·  cache 0%"
         );
     }
 

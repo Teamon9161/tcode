@@ -439,18 +439,23 @@ async fn shell_tool_runs_and_reports_exit_code() {
 
 #[tokio::test]
 async fn oversized_tool_output_is_gated_with_paging_handle() {
+    // A command tool's output is unbounded, so it stays gated (unlike the
+    // self-paginating `read`/`grep`, which opt out). Produce ~5000 lines.
     let dir = tempfile::tempdir().unwrap();
-    let big: String = (1..=5000).map(|i| format!("log line {i}\n")).collect();
-    std::fs::write(dir.path().join("big.log"), &big).unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use("t1", "read", r#"{"path":"big.log","limit":5000}"#),
-        text_done("done"),
-    ]);
+    let (tool_name, cmd) = if cfg!(windows) {
+        (
+            "shell",
+            r#"{"command":"1..5000 | ForEach-Object { \"log line $_\" }"}"#,
+        )
+    } else {
+        ("bash", r#"{"command":"seq 5000 | sed 's/^/log line /'"}"#)
+    };
+    let provider = MockProvider::new(vec![tool_use("t1", tool_name, cmd), text_done("done")]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
-    run(&agent, &mut session, &approver, "read the log").await;
+    run(&agent, &mut session, &approver, "spew a big log").await;
 
     let results = tool_results(&session);
     assert!(
@@ -458,7 +463,9 @@ async fn oversized_tool_output_is_gated_with_paging_handle() {
         "big output must carry a paging handle: …{}",
         &results[0].0[results[0].0.len().saturating_sub(200)..]
     );
-    assert!(tcode_core::blobs::approx_tokens(&results[0].0) < 3000);
+    // The gated preview is bounded near the blob budget (8000 tokens), far
+    // below the full ~20k-token output.
+    assert!(tcode_core::blobs::approx_tokens(&results[0].0) < 9000);
 }
 
 #[tokio::test]

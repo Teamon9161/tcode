@@ -207,6 +207,9 @@ impl WatchdogConfig {
 #[serde(default)]
 pub struct LimitsConfig {
     /// Token budget per tool output before it is gated to the blob store.
+    /// Sized to hold a normal shell command's output (a build/test failure)
+    /// whole while still capping runaway logs. Locating/content tools
+    /// (`read`/`grep`/`glob`/`web_search`) opt out of gating entirely.
     pub tool_output_tokens: usize,
     /// Model round-trips per user turn before the harness ends the turn
     /// (runaway guard; the user can always ask to continue).
@@ -216,7 +219,7 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
-            tool_output_tokens: 2000,
+            tool_output_tokens: 8000,
             max_steps_per_turn: crate::agent::DEFAULT_MAX_STEPS,
         }
     }

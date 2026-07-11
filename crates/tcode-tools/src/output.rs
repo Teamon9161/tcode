@@ -14,10 +14,16 @@ impl Tool for ReadOutputTool {
         "read_output"
     }
 
+    // Pages a stored blob by explicit offset/limit — re-gating a page back
+    // into a new blob would be absurd. Never blob-gate.
+    fn gates_output(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &str {
         "Read a stored tool output by id: o1… for truncated results, b1… for \
          live/finished background task output. offset is 1-based line number; \
-         limit defaults to 200."
+         limit defaults to 200, max 2000."
     }
 
     fn input_schema(&self) -> Value {
@@ -41,7 +47,7 @@ impl Tool for ReadOutputTool {
             return ToolOutput::err("missing required parameter: id");
         };
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
-        let limit = input["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
+        let limit = input["limit"].as_u64().unwrap_or(200).clamp(1, 2000) as usize;
         let result = if id.starts_with('b') {
             ctx.background
                 .lock()

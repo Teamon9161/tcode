@@ -377,6 +377,14 @@ impl Transcript {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        // Transcript rows vary a lot while scrolling and while live panels
+        // resize. A Line widget only paints its own cells, so stale glyphs from
+        // the previous frame otherwise remain as "floating" letters.
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                buf[(x, y)].reset();
+            }
+        }
         self.ensure_width(area.width);
         self.view_height = area.height as usize;
         self.view_area = area;
@@ -611,17 +619,33 @@ fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Lin
         let mut current: Vec<Span<'static>> = Vec::new();
         let mut current_width = 0usize;
         for span in line.spans {
-            for c in span.content.chars() {
-                let char_width = c.width().unwrap_or(0);
-                if !current.is_empty() && current_width + char_width > width {
-                    out.push((
-                        std::mem::replace(&mut first, false),
-                        pad_background_line(std::mem::take(&mut current), current_width, width),
-                    ));
-                    current_width = 0;
+            for raw in span.content.chars() {
+                // A tab has zero measured width but still occupies a real cell
+                // in ratatui's buffer diff, which leaves stray glyphs floating
+                // between columns (visible between line numbers and content, or
+                // stranded in blank areas while scrolling). Expand tabs to
+                // spaces at 8-column stops so every display cell is accounted
+                // for. Copy then yields spaces, matching what is on screen.
+                let mut buf = [' '; 8];
+                let expanded: &[char] = if raw == '\t' {
+                    let stop = 8 - (current_width % 8);
+                    &buf[..stop]
+                } else {
+                    buf[0] = raw;
+                    &buf[..1]
+                };
+                for &c in expanded {
+                    let char_width = c.width().unwrap_or(0);
+                    if !current.is_empty() && current_width + char_width > width {
+                        out.push((
+                            std::mem::replace(&mut first, false),
+                            pad_background_line(std::mem::take(&mut current), current_width, width),
+                        ));
+                        current_width = 0;
+                    }
+                    current.push(Span::styled(c.to_string(), span.style));
+                    current_width += char_width;
                 }
-                current.push(Span::styled(c.to_string(), span.style));
-                current_width += char_width;
             }
         }
         out.push((first, pad_background_line(current, current_width, width)));
@@ -661,6 +685,17 @@ mod tests {
     fn wrapped_lines_split_at_width() {
         let lines = wrap_lines(vec![Line::raw("abcdefghi")], 7);
         assert_eq!(text_of(&lines), ["abcdef", "ghi"]);
+    }
+
+    #[test]
+    fn tabs_expand_to_spaces_at_eight_column_stops() {
+        // "     1\tcontent" is the numbered() shape: 6 columns then a tab that
+        // must land on column 8, i.e. two spaces — never a stray tab cell.
+        let lines = wrap_lines(vec![Line::raw("     1\tx")], 40);
+        assert_eq!(text_of(&lines), ["     1  x"]);
+        // A leading tab expands to a full eight-column stop.
+        let lines = wrap_lines(vec![Line::raw("\ty")], 40);
+        assert_eq!(text_of(&lines), ["        y"]);
     }
 
     #[test]
@@ -778,6 +813,24 @@ mod tests {
                     .chain(["\n".to_string()])
             })
             .collect()
+    }
+
+    #[test]
+    fn render_clears_stale_cells_from_previous_frame() {
+        let mut t = Transcript::new(20);
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+
+        t.push(vec![Line::raw("long stale text")]);
+        t.render(&mut buf, area);
+        assert!(buffer_text(&buf, area).contains("long stale text"));
+
+        t.clear();
+        t.push(vec![Line::raw("new")]);
+        t.render(&mut buf, area);
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("new"));
+        assert!(!text.contains("stale"));
     }
 
     #[test]
