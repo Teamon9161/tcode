@@ -34,6 +34,12 @@ fn build_menu(
     let mut options = Vec::new();
     let mut current = 0;
     for (pname, profile) in &config.profiles {
+        // The built-in catalog always contributes every provider; hide the
+        // ones the user has no credentials for so the picker stays short.
+        // The active profile is always shown so `current` stays valid.
+        if !profile.is_usable(pname) && pname != &selection.profile {
+            continue;
+        }
         for def in profile.model_defs() {
             if pname == &selection.profile && def.name == selection.model.name {
                 current = options.len();

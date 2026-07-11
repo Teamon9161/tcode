@@ -6,7 +6,14 @@
       "Bash(curl -sS -m 30 https://api.deepseek.com/anthropic/v1/messages -H 'x-api-key: sk-ae9219fc3a034a46b71912da54d8cad7' -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{\"model\":\"deepseek-v4-flash[1m]\",\"max_tokens\":16,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
       "Bash(curl -sS -m 30 https://api.deepseek.com/anthropic/v1/messages -H 'x-api-key: sk-ae9219fc3a034a46b71912da54d8cad7' -H 'anthropic-version: 2023-06-01' -H 'content-type: application/json' -d '{\"model\":\"deepseek-v4-flash\",\"max_tokens\":16,\"thinking\":{\"type\":\"disabled\"},\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}')",
       "Bash(xargs wc -l)",
-      "Bash(cargo test *)"
+      "Bash(cargo test *)",
+      "Skill(claude-api)",
+      "WebSearch",
+      "Bash(cargo clippy *)",
+      "Bash(sed -i 's/-> anyhow::Result<Option<\\(ProviderSelection, Vec<\\(String, Profile\\)>\\)>>/-> anyhow::Result<Option<\\(ProviderSelection, Vec<CustomProfile>\\)>>/' crates/tcode-tui/src/wizard.rs)",
+      "Bash(sed -i 's/fn read_custom_provider\\(out: &mut std::io::Stdout\\) -> anyhow::Result<Option<\\(String, Profile\\)>>/fn read_custom_provider\\(out: \\\\&mut std::io::Stdout\\) -> anyhow::Result<Option<CustomProfile>>/' crates/tcode-tui/src/wizard.rs)",
+      "Bash(cargo fmt *)",
+      "Bash(cargo build *)"
     ]
   }
 }

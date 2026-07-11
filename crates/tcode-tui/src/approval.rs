@@ -1,8 +1,8 @@
 //! Approval dialog with Tab-annotation: any option can carry a free-text
 //! note. "Yes + note" lets the model adjust without redoing the work;
-//! "No + note" tells it why. Change previews are NOT shown here: they are
-//! baked into native scrollback before consent, where the mouse wheel and
-//! terminal search work — the dialog stays a compact decision box.
+//! "No + note" tells it why. A change proposal's full diff is baked into
+//! the transcript (scrollable there) while this dialog is open, so the
+//! dialog itself carries only the choices; a decline retracts the diff.
 
 use ratatui::text::{Line, Span};
 use tcode_core::{Approval, ApprovalDecision};
@@ -16,9 +16,6 @@ pub struct Dialog {
     /// ToolStart-format call summary. A declined call never emits
     /// ToolStart, so the dialog supplies the line to bake instead.
     pub call_summary: String,
-    /// The call's header + diff were already baked into scrollback before
-    /// consent; the decision record must not repeat them.
-    pub prebaked: bool,
     selected: usize,
     /// Single-line note editor: full cursor movement, wraps on render.
     note: Editor,
@@ -41,12 +38,11 @@ pub enum DialogResult {
 }
 
 impl Dialog {
-    pub fn new(summary: String, descriptor: String, call_summary: String, prebaked: bool) -> Self {
+    pub fn new(summary: String, descriptor: String, call_summary: String) -> Self {
         Self {
             summary,
             descriptor,
             call_summary,
-            prebaked,
             selected: 0,
             note: Editor::new(),
             note_focused: false,
@@ -59,7 +55,6 @@ impl Dialog {
             summary,
             descriptor: "ask_user".into(),
             call_summary: String::new(),
-            prebaked: false,
             selected: 0,
             note: Editor::new(),
             note_focused: false,
@@ -243,15 +238,6 @@ impl Dialog {
         ));
         out
     }
-
-    pub fn height(&self, width: u16) -> u16 {
-        (self
-            .question_options
-            .as_ref()
-            .map_or(OPTIONS.len(), Vec::len)
-            + self.note_rows(width).len()
-            + 2) as u16
-    }
 }
 
 /// Split into rows of at most `width` display cells (never mid-char).
@@ -281,7 +267,6 @@ mod tests {
             "edit src/main.rs".into(),
             "edit(src/main.rs)".into(),
             "edit(src/main.rs)".into(),
-            true,
         )
     }
 
@@ -361,7 +346,7 @@ mod tests {
             })
             .count();
         assert!(rows >= 2, "60-char note must wrap at width 40");
-        assert!(d.height(40) > d.height(200));
+        assert!(d.render(40).len() > d.render(200).len());
     }
 
     #[test]

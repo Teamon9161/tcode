@@ -24,13 +24,22 @@ impl Approver for LineApprover {
         );
         let _ = std::io::stdout().flush();
         loop {
-            let line = tokio::task::spawn_blocking(|| {
+            let (n, line) = tokio::task::spawn_blocking(|| {
                 let mut s = String::new();
-                std::io::stdin().read_line(&mut s).map(|_| s)
+                std::io::stdin().read_line(&mut s).map(|n| (n, s))
             })
             .await
-            .unwrap_or_else(|_| Ok(String::new()))
-            .unwrap_or_default();
+            .unwrap_or(Ok((0, String::new())))
+            .unwrap_or((0, String::new()));
+            // EOF (n == 0): no human on stdin to approve. Deny rather than
+            // approve blindly — a blank Enter (n >= 1) still defaults to Yes.
+            if n == 0 {
+                println!("{DIM}  no input (EOF) — denied{RESET}");
+                return Approval {
+                    decision: ApprovalDecision::No,
+                    comment: None,
+                };
+            }
             let line = line.trim();
             let (head, rest) = match line.split_once(char::is_whitespace) {
                 Some((h, r)) => (h, Some(r.trim().to_string()).filter(|s| !s.is_empty())),

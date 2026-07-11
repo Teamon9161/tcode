@@ -114,10 +114,6 @@ impl Picker {
         ));
         lines
     }
-
-    pub fn height(&self) -> u16 {
-        (self.items.len().min(VISIBLE_ROWS) + 2) as u16
-    }
 }
 
 /// Codex stores sessions in verbose `rollout-…` filenames.  In a picker the

@@ -1,0 +1,86 @@
+# Built-in provider/model catalog. Always loaded as the base layer; the
+# user's ~/.tcode/config.toml overlays it. Profiles merge by their toml
+# key (same key → fields and models merge, new key → added); models merge
+# by `name` (same name → overridden, new name → appended). Context sizes
+# live here so the harness never has to guess them from a model id.
+#
+# Model IDs, context windows, and pricing tiers verified 2026-07.
+
+[profiles.anthropic]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+
+# Fable 5 always thinks; it has no effort dial here (the picker's "auto"
+# sends nothing, which is correct).
+[[profiles.anthropic.models]]
+name = "claude-fable-5"
+label = "Claude Fable 5"
+context_window = 1000000
+
+[[profiles.anthropic.models]]
+name = "claude-opus-4-8"
+label = "Claude Opus 4.8"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[[profiles.anthropic.models]]
+name = "claude-sonnet-5"
+label = "Claude Sonnet 5"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[[profiles.anthropic.models]]
+name = "claude-haiku-4-5"
+label = "Claude Haiku 4.5"
+context_window = 200000
+
+[profiles.openai]
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+
+[[profiles.openai.models]]
+name = "gpt-5.6-sol"
+label = "GPT-5.6 Sol"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+[[profiles.openai.models]]
+name = "gpt-5.6-terra"
+label = "GPT-5.6 Terra"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+[[profiles.openai.models]]
+name = "gpt-5.6-luna"
+label = "GPT-5.6 Luna"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+# ChatGPT subscription through the Codex backend. Models come from Codex's
+# local cache at runtime, so an empty list stays current automatically.
+[profiles.chatgpt]
+provider = "chatgpt"
+
+# DeepSeek's Anthropic-compatible endpoint. `deepseek-v4-pro` and
+# `deepseek-v4-flash` are the real model ids (the 1M context is a property
+# recorded here, not a suffix on the id). Thinking is ON by default
+# server-side; "off" disables it.
+[profiles.deepseek]
+provider = "anthropic"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/anthropic"
+
+[[profiles.deepseek.models]]
+name = "deepseek-v4-pro"
+label = "DeepSeek V4 Pro"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[[profiles.deepseek.models]]
+name = "deepseek-v4-flash"
+label = "DeepSeek V4 Flash"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]

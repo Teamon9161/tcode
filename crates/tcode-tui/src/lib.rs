@@ -1,7 +1,8 @@
-//! Inline TUI: content is baked into the terminal's native scrollback
-//! via `insert_before`; only un-finalized state (streaming text, status
-//! line, input box, dialogs) lives in the small bottom viewport. Core
-//! never depends on this crate.
+//! Self-rendered TUI: the in-memory transcript (`transcript.rs`) is the
+//! single source of truth; the alternate screen is only a viewport into
+//! it. Scrolling, selection and copy are owned by tcode, which is what
+//! makes rewind truncation, collapsible tool output and un-baked declined
+//! diffs possible at all. Core never depends on this crate.
 
 mod app;
 mod approval;
@@ -10,16 +11,20 @@ mod editor;
 mod markdown;
 mod model_picker;
 mod resume;
-mod rewind;
 mod theme;
+mod transcript;
 pub mod wizard;
 
 use std::io::stdout;
 use std::sync::Arc;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use tcode_core::{Agent, Session};
 
 pub use app::App;
@@ -37,7 +42,12 @@ pub enum Exit {
 /// the terminal is restored even if the app errors or panics.
 pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
-    execute!(stdout(), EnableBracketedPaste)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
 
     // Restore the terminal on panic, then let the default hook print.
     let default_hook = std::panic::take_hook();
@@ -66,7 +76,12 @@ pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow
 }
 
 fn restore_terminal() {
-    let _ = execute!(stdout(), DisableBracketedPaste);
+    let _ = execute!(
+        stdout(),
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
     let _ = execute!(stdout(), crossterm::cursor::Show);
 }

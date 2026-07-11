@@ -162,10 +162,6 @@ impl Picker {
         ));
         out
     }
-
-    pub fn height(&self) -> u16 {
-        (2 + self.rows.len().min(8)) as u16
-    }
 }
 
 #[cfg(test)]

@@ -50,6 +50,11 @@ pub fn thinking() -> Style {
     Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
 }
 
+/// Amber-tinted row background marking the rewind-navigation target.
+pub fn rewind_highlight_bg() -> Color {
+    Color::Rgb(82, 62, 24)
+}
+
 pub fn diff_add_bg() -> Color {
     Color::Rgb(20, 62, 38)
 }

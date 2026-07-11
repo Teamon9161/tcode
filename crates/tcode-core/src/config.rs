@@ -133,6 +133,47 @@ impl Profile {
         }
         defs
     }
+
+    /// Overlay `over` onto self: scalar fields win when set; models merge
+    /// by `name` (same name replaced, new name appended). This is how a
+    /// user profile extends or overrides a same-named default profile.
+    fn merge(&mut self, over: Profile) {
+        self.provider = over.provider;
+        if over.model.is_some() {
+            self.model = over.model;
+        }
+        if over.api_key.is_some() {
+            self.api_key = over.api_key;
+        }
+        if over.api_key_env.is_some() {
+            self.api_key_env = over.api_key_env;
+        }
+        if over.base_url.is_some() {
+            self.base_url = over.base_url;
+        }
+        if over.max_tokens.is_some() {
+            self.max_tokens = over.max_tokens;
+        }
+        if over.context_window.is_some() {
+            self.context_window = over.context_window;
+        }
+        for model in over.models {
+            match self.models.iter_mut().find(|d| d.name == model.name) {
+                Some(existing) => *existing = model,
+                None => self.models.push(model),
+            }
+        }
+    }
+
+    /// Whether credentials for this profile resolve right now. Used to hide
+    /// unconfigured built-in profiles from the `/model` picker so the
+    /// always-present default catalog doesn't clutter it.
+    pub fn is_usable(&self, name: &str) -> bool {
+        if self.provider == ProviderKind::Chatgpt {
+            return crate::codex::auth_available();
+        }
+        self.api_key(name).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,20 +312,29 @@ impl Config {
         Self::global_file().map(|p| p.exists()).unwrap_or(false)
     }
 
-    /// Load only the user-level configuration, without applying a project
-    /// overlay. Setup uses this so it never writes project settings back to
-    /// the global file.
+    /// The built-in provider/model catalog, parsed from the embedded
+    /// `default.toml`. It is the base layer every runtime `load` starts
+    /// from; the user's config only needs to add keys and overrides.
+    pub fn defaults() -> Self {
+        toml::from_str(include_str!("default.toml")).expect("embedded default.toml is valid")
+    }
+
+    /// Load only the hand-written user-level configuration — no built-in
+    /// defaults, no project overlay. Setup reads and writes this, so the
+    /// built-in catalog is never serialized onto the user's disk.
     pub fn load_global() -> Result<Self, ConfigError> {
         let global_file = Self::global_file()?;
         Self::read_file(&global_file)
     }
 
-    /// Load global config, then overlay the project-level
-    /// `.tcode/config.toml` if present. Errors if no global config
-    /// exists — first-run setup (the wizard or `Config::write_global`)
+    /// Runtime config: built-in defaults, then the user's global config,
+    /// then the project-level `.tcode/config.toml`. Errors if no global
+    /// config exists — first-run setup (the wizard or `Config::write_global`)
     /// must run before this.
     pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
-        let mut config = Self::load_global()?;
+        let user = Self::load_global()?;
+        let mut config = Self::defaults();
+        config.merge_global(user);
         let project_file = project_dir.join(".tcode").join("config.toml");
         if project_file.exists() {
             config.overlay(Self::read_file(&project_file)?);
@@ -319,17 +369,35 @@ impl Config {
         })
     }
 
-    /// Project-level values win; profiles merge by name; permission
-    /// rule lists concatenate (both levels apply).
-    fn overlay(&mut self, project: Config) {
-        if project.default_profile.is_some() {
-            self.default_profile = project.default_profile;
+    /// Overlay the user's global config onto the built-in defaults. The
+    /// user file is authoritative for watchdog/limits/permission mode;
+    /// profiles merge by key (see `Profile::merge`).
+    fn merge_global(&mut self, user: Config) {
+        self.watchdog = user.watchdog.clone();
+        self.limits = user.limits.clone();
+        self.permissions.mode = user.permissions.mode;
+        self.overlay(user);
+    }
+
+    /// Overlay project (or user) config: `default_profile` wins when set,
+    /// profiles merge by key, permission/hook/MCP lists concatenate.
+    /// Unlike `merge_global` this leaves watchdog/limits/mode untouched.
+    fn overlay(&mut self, over: Config) {
+        if over.default_profile.is_some() {
+            self.default_profile = over.default_profile;
         }
-        self.profiles.extend(project.profiles);
-        self.permissions.allow.extend(project.permissions.allow);
-        self.permissions.deny.extend(project.permissions.deny);
-        self.hooks.extend(project.hooks);
-        self.mcp_servers.extend(project.mcp_servers);
+        for (name, profile) in over.profiles {
+            match self.profiles.get_mut(&name) {
+                Some(existing) => existing.merge(profile),
+                None => {
+                    self.profiles.insert(name, profile);
+                }
+            }
+        }
+        self.permissions.allow.extend(over.permissions.allow);
+        self.permissions.deny.extend(over.permissions.deny);
+        self.hooks.extend(over.hooks);
+        self.mcp_servers.extend(over.mcp_servers);
     }
 
     pub fn profile(&self, name: Option<&str>) -> Result<(String, &Profile), ConfigError> {
@@ -422,134 +490,111 @@ impl Config {
     }
 }
 
-/// Built-in profile presets used by the first-run wizard (and handy as
-/// documentation of known-good endpoints).
+/// Built-in profile presets used by the first-run wizard. These are just
+/// the entries from the embedded `default.toml` catalog with an inline API
+/// key filled in, so the wizard and the runtime default layer never drift.
 pub mod presets {
-    use super::{ModelDef, Profile, ProviderKind};
+    use super::{Config, Profile};
 
-    fn model(
-        name: &str,
-        label: &str,
-        ctx: u64,
-        efforts: &[&str],
-        default_effort: Option<&str>,
-    ) -> ModelDef {
-        ModelDef {
-            name: name.into(),
-            label: Some(label.into()),
-            context_window: Some(ctx),
-            max_tokens: None,
-            efforts: efforts.iter().map(|s| s.to_string()).collect(),
-            default_effort: default_effort.map(String::from),
+    fn from_catalog(id: &str) -> Profile {
+        Config::defaults()
+            .profiles
+            .remove(id)
+            .unwrap_or_else(|| panic!("default.toml is missing the '{id}' profile"))
+    }
+
+    fn with_key(id: &str, api_key: Option<String>) -> Profile {
+        let mut profile = from_catalog(id);
+        if api_key.is_some() {
+            profile.api_key = api_key;
         }
+        profile
     }
 
     pub fn anthropic(api_key: Option<String>) -> Profile {
-        Profile {
-            provider: ProviderKind::Anthropic,
-            model: None,
-            models: vec![
-                model(
-                    "claude-sonnet-5",
-                    "Claude Sonnet 5",
-                    200_000,
-                    &["off", "low", "medium", "high"],
-                    None,
-                ),
-                model(
-                    "claude-opus-4-8",
-                    "Claude Opus 4.8",
-                    200_000,
-                    &["off", "low", "medium", "high"],
-                    None,
-                ),
-                model(
-                    "claude-haiku-4-5-20251001",
-                    "Claude Haiku 4.5",
-                    200_000,
-                    &["off", "low", "medium", "high"],
-                    None,
-                ),
-            ],
-            api_key,
-            api_key_env: Some("ANTHROPIC_API_KEY".into()),
-            base_url: None,
-            max_tokens: None,
-            context_window: None,
-        }
+        with_key("anthropic", api_key)
     }
 
     pub fn openai(api_key: Option<String>) -> Profile {
-        Profile {
-            provider: ProviderKind::Openai,
-            model: None,
-            models: vec![
-                model(
-                    "gpt-5.4",
-                    "GPT-5.4",
-                    272_000,
-                    &["low", "medium", "high", "xhigh"],
-                    Some("medium"),
-                ),
-                model(
-                    "gpt-5.4-mini",
-                    "GPT-5.4 mini",
-                    272_000,
-                    &["low", "medium", "high", "xhigh"],
-                    Some("medium"),
-                ),
-            ],
-            api_key,
-            api_key_env: Some("OPENAI_API_KEY".into()),
-            base_url: None,
-            max_tokens: None,
-            context_window: None,
-        }
+        with_key("openai", api_key)
     }
 
     /// ChatGPT subscription: models come from Codex's local cache at
     /// runtime, so an empty list stays current automatically.
     pub fn chatgpt() -> Profile {
-        Profile {
-            provider: ProviderKind::Chatgpt,
-            model: None,
-            models: Vec::new(),
-            api_key: None,
-            api_key_env: None,
-            base_url: None,
-            max_tokens: None,
-            context_window: None,
-        }
+        from_catalog("chatgpt")
     }
 
-    /// DeepSeek's Anthropic-compatible endpoint. The `[1m]` suffix
-    /// selects the 1M-context variants. Thinking is ON by default
-    /// server-side; "off" disables it.
+    /// DeepSeek's Anthropic-compatible endpoint.
     pub fn deepseek(api_key: Option<String>) -> Profile {
-        Profile {
-            provider: ProviderKind::Anthropic,
-            model: None,
-            models: vec![
-                model(
-                    "deepseek-v4-pro[1m]",
-                    "DeepSeek V4 Pro (1M)",
-                    1_000_000,
-                    &["off", "low", "medium", "high"],
-                    None,
-                ),
-                model(
-                    "deepseek-v4-flash[1m]",
-                    "DeepSeek V4 Flash (1M)",
-                    1_000_000,
-                    &["off", "low", "medium", "high"],
-                    None,
-                ),
-            ],
-            api_key,
-            api_key_env: Some("DEEPSEEK_API_KEY".into()),
-            base_url: Some("https://api.deepseek.com/anthropic".into()),
-            max_tokens: None,
-            context_window: None,
-        }
+        with_key("deepseek", api_key)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_defaults_parse_and_carry_clean_model_ids() {
+        let defaults = Config::defaults();
+        let deepseek = defaults.profiles.get("deepseek").expect("deepseek default");
+        let names: Vec<&str> = deepseek.models.iter().map(|m| m.name.as_str()).collect();
+        // The 1M context is a property, not a `[1m]` suffix on the id.
+        assert!(names.contains(&"deepseek-v4-pro"));
+        assert!(names.iter().all(|n| !n.contains('[')));
+        assert_eq!(deepseek.models[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn user_config_merges_onto_defaults_by_key_and_model_name() {
+        let mut config = Config::defaults();
+        // User overrides one model's context and adds a new one, under the
+        // existing `deepseek` key.
+        let user: Config = toml::from_str(
+            r#"
+            [profiles.deepseek]
+            provider = "anthropic"
+            api_key = "sk-test"
+
+            [[profiles.deepseek.models]]
+            name = "deepseek-v4-pro"
+            context_window = 2000000
+
+            [[profiles.deepseek.models]]
+            name = "deepseek-custom"
+            "#,
+        )
+        .unwrap();
+        config.merge_global(user);
+
+        let deepseek = &config.profiles["deepseek"];
+        // Scalar override applied, other default fields (base_url) preserved.
+        assert_eq!(deepseek.api_key.as_deref(), Some("sk-test"));
+        assert!(deepseek.base_url.is_some());
+        // Same-named model replaced, new model appended, flash kept.
+        let pro = deepseek
+            .models
+            .iter()
+            .find(|m| m.name == "deepseek-v4-pro")
+            .unwrap();
+        assert_eq!(pro.context_window, Some(2_000_000));
+        assert!(deepseek.models.iter().any(|m| m.name == "deepseek-custom"));
+        assert!(deepseek
+            .models
+            .iter()
+            .any(|m| m.name == "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn is_usable_reflects_resolvable_credentials() {
+        let defaults = Config::defaults();
+        // No env var, no inline key → not usable.
+        std::env::remove_var("DEEPSEEK_API_KEY");
+        assert!(!defaults.profiles["deepseek"].is_usable("deepseek"));
+
+        let mut with_inline = defaults.profiles["deepseek"].clone();
+        with_inline.api_key = Some("sk-x".into());
+        assert!(with_inline.is_usable("deepseek"));
     }
 }

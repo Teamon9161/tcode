@@ -1,22 +1,19 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::{
-    cursor::MoveTo,
-    execute,
-    terminal::{Clear, ClearType},
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
-use ratatui::{Terminal, TerminalOptions, Viewport};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -31,8 +28,17 @@ use crate::approval::{Dialog, DialogResult};
 use crate::editor::Editor;
 use crate::model_picker::{self, ModelMenu};
 use crate::resume::{self, PickResult as ResumePickResult};
-use crate::rewind::{self, PickResult};
+use crate::transcript::Transcript;
 use crate::{diff, markdown, theme};
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Lines scrolled per mouse-wheel event.
+const WHEEL_STEP: usize = 3;
+/// Visible rows of an open diff region before it scrolls internally.
+const DIFF_VIEW_ROWS: usize = 14;
+/// Visible rows of an expanded tool-output region.
+const OUTPUT_VIEW_ROWS: usize = 12;
 
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
@@ -137,14 +143,32 @@ struct PlanStep {
     status: String,
 }
 
+struct RewindCandidate {
+    /// Ledger index of the user entry (truncate target).
+    index: usize,
+    /// Full original input, prefilled into the editor.
+    text: String,
+    /// Files changed at/after this point → offer to restore them.
+    dirty: bool,
+}
+
+/// Double-Esc rewind navigation: the transcript itself jumps to and
+/// highlights the chosen user input — no picker dialog.
+struct RewindNav {
+    candidates: Vec<RewindCandidate>,
+    pos: usize,
+    /// Editor content before navigation began, restored on exit.
+    saved_input: String,
+}
+
 pub struct App {
     agent: Arc<Agent>,
     session: Option<Session>,
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
     cwd: PathBuf,
-    terminal: Terminal<KnownPosBackend>,
-    viewport_h: u16,
+    terminal: Term,
+    transcript: Transcript,
     md: markdown::Renderer,
 
     phase: Phase,
@@ -161,10 +185,13 @@ pub struct App {
     editor: Editor,
     attachments: Vec<Attachment>,
     dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
-    /// Change proposals (edit/write) already baked into scrollback before
-    /// consent; ToolStart must not render them a second time.
-    previewed_changes: HashSet<String>,
-    rewind: Option<rewind::Picker>,
+    /// A change diff baked into the transcript while its approval dialog is
+    /// open (so the full code is scrollable in the record, not cramped in
+    /// the dialog). Holds the block-count mark to retract to on decline or
+    /// when a batch supersedes it; on approval it tells the upcoming
+    /// `ToolStart` to skip re-baking the diff.
+    change_prebake: Option<usize>,
+    rewind_nav: Option<RewindNav>,
     resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
     model_picker: Option<model_picker::Picker>,
@@ -214,6 +241,8 @@ pub struct App {
     prev_cache_ratio: Option<f64>,
     should_exit: bool,
     provider_setup_requested: bool,
+    /// Transient feedback ("copied 3 lines") shown in the hint row.
+    notice: Option<(String, Instant)>,
 }
 
 impl App {
@@ -230,14 +259,14 @@ impl App {
         // Keep the agent's automatic-compaction guard and status block in
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
-        let viewport_h = 4;
-        let terminal = make_terminal(viewport_h, None)?;
+        let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
         Ok(Self {
             agent,
             session: Some(session),
             cwd,
             terminal,
-            viewport_h,
+            transcript,
             md: markdown::Renderer::default(),
             phase: Phase::Idle,
             events_rx: None,
@@ -247,8 +276,8 @@ impl App {
             editor: Editor::new(),
             attachments: Vec::new(),
             dialog: None,
-            previewed_changes: HashSet::new(),
-            rewind: None,
+            change_prebake: None,
+            rewind_nav: None,
             resume_picker: None,
             menu,
             model_picker: None,
@@ -280,21 +309,19 @@ impl App {
             prev_cache_ratio: None,
             should_exit: false,
             provider_setup_requested: false,
+            notice: None,
         })
     }
 
     pub async fn run(&mut self) -> anyhow::Result<()> {
-        self.clear_conversation_screen()?;
+        let banner = self.banner();
+        self.bake(banner);
         self.bake_transcript();
         let mut term_events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !self.should_exit {
-            let desired = self.desired_viewport();
-            if desired != self.viewport_h {
-                self.resize_viewport(desired)?;
-            }
             self.redraw()?;
             tokio::select! {
                 ev = term_events.next() => {
@@ -324,29 +351,30 @@ impl App {
                             .unwrap_or_default();
                         Dialog::question(ask.summary, options)
                     } else {
-                        // Change proposals (edit/write) go into native
-                        // scrollback before consent: the mouse wheel and
-                        // terminal search beat any in-dialog pager. The
-                        // decision record marks a decline; scrollback
-                        // cannot be un-baked.
+                        // A change proposal (edit/write) is baked into the
+                        // transcript now — in full, scrollable as part of the
+                        // record — so the reviewer reads the whole diff there
+                        // rather than in the cramped dialog. On decline it is
+                        // retracted; on approval the upcoming ToolStart skips
+                        // re-baking it (see `change_prebake`).
                         let call_summary = self.display_summary(
                             &tcode_core::agent::summarize_call(&ask.tool, &ask.input),
                         );
                         let change = diff::render_change(&ask.tool, &ask.input);
-                        let prebaked = !change.is_empty();
-                        if prebaked {
-                            // Flush streamed text first so the transcript
-                            // keeps its chronological order.
+                        if !change.is_empty() {
                             self.bake_live_text();
                             self.finish_thinking();
-                            let mut spans = colored_tool_summary(&call_summary);
+                            self.change_prebake = Some(self.transcript.block_count());
+                            let mut spans: Vec<Span> = colored_tool_summary(&call_summary);
                             spans.insert(0, Span::styled("● ", theme::accent()));
-                            let mut lines = vec![Line::default(), Line::from(spans)];
-                            lines.extend(change);
-                            self.bake(lines);
-                            self.previewed_changes.insert(change_key(&ask.tool, &ask.input));
+                            let head = vec![Line::default(), Line::from(spans)];
+                            // Uncapped view_rows: show every line, no scroll footer.
+                            let rows = change.len().max(1);
+                            self.transcript.push_with_detail(head, change, true, rows);
                         }
-                        Dialog::new(ask.summary, ask.descriptor, call_summary, prebaked)
+                        // Diff lives in the transcript; the dialog carries only
+                        // the choices.
+                        Dialog::new(ask.summary, ask.descriptor, call_summary)
                     };
                     self.dialog = Some((dialog, ask.reply));
                 }
@@ -363,7 +391,6 @@ impl App {
                 }
             }
         }
-        self.clear_viewport_on_exit()?;
         Ok(())
     }
 
@@ -371,24 +398,10 @@ impl App {
         self.provider_setup_requested
     }
 
-    fn take_previewed_change(&mut self, name: &str, input: &serde_json::Value) -> bool {
-        self.previewed_changes.remove(&change_key(name, input))
-    }
-
     /// Recover the active session when the app intentionally exits to launch
     /// the provider wizard.
     pub fn take_session(&mut self) -> Option<Session> {
         self.session.take()
-    }
-
-    fn clear_viewport_on_exit(&mut self) -> anyhow::Result<()> {
-        // An inline viewport is not an alternate screen. Clear its transient
-        // input/status area before returning control to the shell, while
-        // preserving the baked conversation above it.
-        self.terminal.clear()?;
-        let height = self.terminal.size()?.height;
-        execute!(std::io::stdout(), MoveTo(0, height.saturating_sub(1)))?;
-        Ok(())
     }
 
     /// Welcome box, Claude Code style: identity, model, cwd.
@@ -484,15 +497,19 @@ impl App {
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_plan: Option<serde_json::Value> = None;
-        for entry in session.ledger.entries() {
+        for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
                 tcode_core::Entry::User(blocks) => {
+                    // User echoes are their own entry-tagged blocks so
+                    // rewind can jump to and truncate from them.
+                    self.transcript.push(std::mem::take(&mut lines));
+                    let mut echo: Vec<Line<'static>> = Vec::new();
                     for b in blocks {
                         match b {
                             ContentBlock::Text { text } if !text.starts_with("<tcode-status>") => {
                                 for (i, l) in text.lines().enumerate() {
                                     let prefix = if i == 0 { "› " } else { "  " };
-                                    lines.push(Line::from(vec![
+                                    echo.push(Line::from(vec![
                                         Span::styled(
                                             prefix.to_string(),
                                             theme::user_prompt_message(),
@@ -502,14 +519,15 @@ impl App {
                                 }
                             }
                             ContentBlock::Image { .. } => {
-                                lines.push(Line::styled("  ⌞ [image]", theme::dim()));
+                                echo.push(Line::styled("  ⌞ [image]", theme::dim()));
                             }
                             _ => {}
                         }
                     }
                     // Keep a breathing row between a highlighted human
                     // message and the following assistant/tool activity.
-                    lines.push(Line::default());
+                    echo.push(Line::default());
+                    self.transcript.push_tagged(echo, entry_index);
                 }
                 tcode_core::Entry::Assistant(blocks) => {
                     for b in blocks {
@@ -608,7 +626,9 @@ impl App {
             .saturating_add(approx_tokens(&input) as u64)
             .saturating_add(attachment_tokens);
         self.context_step_start = self.context_tokens;
-        // Echo the user input into the transcript.
+        // Echo the user input into the transcript, tagged with the ledger
+        // index its User entry is about to occupy (rewind jumps to it).
+        let entry_index = session.ledger.entries().len();
         let mut echo: Vec<Line> = Vec::new();
         for (i, l) in input.lines().enumerate() {
             let prefix = if i == 0 { "› " } else { "  " };
@@ -636,7 +656,7 @@ impl App {
                 }
             }
         }
-        self.bake(echo);
+        self.transcript.push_tagged(echo, entry_index);
         blocks.push(ContentBlock::Text { text: input });
 
         let (tx, rx) = mpsc::channel(64);
@@ -784,13 +804,20 @@ impl App {
                 self.state_label = "thinking".into();
             }
             AgentEvent::ToolBatchStart { label, calls } => {
+                // A batch supersedes any single diff pre-baked for its
+                // (once) approval — retract it so the batch renders in full.
+                if let Some(mark) = self.change_prebake.take() {
+                    self.transcript.truncate_blocks(mark);
+                }
                 self.bake_live_text();
                 self.finish_thinking();
-                self.bake(vec![Line::default()]);
-                let mut lines = vec![Line::from(vec![
-                    Span::styled("● ", theme::accent()),
-                    Span::styled(label.clone(), theme::bold()),
-                ])];
+                self.bake(vec![
+                    Line::default(),
+                    Line::from(vec![
+                        Span::styled("● ", theme::accent()),
+                        Span::styled(label.clone(), theme::bold()),
+                    ]),
+                ]);
                 self.pending_batch.clear();
                 for (name, input) in calls {
                     let summary =
@@ -802,15 +829,14 @@ impl App {
                     });
                     let mut spans: Vec<Span> = colored_tool_summary(&summary);
                     spans.insert(0, Span::raw("  ├ "));
-                    lines.push(Line::from(spans));
-                    // Diffs already baked before consent are not repeated;
-                    // auto-allowed changes render theirs here.
-                    if !self.take_previewed_change(&name, &input) {
-                        lines.extend(diff::render_change(&name, &input));
-                    }
-                    lines.push(Line::default());
+                    let change = diff::render_change(&name, &input);
+                    self.transcript.push_with_detail(
+                        vec![Line::from(spans)],
+                        change,
+                        true,
+                        DIFF_VIEW_ROWS,
+                    );
                 }
-                self.bake(lines);
                 self.state_label = format!("running: {label}");
             }
             AgentEvent::ToolStart {
@@ -829,31 +855,26 @@ impl App {
                     return;
                 }
                 let summary = self.display_summary(&summary);
-                // A change baked before consent is this call's display;
-                // repeating the header or diff here would duplicate it.
-                if self.take_previewed_change(&name, &input) {
-                    self.pending_tool = Some(ActivityEntry {
-                        title: summary.clone(),
-                        detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                        expanded: false,
-                    });
-                    self.state_label = format!("running: {summary}");
-                    return;
-                }
                 self.bake_live_text();
                 self.finish_thinking();
-                self.bake(vec![Line::default()]);
-                let approved_change = diff::render_change(&name, &input);
                 self.pending_tool = Some(ActivityEntry {
                     title: summary.clone(),
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
                     expanded: false,
                 });
-                let mut spans: Vec<Span> = colored_tool_summary(&summary);
-                spans.insert(0, Span::styled("● ", theme::accent()));
-                let mut lines = vec![Line::from(spans)];
-                lines.extend(approved_change);
-                self.bake(lines);
+                // If this call's diff was already baked in full while its
+                // approval dialog was open, keep that block — don't render a
+                // second, capped copy.
+                if self.change_prebake.take().is_none() {
+                    let mut spans: Vec<Span> = colored_tool_summary(&summary);
+                    spans.insert(0, Span::styled("● ", theme::accent()));
+                    let head = vec![Line::default(), Line::from(spans)];
+                    // An approved/auto-allowed change renders as an open,
+                    // height-capped diff that a click folds away.
+                    let change = diff::render_change(&name, &input);
+                    self.transcript
+                        .push_with_detail(head, change, true, DIFF_VIEW_ROWS);
+                }
                 self.state_label = format!("running: {summary}");
             }
             AgentEvent::ToolEnd {
@@ -871,6 +892,11 @@ impl App {
                     .pending_tool
                     .take()
                     .or_else(|| self.pending_batch.pop_front());
+                // Recover the call's input (stashed as JSON) to decide whether
+                // the output is markdown before the result is appended to it.
+                let input: Option<serde_json::Value> = entry
+                    .as_ref()
+                    .and_then(|e| serde_json::from_str(&e.detail).ok());
                 if let Some(mut entry) = entry {
                     entry.detail.push_str("\n\nresult:\n");
                     entry.detail.push_str(&content);
@@ -886,7 +912,17 @@ impl App {
                 } else {
                     theme::dim()
                 };
-                self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
+                // The preview row carries the fold affordance (added by the
+                // transcript). The full output folds out on click.
+                let detail =
+                    self.output_detail(&name, input.as_ref(), &preview, &content, is_error);
+                if detail.is_empty() {
+                    self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
+                } else {
+                    let head = vec![Line::styled(format!("  ⎿ {preview}"), style)];
+                    self.transcript
+                        .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+                }
                 self.state_label = "responding".into();
             }
             AgentEvent::Retrying {
@@ -966,11 +1002,14 @@ impl App {
         }
     }
 
-    /// Transcript record of a consent decision. Each tool call appears in
-    /// scrollback exactly once, rendered by its ToolStart — so an approval
-    /// bakes nothing but the user's note, and only a declined call (which
-    /// never emits ToolStart) bakes its own header.
+    /// Transcript record of a consent decision. An approved call renders
+    /// via its ToolStart (header + diff), so approval bakes nothing but the
+    /// user's note; a declined call (which never emits ToolStart) leaves a
+    /// one-line record — the proposed diff never reaches the transcript.
     fn bake_approval_record(&mut self, dialog: &Dialog, approval: &Approval) {
+        // Flush streamed text so the record keeps chronological order.
+        self.bake_live_text();
+        self.finish_thinking();
         if dialog.is_question() {
             let answer = approval.comment.clone().unwrap_or_default();
             self.bake(vec![
@@ -986,35 +1025,33 @@ impl App {
         match approval.decision {
             ApprovalDecision::Yes | ApprovalDecision::YesAlways => {
                 if let Some(note) = approval.comment.as_deref() {
-                    let line = Line::styled(format!("  ⊙ note to model — {note}"), theme::dim());
-                    // A prebaked diff block is directly above: attach to it.
-                    if dialog.prebaked {
-                        self.bake(vec![line]);
-                    } else {
-                        self.bake(vec![Line::default(), line]);
-                    }
+                    self.bake(vec![
+                        Line::default(),
+                        Line::styled(format!("  ⊙ note to model — {note}"), theme::dim()),
+                    ]);
                 }
             }
             ApprovalDecision::No => {
+                // Retract the diff baked while the dialog was open — a
+                // declined change leaves only its one-line record.
+                if let Some(mark) = self.change_prebake.take() {
+                    self.transcript.truncate_blocks(mark);
+                }
                 let reason = approval
                     .comment
                     .as_deref()
                     .map(|c| format!(" — {c}"))
                     .unwrap_or_default();
-                let declined = Line::styled(
-                    format!("  ⎿ declined{reason}"),
-                    ratatui::style::Style::default().fg(theme::ERROR),
-                );
-                if dialog.prebaked {
-                    // The header + diff are already in scrollback and cannot
-                    // be un-baked; mark them as not applied.
-                    self.previewed_changes.clear();
-                    self.bake(vec![declined]);
-                } else {
-                    let mut spans = colored_tool_summary(&dialog.call_summary);
-                    spans.insert(0, Span::styled("● ", theme::accent()));
-                    self.bake(vec![Line::default(), Line::from(spans), declined]);
-                }
+                let mut spans = colored_tool_summary(&dialog.call_summary);
+                spans.insert(0, Span::styled("● ", theme::accent()));
+                self.bake(vec![
+                    Line::default(),
+                    Line::from(spans),
+                    Line::styled(
+                        format!("  ⎿ declined{reason}"),
+                        ratatui::style::Style::default().fg(theme::ERROR),
+                    ),
+                ]);
             }
         }
     }
@@ -1047,6 +1084,53 @@ impl App {
         self.bake(lines);
     }
 
+    /// The foldable body of a tool result. Markdown-shaped output (a
+    /// `web_fetch`, or a `read` of a `.md` file) is rendered; everything
+    /// else stays literal. Either way a left gutter bar delineates the
+    /// expanded region, and the first line — already shown untruncated in
+    /// the preview head — is dropped from plain output to avoid a duplicate.
+    fn output_detail(
+        &self,
+        name: &str,
+        input: Option<&serde_json::Value>,
+        preview: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Vec<Line<'static>> {
+        if content.trim() == preview.trim() {
+            return Vec::new(); // nothing beyond the preview
+        }
+        let gutter = || Span::styled("  │ ", theme::dim());
+        let is_markdown = !is_error
+            && (name == "web_fetch" || (name == "read" && input.is_some_and(path_is_markdown)));
+        if is_markdown {
+            return self
+                .md
+                .render(content)
+                .into_iter()
+                .map(|line| {
+                    let mut spans = vec![gutter()];
+                    spans.extend(line.spans);
+                    Line::from(spans)
+                })
+                .collect();
+        }
+        let text_style = if is_error {
+            ratatui::style::Style::default().fg(theme::ERROR)
+        } else {
+            ratatui::style::Style::default()
+        };
+        // The preview shows line 1 in full unless it was truncated (>120
+        // chars); when it wasn't, skip it here so it isn't shown twice.
+        let first = content.lines().next().unwrap_or("");
+        let skip = usize::from(first.chars().count() <= 120 && content.lines().count() > 1);
+        content
+            .lines()
+            .skip(skip)
+            .map(|line| Line::from(vec![gutter(), Span::styled(line.to_string(), text_style)]))
+            .collect()
+    }
+
     // ------------------------------------------------------------ keys
 
     fn on_term_event(&mut self, ev: Event) {
@@ -1055,6 +1139,30 @@ impl App {
                 self.on_key(key)
             }
             Event::Paste(text) => self.on_paste_text(text),
+            Event::Mouse(mouse) => match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    let up = mouse.kind == MouseEventKind::ScrollUp;
+                    // The wheel always scrolls the transcript — including
+                    // while an approval dialog is open, so the reviewer can
+                    // scroll back through the full pre-baked diff.
+                    self.transcript
+                        .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.transcript.mouse_down(mouse.column, mouse.row)
+                }
+                MouseEventKind::Drag(MouseButton::Left) => {
+                    self.transcript.mouse_drag(mouse.column, mouse.row)
+                }
+                MouseEventKind::Up(MouseButton::Left) => {
+                    if let Some(text) = self.transcript.mouse_up() {
+                        self.copy_selection(text);
+                    }
+                }
+                _ => {}
+            },
+            // ratatui's autoresize adapts on the next draw; the transcript
+            // rewraps lazily from the new area width.
             Event::Resize(..) => {}
             _ => {}
         }
@@ -1117,19 +1225,32 @@ impl App {
             return;
         }
 
-        // Rewind picker captures everything while open.
-        if let Some(picker) = self.rewind.as_mut() {
-            match picker.handle_key(key) {
-                PickResult::Pending => {}
-                PickResult::Cancelled => self.rewind = None,
-                PickResult::Rewind {
-                    index,
-                    restore_files,
-                    text,
-                } => {
-                    self.rewind = None;
-                    self.do_rewind(index, restore_files, text);
+        // Rewind navigation captures everything while active: the
+        // transcript itself shows the target, keys move between inputs.
+        if self.rewind_nav.is_some() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Esc keeps the double-Esc rhythm: each press jumps to
+                // the next-older input.
+                KeyCode::Esc | KeyCode::Up => {
+                    let nav = self.rewind_nav.as_mut().expect("nav present");
+                    nav.pos = nav.pos.saturating_sub(1);
+                    self.apply_rewind_nav();
                 }
+                KeyCode::Down => {
+                    let nav = self.rewind_nav.as_mut().expect("nav present");
+                    if nav.pos + 1 < nav.candidates.len() {
+                        nav.pos += 1;
+                        self.apply_rewind_nav();
+                    } else {
+                        // Past the newest input: leave navigation.
+                        self.exit_rewind_nav();
+                    }
+                }
+                KeyCode::Enter => self.confirm_rewind_nav(false),
+                KeyCode::Char('r') if ctrl => self.confirm_rewind_nav(true),
+                KeyCode::Char('c') if ctrl => self.exit_rewind_nav(),
+                _ => {}
             }
             return;
         }
@@ -1224,6 +1345,8 @@ impl App {
             KeyCode::Right => self.editor.right(),
             KeyCode::Home => self.editor.home(),
             KeyCode::End => self.editor.end(),
+            KeyCode::PageUp => self.transcript.page_up(),
+            KeyCode::PageDown => self.transcript.page_down(),
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Char(c) => {
@@ -1250,6 +1373,8 @@ impl App {
             return; // M3: queued follow-up messages
         }
         let input = self.editor.take();
+        // Sending a message means the user is done reading history.
+        self.transcript.scroll_to_bottom();
         self.start_turn(input);
     }
 
@@ -1259,7 +1384,7 @@ impl App {
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let candidates: Vec<rewind::Candidate> = session
+        let candidates: Vec<RewindCandidate> = session
             .ledger
             .entries()
             .iter()
@@ -1279,7 +1404,7 @@ impl App {
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
-                    (!text.is_empty()).then(|| rewind::Candidate {
+                    (!text.is_empty()).then(|| RewindCandidate {
                         index: i,
                         text,
                         dirty: session.checkpoints.dirty_since(i),
@@ -1288,16 +1413,57 @@ impl App {
                 _ => None,
             })
             .collect();
-        self.rewind = rewind::Picker::new(candidates);
-        if self.rewind.is_none() {
+        if candidates.is_empty() {
             self.bake(vec![Line::styled("nothing to rewind to", theme::dim())]);
+            return;
         }
+        self.rewind_nav = Some(RewindNav {
+            pos: candidates.len() - 1,
+            candidates,
+            saved_input: self.editor.text(),
+        });
+        self.apply_rewind_nav();
+    }
+
+    /// Show the current navigation target: highlight + scroll its echo
+    /// into view, prefill the editor with the original input.
+    fn apply_rewind_nav(&mut self) {
+        let Some(nav) = &self.rewind_nav else {
+            return;
+        };
+        let candidate = &nav.candidates[nav.pos];
+        let text = candidate.text.clone();
+        self.transcript.highlight_entry(candidate.index);
+        self.editor.clear();
+        self.editor.insert_str(&text);
+    }
+
+    fn exit_rewind_nav(&mut self) {
+        if let Some(nav) = self.rewind_nav.take() {
+            self.transcript.clear_highlight();
+            self.transcript.scroll_to_bottom();
+            self.editor.clear();
+            self.editor.insert_str(&nav.saved_input);
+        }
+    }
+
+    fn confirm_rewind_nav(&mut self, restore_files: bool) {
+        let Some(nav) = self.rewind_nav.take() else {
+            return;
+        };
+        self.transcript.clear_highlight();
+        let candidate = &nav.candidates[nav.pos];
+        self.do_rewind(candidate.index, restore_files, candidate.text.clone());
     }
 
     fn do_rewind(&mut self, index: usize, restore_files: bool, text: String) {
         let Some(session) = self.session.as_mut() else {
             return;
         };
+        // Visual truncation first: the transcript forgets the rewound tail
+        // exactly like the ledger does. (False only for history without an
+        // echo, e.g. compacted or imported conversations.)
+        self.transcript.truncate_from_entry(index);
         session.ledger.truncate_tail(index);
         session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
         self.context_tokens = session.last_prompt_tokens;
@@ -1533,12 +1699,7 @@ impl App {
                     self.pending_tool = None;
                     self.pending_batch.clear();
                     self.thinking_text.clear();
-                    if let Err(e) = self.clear_conversation_screen() {
-                        self.bake(vec![Line::styled(
-                            format!("could not clear terminal scrollback: {e}"),
-                            ratatui::style::Style::default().fg(theme::ERROR),
-                        )]);
-                    }
+                    self.clear_conversation_screen();
                     self.bake(vec![Line::styled("conversation cleared", theme::dim())]);
                 }
             }
@@ -1571,6 +1732,29 @@ impl App {
     }
 
     // ----------------------------------------------------------- paste
+
+    /// Mouse-selection copy: system clipboard first (arboard), OSC 52 as
+    /// the remote/SSH fallback where no local clipboard exists.
+    fn copy_selection(&mut self, text: String) {
+        let lines = text.lines().count();
+        let copied = arboard::Clipboard::new()
+            .and_then(|mut clipboard| clipboard.set_text(text.clone()))
+            .is_ok();
+        if !copied {
+            use base64::Engine as _;
+            use std::io::Write as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b]52;c;{encoded}\x07");
+            let _ = out.flush();
+        }
+        let what = if lines <= 1 {
+            "selection".to_string()
+        } else {
+            format!("{lines} lines")
+        };
+        self.notice = Some((format!("copied {what}"), Instant::now()));
+    }
 
     fn paste_from_clipboard(&mut self) {
         let Ok(mut clipboard) = arboard::Clipboard::new() else {
@@ -1645,30 +1829,19 @@ impl App {
             .map(|(c, _)| (*c).to_string())
     }
 
+    /// Finalize content into the transcript. Name kept from the inline era;
+    /// unlike native scrollback, transcript content can still be truncated
+    /// (rewind) or cleared later.
     fn bake(&mut self, lines: Vec<Line<'static>>) {
-        if lines.is_empty() {
-            return;
-        }
-        let width = self.terminal.size().map(|s| s.width).unwrap_or(80).max(20);
-        let lines = wrap_baked_lines(lines, width as usize);
-        let para = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
-        let height = para.line_count(width) as u16;
-        let _ = self.terminal.insert_before(height, |buf| {
-            para.render(buf.area, buf);
-            blank_wide_continuations(buf);
-        });
+        self.transcript.push(lines);
     }
 
-    /// `/clear` starts a genuinely clean visual conversation. Clearing the
-    /// ledger alone is insufficient with an inline viewport: prior entries
-    /// have already been committed to the terminal's native scrollback.
-    fn clear_conversation_screen(&mut self) -> anyhow::Result<()> {
-        let _ = self.terminal.clear();
-        execute!(std::io::stdout(), Clear(ClearType::Purge), MoveTo(0, 0))?;
-        self.terminal = make_terminal(self.viewport_h, Some(0))?;
+    /// `/clear`, resume and import restart the visual conversation. The
+    /// transcript is ours, so this is a plain reset — no terminal purge.
+    fn clear_conversation_screen(&mut self) {
+        self.transcript.clear();
         let banner = self.banner();
         self.bake(banner);
-        Ok(())
     }
 
     fn resume_session(&mut self, id: &str) {
@@ -1711,12 +1884,7 @@ impl App {
                     .lock()
                     .expect("freshness lock")
                     .clear();
-                if let Err(e) = self.clear_conversation_screen() {
-                    self.bake(vec![Line::styled(
-                        format!("could not clear terminal scrollback: {e}"),
-                        ratatui::style::Style::default().fg(theme::ERROR),
-                    )]);
-                }
+                self.clear_conversation_screen();
                 self.bake_transcript();
             }
             Err(e) => self.bake(vec![Line::styled(
@@ -1825,12 +1993,7 @@ impl App {
                     .lock()
                     .expect("freshness lock")
                     .clear();
-                if let Err(e) = self.clear_conversation_screen() {
-                    self.bake(vec![Line::styled(
-                        format!("could not clear terminal scrollback: {e}"),
-                        ratatui::style::Style::default().fg(theme::ERROR),
-                    )]);
-                }
+                self.clear_conversation_screen();
                 self.bake(vec![Line::styled(
                     format!("imported {} as tcode session {imported_id}", source.label()),
                     theme::dim(),
@@ -1946,58 +2109,6 @@ impl App {
         shorten_summary_path(summary, Some(&self.cwd))
     }
 
-    fn desired_viewport(&self) -> u16 {
-        // Pickers/dialogs replace the whole viewport (bordered box).
-        let h = if self.activity_open {
-            self.activity_lines().len() as u16 + 2
-        } else if let Some(picker) = &self.resume_picker {
-            picker.height() + 2
-        } else if let Some(picker) = &self.model_picker {
-            picker.height() + 2
-        } else if let Some(picker) = &self.rewind {
-            picker.height() + 2
-        } else if let Some((dialog, _)) = &self.dialog {
-            dialog.height(area_width(&self.terminal)) + 2
-        } else {
-            let running = matches!(self.phase, Phase::Running { .. });
-            let live = if running {
-                (self.live_text.lines().count().min(8) + 1) as u16
-            } else {
-                0
-            };
-            let editor_rows = editor_layout(&self.editor, area_width(&self.terminal))
-                .lines
-                .len() as u16;
-            let editor_box = editor_rows.clamp(1, 6) + 2;
-            let popup_h = if self.popup_active() {
-                self.popup_matches().len() as u16
-            } else {
-                0
-            };
-            let attach_h = if self.attachments.is_empty() { 0 } else { 1 };
-            // context meter + hint both get their own row below the editor.
-            live + self.plan_lines().len() as u16
-                + if self.plan.is_empty() { 0 } else { 2 }
-                + editor_box
-                + popup_h
-                + attach_h
-                + 2
-                + usize::from(self.rate_limits.is_some()) as u16
-        };
-        h.clamp(4, 18)
-    }
-
-    fn resize_viewport(&mut self, desired: u16) -> anyhow::Result<()> {
-        // We know where the viewport sits; clearing parks the physical
-        // cursor at its top row, and the new terminal is told that row
-        // directly — no stdin round-trip, no race (see KnownPosBackend).
-        let top = self.terminal.get_frame().area().y;
-        let _ = self.terminal.clear();
-        self.terminal = make_terminal(desired, Some(top))?;
-        self.viewport_h = desired;
-        Ok(())
-    }
-
     fn redraw(&mut self) -> anyhow::Result<()> {
         let running = matches!(self.phase, Phase::Running { .. });
         let started = match &self.phase {
@@ -2021,7 +2132,6 @@ impl App {
             .then(|| self.activity_lines())
             .or_else(|| self.resume_picker.as_ref().map(|p| p.render()))
             .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
-            .or_else(|| self.rewind.as_ref().map(|p| p.render()))
             .or_else(|| {
                 self.dialog
                     .as_ref()
@@ -2048,9 +2158,43 @@ impl App {
 
         use ratatui::widgets::{Block, BorderType};
 
+        let transcript = &mut self.transcript;
         self.terminal.draw(|frame| {
             let area = frame.area();
-            let mut y = area.y;
+
+            // ------- bottom panel height (transcript gets the rest) -------
+            let editor_start = editor.cursor_row.saturating_sub(5);
+            let editor_h = ((editor.lines.len() - editor_start) as u16).clamp(1, 6);
+            let panel_h = if let Some(lines) = &dialog_lines {
+                lines.len() as u16 + 2
+            } else {
+                let mut h = editor_h + 2 + 2; // input box + context meter + hint
+                if running {
+                    h += live_tail.len() as u16 + 1; // live tail + status line
+                }
+                if !plan_lines.is_empty() {
+                    h += plan_lines.len() as u16 + 2;
+                }
+                if !attach_labels.is_empty() {
+                    h += 1;
+                }
+                if self.rate_limits.is_some() {
+                    h += 1;
+                }
+                h + popup.len() as u16
+            };
+            // The transcript keeps at least a few visible rows.
+            let panel_h = panel_h.min(area.height.saturating_sub(4)).max(1);
+            let split = area.height.saturating_sub(panel_h);
+            transcript.render(
+                frame.buffer_mut(),
+                Rect {
+                    height: split,
+                    ..area
+                },
+            );
+
+            let mut y = area.y + split;
             let row = |y: u16, h: u16| Rect {
                 x: area.x,
                 y,
@@ -2058,7 +2202,7 @@ impl App {
                 height: h.min(area.bottom().saturating_sub(y)),
             };
 
-            // Pickers and approval dialogs own the viewport: a rounded
+            // Pickers and approval dialogs own the panel: a rounded
             // accent-bordered box signals "keys go here now".
             if let Some(lines) = dialog_lines {
                 let h = lines.len() as u16 + 2;
@@ -2104,12 +2248,10 @@ impl App {
             // Input inside a rounded box, Claude Code style.
             // Show the cursor even when a long multi-line prompt exceeds
             // the six-row input box.
-            let editor_start = editor.cursor_row.saturating_sub(5);
             let visible_editor = editor.lines[editor_start..]
                 .iter()
                 .take(6)
                 .collect::<Vec<_>>();
-            let editor_h = (visible_editor.len() as u16).clamp(1, 6);
             let inner: Vec<Line> = visible_editor
                 .iter()
                 .map(|(first_logical_line, l)| {
@@ -2206,6 +2348,14 @@ impl App {
 
     /// Dim one-liner under the input box: mode, model, cache health.
     fn idle_hint(&self) -> String {
+        if let Some(nav) = &self.rewind_nav {
+            let files = if nav.candidates[nav.pos].dirty {
+                " · ctrl+r rewind + restore files"
+            } else {
+                ""
+            };
+            return format!("  ↺ rewind: enter confirm{files} · esc/↑ older · ↓ newer/exit");
+        }
         let u = self.turn_usage;
         let cache = if u.total_input() > 0 {
             format!(
@@ -2215,17 +2365,39 @@ impl App {
         } else {
             String::new()
         };
+        let scrolled = if self.transcript.is_following() {
+            ""
+        } else {
+            " · ↑ viewing history"
+        };
+        let notice = self
+            .notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+            .map(|(text, _)| format!(" · {text}"))
+            .unwrap_or_default();
         format!(
-            "  mode {} · {}{} · /help",
+            "  mode {} · {}{}{}{} · /help",
             self.mode_label,
             self.agent.model.snapshot().describe(),
-            cache
+            cache,
+            scrolled,
+            notice
         )
     }
 }
 
 /// Split a tool summary like `shell(cargo test)` into colored spans:
 /// the tool name is green, the arguments are dim.
+/// Whether a `read` call targets a Markdown file (so its output is worth
+/// rendering rather than showing raw). Keyed on the tool's `file_path`.
+fn path_is_markdown(input: &serde_json::Value) -> bool {
+    input["file_path"]
+        .as_str()
+        .map(|p| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase())
+        .is_some_and(|ext| matches!(ext.as_str(), "md" | "markdown" | "mdx"))
+}
+
 fn colored_tool_summary(summary: &str) -> Vec<Span<'static>> {
     let s = summary.to_string();
     if let Some(paren) = s.find('(') {
@@ -2449,50 +2621,7 @@ fn shorten_summary_path(summary: &str, cwd: Option<&Path>) -> String {
     format!("{tool}({})", relative.display())
 }
 
-/// Prevent the terminal from silently soft-wrapping baked output. A visible
-/// continuation marker makes copied code/text unambiguous: `↪` is display
-/// wrapping, whereas a new `Line` is an actual newline from the content.
-fn wrap_baked_lines(lines: Vec<Line<'static>>, terminal_width: usize) -> Vec<Line<'static>> {
-    use unicode_width::UnicodeWidthChar;
-
-    let width = terminal_width.saturating_sub(1).max(1);
-    let mut out = Vec::new();
-    for line in lines {
-        let mut current: Vec<Span<'static>> = Vec::new();
-        let mut current_width = 0usize;
-        for span in line.spans {
-            for c in span.content.chars() {
-                let char_width = c.width().unwrap_or(0);
-                if !current.is_empty() && current_width + char_width > width {
-                    out.push(pad_background_line(
-                        std::mem::take(&mut current),
-                        current_width,
-                        width,
-                    ));
-                    current_width = 0;
-                }
-                current.push(Span::styled(c.to_string(), span.style));
-                current_width += char_width;
-            }
-        }
-        out.push(pad_background_line(current, current_width, width));
-    }
-    out
-}
-
-/// Ratatui backgrounds otherwise stop at the final code character. Extend
-/// diff lines to the terminal edge, including every manually wrapped chunk.
-fn pad_background_line(mut spans: Vec<Span<'static>>, used: usize, width: usize) -> Line<'static> {
-    if let Some(background) = spans.iter().find_map(|span| span.style.bg) {
-        spans.push(Span::styled(
-            " ".repeat(width.saturating_sub(used)),
-            ratatui::style::Style::default().bg(background),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn area_width(terminal: &Terminal<KnownPosBackend>) -> u16 {
+fn area_width(terminal: &Term) -> u16 {
     terminal.size().map(|s| s.width).unwrap_or(80)
 }
 
@@ -2546,112 +2675,6 @@ fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
         cursor_row: visual_cursor.0,
         cursor_col: visual_cursor.1,
     }
-}
-
-/// ratatui's `insert_before` writes every buffer cell to the backend,
-/// including the placeholder cells after a wide (CJK) character. The
-/// backend then prints those placeholder spaces at an already-advanced
-/// cursor, shifting the line ("你 是 什 么"). Blanking the placeholder
-/// symbols keeps the terminal cursor in sync. (The normal `draw` path
-/// diffs the buffer and skips these cells, so it is unaffected.)
-fn blank_wide_continuations(buf: &mut ratatui::buffer::Buffer) {
-    use unicode_width::UnicodeWidthStr;
-    let area = buf.area;
-    for y in area.top()..area.bottom() {
-        let mut skip = 0usize;
-        for x in area.left()..area.right() {
-            let Some(cell) = buf.cell_mut((x, y)) else {
-                continue;
-            };
-            if skip > 0 {
-                cell.set_symbol("");
-                skip -= 1;
-            } else {
-                skip = cell.symbol().width().saturating_sub(1);
-            }
-        }
-    }
-}
-
-/// CrosstermBackend that can answer one cursor-position request from
-/// memory instead of querying the terminal over stdin.
-///
-/// Creating an inline-viewport terminal asks where the cursor is; that
-/// round-trip races with the crossterm event reader and with typed-ahead
-/// input, and a stale or lost answer places the new viewport on top of
-/// already-baked scrollback (text "disappears") or errors out. After
-/// startup we always know exactly where the viewport is, so resizes
-/// answer from memory and never touch the wire.
-struct KnownPosBackend {
-    inner: CrosstermBackend<Stdout>,
-    forced: Option<ratatui::layout::Position>,
-}
-
-impl ratatui::backend::Backend for KnownPosBackend {
-    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
-    where
-        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
-    {
-        self.inner.draw(content)
-    }
-    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
-        self.inner.append_lines(n)
-    }
-    fn hide_cursor(&mut self) -> std::io::Result<()> {
-        self.inner.hide_cursor()
-    }
-    fn show_cursor(&mut self) -> std::io::Result<()> {
-        self.inner.show_cursor()
-    }
-    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
-        match self.forced.take() {
-            Some(pos) => Ok(pos),
-            None => self.inner.get_cursor_position(),
-        }
-    }
-    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
-        &mut self,
-        position: P,
-    ) -> std::io::Result<()> {
-        self.inner.set_cursor_position(position)
-    }
-    fn clear(&mut self) -> std::io::Result<()> {
-        self.inner.clear()
-    }
-    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
-        self.inner.clear_region(clear_type)
-    }
-    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
-        self.inner.size()
-    }
-    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
-        self.inner.window_size()
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.inner.flush()
-    }
-}
-
-/// `known_top` = the row the viewport should start at (we track it);
-/// None (first creation only) queries the real cursor position.
-fn make_terminal(height: u16, known_top: Option<u16>) -> anyhow::Result<Terminal<KnownPosBackend>> {
-    let backend = KnownPosBackend {
-        inner: CrosstermBackend::new(std::io::stdout()),
-        forced: known_top.map(|y| ratatui::layout::Position { x: 0, y }),
-    };
-    Ok(Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(height),
-        },
-    )?)
-}
-
-fn change_key(tool: &str, input: &serde_json::Value) -> String {
-    format!(
-        "{tool}:{}",
-        serde_json::to_string(input).unwrap_or_default()
-    )
 }
 
 async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEvent> {
@@ -2728,21 +2751,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(true, "abc"), (true, "def")]
         );
-    }
-
-    #[test]
-    fn baked_lines_mark_visual_wraps() {
-        let lines = wrap_baked_lines(vec![Line::raw("abcdefghi")], 7);
-        let rendered = lines
-            .iter()
-            .map(|line| {
-                line.spans
-                    .iter()
-                    .map(|span| span.content.as_ref())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(rendered, ["abcdef", "ghi"]);
     }
 
     #[test]

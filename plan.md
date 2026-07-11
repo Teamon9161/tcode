@@ -244,9 +244,59 @@ tokio, reqwest(rustls, stream), serde/serde_json, ratatui, crossterm, arboard, s
    - **首期 non-goals**：不做 `@import`、`.tcode/rules`/path glob、会话结束自动建议、shell 脚本静态分析、无项目标记的外部目录猜测；这些没有真实需求前不增加解析器和状态。
    - **预算与安全**：启动指令与自动记忆分别计量，项目指令总预算先维持 16 KiB，自动记忆独立 25 KiB/200 行；动态补载每文件和每次 turn 都有硬上限，截断必须列出来源。所有路径 canonicalize 后做去重和边界判断，读取失败只产生可见诊断，不阻断无关工具。
    - **验收**：单测覆盖祖先顺序、同层优先级、home/root 排除、Git worktree identity、无 marker 外部路径、symlink/canonical 去重、预算 UTF-8 边界；agent-loop 集成测试覆盖只读按需加载、首次外部写阻断后重试、并行 read/edit preflight、resume/compact 后不重复注入；真实 smoke 覆盖从项目 A 读取并修改项目 B，确认 B 的规则在副作用前生效。
-7. **全屏渲染器**（可选，靠 Renderer trait 零重构）。
+7. **全屏渲染器** → 已升级为正式里程碑，见下节 M6。
 
 v2 方向（未变）：/branches 分支浏览、WASM 插件式 hooks。
+
+## M6：自绘屏幕渲染器（2026-07 决策，进行中）
+
+### 动机
+
+inline 模式把定型内容交给终端原生 scrollback，代价是**写入即不可撤销**：rewind 后旧转录仍留在屏幕上（同一条输入显示多次）、edit 的 diff 必须在审批前 prebake（被拒后无法撤下）、`/clear` 要靠清 purge 整个终端、退出时留大片空白。这些不是各自独立的 bug，是"渲染目标不受我们控制"这一个根因的多个症状。Codex tui2 的重做结论相同：**内存中的 transcript 作为唯一事实源，屏幕只是它的一个视图**。
+
+### 已确认决策（2026-07-11）
+
+1. **直接替换 inline**：alternate screen 成为唯一 TUI 路径，inline 代码删除；非 TTY 的 plain 模式保留。不留 `--inline` fallback。
+2. **鼠标全套自实现**：开启 mouse capture；滚轮滚动 transcript、拖选高亮、松开复制到系统剪贴板（arboard，SSH 下 OSC 52 回退）。Shift+拖选退回终端原生选择。
+3. **rewind 就地跳转**：双击 Esc 不再弹 picker——transcript 直接跳到并高亮上一个用户输入点，输入框预填原文；Esc/↑ 继续向前跳，Enter 确认截断（含文件回滚选项）。转录视觉同步截断，天然正确。
+4. **审批拒绝只留一行摘要**：diff 在审批对话框内固定高度滚动展示（不再 prebake 进转录）；Yes 才把 diff 落转录，No 只留 `edit(file) — declined` 一行。`previewed_changes` 机制整个删除。
+
+### 数据结构
+
+```rust
+// tcode-tui/transcript.rs
+struct Block {
+    lines: Vec<Line<'static>>,     // 逻辑行（未 wrap）
+    collapse: Option<Collapse>,    // 工具输出/diff 的折叠状态 + 内部滚动偏移
+    entry: Option<usize>,          // 对应 ledger entry，rewind 截断的映射
+    wrapped: Cache<Vec<Line>>,     // 按当前宽度的 wrap 缓存
+}
+struct Transcript {
+    blocks: Vec<Block>,
+    heights: Vec<usize>,           // 可视高度前缀和，append 时增量维护
+    scroll: Scroll,                // 距底部偏移；0 = 跟随流式输出
+    selection: Option<Selection>,  // 视觉行坐标 anchor/head
+}
+```
+
+### 性能纪律（渲染效率的保证，改动不得破坏）
+
+- **wrap 只算一次**：每块缓存当前宽度的 wrap 结果，只有 resize 使其失效；流式追加只重排最后一块。
+- **只渲染可见切片**：前缀和二分定位视口起点，每帧成本 O(视口高度)，与转录总长无关。
+- **ratatui 双缓冲 diff** 负责最小化终端写入；帧外再包 crossterm synchronized update 防撕裂。
+- 重绘按事件驱动 + 250ms tick 合并，不做无变化重绘。
+
+### 子里程碑（2026-07-11 全部实现，待真机验收）
+
+1. ✅ **M6a 核心替换**：`transcript.rs` + alternate screen 渲染循环；`bake`/`insert_before` 全部改写为 Transcript 追加；滚轮/PgUp/PgDn 滚动，新输出自动跟随（用户上滚时保持阅读位置，hint 行显示 `↑ viewing history`）；resize 全量 rewrap；alternate screen 退出即恢复原屏幕（"退出留空白"随之消失）。`KnownPosBackend`/`insert_before` 宽字符补丁等 inline 机制整体删除。
+2. ✅ **M6b 选择复制**：transcript 区域拖选高亮（REVERSED）→ 松开即复制（arboard，失败退 OSC 52）；软换行行复制时自动合并、行尾 padding 剔除；hint 行短暂显示 "copied N lines"。
+3. ✅ **M6c 块级交互**：统一为 `Block { head, detail }` 模型——工具输出 = head（`⎿ preview ▸`）+ 默认折叠的 detail；edit diff = 默认展开、固定 14 行、超出部分 footer 显示范围；**点击块 = 折叠/展开，悬停滚轮 = 区域内滚，拖动 = 选择**。审批对话框内嵌可滚动 diff（滚轮/PgUp/PgDn），拒绝只留 `⎿ declined` 一行——prebake/`previewed_changes` 机制删除，每个 tool call 恰好渲染一次（ToolStart），特殊情况消失。
+4. ✅ **M6d rewind 就地跳转**：用户输入 echo 块携带 ledger entry 标签；双击 Esc 进导航——transcript 跳转并高亮（琥珀底色）目标输入、编辑框预填原文，Esc/↑ 更早、↓ 更近（越过最新则退出），Enter 确认（ctrl+r = 同时回滚文件）；确认后 `truncate_from_entry` 让视觉与 ledger 同步截断。`rewind.rs` picker 已删除。
+
+### 调研备注
+
+- 现成 crate 无法直接套：`tui-textarea`/`ratatui-code-editor` 的选择只针对编辑器组件；`tui-scrollview` 按内容总尺寸分配整块 buffer，长转录不可接受。自实现是正解。
+- Codex tui2 踩过的坑值得预防：滚轮/触控板事件在不同终端节奏差异大（iTerm2 连发），滚动步长需按事件序列自适应；alternate screen 下终端原生搜索不可用，后续可考虑 `/` 转录内搜索（暂列 v2，不进 M6）。
 
 
 ## 验证方式（贯穿）
@@ -256,6 +306,11 @@ v2 方向（未变）：/branches 分支浏览、WASM 插件式 hooks。
 - 每里程碑用真实 API 跑端到端任务，盯状态行缓存命中数字（这本身就是对"省 token"的持续验收）。
 
 
-## 待解决问题
-1. 退出时会留下较大空白，之前好像是因为退出的时候新的命令行会挤在底下的context栏什么的中间才被改成这样的，但这个解决方式是不是有点过于简单了，现在退出的时候中间一大片空白行也有点奇怪。
-2. deepseek模型名称那里感觉不需要带[1m]后缀了吧，这个是为了让claude-code知道这是个1m context的模型才使用的，
+## 待解决问题（2026-07 已处理）
+1. ✅ **折叠交互与工具输出排版**：折叠指示器改为动态渲染在 head 末行——收起显示 `▸ N lines`（accent 色，明确可点击并告知隐藏多少），展开显示 `▾`（方向翻转）；展开体加左侧 `│ ` gutter bar 作为"框"分隔；消除首行重复（plain 输出跳过已在 preview 完整展示的第一行，被截断的除外）；markdown 类输出（`web_fetch`、`read` 到 `.md`）走 markdown 渲染器，其余保持字面但用默认前景色（不再一律 dim）改善可读性。（`transcript.rs::Block::row`、`app.rs::output_detail`/`path_is_markdown`）
+2. ✅ **模型配置 toml 化 + 去掉 `[1m]`**：新增内置 `crates/tcode-core/src/default.toml`（`Config::defaults()` 经 `include_str!` 解析），作为运行时 `load()` 的基础层；用户 `~/.tcode/config.toml` 按 profile key 合并、models 按 name 覆盖/增量（`Profile::merge`/`Config::overlay`）。默认层不落盘：`load_global()` 仍只读用户文件（setup 读写它），`load()` 才叠加 defaults。deepseek 用真实 id `deepseek-v4-pro`/`deepseek-v4-flash`（1M context 记在 `context_window`，不再是 `[1m]` 后缀）。**模型目录 2026-07 校准**（经 claude-api skill + web 搜索核实）：Anthropic Opus 4.8 / Sonnet 5 / Fable 5 均为 1M context（原 200K 是错的），Haiku 4.5 200K；OpenAI 换 gpt-5.6-sol/terra/luna（1.05M）；DeepSeek v4 1M。`/model` picker 过滤掉无凭证的默认 profile（`Profile::is_usable`，`build_menu`）。`presets` 改为从 defaults() 取，wizard 与运行时默认层不再各写一份。**`/provider` 自定义端点**：wizard 加 `c` 键定义 openai/anthropic 兼容 profile（名称/协议/base_url/模型/key，`read_custom_provider`）。
+3. ✅ **审批时完整 diff 进记录**：change 提案在审批对话框打开时即以完整（不截断）open diff 落入 transcript，滚轮滚动 transcript 可看全码；对话框只留选项。批准 → 该 diff 留存，后续 `ToolStart` 跳过重画（`change_prebake`）；拒绝 → 回撤该块只留一行 `⎿ declined`（`truncate_blocks`）；批量（`ToolBatchStart`）会撤销单条 pre-bake 再整体渲染。审批对话框内嵌 diff（`CHANGE_ROWS`/`scroll_change`）整套删除。
+4. ✅ **Anthropic provider 的 effort wire 迁移**（2026-07-11 实现）：`anthropic.rs::build_body` 的旧 `thinking:{type:"enabled",budget_tokens:N}` 会在新模型（Opus 4.8、Sonnet 5、Fable 5）上返回 400。修复按端点分流——`AnthropicProvider` 新增 `native` 字段（base_url 为 None 或含 `anthropic.com` 判为第一方；`api.deepseek.com/anthropic` 等兼容后端为 false）：
+   - **native**：`low/medium/high` → `thinking:{type:"adaptive"}` + `output_config:{effort:...}`（经 Anthropic 文档核实）；`off` → `thinking:{type:"disabled"}`；`None`（picker auto）省略 thinking。Fable 无 effort dial，只走 None 分支，天然省略 thinking，满足其"连 disabled 都拒"的要求。
+   - **兼容后端**（DeepSeek 等）：保持旧的 `enabled`+`budget_tokens`（DeepSeek 的 Anthropic 兼容端点仍吃这格式），行为不变。
+   - 单测覆盖 native/兼容 × None/off/low/medium/high 五档 wire（`anthropic.rs::tests`）。

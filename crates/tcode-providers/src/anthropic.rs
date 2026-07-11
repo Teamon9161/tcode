@@ -22,6 +22,11 @@ pub struct AnthropicProvider {
     api_key: String,
     model: String,
     base_url: String,
+    /// True when talking to the first-party Anthropic API (vs an
+    /// Anthropic-compatible backend like DeepSeek). Decides the effort
+    /// wire format: native uses adaptive thinking + `output_config.effort`;
+    /// compatible backends still take the classic `thinking.budget_tokens`.
+    native: bool,
     watchdog: WatchdogConfig,
 }
 
@@ -32,6 +37,12 @@ impl AnthropicProvider {
         base_url: Option<String>,
         watchdog: WatchdogConfig,
     ) -> Self {
+        // A `None` base_url means the default first-party endpoint; an
+        // explicit URL is native only if it is on anthropic.com (matches
+        // api.anthropic.com but not e.g. api.deepseek.com/anthropic).
+        let native = base_url
+            .as_deref()
+            .map_or(true, |u| u.contains("anthropic.com"));
         Self {
             http: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -40,6 +51,7 @@ impl AnthropicProvider {
             api_key,
             model,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
+            native,
             watchdog,
         }
     }
@@ -82,12 +94,28 @@ impl AnthropicProvider {
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
-        // Effort → extended-thinking budget. "off" forces thinking off
-        // (some Anthropic-compatible backends, e.g. DeepSeek, think by
-        // default); None leaves the server default untouched.
+        // Effort mapping. None (picker "auto") leaves the server default
+        // untouched — always safe. "off" forces thinking off (some backends,
+        // e.g. DeepSeek, think by default). Explicit low/medium/high depends
+        // on the endpoint:
+        //   - Native Anthropic (Opus 4.8, Sonnet 5, …) removed the legacy
+        //     `thinking:{enabled,budget_tokens}` field (it now 400s) in
+        //     favour of adaptive thinking guided by `output_config.effort`.
+        //   - Compatible backends still take the classic budget form.
+        // Fable 5 has no effort dial (its models carry no efforts), so it
+        // only ever hits the None arm — thinking is omitted entirely, which
+        // is what it requires.
         match req.effort.as_deref() {
             None => {}
             Some("off") => body["thinking"] = json!({ "type": "disabled" }),
+            Some(effort) if self.native => {
+                let level = match effort {
+                    "low" | "medium" | "high" => effort,
+                    _ => "high",
+                };
+                body["thinking"] = json!({ "type": "adaptive" });
+                body["output_config"] = json!({ "effort": level });
+            }
             Some(effort) => {
                 let budget: u32 = match effort {
                     "low" => 4096,
@@ -284,5 +312,99 @@ impl Provider for AnthropicProvider {
 
         let guarded = with_idle_timeout(raw, self.watchdog.idle_timeout());
         Ok(Box::pin(guarded.take_until(cancel.cancelled_owned())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tcode_core::{ContentBlock, Message, Role};
+
+    fn watchdog() -> WatchdogConfig {
+        WatchdogConfig {
+            idle_timeout_secs: 5,
+            max_retries: 1,
+            initial_backoff_ms: 1,
+        }
+    }
+
+    fn req(effort: Option<&str>) -> Request {
+        Request {
+            model: "m".into(),
+            system: "sys".into(),
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+            max_tokens: 1000,
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    fn native() -> AnthropicProvider {
+        AnthropicProvider::new("k".into(), "m".into(), None, watchdog())
+    }
+
+    fn compatible() -> AnthropicProvider {
+        AnthropicProvider::new(
+            "k".into(),
+            "m".into(),
+            Some("https://api.deepseek.com/anthropic".into()),
+            watchdog(),
+        )
+    }
+
+    #[test]
+    fn base_url_decides_native() {
+        assert!(native().native);
+        assert!(!compatible().native);
+        // An explicit first-party URL is still native.
+        assert!(AnthropicProvider::new(
+            "k".into(),
+            "m".into(),
+            Some("https://api.anthropic.com".into()),
+            watchdog(),
+        )
+        .native);
+    }
+
+    #[test]
+    fn none_effort_omits_thinking() {
+        for p in [native(), compatible()] {
+            let body = p.build_body(&req(None));
+            assert!(body.get("thinking").is_none());
+            assert!(body.get("output_config").is_none());
+            assert_eq!(body["max_tokens"], json!(1000));
+        }
+    }
+
+    #[test]
+    fn off_disables_thinking_both_backends() {
+        for p in [native(), compatible()] {
+            let body = p.build_body(&req(Some("off")));
+            assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+            assert!(body.get("output_config").is_none());
+        }
+    }
+
+    #[test]
+    fn native_uses_adaptive_and_output_config() {
+        let body = native().build_body(&req(Some("medium")));
+        assert_eq!(body["thinking"], json!({ "type": "adaptive" }));
+        assert_eq!(body["output_config"], json!({ "effort": "medium" }));
+        // No legacy budget bump on native.
+        assert_eq!(body["max_tokens"], json!(1000));
+    }
+
+    #[test]
+    fn compatible_uses_legacy_budget() {
+        let body = compatible().build_body(&req(Some("medium")));
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 12288 })
+        );
+        assert!(body.get("output_config").is_none());
+        assert_eq!(body["max_tokens"], json!(1000 + 12288));
     }
 }
