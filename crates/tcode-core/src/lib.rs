@@ -1,13 +1,16 @@
 pub mod accumulate;
 pub mod agent;
+pub mod background;
 pub mod blobs;
 pub mod checkpoint;
 pub mod codex;
 pub mod config;
+pub mod export;
 pub mod external;
 pub mod freshness;
 pub mod hooks;
 pub mod ledger;
+pub mod memory;
 pub mod permission;
 pub mod provider;
 pub mod store;
@@ -15,18 +18,21 @@ pub mod stream_util;
 pub mod tool;
 pub mod types;
 
-pub use agent::{Agent, AgentError, AgentEvent, Session};
+pub use agent::{Agent, AgentError, AgentEvent, Session, DEFAULT_MAX_STEPS};
+pub use background::{BackgroundTasks, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
-pub use external::{import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource};
+pub use export::export_markdown;
+pub use external::{
+    import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
+};
 pub use hooks::{HookDef, HookEvent, Hooks};
 pub use ledger::{Entry, Ledger, LedgerSink};
-pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
-pub use permission::{
-    Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules,
-};
+pub use memory::{MemoryManager, MemoryUpdate};
+pub use permission::{Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules};
 pub use provider::{
     ActiveModel, CacheStrategy, EventStream, ModelCell, Provider, ProviderError, Request,
     StreamEvent,
 };
+pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use tool::{PermissionRequest, Tool, ToolCtx, ToolOutput};
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

@@ -43,6 +43,8 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "http2",
     "charset",
+    # Honor the OS-level proxy (e.g. Windows system proxy), not just env vars.
+    "system-proxy",
 ] }
 eventsource-stream = "0.2"
 uuid = { version = "1", features = ["v4"] }

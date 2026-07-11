@@ -11,7 +11,9 @@ pub struct UpdatePlanTool;
 
 #[async_trait]
 impl Tool for UpdatePlanTool {
-    fn name(&self) -> &str { "update_plan" }
+    fn name(&self) -> &str {
+        "update_plan"
+    }
     fn description(&self) -> &str {
         "Record the current execution plan. Use a short ordered list; each item must have a step and status (pending, in_progress, or completed). Keep it current as work advances."
     }
@@ -25,7 +27,9 @@ impl Tool for UpdatePlanTool {
             "required": ["plan"]
         })
     }
-    fn permission(&self, _: &Value) -> PermissionRequest { PermissionRequest::None }
+    fn permission(&self, _: &Value) -> PermissionRequest {
+        PermissionRequest::None
+    }
     async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
         ToolOutput::ok("plan updated")
     }
@@ -35,7 +39,9 @@ pub struct AskUserTool;
 
 #[async_trait]
 impl Tool for AskUserTool {
-    fn name(&self) -> &str { "ask_user" }
+    fn name(&self) -> &str {
+        "ask_user"
+    }
     fn description(&self) -> &str {
         "Ask the user a blocking question when a choice is required to continue. Provide 2–4 concise options. The selected option and any note are returned as a harness note."
     }
@@ -52,7 +58,10 @@ impl Tool for AskUserTool {
     fn permission(&self, input: &Value) -> PermissionRequest {
         PermissionRequest::UserInput {
             descriptor: "ask_user".into(),
-            summary: input["question"].as_str().unwrap_or("Choose how to continue").into(),
+            summary: input["question"]
+                .as_str()
+                .unwrap_or("Choose how to continue")
+                .into(),
         }
     }
     async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
@@ -64,15 +73,22 @@ pub struct AddNoteTool;
 
 #[async_trait]
 impl Tool for AddNoteTool {
-    fn name(&self) -> &str { "add_note" }
+    fn name(&self) -> &str {
+        "add_note"
+    }
     fn description(&self) -> &str {
         "Record a concise durable note for the current conversation before continuing. Use it for decisions, constraints, or handoff context."
     }
     fn input_schema(&self) -> Value {
         json!({ "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] })
     }
-    fn permission(&self, _: &Value) -> PermissionRequest { PermissionRequest::None }
+    fn permission(&self, _: &Value) -> PermissionRequest {
+        PermissionRequest::None
+    }
     async fn run(&self, input: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
-        ToolOutput::ok(format!("note recorded: {}", input["text"].as_str().unwrap_or("")))
+        ToolOutput::ok(format!(
+            "note recorded: {}",
+            input["text"].as_str().unwrap_or("")
+        ))
     }
 }

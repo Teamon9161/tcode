@@ -10,16 +10,14 @@ use tokio_util::sync::CancellationToken;
 use crate::accumulate::ResponseAccumulator;
 use crate::config::WatchdogConfig;
 use crate::ledger::{Entry, Ledger};
-use crate::permission::{
-    ApprovalDecision, Approver, Decision, PermissionMode, PermissionRules,
-};
+use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode, PermissionRules};
 use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{PermissionRequest, Tool, ToolCtx, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 
-/// Hard ceiling on model round-trips per user turn; a runaway loop
-/// should never bill unbounded.
-const MAX_STEPS: usize = 100;
+/// Default ceiling on model round-trips per user turn; a runaway loop
+/// should never bill unbounded. Configurable via `limits.max_steps_per_turn`.
+pub const DEFAULT_MAX_STEPS: usize = 100;
 
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
@@ -68,6 +66,11 @@ pub enum AgentEvent {
     /// A mutating call was declined without guidance. The turn is over so the
     /// user can provide the missing direction instead of the model guessing.
     AwaitingUserInput,
+    /// The runaway guard ended the turn. Nothing is lost: the ledger is
+    /// consistent and the user can simply ask to continue.
+    StepLimitReached {
+        max: usize,
+    },
     Interrupted,
     TurnEnd,
 }
@@ -76,8 +79,6 @@ pub enum AgentEvent {
 pub enum AgentError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    #[error("agent stopped after {MAX_STEPS} steps in one turn")]
-    StepLimit,
     #[error("event channel closed")]
     ChannelClosed,
 }
@@ -116,9 +117,18 @@ impl Session {
             return None;
         }
         let pct = (self.last_prompt_tokens as f64 / context_window as f64 * 100.0).round();
+        let background = {
+            let tasks = self.tool_ctx.background.lock().expect("background lock");
+            let running = tasks.running();
+            if running.is_empty() {
+                String::new()
+            } else {
+                format!(" · background tasks running: {}", running.join(", "))
+            }
+        };
         Some(ContentBlock::Text {
             text: format!(
-                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}</tcode-status>",
+                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}</tcode-status>",
                 context_window / 1000,
                 self.mode.label()
             ),
@@ -133,6 +143,9 @@ pub struct Agent {
     pub system: String,
     pub watchdog: WatchdogConfig,
     pub hooks: crate::hooks::Hooks,
+    /// Runaway guard: model round-trips per user turn before the harness
+    /// ends the turn gracefully.
+    pub max_steps: usize,
 }
 
 impl Agent {
@@ -161,15 +174,30 @@ impl Agent {
             self.emit(events, AgentEvent::Compacting).await?;
             self.compact(session, &cancel).await?;
         }
+        // Background tasks that finished between turns: tell the model
+        // before its new instruction (pure append, cache-safe).
+        self.note_finished_background_tasks(session);
+        if let Some(reminder) = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .maintenance_reminder()
+        {
+            input.push(ContentBlock::Text { text: reminder });
+        }
         if let Some(status) = session.status_block(model.context_window) {
             input.push(status);
         }
         session.ledger.append(Entry::User(input));
         session.turn_usage = Usage::default();
 
-        for _step in 0..MAX_STEPS {
-            let (blocks, usage, stop) =
-                self.stream_step(&model, session, events, &cancel).await?;
+        let max_steps = self.max_steps.max(1);
+        // One-shot heads-up at ~80% so the model wraps up instead of being
+        // cut off mid-exploration.
+        let warn_at = max_steps * 4 / 5;
+        for step in 0..max_steps {
+            let (blocks, usage, stop) = self.stream_step(&model, session, events, &cancel).await?;
             session.last_prompt_tokens = usage.total_input() + usage.output_tokens;
             session.turn_usage.input_tokens += usage.input_tokens;
             session.turn_usage.output_tokens += usage.output_tokens;
@@ -213,8 +241,30 @@ impl Agent {
                 self.emit(events, AgentEvent::TurnEnd).await?;
                 return Ok(());
             }
+            // End of a tool batch is a safe append boundary for background
+            // task completion notes.
+            self.note_finished_background_tasks(session);
+            if step + 1 == warn_at {
+                session.ledger.append(Entry::Note(format!(
+                    "step {} of {max_steps} for this turn; the harness ends \
+                     the turn at the limit. Finish up or report progress \
+                     instead of starting new exploration.",
+                    step + 1
+                )));
+            }
         }
-        Err(AgentError::StepLimit)
+        // Runaway guard tripped. The ledger is consistent (the last tool
+        // batch committed its results), so end the turn instead of erroring:
+        // the user can review and simply ask to continue.
+        session.ledger.append(Entry::Note(format!(
+            "Turn ended by the harness after {max_steps} model steps \
+             (runaway guard). Nothing was lost; continue where you left off \
+             when the user asks."
+        )));
+        self.emit(events, AgentEvent::StepLimitReached { max: max_steps })
+            .await?;
+        self.emit(events, AgentEvent::TurnEnd).await?;
+        Ok(())
     }
 
     /// Summarize the whole ledger into one entry — the single deliberate
@@ -271,6 +321,15 @@ the summary text.";
         }
         let upto = session.ledger.len();
         session.ledger.compact(summary, upto);
+        let memory_note = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .post_compact_note();
+        if let Some(note) = memory_note {
+            session.ledger.append(Entry::Note(note));
+        }
         session.turn_usage.input_tokens += usage.input_tokens;
         session.turn_usage.output_tokens += usage.output_tokens;
         session.turn_usage.cache_read_tokens += usage.cache_read_tokens;
@@ -305,9 +364,7 @@ the summary text.";
                 match item {
                     Ok(ev) => {
                         match &ev {
-                            StreamEvent::Started => {
-                                self.emit(events, AgentEvent::Started).await?
-                            }
+                            StreamEvent::Started => self.emit(events, AgentEvent::Started).await?,
                             StreamEvent::TextDelta(t) => {
                                 self.emit(events, AgentEvent::TextDelta(t.clone())).await?
                             }
@@ -352,13 +409,33 @@ the summary text.";
         approver: &dyn Approver,
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
+        let memory_note = self.preflight_memory(session, calls);
+        if let Some(note) = &memory_note {
+            let has_mutation = calls.iter().any(|(_, name, input)| {
+                self.tool(name)
+                    .is_some_and(|tool| tool.is_mutating() && !tool.context_paths(input).is_empty())
+            });
+            if has_mutation {
+                let message = "Not executed: new directory-scoped instructions were loaded for this tool batch. Review them and retry only the actions that still comply; no side effects occurred.";
+                let results = calls
+                    .iter()
+                    .map(|(id, _, _)| tool_result(id, message, true))
+                    .collect();
+                session.ledger.append(Entry::ToolResults(results));
+                session.ledger.append(Entry::Note(note.clone()));
+                return Ok(ToolsOutcome {
+                    interrupted: false,
+                    awaiting_user_input: false,
+                });
+            }
+        }
         if calls.len() > 1
             && calls
                 .iter()
                 .all(|(_, name, _)| is_parallel_read_only_tool(name))
         {
             return self
-                .run_read_only_tools_parallel(session, calls, events, cancel)
+                .run_read_only_tools_parallel(session, calls, events, cancel, memory_note)
                 .await;
         }
         // Edits to distinct files are the other safe parallel case.  Do not
@@ -370,8 +447,27 @@ the summary text.";
                 .run_file_mutations_parallel(session, calls, events, approver, cancel)
                 .await;
         }
+        // Shell / bash: batch the approval (show all commands at once),
+        // then run sequentially so side effects from earlier commands
+        // are visible to later ones.
+        if calls.len() > 1
+            && calls
+                .iter()
+                .all(|(_, name, _)| is_sequential_batch_tool(name))
+        {
+            return self
+                .run_sequential_batch_combined_approval(
+                    session,
+                    calls,
+                    events,
+                    approver,
+                    cancel,
+                    memory_note,
+                )
+                .await;
+        }
         let mut results: Vec<ContentBlock> = Vec::new();
-        let mut notes: Vec<String> = Vec::new();
+        let mut notes: Vec<String> = memory_note.into_iter().collect();
         let mut executed: Vec<String> = Vec::new();
         let mut declined = false;
         let mut awaiting_user_input = false;
@@ -419,10 +515,13 @@ the summary text.";
                 Decision::Ask => {
                     let (descriptor, summary) = match &request {
                         PermissionRequest::Ask {
-                            descriptor, summary, ..
+                            descriptor,
+                            summary,
+                            ..
                         }
                         | PermissionRequest::UserInput {
-                            descriptor, summary,
+                            descriptor,
+                            summary,
                         } => (descriptor, summary),
                         PermissionRequest::None => unreachable!("Ask decision implies a prompt"),
                     };
@@ -511,6 +610,17 @@ the summary text.";
                 session.tool_ctx.clear_usage_reporter();
                 output
             };
+            if !output.is_error {
+                if let Some(raw) = tool.touches(input) {
+                    let path = session.tool_ctx.resolve(&raw);
+                    session
+                        .tool_ctx
+                        .memory
+                        .lock()
+                        .expect("memory lock")
+                        .mark_written(&path);
+                }
+            }
             // Post-tool hooks (e.g. a formatter after edit): their
             // failures are appended so the model sees them immediately.
             let post = self
@@ -554,8 +664,7 @@ the summary text.";
         }
 
         if let Some(at) = interrupted_at {
-            let cancelled: Vec<String> =
-                calls[at..].iter().map(|(_, n, _)| n.clone()).collect();
+            let cancelled: Vec<String> = calls[at..].iter().map(|(_, n, _)| n.clone()).collect();
             self.commit_interrupt(session, &[], &cancelled, false);
             // Executed calls before the cut already have real results.
             let _ = executed;
@@ -580,10 +689,11 @@ the summary text.";
         calls: &[(String, String, Value)],
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
+        memory_note: Option<String>,
     ) -> Result<ToolsOutcome, AgentError> {
         let mut prepared = Vec::new();
         let mut results = Vec::new();
-        let mut notes = Vec::new();
+        let mut notes: Vec<String> = memory_note.into_iter().collect();
         for (id, name, input) in calls {
             let Some(tool) = self.tool(name).cloned() else {
                 results.push(tool_result(id, &format!("Unknown tool '{name}'"), true));
@@ -601,7 +711,11 @@ the summary text.";
                 .await;
             notes.extend(pre.notes);
             if let Some(reason) = pre.block {
-                results.push(tool_result(id, &format!("Blocked by pre-tool hook: {reason}"), true));
+                results.push(tool_result(
+                    id,
+                    &format!("Blocked by pre-tool hook: {reason}"),
+                    true,
+                ));
                 continue;
             }
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
@@ -619,9 +733,11 @@ the summary text.";
         )
         .await?;
 
-        let outputs = join_all(prepared.iter().map(|(_, _, input, tool)| {
-            tool.run(input.clone(), &session.tool_ctx, cancel)
-        }))
+        let outputs = join_all(
+            prepared
+                .iter()
+                .map(|(_, _, input, tool)| tool.run(input.clone(), &session.tool_ctx, cancel)),
+        )
         .await;
         for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
             let post = self
@@ -710,7 +826,9 @@ the summary text.";
                 }
                 Decision::Ask => {
                     let PermissionRequest::Ask {
-                        descriptor, summary, ..
+                        descriptor,
+                        summary,
+                        ..
                     } = tool.permission(input)
                     else {
                         unreachable!("file mutation needs an edit approval")
@@ -719,13 +837,17 @@ the summary text.";
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
-                                notes.push(format!("Note from the user when approving {name}: {note}"));
+                                notes.push(format!(
+                                    "Note from the user when approving {name}: {note}"
+                                ));
                             }
                         }
                         ApprovalDecision::YesAlways => {
                             session.rules.allow.push(descriptor);
                             if let Some(note) = approval.comment {
-                                notes.push(format!("Note from the user when approving {name}: {note}"));
+                                notes.push(format!(
+                                    "Note from the user when approving {name}: {note}"
+                                ));
                             }
                         }
                         ApprovalDecision::No => {
@@ -777,7 +899,9 @@ the summary text.";
         // Save every original before a concurrent task gets a chance to
         // change it. `touches` is guaranteed by the batch predicate.
         for (_, _, input, tool) in &prepared {
-            let path = session.tool_ctx.resolve(&tool.touches(input).expect("preflighted path"));
+            let path = session
+                .tool_ctx
+                .resolve(&tool.touches(input).expect("preflighted path"));
             let len = session.ledger.len();
             if let Some(ev) = session.checkpoints.save(len, &path) {
                 session.ledger.record_aux(&ev);
@@ -795,12 +919,27 @@ the summary text.";
         )
         .await?;
 
-        let outputs = join_all(prepared.iter().map(|(_, _, input, tool)| {
-            tool.run(input.clone(), &session.tool_ctx, cancel)
-        }))
+        let outputs = join_all(
+            prepared
+                .iter()
+                .map(|(_, _, input, tool)| tool.run(input.clone(), &session.tool_ctx, cancel)),
+        )
         .await;
         let mut results = Vec::new();
         for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
+            if !output.is_error {
+                if let Some(tool) = self.tool(&name) {
+                    if let Some(raw) = tool.touches(&input) {
+                        let path = session.tool_ctx.resolve(&raw);
+                        session
+                            .tool_ctx
+                            .memory
+                            .lock()
+                            .expect("memory lock")
+                            .mark_written(&path);
+                    }
+                }
+            }
             let post = self
                 .hooks
                 .run(
@@ -831,6 +970,245 @@ the summary text.";
         for note in notes {
             session.ledger.append(Entry::Note(note));
         }
+        Ok(ToolsOutcome {
+            interrupted: cancel.is_cancelled(),
+            awaiting_user_input: false,
+        })
+    }
+
+    /// Run multiple shell/bash calls with a single combined approval step.
+    /// All commands are shown in the batch display, the user approves once,
+    /// then they run sequentially so side effects are visible to later calls.
+    async fn run_sequential_batch_combined_approval(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        events: &mpsc::Sender<AgentEvent>,
+        approver: &dyn Approver,
+        cancel: &CancellationToken,
+        memory_note: Option<String>,
+    ) -> Result<ToolsOutcome, AgentError> {
+        // Pre-flight: gather tools, hooks, and build the batch label.
+        let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
+        let mut notes: Vec<String> = memory_note.into_iter().collect();
+        for (id, name, input) in calls {
+            let Some(tool) = self.tool(name).cloned() else {
+                return Ok(ToolsOutcome {
+                    interrupted: false,
+                    awaiting_user_input: false,
+                });
+            };
+            let pre = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PreToolUse,
+                    name,
+                    input,
+                    None,
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            notes.extend(pre.notes);
+            if let Some(reason) = pre.block {
+                let results: Vec<ContentBlock> = calls
+                    .iter()
+                    .map(|(cid, _, _)| {
+                        let msg = if cid == id {
+                            format!("Blocked by pre-tool hook: {reason}")
+                        } else {
+                            "Not executed: a previous tool call in this batch was blocked.".into()
+                        };
+                        tool_result(cid, &msg, true)
+                    })
+                    .collect();
+                session.ledger.append(Entry::ToolResults(results));
+                return Ok(ToolsOutcome {
+                    interrupted: false,
+                    awaiting_user_input: false,
+                });
+            }
+            prepared.push((id.clone(), name.clone(), input.clone(), tool));
+        }
+
+        let batch_label = format!(
+            "shell · Run {} {}",
+            prepared.len(),
+            if prepared.len() == 1 {
+                "command"
+            } else {
+                "commands"
+            }
+        );
+
+        // Combined approval: ask once for the whole batch.
+        for (id, name, input, tool) in &prepared {
+            let request = tool.permission(input);
+            match session.rules.decide(session.mode, &request) {
+                Decision::Allow => {}
+                Decision::Deny(reason) => {
+                    let results: Vec<ContentBlock> = calls
+                        .iter()
+                        .map(|(cid, _, _)| {
+                            tool_result(
+                                cid,
+                                if cid == id {
+                                    &reason
+                                } else {
+                                    "Not executed: a previous tool call in this batch was declined."
+                                },
+                                true,
+                            )
+                        })
+                        .collect();
+                    session.ledger.append(Entry::ToolResults(results));
+                    return Ok(ToolsOutcome {
+                        interrupted: false,
+                        awaiting_user_input: false,
+                    });
+                }
+                Decision::Ask => {
+                    let (PermissionRequest::Ask {
+                        descriptor,
+                        summary,
+                        ..
+                    }
+                    | PermissionRequest::UserInput {
+                        descriptor,
+                        summary,
+                    }) = &request
+                    else {
+                        unreachable!()
+                    };
+                    let approval = approver.ask(name, summary, descriptor, input).await;
+                    match approval.decision {
+                        ApprovalDecision::Yes => {
+                            if let Some(note) = approval.comment {
+                                notes.push(format!(
+                                    "Note from the user when approving {name}: {note}"
+                                ));
+                            }
+                        }
+                        ApprovalDecision::YesAlways => {
+                            if !matches!(request, PermissionRequest::UserInput { .. }) {
+                                session.rules.allow.push(descriptor.clone());
+                            }
+                            if let Some(note) = approval.comment {
+                                notes.push(format!(
+                                    "Note from the user when approving {name}: {note}"
+                                ));
+                            }
+                        }
+                        ApprovalDecision::No => {
+                            let (reason, awaiting_user_input) = match approval.comment {
+                                Some(comment) => (
+                                    format!("User declined this action. Reason: {comment}"),
+                                    false,
+                                ),
+                                None => (
+                                    "User declined this action without further guidance. Stop now and wait for the user's next instruction; do not guess an alternative.".to_string(),
+                                    true,
+                                ),
+                            };
+                            let results: Vec<ContentBlock> = calls
+                                .iter()
+                                .map(|(cid, _, _)| {
+                                    tool_result(
+                                        cid,
+                                        if cid == id {
+                                            &reason
+                                        } else {
+                                            "Not executed: a previous tool call in this batch was declined."
+                                        },
+                                        true,
+                                    )
+                                })
+                                .collect();
+                            session.ledger.append(Entry::ToolResults(results));
+                            return Ok(ToolsOutcome {
+                                interrupted: false,
+                                awaiting_user_input,
+                            });
+                        }
+                    }
+                    // Only ask once for the whole batch
+                    break;
+                }
+            }
+        }
+
+        // Emit batch start for display.
+        let batch_calls: Vec<(String, Value)> = prepared
+            .iter()
+            .map(|(_, name, input, _)| (name.clone(), input.clone()))
+            .collect();
+        self.emit(
+            events,
+            AgentEvent::ToolBatchStart {
+                label: batch_label,
+                calls: batch_calls,
+            },
+        )
+        .await?;
+
+        // Run sequentially.
+        let mut results: Vec<ContentBlock> = Vec::new();
+        for (id, name, input, tool) in &prepared {
+            if cancel.is_cancelled() {
+                results.push(tool_result(id, "Cancelled by user before execution.", true));
+                let cancelled: Vec<ContentBlock> = prepared
+                    .iter()
+                    .skip(results.len())
+                    .map(|(cid, _, _, _)| {
+                        tool_result(cid, "Cancelled by user before execution.", true)
+                    })
+                    .collect();
+                results.extend(cancelled);
+                break;
+            }
+            self.emit(
+                events,
+                AgentEvent::ToolStart {
+                    name: name.clone(),
+                    summary: summarize_call(name, input),
+                    input: input.clone(),
+                },
+            )
+            .await?;
+
+            let mut output = tool.run(input.clone(), &session.tool_ctx, cancel).await;
+
+            let post = self
+                .hooks
+                .run(
+                    crate::hooks::HookEvent::PostToolUse,
+                    name,
+                    input,
+                    Some(&output.content),
+                    &session.tool_ctx.cwd,
+                )
+                .await;
+            for note in post.notes {
+                output.content.push_str(&format!("\n[hook] {note}"));
+            }
+            let output = self.gate(session, name, output);
+
+            self.emit(
+                events,
+                AgentEvent::ToolEnd {
+                    name: name.clone(),
+                    preview: preview(&output.content),
+                    content: output.content.clone(),
+                    is_error: output.is_error,
+                },
+            )
+            .await?;
+            results.push(tool_result(id, &output.content, output.is_error));
+        }
+
+        for note in notes {
+            session.ledger.append(Entry::Note(note));
+        }
+        session.ledger.append(Entry::ToolResults(results));
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
@@ -916,6 +1294,40 @@ the summary text.";
         session.ledger.append(Entry::Note(msg));
     }
 
+    /// Append harness notes for background tasks that finished since the
+    /// last check. Only called at safe boundaries (turn start, after a
+    /// completed tool batch) so history stays append-only.
+    fn note_finished_background_tasks(&self, session: &mut Session) {
+        let notes = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .take_completion_notes();
+        for note in notes {
+            session.ledger.append(Entry::Note(note));
+        }
+    }
+
+    fn preflight_memory(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+    ) -> Option<String> {
+        let paths: Vec<PathBuf> = calls
+            .iter()
+            .filter_map(|(_, name, input)| self.tool(name).map(|tool| (tool, input)))
+            .flat_map(|(tool, input)| tool.context_paths(input))
+            .map(|path| session.tool_ctx.resolve(&path))
+            .collect();
+        if paths.is_empty() {
+            return None;
+        }
+        let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
+        memory.restore_from_entries(session.ledger.entries());
+        memory.discover_for_paths(&paths).map(|update| update.note)
+    }
+
     /// Central token-budget gate for tool outputs.
     fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
         let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
@@ -944,13 +1356,23 @@ struct ToolsOutcome {
     awaiting_user_input: bool,
 }
 
+const PARALLEL_READ_ONLY: &[&str] = &["read", "grep", "glob", "read_output"];
+const SEQUENTIAL_BATCH_TOOLS: &[&str] = &["shell", "bash"];
+
 fn is_parallel_read_only_tool(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "glob" | "read_output")
+    PARALLEL_READ_ONLY.contains(&name)
+}
+
+fn is_sequential_batch_tool(name: &str) -> bool {
+    SEQUENTIAL_BATCH_TOOLS.contains(&name)
 }
 
 fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
     let count = prepared.len();
-    let names: HashSet<&str> = prepared.iter().map(|(_, name, _, _)| name.as_str()).collect();
+    let names: HashSet<&str> = prepared
+        .iter()
+        .map(|(_, name, _, _)| name.as_str())
+        .collect();
     if names.len() == 1 {
         let name = names.into_iter().next().unwrap_or("tool");
         let display = match name {
@@ -961,7 +1383,10 @@ fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
             "glob" => "Find",
             other => other,
         };
-        format!("{display} {count} {}", if count == 1 { "file" } else { "files" })
+        format!(
+            "{display} {count} {}",
+            if count == 1 { "file" } else { "files" }
+        )
     } else {
         format!("Run {count} tools")
     }
@@ -1062,10 +1487,20 @@ fn compact_successful_test_output(output: String) -> String {
 
 /// One-line description of a call for the UI, e.g. `shell(cargo build)`.
 pub fn summarize_call(name: &str, input: &Value) -> String {
-    let arg = ["command", "path", "pattern", "id", "agent"]
-        .iter()
-        .find_map(|k| input.get(k).and_then(|v| v.as_str()))
-        .unwrap_or("");
+    // "file_path" covers imported Claude Code calls (Read/Edit/Write).
+    let arg = [
+        "command",
+        "path",
+        "file_path",
+        "pattern",
+        "id",
+        "agent",
+        "url",
+        "query",
+    ]
+    .iter()
+    .find_map(|k| input.get(k).and_then(|v| v.as_str()))
+    .unwrap_or("");
     if arg.is_empty() {
         name.to_string()
     } else {

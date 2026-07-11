@@ -167,14 +167,30 @@ impl WatchdogConfig {
 pub struct LimitsConfig {
     /// Token budget per tool output before it is gated to the blob store.
     pub tool_output_tokens: usize,
+    /// Model round-trips per user turn before the harness ends the turn
+    /// (runaway guard; the user can always ask to continue).
+    pub max_steps_per_turn: usize,
 }
 
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
             tool_output_tokens: 2000,
+            max_steps_per_turn: crate::agent::DEFAULT_MAX_STEPS,
         }
     }
+}
+
+/// One MCP server over stdio: `[mcp_servers.name]` with a command to
+/// spawn. Its tools register as `mcp__name__tool`, which is also the
+/// descriptor permission rules match against.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerConfig {
+    pub command: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,6 +213,7 @@ pub struct Config {
     /// `[[hooks]] event = "post_tool_use", matcher = "edit|write",
     /// command = "cargo fmt"`.
     pub hooks: Vec<crate::hooks::HookDef>,
+    pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 /// The active (profile, model, effort) choice. `/model` writes it here so
@@ -254,13 +271,20 @@ impl Config {
         Self::global_file().map(|p| p.exists()).unwrap_or(false)
     }
 
+    /// Load only the user-level configuration, without applying a project
+    /// overlay. Setup uses this so it never writes project settings back to
+    /// the global file.
+    pub fn load_global() -> Result<Self, ConfigError> {
+        let global_file = Self::global_file()?;
+        Self::read_file(&global_file)
+    }
+
     /// Load global config, then overlay the project-level
     /// `.tcode/config.toml` if present. Errors if no global config
     /// exists — first-run setup (the wizard or `Config::write_global`)
     /// must run before this.
     pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
-        let global_file = Self::global_file()?;
-        let mut config = Self::read_file(&global_file)?;
+        let mut config = Self::load_global()?;
         let project_file = project_dir.join(".tcode").join("config.toml");
         if project_file.exists() {
             config.overlay(Self::read_file(&project_file)?);
@@ -305,6 +329,7 @@ impl Config {
         self.permissions.allow.extend(project.permissions.allow);
         self.permissions.deny.extend(project.permissions.deny);
         self.hooks.extend(project.hooks);
+        self.mcp_servers.extend(project.mcp_servers);
     }
 
     pub fn profile(&self, name: Option<&str>) -> Result<(String, &Profile), ConfigError> {
@@ -316,11 +341,7 @@ impl Config {
             Some(p) => Ok((name.to_string(), p)),
             None => Err(ConfigError::UnknownProfile(
                 name.to_string(),
-                self.profiles
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", "),
+                self.profiles.keys().cloned().collect::<Vec<_>>().join(", "),
             )),
         }
     }

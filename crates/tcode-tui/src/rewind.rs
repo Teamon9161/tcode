@@ -59,9 +59,7 @@ impl Picker {
             Stage::ChooseEntry => match key.code {
                 KeyCode::Esc => return PickResult::Cancelled,
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                KeyCode::Down => {
-                    self.selected = (self.selected + 1).min(self.candidates.len() - 1)
-                }
+                KeyCode::Down => self.selected = (self.selected + 1).min(self.candidates.len() - 1),
                 KeyCode::Enter => {
                     if self.candidates[self.selected].dirty {
                         self.stage = Stage::ChooseScope;
@@ -101,10 +99,7 @@ impl Picker {
             Stage::ChooseEntry => {
                 // Window of up to 6 candidates around the selection.
                 let total = self.candidates.len();
-                let start = self
-                    .selected
-                    .saturating_sub(3)
-                    .min(total.saturating_sub(6));
+                let start = self.selected.saturating_sub(3).min(total.saturating_sub(6));
                 for (i, c) in self.candidates.iter().enumerate().skip(start).take(6) {
                     let marker = if i == self.selected { "▸ " } else { "  " };
                     let style = if i == self.selected {
@@ -112,8 +107,14 @@ impl Picker {
                     } else {
                         theme::dim()
                     };
-                    let preview: String =
-                        c.text.lines().next().unwrap_or("").chars().take(60).collect();
+                    let preview: String = c
+                        .text
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(60)
+                        .collect();
                     out.push(Line::styled(format!("  {marker}› {preview}"), style));
                 }
                 out.push(Line::styled(

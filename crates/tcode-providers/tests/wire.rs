@@ -176,9 +176,7 @@ async fn anthropic_retries_5xx_then_succeeds() {
     let stream = p.stream(request(), CancellationToken::new()).await.unwrap();
     let events: Vec<_> = stream.collect().await;
     assert!(events.iter().all(|e| e.is_ok()));
-    assert!(events
-        .iter()
-        .any(|e| matches!(e, Ok(StreamEvent::Done(_)))));
+    assert!(events.iter().any(|e| matches!(e, Ok(StreamEvent::Done(_)))));
 }
 
 #[tokio::test]

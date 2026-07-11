@@ -203,10 +203,7 @@ impl Editor {
 }
 
 fn char_to_byte(s: &str, col: usize) -> usize {
-    s.char_indices()
-        .nth(col)
-        .map(|(i, _)| i)
-        .unwrap_or(s.len())
+    s.char_indices().nth(col).map(|(i, _)| i).unwrap_or(s.len())
 }
 
 #[cfg(test)]

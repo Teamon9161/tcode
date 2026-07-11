@@ -6,6 +6,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use crate::background::BackgroundTasks;
 use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
 use crate::types::Usage;
@@ -51,10 +52,7 @@ pub enum PermissionRequest {
     /// A model-facing question that must always reach the human, including in
     /// unsafe mode. It is not an authorization request and can never become a
     /// persistent allow rule.
-    UserInput {
-        descriptor: String,
-        summary: String,
-    },
+    UserInput { descriptor: String, summary: String },
 }
 
 /// Shared context handed to every tool invocation.
@@ -62,6 +60,8 @@ pub struct ToolCtx {
     pub cwd: PathBuf,
     pub freshness: Mutex<FreshnessTracker>,
     pub blobs: Mutex<BlobStore>,
+    pub background: Mutex<BackgroundTasks>,
+    pub memory: Mutex<crate::memory::MemoryManager>,
     /// A parent agent installs this only while a tool is running. Nested
     /// agents use it to report their own billable usage without pretending it
     /// occupies the parent's context window.
@@ -70,10 +70,13 @@ pub struct ToolCtx {
 
 impl ToolCtx {
     pub fn new(cwd: PathBuf, output_budget_tokens: usize) -> Self {
+        let memory = crate::memory::MemoryManager::new(&cwd);
         Self {
             cwd,
             freshness: Mutex::new(FreshnessTracker::default()),
             blobs: Mutex::new(BlobStore::new(output_budget_tokens)),
+            background: Mutex::new(BackgroundTasks::default()),
+            memory: Mutex::new(memory),
             usage_reporter: Mutex::new(None),
         }
     }
@@ -116,6 +119,14 @@ pub trait Tool: Send + Sync {
     /// before running so rewind can restore the file.
     fn touches(&self, _input: &Value) -> Option<String> {
         None
+    }
+    /// Files or directories whose scoped instructions apply to this call.
+    fn context_paths(&self, _input: &Value) -> Vec<String> {
+        Vec::new()
+    }
+    /// Whether this call can create externally visible side effects.
+    fn is_mutating(&self) -> bool {
+        false
     }
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput;
 }

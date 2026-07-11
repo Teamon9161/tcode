@@ -99,6 +99,7 @@ pub struct Resumed {
 pub struct SessionInfo {
     pub id: String,
     pub last_user_preview: String,
+    pub modified: Option<SystemTime>,
 }
 
 impl SessionStore {
@@ -117,6 +118,7 @@ impl SessionStore {
 
         let mut result = Vec::new();
         for path in files {
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
             let id = path
                 .file_stem()
                 .map(|s| s.to_string_lossy().into_owned())
@@ -142,6 +144,7 @@ impl SessionStore {
                 result.push(SessionInfo {
                     id: resumed.store.id,
                     last_user_preview,
+                    modified,
                 });
             }
         }
@@ -275,6 +278,31 @@ mod tests {
         assert_eq!(resumed.ledger.len(), 2);
         assert!(matches!(&resumed.ledger.entries()[0], Entry::Summary(s) if s == "sum"));
         assert!(matches!(&resumed.ledger.entries()[1], Entry::User(_)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn roundtrips_large_tool_output_with_windows_paths() {
+        let dir = std::env::temp_dir().join(format!("tcode-store-large-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = SessionStore::create(&dir, Path::new("C:/proj")).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        let content = "C:\\code\\rust\\tcode\\plan.md\n".repeat(1_000);
+        ledger.append(Entry::ToolResults(vec![ContentBlock::ToolResult {
+            tool_use_id: "read-plan".into(),
+            content: content.clone(),
+            is_error: false,
+        }]));
+
+        let resumed = SessionStore::resume(&dir, None).unwrap();
+        assert!(matches!(
+            &resumed.ledger.entries()[0],
+            Entry::ToolResults(blocks)
+                if matches!(&blocks[0], ContentBlock::ToolResult { content: saved, .. } if saved == &content)
+        ));
 
         let _ = fs::remove_dir_all(&dir);
     }

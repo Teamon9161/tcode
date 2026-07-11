@@ -9,8 +9,8 @@ mod diff;
 mod editor;
 mod markdown;
 mod model_picker;
-mod rewind;
 mod resume;
+mod rewind;
 mod theme;
 pub mod wizard;
 
@@ -25,9 +25,17 @@ use tcode_core::{Agent, Session};
 pub use app::App;
 pub use model_picker::{ModelMenu, ModelOption, SwitchFn};
 
+pub enum Exit {
+    Quit,
+    /// The provider wizard runs outside the inline TUI. Return the live
+    /// session so startup can reconfigure the model and immediately reopen
+    /// it. Boxed: `Session` is large and `Quit` carries nothing.
+    ConfigureProvider(Box<Session>),
+}
+
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
 /// the terminal is restored even if the app errors or panics.
-pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow::Result<()> {
+pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
     execute!(stdout(), EnableBracketedPaste)?;
 
@@ -39,7 +47,16 @@ pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow
     }));
 
     let result = match App::new(agent, session, menu) {
-        Ok(app) => app.run().await,
+        Ok(mut app) => match app.run().await {
+            Ok(()) if app.provider_setup_requested() => app
+                .take_session()
+                .map(|session| Exit::ConfigureProvider(Box::new(session)))
+                .ok_or_else(|| {
+                    anyhow::anyhow!("provider setup requested without an active session")
+                }),
+            Ok(()) => Ok(Exit::Quit),
+            Err(error) => Err(error),
+        },
         Err(e) => Err(e),
     };
 

@@ -1,6 +1,6 @@
 use async_trait::async_trait;
-use serde_json::Value;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::tool::PermissionRequest;
 
@@ -73,9 +73,9 @@ impl PermissionRules {
             return Decision::Deny(format!("denied by rule '{rule}'"));
         }
         match mode {
-            PermissionMode::Plan => Decision::Deny(
-                "blocked: plan mode is active; only read-only tools may run".into(),
-            ),
+            PermissionMode::Plan => {
+                Decision::Deny("blocked: plan mode is active; only read-only tools may run".into())
+            }
             PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
             _ => {
@@ -94,10 +94,10 @@ pub fn pattern_match(pattern: &str, text: &str) -> bool {
     fn inner(p: &[char], t: &[char]) -> bool {
         match p.split_first() {
             None => t.is_empty(),
-            Some(('*', rest)) => {
-                (0..=t.len()).any(|i| inner(rest, &t[i..]))
-            }
-            Some((c, rest)) => t.split_first().is_some_and(|(tc, tr)| tc == c && inner(rest, tr)),
+            Some(('*', rest)) => (0..=t.len()).any(|i| inner(rest, &t[i..])),
+            Some((c, rest)) => t
+                .split_first()
+                .is_some_and(|(tc, tr)| tc == c && inner(rest, tr)),
         }
     }
     let p: Vec<char> = pattern.chars().collect();
@@ -126,13 +126,7 @@ pub enum ApprovalDecision {
 pub trait Approver: Send + Sync {
     /// `input` is included so an interactive front end can show the exact
     /// file change before asking for consent.
-    async fn ask(
-        &self,
-        tool: &str,
-        summary: &str,
-        descriptor: &str,
-        input: &Value,
-    ) -> Approval;
+    async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval;
 }
 
 #[cfg(test)]
@@ -189,7 +183,10 @@ mod tests {
             rules.decide(PermissionMode::Plan, &edit),
             Decision::Deny(_)
         ));
-        assert_eq!(rules.decide(PermissionMode::Unsafe, &shell), Decision::Allow);
+        assert_eq!(
+            rules.decide(PermissionMode::Unsafe, &shell),
+            Decision::Allow
+        );
         assert_eq!(rules.decide(PermissionMode::Default, &shell), Decision::Ask);
     }
 }

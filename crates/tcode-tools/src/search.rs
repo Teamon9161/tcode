@@ -56,6 +56,10 @@ impl Tool for GrepTool {
         PermissionRequest::None
     }
 
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        vec![input["path"].as_str().unwrap_or(".").to_string()]
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
         let Some(pattern) = input["pattern"].as_str() else {
             return ToolOutput::err("missing required parameter: pattern");
@@ -173,6 +177,10 @@ impl Tool for GlobTool {
 
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::None
+    }
+
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        vec![input["path"].as_str().unwrap_or(".").to_string()]
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {

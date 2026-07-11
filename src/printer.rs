@@ -5,9 +5,22 @@ use tokio::sync::mpsc;
 
 const DIM: &str = "\x1b[2m";
 const CYAN: &str = "\x1b[36m";
+const GREEN: &str = "\x1b[32m";
 const RED: &str = "\x1b[31m";
 const YELLOW: &str = "\x1b[33m";
 const RESET: &str = "\x1b[0m";
+
+/// Color the tool name in a summary like "shell(command)" or
+/// "read(path/to/file)" — the name is green, the rest is dim.
+fn color_tool_summary(summary: &str) -> String {
+    if let Some(paren) = summary.find('(') {
+        let name = &summary[..paren];
+        let args = &summary[paren..];
+        format!("{GREEN}{name}{RESET}{DIM}{args}{RESET}")
+    } else {
+        format!("{GREEN}{summary}{RESET}")
+    }
+}
 
 /// Line-mode event renderer. The M2 TUI is a different consumer of the
 /// same event stream.
@@ -54,7 +67,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                     println!();
                     wrote_text = false;
                 }
-                println!("{CYAN}●{RESET} {summary}");
+                println!("{CYAN}●{RESET} {}", color_tool_summary(&summary));
             }
             AgentEvent::ToolBatchStart { label, calls } => {
                 if in_thinking {
@@ -63,7 +76,10 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 }
                 println!("{CYAN}●{RESET} {label}");
                 for (name, input) in calls {
-                    println!("  {DIM}├ {}{RESET}", tcode_core::agent::summarize_call(&name, &input));
+                    println!(
+                        "  ├ {}",
+                        color_tool_summary(&tcode_core::agent::summarize_call(&name, &input))
+                    );
                 }
             }
             AgentEvent::ToolEnd {
@@ -78,6 +94,9 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             }
             AgentEvent::AwaitingUserInput => {
                 println!("{YELLOW}[change declined — add guidance to continue]{RESET}");
+            }
+            AgentEvent::StepLimitReached { max } => {
+                println!("{YELLOW}[step limit reached ({max} steps) — say \"continue\" to keep going]{RESET}");
             }
             AgentEvent::Interrupted => {
                 if in_thinking {

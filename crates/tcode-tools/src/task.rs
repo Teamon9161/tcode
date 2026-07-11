@@ -17,18 +17,8 @@ use tcode_core::{
     PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
 };
 
-const EXPLORE_SYSTEM: &str = "\
-You are a read-only exploration sub-agent inside tcode. Investigate the \
-codebase with the tools provided and answer the request. You cannot edit \
-files, run commands, or ask the user anything. Finish with a compact, \
-self-contained report: findings, relevant file paths (with line numbers \
-where useful), and conclusions. The report is all the caller will see.";
-
-const GENERAL_SYSTEM: &str = "\
-You are a sub-agent inside tcode executing a delegated task. Work \
-autonomously: you cannot ask the user anything. When done, summarize \
-what you did, what changed, and anything the caller must know. The \
-summary is all the caller will see.";
+const EXPLORE_SYSTEM: &str = include_str!("../prompts/task-explore-system.md");
+const GENERAL_SYSTEM: &str = include_str!("../prompts/task-general-system.md");
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.
@@ -125,8 +115,7 @@ impl Tool for TaskTool {
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
-        let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str())
-        else {
+        let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str()) else {
             return ToolOutput::err("missing required parameters: agent, prompt");
         };
         let system = match kind {
@@ -145,6 +134,7 @@ impl Tool for TaskTool {
             system: system.to_string(),
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
+            max_steps: tcode_core::DEFAULT_MAX_STEPS,
         };
         let mut session = Session::new(
             ToolCtx::new(self.cwd.clone(), self.output_budget),

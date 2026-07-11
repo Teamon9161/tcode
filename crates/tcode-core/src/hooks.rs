@@ -213,7 +213,13 @@ mod tests {
     async fn passing_hook_is_silent() {
         let hooks = Hooks::new(vec![hook(HookEvent::PostToolUse, "*", "exit 0")]);
         let v = hooks
-            .run(HookEvent::PostToolUse, "edit", &json!({}), None, Path::new("."))
+            .run(
+                HookEvent::PostToolUse,
+                "edit",
+                &json!({}),
+                None,
+                Path::new("."),
+            )
             .await;
         assert!(v.block.is_none());
         assert!(v.notes.is_empty());

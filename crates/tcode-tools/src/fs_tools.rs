@@ -8,6 +8,9 @@ use tcode_core::freshness::{content_hash, ReadStatus};
 use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
+/// Requests below this are widened: extra lines are cheap, but a model
+/// walking a file in 10-line slices costs a round-trip per slice.
+const MIN_READ_WINDOW: usize = 120;
 const MAX_LINE_CHARS: usize = 500;
 
 fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
@@ -78,10 +81,13 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file with line numbers. Use offset/limit for large files. \
-         If the harness reports the file unchanged since your last read, the \
-         content is already in your context — do not re-read; pass force=true \
-         only if you have a specific reason."
+        "Read a file with line numbers. Use offset/limit for large files; \
+         limits under 120 lines are widened to 120, so read generous windows \
+         instead of many small slices. Need several files or regions? Issue \
+         all reads in one message — they run in parallel. If the harness \
+         reports the file unchanged since your last read, the content is \
+         already in your context — do not re-read; pass force=true only if \
+         you have a specific reason."
     }
 
     fn input_schema(&self) -> Value {
@@ -99,6 +105,14 @@ impl Tool for ReadTool {
 
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::None
+    }
+
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        input["path"]
+            .as_str()
+            .map(String::from)
+            .into_iter()
+            .collect()
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
@@ -140,7 +154,8 @@ impl Tool for ReadTool {
         let total = lines.len();
 
         let offset = (input["offset"].as_u64().unwrap_or(1) as usize).max(1);
-        let limit = input["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize;
+        let limit = (input["limit"].as_u64().unwrap_or(DEFAULT_READ_LIMIT as u64) as usize)
+            .max(MIN_READ_WINDOW);
         let start = (offset - 1).min(total);
         let end = start.saturating_add(limit).min(total);
         let whole_file = start == 0 && end == total;
@@ -226,6 +241,18 @@ impl Tool for WriteTool {
         input["path"].as_str().map(String::from)
     }
 
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        input["path"]
+            .as_str()
+            .map(String::from)
+            .into_iter()
+            .collect()
+    }
+
+    fn is_mutating(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
         let (Some(path_str), Some(content)) = (input["path"].as_str(), input["content"].as_str())
         else {
@@ -272,7 +299,10 @@ impl Tool for EditTool {
     fn description(&self) -> &str {
         "Exact string replacement in a file. `old_string` must match the \
          current content exactly (including whitespace) and be unique unless \
-         replace_all is set. Requires having read the file's current version."
+         replace_all is set. Only edit text you have actually seen in this \
+         session (read or grep output both count) and whose surroundings you \
+         understand; if you are unsure of the exact content or the impact of \
+         the change, read the file first instead of guessing."
     }
 
     fn input_schema(&self) -> Value {
@@ -301,6 +331,18 @@ impl Tool for EditTool {
         input["path"].as_str().map(String::from)
     }
 
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        input["path"]
+            .as_str()
+            .map(String::from)
+            .into_iter()
+            .collect()
+    }
+
+    fn is_mutating(&self) -> bool {
+        true
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
         let (Some(path_str), Some(old), Some(new)) = (
             input["path"].as_str(),
@@ -320,20 +362,26 @@ impl Tool for EditTool {
             }
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
+        // No read-before-edit gate: the exact, unique match against current
+        // disk content is the verification. A stale or guessed old_string
+        // fails safely below.
         let mut freshness = ctx.freshness.lock().expect("freshness lock");
-        if !freshness.seen_current(&path, content_hash(&bytes)) {
-            return ToolOutput::err(format!(
-                "{} changed on disk since you last read it (or was never read); \
-                 read it before editing.",
-                rel(&path, &ctx.cwd).display()
-            ));
-        }
+        let seen = freshness.seen_current(&path, content_hash(&bytes));
         let text = String::from_utf8_lossy(&bytes).into_owned();
 
         let count = text.matches(old).count();
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
         match count {
-            0 => return ToolOutput::err(near_miss_help(&text, old)),
+            0 => {
+                let mut msg = near_miss_help(&text, old);
+                if !seen {
+                    msg.push_str(
+                        "\nnote: you have not read the current version of this \
+                         file; read it to get the exact text.",
+                    );
+                }
+                return ToolOutput::err(msg);
+            }
             1 => {}
             n if !replace_all => {
                 let occurrences: Vec<String> = text

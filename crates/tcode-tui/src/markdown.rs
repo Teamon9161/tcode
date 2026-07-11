@@ -37,15 +37,14 @@ impl Renderer {
         let mut code_buf = String::new();
         let mut quote_depth = 0usize;
 
-        let flush =
-            |spans: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>, quote: usize| {
-                let mut line_spans = Vec::new();
-                if quote > 0 {
-                    line_spans.push(Span::styled("▎ ".repeat(quote), theme::dim()));
-                }
-                line_spans.append(spans);
-                out.push(Line::from(line_spans));
-            };
+        let flush = |spans: &mut Vec<Span<'static>>, out: &mut Vec<Line<'static>>, quote: usize| {
+            let mut line_spans = Vec::new();
+            if quote > 0 {
+                line_spans.push(Span::styled("▎ ".repeat(quote), theme::dim()));
+            }
+            line_spans.append(spans);
+            out.push(Line::from(line_spans));
+        };
 
         let parser = Parser::new_ext(text, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
         for ev in parser {
@@ -234,7 +233,9 @@ mod tests {
     #[test]
     fn renders_basic_markdown() {
         let r = Renderer::default();
-        let lines = r.render("# Title\n\nsome **bold** and `code`\n\n```rust\nfn main() {}\n```\n\n- a\n- b");
+        let lines = r.render(
+            "# Title\n\nsome **bold** and `code`\n\n```rust\nfn main() {}\n```\n\n- a\n- b",
+        );
         let text: Vec<String> = lines
             .iter()
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
@@ -249,7 +250,11 @@ mod tests {
         let lines = Renderer::default().render("```rust\nlet answer = 42;\n```");
         let code = lines
             .iter()
-            .find(|line| line.spans.iter().any(|span| span.content.contains("answer")))
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("answer"))
+            })
             .expect("code line");
         // The first span is indentation; at least one code token must carry
         // the colour emitted by syntect rather than the plain terminal style.

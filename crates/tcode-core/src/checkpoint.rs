@@ -175,9 +175,7 @@ mod tests {
     #[test]
     fn disabled_store_is_noop() {
         let mut store = CheckpointStore::default();
-        assert!(store
-            .save(0, Path::new("C:/nonexistent/x.txt"))
-            .is_none());
+        assert!(store.save(0, Path::new("C:/nonexistent/x.txt")).is_none());
         assert!(store.restore_to(0).is_empty());
     }
 }

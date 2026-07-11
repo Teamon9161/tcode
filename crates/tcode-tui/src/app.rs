@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -6,7 +6,11 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
-use crossterm::{cursor::MoveTo, execute, terminal::{Clear, ClearType}};
+use crossterm::{
+    cursor::MoveTo,
+    execute,
+    terminal::{Clear, ClearType},
+};
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -26,25 +30,34 @@ use tcode_core::{
 use crate::approval::{Dialog, DialogResult};
 use crate::editor::Editor;
 use crate::model_picker::{self, ModelMenu};
-use crate::rewind::{self, PickResult};
 use crate::resume::{self, PickResult as ResumePickResult};
+use crate::rewind::{self, PickResult};
 use crate::{diff, markdown, theme};
 
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const PASTE_FOLD_LINES: usize = 15;
+/// A calm, low-contrast alternative to the legacy sparkle animation.
+const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
+    (".", theme::DIM),
+    ("o", theme::DIM),
+    ("O", theme::DIM),
+    ("o", theme::DIM),
+];
 
-const SLASH_COMMANDS: [(&str, &str); 9] = [
+const SLASH_COMMANDS: [(&str, &str); 12] = [
     ("/help", "show keys and commands"),
     ("/model", "switch model · adjust reasoning effort"),
+    ("/provider", "configure or switch provider"),
     ("/mode", "cycle permission mode"),
     ("/cost", "show last turn token usage"),
     ("/compact", "summarize history to free context"),
     ("/clear", "start a fresh conversation"),
     ("/resume", "resume a session: /resume <id>"),
     ("/note", "add a durable conversation note"),
+    ("/memory", "show memory sources · /memory on|off"),
+    ("/export", "export transcript: /export [path.md]"),
     ("/exit", "quit tcode"),
 ];
 
@@ -136,13 +149,21 @@ pub struct App {
 
     phase: Phase,
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
-    external_import: Option<JoinHandle<(tcode_core::ExternalSource, Result<tcode_core::Resumed, tcode_core::store::StoreError>)>>,
+    external_import: Option<
+        JoinHandle<(
+            tcode_core::ExternalSource,
+            Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+        )>,
+    >,
     ask_rx: mpsc::Receiver<AskMsg>,
     approver: Arc<ChannelApprover>,
 
     editor: Editor,
     attachments: Vec<Attachment>,
     dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
+    /// Change proposals (edit/write) already baked into scrollback before
+    /// consent; ToolStart must not render them a second time.
+    previewed_changes: HashSet<String>,
     rewind: Option<rewind::Picker>,
     resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
@@ -192,6 +213,7 @@ pub struct App {
     /// compares against it so cache decay is visible immediately.
     prev_cache_ratio: Option<f64>,
     should_exit: bool,
+    provider_setup_requested: bool,
 }
 
 impl App {
@@ -225,6 +247,7 @@ impl App {
             editor: Editor::new(),
             attachments: Vec::new(),
             dialog: None,
+            previewed_changes: HashSet::new(),
             rewind: None,
             resume_picker: None,
             menu,
@@ -256,14 +279,15 @@ impl App {
             spinner: 0,
             prev_cache_ratio: None,
             should_exit: false,
+            provider_setup_requested: false,
         })
     }
 
-    pub async fn run(mut self) -> anyhow::Result<()> {
+    pub async fn run(&mut self) -> anyhow::Result<()> {
         self.clear_conversation_screen()?;
         self.bake_transcript();
         let mut term_events = EventStream::new();
-        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !self.should_exit {
@@ -300,11 +324,29 @@ impl App {
                             .unwrap_or_default();
                         Dialog::question(ask.summary, options)
                     } else {
-                        Dialog::new(
-                            ask.summary,
-                            ask.descriptor,
-                            diff::render_change(&ask.tool, &ask.input),
-                        )
+                        // Change proposals (edit/write) go into native
+                        // scrollback before consent: the mouse wheel and
+                        // terminal search beat any in-dialog pager. The
+                        // decision record marks a decline; scrollback
+                        // cannot be un-baked.
+                        let call_summary = self.display_summary(
+                            &tcode_core::agent::summarize_call(&ask.tool, &ask.input),
+                        );
+                        let change = diff::render_change(&ask.tool, &ask.input);
+                        let prebaked = !change.is_empty();
+                        if prebaked {
+                            // Flush streamed text first so the transcript
+                            // keeps its chronological order.
+                            self.bake_live_text();
+                            self.finish_thinking();
+                            let mut spans = colored_tool_summary(&call_summary);
+                            spans.insert(0, Span::styled("● ", theme::accent()));
+                            let mut lines = vec![Line::default(), Line::from(spans)];
+                            lines.extend(change);
+                            self.bake(lines);
+                            self.previewed_changes.insert(change_key(&ask.tool, &ask.input));
+                        }
+                        Dialog::new(ask.summary, ask.descriptor, call_summary, prebaked)
                     };
                     self.dialog = Some((dialog, ask.reply));
                 }
@@ -316,11 +358,36 @@ impl App {
                 }
                 _ = tick.tick() => {
                     if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
-                        self.spinner = (self.spinner + 1) % SPINNER.len();
+                        self.spinner = (self.spinner + 1) % CALM_SPINNER.len();
                     }
                 }
             }
         }
+        self.clear_viewport_on_exit()?;
+        Ok(())
+    }
+
+    pub fn provider_setup_requested(&self) -> bool {
+        self.provider_setup_requested
+    }
+
+    fn take_previewed_change(&mut self, name: &str, input: &serde_json::Value) -> bool {
+        self.previewed_changes.remove(&change_key(name, input))
+    }
+
+    /// Recover the active session when the app intentionally exits to launch
+    /// the provider wizard.
+    pub fn take_session(&mut self) -> Option<Session> {
+        self.session.take()
+    }
+
+    fn clear_viewport_on_exit(&mut self) -> anyhow::Result<()> {
+        // An inline viewport is not an alternate screen. Clear its transient
+        // input/status area before returning control to the shell, while
+        // preserving the baked conversation above it.
+        self.terminal.clear()?;
+        let height = self.terminal.size()?.height;
+        execute!(std::io::stdout(), MoveTo(0, height.saturating_sub(1)))?;
         Ok(())
     }
 
@@ -337,7 +404,9 @@ impl App {
                     .as_ref()
                     .map(|s| s.tool_ctx.cwd.display().to_string())
                     .unwrap_or_default();
-                let home = std::env::var("HOME").unwrap_or_default();
+                let home = std::env::var("HOME")
+                    .or_else(|_| std::env::var("USERPROFILE"))
+                    .unwrap_or_default();
                 let cwd = match (home.is_empty(), cwd.strip_prefix(&home)) {
                     (false, Some(rest)) => format!("~{rest}"),
                     _ => cwd,
@@ -358,7 +427,7 @@ impl App {
                 .rev()
                 .scan(0usize, |w, c| {
                     *w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                    (*w <= max_content - 1).then_some(c)
+                    (*w < max_content).then_some(c)
                 })
                 .collect::<Vec<_>>()
                 .into_iter()
@@ -375,9 +444,10 @@ impl App {
             .max()
             .unwrap_or(0);
         let pad = |s: &str| " ".repeat(width.saturating_sub(s.width()));
-        let mut out = vec![Line::from(vec![
-            Span::styled(format!("╭{}╮", "─".repeat(width + 2)), theme::border()),
-        ])];
+        let mut out = vec![Line::from(vec![Span::styled(
+            format!("╭{}╮", "─".repeat(width + 2)),
+            theme::border(),
+        )])];
         out.push(Line::from(vec![
             Span::styled("│ ".to_string(), theme::border()),
             Span::styled(title.clone(), theme::user_prompt()),
@@ -414,19 +484,19 @@ impl App {
         }
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_plan: Option<serde_json::Value> = None;
-        let mut imported_tool: Option<(String, serde_json::Value)> = None;
         for entry in session.ledger.entries() {
             match entry {
                 tcode_core::Entry::User(blocks) => {
                     for b in blocks {
                         match b {
-                            ContentBlock::Text { text }
-                                if !text.starts_with("<tcode-status>") =>
-                            {
+                            ContentBlock::Text { text } if !text.starts_with("<tcode-status>") => {
                                 for (i, l) in text.lines().enumerate() {
                                     let prefix = if i == 0 { "› " } else { "  " };
                                     lines.push(Line::from(vec![
-                                        Span::styled(prefix.to_string(), theme::user_prompt_message()),
+                                        Span::styled(
+                                            prefix.to_string(),
+                                            theme::user_prompt_message(),
+                                        ),
                                         Span::styled(l.to_string(), theme::user_message()),
                                     ]));
                                 }
@@ -456,10 +526,9 @@ impl App {
                                 let summary = self.display_summary(
                                     &tcode_core::agent::summarize_call(name, input),
                                 );
-                                lines.push(Line::from(vec![
-                                    Span::styled("● ", theme::accent()),
-                                    Span::styled(summary, theme::bold()),
-                                ]));
+                                let mut spans: Vec<Span> = colored_tool_summary(&summary);
+                                spans.insert(0, Span::styled("● ", theme::accent()));
+                                lines.push(Line::from(spans));
                             }
                             _ => {}
                         }
@@ -471,7 +540,11 @@ impl App {
                         theme::dim(),
                     ));
                 }
-                tcode_core::Entry::ImportedTool { name, input, content } => {
+                tcode_core::Entry::ImportedTool {
+                    name,
+                    input,
+                    content,
+                } => {
                     if name.contains("apply_patch") {
                         lines.push(Line::from(vec![
                             Span::styled("● ", theme::accent()),
@@ -482,18 +555,9 @@ impl App {
                         ]));
                         lines.extend(diff::render_unified_patch(content));
                     } else if name == "output" {
-                        if let Some((tool, input)) = &imported_tool {
-                            if tool == "read" {
-                                let path_hint = input["path"].as_str().unwrap_or("");
-                                lines.extend(diff::render_code(path_hint, content));
-                            } else {
-                                for (index, line) in content.lines().enumerate() {
-                                    let prefix = if index == 0 { "  ⎿ " } else { "    " };
-                                    lines.push(Line::styled(format!("{prefix}{line}"), theme::dim()));
-                                }
-                            }
-                        } else {
-                            lines.push(Line::styled(format!("  ⎿ {content}"), theme::dim()));
+                        for (index, line) in content.lines().enumerate() {
+                            let prefix = if index == 0 { "  ⎿ " } else { "    " };
+                            lines.push(Line::styled(format!("{prefix}{line}"), theme::dim()));
                         }
                     } else {
                         let summary = if input.is_null() {
@@ -508,7 +572,6 @@ impl App {
                         if !content.is_empty() {
                             lines.extend(self.md.render(content));
                         }
-                        imported_tool = Some((name.clone(), input.clone()));
                     }
                     lines.push(Line::default());
                 }
@@ -723,23 +786,29 @@ impl App {
             AgentEvent::ToolBatchStart { label, calls } => {
                 self.bake_live_text();
                 self.finish_thinking();
+                self.bake(vec![Line::default()]);
                 let mut lines = vec![Line::from(vec![
                     Span::styled("● ", theme::accent()),
                     Span::styled(label.clone(), theme::bold()),
                 ])];
                 self.pending_batch.clear();
                 for (name, input) in calls {
-                    let summary = self.display_summary(&tcode_core::agent::summarize_call(&name, &input));
+                    let summary =
+                        self.display_summary(&tcode_core::agent::summarize_call(&name, &input));
                     self.pending_batch.push_back(ActivityEntry {
                         title: summary.clone(),
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
                         expanded: false,
                     });
-                    lines.push(Line::styled(format!("  ├ {summary}"), theme::dim()));
-                    // The changes have passed all approvals. Keep the full,
-                    // syntax-highlighted diff in normal scrollback while the
-                    // one-line group remains easy to scan.
-                    lines.extend(diff::render_change(&name, &input));
+                    let mut spans: Vec<Span> = colored_tool_summary(&summary);
+                    spans.insert(0, Span::raw("  ├ "));
+                    lines.push(Line::from(spans));
+                    // Diffs already baked before consent are not repeated;
+                    // auto-allowed changes render theirs here.
+                    if !self.take_previewed_change(&name, &input) {
+                        lines.extend(diff::render_change(&name, &input));
+                    }
+                    lines.push(Line::default());
                 }
                 self.bake(lines);
                 self.state_label = format!("running: {label}");
@@ -754,21 +823,35 @@ impl App {
                     self.state_label = "updating plan".into();
                     return;
                 }
+                // The question and its answer are already baked by the
+                // approval dialog; a second ask_user(...) header is noise.
+                if name == "ask_user" {
+                    return;
+                }
+                let summary = self.display_summary(&summary);
+                // A change baked before consent is this call's display;
+                // repeating the header or diff here would duplicate it.
+                if self.take_previewed_change(&name, &input) {
+                    self.pending_tool = Some(ActivityEntry {
+                        title: summary.clone(),
+                        detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
+                        expanded: false,
+                    });
+                    self.state_label = format!("running: {summary}");
+                    return;
+                }
                 self.bake_live_text();
                 self.finish_thinking();
-                let summary = self.display_summary(&summary);
+                self.bake(vec![Line::default()]);
                 let approved_change = diff::render_change(&name, &input);
                 self.pending_tool = Some(ActivityEntry {
                     title: summary.clone(),
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
                     expanded: false,
                 });
-                let mut lines = vec![Line::from(vec![
-                    Span::styled("● ", theme::accent()),
-                    Span::styled(summary.clone(), theme::bold()),
-                ])];
-                // Only an accepted mutation is committed to the transcript;
-                // a declined proposal stays solely in the consent dialog.
+                let mut spans: Vec<Span> = colored_tool_summary(&summary);
+                spans.insert(0, Span::styled("● ", theme::accent()));
+                let mut lines = vec![Line::from(spans)];
                 lines.extend(approved_change);
                 self.bake(lines);
                 self.state_label = format!("running: {summary}");
@@ -780,11 +863,14 @@ impl App {
                 is_error,
                 ..
             } => {
-                if name == "update_plan" {
+                if name == "update_plan" || name == "ask_user" {
                     self.state_label = "responding".into();
                     return;
                 }
-                let entry = self.pending_tool.take().or_else(|| self.pending_batch.pop_front());
+                let entry = self
+                    .pending_tool
+                    .take()
+                    .or_else(|| self.pending_batch.pop_front());
                 if let Some(mut entry) = entry {
                     entry.detail.push_str("\n\nresult:\n");
                     entry.detail.push_str(&content);
@@ -858,6 +944,13 @@ impl App {
                 )]);
                 self.state_label = "waiting for your instruction".into();
             }
+            AgentEvent::StepLimitReached { max } => {
+                self.bake(vec![Line::styled(
+                    format!("⊙ step limit reached ({max} steps) — say \"continue\" to keep going"),
+                    ratatui::style::Style::default().fg(theme::WARN),
+                )]);
+                self.state_label = "waiting for your instruction".into();
+            }
             AgentEvent::Interrupted => {
                 self.bake_live_text();
                 self.finish_thinking();
@@ -869,6 +962,59 @@ impl App {
             AgentEvent::TurnEnd => {
                 self.bake_live_text();
                 self.finish_thinking();
+            }
+        }
+    }
+
+    /// Transcript record of a consent decision. Each tool call appears in
+    /// scrollback exactly once, rendered by its ToolStart — so an approval
+    /// bakes nothing but the user's note, and only a declined call (which
+    /// never emits ToolStart) bakes its own header.
+    fn bake_approval_record(&mut self, dialog: &Dialog, approval: &Approval) {
+        if dialog.is_question() {
+            let answer = approval.comment.clone().unwrap_or_default();
+            self.bake(vec![
+                Line::default(),
+                Line::from(vec![
+                    Span::styled("? ", theme::accent()),
+                    Span::styled(dialog.summary.clone(), theme::bold()),
+                ]),
+                Line::styled(format!("  ⎿ {answer}"), theme::dim()),
+            ]);
+            return;
+        }
+        match approval.decision {
+            ApprovalDecision::Yes | ApprovalDecision::YesAlways => {
+                if let Some(note) = approval.comment.as_deref() {
+                    let line = Line::styled(format!("  ⊙ note to model — {note}"), theme::dim());
+                    // A prebaked diff block is directly above: attach to it.
+                    if dialog.prebaked {
+                        self.bake(vec![line]);
+                    } else {
+                        self.bake(vec![Line::default(), line]);
+                    }
+                }
+            }
+            ApprovalDecision::No => {
+                let reason = approval
+                    .comment
+                    .as_deref()
+                    .map(|c| format!(" — {c}"))
+                    .unwrap_or_default();
+                let declined = Line::styled(
+                    format!("  ⎿ declined{reason}"),
+                    ratatui::style::Style::default().fg(theme::ERROR),
+                );
+                if dialog.prebaked {
+                    // The header + diff are already in scrollback and cannot
+                    // be un-baked; mark them as not applied.
+                    self.previewed_changes.clear();
+                    self.bake(vec![declined]);
+                } else {
+                    let mut spans = colored_tool_summary(&dialog.call_summary);
+                    spans.insert(0, Span::styled("● ", theme::accent()));
+                    self.bake(vec![Line::default(), Line::from(spans), declined]);
+                }
             }
         }
     }
@@ -923,8 +1069,8 @@ impl App {
                 }
                 KeyCode::Up => self.activity_selected = self.activity_selected.saturating_sub(1),
                 KeyCode::Down => {
-                    self.activity_selected = (self.activity_selected + 1)
-                        .min(self.activity.len().saturating_sub(1));
+                    self.activity_selected =
+                        (self.activity_selected + 1).min(self.activity.len().saturating_sub(1));
                 }
                 KeyCode::Enter | KeyCode::Char(' ') => {
                     self.activity_detail_scroll = 0;
@@ -932,7 +1078,9 @@ impl App {
                         entry.expanded = !entry.expanded;
                     }
                 }
-                KeyCode::PageUp => self.activity_detail_scroll = self.activity_detail_scroll.saturating_sub(12),
+                KeyCode::PageUp => {
+                    self.activity_detail_scroll = self.activity_detail_scroll.saturating_sub(12)
+                }
                 KeyCode::PageDown => self.activity_detail_scroll += 12,
                 _ => {}
             }
@@ -990,23 +1138,7 @@ impl App {
         if let Some((dialog, _)) = self.dialog.as_mut() {
             if let DialogResult::Done(approval) = dialog.handle_key(key) {
                 let (dialog, reply) = self.dialog.take().expect("dialog present");
-                let verdict = match approval.decision {
-                    ApprovalDecision::Yes => "approved",
-                    ApprovalDecision::YesAlways => "approved (always)",
-                    ApprovalDecision::No => "declined",
-                };
-                let note = approval
-                    .comment
-                    .as_deref()
-                    .map(|c| format!(" — {c}"))
-                    .unwrap_or_default();
-                self.bake(vec![
-                    Line::from(vec![
-                        Span::styled("? ", theme::accent()),
-                        Span::styled(dialog.summary, theme::bold()),
-                    ]),
-                    Line::styled(format!("  ⎿ {verdict}{note}"), theme::dim()),
-                ]);
+                self.bake_approval_record(&dialog, &approval);
                 let _ = reply.send(approval);
                 if let Some(wait_started) = self.user_wait_started.take() {
                     self.user_wait_total += wait_started.elapsed();
@@ -1109,9 +1241,7 @@ impl App {
             return;
         }
         if trimmed.starts_with('/') {
-            let cmd = self
-                .popup_selection()
-                .unwrap_or_else(|| trimmed.clone());
+            let cmd = self.popup_selection().unwrap_or_else(|| trimmed.clone());
             self.editor.take();
             self.run_slash(&cmd);
             return;
@@ -1241,7 +1371,79 @@ impl App {
         }
     }
 
+    /// `/export [path]`: write the conversation as a markdown transcript.
+    fn export_transcript(&mut self, path_arg: &str) {
+        let Some(session) = self.session.as_ref() else {
+            self.bake(vec![Line::styled(
+                "wait for the current turn before exporting",
+                theme::dim(),
+            )]);
+            return;
+        };
+        if session.ledger.is_empty() {
+            self.bake(vec![Line::styled("nothing to export yet", theme::dim())]);
+            return;
+        }
+        let path = if path_arg.is_empty() {
+            let secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            std::path::PathBuf::from(format!("tcode-transcript-{secs}.md"))
+        } else {
+            std::path::PathBuf::from(path_arg)
+        };
+        let markdown = tcode_core::export_markdown(session.ledger.entries(), "tcode conversation");
+        match std::fs::write(&path, markdown) {
+            Ok(()) => self.bake(vec![Line::styled(
+                format!("transcript exported → {}", path.display()),
+                theme::dim(),
+            )]),
+            Err(e) => self.bake(vec![Line::styled(
+                format!("export failed: {e}"),
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    fn memory_status(&mut self, arg: &str) {
+        let Some(session) = self.session.as_mut() else {
+            self.bake(vec![Line::styled(
+                "wait for the current turn before inspecting memory",
+                theme::dim(),
+            )]);
+            return;
+        };
+        let (status, toggle_note) = {
+            let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
+            memory.restore_from_entries(session.ledger.entries());
+            let note = match arg {
+                "" => None,
+                "on" => Some(memory.set_enabled(true)),
+                "off" => Some(memory.set_enabled(false)),
+                _ => {
+                    drop(memory);
+                    self.bake(vec![Line::styled("usage: /memory [on|off]", theme::dim())]);
+                    return;
+                }
+            };
+            (memory.status(), note)
+        };
+        if let Some(note) = toggle_note {
+            session.ledger.append(tcode_core::Entry::Note(note));
+        }
+        let lines = status
+            .lines()
+            .map(|line| Line::styled(format!("  {line}"), theme::dim()))
+            .collect();
+        self.bake(lines);
+    }
+
     fn run_slash(&mut self, cmd: &str) {
+        if cmd == "/memory" || cmd.starts_with("/memory ") {
+            self.memory_status(cmd.strip_prefix("/memory").unwrap_or("").trim());
+            return;
+        }
         if cmd == "/resume" {
             self.open_resume_picker();
             return;
@@ -1255,15 +1457,31 @@ impl App {
             if note.is_empty() {
                 self.bake(vec![Line::styled("usage: /note <text>", theme::dim())]);
             } else if let Some(session) = self.session.as_mut() {
-                session.ledger.append(tcode_core::Entry::Note(note.to_string()));
-                self.bake(vec![Line::styled(format!("  ⌞ note: {note}"), theme::dim())]);
+                session
+                    .ledger
+                    .append(tcode_core::Entry::Note(note.to_string()));
+                self.bake(vec![Line::styled(
+                    format!("  ⌞ note: {note}"),
+                    theme::dim(),
+                )]);
             } else {
-                self.bake(vec![Line::styled("wait for the current turn before adding a note", theme::dim())]);
+                self.bake(vec![Line::styled(
+                    "wait for the current turn before adding a note",
+                    theme::dim(),
+                )]);
             }
+            return;
+        }
+        if cmd == "/export" || cmd.starts_with("/export ") {
+            self.export_transcript(cmd.strip_prefix("/export").unwrap_or("").trim());
             return;
         }
         match cmd {
             "/exit" | "/quit" => self.should_exit = true,
+            "/provider" => {
+                self.provider_setup_requested = true;
+                self.should_exit = true;
+            }
             "/model" => {
                 let effort = self.agent.model.snapshot().effort;
                 self.model_picker = model_picker::Picker::new(&self.menu, effort.as_deref());
@@ -1290,10 +1508,7 @@ impl App {
                 self.bake(vec![Line::styled(
                     format!(
                         "last turn: in {} | out {} | cache r {} w {}",
-                        u.input_tokens,
-                        u.output_tokens,
-                        u.cache_read_tokens,
-                        u.cache_write_tokens
+                        u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
                     ),
                     theme::dim(),
                 )]);
@@ -1328,7 +1543,8 @@ impl App {
                 }
             }
             "/help" => {
-                let mut lines: Vec<Line> = vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
+                let mut lines: Vec<Line> =
+                    vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
                 for (k, d) in [
                     ("enter", "send · alt+enter/ctrl+j newline"),
                     ("esc", "cancel current turn / clear input"),
@@ -1405,7 +1621,9 @@ impl App {
     // ------------------------------------------------------- rendering
 
     fn popup_active(&self) -> bool {
-        self.dialog.is_none() && self.editor.line_count() == 1 && self.editor.text().starts_with('/')
+        self.dialog.is_none()
+            && self.editor.line_count() == 1
+            && self.editor.text().starts_with('/')
     }
 
     fn popup_matches(&self) -> Vec<(&'static str, &'static str)> {
@@ -1455,20 +1673,27 @@ impl App {
 
     fn resume_session(&mut self, id: &str) {
         if matches!(self.phase, Phase::Running { .. }) {
-            self.bake(vec![Line::styled("wait for the current turn before resuming", theme::dim())]);
+            self.bake(vec![Line::styled(
+                "wait for the current turn before resuming",
+                theme::dim(),
+            )]);
             return;
         }
         let Some(session) = self.session.as_mut() else {
             return;
         };
         let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled("cannot locate tcode session storage", theme::dim())]);
+            self.bake(vec![Line::styled(
+                "cannot locate tcode session storage",
+                theme::dim(),
+            )]);
             return;
         };
         match tcode_core::SessionStore::resume(&data_dir, Some(id)) {
             Ok(resumed) => {
                 let ckpt_dir = data_dir.join("checkpoints").join(&resumed.store.id);
-                session.checkpoints = tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
+                session.checkpoints =
+                    tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
                 session.ledger = resumed.ledger;
                 session.ledger.attach_sink(Box::new(resumed.store));
                 session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
@@ -1506,7 +1731,10 @@ impl App {
             return;
         };
         let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled("cannot locate tcode session storage", theme::dim())]);
+            self.bake(vec![Line::styled(
+                "cannot locate tcode session storage",
+                theme::dim(),
+            )]);
             return;
         };
         match tcode_core::SessionStore::list(&data_dir) {
@@ -1539,14 +1767,20 @@ impl App {
 
     fn import_external_session(&mut self, external: tcode_core::ExternalSessionInfo) {
         if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
-            self.bake(vec![Line::styled("wait for the current turn before importing", theme::dim())]);
+            self.bake(vec![Line::styled(
+                "wait for the current turn before importing",
+                theme::dim(),
+            )]);
             return;
         }
         let Some(session) = self.session.as_ref() else {
             return;
         };
         let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled("cannot locate tcode session storage", theme::dim())]);
+            self.bake(vec![Line::styled(
+                "cannot locate tcode session storage",
+                theme::dim(),
+            )]);
             return;
         };
         let cwd = session.tool_ctx.cwd.clone();
@@ -1560,7 +1794,10 @@ impl App {
 
     fn on_external_import_done(
         &mut self,
-        (source, result): (tcode_core::ExternalSource, Result<tcode_core::Resumed, tcode_core::store::StoreError>),
+        (source, result): (
+            tcode_core::ExternalSource,
+            Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+        ),
     ) {
         self.external_import = None;
         self.state_label.clear();
@@ -1582,7 +1819,12 @@ impl App {
                 self.pending_tool = None;
                 self.pending_batch.clear();
                 self.thinking_text.clear();
-                session.tool_ctx.freshness.lock().expect("freshness lock").clear();
+                session
+                    .tool_ctx
+                    .freshness
+                    .lock()
+                    .expect("freshness lock")
+                    .clear();
                 if let Err(e) = self.clear_conversation_screen() {
                     self.bake(vec![Line::styled(
                         format!("could not clear terminal scrollback: {e}"),
@@ -1603,14 +1845,28 @@ impl App {
     }
 
     fn activity_lines(&self) -> Vec<Line<'static>> {
-        let mut lines = vec![Line::styled("activity details", theme::bold().fg(theme::ACCENT))];
+        let mut lines = vec![Line::styled(
+            "activity details",
+            theme::bold().fg(theme::ACCENT),
+        )];
         let start = self.activity_selected.saturating_sub(4);
         for (index, entry) in self.activity.iter().enumerate().skip(start).take(5) {
             let selected = index == self.activity_selected;
             let marker = if selected { "▸ " } else { "  " };
-            let icon = if entry.title.starts_with("thought") { "✻" } else { "●" };
-            let style = if selected { theme::accent() } else { theme::dim() };
-            lines.push(Line::styled(format!("  {marker}{icon} {}", entry.title), style));
+            let icon = if entry.title.starts_with("thought") {
+                "✻"
+            } else {
+                "●"
+            };
+            let style = if selected {
+                theme::accent()
+            } else {
+                theme::dim()
+            };
+            lines.push(Line::styled(
+                format!("  {marker}{icon} {}", entry.title),
+                style,
+            ));
             if selected && entry.expanded {
                 let details: Vec<_> = entry.detail.lines().collect();
                 for detail in details.iter().skip(self.activity_detail_scroll).take(14) {
@@ -1637,8 +1893,7 @@ impl App {
             .filter_map(|item| {
                 let step = item["step"].as_str()?.trim();
                 let status = item["status"].as_str()?;
-                (!step.is_empty()
-                    && matches!(status, "pending" | "in_progress" | "completed"))
+                (!step.is_empty() && matches!(status, "pending" | "in_progress" | "completed"))
                     .then(|| PlanStep {
                         step: step.to_string(),
                         status: status.to_string(),
@@ -1652,10 +1907,17 @@ impl App {
         if self.plan.is_empty() {
             return Vec::new();
         }
-        let complete = self.plan.iter().filter(|item| item.status == "completed").count();
+        let complete = self
+            .plan
+            .iter()
+            .filter(|item| item.status == "completed")
+            .count();
         let mut lines = vec![Line::from(vec![
             Span::styled("  plan ", theme::bold().fg(theme::ACCENT)),
-            Span::styled(format!("{complete}/{} complete", self.plan.len()), theme::dim()),
+            Span::styled(
+                format!("{complete}/{} complete", self.plan.len()),
+                theme::dim(),
+            ),
         ])];
         lines.extend(self.plan.iter().map(|item| {
             let (marker, style) = match item.status.as_str() {
@@ -1665,7 +1927,14 @@ impl App {
             };
             Line::from(vec![
                 Span::styled(format!("    {marker}"), style),
-                Span::styled(item.step.clone(), if item.status == "pending" { theme::dim() } else { ratatui::style::Style::default() }),
+                Span::styled(
+                    item.step.clone(),
+                    if item.status == "pending" {
+                        theme::dim()
+                    } else {
+                        ratatui::style::Style::default()
+                    },
+                ),
             ])
         }));
         lines
@@ -1688,7 +1957,7 @@ impl App {
         } else if let Some(picker) = &self.rewind {
             picker.height() + 2
         } else if let Some((dialog, _)) = &self.dialog {
-            dialog.height() + 2
+            dialog.height(area_width(&self.terminal)) + 2
         } else {
             let running = matches!(self.phase, Phase::Running { .. });
             let live = if running {
@@ -1707,7 +1976,12 @@ impl App {
             };
             let attach_h = if self.attachments.is_empty() { 0 } else { 1 };
             // context meter + hint both get their own row below the editor.
-            live + self.plan_lines().len() as u16 + editor_box + popup_h + attach_h + 2
+            live + self.plan_lines().len() as u16
+                + if self.plan.is_empty() { 0 } else { 2 }
+                + editor_box
+                + popup_h
+                + attach_h
+                + 2
                 + usize::from(self.rate_limits.is_some()) as u16
         };
         h.clamp(4, 18)
@@ -1746,11 +2020,13 @@ impl App {
             .activity_open
             .then(|| self.activity_lines())
             .or_else(|| self.resume_picker.as_ref().map(|p| p.render()))
-            .or_else(|| self.model_picker
-            .as_ref()
-            .map(|p| p.render(&self.menu)))
+            .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
             .or_else(|| self.rewind.as_ref().map(|p| p.render()))
-            .or_else(|| self.dialog.as_ref().map(|(d, _)| d.render()));
+            .or_else(|| {
+                self.dialog
+                    .as_ref()
+                    .map(|(d, _)| d.render(area_width(&self.terminal)))
+            });
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
         let popup: Vec<(String, String)> = if self.popup_active() {
             self.popup_matches()
@@ -1808,16 +2084,20 @@ impl App {
             }
 
             if !plan_lines.is_empty() {
-                let h = plan_lines.len() as u16;
-                frame.render_widget(Paragraph::new(Text::from(plan_lines)), row(y, h));
+                let h = plan_lines.len() as u16 + 2;
+                frame.render_widget(
+                    Paragraph::new(Text::from(plan_lines)).block(
+                        Block::bordered()
+                            .border_type(BorderType::Rounded)
+                            .border_style(theme::border()),
+                    ),
+                    row(y, h),
+                );
                 y += h;
             }
 
             if running {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(status, theme::dim())),
-                    row(y, 1),
-                );
+                frame.render_widget(Paragraph::new(status), row(y, 1));
                 y += 1;
             }
 
@@ -1898,24 +2178,30 @@ impl App {
                 y += 1;
             }
 
-            frame.render_widget(
-                Paragraph::new(Line::styled(hint, theme::dim())),
-                row(y, 1),
-            );
+            frame.render_widget(Paragraph::new(Line::styled(hint, theme::dim())), row(y, 1));
         })?;
         Ok(())
     }
 
-    /// Spinner line shown above the input while a turn runs.
-    fn status_line(&self, running: bool, started: Option<Instant>) -> String {
+    /// Spinner line shown above the input while a turn runs. The sparkle
+    /// carries the animation; the label stays readable, metadata stays dim.
+    fn status_line(&self, running: bool, started: Option<Instant>) -> Line<'static> {
         if !running {
-            return String::new();
+            return Line::default();
         }
         let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        format!(
-            "{} {} · {}s · ↓ ~{} tok · esc to cancel",
-            SPINNER[self.spinner], self.state_label, elapsed, self.out_tokens
-        )
+        let (frame, color) = CALM_SPINNER[self.spinner % CALM_SPINNER.len()];
+        Line::from(vec![
+            Span::styled(
+                format!("{frame} "),
+                ratatui::style::Style::default().fg(color),
+            ),
+            Span::styled(self.state_label.clone(), theme::accent()),
+            Span::styled(
+                format!(" · {elapsed}s · ↓ ~{} tok · esc to cancel", self.out_tokens),
+                theme::dim(),
+            ),
+        ])
     }
 
     /// Dim one-liner under the input box: mode, model, cache health.
@@ -1935,6 +2221,22 @@ impl App {
             self.agent.model.snapshot().describe(),
             cache
         )
+    }
+}
+
+/// Split a tool summary like `shell(cargo test)` into colored spans:
+/// the tool name is green, the arguments are dim.
+fn colored_tool_summary(summary: &str) -> Vec<Span<'static>> {
+    let s = summary.to_string();
+    if let Some(paren) = s.find('(') {
+        let name = &s[..paren];
+        let args = &s[paren..];
+        vec![
+            Span::styled(name.to_string(), theme::ok()),
+            Span::styled(args.to_string(), theme::dim()),
+        ]
+    } else {
+        vec![Span::styled(s, theme::bold())]
     }
 }
 
@@ -1998,15 +2300,29 @@ fn token_count(tokens: u64) -> String {
 
 fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
     let weekly = limits.secondary.filter(|limit| limit.used_percent >= 80.0);
-    let (label, limit) = weekly.map(|limit| ("week", limit)).unwrap_or(("5h", limits.primary));
+    let (label, limit) = weekly
+        .map(|limit| ("week", limit))
+        .unwrap_or(("5h", limits.primary));
     let filled = ((limit.used_percent.clamp(0.0, 100.0) / 100.0) * 12.0).round() as usize;
-    let color = if limit.used_percent >= 90.0 { theme::ERROR } else if limit.used_percent >= 75.0 { theme::WARN } else { theme::ACCENT };
+    let color = if limit.used_percent >= 90.0 {
+        theme::ERROR
+    } else if limit.used_percent >= 75.0 {
+        theme::WARN
+    } else {
+        theme::ACCENT
+    };
     Line::from(vec![
         Span::styled(format!("  OpenAI {label} "), theme::dim()),
         Span::styled("▕", ratatui::style::Style::default().fg(color)),
-        Span::styled("▰".repeat(filled), ratatui::style::Style::default().fg(color)),
+        Span::styled(
+            "▰".repeat(filled),
+            ratatui::style::Style::default().fg(color),
+        ),
         Span::styled("▱".repeat(12 - filled), theme::dim()),
-        Span::styled(format!("▏ {:.0}%", limit.used_percent), ratatui::style::Style::default().fg(color)),
+        Span::styled(
+            format!("▏ {:.0}%", limit.used_percent),
+            ratatui::style::Style::default().fg(color),
+        ),
     ])
 }
 
@@ -2067,8 +2383,9 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
         .iter()
         .map(|tool| {
             let schema = serde_json::to_string(&tool.input_schema()).unwrap_or_default();
-            (approx_tokens(tool.name()) + approx_tokens(tool.description()) + approx_tokens(&schema))
-                as u64
+            (approx_tokens(tool.name())
+                + approx_tokens(tool.description())
+                + approx_tokens(&schema)) as u64
         })
         .sum();
     let conversation: u64 = ledger
@@ -2081,7 +2398,10 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
                 .iter()
                 .map(|block| match block {
                     ContentBlock::Text { text } => approx_tokens(text) as u64,
-                    ContentBlock::Thinking { thinking, signature } => {
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                    } => {
                         (approx_tokens(thinking)
                             + signature.as_deref().map(approx_tokens).unwrap_or_default())
                             as u64
@@ -2094,9 +2414,11 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
                                 .map(|json| approx_tokens(&json))
                                 .unwrap_or_default()) as u64
                     }
-                    ContentBlock::ToolResult { tool_use_id, content, .. } => {
-                        (approx_tokens(tool_use_id) + approx_tokens(content)) as u64
-                    }
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        ..
+                    } => (approx_tokens(tool_use_id) + approx_tokens(content)) as u64,
                 })
                 .sum(),
             // These variants grow into small XML-like wrappers before the
@@ -2106,7 +2428,9 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
             tcode_core::Entry::ImportedTool { .. } => 0,
         })
         .sum();
-    system.saturating_add(tool_defs).saturating_add(conversation)
+    system
+        .saturating_add(tool_defs)
+        .saturating_add(conversation)
 }
 
 fn shorten_summary_path(summary: &str, cwd: Option<&Path>) -> String {
@@ -2140,7 +2464,11 @@ fn wrap_baked_lines(lines: Vec<Line<'static>>, terminal_width: usize) -> Vec<Lin
             for c in span.content.chars() {
                 let char_width = c.width().unwrap_or(0);
                 if !current.is_empty() && current_width + char_width > width {
-                    out.push(pad_background_line(std::mem::take(&mut current), current_width, width));
+                    out.push(pad_background_line(
+                        std::mem::take(&mut current),
+                        current_width,
+                        width,
+                    ));
                     current_width = 0;
                 }
                 current.push(Span::styled(c.to_string(), span.style));
@@ -2204,7 +2532,10 @@ fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
                 .position(|(_, start, end)| *start <= cursor_col && cursor_col <= *end)
                 .unwrap_or(chunks.len() - 1);
             let (_, start, _) = &chunks[cursor_chunk];
-            visual_cursor = (lines.len() + cursor_chunk, cursor_col.saturating_sub(*start));
+            visual_cursor = (
+                lines.len() + cursor_chunk,
+                cursor_col.saturating_sub(*start),
+            );
         }
         for (i, (chunk, _, _)) in chunks.into_iter().enumerate() {
             lines.push((i == 0, chunk));
@@ -2316,6 +2647,13 @@ fn make_terminal(height: u16, known_top: Option<u16>) -> anyhow::Result<Terminal
     )?)
 }
 
+fn change_key(tool: &str, input: &serde_json::Value) -> String {
+    format!(
+        "{tool}:{}",
+        serde_json::to_string(input).unwrap_or_default()
+    )
+}
+
 async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEvent> {
     match rx {
         Some(rx) => rx.recv().await,
@@ -2337,11 +2675,16 @@ async fn join_phase(phase: &mut Phase) -> (Session, Result<(), AgentError>) {
 /// Resolves when a disk-heavy external import finishes; pends otherwise so it
 /// composes cleanly with the terminal event loop.
 async fn join_external_import(
-    import: &mut Option<JoinHandle<(
-        tcode_core::ExternalSource,
-        Result<tcode_core::Resumed, tcode_core::store::StoreError>,
-    )>>,
-) -> (tcode_core::ExternalSource, Result<tcode_core::Resumed, tcode_core::store::StoreError>) {
+    import: &mut Option<
+        JoinHandle<(
+            tcode_core::ExternalSource,
+            Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+        )>,
+    >,
+) -> (
+    tcode_core::ExternalSource,
+    Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+) {
     match import {
         Some(handle) => match handle.await {
             Ok(done) => done,
@@ -2428,7 +2771,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains("context 85% · 170k/200k"));
-        assert!(line.spans.iter().any(|span| span.style.fg == Some(theme::WARN)));
+        assert!(line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme::WARN)));
     }
 
     #[test]
@@ -2446,7 +2792,10 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(text, "  ╰─ completed 2.5s  ·  ↑ 1.2k input  ·  ↓ 23 output  ·  cache 0%");
+        assert_eq!(
+            text,
+            "  ╰─ completed 2.5s  ·  ↑ 1.2k input  ·  ↓ 23 output  ·  cache 0%"
+        );
     }
 
     #[test]

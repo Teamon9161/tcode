@@ -33,10 +33,9 @@ pub fn build(
             profile.base_url.clone(),
             watchdog.clone(),
         )),
-        ProviderKind::Chatgpt => Arc::new(ChatGptProvider::new(
-            model.name.clone(),
-            watchdog.clone(),
-        )),
+        ProviderKind::Chatgpt => {
+            Arc::new(ChatGptProvider::new(model.name.clone(), watchdog.clone()))
+        }
     })
 }
 

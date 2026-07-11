@@ -27,6 +27,11 @@ pub fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
 }
 
+/// Green — used for tool names and successful status indicators.
+pub fn ok() -> Style {
+    Style::default().fg(OK)
+}
+
 pub fn user_prompt() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }

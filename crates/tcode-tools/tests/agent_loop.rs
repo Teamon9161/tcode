@@ -127,6 +127,7 @@ fn agent(provider: Arc<MockProvider>) -> Agent {
         system: "test".into(),
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
     }
 }
 
@@ -212,6 +213,65 @@ async fn loop_runs_tool_and_feeds_result_back() {
 }
 
 #[tokio::test]
+async fn external_read_loads_project_instructions_without_blocking() {
+    let base = tempfile::tempdir().unwrap();
+    let current = base.path().join("current");
+    let external = base.path().join("external");
+    std::fs::create_dir_all(current.join(".git")).unwrap();
+    std::fs::create_dir_all(external.join(".git")).unwrap();
+    std::fs::write(external.join("AGENTS.md"), "external read rule").unwrap();
+    let target = external.join("data.txt");
+    std::fs::write(&target, "external data").unwrap();
+    let input = serde_json::json!({"path": target}).to_string();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", &input),
+        text_done("rules applied"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(&current, PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "read external data").await;
+
+    let results = tool_results(&session);
+    assert!(!results[0].1, "read should execute: {}", results[0].0);
+    assert!(results[0].0.contains("external data"));
+    assert!(session
+        .ledger
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, Entry::Note(note) if note.contains("external read rule"))));
+}
+
+#[tokio::test]
+async fn first_external_write_is_blocked_then_retry_executes() {
+    let base = tempfile::tempdir().unwrap();
+    let current = base.path().join("current");
+    let external = base.path().join("external");
+    std::fs::create_dir_all(current.join(".git")).unwrap();
+    std::fs::create_dir_all(external.join(".git")).unwrap();
+    std::fs::write(external.join("AGENTS.md"), "external write rule").unwrap();
+    let target = external.join("created.txt");
+    let input = serde_json::json!({"path": target, "content": "written once"}).to_string();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "write", &input),
+        tool_use("t2", "write", &input),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(&current, PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "write external file").await;
+
+    let results = tool_results(&session);
+    assert!(results[0].1);
+    assert!(results[0].0.contains("no side effects occurred"));
+    assert!(!results[1].1, "retry should execute: {}", results[1].0);
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "written once");
+}
+
+#[tokio::test]
 async fn approval_comment_becomes_note_for_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![
@@ -268,7 +328,10 @@ async fn plan_mode_blocks_edits_without_prompting() {
 
     run(&agent, &mut session, &approver, "create a.txt").await;
 
-    assert!(approver.asked.lock().unwrap().is_empty(), "plan mode must not prompt");
+    assert!(
+        approver.asked.lock().unwrap().is_empty(),
+        "plan mode must not prompt"
+    );
     assert!(!dir.path().join("a.txt").exists());
     let results = tool_results(&session);
     assert!(results[0].0.contains("plan mode"));
@@ -334,7 +397,10 @@ async fn interrupt_contract_pairs_results_and_explains_state() {
     drop(tx);
     let events = collector.await.unwrap();
 
-    assert!(!dir.path().join("a.txt").exists(), "cancelled call must not run");
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "cancelled call must not run"
+    );
     // API invariant: the committed tool_use still got a (cancelled) result.
     let results = tool_results(&session);
     assert_eq!(results.len(), 1);
@@ -359,10 +425,7 @@ async fn shell_tool_runs_and_reports_exit_code() {
         (r#"{"command":"echo tcode-ping"}"#, "tcode-ping")
     };
     let tool_name = if cfg!(windows) { "shell" } else { "bash" };
-    let provider = MockProvider::new(vec![
-        tool_use("t1", tool_name, cmd),
-        text_done("done"),
-    ]);
+    let provider = MockProvider::new(vec![tool_use("t1", tool_name, cmd), text_done("done")]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Unsafe);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
@@ -505,7 +568,10 @@ async fn pre_tool_hook_blocks_the_call() {
 
     run(&agent, &mut session, &approver, "write it").await;
 
-    assert!(!dir.path().join("a.txt").exists(), "hook must block the write");
+    assert!(
+        !dir.path().join("a.txt").exists(),
+        "hook must block the write"
+    );
     let results = tool_results(&session);
     assert!(results[0].1, "blocked call must be an error result");
     assert!(results[0].0.contains("protected file"));
@@ -522,8 +588,7 @@ async fn agent_checkpoints_files_before_mutating_tools() {
     ]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Unsafe);
-    session.checkpoints =
-        tcode_core::CheckpointStore::new(dir.path().join(".ckpts"));
+    session.checkpoints = tcode_core::CheckpointStore::new(dir.path().join(".ckpts"));
     // The write tool demands a prior read before overwriting.
     session
         .tool_ctx
@@ -540,4 +605,239 @@ async fn agent_checkpoints_files_before_mutating_tools() {
     let restored = session.checkpoints.restore_to(0);
     assert!(!restored.is_empty());
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "original");
+}
+
+#[tokio::test]
+async fn background_shell_task_reports_completion_next_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_name = if cfg!(windows) { "shell" } else { "bash" };
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            tool_name,
+            r#"{"command":"echo bg-done","run_in_background":true}"#,
+        ),
+        text_done("started it"),
+        text_done("noted"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "run echo in background").await;
+
+    // The tool returns immediately with a task id, not the echo output.
+    let results = tool_results(&session);
+    assert!(
+        results[0].0.contains("Started background task b1"),
+        "{}",
+        results[0].0
+    );
+    assert!(!results[0].1);
+
+    // Wait for the process to finish.
+    for _ in 0..100 {
+        if session
+            .tool_ctx
+            .background
+            .lock()
+            .unwrap()
+            .running()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        session
+            .tool_ctx
+            .background
+            .lock()
+            .unwrap()
+            .running()
+            .is_empty(),
+        "background echo did not finish in time"
+    );
+
+    // Its captured output pages through the registry (read_output path).
+    let page = session
+        .tool_ctx
+        .background
+        .lock()
+        .unwrap()
+        .read("b1", 1, 50)
+        .unwrap();
+    assert!(page.contains("bg-done"), "{page}");
+
+    // The next turn starts by telling the model the task finished.
+    run(&agent, &mut session, &approver, "anything else").await;
+    let note = session
+        .ledger
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            Entry::Note(n) if n.contains("Background task b1") => Some(n.clone()),
+            _ => None,
+        })
+        .expect("completion note must be appended at the next turn start");
+    assert!(note.contains("exited with code 0"), "{note}");
+    assert!(note.contains("read_output"), "{note}");
+}
+
+#[tokio::test]
+async fn kill_task_stops_a_background_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let tool_name = if cfg!(windows) { "shell" } else { "bash" };
+    let command = if cfg!(windows) {
+        r#"{"command":"Start-Sleep -Seconds 60","run_in_background":true}"#
+    } else {
+        r#"{"command":"sleep 60","run_in_background":true}"#
+    };
+    let provider = MockProvider::new(vec![
+        tool_use("t1", tool_name, command),
+        tool_use("t2", "kill_task", r#"{"id":"b1"}"#),
+        text_done("killed"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "start then kill").await;
+
+    let results = tool_results(&session);
+    assert!(
+        results[1].0.contains("kill signal sent"),
+        "{}",
+        results[1].0
+    );
+    for _ in 0..100 {
+        if session
+            .tool_ctx
+            .background
+            .lock()
+            .unwrap()
+            .running()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let notes = session
+        .tool_ctx
+        .background
+        .lock()
+        .unwrap()
+        .take_completion_notes();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(notes[0].contains("killed"), "{}", notes[0]);
+}
+
+#[tokio::test]
+async fn edit_succeeds_without_prior_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "alpha beta gamma").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "edit",
+            r#"{"path":"a.txt","old_string":"beta","new_string":"BETA"}"#,
+        ),
+        text_done("edited"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "edit it").await;
+
+    let results = tool_results(&session);
+    assert!(
+        !results[0].1,
+        "exact match needs no prior read: {}",
+        results[0].0
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha BETA gamma");
+}
+
+#[tokio::test]
+async fn edit_miss_without_read_suggests_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "edit",
+            r#"{"path":"a.txt","old_string":"delta","new_string":"DELTA"}"#,
+        ),
+        text_done("gave up"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "edit it").await;
+
+    let results = tool_results(&session);
+    assert!(results[0].1);
+    assert!(
+        results[0].0.contains("not read the current version"),
+        "{}",
+        results[0].0
+    );
+}
+
+#[tokio::test]
+async fn step_limit_ends_turn_gracefully() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "x").unwrap();
+    // Three scripted tool steps, but the guard allows only two.
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"a.txt"}"#),
+        tool_use("t2", "read", r#"{"path":"a.txt","force":true}"#),
+        tool_use("t3", "read", r#"{"path":"a.txt","force":true}"#),
+        text_done("never reached"),
+    ]);
+    let mut agent = agent(provider);
+    agent.max_steps = 2;
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "loop forever").await;
+
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::StepLimitReached { max: 2 })));
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
+    // The ledger stays consistent and tells the model why the turn ended.
+    assert!(session
+        .ledger
+        .entries()
+        .iter()
+        .any(|entry| matches!(entry, Entry::Note(note) if note.contains("runaway guard"))));
+}
+
+#[tokio::test]
+async fn tiny_read_limits_are_widened() {
+    let dir = tempfile::tempdir().unwrap();
+    let body: String = (1..=200).map(|i| format!("line{i}\n")).collect();
+    std::fs::write(dir.path().join("big.txt"), body).unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"big.txt","offset":10,"limit":5}"#),
+        text_done("saw it"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "peek at big.txt").await;
+
+    // A 5-line request is widened to the 120-line floor: one round-trip
+    // instead of a dozen slivers.
+    let results = tool_results(&session);
+    assert!(results[0].0.contains("line100"), "{}", results[0].0);
+    assert!(results[0].0.contains("line129"), "{}", results[0].0);
+    assert!(!results[0].0.contains("line130"), "{}", results[0].0);
 }

@@ -22,8 +22,8 @@ use tcode_core::codex;
 use tcode_core::config::WatchdogConfig;
 use tcode_core::stream_util::with_idle_timeout;
 use tcode_core::{
-    CacheStrategy, ContentBlock, EventStream, Message, Provider, ProviderError, Request, Role,
-    RateLimit, RateLimits, StopReason, StreamEvent,
+    CacheStrategy, ContentBlock, EventStream, Message, Provider, ProviderError, RateLimit,
+    RateLimits, Request, Role, StopReason, StreamEvent,
 };
 
 use crate::retry::short;
@@ -210,12 +210,13 @@ fn push_items(msg: &Message, out: &mut Vec<Value>) {
         Role::Assistant => {
             for block in &msg.content {
                 match block {
-                    ContentBlock::Thinking { signature, .. } => {
-                        // The signature holds the raw reasoning item.
-                        if let Some(sig) = signature {
-                            if let Ok(item) = serde_json::from_str::<Value>(sig) {
-                                out.push(item);
-                            }
+                    // The signature holds the raw reasoning item.
+                    ContentBlock::Thinking {
+                        signature: Some(sig),
+                        ..
+                    } => {
+                        if let Ok(item) = serde_json::from_str::<Value>(sig) {
+                            out.push(item);
                         }
                     }
                     ContentBlock::Text { text } => out.push(json!({
@@ -400,13 +401,15 @@ impl Provider for ChatGptProvider {
 }
 
 fn rate_limits_from(value: &Value) -> Option<RateLimits> {
-    let parse = |value: &Value| Some(RateLimit {
-        used_percent: value["used_percent"].as_f64()?,
-        window_minutes: value["window_minutes"].as_u64()?,
-        resets_at: value["resets_at"].as_u64()?,
-    });
+    let parse = |value: &Value| {
+        Some(RateLimit {
+            used_percent: value["used_percent"].as_f64()?,
+            window_minutes: value["window_minutes"].as_u64()?,
+            resets_at: value["resets_at"].as_u64()?,
+        })
+    };
     Some(RateLimits {
-        primary: parse(&value["primary"] )?,
+        primary: parse(&value["primary"])?,
         secondary: parse(&value["secondary"]),
     })
 }

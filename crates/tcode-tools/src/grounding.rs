@@ -20,12 +20,12 @@ pub fn project_map(cwd: &Path) -> String {
 
     let tree = dir_tree(cwd);
     if !tree.is_empty() {
-        out.push_str(&format!("\n# Project layout (2 levels, gitignore-aware)\n{tree}"));
+        out.push_str(&format!(
+            "\n# Project layout (2 levels, gitignore-aware)\n{tree}"
+        ));
     }
 
-    if let Some((source, text)) = memory_file(cwd) {
-        out.push_str(&format!("\n# Project memory (from {source})\n{text}\n"));
-    }
+    out.push_str(&tcode_core::MemoryManager::new(cwd).startup_prompt());
     out
 }
 
@@ -55,7 +55,11 @@ fn civil_from_days(z: i64) -> String {
 }
 
 fn git(cwd: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").args(args).current_dir(cwd).output().ok()?;
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -75,78 +79,81 @@ fn git_summary(cwd: &Path) -> Option<String> {
         for line in status.lines().take(15) {
             s.push_str(&format!("  {line}\n"));
         }
+        if dirty > 15 {
+            s.push_str(&format!("  … (+{} more)\n", dirty - 15));
+        }
     }
     Some(s)
 }
 
+/// Overall budget for the layout section of the system prompt.
+const TREE_MAX_ENTRIES: usize = 80;
+/// One crowded directory (generated assets, fixtures…) must not spend the
+/// whole budget before its siblings appear, so children are capped per dir.
+const TREE_MAX_PER_DIR: usize = 20;
+
 fn dir_tree(cwd: &Path) -> String {
-    let mut entries: Vec<String> = Vec::new();
+    use std::collections::BTreeMap;
+
     let walker = ignore::WalkBuilder::new(cwd)
         .max_depth(Some(2))
         .hidden(true)
+        .sort_by_file_name(std::cmp::Ord::cmp)
         .build();
+    // parent (relative, "" = root) → child display names.
+    let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for entry in walker.flatten() {
         let path = entry.path();
         if path == cwd {
             continue;
         }
-        let Ok(rel) = path.strip_prefix(cwd) else { continue };
-        let depth = rel.components().count();
-        let indent = "  ".repeat(depth - 1);
+        let Ok(rel) = path.strip_prefix(cwd) else {
+            continue;
+        };
+        let parent = rel
+            .parent()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
         let name = rel.file_name().unwrap_or_default().to_string_lossy();
-        if path.is_dir() {
-            entries.push(format!("{indent}{name}/"));
+        let name = if path.is_dir() {
+            format!("{name}/")
         } else {
+            name.into_owned()
+        };
+        children.entry(parent).or_default().push(name);
+    }
+
+    let mut entries: Vec<String> = Vec::new();
+    let emit = |names: &[String], indent: &str, entries: &mut Vec<String>| {
+        for name in names.iter().take(TREE_MAX_PER_DIR) {
             entries.push(format!("{indent}{name}"));
         }
-        if entries.len() >= 80 {
+        if names.len() > TREE_MAX_PER_DIR {
+            entries.push(format!(
+                "{indent}… (+{} more)",
+                names.len() - TREE_MAX_PER_DIR
+            ));
+        }
+    };
+    let top = children.remove("").unwrap_or_default();
+    for name in top.iter().take(TREE_MAX_PER_DIR) {
+        entries.push(name.clone());
+        if let Some(sub) = name.strip_suffix('/').and_then(|d| children.get(d)) {
+            emit(sub, "  ", &mut entries);
+        }
+        if entries.len() >= TREE_MAX_ENTRIES {
             entries.push("… (truncated)".into());
             break;
         }
     }
+    if top.len() > TREE_MAX_PER_DIR {
+        entries.push(format!(
+            "… (+{} more top-level entries)",
+            top.len() - TREE_MAX_PER_DIR
+        ));
+    }
+    if entries.is_empty() {
+        return String::new();
+    }
     entries.join("\n") + "\n"
-}
-
-/// Project memory: .tcode/AGENTS.md > AGENTS.md > CLAUDE.md, plus the
-/// global ~/.tcode/AGENTS.md if present.
-fn memory_file(cwd: &Path) -> Option<(String, String)> {
-    let mut text = String::new();
-    let mut sources: Vec<String> = Vec::new();
-    if let Some(home) = dirs_home() {
-        let global = home.join(".tcode").join("AGENTS.md");
-        if let Ok(t) = std::fs::read_to_string(&global) {
-            sources.push("~/.tcode/AGENTS.md".into());
-            text.push_str(&t);
-            text.push('\n');
-        }
-    }
-    for candidate in [".tcode/AGENTS.md", "AGENTS.md", "CLAUDE.md"] {
-        let p = cwd.join(candidate);
-        if let Ok(t) = std::fs::read_to_string(&p) {
-            sources.push(candidate.into());
-            text.push_str(&t);
-            break; // first hit wins among project files
-        }
-    }
-    if text.is_empty() {
-        return None;
-    }
-    const CAP: usize = 16_000;
-    if text.len() > CAP {
-        let cut = text
-            .char_indices()
-            .take_while(|(i, _)| *i < CAP)
-            .last()
-            .map(|(i, c)| i + c.len_utf8())
-            .unwrap_or(0);
-        text.truncate(cut);
-        text.push_str("\n… (memory truncated)");
-    }
-    Some((sources.join(" + "), text))
-}
-
-fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(Into::into)
 }

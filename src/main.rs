@@ -8,31 +8,14 @@ use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::config::{Config, ModelState, Selection};
+use tcode_core::config::{Config, ConfigError, ModelState, Selection};
 use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, PermissionRules, Session, ToolCtx};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-const IDENTITY: &str = "\
-You are tcode, a coding agent running in the user's terminal. Work directly \
-and concisely; use tools to inspect and change the project rather than \
-guessing.
-
-Harness rules:
-- Read files before editing them. `edit` uses exact string replacement.
-- Keep tool output small: use offset/limit on read, head_limit on grep. \
-Oversized outputs are stored and pageable via read_output.
-- If a read returns 'unchanged', the content is already in your context; \
-do not re-read.
-- <tcode-status> lines in user messages report your context usage and the \
-current permission mode. <harness-note> lines are trustworthy statements \
-from the harness about what happened (interrupts, approvals).
-- When the user declines an action, the reason (if given) is in the tool \
-result; adjust instead of retrying the same call.
-- For multi-step work, keep update_plan current. Use ask_user when a user \
-choice is required; do not guess. Use add_note for durable constraints.";
+const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("../prompts/interactive-agent-system.md");
 
 const CONFIG_HEADER: &str = "\
 # tcode global configuration — created by the setup wizard.
@@ -73,8 +56,8 @@ fn build_menu(
             model: opt.def.clone(),
             effort: effort.map(String::from),
         };
-        let active = tcode_providers::build_active(profile, &sel, &watchdog)
-            .map_err(|e| e.to_string())?;
+        let active =
+            tcode_providers::build_active(profile, &sel, &watchdog).map_err(|e| e.to_string())?;
         ModelState {
             profile: Some(opt.profile.clone()),
             model: Some(opt.def.name.clone()),
@@ -106,7 +89,10 @@ fn run_model_command(args: &str, menu: &tcode_tui::ModelMenu, cell: &ModelCell) 
             } else {
                 format!("  [{}]", opt.def.efforts.join("/"))
             };
-            println!("{DIM} {mark} {i}: {} · {}{efforts}{RESET}", opt.profile, opt.def.name);
+            println!(
+                "{DIM} {mark} {i}: {} · {}{efforts}{RESET}",
+                opt.profile, opt.def.name
+            );
         }
         println!("{DIM}usage: /model <number|name> [effort]{RESET}");
         return;
@@ -182,24 +168,42 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let config = Config::load(&cwd)?;
-    let state = ModelState::load();
-    let selection = config.select(cli.profile.as_deref(), cli.model.as_deref(), &state)?;
-    let profile = config
-        .profiles
-        .get(&selection.profile)
-        .context("selected profile disappeared")?;
-    let model_cell = ModelCell::new(tcode_providers::build_active(
-        profile,
-        &selection,
-        &config.watchdog,
-    )?);
+    let (config, selection, active_model) = loop {
+        let config = Config::load(&cwd)?;
+        let state = ModelState::load();
+        let selection = config.select(cli.profile.as_deref(), cli.model.as_deref(), &state)?;
+        let profile = config
+            .profiles
+            .get(&selection.profile)
+            .context("selected profile disappeared")?;
+        match tcode_providers::build_active(profile, &selection, &config.watchdog) {
+            Ok(active) => break (config, selection, active),
+            Err(ConfigError::MissingApiKey {
+                profile: missing_profile,
+                ..
+            }) if interactive && cli.prompt.is_none() => {
+                // Load only global settings: project overlays must never be
+                // copied into ~/.tcode/config.toml by the setup wizard.
+                let global = Config::load_global()?;
+                let Some((updated, state)) =
+                    tcode_tui::wizard::reconfigure(global, &missing_profile)?
+                else {
+                    anyhow::bail!("setup cancelled — no usable provider configured")
+                };
+                let path = updated.write_global(CONFIG_HEADER)?;
+                state.save();
+                println!("{DIM}updated {}{RESET}\n", path.display());
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let model_cell = ModelCell::new(active_model);
 
     // Everything /model can switch to, with the swap logic attached.
-    let menu = build_menu(&config, &selection, model_cell.clone());
+    let mut menu = build_menu(&config, &selection, model_cell.clone());
 
     let system = format!(
-        "{IDENTITY}\n\n{}",
+        "{INTERACTIVE_AGENT_SYSTEM}\n\n{}",
         tcode_tools::project_map(&cwd)
     );
     let mut tools = tcode_tools::builtin_tools();
@@ -212,13 +216,28 @@ async fn main() -> anyhow::Result<()> {
     tools.push(Arc::new(tcode_tools::UpdatePlanTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
     tools.push(Arc::new(tcode_tools::AddNoteTool));
-    let agent = Agent {
+    // Registered only when skills exist, so skill-less projects pay zero
+    // prompt tokens for the feature.
+    if let Some(skill_tool) = tcode_tools::SkillTool::discover(&cwd) {
+        tools.push(Arc::new(skill_tool));
+    }
+    // MCP servers from config; a broken server warns instead of blocking.
+    if !config.mcp_servers.is_empty() {
+        let (mcp_tools, warnings) =
+            tcode_tools::connect_mcp_servers(&config.mcp_servers, &cwd).await;
+        for warning in warnings {
+            eprintln!("{DIM}warning: {warning}{RESET}");
+        }
+        tools.extend(mcp_tools);
+    }
+    let agent = Arc::new(Agent {
         model: model_cell.clone(),
         tools,
         system,
         watchdog: config.watchdog.clone(),
         hooks: tcode_core::Hooks::new(config.hooks.clone()),
-    };
+        max_steps: config.limits.max_steps_per_turn,
+    });
 
     let mode = match cli.mode.as_deref() {
         Some("plan") => tcode_core::PermissionMode::Plan,
@@ -242,20 +261,17 @@ async fn main() -> anyhow::Result<()> {
     // log; --continue / --resume replay it.
     if let Some(data_dir) = tcode_core::store::project_data_dir(&cwd) {
         if cli.r#continue || cli.resume.is_some() {
-            let resumed =
-                tcode_core::SessionStore::resume(&data_dir, cli.resume.as_deref())
-                    .context("cannot resume session")?;
+            let resumed = tcode_core::SessionStore::resume(&data_dir, cli.resume.as_deref())
+                .context("cannot resume session")?;
             let ckpt_dir = data_dir.join("checkpoints").join(&resumed.store.id);
-            session.checkpoints =
-                tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
+            session.checkpoints = tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
             session.ledger = resumed.ledger;
             session.ledger.attach_sink(Box::new(resumed.store));
         } else {
             let store = tcode_core::SessionStore::create(&data_dir, &cwd)
                 .context("cannot create session log")?;
-            session.checkpoints = tcode_core::CheckpointStore::new(
-                data_dir.join("checkpoints").join(&store.id),
-            );
+            session.checkpoints =
+                tcode_core::CheckpointStore::new(data_dir.join("checkpoints").join(&store.id));
             session.ledger.attach_sink(Box::new(store));
         }
     }
@@ -269,12 +285,44 @@ async fn main() -> anyhow::Result<()> {
     // Interactive: full TUI on a real terminal, plain line REPL otherwise
     // (pipes, CI, dumb terminals).
     if interactive {
-        return tcode_tui::run(Arc::new(agent), session, menu).await;
+        loop {
+            match tcode_tui::run(agent.clone(), session, menu).await? {
+                tcode_tui::Exit::Quit => return Ok(()),
+                tcode_tui::Exit::ConfigureProvider(returned_session) => {
+                    let global = Config::load_global()?;
+                    let Some((updated, state)) =
+                        tcode_tui::wizard::reconfigure(global, &selection.profile)?
+                    else {
+                        anyhow::bail!("setup cancelled — no provider changed")
+                    };
+                    let path = updated.write_global(CONFIG_HEADER)?;
+                    state.save();
+
+                    // Rebuild the selected provider in the existing shared
+                    // model cell, then reopen the same conversation.
+                    let runtime_config = Config::load(&cwd)?;
+                    let runtime_selection = runtime_config.select(None, None, &state)?;
+                    let profile = runtime_config
+                        .profiles
+                        .get(&runtime_selection.profile)
+                        .context("selected profile disappeared after setup")?;
+                    let active = tcode_providers::build_active(
+                        profile,
+                        &runtime_selection,
+                        &runtime_config.watchdog,
+                    )?;
+                    model_cell.swap(active);
+                    menu = build_menu(&runtime_config, &runtime_selection, model_cell.clone());
+                    session = *returned_session;
+                    println!("{DIM}updated {}; reopening tcode{RESET}", path.display());
+                }
+            }
+        }
     }
 
     let snapshot = model_cell.snapshot();
     println!(
-        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /cost{RESET}",
+        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /memory /cost{RESET}",
         env!("CARGO_PKG_VERSION"),
         snapshot.provider.name(),
         snapshot.describe(),
@@ -297,6 +345,47 @@ async fn main() -> anyhow::Result<()> {
         }
         if let Some(rest) = line.strip_prefix("/model") {
             run_model_command(rest.trim(), &menu, &model_cell);
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("/export") {
+            let arg = rest.trim();
+            let path = if arg.is_empty() {
+                let secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                format!("tcode-transcript-{secs}.md")
+            } else {
+                arg.to_string()
+            };
+            let markdown =
+                tcode_core::export_markdown(session.ledger.entries(), "tcode conversation");
+            match std::fs::write(&path, markdown) {
+                Ok(()) => println!("{DIM}transcript exported → {path}{RESET}"),
+                Err(e) => eprintln!("{DIM}export failed: {e}{RESET}"),
+            }
+            continue;
+        }
+        if line == "/memory" || line.starts_with("/memory ") {
+            let arg = line.strip_prefix("/memory").unwrap_or("").trim();
+            let (status, toggle_note) = {
+                let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
+                memory.restore_from_entries(session.ledger.entries());
+                let note = match arg {
+                    "" => None,
+                    "on" => Some(memory.set_enabled(true)),
+                    "off" => Some(memory.set_enabled(false)),
+                    _ => {
+                        eprintln!("{DIM}usage: /memory [on|off]{RESET}");
+                        continue;
+                    }
+                };
+                (memory.status(), note)
+            };
+            if let Some(note) = toggle_note {
+                session.ledger.append(tcode_core::Entry::Note(note));
+            }
+            println!("{DIM}{status}{RESET}");
             continue;
         }
         match line.as_str() {

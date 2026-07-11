@@ -11,7 +11,7 @@
 - **不要的**：Codex 的沙箱式能力阉割。
 - **核心约束**：省 token、缓存命中率最大化。上下文一旦写入绝不回改，用类型系统强制，不靠纪律。
 
-已确认决策：v1 双 Provider（Anthropic + OpenAI 兼容）；inline 渲染为主（Renderer 做成 trait，全屏模式 v2）；含 resume、compact、项目记忆（`.tcode/AGENTS.md` > `AGENTS.md` > `CLAUDE.md`）；双 Shell 以 PowerShell 为主；v1 含文件 checkpoints + rewind；分支只记录进事件日志，浏览 UI 放 v2。
+已确认决策：v1 双 Provider（Anthropic + OpenAI 兼容）；inline 渲染为主（Renderer 做成 trait，全屏模式 v2）；含 resume、compact、分层项目指令（详见 M5 memory 2.0）；双 Shell 以 PowerShell 为主；v1 含文件 checkpoints + rewind；分支只记录进事件日志，浏览 UI 放 v2。
 
 ## 第一性原则：零猜测原则
 
@@ -157,9 +157,10 @@ pub trait Renderer {
 
 ```
 ~/.tcode/config.toml      # provider profiles (model, base_url, api_key_env), 全局权限规则
-~/.tcode/AGENTS.md        # 全局记忆
+~/.tcode/AGENTS.md        # 用户级持久指令（所有项目加载）
 .tcode/config.toml        # 项目级: hooks, 权限规则
-项目记忆: .tcode/AGENTS.md > AGENTS.md > CLAUDE.md (第一个命中注入 system prompt)
+项目指令: 每层目录按 .tcode/AGENTS.md > AGENTS.md > CLAUDE.md 取第一个，祖先到目标逐层叠加
+自动记忆: ~/.tcode/projects/<project-id>/memory/{MEMORY.md,topic files}
 会话/checkpoint/blob: ~/.tcode/projects/<cwd-hash>/{sessions,checkpoints,blobs}/
 ```
 
@@ -201,26 +202,60 @@ tokio, reqwest(rustls, stream), serde/serde_json, ratatui, crossterm, arboard, s
 
 ## 里程碑（每个可运行、可验证）
 
-1. **M0 骨架 + Provider**：workspace、config、双 Provider（SSE 解析、watchdog、重试）、行式 REPL 流式对话。→ 验证：两后端各跑对话；断网/挂代理验证 watchdog。
-2. **M1 工具 + loop**：Tool trait、六个工具（含自愈式错误信息）、ledger、agent loop、权限模式+规则（行式确认）、blob store 预算门、Freshness Tracker、中断契约、开局项目地图、尾部自知一行。→ 验证：真实任务"读→改→跑测试"；故意让 edit 失败观察模型无需额外 read 即修复；中断后观察模型不做无效验证；重复读同文件返回 stub。
-3. **M2 TUI**：inline 渲染器、markdown/高亮/diff、输入框、slash 命令、**权限选项+Tab 意见**、状态行（token 实时计数 + 缓存遥测）、图片/长文本粘贴。→ 验证：approve+意见流程；连续 turn 的 cache_read 占比接近前缀全长；贴图发给模型描述。
-4. **M3 持久化 + rewind + sub-agent + hooks**：JSONL 事件日志、`--continue`/`--resume`、双击 Esc rewind + 文件 checkpoint 回滚、task 工具 + explore agent、hooks、`/compact` + 自动 compact。→ 验证：resume 续任务；rewind 后文件恢复且缓存仍命中（看遥测）；edit 挂 formatter hook。
-5. **M4 打磨**：中断边角（半截 tool_use 合法化）、Windows Terminal/conhost 兼容、缓存回归哨兵、`/cost`、错误信息。
+1. ✅ **M0 骨架 + Provider**：workspace、config、双 Provider（SSE 解析、watchdog、重试）、行式 REPL 流式对话。→ 验证：两后端各跑对话；断网/挂代理验证 watchdog。
+2. ✅ **M1 工具 + loop**：Tool trait、六个工具（含自愈式错误信息）、ledger、agent loop、权限模式+规则（行式确认）、blob store 预算门、Freshness Tracker、中断契约、开局项目地图、尾部自知一行。→ 验证：真实任务"读→改→跑测试"；故意让 edit 失败观察模型无需额外 read 即修复；中断后观察模型不做无效验证；重复读同文件返回 stub。
+3. ✅ **M2 TUI**：inline 渲染器、markdown/高亮/diff、输入框、slash 命令、**权限选项+Tab 意见**、状态行（token 实时计数 + 缓存遥测）、图片/长文本粘贴。→ 验证：approve+意见流程；连续 turn 的 cache_read 占比接近前缀全长；贴图发给模型描述。
+4. ✅ **M3 持久化 + rewind + sub-agent + hooks**：JSONL 事件日志、`--continue`/`--resume`、双击 Esc rewind + 文件 checkpoint 回滚、task 工具 + explore agent、hooks、`/compact` + 自动 compact。→ 验证：resume 续任务；rewind 后文件恢复且缓存仍命中（看遥测）；edit 挂 formatter hook。
+5. ✅ **M4 打磨**：中断边角（半截 tool_use 合法化）、Windows Terminal/conhost 兼容、缓存回归哨兵、`/cost`、错误信息。
 
-v2 方向：MCP 客户端（Tool trait 天然容纳）、全屏渲染器、/branches 分支浏览、memory 深化、WASM 插件式 hooks。
+## 计划外已实现（2026-07）
 
-## 模型配置（已实现，2026-07）
+- **多模型 profile + chatgpt provider + 首启向导 + /model**（见下节"模型配置"）。
+- **交互工具**：`update_plan`（TUI 常驻 plan 面板）、`ask_user`（结构化选项提问，复用审批对话框）、`add_note`。
+- **外部会话导入**：`/resume` 可列出并导入 Codex（`~/.codex/sessions`）与 Claude Code（`~/.claude/projects/<dir>`）的 JSONL 会话。设计决定：
+  - 导入是**只读复制**为新 tcode 会话，原文件不动；
+  - 工具调用/输出映射为 `Entry::ImportedTool`，**只进终端转录、不进 prompt**（不可回放、不占上下文）；`apply_patch` 按红绿 diff 渲染；
+  - 映射保持诚实：Codex `exec` → `shell(原命令)`，不再猜测 grep/read 等 tcode 工具名（假映射已删）；
+  - 导入尾部附 harness note 告知模型"历史为二手、工具输出已省略、文件可能已变"（零猜测原则）；
+  - 已评估 ACP：ACP 解决的是"把别的 agent 当引擎实时驱动"，不提供历史转录访问，对导入场景无帮助，维持 JSONL 解析方案。
+- **OpenAI 限额显示**：状态区 5h/周限额进度条。
+- **Skills**：发现 `<项目>/.tcode/skills`、`<项目>/.claude/skills`、`~/.tcode/skills`、`~/.claude/skills`（同名去重，项目 > 全局，.tcode > .claude 兼容位）；解析 SKILL.md YAML front matter（含 `description: |` 块标量折叠）。**context 预算**：每条描述截 200 字符、列表总预算 6k 字符（约 1.5k token，进缓存前缀），超出的 skill 降级为"仅名字"列出但仍可调用；调用时才读 SKILL.md 正文（过统一输出预算门）；名字错误的调用返回全部合法名字（自愈式错误）；无 skill 的项目不注册该工具，零 token 成本。
+- **project_map 预算防御**：目录树全局 80 项 + 每目录 20 子项上限（单个爆炸目录不再吃光预算），git status 只列 15 个文件、超出加 `+N more` 标记，项目指令总预算 16 KiB。
 
-- **Profile 多模型**：`[profiles.X]` 下 `[[profiles.X.models]]` 列表，每个模型带 `context_window` / `efforts` / `default_effort`；`provider` 三种：`anthropic`（含所有 Anthropic 兼容端点如 DeepSeek）、`openai`（Chat Completions 兼容）、`chatgpt`（ChatGPT 订阅）。
-- **chatgpt provider**：走 Codex 后端 Responses API（`chatgpt.com/backend-api/codex/responses`），凭证直接复用 `~/.codex/auth.json`（401 自动 refresh 并写回）；模型列表运行时读 `~/.codex/models_cache.json`，Codex 更新即自动跟进。加密 reasoning item 原样存入 `Thinking.signature` 并回放（backend 硬性要求）。
-- **effort 统一语义**：`Request.effort` 字符串；anthropic 映射 thinking budget（off/low=4k/medium=12k/high=24k），openai 映射 `reasoning_effort`，chatgpt 映射 `reasoning.effort`。
-- **ModelCell**：Agent 与 TaskTool 共享的 RwLock 模型句柄，每 turn snapshot 一次；`/model` 热切换对运行中 turn 无影响。
-- **选择持久化**：`~/.tcode/state.toml`（profile/model/effort），程序只写这个文件，config.toml 永远手写。优先级：CLI flag > state > config 默认。
-- **首启向导**：无 config 时自动进入；探测 `~/.codex/auth.json` 与 `ANTHROPIC/OPENAI/DEEPSEEK_API_KEY`，预设 4 家 provider 多选 + key 输入 + 默认模型选择。非 TTY 场景写 env-based 默认配置。
-- **/model**：TUI 弹层 ↑↓ 选模型（跨 profile）、←→ 调 effort、Enter 生效；REPL 下 `/model <n|name> [effort]`。
+## M5（下一步提案）
+
+1. ✅ **后台任务**（2026-07 实现）：`shell`/`bash` 加 `run_in_background` 参数（模型判定，工具描述给判定准则）。实现：`tcode-core/background.rs` 的 `BackgroundTasks` 注册表挂在 `ToolCtx`（与 blobs 同构）；子进程由 supervisor tokio task 持有（`kill_on_drop`，tcode 退出不留孤儿），stdout/stderr 按行流入共享缓冲；返回 `b1` 类 task id。完成时 agent loop 在两个安全边界（下一 turn 开头 / 当前工具批结束）append `Entry::Note` 通知模型（纯 append，缓存安全，`take_completion_notes` 保证恰好一次）；`read_output` 认 `b` 前缀 id 分页读实时输出（带状态头）；`kill_task` 工具停任务（幂等，杀已结束任务不算错）。运行中任务列在尾部 `<tcode-status>` 状态行。
+2. ✅ **工具差距补齐**（2026-07 实现）：`web_fetch` + `web_search`（`tcode-tools/web.rs`）。
+   - `web_fetch`：reqwest 直连（30s 超时、5MB 上限），HTML 经 `htmd` 转 markdown（跳过 script/style/nav 等），json pretty、text 原样、二进制报错；重定向手动跟（≤5 跳），**跨域重定向不自动跟**——返回目标 URL 让模型显式重调，保证按域审批（descriptor `web_fetch(host)`）诚实；输出过统一 blob 预算门。
+   - `web_search`：DuckDuckGo HTML 端点（`html.duckduckgo.com/html/`）scraper 解析（`div.result`/`a.result__a`/`.result__snippet`，解码 `uddg=` 重定向、跳广告），无需 API key、三家 provider 一律可用、不碰 wire 格式；descriptor 无参数（`web_search`），一次 always-allow 覆盖全部搜索。空结果与 bot-check 分开报错（自愈式）。
+   - workspace reqwest 加 `system-proxy` feature：Windows 系统代理（如 Clash `127.0.0.1:7890`）下 env 变量为空时请求也走代理，providers 同样受益。
+   - 测试：解析/转换纯单元测试；`tests/web_live.rs` 是 `#[ignore]` 的真实网络 smoke（`cargo test -p tcode-tools --test web_live -- --ignored` 手动跑）。
+   - `notebook_edit` 暂不做（用户场景少）；`multi_edit` 不做（Claude Code 已弃用，edit 循环即可）。
+3. ✅ **导入体验完善**（2026-07 实现）：两个 picker（本会话 + 外部导入）都显示相对修改时间（`SessionInfo`/`ExternalSessionInfo` 加 `modified`，渲染 "3h ago"）；Claude 导入解析 content 数组——tool_use → `Entry::ImportedTool`（保留 Claude 原始工具名与 input，不做假映射），tool_result → `output` 条目（复用 compact_output 折叠测试输出）；`summarize_call` 认识 `file_path`/`url`/`query` 键。
+4. ✅ **MCP 客户端**（2026-07 实现）：`tcode-tools/mcp.rs`，stdio 传输（newline-delimited JSON-RPC，协议版 2025-06-18）。`config.toml` 的 `[mcp_servers.名字]`（command/args/env，全局+项目级 overlay）；启动时 initialize → tools/list（含 nextCursor 分页），工具以 `mcp__server__tool` 注册进普通 Tool trait，该名字即权限 descriptor（规则可写 `mcp__server__*`）。Windows 经 `cmd /c` 解析 .cmd shim（npx 等）。server 挂掉/起不来只警告不阻塞启动；请求超时 init 30s / call 120s；进程 `kill_on_drop`，tcode 退出不留孤儿。测试：`tests/mcp_stdio.rs` 用脚本化 python fake server 打真协议（无 python 自动跳过）。
+5. ✅ **/export**（2026-07 实现）：`tcode-core/export.rs` 纯函数 `export_markdown(entries)`——ledger 是唯一事实源，导出只是又一个视图。User/Assistant 文本、工具调用摘要行、工具结果（`<details>` 折叠 + 自适应长度 code fence 防逃逸）、Note/Summary/ImportedTool 全覆盖；`<tcode-status>` 等 harness 管道内容不导出。TUI `/export [path]` + REPL 同名命令，默认文件名 `tcode-transcript-<unix>.md`。
+6. ✅ **Memory 2.0**（2026-07 实现；替换 `/remember` 盲追加方案）：参照 Claude Code 当前的两类记忆，但保留 tcode 对 `AGENTS.md` 的原生支持。核心区别必须建模清楚：**指令由人维护、可随仓库共享；自动记忆由模型维护、仅存本机**。二者不得写进同一个文件。
+   - **用户与项目指令**：`~/.tcode/AGENTS.md` 是用户级指令；项目内每层目录按 `.tcode/AGENTS.md > AGENTS.md > CLAUDE.md` 取第一个命中，多个目录层级不互相覆盖，而是按“项目根 → 目标目录”依次拼接，使更具体的指令最后出现。启动时加载项目根到 cwd；之后访问其他子目录时按需补载尚未出现的层级。
+   - **自动记忆**：每个项目使用 `~/.tcode/projects/<project-id>/memory/`，`MEMORY.md` 是精简索引，启动只注入前 200 行或 25 KiB（先到者为准）；详细内容放同目录 topic 文件，由模型按需 `read`。Git 项目的 `<project-id>` 基于 canonical git common dir，使同仓库的子目录和 worktree 共享记忆；非 Git 项目基于显式 `.tcode/config.toml` 项目根。自动记忆默认开启，system prompt 明确何时值得记录、不得保存秘密、优先更新而非重复追加。项目累计 20 个用户回合或距上次整理提醒满 7 天后，在下一次活跃 turn 注入一次维护提醒：整理重复/过期条目、把细节归档到 topic 文件，并记录仍有效的重要决策；模型成功写入当前项目自动记忆后重置周期。状态持久化，因此关闭后不会后台运行，重新使用项目时才继续计数和提醒。
+   - **项目边界**：启动项目根取最近的 `.git` 或 `.tcode/config.toml` 祖先；若都不存在，当前 cwd 自身就是临时项目根。访问 cwd 项目以外的路径时，只有目标祖先存在 `.git` 或 `.tcode/config.toml` 才视为另一个项目；单独的 `.tcode/AGENTS.md` 只是目录级指令，不重定义项目根。`home` 和文件系统根永不因附近存在 `AGENTS.md`/`CLAUDE.md` 被猜成项目。无显式标记的外部路径不加载额外项目记忆，只继承用户级指令。
+   - **外部项目按需加载**：`Tool` 增加声明式 `context_paths(input)`，由 `read`/`write`/`edit`/`grep`/`glob` 返回 path，`shell` 返回显式 `cwd`（未给则当前 cwd）；agent loop 在工具执行前统一解析目标项目并去重已加载的 canonical 指令路径。禁止解析 shell 命令字符串猜文件路径；MCP/第三方工具没有声明路径时不做隐式发现。
+   - **注入与执行顺序**：按需内容通过 append-only `Entry::Note` 进入 ledger，绝不改 system prompt 前缀。模型已经生成 tool call 后才发现新指令，因此首次 `write`/`edit` 或外部 `cwd` 的 `shell` 必须返回“已加载新指令，请据此重试”且不执行；只读工具可正常执行，并把新指令与 tool results 一起交给下一轮。这样不会在未知项目规则时先产生副作用，也不破坏 provider 要求的 tool-use/tool-result 相邻关系。并行批次先统一 preflight、合并并去重所有新指令，再决定执行或整体阻断。
+   - **命令语义（已确认）**：删除 `/remember <fact>`，改为 Claude Code 风格的自然语言“记住 X”，由模型维护自动记忆；新增 `/memory` 列出本会话已加载的用户/项目指令、自动记忆目录和开关状态，`/memory on|off` 显式切换，不暗中改记忆正文。
+   - **首期 non-goals**：不做 `@import`、`.tcode/rules`/path glob、会话结束自动建议、shell 脚本静态分析、无项目标记的外部目录猜测；这些没有真实需求前不增加解析器和状态。
+   - **预算与安全**：启动指令与自动记忆分别计量，项目指令总预算先维持 16 KiB，自动记忆独立 25 KiB/200 行；动态补载每文件和每次 turn 都有硬上限，截断必须列出来源。所有路径 canonicalize 后做去重和边界判断，读取失败只产生可见诊断，不阻断无关工具。
+   - **验收**：单测覆盖祖先顺序、同层优先级、home/root 排除、Git worktree identity、无 marker 外部路径、symlink/canonical 去重、预算 UTF-8 边界；agent-loop 集成测试覆盖只读按需加载、首次外部写阻断后重试、并行 read/edit preflight、resume/compact 后不重复注入；真实 smoke 覆盖从项目 A 读取并修改项目 B，确认 B 的规则在副作用前生效。
+7. **全屏渲染器**（可选，靠 Renderer trait 零重构）。
+
+v2 方向（未变）：/branches 分支浏览、WASM 插件式 hooks。
+
 
 ## 验证方式（贯穿）
 
 - Ledger / 缓存断点 / 预算门 / Freshness Tracker：纯单元测试。
 - Agent loop：MockProvider 脚本化 tool_use 序列做集成测试，不打真 API。
 - 每里程碑用真实 API 跑端到端任务，盯状态行缓存命中数字（这本身就是对"省 token"的持续验收）。
+
+
+## 待解决问题
+1. 退出时会留下较大空白，之前好像是因为退出的时候新的命令行会挤在底下的context栏什么的中间才被改成这样的，但这个解决方式是不是有点过于简单了，现在退出的时候中间一大片空白行也有点奇怪。
+2. deepseek模型名称那里感觉不需要带[1m]后缀了吧，这个是为了让claude-code知道这是个1m context的模型才使用的，

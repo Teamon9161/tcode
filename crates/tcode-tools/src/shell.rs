@@ -3,10 +3,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -69,15 +69,123 @@ impl ShellTool {
                 cmd
             }
             ShellKind::Bash => {
-                let mut cmd = tokio::process::Command::new(
-                    which_bash().unwrap_or_else(|| "bash".into()),
-                );
+                let mut cmd =
+                    tokio::process::Command::new(which_bash().unwrap_or_else(|| "bash".into()));
                 cmd.args(["-c", script]);
                 cmd.current_dir(cwd);
                 cmd
             }
         }
     }
+}
+
+impl ShellTool {
+    /// Detach a long-running command: the process is owned by a supervisor
+    /// task, its output streams into the background registry, and the model
+    /// gets a task id back immediately. No timeout — that is the point;
+    /// `kill_task` stops it, and process exit is reported via harness note.
+    fn spawn_background(&self, script: &str, cwd: &std::path::Path, ctx: &ToolCtx) -> ToolOutput {
+        let mut cmd = self.command(script, cwd);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => return ToolOutput::err(format!("failed to start background task: {e}")),
+        };
+        let (id, shared) = ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .register(script);
+
+        let stdout = child.stdout.take().expect("piped stdout");
+        let stderr = child.stderr.take().expect("piped stderr");
+        let readers = [
+            spawn_line_reader(stdout, shared.clone()),
+            spawn_line_reader(stderr, shared.clone()),
+        ];
+        let supervisor_shared = shared.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                status = child.wait() => {
+                    // Drain what the pipes still hold before declaring done.
+                    for r in readers {
+                        let _ = r.await;
+                    }
+                    let code = status.ok().and_then(|s| s.code()).unwrap_or(-1);
+                    supervisor_shared.set_status(TaskStatus::Exited(code));
+                }
+                _ = supervisor_shared.kill.cancelled() => {
+                    let _ = child.kill().await;
+                    for r in readers {
+                        let _ = r.await;
+                    }
+                    supervisor_shared.set_status(TaskStatus::Killed);
+                }
+            }
+        });
+        ToolOutput::ok(format!(
+            "Started background task {id}: {script}\nIt keeps running while you \
+             continue working. Page its output with read_output(id=\"{id}\"); \
+             you will get a note when it finishes. Stop it with kill_task(id=\"{id}\")."
+        ))
+    }
+}
+
+/// Stops a background task started by shell/bash with run_in_background.
+pub struct KillTaskTool;
+
+#[async_trait]
+impl Tool for KillTaskTool {
+    fn name(&self) -> &str {
+        "kill_task"
+    }
+
+    fn description(&self) -> &str {
+        "Stop a background task by id (e.g. b1). Killing an already-finished \
+         task is a no-op. Its captured output stays readable via read_output."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Background task id, e.g. b1" }
+            },
+            "required": ["id"]
+        })
+    }
+
+    fn permission(&self, _input: &Value) -> PermissionRequest {
+        // Only reaches processes the model itself started.
+        PermissionRequest::None
+    }
+
+    async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
+        let Some(id) = input["id"].as_str() else {
+            return ToolOutput::err("missing required parameter: id");
+        };
+        match ctx.background.lock().expect("background lock").kill(id) {
+            Ok(msg) => ToolOutput::ok(msg),
+            Err(e) => ToolOutput::err(e),
+        }
+    }
+}
+
+/// Append a pipe's lines to the shared task output until EOF.
+fn spawn_line_reader(
+    pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    shared: std::sync::Arc<tcode_core::TaskShared>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(pipe).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            shared.append_output(&line);
+            shared.append_output("\n");
+        }
+    })
 }
 
 #[async_trait]
@@ -94,11 +202,20 @@ impl Tool for ShellTool {
             ShellKind::PowerShell => {
                 "Run a PowerShell command. Output is captured; interactive \
                  commands will hang and must be avoided. Use timeout_ms for \
-                 long-running commands (default 120s, max 600s)."
+                 long-running commands (default 120s, max 600s). Several \
+                 shell calls in one message share a single approval and run \
+                 in order — batch related commands. Set \
+                 run_in_background=true ONLY for commands that run long and \
+                 whose intermediate output you don't need to wait for (dev \
+                 server, watcher, long build/test): you get a task id back \
+                 immediately, can keep working, page its output with \
+                 read_output and are notified when it finishes."
             }
             ShellKind::Bash => {
                 "Run a bash (Git Bash) command with POSIX syntax. Same rules \
-                 as shell: non-interactive only, timeout_ms configurable."
+                 as shell: non-interactive only, timeout_ms configurable, \
+                 batched calls share one approval and run in order, \
+                 run_in_background for long-running commands."
             }
         }
     }
@@ -108,8 +225,9 @@ impl Tool for ShellTool {
             "type": "object",
             "properties": {
                 "command": { "type": "string" },
-                "timeout_ms": { "type": "integer", "description": "Kill after this many ms (default 120000, max 600000)" },
-                "cwd": { "type": "string", "description": "Working directory (default: project cwd)" }
+                "timeout_ms": { "type": "integer", "description": "Kill after this many ms (default 120000, max 600000); ignored for background tasks" },
+                "cwd": { "type": "string", "description": "Working directory (default: project cwd)" },
+                "run_in_background": { "type": "boolean", "description": "Run detached and return a task id immediately (default false)" }
             },
             "required": ["command"]
         })
@@ -122,6 +240,14 @@ impl Tool for ShellTool {
             summary: format!("run: {command}"),
             is_edit: false,
         }
+    }
+
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        vec![input["cwd"].as_str().unwrap_or(".").to_string()]
+    }
+
+    fn is_mutating(&self) -> bool {
+        true
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
@@ -141,6 +267,9 @@ impl Tool for ShellTool {
                 .unwrap_or(DEFAULT_TIMEOUT_MS)
                 .min(MAX_TIMEOUT_MS),
         );
+        if input["run_in_background"].as_bool().unwrap_or(false) {
+            return self.spawn_background(script, &cwd, ctx);
+        }
 
         let mut cmd = self.command(script, &cwd);
         cmd.stdin(Stdio::null())

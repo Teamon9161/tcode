@@ -15,8 +15,9 @@ impl Tool for ReadOutputTool {
     }
 
     fn description(&self) -> &str {
-        "Read a stored tool output by id (e.g. o1) when a previous result \
-         was truncated. offset is 1-based line number; limit defaults to 200."
+        "Read a stored tool output by id: o1… for truncated results, b1… for \
+         live/finished background task output. offset is 1-based line number; \
+         limit defaults to 200."
     }
 
     fn input_schema(&self) -> Value {
@@ -41,8 +42,18 @@ impl Tool for ReadOutputTool {
         };
         let offset = input["offset"].as_u64().unwrap_or(1).max(1) as usize;
         let limit = input["limit"].as_u64().unwrap_or(200).clamp(1, 500) as usize;
-        let blobs = ctx.blobs.lock().expect("blobs lock");
-        match blobs.read(id, offset, limit) {
+        let result = if id.starts_with('b') {
+            ctx.background
+                .lock()
+                .expect("background lock")
+                .read(id, offset, limit)
+        } else {
+            ctx.blobs
+                .lock()
+                .expect("blobs lock")
+                .read(id, offset, limit)
+        };
+        match result {
             Ok(page) => ToolOutput::ok(page),
             Err(e) => ToolOutput::err(e),
         }

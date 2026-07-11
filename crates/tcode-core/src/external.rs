@@ -35,6 +35,7 @@ pub struct ExternalSessionInfo {
     pub id: String,
     pub path: PathBuf,
     pub last_user_preview: String,
+    pub modified: Option<std::time::SystemTime>,
 }
 
 /// Find conversations whose recorded working directory is the supplied
@@ -68,10 +69,19 @@ pub fn import_external_session(
     cwd: &Path,
     external: &ExternalSessionInfo,
 ) -> Result<Resumed, StoreError> {
-    let entries = parse_entries(external)?;
+    let mut entries = parse_entries(external)?;
     if entries.is_empty() {
         return Err(StoreError::External("no importable text messages".into()));
     }
+    // Zero-guessing: the model must not spend a turn discovering that this
+    // history is second-hand. Tool calls/outputs were dropped on import and
+    // the workspace may have moved on since the original conversation.
+    entries.push(Entry::Note(format!(
+        "This conversation was imported from a {} transcript. Tool calls and their outputs \
+         were omitted, and files may have changed since; re-read any file before relying on \
+         or editing it.",
+        external.source.label()
+    )));
     let mut store = SessionStore::create(data_dir, cwd)?;
     let mut ledger = crate::ledger::Ledger::new();
     for entry in entries {
@@ -89,13 +99,17 @@ pub fn import_external_session(
 
 fn external_info(cwd: &Path, source: ExternalSource, path: PathBuf) -> Option<ExternalSessionInfo> {
     let first_cwd = recorded_cwd(&path).ok().flatten();
-    if source == ExternalSource::Codex && first_cwd.as_deref() != Some(cwd.to_string_lossy().as_ref()) {
+    if source == ExternalSource::Codex
+        && first_cwd.as_deref() != Some(cwd.to_string_lossy().as_ref())
+    {
         return None;
     }
     // Claude's project directory is already scoped, but retain the cwd check
     // when it is present so copied/moved JSONL files cannot leak in.
     if source == ExternalSource::Claude
-        && first_cwd.as_deref().is_some_and(|recorded| recorded != cwd.to_string_lossy())
+        && first_cwd
+            .as_deref()
+            .is_some_and(|recorded| recorded != cwd.to_string_lossy())
     {
         return None;
     }
@@ -104,11 +118,13 @@ fn external_info(cwd: &Path, source: ExternalSource, path: PathBuf) -> Option<Ex
     // obtain the picker preview; only decode candidate user-message lines.
     let last_user_preview = last_user_preview(source, &path)?;
     let id = path.file_stem()?.to_string_lossy().into_owned();
+    let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
     Some(ExternalSessionInfo {
         source,
         id,
         path,
         last_user_preview,
+        modified,
     })
 }
 
@@ -127,7 +143,10 @@ fn last_user_preview(source: ExternalSource, path: &Path) -> Option<String> {
     // A very long final tool output can theoretically push the user's last
     // message beyond the tail. Fall back only in that uncommon case.
     let mut latest = None;
-    for line in BufReader::new(File::open(path).ok()?).lines().flatten() {
+    for line in BufReader::new(File::open(path).ok()?)
+        .lines()
+        .map_while(Result::ok)
+    {
         if let Some(preview) = preview_from_line(source, &line) {
             latest = Some(preview);
         }
@@ -136,7 +155,9 @@ fn last_user_preview(source: ExternalSource, path: &Path) -> Option<String> {
 }
 
 fn tail_preview(source: ExternalSource, tail: &str) -> Option<String> {
-    tail.lines().rev().find_map(|line| preview_from_line(source, line))
+    tail.lines()
+        .rev()
+        .find_map(|line| preview_from_line(source, line))
 }
 
 fn preview_from_line(source: ExternalSource, line: &str) -> Option<String> {
@@ -152,6 +173,9 @@ fn preview_from_line(source: ExternalSource, line: &str) -> Option<String> {
         ExternalSource::Codex => value.pointer("/payload/message").and_then(Value::as_str),
         ExternalSource::Claude => value.pointer("/message/content").and_then(Value::as_str),
     }?;
+    if is_transcript_noise(text) {
+        return None;
+    }
     text.lines()
         .next()
         .filter(|text| !text.trim().is_empty())
@@ -169,11 +193,7 @@ fn parse_entries_at(source: ExternalSource, path: &Path) -> Result<Vec<Entry>, S
         let value: Value = serde_json::from_str(&line?)?;
         match source {
             ExternalSource::Codex => entries.extend(codex_entries(&value, &mut suppressed_calls)),
-            ExternalSource::Claude => {
-                if let Some((is_user, text)) = claude_message(&value).filter(|(_, text)| !text.trim().is_empty()) {
-                    entries.push(text_entry(is_user, text));
-                }
-            }
+            ExternalSource::Claude => entries.extend(claude_entries(&value)),
         }
     }
     Ok(entries)
@@ -199,6 +219,7 @@ fn codex_entries(value: &Value, suppressed_calls: &mut HashSet<String>) -> Vec<E
         return value
             .pointer("/payload/message")
             .and_then(Value::as_str)
+            .filter(|text| !is_transcript_noise(text))
             .map(|text| vec![text_entry(true, text.to_owned())])
             .unwrap_or_default();
     }
@@ -211,17 +232,27 @@ fn codex_entries(value: &Value, suppressed_calls: &mut HashSet<String>) -> Vec<E
     match payload.get("type").and_then(Value::as_str) {
         Some("message") if payload.get("role").and_then(Value::as_str) == Some("assistant") => {
             let text = payload.get("content").map(content_text).unwrap_or_default();
-            (!text.is_empty()).then(|| vec![text_entry(false, text)]).unwrap_or_default()
+            if !text.is_empty() {
+                vec![text_entry(false, text)]
+            } else {
+                Default::default()
+            }
         }
         Some("function_call") => {
-            let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let name = payload
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
             if name == "wait" || name.ends_with(".wait") {
                 if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
                     suppressed_calls.insert(call_id.to_owned());
                 }
                 return Vec::new();
             }
-            let arguments = payload.get("arguments").and_then(Value::as_str).unwrap_or("");
+            let arguments = payload
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or("");
             let (name, input, content) = normalize_codex_call(name, arguments);
             vec![Entry::ImportedTool {
                 name,
@@ -258,7 +289,9 @@ fn codex_entries(value: &Value, suppressed_calls: &mut HashSet<String>) -> Vec<E
 fn custom_codex_call(payload: &Value) -> Vec<Entry> {
     let source = payload.get("input").and_then(Value::as_str).unwrap_or("");
     if source.contains("tools.apply_patch(") {
-        if let Some(patch) = js_value_after(source, "const patch = ").and_then(|value| value.as_str().map(str::to_owned)) {
+        if let Some(patch) = js_value_after(source, "const patch = ")
+            .and_then(|value| value.as_str().map(str::to_owned))
+        {
             return vec![Entry::ImportedTool {
                 name: "apply_patch".into(),
                 input: Value::Null,
@@ -268,11 +301,18 @@ fn custom_codex_call(payload: &Value) -> Vec<Entry> {
     }
     if let Some(arguments) = js_value_after(source, "tools.exec_command(") {
         let (name, input, content) = normalize_codex_call("exec", &arguments.to_string());
-        return vec![Entry::ImportedTool { name, input, content }];
+        return vec![Entry::ImportedTool {
+            name,
+            input,
+            content,
+        }];
     }
     // Keep an uncommon custom call visible under its own label, but do not
     // leak its implementation wrapper into the resumed model prompt.
-    let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool");
     vec![Entry::ImportedTool {
         name: name.to_owned(),
         input: Value::Null,
@@ -297,8 +337,9 @@ fn text_entry(is_user: bool, text: String) -> Entry {
     }
 }
 
-/// Convert common Codex internals to the tcode vocabulary used in the live
-/// transcript. The mapping is visual-only; imported calls remain non-runnable.
+/// Reduce a Codex call to what actually happened: a patch is a patch, an
+/// exec is a shell command. No guessing which tcode tool it "would have
+/// been" — imported history must not fabricate inputs that never existed.
 fn normalize_codex_call(name: &str, arguments: &str) -> (String, Value, String) {
     let parsed = serde_json::from_str::<Value>(arguments).ok();
     if name.contains("apply_patch") {
@@ -307,11 +348,7 @@ fn normalize_codex_call(name: &str, arguments: &str) -> (String, Value, String) 
             .and_then(|value| value.get("patch"))
             .and_then(Value::as_str)
         {
-            return (
-                "apply_patch".into(),
-                Value::Null,
-                cap_text(patch, 12_000),
-            );
+            return ("apply_patch".into(), Value::Null, cap_text(patch, 12_000));
         }
     }
     if name.ends_with("exec") || name.ends_with("exec_command") {
@@ -320,17 +357,9 @@ fn normalize_codex_call(name: &str, arguments: &str) -> (String, Value, String) 
             .and_then(|value| value.get("cmd").or_else(|| value.get("command")))
             .and_then(Value::as_str)
         {
-            let tool = if command.trim_start().starts_with("rg ") {
-                if command.contains("--files") { "glob" } else { "grep" }
-            } else if matches!(command.trim_start().split_whitespace().next(), Some("sed" | "head" | "tail" | "cat")) {
-                "read"
-            } else {
-                "shell"
-            };
-            let key = if tool == "shell" { "command" } else if tool == "read" { "path" } else { "pattern" };
             return (
-                tool.into(),
-                serde_json::json!({ key: command }),
+                "shell".into(),
+                serde_json::json!({ "command": command }),
                 String::new(),
             );
         }
@@ -338,7 +367,11 @@ fn normalize_codex_call(name: &str, arguments: &str) -> (String, Value, String) 
     let body = parsed
         .and_then(|value| serde_json::to_string_pretty(&value).ok())
         .unwrap_or_else(|| arguments.to_owned());
-    (name.to_owned(), Value::Null, format!("```json\n{}\n```", cap_text(&body, 2_000)))
+    (
+        name.to_owned(),
+        Value::Null,
+        format!("```json\n{}\n```", cap_text(&body, 2_000)),
+    )
 }
 
 fn compact_output(output: &str) -> String {
@@ -370,7 +403,10 @@ fn test_summary(output: &str) -> Option<String> {
         .lines()
         .filter(|line| line.trim_start().starts_with("test result: ok."))
         .collect();
-    let meaningful = running.iter().copied().find(|line| !line.contains("running 0 tests"))?;
+    let meaningful = running
+        .iter()
+        .copied()
+        .find(|line| !line.contains("running 0 tests"))?;
     let passed = passed
         .iter()
         .copied()
@@ -389,19 +425,92 @@ fn cap_text(text: &str, limit: usize) -> String {
     }
 }
 
-fn claude_message(value: &Value) -> Option<(bool, String)> {
-    if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-        return None;
+/// One Claude Code JSONL record → ledger entries. Text becomes normal
+/// user/assistant entries; tool_use calls and tool_result outputs become
+/// `Entry::ImportedTool` (transcript-only), keeping Claude's real tool
+/// names and inputs — no mapping guesses.
+fn claude_entries(value: &Value) -> Vec<Entry> {
+    if value.get("isSidechain").and_then(Value::as_bool) == Some(true)
+        || value.get("isMeta").and_then(Value::as_bool) == Some(true)
+    {
+        return Vec::new();
     }
-    let kind = value.get("type").and_then(Value::as_str)?;
-    let is_user = match kind {
-        "user" => true,
-        "assistant" => false,
-        _ => return None,
+    let is_user = match value.get("type").and_then(Value::as_str) {
+        Some("user") => true,
+        Some("assistant") => false,
+        _ => return Vec::new(),
     };
-    let message = value.get("message")?;
-    let text = content_text(message.get("content")?);
-    (!text.is_empty()).then_some((is_user, text))
+    let Some(content) = value.pointer("/message/content") else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    let mut text = String::new();
+    let parts = match content {
+        Value::String(t) => {
+            text.push_str(t);
+            &[][..]
+        }
+        Value::Array(parts) => parts.as_slice(),
+        _ => &[][..],
+    };
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") => {
+                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(t);
+                }
+            }
+            Some("tool_use") => {
+                flush_text(is_user, &mut text, &mut entries);
+                entries.push(Entry::ImportedTool {
+                    name: part
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("tool")
+                        .to_owned(),
+                    input: part.get("input").cloned().unwrap_or(Value::Null),
+                    content: String::new(),
+                });
+            }
+            Some("tool_result") => {
+                flush_text(is_user, &mut text, &mut entries);
+                let output = part.get("content").map(content_text).unwrap_or_default();
+                if !output.trim().is_empty() {
+                    entries.push(Entry::ImportedTool {
+                        name: "output".into(),
+                        input: Value::Null,
+                        content: compact_output(&output),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    flush_text(is_user, &mut text, &mut entries);
+    entries
+}
+
+fn flush_text(is_user: bool, text: &mut String, entries: &mut Vec<Entry>) {
+    let taken = std::mem::take(text);
+    let trimmed = taken.trim();
+    if !trimmed.is_empty() && !is_transcript_noise(trimmed) {
+        entries.push(text_entry(is_user, trimmed.to_owned()));
+    }
+}
+
+/// Harness-injected records that read as noise outside their original UI:
+/// slash-command envelopes, caveat banners, and environment blobs.
+fn is_transcript_noise(text: &str) -> bool {
+    let head = text.trim_start();
+    head.starts_with("<command-")
+        || head.starts_with("<local-command")
+        || head.starts_with("<system-reminder>")
+        || head.starts_with("<user_instructions>")
+        || head.starts_with("<environment_context>")
+        || head.starts_with("Caveat: the messages below")
 }
 
 fn content_text(value: &Value) -> String {
@@ -411,10 +520,7 @@ fn content_text(value: &Value) -> String {
             .iter()
             .filter_map(|part| match part {
                 Value::String(text) => Some(text.clone()),
-                Value::Object(_) => part
-                    .get("text")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                Value::Object(_) => part.get("text").and_then(Value::as_str).map(str::to_owned),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -423,8 +529,14 @@ fn content_text(value: &Value) -> String {
     }
 }
 
+/// Claude Code derives its project directory by replacing every
+/// non-alphanumeric character with '-' (`C:\code\rust\tcode` →
+/// `C--code-rust-tcode`), so the same rule works on every platform.
 fn claude_project_name(cwd: &Path) -> String {
-    cwd.to_string_lossy().replace('/', "-")
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
 }
 
 fn jsonl_files(root: &Path) -> Vec<PathBuf> {
@@ -454,4 +566,92 @@ fn jsonl_files_recursive(root: &Path) -> Vec<PathBuf> {
         }
     }
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_project_name_matches_claude_code_on_windows_paths() {
+        assert_eq!(
+            claude_project_name(Path::new(r"C:\code\rust\tcode")),
+            "C--code-rust-tcode"
+        );
+        assert_eq!(
+            claude_project_name(Path::new("/home/user/proj")),
+            "-home-user-proj"
+        );
+    }
+
+    #[test]
+    fn codex_exec_maps_to_shell_without_guessing_other_tools() {
+        for cmd in ["rg -n foo src/", "sed -n 1,40p main.rs", "cargo test"] {
+            let (name, input, content) = normalize_codex_call(
+                "exec_command",
+                &format!(r#"{{"cmd":{}}}"#, Value::from(cmd)),
+            );
+            assert_eq!(name, "shell");
+            assert_eq!(input["command"].as_str(), Some(cmd));
+            assert!(content.is_empty());
+        }
+    }
+
+    #[test]
+    fn claude_assistant_tool_use_becomes_imported_tool() {
+        let record: Value = serde_json::from_str(
+            r#"{"type":"assistant","message":{"content":[
+                {"type":"text","text":"Let me check."},
+                {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":"src/main.rs"}}
+            ]}}"#,
+        )
+        .unwrap();
+        let entries = claude_entries(&record);
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(&entries[0], Entry::Assistant(_)));
+        match &entries[1] {
+            Entry::ImportedTool { name, input, .. } => {
+                assert_eq!(name, "Read");
+                assert_eq!(input["file_path"].as_str(), Some("src/main.rs"));
+            }
+            other => panic!("expected ImportedTool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_tool_result_becomes_output_entry() {
+        let record: Value = serde_json::from_str(
+            r#"{"type":"user","message":{"content":[
+                {"type":"tool_result","tool_use_id":"t1","content":[{"type":"text","text":"fn main() {}"}]}
+            ]}}"#,
+        )
+        .unwrap();
+        let entries = claude_entries(&record);
+        assert_eq!(entries.len(), 1);
+        match &entries[0] {
+            Entry::ImportedTool { name, content, .. } => {
+                assert_eq!(name, "output");
+                assert!(content.contains("fn main"));
+            }
+            other => panic!("expected ImportedTool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_sidechain_and_meta_records_are_skipped() {
+        let record: Value = serde_json::from_str(
+            r#"{"type":"user","isSidechain":true,"message":{"content":"hi"}}"#,
+        )
+        .unwrap();
+        assert!(claude_entries(&record).is_empty());
+    }
+
+    #[test]
+    fn harness_envelopes_are_noise() {
+        assert!(is_transcript_noise("<command-name>/clear</command-name>"));
+        assert!(is_transcript_noise(
+            "Caveat: the messages below were generated…"
+        ));
+        assert!(!is_transcript_noise("please fix <T> handling in parse"));
+    }
 }

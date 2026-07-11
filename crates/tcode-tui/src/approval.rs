@@ -1,20 +1,27 @@
 //! Approval dialog with Tab-annotation: any option can carry a free-text
 //! note. "Yes + note" lets the model adjust without redoing the work;
-//! "No + note" tells it why.
+//! "No + note" tells it why. Change previews are NOT shown here: they are
+//! baked into native scrollback before consent, where the mouse wheel and
+//! terminal search work — the dialog stays a compact decision box.
 
 use ratatui::text::{Line, Span};
 use tcode_core::{Approval, ApprovalDecision};
 
+use crate::editor::Editor;
 use crate::theme;
 
 pub struct Dialog {
     pub summary: String,
     pub descriptor: String,
-    /// Red/green change preview supplied with the approval request.
-    preview: Vec<Line<'static>>,
-    preview_scroll: usize,
+    /// ToolStart-format call summary. A declined call never emits
+    /// ToolStart, so the dialog supplies the line to bake instead.
+    pub call_summary: String,
+    /// The call's header + diff were already baked into scrollback before
+    /// consent; the decision record must not repeat them.
+    pub prebaked: bool,
     selected: usize,
-    note: String,
+    /// Single-line note editor: full cursor movement, wraps on render.
+    note: Editor,
     note_focused: bool,
     question_options: Option<Vec<String>>,
 }
@@ -25,9 +32,8 @@ const OPTIONS: [(&str, ApprovalDecision); 3] = [
     ("No", ApprovalDecision::No),
 ];
 
-/// Keep the controls in view even for a long edit. PageUp/PageDown expose
-/// the remaining preview before the user gives consent.
-const PREVIEW_ROWS: usize = 8;
+/// "  note: " prefix width; continuation rows are indented to match.
+const NOTE_INDENT: usize = 8;
 
 pub enum DialogResult {
     Pending,
@@ -35,14 +41,14 @@ pub enum DialogResult {
 }
 
 impl Dialog {
-    pub fn new(summary: String, descriptor: String, preview: Vec<Line<'static>>) -> Self {
+    pub fn new(summary: String, descriptor: String, call_summary: String, prebaked: bool) -> Self {
         Self {
             summary,
             descriptor,
-            preview,
-            preview_scroll: 0,
+            call_summary,
+            prebaked,
             selected: 0,
-            note: String::new(),
+            note: Editor::new(),
             note_focused: false,
             question_options: None,
         }
@@ -52,10 +58,10 @@ impl Dialog {
         Self {
             summary,
             descriptor: "ask_user".into(),
-            preview: Vec::new(),
-            preview_scroll: 0,
+            call_summary: String::new(),
+            prebaked: false,
             selected: 0,
-            note: String::new(),
+            note: Editor::new(),
             note_focused: false,
             question_options: Some(if options.is_empty() {
                 vec!["Continue".into()]
@@ -65,23 +71,27 @@ impl Dialog {
         }
     }
 
+    pub fn is_question(&self) -> bool {
+        self.question_options.is_some()
+    }
+
+    fn note_text(&self) -> String {
+        self.note.text().trim().to_string()
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
         use crossterm::event::KeyCode as K;
         match key.code {
-            K::PageUp => self.preview_scroll = self.preview_scroll.saturating_sub(PREVIEW_ROWS),
-            K::PageDown => {
-                self.preview_scroll = (self.preview_scroll + PREVIEW_ROWS)
-                    .min(self.preview.len().saturating_sub(PREVIEW_ROWS));
-            }
             K::Tab => self.note_focused = !self.note_focused,
             K::Enter => {
+                let note = self.note_text();
                 if let Some(options) = &self.question_options {
                     let mut answer = options
                         .get(self.selected.min(options.len().saturating_sub(1)))
                         .cloned()
                         .unwrap_or_default();
-                    if !self.note.trim().is_empty() {
-                        answer.push_str(&format!(" — {}", self.note.trim()));
+                    if !note.is_empty() {
+                        answer.push_str(&format!(" — {note}"));
                     }
                     return DialogResult::Done(Approval {
                         decision: ApprovalDecision::Yes,
@@ -91,7 +101,7 @@ impl Dialog {
                 let decision = OPTIONS[self.selected].1;
                 return DialogResult::Done(Approval {
                     decision,
-                    comment: Some(self.note.trim().to_string()).filter(|s| !s.is_empty()),
+                    comment: Some(note).filter(|s| !s.is_empty()),
                 });
             }
             K::Esc => {
@@ -104,59 +114,81 @@ impl Dialog {
                     });
                 }
             }
+            K::Left if self.note_focused => self.note.left(),
+            K::Right if self.note_focused => self.note.right(),
+            K::Home if self.note_focused => self.note.home(),
+            K::End if self.note_focused => self.note.end(),
+            K::Delete if self.note_focused => self.note.delete(),
+            K::Backspace if self.note_focused => self.note.backspace(),
             K::Up if !self.note_focused => {
-                let len = self.question_options.as_ref().map_or(OPTIONS.len(), Vec::len);
+                let len = self
+                    .question_options
+                    .as_ref()
+                    .map_or(OPTIONS.len(), Vec::len);
                 self.selected = self.selected.checked_sub(1).unwrap_or(len - 1)
             }
             K::Down if !self.note_focused => {
-                let len = self.question_options.as_ref().map_or(OPTIONS.len(), Vec::len);
+                let len = self
+                    .question_options
+                    .as_ref()
+                    .map_or(OPTIONS.len(), Vec::len);
                 self.selected = (self.selected + 1) % len;
             }
-            K::Char(c) if !self.note_focused && ('1'..='3').contains(&c) => {
-                let index = c as usize - '1' as usize;
-                let len = self.question_options.as_ref().map_or(OPTIONS.len(), Vec::len);
+            K::Char(c) if !self.note_focused && c.is_ascii_digit() => {
+                let index = (c as usize).wrapping_sub('1' as usize);
+                let len = self
+                    .question_options
+                    .as_ref()
+                    .map_or(OPTIONS.len(), Vec::len);
                 if index < len {
                     self.selected = index;
+                } else {
+                    // A digit with no matching option is note text, not a hotkey.
+                    self.note_focused = true;
+                    self.note.insert_char(c);
                 }
             }
-            K::Char(c) if self.note_focused => self.note.push(c),
-            K::Backspace if self.note_focused => {
-                self.note.pop();
-            }
+            K::Char(c) if self.note_focused => self.note.insert_char(c),
             K::Char(c) if !self.note_focused => {
                 // Any other typing implies annotating: focus the note.
                 self.note_focused = true;
-                self.note.push(c);
+                self.note.insert_char(c);
             }
             _ => {}
         }
         DialogResult::Pending
     }
 
-    pub fn render(&self) -> Vec<Line<'static>> {
+    /// The note as display rows: cursor bar inserted when focused, then
+    /// soft-wrapped to the available width so long notes stay visible.
+    fn note_rows(&self, width: u16) -> Vec<String> {
+        let text = self.note.text();
+        let display = if self.note_focused {
+            let (_, col) = self.note.cursor();
+            let byte = text
+                .char_indices()
+                .nth(col)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            format!("{}▏{}", &text[..byte], &text[byte..])
+        } else {
+            text
+        };
+        let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
+        wrap_cells(&display, avail)
+    }
+
+    pub fn render(&self, width: u16) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(vec![
             Span::styled("● ", theme::accent()),
             Span::styled(self.summary.clone(), theme::bold()),
         ])];
-        if !self.preview.is_empty() {
-            out.push(Line::styled("  proposed change:", theme::dim()));
-            let end = (self.preview_scroll + PREVIEW_ROWS).min(self.preview.len());
-            out.extend(self.preview[self.preview_scroll..end].iter().cloned());
-            if self.preview.len() > PREVIEW_ROWS {
-                out.push(Line::styled(
-                    format!(
-                        "  {}–{} / {} lines · page up/down to scroll",
-                        self.preview_scroll + 1,
-                        end,
-                        self.preview.len()
-                    ),
-                    theme::dim(),
-                ));
-            }
-        }
         let choices: Vec<String> = match &self.question_options {
             Some(options) => options.clone(),
-            None => OPTIONS.iter().map(|(label, _)| (*label).to_string()).collect(),
+            None => OPTIONS
+                .iter()
+                .map(|(label, _)| (*label).to_string())
+                .collect(),
         };
         for (i, label) in choices.iter().enumerate() {
             let marker = if i == self.selected { "▸ " } else { "  " };
@@ -165,10 +197,20 @@ impl Dialog {
             } else {
                 label.to_string()
             };
+            // Consent colours: approve is green, standing approval cyan,
+            // decline red. Model questions carry no such semantics.
+            let color = match (&self.question_options, i) {
+                (Some(_), _) => theme::ACCENT,
+                (None, 0) => theme::OK,
+                (None, 1) => theme::ACCENT,
+                (None, _) => theme::ERROR,
+            };
             let style = if i == self.selected {
-                theme::accent()
-            } else {
                 ratatui::style::Style::default()
+                    .fg(color)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                theme::dim()
             };
             out.push(Line::from(vec![
                 Span::raw("  "),
@@ -180,31 +222,53 @@ impl Dialog {
         } else {
             theme::dim()
         };
-        let cursor = if self.note_focused { "▏" } else { "" };
-        out.push(Line::from(vec![
-            Span::styled("  note: ", note_style),
-            Span::raw(self.note.clone()),
-            Span::styled(cursor.to_string(), theme::accent()),
-        ]));
+        for (i, row) in self.note_rows(width).iter().enumerate() {
+            let prefix = if i == 0 { "  note: " } else { "        " };
+            out.push(Line::from(vec![
+                Span::styled(prefix.to_string(), note_style),
+                Span::raw(row.clone()),
+            ]));
+        }
+        let option_count = self
+            .question_options
+            .as_ref()
+            .map_or(OPTIONS.len(), Vec::len);
         out.push(Line::styled(
             if self.question_options.is_some() {
-                "  ↑↓/1-4 choose · type/tab add note · enter answer · esc = cancel"
+                format!("  ↑↓/1-{option_count} choose · type/tab add note · enter answer · esc = cancel")
             } else {
-                "  ↑↓/1-3 choose · pgup/pgdn diff · type/tab note · enter confirm · esc = no"
+                format!("  ↑↓/1-{option_count} choose · type/tab note · enter confirm · esc = no")
             },
             theme::dim(),
         ));
         out
     }
 
-    pub fn height(&self) -> u16 {
-        let preview = if self.preview.is_empty() {
-            0
-        } else {
-            1 + self.preview.len().min(PREVIEW_ROWS) + usize::from(self.preview.len() > PREVIEW_ROWS)
-        };
-        (preview + self.question_options.as_ref().map_or(OPTIONS.len(), Vec::len) + 3) as u16
+    pub fn height(&self, width: u16) -> u16 {
+        (self
+            .question_options
+            .as_ref()
+            .map_or(OPTIONS.len(), Vec::len)
+            + self.note_rows(width).len()
+            + 2) as u16
     }
+}
+
+/// Split into rows of at most `width` display cells (never mid-char).
+fn wrap_cells(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let mut rows = vec![String::new()];
+    let mut used = 0usize;
+    for c in text.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > width && rows.last().is_some_and(|row| !row.is_empty()) {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("rows never empty").push(c);
+        used += w;
+    }
+    rows
 }
 
 #[cfg(test)]
@@ -213,7 +277,12 @@ mod tests {
     use crossterm::event::{KeyCode, KeyEvent};
 
     fn dialog() -> Dialog {
-        Dialog::new("edit src/main.rs".into(), "edit(src/main.rs)".into(), Vec::new())
+        Dialog::new(
+            "edit src/main.rs".into(),
+            "edit(src/main.rs)".into(),
+            "edit(src/main.rs)".into(),
+            true,
+        )
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -263,6 +332,39 @@ mod tests {
     }
 
     #[test]
+    fn note_cursor_moves_and_edits_mid_string() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "abc");
+        d.handle_key(key(KeyCode::Left));
+        type_str(&mut d, "X");
+        d.handle_key(key(KeyCode::Home));
+        d.handle_key(key(KeyCode::Delete));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should confirm");
+        };
+        assert_eq!(a.comment.as_deref(), Some("bXc"));
+    }
+
+    #[test]
+    fn long_note_wraps_and_grows_height() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, &"x".repeat(60));
+        // 40 cells wide leaves ~30 for the note: expect several rows.
+        let rows = d
+            .render(40)
+            .iter()
+            .filter(|l| {
+                let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.contains('x')
+            })
+            .count();
+        assert!(rows >= 2, "60-char note must wrap at width 40");
+        assert!(d.height(40) > d.height(200));
+    }
+
+    #[test]
     fn esc_declines_but_first_unfocuses_note() {
         let mut d = dialog();
         d.handle_key(key(KeyCode::Tab));
@@ -284,29 +386,5 @@ mod tests {
             panic!("enter should confirm");
         };
         assert_eq!(a.decision, ApprovalDecision::YesAlways);
-    }
-
-    #[test]
-    fn preview_is_visible_and_scrollable() {
-        let preview = (0..10)
-            .map(|i| Line::raw(format!("change {i}")))
-            .collect();
-        let mut d = Dialog::new("edit f".into(), "edit(f)".into(), preview);
-        let first = d
-            .render()
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(first.contains("change 0"));
-        assert!(first.contains("page up/down"));
-        d.handle_key(key(KeyCode::PageDown));
-        let second = d
-            .render()
-            .iter()
-            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(second.contains("change 9"));
     }
 }

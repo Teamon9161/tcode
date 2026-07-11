@@ -1,15 +1,20 @@
 mod fs_tools;
 mod grounding;
 mod interaction;
+mod mcp;
 mod output;
 mod search;
 mod shell;
+mod skills;
 mod task;
+mod web;
 
 pub use grounding::project_map;
-pub use shell::ShellKind;
-pub use task::TaskTool;
 pub use interaction::{AddNoteTool, AskUserTool, UpdatePlanTool};
+pub use mcp::connect_mcp_servers;
+pub use shell::ShellKind;
+pub use skills::SkillTool;
+pub use task::TaskTool;
 
 use std::sync::Arc;
 
@@ -25,6 +30,9 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(search::GrepTool),
         Arc::new(search::GlobTool),
         Arc::new(output::ReadOutputTool),
+        Arc::new(web::WebFetchTool),
+        Arc::new(web::WebSearchTool),
+        Arc::new(shell::KillTaskTool),
     ];
     if cfg!(windows) {
         tools.push(Arc::new(shell::ShellTool::new(ShellKind::PowerShell)));

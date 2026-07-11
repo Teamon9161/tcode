@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use std::io::Write as _;
 
-use tcode_core::{Approval, ApprovalDecision, Approver};
 use serde_json::Value;
+use tcode_core::{Approval, ApprovalDecision, Approver};
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -16,13 +16,7 @@ pub struct LineApprover;
 
 #[async_trait]
 impl Approver for LineApprover {
-    async fn ask(
-        &self,
-        tool: &str,
-        summary: &str,
-        descriptor: &str,
-        input: &Value,
-    ) -> Approval {
+    async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval {
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
         print!(

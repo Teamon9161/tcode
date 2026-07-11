@@ -35,18 +35,24 @@ fn highlighter() -> &'static Highlighter {
 pub fn render_change(tool: &str, input: &Value) -> Vec<Line<'static>> {
     let path = input["path"].as_str().unwrap_or("");
     match tool {
-        "edit" => diff_lines(path, input["old_string"].as_str().unwrap_or(""), input["new_string"].as_str().unwrap_or("")),
+        "edit" => diff_lines(
+            path,
+            input["old_string"].as_str().unwrap_or(""),
+            input["new_string"].as_str().unwrap_or(""),
+        ),
         "write" => input["content"]
             .as_str()
             .unwrap_or("")
             .lines()
             .take(MAX_DIFF_LINES)
             .map(|line| code_line(path, "+ ", line, Some(theme::diff_add_bg())))
-            .chain(if input["content"].as_str().unwrap_or("").lines().count() > MAX_DIFF_LINES {
-                Some(Line::styled("    … (preview truncated)", theme::dim()))
-            } else {
-                None
-            })
+            .chain(
+                if input["content"].as_str().unwrap_or("").lines().count() > MAX_DIFF_LINES {
+                    Some(Line::styled("    … (preview truncated)", theme::dim()))
+                } else {
+                    None
+                },
+            )
             .collect(),
         _ => Vec::new(),
     }
@@ -69,8 +75,12 @@ pub fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
             continue;
         }
         let (marker, text, background) = match line.as_bytes().first() {
-            Some(b'+') if !line.starts_with("+++") => ("+ ", &line[1..], Some(theme::diff_add_bg())),
-            Some(b'-') if !line.starts_with("---") => ("- ", &line[1..], Some(theme::diff_del_bg())),
+            Some(b'+') if !line.starts_with("+++") => {
+                ("+ ", &line[1..], Some(theme::diff_add_bg()))
+            }
+            Some(b'-') if !line.starts_with("---") => {
+                ("- ", &line[1..], Some(theme::diff_del_bg()))
+            }
             Some(b' ') => ("  ", &line[1..], None),
             _ => ("  ", line, None),
         };
@@ -82,22 +92,11 @@ pub fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Syntax-highlight a historical `read` result without diff polarity.
-pub fn render_code(path_hint: &str, content: &str) -> Vec<Line<'static>> {
-    content
-        .lines()
-        .take(MAX_DIFF_LINES)
-        .map(|line| code_line(path_hint, "  ", line, None))
-        .chain((content.lines().count() > MAX_DIFF_LINES).then(|| {
-            Line::styled("    … (output truncated)", theme::dim())
-        }))
-        .collect()
-}
-
+/// Edit diffs render in full: the user is approving this exact change and
+/// must be able to see all of it. Only `write` previews are capped.
 fn diff_lines(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     let diff = similar::TextDiff::from_lines(old, new);
     diff.iter_all_changes()
-        .take(MAX_DIFF_LINES)
         .map(|change| {
             let text = change.value().trim_end_matches('\n');
             match change.tag() {
@@ -106,9 +105,6 @@ fn diff_lines(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
                 ChangeTag::Equal => code_line(path, "  ", text, None),
             }
         })
-        .chain((diff.iter_all_changes().count() > MAX_DIFF_LINES).then(|| {
-            Line::styled("    … (preview truncated)", theme::dim())
-        }))
         .collect()
 }
 
@@ -119,10 +115,14 @@ fn code_line(path: &str, marker: &str, text: &str, background: Option<Color>) ->
         .and_then(|extension| extension.to_str())
         .or_else(|| {
             path.split_whitespace()
-                .filter_map(|part| std::path::Path::new(part.trim_matches(|c: char| !c.is_alphanumeric() && c != '.'))
+                .filter_map(|part| {
+                    std::path::Path::new(
+                        part.trim_matches(|c: char| !c.is_alphanumeric() && c != '.'),
+                    )
                     .extension()
-                    .and_then(|extension| extension.to_str()))
-                .last()
+                    .and_then(|extension| extension.to_str())
+                })
+                .next_back()
         });
     let syntax = extension
         .and_then(|extension| highlighter.syntaxes.find_syntax_by_extension(extension))
@@ -139,13 +139,17 @@ fn code_line(path: &str, marker: &str, text: &str, background: Option<Color>) ->
     match line_highlighter.highlight_line(text, &highlighter.syntaxes) {
         Ok(ranges) => spans.extend(ranges.into_iter().map(|(style, token)| {
             let foreground = style.foreground;
-            let mut style = Style::default().fg(Color::Rgb(foreground.r, foreground.g, foreground.b));
+            let mut style =
+                Style::default().fg(Color::Rgb(foreground.r, foreground.g, foreground.b));
             if let Some(background) = background {
                 style = style.bg(background);
             }
             Span::styled(token.to_string(), style)
         })),
-        Err(_) => spans.push(Span::styled(text.to_string(), Style::default().bg(background.unwrap_or(Color::Reset)))),
+        Err(_) => spans.push(Span::styled(
+            text.to_string(),
+            Style::default().bg(background.unwrap_or(Color::Reset)),
+        )),
     }
     Line::from(spans)
 }
@@ -156,12 +160,22 @@ mod tests {
 
     #[test]
     fn diff_uses_background_without_losing_syntax_foreground() {
-        let lines = render_change("edit", &serde_json::json!({
-            "path": "src/main.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
-        }));
-        let added = lines.iter().find(|line| line.spans[0].content.contains('+')).unwrap();
+        let lines = render_change(
+            "edit",
+            &serde_json::json!({
+                "path": "src/main.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
+            }),
+        );
+        let added = lines
+            .iter()
+            .find(|line| line.spans[0].content.contains('+'))
+            .unwrap();
         assert_eq!(added.spans[0].style.bg, Some(theme::diff_add_bg()));
-        assert!(added.spans.iter().skip(1).any(|span| span.style.fg.is_some()));
+        assert!(added
+            .spans
+            .iter()
+            .skip(1)
+            .any(|span| span.style.fg.is_some()));
     }
 
     #[test]
@@ -169,5 +183,29 @@ mod tests {
         let lines = render_unified_patch("*** Update File: src/main.rs\n@@\n-old\n+new");
         assert_eq!(lines[2].spans[0].style.bg, Some(theme::diff_del_bg()));
         assert_eq!(lines[3].spans[0].style.bg, Some(theme::diff_add_bg()));
+    }
+
+    #[test]
+    fn approved_edit_diff_is_not_truncated() {
+        let old = (0..81)
+            .map(|line| format!("let value_{line} = 1;\n"))
+            .collect::<String>();
+        let new = (0..81)
+            .map(|line| format!("let value_{line} = 2;\n"))
+            .collect::<String>();
+        let lines = render_change(
+            "edit",
+            &serde_json::json!({
+                "path": "src/main.rs",
+                "old_string": old,
+                "new_string": new,
+            }),
+        );
+
+        assert!(lines.len() > MAX_DIFF_LINES);
+        assert!(!lines.iter().any(|line| line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("preview truncated"))));
     }
 }

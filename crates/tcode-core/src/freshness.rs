@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 
 /// Tracks what file content the model has already seen, so the harness
 /// can (a) short-circuit redundant reads of unchanged files, (b) demand
-/// a read before edits, and (c) detect external modifications.
+/// a read before `write` overwrites an existing file, and (c) detect
+/// external modifications. `edit` needs no gate: its exact-match against
+/// current disk content is the verification.
 /// Zero-guessing principle: the model never spends tokens discovering
 /// what the harness already knows.
 #[derive(Debug, Default)]
@@ -42,12 +44,7 @@ pub fn content_hash(bytes: &[u8]) -> u64 {
 }
 
 impl FreshnessTracker {
-    pub fn check_read(
-        &self,
-        path: &Path,
-        hash: u64,
-        range: Option<(usize, usize)>,
-    ) -> ReadStatus {
+    pub fn check_read(&self, path: &Path, hash: u64, range: Option<(usize, usize)>) -> ReadStatus {
         let Some(rec) = self.files.get(path) else {
             return ReadStatus::New;
         };
@@ -56,9 +53,7 @@ impl FreshnessTracker {
         }
         let covered = match range {
             None => rec.full,
-            Some((s, e)) => {
-                rec.full || rec.ranges.iter().any(|(rs, re)| *rs <= s && e <= *re)
-            }
+            Some((s, e)) => rec.full || rec.ranges.iter().any(|(rs, re)| *rs <= s && e <= *re),
         };
         if covered {
             ReadStatus::Unchanged
@@ -98,7 +93,8 @@ impl FreshnessTracker {
         );
     }
 
-    /// Has the model seen the current on-disk version (required for edits)?
+    /// Has the model seen the current on-disk version (required before
+    /// `write` overwrites an existing file)?
     pub fn seen_current(&self, path: &Path, hash: u64) -> bool {
         self.files.get(path).is_some_and(|r| r.hash == hash)
     }
