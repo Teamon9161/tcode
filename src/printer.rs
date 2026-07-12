@@ -54,6 +54,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 attempt,
                 max,
                 error,
+                partial_output_retained,
                 delay_ms,
             } => {
                 if in_thinking {
@@ -61,7 +62,12 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                     in_thinking = false;
                 }
                 let secs = (delay_ms + 999) / 1000;
-                println!("\n{RED}[retry {attempt}/{max}] API error: {error}; retrying in {secs}s — partial output above is discarded{RESET}");
+                let retained = if partial_output_retained {
+                    " — incomplete response above retained; not sent back to model"
+                } else {
+                    ""
+                };
+                println!("\n{RED}[retry {attempt}/{max}] API error: {error}; retrying in {secs}s{retained}{RESET}");
             }
             AgentEvent::ToolStart { summary, .. } => {
                 if in_thinking {

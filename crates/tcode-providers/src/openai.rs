@@ -6,12 +6,12 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
-use tcode_core::stream_util::with_idle_timeout;
 use tcode_core::{
     CacheStrategy, ContentBlock, EventStream, Message, Provider, ProviderError, Request, Role,
     StopReason, StreamEvent,
 };
 
+use crate::idle::{classify, idle_guard};
 use crate::retry::connect_once;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
@@ -241,7 +241,7 @@ impl Provider for OpenAiProvider {
         })
         .await?;
 
-        let mut sse = resp.bytes_stream().eventsource();
+        let mut sse = idle_guard(resp.bytes_stream(), self.watchdog.idle_timeout()).eventsource();
         let raw: EventStream = Box::pin(stream! {
             let mut started = false;
             let mut finish: Option<StopReason> = None;
@@ -252,7 +252,7 @@ impl Provider for OpenAiProvider {
                 let event = match item {
                     Ok(e) => e,
                     Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
+                        yield Err(classify(e));
                         return;
                     }
                 };
@@ -322,7 +322,6 @@ impl Provider for OpenAiProvider {
             }
         });
 
-        let guarded = with_idle_timeout(raw, self.watchdog.idle_timeout());
-        Ok(Box::pin(guarded.take_until(cancel.cancelled_owned())))
+        Ok(Box::pin(raw.take_until(cancel.cancelled_owned())))
     }
 }

@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::sinks::UTF8;
-use grep_searcher::SearcherBuilder;
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
@@ -21,6 +20,9 @@ const MAX_LINE_BYTES: usize = 512;
 /// files is both slow and useless. Applies to grep only, not glob (name
 /// search must still find large files).
 const MAX_FILE_BYTES: u64 = 256 * 1024;
+/// Ceiling on -A/-B/-C context so a wide window over many matches cannot
+/// balloon the (un-gated) grep output.
+const MAX_CONTEXT: u64 = 30;
 /// Wall-clock ceiling for a single search. Cancellation (Esc) still works;
 /// this is the automatic backstop so a walk over a huge tree returns a
 /// clearly-marked partial result instead of hanging.
@@ -93,6 +95,93 @@ fn cap_line(line: &str) -> String {
     format!("{}…[+{} bytes]", &s[..end], s.len() - end)
 }
 
+/// One output line: a match or a surrounding context line.
+struct Line {
+    lnum: u64,
+    text: String,
+    is_match: bool,
+}
+
+/// A contiguous block of lines (matches plus any merged context), as
+/// delimited by the searcher's context breaks. Paging counts `matches`, not
+/// lines, so context never distorts head_limit/offset.
+struct Group {
+    file: String,
+    first: u64,
+    matches: usize,
+    lines: Vec<Line>,
+}
+
+/// Collects matches and context into `Group`s. Match totals accumulate into a
+/// shared counter so the parallel walk can stop once the page is filled;
+/// completed groups are appended to the shared `groups` on `finish`.
+struct GroupSink<'a> {
+    file: String,
+    groups: &'a Mutex<Vec<Group>>,
+    total: &'a AtomicUsize,
+    want: usize,
+    cur: Vec<Line>,
+    cur_matches: usize,
+    out: Vec<Group>,
+}
+
+impl GroupSink<'_> {
+    fn flush(&mut self) {
+        if self.cur.is_empty() {
+            return;
+        }
+        let lines = std::mem::take(&mut self.cur);
+        self.out.push(Group {
+            file: self.file.clone(),
+            first: lines[0].lnum,
+            matches: std::mem::take(&mut self.cur_matches),
+            lines,
+        });
+    }
+}
+
+impl Sink for GroupSink<'_> {
+    type Error = std::io::Error;
+
+    fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
+        let mut lnum = mat.line_number().unwrap_or(0);
+        for line in mat.lines() {
+            self.cur.push(Line {
+                lnum,
+                text: cap_line(&String::from_utf8_lossy(line)),
+                is_match: true,
+            });
+            self.cur_matches += 1;
+            self.total.fetch_add(1, Ordering::Relaxed);
+            lnum += 1;
+        }
+        // Stop this file once the requested page is full; the walk quits too.
+        Ok(self.total.load(Ordering::Relaxed) < self.want)
+    }
+
+    fn context(&mut self, _s: &Searcher, c: &SinkContext<'_>) -> Result<bool, Self::Error> {
+        self.cur.push(Line {
+            lnum: c.line_number().unwrap_or(0),
+            text: cap_line(&String::from_utf8_lossy(c.bytes())),
+            is_match: false,
+        });
+        Ok(true)
+    }
+
+    fn context_break(&mut self, _s: &Searcher) -> Result<bool, Self::Error> {
+        self.flush();
+        Ok(true)
+    }
+
+    fn finish(&mut self, _s: &Searcher, _: &SinkFinish) -> Result<(), Self::Error> {
+        self.flush();
+        if !self.out.is_empty() {
+            self.groups.lock().unwrap().append(&mut self.out);
+        }
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------- grep
 
 pub struct GrepTool;
@@ -127,9 +216,12 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "Search file contents with a regex (ripgrep engine, respects \
-         .gitignore). Returns matching lines as path:line:text. Filter \
-         files with `glob`; cap output with head_limit (default 200) and \
-         page with offset."
+         .gitignore). Matches are `path:line: text`. Pull surrounding code \
+         with `context` (-C, both sides), `before` (-B) or `after` (-A); \
+         context lines show as `path:line- text` and blocks are separated by \
+         `--`, so one search often gives enough to edit without a follow-up \
+         read. Filter files with `glob`; cap matches with head_limit \
+         (default 200) and page with offset."
     }
 
     fn input_schema(&self) -> Value {
@@ -140,6 +232,9 @@ impl Tool for GrepTool {
                 "path": { "type": "string", "description": "Directory or file to search (default: cwd)" },
                 "glob": { "type": "string", "description": "Filter files, e.g. *.rs or src/**/*.toml" },
                 "case_insensitive": { "type": "boolean" },
+                "context": { "type": "integer", "description": "Context lines on both sides of each match (-C)" },
+                "before": { "type": "integer", "description": "Context lines before each match (-B); overrides context" },
+                "after": { "type": "integer", "description": "Context lines after each match (-A); overrides context" },
                 "head_limit": { "type": "integer" },
                 "offset": { "type": "integer", "description": "Skip this many matches before head_limit (for paging)" }
             },
@@ -192,6 +287,11 @@ impl Tool for GrepTool {
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
         // Collect just enough to fill the requested page, then stop.
         let want = offset.saturating_add(limit);
+        // -C sets both sides; -A/-B override it. Capped so context can't blow
+        // up the output.
+        let ctx_c = input["context"].as_u64().unwrap_or(0);
+        let before = input["before"].as_u64().unwrap_or(ctx_c).min(MAX_CONTEXT) as usize;
+        let after = input["after"].as_u64().unwrap_or(ctx_c).min(MAX_CONTEXT) as usize;
 
         let glob_note = input["glob"]
             .as_str()
@@ -204,7 +304,7 @@ impl Tool for GrepTool {
         // The walk reads many files and runs its own thread pool — keep it off
         // the async runtime.
         let out = tokio::task::spawn_blocking(move || {
-            let matches: Mutex<Vec<(String, u64, String)>> = Mutex::new(Vec::new());
+            let groups: Mutex<Vec<Group>> = Mutex::new(Vec::new());
             let count = AtomicUsize::new(0);
             let files = AtomicUsize::new(0);
             let timed_out = AtomicBool::new(false);
@@ -213,12 +313,16 @@ impl Tool for GrepTool {
             let mut builder = walk_builder(&base);
             builder.max_filesize(Some(MAX_FILE_BYTES));
             builder.build_parallel().run(|| {
-                let mut searcher = SearcherBuilder::new().line_number(true).build();
+                let mut searcher = SearcherBuilder::new()
+                    .line_number(true)
+                    .before_context(before)
+                    .after_context(after)
+                    .build();
                 let matcher = &matcher;
                 let glob = glob.as_ref();
                 let base: &Path = &base;
                 let cwd: &Path = &cwd;
-                let matches = &matches;
+                let groups = &groups;
                 let count = &count;
                 let files = &files;
                 let timed_out = &timed_out;
@@ -245,34 +349,44 @@ impl Tool for GrepTool {
                         }
                     }
                     files.fetch_add(1, Ordering::Relaxed);
-                    let display = rel_display(path, cwd);
-                    let mut local: Vec<(String, u64, String)> = Vec::new();
-                    let _ = searcher.search_path(
-                        matcher,
-                        path,
-                        UTF8(|lnum, line| {
-                            local.push((display.clone(), lnum, cap_line(line)));
-                            // A single file can't contribute more than the page.
-                            Ok(local.len() < want)
-                        }),
-                    );
-                    if !local.is_empty() {
-                        count.fetch_add(local.len(), Ordering::Relaxed);
-                        matches.lock().unwrap().extend(local);
-                    }
+                    let mut sink = GroupSink {
+                        file: rel_display(path, cwd),
+                        groups,
+                        total: count,
+                        want,
+                        cur: Vec::new(),
+                        cur_matches: 0,
+                        out: Vec::new(),
+                    };
+                    let _ = searcher.search_path(matcher, path, &mut sink);
                     WalkState::Continue
                 })
             });
 
-            let mut hits = matches.into_inner().unwrap();
-            // Parallel walk yields matches out of order; sort for stable output.
-            hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
-            let total = hits.len();
-            let page: Vec<_> = hits.into_iter().skip(offset).take(limit).collect();
+            let mut groups = groups.into_inner().unwrap();
+            // Parallel walk yields files out of order; sort for stable output.
+            groups.sort_by(|a, b| a.file.cmp(&b.file).then(a.first.cmp(&b.first)));
+            let total: usize = groups.iter().map(|g| g.matches).sum();
             let files = files.load(Ordering::Relaxed);
             let timed_out = timed_out.load(Ordering::Relaxed);
 
-            if page.is_empty() {
+            // Page by *matches*: keep whole groups that overlap the window so
+            // context blocks stay intact.
+            let mut seen = 0usize;
+            let mut selected: Vec<Group> = Vec::new();
+            for g in groups {
+                let start = seen;
+                seen += g.matches;
+                if start >= offset + limit {
+                    break;
+                }
+                if seen > offset {
+                    selected.push(g);
+                }
+            }
+            let shown: usize = selected.iter().map(|g| g.matches).sum();
+
+            if selected.is_empty() {
                 let mut m =
                     format!("no matches for /{pattern}/ ({files} files scanned{glob_note})");
                 if timed_out {
@@ -283,12 +397,21 @@ impl Tool for GrepTool {
                 }
                 return m;
             }
-            let shown = page.len();
-            let mut out = page
-                .into_iter()
-                .map(|(d, l, t)| format!("{d}:{l}: {t}"))
+            let joiner = if before > 0 || after > 0 { "\n--\n" } else { "\n" };
+            let mut out = selected
+                .iter()
+                .map(|g| {
+                    g.lines
+                        .iter()
+                        .map(|l| {
+                            let sep = if l.is_match { ':' } else { '-' };
+                            format!("{}:{}{sep} {}", g.file, l.lnum, l.text)
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
                 .collect::<Vec<_>>()
-                .join("\n");
+                .join(joiner);
             if timed_out {
                 out.push_str(&format!(
                     "\n[search timed out after {}s — partial results; narrow the path or glob]",
@@ -455,4 +578,62 @@ fn build_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
 fn glob_matches(glob: &globset::GlobMatcher, path: &Path, base: &Path) -> bool {
     let rel = path.strip_prefix(base).unwrap_or(path);
     glob.is_match(rel) || path.file_name().is_some_and(|n| glob.is_match(n))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tcode_core::ToolCtx;
+
+    async fn grep(dir: &Path, input: Value) -> String {
+        let ctx = ToolCtx::new(dir.to_path_buf(), 100_000);
+        GrepTool
+            .run(input, &ctx, &CancellationToken::new())
+            .await
+            .content
+    }
+
+    fn scratch(name: &str, body: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tcode-grep-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.rs"), body).unwrap();
+        dir
+    }
+
+    const BODY: &str = "line1\nline2\nTARGET\nline4\nline5\n";
+
+    #[tokio::test]
+    async fn no_context_returns_bare_match() {
+        let dir = scratch("bare", BODY);
+        let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
+        assert_eq!(out, "a.rs:3: TARGET");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn context_wraps_match_with_dash_lines() {
+        let dir = scratch("ctx", BODY);
+        let out = grep(&dir, json!({ "pattern": "TARGET", "context": 1 })).await;
+        assert_eq!(out, "a.rs:2- line2\na.rs:3: TARGET\na.rs:4- line4");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn before_and_after_are_independent() {
+        let dir = scratch("ba", BODY);
+        let before = grep(&dir, json!({ "pattern": "TARGET", "before": 1, "after": 0 })).await;
+        assert_eq!(before, "a.rs:2- line2\na.rs:3: TARGET");
+        let after = grep(&dir, json!({ "pattern": "TARGET", "after": 2, "before": 0 })).await;
+        assert_eq!(after, "a.rs:3: TARGET\na.rs:4- line4\na.rs:5- line5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn separate_matches_break_with_marker() {
+        let dir = scratch("break", "hit\nx\nx\nx\nx\nx\nhit\n");
+        let out = grep(&dir, json!({ "pattern": "hit", "context": 1 })).await;
+        // Two matches far apart: distinct blocks joined by `--`.
+        assert_eq!(out, "a.rs:1: hit\na.rs:2- x\n--\na.rs:6- x\na.rs:7: hit");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

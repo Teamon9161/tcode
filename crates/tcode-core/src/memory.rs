@@ -14,6 +14,7 @@ const MAINTENANCE_TURNS: u32 = 20;
 const MAINTENANCE_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const SOURCE_MARKER: &str = "tcode-memory-source: ";
 const PROJECT_MARKER: &str = "tcode-memory-project: ";
+const AUTO_MEMORY_SYSTEM: &str = include_str!("../../../prompts/memory-system.md");
 
 #[derive(Debug, Clone)]
 struct Project {
@@ -139,9 +140,7 @@ impl MemoryManager {
                 } else {
                     out.push_str("MEMORY.md does not exist yet.\n");
                 }
-                out.push_str(
-                    "Maintain this machine-local memory with normal read/write/edit tools. Record durable build/debugging facts, user corrections, architecture patterns, and important project decisions that will matter in future sessions. Keep MEMORY.md as a concise index; move detail to topic files in the same directory. Update existing facts instead of blindly appending duplicates. Never store secrets, credentials, or transient task state.\n",
-                );
+                out.push_str(AUTO_MEMORY_SYSTEM);
             }
             Some(dir) => out.push_str(&format!(
                 "disabled for this project (directory: {}). Do not write auto memory.\n",

@@ -69,13 +69,30 @@ impl Editor {
 
     pub fn insert_str(&mut self, s: &str) {
         self.delete_selection();
-        for c in s.chars() {
-            if c == '\n' {
-                self.newline();
-            } else if c != '\r' {
-                self.insert_char(c);
-            }
+        let row = self.row;
+        let byte = char_to_byte(&self.lines[row], self.col);
+        let tail = self.lines[row].split_off(byte);
+        let mut pasted = s.split('\n');
+        let first = pasted.next().unwrap_or_default();
+        let first = first.strip_suffix('\r').unwrap_or(first);
+        self.lines[row].push_str(first);
+
+        let mut inserted_rows = 0usize;
+        for fragment in pasted {
+            inserted_rows += 1;
+            self.lines.insert(
+                row + inserted_rows,
+                fragment.strip_suffix('\r').unwrap_or(fragment).to_string(),
+            );
         }
+        let last = row + inserted_rows;
+        self.lines[last].push_str(&tail);
+        self.row = last;
+        self.col = self.lines[last]
+            .chars()
+            .count()
+            .saturating_sub(tail.chars().count());
+        self.history_pos = None;
     }
 
     pub fn newline(&mut self) {
@@ -355,6 +372,19 @@ mod tests {
         assert!(e.is_empty());
         e.history_prev();
         assert_eq!(e.text(), "hello\nworl");
+    }
+
+    #[test]
+    fn bulk_insert_keeps_tail_and_cursor_position() {
+        let mut e = Editor::new();
+        e.insert_str("headtail");
+        e.home();
+        for _ in 0..4 {
+            e.right();
+        }
+        e.insert_str("A\nB");
+        assert_eq!(e.text(), "headA\nBtail");
+        assert_eq!(e.position(), Position { row: 1, col: 1 });
     }
 
     #[test]

@@ -39,12 +39,16 @@ pub enum AgentEvent {
     /// producing output while assembling a tool call, instead of appearing
     /// frozen until the finished call arrives as `ToolStart`.
     ToolInputDelta(String),
-    /// Streaming failed mid-turn; the request is being re-sent.
-    /// UI must discard un-baked partial output for this step.
+    /// Streaming failed mid-turn; the request is being re-sent. Any partial
+    /// assistant text was committed as transcript-only history, so the UI
+    /// should bake rather than discard its live block.
     Retrying {
         attempt: u32,
         max: u32,
         error: String,
+        /// Whether streamed assistant text was retained in transcript-only
+        /// history before this retry.
+        partial_output_retained: bool,
         /// How long the loop will wait before the next attempt, so the UI can
         /// show a live countdown.
         delay_ms: u64,
@@ -384,14 +388,17 @@ impl Agent {
         session: &mut Session,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        const COMPACT_PROMPT: &str = "\
-Context is being compacted. Write a summary that will REPLACE all \
-earlier history; it is the only memory you will keep. Include: \
-1) the task and its goal, 2) what was done so far (files read/changed, \
-commands run, outcomes), 3) decisions made and constraints discovered, \
-4) current state and what remains, 5) exact paths, names and other \
-details needed to continue without re-discovering them. Output only \
-the summary text.";
+        self.compact_with_focus(session, None, cancel).await
+    }
+
+    /// Compact with an optional user-requested emphasis. The focus guides the
+    /// summary but never replaces the baseline continuation requirements.
+    pub async fn compact_with_focus(
+        &self,
+        session: &mut Session,
+        focus: Option<&str>,
+        cancel: &CancellationToken,
+    ) -> Result<(), AgentError> {
         if session.ledger.is_empty() {
             return Ok(());
         }
@@ -399,7 +406,7 @@ the summary text.";
         messages.push(crate::Message {
             role: crate::Role::User,
             content: vec![ContentBlock::Text {
-                text: COMPACT_PROMPT.into(),
+                text: compact_prompt(focus),
             }],
         });
         let model = self.model.snapshot();
@@ -449,12 +456,12 @@ the summary text.";
         Ok(())
     }
 
-    /// One model request with watchdog retries. Partial output from a
-    /// failed attempt is discarded (UI told via `Retrying`).
+    /// One model request with watchdog retries. Text emitted by a failed
+    /// attempt is preserved as transcript-only history before the retry.
     async fn stream_step(
         &self,
         model: &crate::provider::ActiveModel,
-        session: &Session,
+        session: &mut Session,
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(Vec<ContentBlock>, Usage, Option<StopReason>), AgentError> {
@@ -475,7 +482,8 @@ the summary text.";
                 Ok(stream) => stream,
                 Err(e) if e.retryable() && attempt < self.watchdog.max_retries => {
                     attempt += 1;
-                    self.emit_retry(events, attempt, &e.to_string()).await?;
+                    self.emit_retry(events, attempt, &e.to_string(), false)
+                        .await?;
                     continue 'retry;
                 }
                 Err(e) => return Err(e.into()),
@@ -505,8 +513,11 @@ the summary text.";
                         acc.feed(&ev);
                     }
                     Err(e) if e.retryable() && attempt < self.watchdog.max_retries => {
+                        let partial_output_retained =
+                            self.preserve_incomplete_assistant(session, acc, &e);
                         attempt += 1;
-                        self.emit_retry(events, attempt, &e.to_string()).await?;
+                        self.emit_retry(events, attempt, &e.to_string(), partial_output_retained)
+                            .await?;
                         continue 'retry;
                     }
                     Err(e) => return Err(e.into()),
@@ -517,6 +528,30 @@ the summary text.";
         }
     }
 
+    fn preserve_incomplete_assistant(
+        &self,
+        session: &mut Session,
+        acc: ResponseAccumulator,
+        error: &ProviderError,
+    ) -> bool {
+        let (blocks, _, _) = acc.finish();
+        let text = blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        if text.trim().is_empty() {
+            return false;
+        }
+        session.ledger.append(Entry::IncompleteAssistant {
+            text,
+            error: error.to_string(),
+        });
+        true
+    }
+
     /// Announce a retry and wait out the exponential backoff. The event carries
     /// the delay so the UI can render a live countdown.
     async fn emit_retry(
@@ -524,6 +559,7 @@ the summary text.";
         events: &mpsc::Sender<AgentEvent>,
         attempt: u32,
         error: &str,
+        partial_output_retained: bool,
     ) -> Result<(), AgentError> {
         let delay = self.watchdog.backoff(attempt);
         self.emit(
@@ -532,6 +568,7 @@ the summary text.";
                 attempt,
                 max: self.watchdog.max_retries,
                 error: error.to_string(),
+                partial_output_retained,
                 delay_ms: delay.as_millis() as u64,
             },
         )
@@ -1528,6 +1565,21 @@ the summary text.";
     }
 }
 
+const COMPACT_PROMPT: &str = include_str!("../../../prompts/compact.md");
+
+fn compact_prompt(focus: Option<&str>) -> String {
+    let focus = focus
+        .map(str::trim)
+        .filter(|focus| !focus.is_empty())
+        .map(|focus| {
+            format!(
+                "Additional user-requested summary focus (this supplements, not replaces, the required continuation details):\n{focus}\n\n"
+            )
+        })
+        .unwrap_or_default();
+    COMPACT_PROMPT.replace("{{USER_FOCUS}}", &focus)
+}
+
 struct ToolsOutcome {
     interrupted: bool,
     awaiting_user_input: bool,
@@ -1681,7 +1733,7 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{compact_successful_test_output, Session};
+    use super::{compact_prompt, compact_successful_test_output, Session};
     use crate::{Entry, PermissionMode, PermissionRules, ToolCtx};
 
     #[test]
@@ -1729,6 +1781,24 @@ mod tests {
         assert!(folded.contains("running 24 tests"));
         assert!(folded.contains("folded"));
         assert!(!folded.contains("running 0 tests"));
+    }
+
+    #[test]
+    fn compact_prompt_omits_focus_section_when_none_is_given() {
+        let prompt = compact_prompt(None);
+        assert!(!prompt.contains("Additional user-requested summary focus"));
+        assert!(!prompt.contains("{{USER_FOCUS}}"));
+    }
+
+    #[test]
+    fn compact_focus_supplements_required_summary_details() {
+        let prompt = compact_prompt(Some("prioritize API decisions and migration risks"));
+        assert!(prompt.contains("**Current state**"));
+        assert!(prompt.contains("**Next steps**"));
+        assert!(prompt.contains("prioritize API decisions and migration risks"));
+        assert!(prompt.contains("supplements, not replaces"));
+        assert!(!prompt.contains("{{USER_FOCUS}}"));
+        assert!(prompt.ends_with("Output only the summary text.\n"));
     }
 
     #[test]

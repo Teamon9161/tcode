@@ -321,6 +321,33 @@ mod tests {
     }
 
     #[test]
+    fn roundtrips_incomplete_assistant_without_prompt_replay() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcode-store-incomplete-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = SessionStore::create(&dir, Path::new("C:/proj")).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(Entry::IncompleteAssistant {
+            text: "partial answer".into(),
+            error: "network error".into(),
+        });
+
+        let resumed = SessionStore::resume(&dir, None).unwrap();
+        assert!(matches!(
+            &resumed.ledger.entries()[0],
+            Entry::IncompleteAssistant { text, error }
+                if text == "partial answer" && error == "network error"
+        ));
+        assert!(resumed.ledger.as_messages().is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn roundtrips_large_tool_output_with_windows_paths() {
         let dir = std::env::temp_dir().join(format!("tcode-store-large-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

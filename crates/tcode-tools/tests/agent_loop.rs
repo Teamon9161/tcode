@@ -940,3 +940,106 @@ async fn connect_failure_is_retried_and_reported() {
     // ...and the turn still completed once the provider recovered.
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
 }
+
+/// Emits a retryable stream error after text, then returns a normal response.
+/// This verifies failed text is kept only in human-facing transcript history.
+struct PartialFailureProvider {
+    scripts: Mutex<VecDeque<Vec<Result<StreamEvent, ProviderError>>>>,
+    requests: Mutex<Vec<Request>>,
+}
+
+#[async_trait]
+impl Provider for PartialFailureProvider {
+    fn name(&self) -> &str {
+        "partial-failure"
+    }
+    fn model(&self) -> &str {
+        "partial-failure-1"
+    }
+    fn cache_strategy(&self) -> CacheStrategy {
+        CacheStrategy::ImplicitPrefix
+    }
+    async fn stream(
+        &self,
+        req: Request,
+        _cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(req);
+        let script = self
+            .scripts
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("partial-failure provider ran out of responses");
+        Ok(Box::pin(futures::stream::iter(script)))
+    }
+}
+
+#[tokio::test]
+async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(PartialFailureProvider {
+        scripts: Mutex::new(
+            vec![
+                vec![
+                    Ok(StreamEvent::Started),
+                    Ok(StreamEvent::TextDelta("partial answer".into())),
+                    Err(ProviderError::Network("connection dropped".into())),
+                ],
+                text_done("recovered answer").into_iter().map(Ok).collect(),
+            ]
+            .into(),
+        ),
+        requests: Mutex::new(Vec::new()),
+    });
+    let agent = Agent {
+        model: ModelCell::new(ActiveModel {
+            provider: provider.clone(),
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        }),
+        tools: tcode_tools::builtin_tools(),
+        system: "test".into(),
+        watchdog: WatchdogConfig {
+            idle_timeout_secs: 5,
+            connect_timeout_secs: 20,
+            max_retries: 1,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+        },
+        hooks: Default::default(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
+    };
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "hi").await;
+
+    assert!(matches!(
+        &session.ledger.entries()[1],
+        Entry::IncompleteAssistant { text, error }
+            if text == "partial answer" && error.contains("connection dropped")
+    ));
+    assert!(matches!(
+        &session.ledger.entries()[2],
+        Entry::Assistant(blocks)
+            if matches!(&blocks[..], [ContentBlock::Text { text }] if text == "recovered answer")
+    ));
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[1]
+        .messages
+        .iter()
+        .all(|message| message.content.iter().all(|block| match block {
+            ContentBlock::Text { text } => !text.contains("partial answer"),
+            _ => true,
+        })));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::Retrying {
+            partial_output_retained: true,
+            ..
+        }
+    )));
+}

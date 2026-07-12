@@ -17,8 +17,8 @@ use tcode_core::{
     PermissionMode, PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
 };
 
-const EXPLORE_SYSTEM: &str = include_str!("../prompts/task-explore-system.md");
-const GENERAL_SYSTEM: &str = include_str!("../prompts/task-general-system.md");
+const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
+const GENERAL_SYSTEM: &str = include_str!("../../../prompts/task-general-system.md");
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.

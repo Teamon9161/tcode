@@ -14,7 +14,6 @@ pub mod memory;
 pub mod permission;
 pub mod provider;
 pub mod store;
-pub mod stream_util;
 pub mod tool;
 pub mod types;
 

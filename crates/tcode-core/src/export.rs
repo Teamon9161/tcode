@@ -55,6 +55,11 @@ pub fn export_markdown(entries: &[Entry], title: &str) -> String {
                 out.push_str(text);
                 out.push_str("\n\n---\n");
             }
+            Entry::IncompleteAssistant { text, error } => {
+                out.push_str("\n## Incomplete assistant response (not sent back to model)\n\n");
+                out.push_str(text);
+                out.push_str(&format!("\n\n> ⚠ stream failed: {error}\n"));
+            }
             Entry::ImportedTool {
                 name,
                 input,
@@ -136,6 +141,10 @@ mod tests {
                 images: vec![],
             }]),
             Entry::Note("background task b1 finished".into()),
+            Entry::IncompleteAssistant {
+                text: "partial answer".into(),
+                error: "network error".into(),
+            },
         ];
         let md = export_markdown(&entries, "session x");
         assert!(md.starts_with("# session x"));
@@ -144,6 +153,9 @@ mod tests {
         assert!(md.contains("`read(src/main.rs)`"));
         assert!(md.contains("fn main() {}"));
         assert!(md.contains("> ⚑ background task b1 finished"));
+        assert!(md.contains("Incomplete assistant response (not sent back to model)"));
+        assert!(md.contains("partial answer"));
+        assert!(md.contains("stream failed: network error"));
     }
 
     #[test]

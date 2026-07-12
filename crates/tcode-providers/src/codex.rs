@@ -22,12 +22,12 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::codex;
 use tcode_core::config::WatchdogConfig;
-use tcode_core::stream_util::with_idle_timeout;
 use tcode_core::{
     CacheStrategy, ContentBlock, EventStream, Message, Provider, ProviderError, RateLimit,
     RateLimits, Request, Role, StopReason, StreamEvent,
 };
 
+use crate::idle::{classify, idle_guard};
 use crate::retry::{short, with_connect_timeout};
 
 const BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -314,7 +314,7 @@ impl Provider for CodexProvider {
         let (resp, header_limits) =
             with_connect_timeout(self.watchdog.connect_timeout(), self.connect(&body)).await?;
 
-        let mut sse = resp.bytes_stream().eventsource();
+        let mut sse = idle_guard(resp.bytes_stream(), self.watchdog.idle_timeout()).eventsource();
         let raw: EventStream = Box::pin(stream! {
             let mut saw_tool_use = false;
             // Codex reports subscription usage only in the response headers of
@@ -327,7 +327,7 @@ impl Provider for CodexProvider {
                 let event = match item {
                     Ok(e) => e,
                     Err(e) => {
-                        yield Err(ProviderError::Network(e.to_string()));
+                        yield Err(classify(e));
                         return;
                     }
                 };
@@ -407,8 +407,7 @@ impl Provider for CodexProvider {
             ));
         });
 
-        let guarded = with_idle_timeout(raw, self.watchdog.idle_timeout());
-        Ok(Box::pin(guarded.take_until(cancel.cancelled_owned())))
+        Ok(Box::pin(raw.take_until(cancel.cancelled_owned())))
     }
 }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use crossterm::event::{
@@ -45,6 +45,9 @@ const PLAN_VISIBLE_STEPS: usize = 5;
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
 
 const PASTE_FOLD_LINES: usize = 15;
+/// Long one-line pastes should not make the editor visibly type character by
+/// character. They are sent as a text attachment instead.
+const PASTE_FOLD_CHARS: usize = 1_000;
 /// A calm, low-contrast alternative to the legacy sparkle animation.
 const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
     (".", theme::DIM),
@@ -60,7 +63,7 @@ const SLASH_COMMANDS: [(&str, &str); 13] = [
     ("/cd", "change working directory: /cd <path>"),
     ("/mode", "cycle permission mode"),
     ("/cost", "show last turn token usage"),
-    ("/compact", "summarize history to free context"),
+    ("/compact", "summarize history · /compact <focus>"),
     ("/clear", "start a fresh conversation"),
     ("/resume", "resume a session: /resume <id>"),
     ("/note", "add a durable conversation note"),
@@ -588,6 +591,16 @@ impl App {
                         }
                     }
                 }
+                tcode_core::Entry::IncompleteAssistant { text, error } => {
+                    lines.extend(self.md.render(text));
+                    lines.push(Line::styled(
+                        format!(
+                            "↻ stream failed: {error} — incomplete response retained; not sent back to model"
+                        ),
+                        theme::error_highlight(),
+                    ));
+                    lines.push(Line::default());
+                }
                 tcode_core::Entry::Summary(_) => {
                     lines.push(Line::styled(
                         "── earlier conversation compacted ──",
@@ -674,7 +687,20 @@ impl App {
                         }
                     }
                 }
-                tcode_core::Entry::Note(_) => {}
+                tcode_core::Entry::Note(text) => {
+                    for (i, line) in text.lines().enumerate() {
+                        let prefix = if i == 0 {
+                            "› note to model — "
+                        } else {
+                            "  "
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled(prefix.to_string(), theme::user_prompt_message()),
+                            Span::styled(line.to_string(), theme::user_message()),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                }
             }
         }
         lines.push(Line::styled("── resumed ──", theme::dim()));
@@ -771,9 +797,10 @@ impl App {
         };
     }
 
-    /// `/compact` runs like a turn (spinner, cancel, usage report) but
-    /// drives `Agent::compact` instead of the tool loop.
-    fn start_compact(&mut self) {
+    /// `/compact [focus]` runs like a turn (spinner, cancel, usage report)
+    /// but drives `Agent::compact` instead of the tool loop. The optional focus
+    /// tells the summarizer which details deserve special attention.
+    fn start_compact(&mut self, focus: Option<String>) {
         let Some(mut session) = self.session.take() else {
             return;
         };
@@ -794,7 +821,9 @@ impl App {
         let agent = self.agent.clone();
         let cancel2 = cancel.clone();
         let handle = tokio::spawn(async move {
-            let result = agent.compact(&mut session, &cancel2).await;
+            let result = agent
+                .compact_with_focus(&mut session, focus.as_deref(), &cancel2)
+                .await;
             (session, result)
         });
         self.phase = Phase::Running {
@@ -1080,19 +1109,22 @@ impl App {
                 attempt,
                 max,
                 error,
+                partial_output_retained,
                 delay_ms,
             } => {
-                // The failed attempt's assistant text was only a live transcript
-                // block; remove it before the retry renders a fresh attempt.
-                self.clear_live_text();
-                self.thinking_chars = 0;
-                self.thinking_text.clear();
-                self.thinking_since = None;
+                // A failed attempt is valid human-facing history, but never
+                // provider history. Bake its live text before the retry starts;
+                // the core ledger persists the same text as IncompleteAssistant.
+                self.bake_live_text();
+                self.finish_thinking();
                 self.context_tokens = self.context_step_start;
                 // Record the failure in red scrollback, then show a live
                 // countdown in the status line until the next attempt fires.
+                let retained = partial_output_retained
+                    .then_some(" — incomplete response retained; not sent back to model")
+                    .unwrap_or("");
                 self.bake(vec![Line::styled(
-                    format!("↻ API error ({attempt}/{max}): {error}"),
+                    format!("↻ API error ({attempt}/{max}): {error}{retained}"),
                     theme::error_highlight(),
                 )]);
                 self.retry_wait = Some(RetryWait {
@@ -1193,7 +1225,10 @@ impl App {
                 if let Some(note) = approval.comment.as_deref() {
                     self.bake(vec![
                         Line::default(),
-                        Line::styled(format!("  ⊙ note to model — {note}"), theme::dim()),
+                        Line::from(vec![
+                            Span::styled("› note to model — ", theme::user_prompt_message()),
+                            Span::styled(note.to_string(), theme::user_message()),
+                        ]),
                     ]);
                 }
             }
@@ -1589,6 +1624,14 @@ impl App {
             KeyCode::End => self.editor.end(),
             KeyCode::PageUp => self.transcript.page_up(),
             KeyCode::PageDown => self.transcript.page_down(),
+            KeyCode::Backspace if self.editor.is_empty() => {
+                if let Some(attachment) = self.attachments.pop() {
+                    let label = match attachment {
+                        Attachment::Image { label, .. } | Attachment::Text { label, .. } => label,
+                    };
+                    self.notice = Some((format!("removed {label}"), Instant::now()));
+                }
+            }
             KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Char(c) => {
@@ -1906,10 +1949,10 @@ impl App {
                 session
                     .ledger
                     .append(tcode_core::Entry::Note(note.to_string()));
-                self.bake(vec![Line::styled(
-                    format!("  ⌞ note: {note}"),
-                    theme::dim(),
-                )]);
+                self.bake(vec![Line::from(vec![
+                    Span::styled("› note to model — ", theme::user_prompt_message()),
+                    Span::styled(note.to_string(), theme::user_message()),
+                ])]);
             } else {
                 self.bake(vec![Line::styled(
                     "wait for the current turn before adding a note",
@@ -1920,6 +1963,15 @@ impl App {
         }
         if cmd == "/export" || cmd.starts_with("/export ") {
             self.export_transcript(cmd.strip_prefix("/export").unwrap_or("").trim());
+            return;
+        }
+        if cmd == "/compact" || cmd.starts_with("/compact ") {
+            let focus = cmd
+                .strip_prefix("/compact")
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            self.start_compact((!focus.is_empty()).then_some(focus));
             return;
         }
         match cmd {
@@ -1959,7 +2011,6 @@ impl App {
                     theme::dim(),
                 )]);
             }
-            "/compact" => self.start_compact(),
             "/clear" => {
                 if let Some(session) = self.session.as_mut() {
                     session.ledger.truncate_tail(0);
@@ -1993,6 +2044,7 @@ impl App {
                     ("ctrl+a", "select prompt · ctrl+c copy selection"),
                     ("alt+c / alt+x", "copy / cut prompt"),
                     ("mouse", "click prompt to move cursor · drag to copy"),
+                    ("backspace", "delete · empty input removes last paste"),
                     ("ctrl+c", "cancel / clear / exit"),
                 ] {
                     lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
@@ -2152,9 +2204,13 @@ impl App {
     }
 
     fn on_paste_text(&mut self, text: String) {
-        let lines = text.lines().count();
-        if lines > PASTE_FOLD_LINES {
-            let label = format!("pasted #{} ({lines} lines)", self.attachments.len() + 1);
+        let lines = text.lines().count().max(1);
+        let chars = text.chars().count();
+        if paste_should_fold(chars, lines) {
+            let label = format!(
+                "pasted #{} ({chars} chars · {lines} lines)",
+                self.attachments.len() + 1
+            );
             self.attachments.push(Attachment::Text {
                 content: text,
                 label,
@@ -2423,7 +2479,11 @@ impl App {
                 Span::styled(format!("    {marker}"), style),
                 Span::styled(
                     item.step.clone(),
-                    if item.status == "pending" {
+                    if item.status == "completed" {
+                        ratatui::style::Style::default()
+                            .fg(theme::OK)
+                            .add_modifier(ratatui::style::Modifier::CROSSED_OUT)
+                    } else if item.status == "pending" {
                         theme::dim()
                     } else {
                         ratatui::style::Style::default()
@@ -2960,18 +3020,18 @@ fn token_count(tokens: u64) -> String {
 }
 
 fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    rate_limit_line_at(limits, now)
+}
+
+fn rate_limit_line_at(limits: tcode_core::RateLimits, now: u64) -> Line<'static> {
     let primary_used = limits.primary.used_percent.clamp(0.0, 100.0);
-    let primary_remaining = 100.0 - primary_used;
-    let filled = ((primary_remaining / 100.0) * 12.0).round() as usize;
-    let color = if primary_remaining <= 10.0 {
-        theme::ERROR
-    } else if primary_remaining <= 25.0 {
-        theme::WARN
-    } else {
-        theme::ACCENT
-    };
+    let filled = ((primary_used / 100.0) * 12.0).round() as usize;
+    let color = usage_color(primary_used);
     let mut spans = vec![
-        Span::styled("  Codex 5h left ", theme::dim()),
+        Span::styled("  Codex 5h used ", theme::dim()),
         Span::styled("▕", ratatui::style::Style::default().fg(color)),
         Span::styled(
             "▰".repeat(filled),
@@ -2979,18 +3039,16 @@ fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
         ),
         Span::styled("▱".repeat(12 - filled), theme::dim()),
         Span::styled(
-            format!("▏ {:.0}%", primary_remaining),
+            format!("▏ {primary_used:.0}%"),
             ratatui::style::Style::default().fg(color),
         ),
     ];
+    append_reset_countdown(&mut spans, limits.primary.resets_at, now);
+
     if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 65.0) {
         let weekly_used = weekly.used_percent.clamp(0.0, 100.0);
         let weekly_filled = ((weekly_used / 100.0) * 12.0).round() as usize;
-        let weekly_color = if weekly_used >= 90.0 {
-            theme::ERROR
-        } else {
-            theme::WARN
-        };
+        let weekly_color = usage_color(weekly_used);
         spans.push(Span::styled(" · week used ", theme::dim()));
         spans.push(Span::styled(
             "▕",
@@ -3005,8 +3063,43 @@ fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
             format!("▏ {weekly_used:.0}%"),
             ratatui::style::Style::default().fg(weekly_color),
         ));
+        append_reset_countdown(&mut spans, weekly.resets_at, now);
     }
     Line::from(spans)
+}
+
+fn usage_color(used_percent: f64) -> ratatui::style::Color {
+    if used_percent >= 90.0 {
+        theme::ERROR
+    } else if used_percent >= 75.0 {
+        theme::WARN
+    } else {
+        theme::ACCENT
+    }
+}
+
+fn append_reset_countdown(spans: &mut Vec<Span<'static>>, resets_at: u64, now: u64) {
+    let Some(remaining) = resets_at.checked_sub(now).filter(|&seconds| seconds > 0) else {
+        return;
+    };
+    spans.push(Span::styled(
+        format!(" ↻ {}", brief_duration(remaining)),
+        theme::dim(),
+    ));
+}
+
+/// Compact countdown for the status line: enough precision for a human to
+/// decide whether to wait, without turning the meter into a timestamp.
+fn brief_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        "<1m".into()
+    } else if seconds < 3_600 {
+        format!("{}m", seconds.div_ceil(60))
+    } else if seconds < 86_400 {
+        format!("{}h{}m", seconds / 3_600, (seconds % 3_600).div_ceil(60))
+    } else {
+        format!("{}d", seconds.div_ceil(86_400))
+    }
 }
 
 fn add_usage(left: Usage, right: Usage) -> Usage {
@@ -3113,7 +3206,8 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
             // provider sees them, so reserve a little structural overhead.
             tcode_core::Entry::Note(text) => approx_tokens(text) as u64 + 12,
             tcode_core::Entry::Summary(text) => approx_tokens(text) as u64 + 24,
-            tcode_core::Entry::ImportedTool { .. } => 0,
+            tcode_core::Entry::ImportedTool { .. }
+            | tcode_core::Entry::IncompleteAssistant { .. } => 0,
         })
         .sum();
     system
@@ -3274,6 +3368,10 @@ fn selection_span(
     (from < to).then(|| (from - char_start, to - char_start))
 }
 
+fn paste_should_fold(chars: usize, lines: usize) -> bool {
+    chars > PASTE_FOLD_CHARS || lines > PASTE_FOLD_LINES
+}
+
 fn key_char_eq(key: &KeyEvent, target: char) -> bool {
     matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&target))
 }
@@ -3321,6 +3419,14 @@ async fn join_external_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn long_or_multiline_pastes_fold_into_attachments() {
+        assert!(!paste_should_fold(PASTE_FOLD_CHARS, 1));
+        assert!(paste_should_fold(PASTE_FOLD_CHARS + 1, 1));
+        assert!(!paste_should_fold(1, PASTE_FOLD_LINES));
+        assert!(paste_should_fold(1, PASTE_FOLD_LINES + 1));
+    }
 
     #[test]
     fn editor_layout_wraps_without_losing_cursor_position() {
@@ -3461,29 +3567,37 @@ mod tests {
     }
 
     #[test]
-    fn codex_rate_limit_line_shows_5h_remaining_and_week_at_65_percent() {
+    fn codex_rate_limit_line_shows_used_percent_and_reset_countdowns() {
         let limits = tcode_core::RateLimits {
             primary: tcode_core::RateLimit {
                 used_percent: 30.0,
                 window_minutes: 300,
-                resets_at: 0,
+                resets_at: 14_800,
             },
             secondary: Some(tcode_core::RateLimit {
                 used_percent: 65.0,
                 window_minutes: 10_080,
-                resets_at: 0,
+                resets_at: 269_200,
             }),
         };
-        let text = rate_limit_line(limits)
+        let text = rate_limit_line_at(limits, 10_000)
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("Codex 5h left"));
-        assert!(text.contains("70%"));
+        assert!(text.contains("Codex 5h used"));
+        assert!(text.contains("▏ 30% ↻ 1h20m"));
         assert!(text.contains("week used ▕"));
-        assert!(text.contains("▏ 65%"));
+        assert!(text.contains("▏ 65% ↻ 3d"));
+    }
+
+    #[test]
+    fn brief_duration_stays_compact_at_unit_boundaries() {
+        assert_eq!(brief_duration(59), "<1m");
+        assert_eq!(brief_duration(60), "1m");
+        assert_eq!(brief_duration(3_601), "1h1m");
+        assert_eq!(brief_duration(86_401), "2d");
     }
 
     #[test]

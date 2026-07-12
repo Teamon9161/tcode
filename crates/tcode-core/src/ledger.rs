@@ -18,6 +18,14 @@ pub enum Entry {
     Note(String),
     /// Product of a compaction; replaces everything before it.
     Summary(String),
+    /// Assistant text from a streaming attempt that failed before the
+    /// provider completed it. Persisted for transcript/export/rewind, but
+    /// deliberately never returned to a provider: a retry resends the same
+    /// prompt and must not treat speculative output as model history.
+    IncompleteAssistant {
+        text: String,
+        error: String,
+    },
     /// Read-only visual history imported from another agent.  It is persisted
     /// and replayed in the terminal, but intentionally never becomes prompt
     /// content or a runnable tool call for the current model.
@@ -35,7 +43,7 @@ impl Entry {
     fn role(&self) -> Role {
         match self {
             Entry::Assistant(_) => Role::Assistant,
-            Entry::ImportedTool { .. } => Role::Assistant,
+            Entry::IncompleteAssistant { .. } | Entry::ImportedTool { .. } => Role::Assistant,
             _ => Role::User,
         }
     }
@@ -51,7 +59,7 @@ impl Entry {
                     "<conversation-summary>\nEarlier conversation was compacted. Summary:\n{text}\n</conversation-summary>"
                 ),
             }],
-            Entry::ImportedTool { .. } => Vec::new(),
+            Entry::ImportedTool { .. } | Entry::IncompleteAssistant { .. } => Vec::new(),
         }
     }
 }
@@ -149,10 +157,13 @@ impl Ledger {
     pub fn as_messages(&self) -> Vec<Message> {
         let mut out: Vec<Message> = Vec::new();
         for e in &self.entries {
-            // Imported tool history is for the human transcript only. It is
-            // neither evidence the current model needs nor a tool request it
-            // may replay.
-            if matches!(e, Entry::ImportedTool { .. }) {
+            // Imported history and incomplete retry attempts are for the human
+            // transcript only. They are neither evidence the current model
+            // needs nor content it may replay.
+            if matches!(
+                e,
+                Entry::ImportedTool { .. } | Entry::IncompleteAssistant { .. }
+            ) {
                 continue;
             }
             let role = e.role();
@@ -197,6 +208,25 @@ mod tests {
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[2].role, Role::User);
         assert_eq!(msgs[2].content.len(), 2); // tool result + note merged
+    }
+
+    #[test]
+    fn incomplete_assistant_is_persistable_but_not_prompt_content() {
+        let mut l = Ledger::new();
+        l.append(Entry::User(text("hi")));
+        l.append(Entry::IncompleteAssistant {
+            text: "partial answer".into(),
+            error: "network error".into(),
+        });
+        l.append(Entry::Assistant(text("recovered answer")));
+
+        let messages = l.as_messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, Role::Assistant);
+        assert!(matches!(
+            &messages[1].content[..],
+            [ContentBlock::Text { text }] if text == "recovered answer"
+        ));
     }
 
     #[test]

@@ -1,5 +1,6 @@
 mod anthropic;
 mod codex;
+mod idle;
 mod openai;
 mod retry;
 
