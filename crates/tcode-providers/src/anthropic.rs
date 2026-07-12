@@ -12,7 +12,7 @@ use tcode_core::{
     StopReason, StreamEvent,
 };
 
-use crate::retry::connect_with_retry;
+use crate::retry::connect_once;
 
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -163,11 +163,23 @@ fn block_to_json(block: &ContentBlock) -> Option<Value> {
             tool_use_id,
             content,
             is_error,
+            images,
         } => {
+            // Anthropic tool_result content is an array, so image blocks ride
+            // right next to the text — no separate user message needed.
+            let mut parts = vec![json!({ "type": "text", "text": content })];
+            for img in images {
+                if let ContentBlock::Image { media_type, data } = img {
+                    parts.push(json!({
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": media_type, "data": data },
+                    }));
+                }
+            }
             let mut v = json!({
                 "type": "tool_result",
                 "tool_use_id": tool_use_id,
-                "content": [{ "type": "text", "text": content }],
+                "content": parts,
             });
             if *is_error {
                 v["is_error"] = json!(true);
@@ -216,7 +228,7 @@ impl Provider for AnthropicProvider {
     ) -> Result<EventStream, ProviderError> {
         let body = self.build_body(&req);
         let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
-        let resp = connect_with_retry(&self.watchdog, || {
+        let resp = connect_once(self.watchdog.connect_timeout(), || {
             self.http
                 .post(&url)
                 .header("x-api-key", &self.api_key)
@@ -323,8 +335,10 @@ mod tests {
     fn watchdog() -> WatchdogConfig {
         WatchdogConfig {
             idle_timeout_secs: 5,
+            connect_timeout_secs: 20,
             max_retries: 1,
             initial_backoff_ms: 1,
+            max_backoff_ms: 10,
         }
     }
 
@@ -340,6 +354,26 @@ mod tests {
             max_tokens: 1000,
             effort: effort.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn tool_result_inlines_image_blocks() {
+        let block = ContentBlock::ToolResult {
+            tool_use_id: "t1".into(),
+            content: "Read image shot.png (image/png, 4 KB).".into(),
+            is_error: false,
+            images: vec![ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "AAAA".into(),
+            }],
+        };
+        let v = block_to_json(&block).unwrap();
+        let parts = v["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[1]["source"]["media_type"], "image/png");
+        assert_eq!(parts[1]["source"]["data"], "AAAA");
     }
 
     fn native() -> AnthropicProvider {

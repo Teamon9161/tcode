@@ -17,6 +17,9 @@ pub struct LineApprover;
 #[async_trait]
 impl Approver for LineApprover {
     async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval {
+        if tool == "ask_user" {
+            return ask_user_plain(summary, input).await;
+        }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
         print!(
@@ -61,6 +64,136 @@ impl Approver for LineApprover {
             };
         }
     }
+}
+
+struct PlainQuestion {
+    question: String,
+    options: Vec<String>,
+    multi: bool,
+}
+
+async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
+    let questions = plain_questions(summary, input);
+    let mut answers: Vec<(String, String)> = Vec::new();
+    for (index, q) in questions.iter().enumerate() {
+        println!("\n{YELLOW}?{RESET} {BOLD}{}{RESET}", q.question);
+        for (i, option) in q.options.iter().enumerate() {
+            println!("{DIM}  {}) {option}{RESET}", i + 1);
+        }
+        if questions.len() > 1 {
+            println!("{DIM}  question {} / {}{RESET}", index + 1, questions.len());
+        }
+        let answer = loop {
+            let prompt = if q.multi {
+                "answer (numbers/text; comma-separated for multiple)"
+            } else if q.options.is_empty() {
+                "answer"
+            } else {
+                "answer (number or text)"
+            };
+            print!("{DIM}  {prompt} > {RESET}");
+            let _ = std::io::stdout().flush();
+            let (n, line) = read_line_blocking().await;
+            if n == 0 {
+                println!("{DIM}  no input (EOF) — cancelled{RESET}");
+                return Approval {
+                    decision: ApprovalDecision::No,
+                    comment: None,
+                };
+            }
+            let raw = line.trim();
+            if raw.is_empty() {
+                println!("{DIM}  please enter an answer{RESET}");
+                continue;
+            }
+            break resolve_plain_answer(raw, &q.options, q.multi);
+        };
+        answers.push((q.question.clone(), answer));
+    }
+    let comment = if answers.len() == 1 {
+        answers.pop().map(|(_, answer)| answer).unwrap_or_default()
+    } else {
+        answers
+            .into_iter()
+            .enumerate()
+            .map(|(i, (question, answer))| format!("{}. {question} → {answer}", i + 1))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Approval {
+        decision: ApprovalDecision::Yes,
+        comment: Some(comment),
+    }
+}
+
+fn plain_questions(summary: &str, input: &Value) -> Vec<PlainQuestion> {
+    let raw = input["questions"].as_array().cloned().unwrap_or_else(|| {
+        input
+            .get("question")
+            .map(|_| vec![input.clone()])
+            .unwrap_or_default()
+    });
+    let mut questions: Vec<PlainQuestion> = raw
+        .iter()
+        .map(|q| PlainQuestion {
+            question: q["question"].as_str().unwrap_or(summary).to_string(),
+            options: q["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            multi: q["multiSelect"].as_bool().unwrap_or(false),
+        })
+        .collect();
+    if questions.is_empty() {
+        questions.push(PlainQuestion {
+            question: summary.to_string(),
+            options: Vec::new(),
+            multi: false,
+        });
+    }
+    questions
+}
+
+fn resolve_plain_answer(raw: &str, options: &[String], multi: bool) -> String {
+    if options.is_empty() {
+        return raw.to_string();
+    }
+    if multi {
+        let parts = raw
+            .split(|c: char| c == ',' || c.is_ascii_whitespace())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            let mut selected = Vec::new();
+            for part in parts {
+                let Ok(index) = part.parse::<usize>() else {
+                    return raw.to_string();
+                };
+                let Some(option) = index.checked_sub(1).and_then(|i| options.get(i)) else {
+                    return raw.to_string();
+                };
+                selected.push(option.clone());
+            }
+            return selected.join(", ");
+        }
+    } else if let Ok(index) = raw.parse::<usize>() {
+        if let Some(option) = index.checked_sub(1).and_then(|i| options.get(i)) {
+            return option.clone();
+        }
+    }
+    raw.to_string()
+}
+
+async fn read_line_blocking() -> (usize, String) {
+    tokio::task::spawn_blocking(|| {
+        let mut s = String::new();
+        std::io::stdin().read_line(&mut s).map(|n| (n, s))
+    })
+    .await
+    .unwrap_or(Ok((0, String::new())))
+    .unwrap_or((0, String::new()))
 }
 
 /// Keep the non-TUI prompt safe too: approval must never be blind just

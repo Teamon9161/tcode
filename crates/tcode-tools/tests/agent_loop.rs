@@ -438,7 +438,7 @@ async fn shell_tool_runs_and_reports_exit_code() {
 }
 
 #[tokio::test]
-async fn oversized_tool_output_is_gated_with_paging_handle() {
+async fn oversized_tool_output_spills_to_a_readable_file() {
     // A command tool's output is unbounded, so it stays gated (unlike the
     // self-paginating `read`/`grep`, which opt out). Produce ~5000 lines.
     let dir = tempfile::tempdir().unwrap();
@@ -458,14 +458,28 @@ async fn oversized_tool_output_is_gated_with_paging_handle() {
     run(&agent, &mut session, &approver, "spew a big log").await;
 
     let results = tool_results(&session);
+    // Overflow is parked in a file the model can read/grep — no bespoke tool.
     assert!(
-        results[0].0.contains("id=o1"),
-        "big output must carry a paging handle: …{}",
+        results[0].0.contains("full output saved to") && results[0].0.contains(".txt"),
+        "big output must point at a saved file: …{}",
         &results[0].0[results[0].0.len().saturating_sub(200)..]
     );
     // The gated preview is bounded near the blob budget (8000 tokens), far
     // below the full ~20k-token output.
     assert!(tcode_core::blobs::approx_tokens(&results[0].0) < 9000);
+
+    // The saved file holds the complete output.
+    let overflow = std::fs::read_dir(tcode_core::store::tool_output_dir(dir.path()))
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .find(|p| p.extension().is_some_and(|x| x == "txt"))
+        .expect("overflow .txt file must exist");
+    let saved = std::fs::read_to_string(&overflow).unwrap();
+    assert!(
+        saved.lines().count() >= 5000,
+        "saved {} lines",
+        saved.lines().count()
+    );
 }
 
 #[tokio::test]
@@ -667,17 +681,13 @@ async fn background_shell_task_reports_completion_next_turn() {
         "background echo did not finish in time"
     );
 
-    // Its captured output pages through the registry (read_output path).
-    let page = session
-        .tool_ctx
-        .background
-        .lock()
-        .unwrap()
-        .read("b1", 1, 50)
-        .unwrap();
-    assert!(page.contains("bg-done"), "{page}");
+    // Its output streamed to a log file the model reads with `read`.
+    let log = tcode_core::store::tool_output_dir(dir.path()).join("b1.log");
+    let logged = std::fs::read_to_string(&log).unwrap();
+    assert!(logged.contains("bg-done"), "{logged}");
 
-    // The next turn starts by telling the model the task finished.
+    // The next turn starts by telling the model the task finished, pointing at
+    // the log file rather than a bespoke paging tool.
     run(&agent, &mut session, &approver, "anything else").await;
     let note = session
         .ledger
@@ -689,7 +699,7 @@ async fn background_shell_task_reports_completion_next_turn() {
         })
         .expect("completion note must be appended at the next turn start");
     assert!(note.contains("exited with code 0"), "{note}");
-    assert!(note.contains("read_output"), "{note}");
+    assert!(note.contains("b1.log"), "{note}");
 }
 
 #[tokio::test]
@@ -847,4 +857,86 @@ async fn tiny_read_limits_are_widened() {
     assert!(results[0].0.contains("line100"), "{}", results[0].0);
     assert!(results[0].0.contains("line129"), "{}", results[0].0);
     assert!(!results[0].0.contains("line130"), "{}", results[0].0);
+}
+
+/// A provider whose first `stream()` calls fail with a retryable error before
+/// eventually connecting — exercises the agent-owned connect retry.
+struct FlakyProvider {
+    remaining_failures: Mutex<u32>,
+    inner: Arc<MockProvider>,
+}
+
+#[async_trait]
+impl Provider for FlakyProvider {
+    fn name(&self) -> &str {
+        "flaky"
+    }
+    fn model(&self) -> &str {
+        "flaky-1"
+    }
+    fn cache_strategy(&self) -> CacheStrategy {
+        CacheStrategy::ImplicitPrefix
+    }
+    async fn stream(
+        &self,
+        req: Request,
+        cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        let fail = {
+            let mut n = self.remaining_failures.lock().unwrap();
+            (*n > 0).then(|| *n -= 1).is_some()
+        };
+        if fail {
+            return Err(ProviderError::Api {
+                status: 503,
+                message: "temporarily unavailable".into(),
+            });
+        }
+        self.inner.stream(req, cancel).await
+    }
+}
+
+#[tokio::test]
+async fn connect_failure_is_retried_and_reported() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FlakyProvider {
+        remaining_failures: Mutex::new(2),
+        inner: MockProvider::new(vec![text_done("recovered")]),
+    });
+    let agent = Agent {
+        model: ModelCell::new(ActiveModel {
+            provider,
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        }),
+        tools: tcode_tools::builtin_tools(),
+        system: "test".into(),
+        watchdog: WatchdogConfig {
+            idle_timeout_secs: 5,
+            connect_timeout_secs: 20,
+            max_retries: 5,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 5,
+        },
+        hooks: Default::default(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
+    };
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "hi").await;
+
+    // Two connect failures each announced a retry with a backoff delay...
+    let retries: Vec<_> = events
+        .iter()
+        .filter(|e| matches!(e, AgentEvent::Retrying { .. }))
+        .collect();
+    assert_eq!(retries.len(), 2, "expected two retries, got {retries:?}");
+    assert!(matches!(
+        retries[0],
+        AgentEvent::Retrying { attempt: 1, delay_ms, .. } if *delay_ms > 0
+    ));
+    // ...and the turn still completed once the provider recovered.
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
 }

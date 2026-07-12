@@ -178,7 +178,7 @@ mod tests {
                     def: flash,
                 },
                 ModelOption {
-                    profile: "chatgpt".into(),
+                    profile: "codex".into(),
                     def: ModelDef::bare("gpt-5.5"),
                 },
             ],

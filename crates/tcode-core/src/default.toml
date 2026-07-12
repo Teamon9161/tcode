@@ -61,8 +61,8 @@ default_effort = "medium"
 
 # ChatGPT subscription through the Codex backend. Models come from Codex's
 # local cache at runtime, so an empty list stays current automatically.
-[profiles.chatgpt]
-provider = "chatgpt"
+[profiles.codex]
+provider = "codex"
 
 # DeepSeek's Anthropic-compatible endpoint. `deepseek-v4-pro` and
 # `deepseek-v4-flash` are the real model ids (the 1M context is a property

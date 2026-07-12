@@ -1,7 +1,9 @@
-//! ChatGPT subscription backend: the Responses API endpoint Codex uses
+//! Codex backend: the Responses API endpoint the Codex CLI uses
 //! (`chatgpt.com/backend-api/codex/responses`), authenticated with the
 //! OAuth tokens from `~/.codex/auth.json`. No API key involved — usage
-//! bills against the ChatGPT plan.
+//! bills against the ChatGPT subscription. Named for the backend, not the
+//! protocol, because that OAuth/Codex path is what sets it apart; a plain
+//! Chat Completions endpoint is `OpenAiProvider`.
 //!
 //! Wire differences from Chat Completions worth knowing:
 //! - History is a flat list of typed *items* (message / function_call /
@@ -26,14 +28,14 @@ use tcode_core::{
     RateLimits, Request, Role, StopReason, StreamEvent,
 };
 
-use crate::retry::short;
+use crate::retry::{short, with_connect_timeout};
 
 const BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// Codex CLI's OAuth client id; the refresh grant is tied to it.
 const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
-pub struct ChatGptProvider {
+pub struct CodexProvider {
     http: reqwest::Client,
     model: String,
     watchdog: WatchdogConfig,
@@ -41,7 +43,7 @@ pub struct ChatGptProvider {
     session_id: String,
 }
 
-impl ChatGptProvider {
+impl CodexProvider {
     pub fn new(model: String, watchdog: WatchdogConfig) -> Self {
         Self {
             http: reqwest::Client::builder()
@@ -160,7 +162,9 @@ impl ChatGptProvider {
         })
     }
 
-    /// Connect with watchdog retries; a 401 triggers one token refresh.
+    /// One connection attempt; a 401 triggers a single token refresh and one
+    /// resend. Backoff retries are the agent loop's job, so failures surface as
+    /// a classified error rather than being retried silently here.
     async fn connect(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
         let mut auth = codex::load_auth().ok_or_else(|| {
             ProviderError::Config(
@@ -168,11 +172,7 @@ impl ChatGptProvider {
             )
         })?;
         let mut refreshed = false;
-        let attempts = self.watchdog.max_retries.max(1);
-        let mut delay = self.watchdog.initial_backoff();
-        let mut last_err = ProviderError::Network("no attempts made".into());
-        let mut i = 0;
-        while i < attempts {
+        loop {
             match self.send(&auth, body).await {
                 Ok(resp) if resp.status().is_success() => return Ok(resp),
                 Ok(resp) => {
@@ -180,27 +180,17 @@ impl ChatGptProvider {
                     if status == 401 && !refreshed {
                         refreshed = true;
                         auth = self.refresh(&auth).await?;
-                        continue; // doesn't consume an attempt
+                        continue;
                     }
                     let text = resp.text().await.unwrap_or_default();
-                    let err = ProviderError::Api {
+                    return Err(ProviderError::Api {
                         status,
                         message: short(&text),
-                    };
-                    if !err.retryable() {
-                        return Err(err);
-                    }
-                    last_err = err;
+                    });
                 }
-                Err(e) => last_err = ProviderError::Network(e.to_string()),
-            }
-            i += 1;
-            if i < attempts {
-                tokio::time::sleep(delay).await;
-                delay *= 2;
+                Err(e) => return Err(ProviderError::Network(e.to_string())),
             }
         }
-        Err(last_err)
     }
 }
 
@@ -239,13 +229,25 @@ fn push_items(msg: &Message, out: &mut Vec<Value>) {
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    images,
                     ..
                 } = block
                 {
+                    // function_call_output takes a text string; images can't
+                    // ride along, so note their omission honestly.
+                    let output = if images.is_empty() {
+                        content.clone()
+                    } else {
+                        format!(
+                            "{content}\n[{} image(s) omitted: images returned from a tool \
+                             cannot be viewed by this model]",
+                            images.len()
+                        )
+                    };
                     out.push(json!({
                         "type": "function_call_output",
                         "call_id": tool_use_id,
-                        "output": content,
+                        "output": output,
                     }));
                 }
             }
@@ -284,9 +286,9 @@ fn usage_from(v: &Value) -> tcode_core::Usage {
 }
 
 #[async_trait]
-impl Provider for ChatGptProvider {
+impl Provider for CodexProvider {
     fn name(&self) -> &str {
-        "chatgpt"
+        "codex"
     }
 
     fn model(&self) -> &str {
@@ -303,7 +305,8 @@ impl Provider for ChatGptProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         let body = self.build_body(&req);
-        let resp = self.connect(&body).await?;
+        let resp =
+            with_connect_timeout(self.watchdog.connect_timeout(), self.connect(&body)).await?;
 
         let mut sse = resp.bytes_stream().eventsource();
         let raw: EventStream = Box::pin(stream! {

@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput};
+use tcode_core::{BatchPolicy, PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -126,10 +126,12 @@ impl ShellTool {
                 }
             }
         });
+        let log = shared.log_path.display();
         ToolOutput::ok(format!(
             "Started background task {id}: {script}\nIt keeps running while you \
-             continue working. Page its output with read_output(id=\"{id}\"); \
-             you will get a note when it finishes. Stop it with kill_task(id=\"{id}\")."
+             continue working. Its output streams to {log} — read that file (with \
+             offset to follow new lines); you will get a note when it finishes. \
+             Stop it with kill_task(id=\"{id}\")."
         ))
     }
 }
@@ -145,7 +147,8 @@ impl Tool for KillTaskTool {
 
     fn description(&self) -> &str {
         "Stop a background task by id (e.g. b1). Killing an already-finished \
-         task is a no-op. Its captured output stays readable via read_output."
+         task is a no-op. Its captured output stays readable in the task's log \
+         file via read."
     }
 
     fn input_schema(&self) -> Value {
@@ -197,6 +200,20 @@ impl Tool for ShellTool {
         }
     }
 
+    fn display_name(&self) -> String {
+        // "Run" reads clearer than the shell's raw name; the command content
+        // itself shows which interpreter it targets.
+        "Run".to_string()
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!(
+            "Run {count} {}",
+            if count == 1 { "command" } else { "commands" }
+        )
+    }
+
     fn description(&self) -> &str {
         match self.kind {
             ShellKind::PowerShell => {
@@ -207,9 +224,9 @@ impl Tool for ShellTool {
                  in order — batch related commands. Set \
                  run_in_background=true ONLY for commands that run long and \
                  whose intermediate output you don't need to wait for (dev \
-                 server, watcher, long build/test): you get a task id back \
-                 immediately, can keep working, page its output with \
-                 read_output and are notified when it finishes."
+                 server, watcher, long build/test): you get a task id and a log \
+                 file path back immediately, can keep working, read the log to \
+                 follow output, and are notified when it finishes."
             }
             ShellKind::Bash => {
                 "Run a bash (Git Bash) command with POSIX syntax. Same rules \
@@ -248,6 +265,10 @@ impl Tool for ShellTool {
 
     fn is_mutating(&self) -> bool {
         true
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::SequentialBatch
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {

@@ -63,7 +63,7 @@ fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Can
     let (d_status, d_found) = env_or_inline("DEEPSEEK_API_KEY", "deepseek");
     vec![
         Candidate {
-            id: "chatgpt",
+            id: "codex",
             title: "ChatGPT subscription (reuse Codex login)",
             status: if codex_ok {
                 "~/.codex/auth.json ✓".into()
@@ -146,7 +146,7 @@ fn run_with(
             }
         } else {
             let profile: Profile = match cand.id {
-                "chatgpt" => presets::chatgpt(),
+                "codex" => presets::codex(),
                 "anthropic" => presets::anthropic(inline_key.clone()),
                 "openai" => presets::openai(inline_key.clone()),
                 "deepseek" => presets::deepseek(inline_key.clone()),
@@ -565,7 +565,7 @@ pub fn default_config() -> Config {
         .profiles
         .insert("openai".into(), presets::openai(None));
     if codex::auth_available() {
-        config.profiles.insert("chatgpt".into(), presets::chatgpt());
+        config.profiles.insert("codex".into(), presets::codex());
     }
     config.default_profile = Some("anthropic".into());
     config

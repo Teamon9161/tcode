@@ -1,5 +1,6 @@
-//! Compact markdown → styled ratatui lines. Baked once per completed
-//! assistant message; streaming text is shown raw until then.
+//! Compact markdown → styled ratatui lines. Used both for finalized assistant
+//! messages and for the still-streaming transcript block that is replaced in
+//! place as deltas arrive.
 
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
@@ -243,6 +244,16 @@ mod tests {
         assert!(text.iter().any(|l| l.contains("Title")));
         assert!(text.iter().any(|l| l.contains("fn main")));
         assert!(text.iter().any(|l| l.contains("• a")));
+    }
+
+    #[test]
+    fn renders_unclosed_fenced_code_for_streaming() {
+        let lines = Renderer::default().render("```rust\nlet answer = 42;");
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l.contains("let answer")));
     }
 
     #[test]

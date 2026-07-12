@@ -47,16 +47,21 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 print!("{t}");
                 let _ = std::io::stdout().flush();
             }
+            // Tool arguments stream silently; the finished call prints via
+            // ToolStart. Nothing to show in plain mode.
+            AgentEvent::ToolInputDelta(_) => {}
             AgentEvent::Retrying {
                 attempt,
                 max,
                 error,
+                delay_ms,
             } => {
                 if in_thinking {
                     print!("{RESET}");
                     in_thinking = false;
                 }
-                println!("\n{YELLOW}[watchdog] {error}; retrying ({attempt}/{max}) — partial output above is discarded{RESET}");
+                let secs = (delay_ms + 999) / 1000;
+                println!("\n{RED}[retry {attempt}/{max}] API error: {error}; retrying in {secs}s — partial output above is discarded{RESET}");
             }
             AgentEvent::ToolStart { summary, .. } => {
                 if in_thinking {

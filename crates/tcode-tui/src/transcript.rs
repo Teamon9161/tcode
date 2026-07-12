@@ -239,6 +239,30 @@ impl Transcript {
         });
     }
 
+    /// Replace a finalized-looking head block in place. Used by the TUI's
+    /// still-streaming assistant message: each delta re-renders the Markdown
+    /// for the whole message and swaps the block without creating duplicates.
+    pub fn replace_block(&mut self, index: usize, lines: Vec<Line<'static>>) {
+        if lines.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        let block = &mut self.blocks[index];
+        block.head = lines;
+        block.detail = None;
+        block.entry = None;
+        block.rewrap(self.width);
+        let new_height = block.height();
+        if self.scroll > 0 {
+            if new_height >= old_height {
+                self.scroll += new_height - old_height;
+            } else {
+                self.scroll = self.scroll.saturating_sub(old_height - new_height);
+            }
+        }
+        self.rebuild_cum();
+    }
+
     fn push_block(&mut self, mut block: Block) {
         block.rewrap(self.width);
         let height = block.height();

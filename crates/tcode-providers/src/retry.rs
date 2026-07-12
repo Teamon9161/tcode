@@ -1,6 +1,6 @@
 use std::future::Future;
+use std::time::Duration;
 
-use tcode_core::config::WatchdogConfig;
 use tcode_core::ProviderError;
 
 /// Truncate API error bodies so a failing endpoint cannot flood the UI.
@@ -19,40 +19,47 @@ pub fn short(body: &str) -> String {
     }
 }
 
-/// Establish a streaming connection with exponential backoff.
-/// Retries connection errors, 429 and 5xx; anything else fails fast.
-pub async fn connect_with_retry<F, Fut>(
-    watchdog: &WatchdogConfig,
-    mut attempt: F,
+/// Cap the wait for a connection's response headers. A provider's connect
+/// future resolves once headers arrive — before any streamed body — so this
+/// bounds the "time to first byte" without touching model generation, which
+/// is guarded separately by the idle watchdog. Elapsing yields a retryable
+/// `ConnectTimeout` so the agent loop backs off and retries instead of
+/// hanging until the OS finally tears the socket down.
+pub async fn with_connect_timeout<F, T>(dur: Duration, fut: F) -> Result<T, ProviderError>
+where
+    F: Future<Output = Result<T, ProviderError>>,
+{
+    match tokio::time::timeout(dur, fut).await {
+        Ok(res) => res,
+        Err(_) => Err(ProviderError::ConnectTimeout(dur)),
+    }
+}
+
+/// One connection attempt, with the response classified into a `ProviderError`
+/// on failure. Retrying is the agent loop's job — it owns the single retry
+/// loop so every attempt (connect and mid-stream) is visible to the user and
+/// backs off uniformly. A non-2xx body is read and truncated for the message.
+pub async fn connect_once<F, Fut>(
+    timeout: Duration,
+    attempt: F,
 ) -> Result<reqwest::Response, ProviderError>
 where
-    F: FnMut() -> Fut,
+    F: FnOnce() -> Fut,
     Fut: Future<Output = Result<reqwest::Response, reqwest::Error>>,
 {
-    let attempts = watchdog.max_retries.max(1);
-    let mut delay = watchdog.initial_backoff();
-    let mut last_err = ProviderError::Network("no attempts made".into());
-    for i in 0..attempts {
+    with_connect_timeout(timeout, async {
         match attempt().await {
-            Ok(resp) if resp.status().is_success() => return Ok(resp),
+            Ok(resp) if resp.status().is_success() => Ok(resp),
             Ok(resp) => {
                 let status = resp.status().as_u16();
                 let body = resp.text().await.unwrap_or_default();
-                let err = ProviderError::Api {
+                Err(ProviderError::Api {
                     status,
                     message: short(&body),
-                };
-                if !err.retryable() {
-                    return Err(err);
-                }
-                last_err = err;
+                })
             }
-            Err(e) => last_err = ProviderError::Network(e.to_string()),
+            Err(e) => Err(ProviderError::Network(e.to_string())),
         }
-        if i + 1 < attempts {
-            tokio::time::sleep(delay).await;
-            delay *= 2;
-        }
-    }
-    Err(last_err)
+    })
+    .await
 }

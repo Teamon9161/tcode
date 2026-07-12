@@ -188,6 +188,7 @@ mod tests {
             tool_use_id: "t1".into(),
             content: "ok".into(),
             is_error: false,
+            images: vec![],
         }]));
         l.append(Entry::Note("user approved with comment".into()));
         let msgs = l.as_messages();

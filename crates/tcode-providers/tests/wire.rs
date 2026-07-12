@@ -10,7 +10,7 @@ use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
-use tcode_core::{ContentBlock, Message, Provider, ProviderError, Request, Role, StreamEvent};
+use tcode_core::{ContentBlock, Message, Provider, ProviderError, Request, Role};
 use tcode_providers::{AnthropicProvider, OpenAiProvider};
 
 /// One scripted HTTP response; `chunks` are written with delays between
@@ -114,8 +114,10 @@ fn request() -> Request {
 fn watchdog(idle_secs: u64) -> WatchdogConfig {
     WatchdogConfig {
         idle_timeout_secs: idle_secs,
+        connect_timeout_secs: 20,
         max_retries: 3,
         initial_backoff_ms: 10,
+        max_backoff_ms: 100,
     }
 }
 
@@ -161,22 +163,27 @@ async fn anthropic_happy_path() {
 }
 
 #[tokio::test]
-async fn anthropic_retries_5xx_then_succeeds() {
-    let base = serve(vec![
-        Script {
-            status: "500 Internal Server Error",
-            chunks: vec!["boom"],
-            delay: Duration::ZERO,
-            stall_after: false,
-        },
-        Script::ok(vec![ANTHROPIC_HAPPY]),
-    ])
+async fn anthropic_surfaces_5xx_as_a_retryable_error() {
+    // The provider now makes a single attempt; retrying (and its backoff) is
+    // the agent loop's job, so a 5xx surfaces as a retryable error here.
+    let base = serve(vec![Script {
+        status: "500 Internal Server Error",
+        chunks: vec!["boom"],
+        delay: Duration::ZERO,
+        stall_after: false,
+    }])
     .await;
     let p = AnthropicProvider::new("key".into(), "test-model".into(), Some(base), watchdog(5));
-    let stream = p.stream(request(), CancellationToken::new()).await.unwrap();
-    let events: Vec<_> = stream.collect().await;
-    assert!(events.iter().all(|e| e.is_ok()));
-    assert!(events.iter().any(|e| matches!(e, Ok(StreamEvent::Done(_)))));
+    // EventStream isn't Debug, so match rather than unwrap_err.
+    let err = match p.stream(request(), CancellationToken::new()).await {
+        Ok(_) => panic!("expected a 5xx error, got a stream"),
+        Err(e) => e,
+    };
+    assert!(
+        matches!(err, ProviderError::Api { status: 500, .. }),
+        "{err:?}"
+    );
+    assert!(err.retryable());
 }
 
 #[tokio::test]

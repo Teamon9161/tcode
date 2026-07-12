@@ -12,8 +12,15 @@ use crate::config::WatchdogConfig;
 use crate::ledger::{Entry, Ledger};
 use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode, PermissionRules};
 use crate::provider::{ProviderError, Request, StreamEvent};
-use crate::tool::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
+
+#[derive(Debug, Clone)]
+pub struct CwdChange {
+    pub old: PathBuf,
+    pub new: PathBuf,
+    pub changed: bool,
+}
 
 /// Default ceiling on model round-trips per user turn; a runaway loop
 /// should never bill unbounded. Configurable via `limits.max_steps_per_turn`.
@@ -27,12 +34,20 @@ pub enum AgentEvent {
     Started,
     TextDelta(String),
     ThinkingDelta(String),
+    /// Streaming fragment of a tool call's JSON arguments. Nothing here is
+    /// rendered — it exists so token meters reflect that the model is actively
+    /// producing output while assembling a tool call, instead of appearing
+    /// frozen until the finished call arrives as `ToolStart`.
+    ToolInputDelta(String),
     /// Streaming failed mid-turn; the request is being re-sent.
     /// UI must discard un-baked partial output for this step.
     Retrying {
         attempt: u32,
         max: u32,
         error: String,
+        /// How long the loop will wait before the next attempt, so the UI can
+        /// show a live countdown.
+        delay_ms: u64,
     },
     ToolStart {
         name: String,
@@ -109,6 +124,53 @@ impl Session {
         }
     }
 
+    /// Change the conversation working directory. This is append-only: when the
+    /// cwd changes mid-conversation, a harness note tells the model that future
+    /// relative paths resolve against the new directory and includes any newly
+    /// discovered directory-scoped instructions for that location.
+    pub fn change_cwd(&mut self, arg: &str) -> Result<CwdChange, String> {
+        let old = self.tool_ctx.cwd.clone();
+        let Some(new) = resolve_cd_target(&old, arg)? else {
+            return Ok(CwdChange {
+                old: old.clone(),
+                new: old,
+                changed: false,
+            });
+        };
+        if same_path(&old, &new) {
+            return Ok(CwdChange {
+                old,
+                new,
+                changed: false,
+            });
+        }
+
+        self.tool_ctx.cwd = new.clone();
+        let memory_note = {
+            let mut memory = self.tool_ctx.memory.lock().expect("memory lock");
+            memory.restore_from_entries(self.ledger.entries());
+            memory
+                .discover_for_paths(std::slice::from_ref(&new))
+                .map(|update| update.note)
+        };
+        let mut note = format!(
+            "Working directory changed by the user from {} to {}. Future relative tool paths, default shell cwd, grep/glob defaults, and cwd-relative operations now resolve against {}. Do not rely on the startup project map or earlier cwd-specific assumptions for the new directory; inspect as needed.",
+            old.display(),
+            new.display(),
+            new.display()
+        );
+        if let Some(memory_note) = memory_note {
+            note.push_str("\n\n");
+            note.push_str(&memory_note);
+        }
+        self.ledger.append(Entry::Note(note));
+        Ok(CwdChange {
+            old,
+            new,
+            changed: true,
+        })
+    }
+
     /// Tail self-awareness line: the model can only manage its context
     /// budget if it knows it. Appended inside the newest user entry, so
     /// the prompt prefix never changes retroactively (cache-safe).
@@ -134,6 +196,54 @@ impl Session {
             ),
         })
     }
+}
+
+fn resolve_cd_target(current: &Path, arg: &str) -> Result<Option<PathBuf>, String> {
+    let arg = strip_matching_quotes(arg.trim());
+    if arg.is_empty() {
+        return Ok(None);
+    }
+    let raw = if arg == "~" {
+        dirs::home_dir().ok_or_else(|| "cannot expand ~: no home directory found".to_string())?
+    } else if let Some(rest) = arg.strip_prefix("~/").or_else(|| arg.strip_prefix("~\\")) {
+        dirs::home_dir()
+            .ok_or_else(|| "cannot expand ~: no home directory found".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(arg)
+    };
+    let candidate = if raw.is_absolute() {
+        raw
+    } else {
+        current.join(raw)
+    };
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|e| format!("cannot cd to {}: {e}", candidate.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!("not a directory: {}", resolved.display()));
+    }
+    Ok(Some(resolved))
+}
+
+fn strip_matching_quotes(s: &str) -> &str {
+    if s.len() >= 2 {
+        let bytes = s.as_bytes();
+        if (bytes[0] == b'\"' && bytes[s.len() - 1] == b'\"')
+            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
+        {
+            return &s[1..s.len() - 1];
+        }
+    }
+    s
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    path_key(a) == path_key(b)
+}
+
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 pub struct Agent {
@@ -358,7 +468,18 @@ the summary text.";
                 max_tokens: model.max_tokens,
                 effort: model.effort.clone(),
             };
-            let mut stream = model.provider.stream(req, cancel.clone()).await?;
+            // The provider does a single connection attempt; this loop owns all
+            // retries (connect failures and mid-stream stalls alike) so every
+            // one is visible and backs off exponentially.
+            let mut stream = match model.provider.stream(req, cancel.clone()).await {
+                Ok(stream) => stream,
+                Err(e) if e.retryable() && attempt < self.watchdog.max_retries => {
+                    attempt += 1;
+                    self.emit_retry(events, attempt, &e.to_string()).await?;
+                    continue 'retry;
+                }
+                Err(e) => return Err(e.into()),
+            };
             let mut acc = ResponseAccumulator::new();
             while let Some(item) = stream.next().await {
                 match item {
@@ -372,6 +493,10 @@ the summary text.";
                                 self.emit(events, AgentEvent::ThinkingDelta(t.clone()))
                                     .await?
                             }
+                            StreamEvent::ToolUseInputDelta { fragment, .. } => {
+                                self.emit(events, AgentEvent::ToolInputDelta(fragment.clone()))
+                                    .await?
+                            }
                             StreamEvent::RateLimits(limits) => {
                                 self.emit(events, AgentEvent::RateLimits(*limits)).await?
                             }
@@ -381,16 +506,7 @@ the summary text.";
                     }
                     Err(e) if e.retryable() && attempt < self.watchdog.max_retries => {
                         attempt += 1;
-                        self.emit(
-                            events,
-                            AgentEvent::Retrying {
-                                attempt,
-                                max: self.watchdog.max_retries,
-                                error: e.to_string(),
-                            },
-                        )
-                        .await?;
-                        tokio::time::sleep(self.watchdog.initial_backoff() * attempt).await;
+                        self.emit_retry(events, attempt, &e.to_string()).await?;
                         continue 'retry;
                     }
                     Err(e) => return Err(e.into()),
@@ -399,6 +515,29 @@ the summary text.";
             let (blocks, usage, stop) = acc.finish();
             return Ok((blocks, usage, stop));
         }
+    }
+
+    /// Announce a retry and wait out the exponential backoff. The event carries
+    /// the delay so the UI can render a live countdown.
+    async fn emit_retry(
+        &self,
+        events: &mpsc::Sender<AgentEvent>,
+        attempt: u32,
+        error: &str,
+    ) -> Result<(), AgentError> {
+        let delay = self.watchdog.backoff(attempt);
+        self.emit(
+            events,
+            AgentEvent::Retrying {
+                attempt,
+                max: self.watchdog.max_retries,
+                error: error.to_string(),
+                delay_ms: delay.as_millis() as u64,
+            },
+        )
+        .await?;
+        tokio::time::sleep(delay).await;
+        Ok(())
     }
 
     async fn run_tools(
@@ -429,11 +568,7 @@ the summary text.";
                 });
             }
         }
-        if calls.len() > 1
-            && calls
-                .iter()
-                .all(|(_, name, _)| is_parallel_read_only_tool(name))
-        {
+        if calls.len() > 1 && self.all_calls_have_policy(calls, BatchPolicy::ParallelReadOnly) {
             return self
                 .run_read_only_tools_parallel(session, calls, events, cancel, memory_note)
                 .await;
@@ -450,11 +585,7 @@ the summary text.";
         // Shell / bash: batch the approval (show all commands at once),
         // then run sequentially so side effects from earlier commands
         // are visible to later ones.
-        if calls.len() > 1
-            && calls
-                .iter()
-                .all(|(_, name, _)| is_sequential_batch_tool(name))
-        {
+        if calls.len() > 1 && self.all_calls_have_policy(calls, BatchPolicy::SequentialBatch) {
             return self
                 .run_sequential_batch_combined_approval(
                     session,
@@ -648,7 +779,12 @@ the summary text.";
             )
             .await?;
             executed.push(name.clone());
-            results.push(tool_result(id, &output.content, output.is_error));
+            results.push(tool_result_with_images(
+                id,
+                &output.content,
+                output.is_error,
+                output.images.clone(),
+            ));
             if let Some(note) = approval_note {
                 if is_user_question {
                     notes.push(format!("User answered {name}: {note}"));
@@ -764,7 +900,12 @@ the summary text.";
                 },
             )
             .await?;
-            results.push(tool_result(&id, &output.content, output.is_error));
+            results.push(tool_result_with_images(
+                &id,
+                &output.content,
+                output.is_error,
+                output.images.clone(),
+            ));
         }
         session.ledger.append(Entry::ToolResults(results));
         for note in notes {
@@ -786,17 +927,28 @@ the summary text.";
     ) -> bool {
         let mut paths = HashSet::new();
         calls.iter().all(|(_, name, input)| {
-            if !matches!(name.as_str(), "edit" | "write") {
-                return false;
-            }
             let Some(tool) = self.tool(name) else {
                 return false;
             };
+            if tool.batch_policy() != BatchPolicy::ParallelPerFile {
+                return false;
+            }
             let Some(path) = tool.touches(input) else {
                 return false;
             };
             paths.insert(normalize_path(session.tool_ctx.resolve(&path)))
         })
+    }
+
+    /// Whether every call in the batch belongs to a tool declaring `policy`.
+    fn all_calls_have_policy(
+        &self,
+        calls: &[(String, String, Value)],
+        policy: BatchPolicy,
+    ) -> bool {
+        calls
+            .iter()
+            .all(|(_, name, _)| self.tool(name).is_some_and(|t| t.batch_policy() == policy))
     }
 
     /// Execute a preflighted, independent edit/write batch.  The preflight is
@@ -964,7 +1116,12 @@ the summary text.";
                 },
             )
             .await?;
-            results.push(tool_result(&id, &output.content, output.is_error));
+            results.push(tool_result_with_images(
+                &id,
+                &output.content,
+                output.is_error,
+                output.images.clone(),
+            ));
         }
         session.ledger.append(Entry::ToolResults(results));
         for note in notes {
@@ -1202,7 +1359,12 @@ the summary text.";
                 },
             )
             .await?;
-            results.push(tool_result(id, &output.content, output.is_error));
+            results.push(tool_result_with_images(
+                id,
+                &output.content,
+                output.is_error,
+                output.images.clone(),
+            ));
         }
 
         for note in notes {
@@ -1330,10 +1492,12 @@ the summary text.";
 
     /// Central token-budget gate for tool outputs. Locating/content tools
     /// opt out (`gates_output` = false): their output is precise and
-    /// self-paginating, so blob-gating it would only force `read_output`
-    /// paging of a result the model needed whole.
+    /// self-paginating, so spilling it to a file would only force a re-`read`
+    /// of a result the model needed whole.
     fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
-        let content = if output.is_error {
+        let is_error = output.is_error;
+        let images = output.images;
+        let content = if is_error {
             output.content
         } else {
             compact_successful_test_output(output.content)
@@ -1342,13 +1506,16 @@ the summary text.";
         if !gates {
             return ToolOutput {
                 content,
-                is_error: output.is_error,
+                is_error,
+                images,
             };
         }
         let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
+        // Only text is budget-gated; images never go to the blob store.
         ToolOutput {
             content: blobs.gate(tool, content),
-            is_error: output.is_error,
+            is_error,
+            images,
         }
     }
 
@@ -1366,62 +1533,24 @@ struct ToolsOutcome {
     awaiting_user_input: bool,
 }
 
-const PARALLEL_READ_ONLY: &[&str] = &["read", "grep", "glob", "read_output"];
-const SEQUENTIAL_BATCH_TOOLS: &[&str] = &["shell", "bash"];
-
-fn is_parallel_read_only_tool(name: &str) -> bool {
-    PARALLEL_READ_ONLY.contains(&name)
-}
-
-fn is_sequential_batch_tool(name: &str) -> bool {
-    SEQUENTIAL_BATCH_TOOLS.contains(&name)
-}
-
+/// Header for a parallel tool batch. Each tool describes its own fragment
+/// (`Tool::batch_label`); a homogeneous batch shows one fragment, a mixed
+/// batch joins them so the header names every tool instead of hiding them.
 fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
-    let count = prepared.len();
-    let names: HashSet<&str> = prepared
-        .iter()
-        .map(|(_, name, _, _)| name.as_str())
-        .collect();
-    if names.len() == 1 {
-        let name = names.into_iter().next().unwrap_or("tool");
-        return match name {
-            "read" => {
-                let unique_paths: HashSet<&str> = prepared
-                    .iter()
-                    .filter_map(|(_, _, input, _)| input["path"].as_str())
-                    .collect();
-                if unique_paths.len() < count {
-                    format!("Read {count} ranges")
-                } else {
-                    format!("Read {count} {}", if count == 1 { "file" } else { "files" })
-                }
-            }
-            "write" => format!(
-                "Write {count} {}",
-                if count == 1 { "file" } else { "files" }
-            ),
-            "edit" => format!("Edit {count} {}", if count == 1 { "file" } else { "files" }),
-            "grep" => format!(
-                "Search {count} {}",
-                if count == 1 { "pattern" } else { "patterns" }
-            ),
-            "glob" => format!(
-                "Find {count} {}",
-                if count == 1 { "pattern" } else { "patterns" }
-            ),
-            other => format!("{} {count} calls", title_case_tool(other)),
-        };
+    // Group calls by tool in first-seen order, carrying each tool's inputs so
+    // it can shape its own fragment (e.g. read's "ranges" vs "files").
+    let mut groups: Vec<(&Arc<dyn Tool>, Vec<&Value>)> = Vec::new();
+    for (_, name, input, tool) in prepared {
+        match groups.iter_mut().find(|(t, _)| t.name() == name.as_str()) {
+            Some((_, inputs)) => inputs.push(input),
+            None => groups.push((tool, vec![input])),
+        }
     }
-    format!("Run {count} tools")
-}
-
-fn title_case_tool(name: &str) -> String {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_uppercase().collect::<String>() + chars.as_str()
+    groups
+        .iter()
+        .map(|(tool, inputs)| tool.batch_label(inputs))
+        .collect::<Vec<_>>()
+        .join(" · ")
 }
 
 /// Lexically normalize paths for the batch collision check.  We cannot rely
@@ -1466,10 +1595,20 @@ fn split_malformed(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
 }
 
 fn tool_result(id: &str, content: &str, is_error: bool) -> ContentBlock {
+    tool_result_with_images(id, content, is_error, Vec::new())
+}
+
+fn tool_result_with_images(
+    id: &str,
+    content: &str,
+    is_error: bool,
+    images: Vec<ContentBlock>,
+) -> ContentBlock {
     ContentBlock::ToolResult {
         tool_use_id: id.to_string(),
         content: content.to_string(),
         is_error,
+        images,
     }
 }
 
@@ -1542,7 +1681,46 @@ pub fn summarize_call(name: &str, input: &Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::compact_successful_test_output;
+    use super::{compact_successful_test_output, Session};
+    use crate::{Entry, PermissionMode, PermissionRules, ToolCtx};
+
+    #[test]
+    fn change_cwd_appends_model_visible_note() {
+        let root = std::env::temp_dir().join(format!(
+            "tcode-cd-test-{}-{}",
+            std::process::id(),
+            "change-cwd"
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let child = root.join("child").canonicalize().unwrap();
+
+        let mut session = Session::new(
+            ToolCtx::new(root.clone(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        let change = session.change_cwd("child").unwrap();
+
+        assert!(change.changed);
+        assert_eq!(change.old, root);
+        assert_eq!(change.new, child);
+        assert_eq!(session.tool_ctx.cwd, child);
+        assert!(matches!(
+            session.ledger.entries().last(),
+            Some(Entry::Note(text))
+                if text.contains("Working directory changed by the user")
+                    && text.contains("Future relative tool paths")
+        ));
+
+        let entries = session.ledger.len();
+        let change = session.change_cwd(".").unwrap();
+        assert!(!change.changed);
+        assert_eq!(session.ledger.len(), entries);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn folds_repeated_successful_test_blocks() {

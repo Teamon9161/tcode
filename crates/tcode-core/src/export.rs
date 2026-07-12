@@ -133,6 +133,7 @@ mod tests {
                 tool_use_id: "t1".into(),
                 content: "fn main() {}".into(),
                 is_error: false,
+                images: vec![],
             }]),
             Entry::Note("background task b1 finished".into()),
         ];

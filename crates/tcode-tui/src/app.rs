@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Stdout;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,10 +50,11 @@ const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
     ("o", theme::DIM),
 ];
 
-const SLASH_COMMANDS: [(&str, &str); 12] = [
+const SLASH_COMMANDS: [(&str, &str); 13] = [
     ("/help", "show keys and commands"),
     ("/model", "switch model · adjust reasoning effort"),
     ("/provider", "configure or switch provider"),
+    ("/cd", "change working directory: /cd <path>"),
     ("/mode", "cycle permission mode"),
     ("/cost", "show last turn token usage"),
     ("/compact", "summarize history to free context"),
@@ -147,6 +148,11 @@ struct InputHitbox {
 
 struct PendingCall {
     detail: String,
+    /// Batch items defer their `├ summary` line (plus any diff) to here, so
+    /// `ToolEnd` can bake it directly above this call's own result instead of
+    /// baking every item first and every result after. Empty for single calls
+    /// (their header is baked at `ToolStart`).
+    header: Vec<Line<'static>>,
 }
 
 struct PlanStep {
@@ -178,6 +184,9 @@ pub struct App {
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
     cwd: PathBuf,
+    /// Tool name → its UI display name, snapshotted from the agent's tools
+    /// so headers can label calls without a live `Tool` handle.
+    display_names: HashMap<String, String>,
     terminal: Term,
     transcript: Transcript,
     md: markdown::Renderer,
@@ -216,9 +225,13 @@ pub struct App {
     last_esc: Option<Instant>,
     popup_index: usize,
 
-    // Live (un-baked) streaming state: rendered only in the viewport,
-    // baked into scrollback once finalized.
+    // Live streaming state: kept as a replace-in-place transcript block until
+    // the provider finishes this assistant message.
     live_text: String,
+    /// Index of the still-streaming assistant block inside the transcript.
+    /// While set, incoming deltas replace that block in place; finalization just
+    /// drops the marker so the block becomes ordinary scrollback.
+    live_block: Option<usize>,
     thinking_chars: usize,
     thinking_text: String,
     thinking_since: Option<Instant>,
@@ -252,6 +265,16 @@ pub struct App {
     provider_setup_requested: bool,
     /// Transient feedback ("copied 3 lines") shown in the hint row.
     notice: Option<(String, Instant)>,
+    /// Active retry backoff: countdown deadline plus attempt/max, rendered red
+    /// in the status line until the next attempt begins.
+    retry_wait: Option<RetryWait>,
+}
+
+#[derive(Clone)]
+struct RetryWait {
+    until: Instant,
+    attempt: u32,
+    max: u32,
 }
 
 impl App {
@@ -268,12 +291,18 @@ impl App {
         // Keep the agent's automatic-compaction guard and status block in
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
+        let display_names = agent
+            .tools
+            .iter()
+            .map(|t| (t.name().to_string(), t.display_name()))
+            .collect();
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
         Ok(Self {
             agent,
             session: Some(session),
             cwd,
+            display_names,
             terminal,
             transcript,
             md: markdown::Renderer::default(),
@@ -298,6 +327,7 @@ impl App {
             last_esc: None,
             popup_index: 0,
             live_text: String::new(),
+            live_block: None,
             thinking_chars: 0,
             thinking_text: String::new(),
             thinking_since: None,
@@ -310,6 +340,7 @@ impl App {
             context_step_start: context_tokens,
             context_estimated,
             state_label: String::new(),
+            retry_wait: None,
             turn_usage: Usage::default(),
             mode_label,
             spinner: 0,
@@ -347,11 +378,7 @@ impl App {
                         self.user_wait_started = Some(Instant::now());
                     }
                     let dialog = if ask.tool == "ask_user" {
-                        let options = ask.input["options"]
-                            .as_array()
-                            .map(|items| items.iter().filter_map(|item| item.as_str().map(str::to_owned)).collect())
-                            .unwrap_or_default();
-                        Dialog::question(ask.summary, options)
+                        Dialog::questions(ask.summary, &ask.input)
                     } else {
                         // A change proposal (edit/write) is baked into the
                         // transcript now — in full, scrollable as part of the
@@ -367,7 +394,7 @@ impl App {
                             self.bake_live_text();
                             self.finish_thinking();
                             self.change_prebake = Some(self.transcript.block_count());
-                            let mut spans: Vec<Span> = colored_tool_summary(&call_summary);
+                            let mut spans: Vec<Span> = self.colored_tool_summary(&call_summary);
                             spans.insert(0, Span::styled("● ", theme::accent()));
                             let mut lines = vec![Line::default(), Line::from(spans)];
                             lines.extend(change);
@@ -540,20 +567,13 @@ impl App {
                                 lines.push(Line::default());
                             }
                             ContentBlock::ToolUse { id, name, input } => {
+                                // Defer the header to the matching ToolResults
+                                // entry so each call renders directly above its
+                                // own result, not all headers then all results.
                                 tool_calls.insert(id.clone(), (name.clone(), input.clone()));
                                 if name == "update_plan" {
                                     resumed_plan = Some(input.clone());
-                                    continue;
                                 }
-                                let summary = self.display_summary(
-                                    &tcode_core::agent::summarize_call(name, input),
-                                );
-                                let mut spans: Vec<Span> = colored_tool_summary(&summary);
-                                spans.insert(0, Span::styled("● ", theme::accent()));
-                                lines.push(Line::from(spans));
-                                // Replay edit/write diffs with the same colored
-                                // gutter a live turn shows; no-op for other tools.
-                                lines.extend(diff::render_change(name, input));
                             }
                             _ => {}
                         }
@@ -606,6 +626,7 @@ impl App {
                             tool_use_id,
                             content,
                             is_error,
+                            ..
                         } = block
                         else {
                             continue;
@@ -614,6 +635,19 @@ impl App {
                             .get(tool_use_id)
                             .map(|(name, input)| (name.as_str(), Some(input)))
                             .unwrap_or(("tool", None));
+                        // Bake this call's header (+ diff / command block) right
+                        // above its result. update_plan renders via the plan
+                        // pane and ask_user via its own record — no tool header.
+                        if let Some(input) = input {
+                            if name != "update_plan" && name != "ask_user" {
+                                let summary = self.display_summary(&call_header(name, input));
+                                let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
+                                spans.insert(0, Span::styled("● ", theme::accent()));
+                                lines.push(Line::from(spans));
+                                lines.extend(diff::render_change(name, input));
+                                lines.extend(diff::render_command(name, input));
+                            }
+                        }
                         let preview = result_preview(content);
                         let style = if *is_error {
                             ratatui::style::Style::default().fg(theme::ERROR)
@@ -647,6 +681,7 @@ impl App {
         let Some(mut session) = self.session.take() else {
             return;
         };
+        self.clear_live_text();
         // Until the provider reports authoritative prompt usage, keep the
         // meter useful with a conservative local estimate. Text attachments
         // count here too; image token accounting is provider-specific.
@@ -704,7 +739,6 @@ impl App {
         self.user_wait_started = None;
         self.user_wait_total = Duration::ZERO;
         self.out_tokens = 0;
-        self.live_text.clear();
         self.thinking_chars = 0;
         self.state_label = "sending".into();
 
@@ -796,7 +830,7 @@ impl App {
         if let Err(e) = result {
             self.bake(vec![Line::styled(
                 format!("error: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
+                theme::error_highlight(),
             )]);
         }
         let u = self.turn_usage;
@@ -839,6 +873,9 @@ impl App {
     fn on_agent_event(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::Started => {
+                // The retry succeeded (or this is the first attempt): drop the
+                // countdown.
+                self.retry_wait = None;
                 self.context_step_start = self.context_tokens;
                 self.state_label = "responding".into();
             }
@@ -848,6 +885,7 @@ impl App {
                 self.out_tokens += tokens;
                 self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
                 self.live_text.push_str(&t);
+                self.refresh_live_text();
                 self.state_label = "writing".into();
             }
             AgentEvent::ThinkingDelta(t) => {
@@ -861,6 +899,15 @@ impl App {
                 self.thinking_text.push_str(&t);
                 self.state_label = "thinking".into();
             }
+            AgentEvent::ToolInputDelta(t) => {
+                // Tool arguments are output tokens too; count them so the meter
+                // moves while the model assembles a call. The call header itself
+                // is rendered later by ToolStart, so nothing is baked here.
+                let tokens = approx_tokens(&t);
+                self.out_tokens += tokens;
+                self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
+                self.state_label = "calling tool".into();
+            }
             AgentEvent::ToolBatchStart { label, calls } => {
                 // A batch supersedes any single diff pre-baked for its
                 // (once) approval — retract it so the batch renders in full.
@@ -869,29 +916,30 @@ impl App {
                 }
                 self.bake_live_text();
                 self.finish_thinking();
-                self.bake(vec![
-                    Line::default(),
-                    Line::from(vec![
-                        Span::styled("● ", theme::accent()),
-                        Span::styled(label.clone(), theme::bold()),
-                    ]),
-                ]);
+                let mut header_spans = vec![Span::styled("● ", theme::accent())];
+                header_spans.extend(colored_batch_label(&label));
+                self.bake(vec![Line::default(), Line::from(header_spans)]);
                 self.pending_batch.clear();
+                // A batch spanning several tools tags each item with its tool
+                // name so the reader can tell the calls apart; a single-tool
+                // batch (e.g. "Read 5 files") needs no per-item prefix.
+                let mixed = calls.iter().map(|(n, _)| n.as_str()).collect::<HashSet<_>>().len() > 1;
                 for (name, input) in calls {
                     let item = batch_item_summary(&name, &input, Some(&self.cwd));
+                    let mut row = vec![Span::raw("  ├ ")];
+                    if mixed {
+                        row.push(Span::styled(
+                            format!("{} ", self.display_name(&name)),
+                            theme::ok(),
+                        ));
+                    }
+                    row.push(Span::styled(item, theme::dim()));
+                    let mut header = vec![Line::from(row)];
+                    header.extend(diff::render_change(&name, &input));
                     self.pending_batch.push_back(PendingCall {
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
+                        header,
                     });
-                    let mut lines = vec![Line::from(vec![
-                        Span::raw("  ├ "),
-                        Span::styled(item, theme::dim()),
-                    ])];
-                    let change = diff::render_change(&name, &input);
-                    lines.extend(change);
-                    if lines.len() > 1 {
-                        lines.push(Line::default());
-                    }
-                    self.bake(lines);
                 }
                 self.state_label = format!("running: {label}");
             }
@@ -910,7 +958,11 @@ impl App {
                 if name == "ask_user" {
                     return;
                 }
-                let summary = self.display_summary(&summary);
+                // Recompute the header from name+input so a long/multi-line
+                // shell command collapses to `Shell` and renders as a block,
+                // instead of the raw command string core put in `summary`.
+                let _ = summary;
+                let summary = self.display_summary(&call_header(&name, &input));
                 self.bake_live_text();
                 self.finish_thinking();
                 if !self.pending_batch.is_empty() {
@@ -919,16 +971,17 @@ impl App {
                 }
                 self.pending_tool = Some(PendingCall {
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
+                    header: Vec::new(),
                 });
                 // If this call's diff was already baked in full while its
                 // approval dialog was open, keep that block — don't render a
                 // second, capped copy.
                 if self.change_prebake.take().is_none() {
-                    let mut spans: Vec<Span> = colored_tool_summary(&summary);
+                    let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
                     spans.insert(0, Span::styled("● ", theme::accent()));
                     let mut lines = vec![Line::default(), Line::from(spans)];
-                    let change = diff::render_change(&name, &input);
-                    lines.extend(change);
+                    lines.extend(diff::render_change(&name, &input));
+                    lines.extend(diff::render_command(&name, &input));
                     if lines.len() > 2 {
                         lines.push(Line::default());
                     }
@@ -956,15 +1009,25 @@ impl App {
                 let input: Option<serde_json::Value> = entry
                     .as_ref()
                     .and_then(|e| serde_json::from_str(&e.detail).ok());
-                if let Some(mut entry) = entry {
-                    entry.detail.push_str("\n\nresult:\n");
-                    entry.detail.push_str(&content);
+                // A batch item's `├ summary` was deferred to here: bake it now
+                // so this call renders as item-then-result, not clustered.
+                if let Some(entry) = entry {
+                    if !entry.header.is_empty() {
+                        self.bake(entry.header);
+                    }
                 }
                 // The gated result is exactly what is appended to the next
                 // model request, so it belongs in the in-between estimate.
                 self.context_tokens = self
                     .context_tokens
                     .saturating_add(approx_tokens(&content) as u64);
+                // edit/write already rendered their diff at the call site; the
+                // textual "edited … Result:" only repeats it, so a successful
+                // one shows nothing further. (Errors still surface below.)
+                if !is_error && matches!(name.as_str(), "edit" | "write") {
+                    self.state_label = "responding".into();
+                    return;
+                }
                 let style = if is_error {
                     ratatui::style::Style::default().fg(theme::ERROR)
                 } else {
@@ -987,18 +1050,26 @@ impl App {
                 attempt,
                 max,
                 error,
+                delay_ms,
             } => {
-                // Un-baked partial output is simply dropped — that is the
-                // whole point of keeping it out of the scrollback.
-                self.live_text.clear();
+                // The failed attempt's assistant text was only a live transcript
+                // block; remove it before the retry renders a fresh attempt.
+                self.clear_live_text();
                 self.thinking_chars = 0;
                 self.thinking_text.clear();
                 self.thinking_since = None;
                 self.context_tokens = self.context_step_start;
+                // Record the failure in red scrollback, then show a live
+                // countdown in the status line until the next attempt fires.
                 self.bake(vec![Line::styled(
-                    format!("↻ watchdog: {error} — retrying ({attempt}/{max})"),
-                    ratatui::style::Style::default().fg(theme::WARN),
+                    format!("↻ API error ({attempt}/{max}): {error}"),
+                    theme::error_highlight(),
                 )]);
+                self.retry_wait = Some(RetryWait {
+                    until: Instant::now() + Duration::from_millis(delay_ms),
+                    attempt,
+                    max,
+                });
                 self.state_label = format!("retrying ({attempt}/{max})");
             }
             AgentEvent::Usage(u) => {
@@ -1070,14 +1141,21 @@ impl App {
         self.finish_thinking();
         if dialog.is_question() {
             let answer = approval.comment.clone().unwrap_or_default();
-            self.bake(vec![
-                Line::default(),
-                Line::from(vec![
-                    Span::styled("? ", theme::accent()),
-                    Span::styled(dialog.summary.clone(), theme::bold()),
-                ]),
-                Line::styled(format!("  ⎿ {answer}"), theme::dim()),
-            ]);
+            let mut lines = vec![Line::default()];
+            for (i, row) in dialog.summary.lines().enumerate() {
+                if i == 0 {
+                    lines.push(Line::from(vec![
+                        Span::styled("? ", theme::accent()),
+                        Span::styled(row.to_string(), theme::bold()),
+                    ]));
+                } else {
+                    lines.push(Line::styled(format!("  {row}"), theme::dim()));
+                }
+            }
+            for row in answer.lines() {
+                lines.push(Line::styled(format!("  ⎿ {row}"), theme::dim()));
+            }
+            self.bake(lines);
             return;
         }
         match approval.decision {
@@ -1100,7 +1178,7 @@ impl App {
                     .as_deref()
                     .map(|c| format!(" — {c}"))
                     .unwrap_or_default();
-                let mut spans = colored_tool_summary(&dialog.call_summary);
+                let mut spans = self.colored_tool_summary(&dialog.call_summary);
                 spans.insert(0, Span::styled("● ", theme::accent()));
                 self.bake(vec![
                     Line::default(),
@@ -1124,15 +1202,65 @@ impl App {
         }
     }
 
+    fn refresh_live_text(&mut self) {
+        if self.live_text.trim().is_empty() {
+            return;
+        }
+        let lines = self.md.render(&self.live_text);
+        if lines.is_empty() {
+            return;
+        }
+        if let Some(index) = self.live_block {
+            self.transcript.replace_block(index, lines);
+        } else {
+            let index = self.transcript.block_count();
+            self.transcript.push(lines);
+            self.live_block = Some(index);
+        }
+    }
+
+    fn clear_live_text(&mut self) {
+        self.live_text.clear();
+        if let Some(index) = self.live_block.take() {
+            self.transcript.truncate_blocks(index);
+        }
+    }
+
     fn bake_live_text(&mut self) {
         if self.live_text.trim().is_empty() {
-            self.live_text.clear();
+            self.clear_live_text();
             return;
         }
         let text = std::mem::take(&mut self.live_text);
         let mut lines = self.md.render(&text);
         lines.push(Line::default());
-        self.bake(lines);
+        if let Some(index) = self.live_block.take() {
+            self.transcript.replace_block(index, lines);
+        } else {
+            self.bake(lines);
+        }
+    }
+
+    /// Tool's UI name, resolved from its own `display_name` when it belongs
+    /// to this session; falls back to title-case for imported/unknown tools.
+    fn display_name(&self, name: &str) -> String {
+        self.display_names
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| title_case_tool_name(name))
+    }
+
+    /// Split a tool summary like `shell(cargo test)` into colored spans: the
+    /// tool's display name is green, the arguments are dim.
+    fn colored_tool_summary(&self, summary: &str) -> Vec<Span<'static>> {
+        if let Some(paren) = summary.find('(') {
+            vec![
+                Span::styled(self.display_name(&summary[..paren]), theme::ok()),
+                Span::styled(summary[paren..].to_string(), theme::dim()),
+            ]
+        } else {
+            vec![Span::styled(self.display_name(summary), theme::bold())]
+        }
     }
 
     fn output_head(
@@ -1148,8 +1276,10 @@ impl App {
             theme::dim()
         };
         if !is_error && suppress_output_preview(name) {
-            let lines = content.lines().count().max(1);
-            Line::styled(format!("  ⎿ {lines} output lines"), style)
+            // The fold affordance already carries the line count ("▸ N lines"),
+            // so the head only marks the result — no duplicate count here.
+            let _ = content;
+            Line::styled("  ⎿", style)
         } else {
             Line::styled(format!("  ⎿ {preview}"), style)
         }
@@ -1677,7 +1807,45 @@ impl App {
         self.bake(lines);
     }
 
+    fn change_cwd(&mut self, arg: &str) {
+        let result = match self.session.as_mut() {
+            Some(session) => session.change_cwd(arg),
+            None => {
+                self.bake(vec![Line::styled(
+                    "wait for the current turn before changing cwd",
+                    theme::dim(),
+                )]);
+                return;
+            }
+        };
+        match result {
+            Ok(change) => {
+                self.cwd = change.new.clone();
+                if change.changed {
+                    let _ = std::env::set_current_dir(&change.new);
+                    self.bake(vec![Line::styled(
+                        format!("cwd → {}", change.new.display()),
+                        theme::dim(),
+                    )]);
+                } else {
+                    self.bake(vec![Line::styled(
+                        format!("cwd: {}", change.new.display()),
+                        theme::dim(),
+                    )]);
+                }
+            }
+            Err(e) => self.bake(vec![Line::styled(
+                e,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
     fn run_slash(&mut self, cmd: &str) {
+        if cmd == "/cd" || cmd.starts_with("/cd ") {
+            self.change_cwd(cmd.strip_prefix("/cd").unwrap_or("").trim());
+            return;
+        }
         if cmd == "/memory" || cmd.starts_with("/memory ") {
             self.memory_status(cmd.strip_prefix("/memory").unwrap_or("").trim());
             return;
@@ -1994,6 +2162,8 @@ impl App {
     /// transcript is ours, so this is a plain reset — no terminal purge.
     fn clear_conversation_screen(&mut self) {
         self.transcript.clear();
+        self.live_text.clear();
+        self.live_block = None;
         let banner = self.banner();
         self.bake(banner);
     }
@@ -2229,16 +2399,6 @@ impl App {
         };
         let status = self.status_line(running, started);
         let hint = self.idle_hint();
-        let live_tail: Vec<String> = if running {
-            let n = self.live_text.lines().count();
-            self.live_text
-                .lines()
-                .skip(n.saturating_sub(8))
-                .map(String::from)
-                .collect()
-        } else {
-            Vec::new()
-        };
         let dialog_lines = self
             .resume_picker
             .as_ref()
@@ -2286,9 +2446,6 @@ impl App {
                 lines.len() as u16 + 2
             } else {
                 let mut h = editor_h + 2 + 2; // input box + context meter + hint
-                if running {
-                    h += live_tail.len() as u16 + 1; // live tail + status line
-                }
                 if !plan_lines.is_empty() {
                     h += plan_lines.len() as u16 + 2;
                 }
@@ -2332,16 +2489,6 @@ impl App {
                     row(y, h),
                 );
                 return;
-            }
-
-            if !live_tail.is_empty() {
-                let lines: Vec<Line> = live_tail
-                    .iter()
-                    .map(|l| Line::styled(l.clone(), theme::dim()))
-                    .collect();
-                let h = lines.len() as u16;
-                frame.render_widget(Paragraph::new(Text::from(lines)), row(y, h));
-                y += h;
             }
 
             if !plan_lines.is_empty() {
@@ -2465,6 +2612,27 @@ impl App {
         if !running {
             return Line::default();
         }
+        // A pending retry takes over the status line with a red live countdown.
+        if let Some(retry) = &self.retry_wait {
+            let remaining = retry.until.saturating_duration_since(Instant::now());
+            let secs = remaining.as_secs() + u64::from(remaining.subsec_millis() > 0);
+            let red = ratatui::style::Style::default().fg(theme::ERROR);
+            return Line::from(vec![
+                Span::styled(
+                    format!("↻ retrying ({}/{}) ", retry.attempt, retry.max),
+                    red,
+                ),
+                Span::styled(
+                    if secs > 0 {
+                        format!("in {secs}s")
+                    } else {
+                        "now…".to_string()
+                    },
+                    red,
+                ),
+                Span::styled(" · esc to cancel", theme::dim()),
+            ]);
+        }
         let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let (frame, color) = CALM_SPINNER[self.spinner % CALM_SPINNER.len()];
         Line::from(vec![
@@ -2534,12 +2702,34 @@ fn path_is_markdown(input: &serde_json::Value) -> bool {
         .is_some_and(|ext| matches!(ext.as_str(), "md" | "markdown" | "mdx"))
 }
 
-fn display_tool_name(name: &str) -> String {
+/// Fallback UI name for a tool whose handle we no longer hold: title-case.
+/// The authoritative name is `Tool::display_name`, resolved via
+/// `App::display_name` when the tool is in this session's set.
+fn title_case_tool_name(name: &str) -> String {
     let mut chars = name.chars();
     let Some(first) = chars.next() else {
         return String::new();
     };
     first.to_uppercase().collect::<String>() + chars.as_str()
+}
+
+/// Color a batch label such as "Read 5 files · Search 2 patterns": each
+/// fragment's leading tool name is green, matching a single call's header.
+fn colored_batch_label(label: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, fragment) in label.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", theme::dim()));
+        }
+        match fragment.split_once(' ') {
+            Some((name, rest)) => {
+                spans.push(Span::styled(name.to_string(), theme::ok()));
+                spans.push(Span::styled(format!(" {rest}"), theme::bold()));
+            }
+            None => spans.push(Span::styled(fragment.to_string(), theme::ok())),
+        }
+    }
+    spans
 }
 
 fn result_preview(s: &str) -> String {
@@ -2554,29 +2744,52 @@ fn result_preview(s: &str) -> String {
     line
 }
 
+// These are the parallel-read-only tools (core's `BatchPolicy::ParallelReadOnly`):
+// their output is a precise, self-explanatory listing, so the transcript hides
+// the preview. The TUI only sees the tool name (no `Tool` handle), so this list
+// must track that set by hand — keep them in sync.
 fn suppress_output_preview(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "glob" | "read_output")
+    matches!(name, "read" | "grep" | "glob")
+}
+
+/// Header text for a tool call. A long or multi-line shell command collapses
+/// to the bare tool name; its full command renders below via
+/// `diff::render_command`, so the header line stays intact.
+fn call_header(name: &str, input: &serde_json::Value) -> String {
+    if diff::command_is_block(name, input) {
+        name.to_string()
+    } else {
+        tcode_core::agent::summarize_call(name, input)
+    }
+}
+
+/// First line of a command, capped, with a note when more lines follow. Keeps
+/// a multi-line command from corrupting a compact one-line batch row.
+fn command_first_line(cmd: &str) -> String {
+    let mut line = cmd.lines().next().unwrap_or("").to_string();
+    if line.chars().count() > 120 {
+        line = line.chars().take(120).collect::<String>() + "…";
+    }
+    let extra = cmd.lines().count().saturating_sub(1);
+    if extra > 0 {
+        line.push_str(&format!(" (+{extra} lines)"));
+    }
+    line
 }
 
 fn batch_item_summary(name: &str, input: &serde_json::Value, cwd: Option<&Path>) -> String {
     match name {
-        "shell" | "bash" => input["command"].as_str().unwrap_or(name).to_string(),
+        "shell" | "bash" => command_first_line(input["command"].as_str().unwrap_or(name)),
         "read" => {
             let path = input_path(input)
                 .map(|path| shorten_path(path, cwd))
                 .unwrap_or_else(|| "<missing path>".into());
             let offset = input["offset"].as_u64().unwrap_or(1);
             match input["limit"].as_u64() {
-                Some(limit) => format!("{path} · lines {offset}+{limit}"),
-                None if offset > 1 => format!("{path} · from line {offset}"),
+                Some(limit) => format!("{path}:{offset}-{}", offset + limit - 1),
+                None if offset > 1 => format!("{path}:{offset}-"),
                 None => path,
             }
-        }
-        "read_output" => {
-            let id = input["id"].as_str().unwrap_or("output");
-            let offset = input["offset"].as_u64().unwrap_or(1);
-            let limit = input["limit"].as_u64().unwrap_or(200);
-            format!("{id} · lines {offset}+{limit}")
         }
         "edit" | "write" => input_path(input)
             .map(|path| shorten_path(path, cwd))
@@ -2601,22 +2814,6 @@ fn shorten_path(path: &str, cwd: Option<&Path>) -> String {
         .strip_prefix(cwd)
         .map(|relative| relative.display().to_string())
         .unwrap_or_else(|_| path.to_string())
-}
-
-/// Split a tool summary like `shell(cargo test)` into colored spans:
-/// the title-cased tool name is green, the arguments are dim.
-fn colored_tool_summary(summary: &str) -> Vec<Span<'static>> {
-    let s = summary.to_string();
-    if let Some(paren) = s.find('(') {
-        let name = display_tool_name(&s[..paren]);
-        let args = &s[paren..];
-        vec![
-            Span::styled(name, theme::ok()),
-            Span::styled(args.to_string(), theme::dim()),
-        ]
-    } else {
-        vec![Span::styled(display_tool_name(&s), theme::bold())]
-    }
 }
 
 /// One compact row below the editor. The meter intentionally reports the

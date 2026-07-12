@@ -31,6 +31,45 @@ fn highlighter() -> &'static Highlighter {
     })
 }
 
+/// Single-line commands up to this width stay inline in the call header;
+/// longer or multi-line ones collapse the header and render as a block.
+const COMMAND_HEADER_MAX: usize = 72;
+/// Cap on command-block lines so a giant heredoc can't flood the transcript.
+const MAX_COMMAND_LINES: usize = 40;
+
+/// True when a shell/bash command is long or multi-line enough that cramming
+/// it into the one-line call header would truncate or corrupt the display.
+pub fn command_is_block(tool: &str, input: &Value) -> bool {
+    if tool != "shell" && tool != "bash" {
+        return false;
+    }
+    let cmd = input["command"].as_str().unwrap_or("");
+    cmd.contains('\n') || cmd.chars().count() > COMMAND_HEADER_MAX
+}
+
+/// Render a shell/bash command as an indented block, shown under a terse
+/// header. Empty for short single-line commands or non-shell tools, so callers
+/// can extend unconditionally.
+pub fn render_command(tool: &str, input: &Value) -> Vec<Line<'static>> {
+    if !command_is_block(tool, input) {
+        return Vec::new();
+    }
+    let cmd = input["command"].as_str().unwrap_or("");
+    let total = cmd.lines().count();
+    let mut lines: Vec<Line<'static>> = cmd
+        .lines()
+        .take(MAX_COMMAND_LINES)
+        .map(|line| Line::styled(format!("    {line}"), theme::dim()))
+        .collect();
+    if total > MAX_COMMAND_LINES {
+        lines.push(Line::styled(
+            format!("    … (+{} more lines)", total - MAX_COMMAND_LINES),
+            theme::dim(),
+        ));
+    }
+    lines
+}
+
 /// Render the file-change preview for an edit/write call, if applicable.
 pub fn render_change(tool: &str, input: &Value) -> Vec<Line<'static>> {
     let path = input["path"].as_str().unwrap_or("");
@@ -288,5 +327,39 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.content.contains("preview truncated"))));
+    }
+
+    #[test]
+    fn short_single_line_command_stays_in_header() {
+        let input = serde_json::json!({ "command": "git status" });
+        assert!(!command_is_block("shell", &input));
+        assert!(render_command("shell", &input).is_empty());
+    }
+
+    #[test]
+    fn multiline_command_renders_as_a_block() {
+        let input = serde_json::json!({
+            "command": "python - <<'PY'\nimport sys\nprint(sys.version)\nPY",
+        });
+        assert!(command_is_block("shell", &input));
+        let lines = render_command("shell", &input);
+        assert_eq!(lines.len(), 4);
+        // Each block row is indented.
+        assert!(lines[0].spans[0].content.starts_with("    python"));
+    }
+
+    #[test]
+    fn long_single_line_command_becomes_a_block() {
+        let cmd = format!("echo {}", "x".repeat(100));
+        let input = serde_json::json!({ "command": cmd });
+        assert!(command_is_block("bash", &input));
+        assert_eq!(render_command("bash", &input).len(), 1);
+    }
+
+    #[test]
+    fn non_shell_tools_never_block() {
+        let input = serde_json::json!({ "path": "src/main.rs" });
+        assert!(!command_is_block("read", &input));
+        assert!(render_command("read", &input).is_empty());
     }
 }

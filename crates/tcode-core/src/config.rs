@@ -30,10 +30,15 @@ pub enum ConfigError {
 #[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Anthropic,
+    /// `OpenAiProvider`: any OpenAI-compatible Chat Completions endpoint —
+    /// OpenAI, DeepSeek, OpenRouter, local.
     Openai,
-    /// ChatGPT subscription through the Codex backend (Responses API).
-    /// Credentials come from `~/.codex/auth.json`, not an API key.
-    Chatgpt,
+    /// ChatGPT subscription through the Codex backend (Responses API,
+    /// `CodexProvider`). Credentials come from `~/.codex/auth.json`, not an
+    /// API key. `alias` keeps pre-rename configs (`provider = "chatgpt"`)
+    /// loading.
+    #[serde(alias = "chatgpt")]
+    Codex,
 }
 
 /// One selectable model within a profile.
@@ -99,7 +104,7 @@ impl Profile {
     /// provider-default) environment variable. ChatGPT profiles don't
     /// use API keys at all.
     pub fn api_key(&self, profile_name: &str) -> Result<String, ConfigError> {
-        if self.provider == ProviderKind::Chatgpt {
+        if self.provider == ProviderKind::Codex {
             return Ok(String::new());
         }
         if let Some(key) = &self.api_key {
@@ -108,7 +113,7 @@ impl Profile {
         let var = self.api_key_env.clone().unwrap_or_else(|| {
             match self.provider {
                 ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-                ProviderKind::Openai | ProviderKind::Chatgpt => "OPENAI_API_KEY",
+                ProviderKind::Openai | ProviderKind::Codex => "OPENAI_API_KEY",
             }
             .to_string()
         });
@@ -128,7 +133,7 @@ impl Profile {
                 defs.push(ModelDef::bare(name.clone()));
             }
         }
-        if defs.is_empty() && self.provider == ProviderKind::Chatgpt {
+        if defs.is_empty() && self.provider == ProviderKind::Codex {
             defs = crate::codex::cached_models();
         }
         defs
@@ -169,7 +174,7 @@ impl Profile {
     /// unconfigured built-in profiles from the `/model` picker so the
     /// always-present default catalog doesn't clutter it.
     pub fn is_usable(&self, name: &str) -> bool {
-        if self.provider == ProviderKind::Chatgpt {
+        if self.provider == ProviderKind::Codex {
             return crate::codex::auth_available();
         }
         self.api_key(name).is_ok()
@@ -180,16 +185,26 @@ impl Profile {
 #[serde(default)]
 pub struct WatchdogConfig {
     pub idle_timeout_secs: u64,
+    /// Cap on the wait for a connection's response headers. `connect_timeout`
+    /// on the HTTP client only bounds TCP setup; this bounds the "time to
+    /// first byte" so a server that accepts but never replies is retried
+    /// instead of hanging for minutes.
+    pub connect_timeout_secs: u64,
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
+    /// Ceiling for the exponential backoff so a long outage doesn't wait
+    /// minutes between attempts.
+    pub max_backoff_ms: u64,
 }
 
 impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 30,
-            max_retries: 3,
+            connect_timeout_secs: 20,
+            max_retries: 5,
             initial_backoff_ms: 1000,
+            max_backoff_ms: 30_000,
         }
     }
 }
@@ -198,8 +213,21 @@ impl WatchdogConfig {
     pub fn idle_timeout(&self) -> Duration {
         Duration::from_secs(self.idle_timeout_secs)
     }
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_secs(self.connect_timeout_secs)
+    }
     pub fn initial_backoff(&self) -> Duration {
         Duration::from_millis(self.initial_backoff_ms)
+    }
+    /// Exponential backoff before the Nth retry (1-based): initial · 2^(n-1),
+    /// capped at `max_backoff_ms`. Short at first, then progressively longer.
+    pub fn backoff(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(20);
+        let ms = self
+            .initial_backoff_ms
+            .saturating_mul(1u64 << shift)
+            .min(self.max_backoff_ms);
+        Duration::from_millis(ms)
     }
 }
 
@@ -522,10 +550,10 @@ pub mod presets {
         with_key("openai", api_key)
     }
 
-    /// ChatGPT subscription: models come from Codex's local cache at
-    /// runtime, so an empty list stays current automatically.
-    pub fn chatgpt() -> Profile {
-        from_catalog("chatgpt")
+    /// ChatGPT subscription via the Codex backend: models come from Codex's
+    /// local cache at runtime, so an empty list stays current automatically.
+    pub fn codex() -> Profile {
+        from_catalog("codex")
     }
 
     /// DeepSeek's Anthropic-compatible endpoint.

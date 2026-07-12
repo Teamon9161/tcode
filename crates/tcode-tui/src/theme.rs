@@ -61,6 +61,15 @@ pub fn rewind_highlight_bg() -> Color {
     Color::Rgb(82, 62, 24)
 }
 
+/// Red highlight for API/tool errors so a failure is unmissable in
+/// scrollback — a bold light foreground on a deep-red background.
+pub fn error_highlight() -> Style {
+    Style::default()
+        .fg(Color::White)
+        .bg(Color::Rgb(90, 24, 28))
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn diff_add_bg() -> Color {
     Color::Rgb(20, 62, 38)
 }

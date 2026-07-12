@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::Path;
 
 use async_trait::async_trait;
@@ -5,7 +6,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::freshness::{content_hash, ReadStatus};
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 /// Requests below this are widened: extra lines are cheap, but a model
@@ -18,6 +19,24 @@ const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Cap the bytes a single read emits into context, independent of the line
 /// count — 2000 lines of long lines would otherwise be ~1 MB.
 const MAX_READ_OUTPUT_BYTES: usize = 128 * 1024;
+/// Largest image inlined into a tool result. Anthropic caps images near 5 MB;
+/// bigger ones are rejected with a resize hint rather than silently failing.
+const MAX_IMAGE_INLINE_BYTES: u64 = 5 * 1024 * 1024;
+
+/// Sniff a supported raster image by magic bytes; the extension is not trusted.
+fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
+        Some("image/png")
+    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        Some("image/webp")
+    } else {
+        None
+    }
+}
 
 fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
     path.strip_prefix(cwd).unwrap_or(path)
@@ -100,6 +119,22 @@ impl Tool for ReadTool {
         "read"
     }
 
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelReadOnly
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        // Multiple reads of one file are ranges within it, not distinct files.
+        let unique_paths: HashSet<&str> =
+            inputs.iter().filter_map(|i| i["path"].as_str()).collect();
+        let count = inputs.len();
+        if unique_paths.len() < count {
+            format!("Read {count} ranges")
+        } else {
+            format!("Read {count} {}", if count == 1 { "file" } else { "files" })
+        }
+    }
+
     // Self-paginating via offset/limit — never blob-gate.
     fn gates_output(&self) -> bool {
         false
@@ -108,11 +143,13 @@ impl Tool for ReadTool {
     fn description(&self) -> &str {
         "Read a file with line numbers. Use offset/limit for large files; \
          limits under 120 lines are widened to 120, so read generous windows \
-         instead of many small slices. Need several files or regions? Issue \
-         all reads in one message — they run in parallel. If the harness \
-         reports the file unchanged since your last read, the content is \
-         already in your context — do not re-read; pass force=true only if \
-         you have a specific reason."
+         instead of many small slices. Images (png/jpeg/gif/webp) are read \
+         straight into context so you can see them; other binaries are \
+         refused. Need several files or regions? Issue all reads in one \
+         message — they run in parallel. If the harness reports the file \
+         unchanged since your last read, the content is already in your \
+         context — do not re-read; pass force=true only if you have a \
+         specific reason."
     }
 
     fn input_schema(&self) -> Value {
@@ -183,6 +220,44 @@ impl Tool for ReadTool {
             }
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
+        // Supported images are read into context as image blocks, deduped by
+        // content hash like a text read. This must come before the binary
+        // rejection below, since images are binary.
+        if let Some(mime) = detect_image_mime(&bytes) {
+            let hash = content_hash(&bytes);
+            let force = input["force"].as_bool().unwrap_or(false);
+            let mut freshness = ctx.freshness.lock().expect("freshness lock");
+            let status = freshness.check_read(&path, hash, None);
+            if status == ReadStatus::Unchanged && !force {
+                return ToolOutput::ok(format!(
+                    "unchanged: {} has not changed since you last read it; the image \
+                     is already in your context above. (force=true overrides.)",
+                    rel(&path, &ctx.cwd).display()
+                ));
+            }
+            freshness.record_read(&path, hash, None);
+            drop(freshness);
+            if bytes.len() as u64 > MAX_IMAGE_INLINE_BYTES {
+                return ToolOutput::err(format!(
+                    "{} is a {mime} image but {:.1} MB exceeds the {} MB inline limit; \
+                     resize it smaller before reading.",
+                    rel(&path, &ctx.cwd).display(),
+                    bytes.len() as f64 / (1024.0 * 1024.0),
+                    MAX_IMAGE_INLINE_BYTES / (1024 * 1024),
+                ));
+            }
+            use base64::Engine as _;
+            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let text = format!(
+                "Read image {} ({mime}, {:.0} KB).",
+                rel(&path, &ctx.cwd).display(),
+                bytes.len() as f64 / 1024.0,
+            );
+            return ToolOutput::ok(text).with_images(vec![tcode_core::ContentBlock::Image {
+                media_type: mime.to_string(),
+                data,
+            }]);
+        }
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return ToolOutput::err(format!(
                 "{} is a binary file ({} bytes); refusing to dump it into context.",
@@ -244,8 +319,11 @@ impl Tool for ReadTool {
         if let Some(note) = overlap_note {
             out.push_str(&note);
         }
-        let (body, emitted) =
-            numbered_capped(&lines[view_start..view_end], view_start + 1, MAX_READ_OUTPUT_BYTES);
+        let (body, emitted) = numbered_capped(
+            &lines[view_start..view_end],
+            view_start + 1,
+            MAX_READ_OUTPUT_BYTES,
+        );
         out.push_str(&body);
         let shown_end = view_start + emitted;
         if shown_end < total {
@@ -270,6 +348,18 @@ pub struct WriteTool;
 impl Tool for WriteTool {
     fn name(&self) -> &str {
         "write"
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelPerFile
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!(
+            "Write {count} {}",
+            if count == 1 { "file" } else { "files" }
+        )
     }
 
     fn description(&self) -> &str {
@@ -358,6 +448,15 @@ pub struct EditTool;
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "edit"
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelPerFile
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!("Edit {count} {}", if count == 1 { "file" } else { "files" })
     }
 
     fn description(&self) -> &str {
@@ -672,5 +771,66 @@ mod tests {
             occurrence_help(text, needle, 8),
             vec!["  line 2: alpha", "  line 4: alpha"]
         );
+    }
+
+    #[test]
+    fn detect_image_mime_by_magic_bytes() {
+        assert_eq!(
+            detect_image_mime(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]),
+            Some("image/png")
+        );
+        assert_eq!(
+            detect_image_mime(&[0xFF, 0xD8, 0xFF, 0x00]),
+            Some("image/jpeg")
+        );
+        assert_eq!(detect_image_mime(b"GIF89a....."), Some("image/gif"));
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&[0, 0, 0, 0]);
+        webp.extend_from_slice(b"WEBP");
+        assert_eq!(detect_image_mime(&webp), Some("image/webp"));
+        // Plain text is not an image even though it starts with printable bytes.
+        assert_eq!(detect_image_mime(b"#!/bin/sh\n"), None);
+    }
+
+    #[tokio::test]
+    async fn read_inlines_a_png_as_an_image_block() {
+        let dir = std::env::temp_dir().join(format!("tcode-img-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("shot.png");
+        // Valid PNG magic + arbitrary payload (incl. null bytes) is enough:
+        // detection is by magic bytes and the body is base64-encoded verbatim.
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        bytes.extend_from_slice(&[0u8; 32]);
+        std::fs::write(&png, &bytes).unwrap();
+
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let out = ReadTool
+            .run(
+                json!({ "path": png.to_str().unwrap() }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!out.is_error);
+        assert!(out.content.contains("Read image"));
+        assert_eq!(out.images.len(), 1);
+        assert!(matches!(
+            &out.images[0],
+            tcode_core::ContentBlock::Image { media_type, .. } if media_type == "image/png"
+        ));
+
+        // A second read of the unchanged image dedupes: no image re-sent.
+        let again = ReadTool
+            .run(
+                json!({ "path": png.to_str().unwrap() }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(again.images.is_empty());
+        assert!(again.content.contains("unchanged"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

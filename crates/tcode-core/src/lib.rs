@@ -18,7 +18,7 @@ pub mod stream_util;
 pub mod tool;
 pub mod types;
 
-pub use agent::{Agent, AgentError, AgentEvent, Session, DEFAULT_MAX_STEPS};
+pub use agent::{Agent, AgentError, AgentEvent, CwdChange, Session, DEFAULT_MAX_STEPS};
 pub use background::{BackgroundTasks, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
 pub use export::export_markdown;
@@ -34,5 +34,5 @@ pub use provider::{
     StreamEvent,
 };
 pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
-pub use tool::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+pub use tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

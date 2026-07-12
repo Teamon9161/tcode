@@ -13,8 +13,8 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    Agent, Approval, ApprovalDecision, Approver, ContentBlock, Entry, ModelCell, PermissionMode,
-    PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
+    Agent, Approval, ApprovalDecision, Approver, BatchPolicy, ContentBlock, Entry, ModelCell,
+    PermissionMode, PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
 };
 
 const EXPLORE_SYSTEM: &str = include_str!("../prompts/task-explore-system.md");
@@ -45,7 +45,6 @@ pub struct TaskTool {
     model: ModelCell,
     watchdog: WatchdogConfig,
     output_budget: usize,
-    cwd: PathBuf,
 }
 
 impl TaskTool {
@@ -53,21 +52,23 @@ impl TaskTool {
         model: ModelCell,
         watchdog: WatchdogConfig,
         output_budget: usize,
-        cwd: PathBuf,
+        _cwd: PathBuf,
     ) -> Self {
         Self {
             model,
             watchdog,
             output_budget,
-            cwd,
         }
     }
 
     fn sub_tools(&self, agent_kind: &str) -> Vec<Arc<dyn Tool>> {
-        let read_only = ["read", "grep", "glob", "read_output"];
+        // `explore` sub-agents get only side-effect-free tools; that is exactly
+        // the set a tool declares as parallel-read-only.
         crate::builtin_tools()
             .into_iter()
-            .filter(|t| agent_kind != "explore" || read_only.contains(&t.name()))
+            .filter(|t| {
+                agent_kind != "explore" || t.batch_policy() == BatchPolicy::ParallelReadOnly
+            })
             .collect()
     }
 }
@@ -137,7 +138,7 @@ impl Tool for TaskTool {
             max_steps: tcode_core::DEFAULT_MAX_STEPS,
         };
         let mut session = Session::new(
-            ToolCtx::new(self.cwd.clone(), self.output_budget),
+            ToolCtx::new(ctx.cwd.clone(), self.output_budget),
             PermissionMode::Unsafe,
             PermissionRules::default(),
         );

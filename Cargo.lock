@@ -2445,6 +2445,7 @@ name = "tcode-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "dirs",
  "futures",
  "globset",

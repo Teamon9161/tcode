@@ -10,7 +10,7 @@ use grep_searcher::SearcherBuilder;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_MATCH_LIMIT: usize = 200;
 /// Cap each matched line so a single giant line (minified JS, JSONL session
@@ -32,11 +32,27 @@ const SEARCH_DEADLINE: Duration = Duration::from_secs(10);
 /// into VCS metadata and caches with hundreds of thousands of files.
 const PRUNE_DIRS: &[&str] = &[
     // version control
-    ".git", ".svn", ".hg", ".bzr", ".jj", ".sl", //
+    ".git",
+    ".svn",
+    ".hg",
+    ".bzr",
+    ".jj",
+    ".sl", //
     // build outputs
-    "node_modules", "target", "dist", "build", //
+    "node_modules",
+    "target",
+    "dist",
+    "build", //
     // language / tool caches
-    ".venv", "venv", "__pycache__", ".cargo", ".rustup", ".cache", ".npm", ".gradle", ".m2",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".cargo",
+    ".rustup",
+    ".cache",
+    ".npm",
+    ".gradle",
+    ".m2",
     // OS
     "AppData",
 ];
@@ -85,6 +101,22 @@ pub struct GrepTool;
 impl Tool for GrepTool {
     fn name(&self) -> &str {
         "grep"
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelReadOnly
+    }
+
+    fn display_name(&self) -> String {
+        "Search".to_string()
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!(
+            "Search {count} {}",
+            if count == 1 { "pattern" } else { "patterns" }
+        )
     }
 
     // Precise file:line list, self-capped by head_limit and per-line bytes —
@@ -287,6 +319,22 @@ pub struct GlobTool;
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "glob"
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelReadOnly
+    }
+
+    fn display_name(&self) -> String {
+        "Find".to_string()
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!(
+            "Find {count} {}",
+            if count == 1 { "pattern" } else { "patterns" }
+        )
     }
 
     // Precise path list, capped at 200 paths — never blob-gate.

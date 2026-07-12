@@ -328,7 +328,7 @@ async fn main() -> anyhow::Result<()> {
 
     let snapshot = model_cell.snapshot();
     println!(
-        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /memory /cost{RESET}",
+        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /cd /memory /cost{RESET}",
         env!("CARGO_PKG_VERSION"),
         snapshot.provider.name(),
         snapshot.describe(),
@@ -347,6 +347,21 @@ async fn main() -> anyhow::Result<()> {
         }
         let line = line.trim().to_string();
         if line.is_empty() {
+            continue;
+        }
+        if line == "/cd" || line.starts_with("/cd ") {
+            let rest = line.strip_prefix("/cd").unwrap_or("").trim();
+            match session.change_cwd(rest) {
+                Ok(change) => {
+                    if change.changed {
+                        let _ = std::env::set_current_dir(&change.new);
+                        println!("{DIM}cwd → {}{RESET}", change.new.display());
+                    } else {
+                        println!("{DIM}cwd: {}{RESET}", change.new.display());
+                    }
+                }
+                Err(e) => eprintln!("{DIM}{e}{RESET}"),
+            }
             continue;
         }
         if let Some(rest) = line.strip_prefix("/model") {

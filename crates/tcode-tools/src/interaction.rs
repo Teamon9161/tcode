@@ -43,30 +43,67 @@ impl Tool for AskUserTool {
         "ask_user"
     }
     fn description(&self) -> &str {
-        "Ask the user a blocking question when a choice is required to continue. Provide 2–4 concise options. The selected option and any note are returned as a harness note."
+        "Ask the user one or more blocking questions when a choice is required to continue. Provide a `questions` array; each question has 2–4 concise `options` and an optional `multiSelect` to let the user pick several. Usually one question is enough — use multiple only for independent choices; they are shown as a paged dialog. All answers come back as a single harness note."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "question": { "type": "string" },
-                "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 4 }
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": { "type": "string" },
+                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 4 },
+                            "multiSelect": { "type": "boolean" }
+                        },
+                        "required": ["question", "options"]
+                    }
+                }
             },
-            "required": ["question", "options"]
+            "required": ["questions"]
         })
     }
     fn permission(&self, input: &Value) -> PermissionRequest {
         PermissionRequest::UserInput {
             descriptor: "ask_user".into(),
-            summary: input["question"]
-                .as_str()
-                .unwrap_or("Choose how to continue")
-                .into(),
+            summary: summarize_questions(input),
         }
     }
     async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
         ToolOutput::ok("user answered; read the following harness note before continuing")
     }
+}
+
+/// A one-line-per-question summary for the approval prompt. The paged TUI
+/// dialog reads the raw `questions` itself; this text is what the plain
+/// line-approver shows and what the transcript records, so it must carry
+/// every question. Tolerates a legacy single `question` + `options` shape.
+fn summarize_questions(input: &Value) -> String {
+    let questions = input["questions"].as_array().cloned().unwrap_or_else(|| {
+        input
+            .get("question")
+            .map(|_| vec![input.clone()])
+            .unwrap_or_default()
+    });
+    if questions.len() == 1 {
+        return questions[0]["question"]
+            .as_str()
+            .unwrap_or("Choose how to continue")
+            .to_string();
+    }
+    if questions.is_empty() {
+        return "Choose how to continue".into();
+    }
+    let body = questions
+        .iter()
+        .enumerate()
+        .map(|(i, q)| format!("{}. {}", i + 1, q["question"].as_str().unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{} questions:\n{body}", questions.len())
 }
 
 pub struct AddNoteTool;

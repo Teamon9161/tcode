@@ -5,7 +5,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
@@ -63,6 +63,44 @@ pub fn project_data_dir(cwd: &Path) -> Option<PathBuf> {
             .join("projects")
             .join(format!("{:016x}", fnv1a(key.as_bytes()))),
     )
+}
+
+/// Scratch space for this project the model and harness can write to:
+/// `<project-data>/scratchpad/`. Overflowed tool output and background task
+/// logs live under `scratchpad/tool-output/`. Falls back to a temp dir when
+/// there is no home directory. The directory is created lazily by writers.
+pub fn scratchpad_dir(cwd: &Path) -> PathBuf {
+    project_data_dir(cwd)
+        .unwrap_or_else(|| std::env::temp_dir().join("tcode"))
+        .join("scratchpad")
+}
+
+/// Where oversized tool output and background logs are parked so `read`/`grep`
+/// can reach them — no separate paging tool needed.
+pub fn tool_output_dir(cwd: &Path) -> PathBuf {
+    scratchpad_dir(cwd).join("tool-output")
+}
+
+/// Best-effort: delete tool-output files older than a week. Called once at
+/// startup, and only touches the directory if it already exists (so a session
+/// with no overflow never creates it).
+pub fn sweep_old_tool_output(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(Duration::from_secs(7 * 24 * 3600))
+        .unwrap_or(UNIX_EPOCH);
+    for entry in entries.flatten() {
+        let too_old = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|modified| modified < cutoff)
+            .unwrap_or(false);
+        if too_old {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Deterministic across runs and Rust versions (unlike DefaultHasher).
@@ -295,6 +333,7 @@ mod tests {
             tool_use_id: "read-plan".into(),
             content: content.clone(),
             is_error: false,
+            images: vec![],
         }]));
 
         let resumed = SessionStore::resume(&dir, None).unwrap();

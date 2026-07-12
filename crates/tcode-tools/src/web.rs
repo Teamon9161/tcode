@@ -236,11 +236,7 @@ fn cache_get(url: &str) -> Option<(String, String)> {
 fn cache_put(url: &str, final_url: String, text: String) {
     let mut c = page_cache().lock().expect("cache lock");
     if c.len() >= CACHE_MAX_ENTRIES && !c.contains_key(url) {
-        if let Some(oldest) = c
-            .iter()
-            .min_by_key(|(_, e)| e.at)
-            .map(|(k, _)| k.clone())
-        {
+        if let Some(oldest) = c.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) {
             c.remove(&oldest);
         }
     }
@@ -273,7 +269,11 @@ fn find_in_page(text: &str, pattern: &str) -> Result<String, String> {
         UTF8(|lnum, line| {
             let trimmed = line.trim_end();
             let clipped: String = if trimmed.chars().count() > FIND_MAX_LINE_CHARS {
-                trimmed.chars().take(FIND_MAX_LINE_CHARS).collect::<String>() + "…"
+                trimmed
+                    .chars()
+                    .take(FIND_MAX_LINE_CHARS)
+                    .collect::<String>()
+                    + "…"
             } else {
                 trimmed.to_string()
             };
@@ -293,7 +293,9 @@ fn find_in_page(text: &str, pattern: &str) -> Result<String, String> {
 fn fetch_output(final_url: &str, text: &str, pattern: Option<&str>) -> ToolOutput {
     match pattern {
         Some(p) => match find_in_page(text, p) {
-            Ok(hits) => ToolOutput::ok(format!("URL: {final_url}  (lines matching /{p}/)\n\n{hits}")),
+            Ok(hits) => ToolOutput::ok(format!(
+                "URL: {final_url}  (lines matching /{p}/)\n\n{hits}"
+            )),
             Err(e) => ToolOutput::err(format!("{final_url}: {e}")),
         },
         None => ToolOutput::ok(format!("URL: {final_url}\n\n{}", text.trim())),
@@ -314,8 +316,9 @@ impl Tool for WebFetchTool {
         "Fetch a URL over http(s) and return its content; HTML is converted \
          to markdown. Pass `pattern` (a regex) to get back only the matching \
          lines instead of the whole page — do this when you are looking for \
-         something specific, it is far cheaper. Large pages are truncated with \
-         a read_output paging handle. A redirect to a different site is not \
+         something specific, it is far cheaper. Large pages are truncated and \
+         the full copy saved to a file you can read or grep. A redirect to a \
+         different site is not \
          followed automatically — you get the target URL and can fetch it \
          explicitly. Responses are cached for 15 minutes."
     }
@@ -454,7 +457,10 @@ async fn mcp_search(
     });
     let mut rb = client()
         .post(url)
-        .header(reqwest::header::ACCEPT, "application/json, text/event-stream")
+        .header(
+            reqwest::header::ACCEPT,
+            "application/json, text/event-stream",
+        )
         .json(&payload);
     for (k, v) in extra_headers {
         rb = rb.header(*k, v);
@@ -528,7 +534,10 @@ async fn exa_search(
         "contextMaxCharacters": EXA_CONTEXT_CHARS,
     });
     let text = mcp_search(&url, "web_search_exa", args, &[], cancel).await?;
-    Ok(format!("Web search (Exa) for \"{query}\":\n\n{}", text.trim()))
+    Ok(format!(
+        "Web search (Exa) for \"{query}\":\n\n{}",
+        text.trim()
+    ))
 }
 
 async fn parallel_search(
@@ -643,9 +652,11 @@ async fn ddg_search(
     let results = parse_ddg_results(&body, limit);
     if results.is_empty() {
         if body.contains("anomaly") || body.contains("challenge") {
-            return Err("search backend blocked the request (bot check); retry later \
+            return Err(
+                "search backend blocked the request (bot check); retry later \
                  or use web_fetch on a known site."
-                .into());
+                    .into(),
+            );
         }
         return Ok(format!(
             "No results for '{query}'. Try fewer or different keywords."

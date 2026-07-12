@@ -12,7 +12,7 @@ use tcode_core::{
     StopReason, StreamEvent,
 };
 
-use crate::retry::connect_with_retry;
+use crate::retry::connect_once;
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 
@@ -128,9 +128,22 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>) {
                 if let ContentBlock::ToolResult {
                     tool_use_id,
                     content,
+                    images,
                     ..
                 } = block
                 {
+                    // The chat-completions `tool` role carries text only, so
+                    // images can't be inlined here. Be honest about it rather
+                    // than letting the model assume it can see them.
+                    let content = if images.is_empty() {
+                        content.clone()
+                    } else {
+                        format!(
+                            "{content}\n[{} image(s) omitted: this model cannot view images \
+                             returned from a tool]",
+                            images.len()
+                        )
+                    };
                     out.push(json!({
                         "role": "tool",
                         "tool_call_id": tool_use_id,
@@ -219,7 +232,7 @@ impl Provider for OpenAiProvider {
     ) -> Result<EventStream, ProviderError> {
         let body = self.build_body(&req);
         let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
-        let resp = connect_with_retry(&self.watchdog, || {
+        let resp = connect_once(self.watchdog.connect_timeout(), || {
             self.http
                 .post(&url)
                 .bearer_auth(&self.api_key)

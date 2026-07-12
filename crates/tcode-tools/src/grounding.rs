@@ -7,10 +7,11 @@ use std::process::Command;
 pub fn project_map(cwd: &Path) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# Environment\nplatform: {}\ncwd: {}\ndate: {}\n",
+        "# Environment\nplatform: {}\ncwd: {}\ndate: {}\nscratch: {}\n",
         std::env::consts::OS,
         cwd.display(),
         chrono_date(),
+        tcode_core::store::scratchpad_dir(cwd).display(),
     ));
 
     match git_summary(cwd) {

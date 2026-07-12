@@ -22,7 +22,12 @@
       "Bash(awk '{print $5, $9}')",
       "Bash(awk '{print $5,$NF}')",
       "WebFetch(domain:parallel.ai)",
-      "WebFetch(domain:exa.ai)"
+      "WebFetch(domain:exa.ai)",
+      "Bash(grep -v \"ContentBlock::ToolResult\\\\s*$\")",
+      "Bash(sed -i 's/\\\\[profiles.chatgpt\\\\]/[profiles.codex]/; s/^provider = \"chatgpt\"/provider = \"codex\"/' ~/.tcode/config.toml)",
+      "Bash(sed -i 's/^profile = \"chatgpt\"/profile = \"codex\"/' ~/.tcode/state.toml)",
+      "Read(//c/Users/Teamon/.tcode/**)",
+      "Bash(cargo check *)"
     ]
   }
 }

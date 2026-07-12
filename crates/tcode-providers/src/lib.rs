@@ -1,10 +1,10 @@
 mod anthropic;
-mod chatgpt;
+mod codex;
 mod openai;
 mod retry;
 
 pub use anthropic::AnthropicProvider;
-pub use chatgpt::ChatGptProvider;
+pub use codex::CodexProvider;
 pub use openai::OpenAiProvider;
 
 use std::sync::Arc;
@@ -33,9 +33,7 @@ pub fn build(
             profile.base_url.clone(),
             watchdog.clone(),
         )),
-        ProviderKind::Chatgpt => {
-            Arc::new(ChatGptProvider::new(model.name.clone(), watchdog.clone()))
-        }
+        ProviderKind::Codex => Arc::new(CodexProvider::new(model.name.clone(), watchdog.clone())),
     })
 }
 

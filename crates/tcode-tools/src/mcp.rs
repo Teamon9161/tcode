@@ -298,7 +298,11 @@ impl Tool for McpTool {
         let call = self.client.call_tool(&self.tool_name, input);
         tokio::select! {
             result = call => match result {
-                Ok((content, is_error)) => ToolOutput { content, is_error },
+                Ok((content, is_error)) => ToolOutput {
+                    content,
+                    is_error,
+                    images: Vec::new(),
+                },
                 Err(e) => ToolOutput::err(e),
             },
             _ = cancel.cancelled() => {

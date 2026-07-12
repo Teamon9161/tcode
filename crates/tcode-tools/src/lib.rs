@@ -2,7 +2,6 @@ mod fs_tools;
 mod grounding;
 mod interaction;
 mod mcp;
-mod output;
 mod search;
 mod shell;
 mod skills;
@@ -29,7 +28,6 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(fs_tools::EditTool),
         Arc::new(search::GrepTool),
         Arc::new(search::GlobTool),
-        Arc::new(output::ReadOutputTool),
         Arc::new(web::WebFetchTool),
         Arc::new(web::WebSearchTool),
         Arc::new(shell::KillTaskTool),
@@ -56,7 +54,7 @@ mod tests {
         let tools = builtin_tools();
         let gates: std::collections::HashMap<&str, bool> =
             tools.iter().map(|t| (t.name(), t.gates_output())).collect();
-        for tool in ["read", "grep", "glob", "read_output", "web_search"] {
+        for tool in ["read", "grep", "glob", "web_search"] {
             assert!(!gates[tool], "{tool} must not blob-gate its output");
         }
         // web_fetch is always present; the shell tool is named per platform.

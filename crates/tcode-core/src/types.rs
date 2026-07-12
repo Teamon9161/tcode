@@ -34,6 +34,11 @@ pub enum ContentBlock {
         tool_use_id: String,
         content: String,
         is_error: bool,
+        /// Image blocks (each a `ContentBlock::Image`) that ride alongside the
+        /// text. Empty for the overwhelming majority of results, so it stays
+        /// out of the wire format and never perturbs the cache prefix.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        images: Vec<ContentBlock>,
     },
 }
 

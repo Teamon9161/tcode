@@ -51,6 +51,8 @@ pub enum ProviderError {
     Api { status: u16, message: String },
     #[error("stream stalled: no data for {0:?}")]
     IdleTimeout(Duration),
+    #[error("no response headers within {0:?}")]
+    ConnectTimeout(Duration),
     #[error("malformed response: {0}")]
     BadResponse(String),
     #[error("configuration error: {0}")]
@@ -61,7 +63,9 @@ impl ProviderError {
     /// Whether re-sending the whole request may succeed.
     pub fn retryable(&self) -> bool {
         match self {
-            ProviderError::Network(_) | ProviderError::IdleTimeout(_) => true,
+            ProviderError::Network(_)
+            | ProviderError::IdleTimeout(_)
+            | ProviderError::ConnectTimeout(_) => true,
             ProviderError::Api { status, .. } => *status == 429 || *status >= 500,
             _ => false,
         }
