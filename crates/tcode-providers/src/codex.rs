@@ -165,7 +165,10 @@ impl CodexProvider {
     /// One connection attempt; a 401 triggers a single token refresh and one
     /// resend. Backoff retries are the agent loop's job, so failures surface as
     /// a classified error rather than being retried silently here.
-    async fn connect(&self, body: &Value) -> Result<reqwest::Response, ProviderError> {
+    async fn connect(
+        &self,
+        body: &Value,
+    ) -> Result<(reqwest::Response, Option<RateLimits>), ProviderError> {
         let mut auth = codex::load_auth().ok_or_else(|| {
             ProviderError::Config(
                 "no ChatGPT credentials found (~/.codex/auth.json); run `codex login`".into(),
@@ -174,7 +177,10 @@ impl CodexProvider {
         let mut refreshed = false;
         loop {
             match self.send(&auth, body).await {
-                Ok(resp) if resp.status().is_success() => return Ok(resp),
+                Ok(resp) if resp.status().is_success() => {
+                    let limits = rate_limits_from_headers(resp.headers());
+                    return Ok((resp, limits));
+                }
                 Ok(resp) => {
                     let status = resp.status().as_u16();
                     if status == 401 && !refreshed {
@@ -305,12 +311,18 @@ impl Provider for CodexProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         let body = self.build_body(&req);
-        let resp =
+        let (resp, header_limits) =
             with_connect_timeout(self.watchdog.connect_timeout(), self.connect(&body)).await?;
 
         let mut sse = resp.bytes_stream().eventsource();
         let raw: EventStream = Box::pin(stream! {
             let mut saw_tool_use = false;
+            // Codex reports subscription usage only in the response headers of
+            // each /responses call — never in the SSE body — so this is the one
+            // place we learn it.
+            if let Some(limits) = header_limits {
+                yield Ok(StreamEvent::RateLimits(limits));
+            }
             while let Some(item) = sse.next().await {
                 let event = match item {
                     Ok(e) => e,
@@ -369,9 +381,6 @@ impl Provider for CodexProvider {
                     }
                     "response.completed" => {
                         let resp = &data["response"];
-                        if let Some(limits) = rate_limits_from(resp.get("rate_limits").unwrap_or(&data["rate_limits"])) {
-                            yield Ok(StreamEvent::RateLimits(limits));
-                        }
                         yield Ok(StreamEvent::Usage(usage_from(&resp["usage"])));
                         let stop = if saw_tool_use {
                             StopReason::ToolUse
@@ -403,16 +412,84 @@ impl Provider for CodexProvider {
     }
 }
 
-fn rate_limits_from(value: &Value) -> Option<RateLimits> {
-    let parse = |value: &Value| {
+/// Subscription usage rides on the response headers of every /responses call,
+/// mirroring the `x-codex-*` family the Codex CLI reads. `used_percent` is the
+/// real signal (and all the status line renders); the window/reset fields are
+/// best-effort and default to 0 when absent.
+fn rate_limits_from_headers(headers: &reqwest::header::HeaderMap) -> Option<RateLimits> {
+    let window = |kind: &str| -> Option<RateLimit> {
+        let used = header_f64(headers, &format!("x-codex-{kind}-used-percent"))?;
         Some(RateLimit {
-            used_percent: value["used_percent"].as_f64()?,
-            window_minutes: value["window_minutes"].as_u64()?,
-            resets_at: value["resets_at"].as_u64()?,
+            used_percent: used,
+            window_minutes: header_u64(headers, &format!("x-codex-{kind}-window-minutes"))
+                .unwrap_or(0),
+            resets_at: header_u64(headers, &format!("x-codex-{kind}-reset-at")).unwrap_or(0),
         })
     };
     Some(RateLimits {
-        primary: parse(&value["primary"])?,
-        secondary: parse(&value["secondary"]),
+        primary: window("primary")?,
+        secondary: window("secondary"),
     })
+}
+
+fn header_f64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
+    headers.get(name)?.to_str().ok()?.trim().parse().ok()
+}
+
+fn header_u64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<u64> {
+    // reset-at is a unix timestamp the server sends as a signed int; treat any
+    // negative/garbage value as "unknown" rather than failing the whole parse.
+    let raw: i64 = headers.get(name)?.to_str().ok()?.trim().parse().ok()?;
+    u64::try_from(raw).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reqwest::header::{HeaderMap, HeaderName};
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        for (k, v) in pairs {
+            h.insert(
+                HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                v.parse().unwrap(),
+            );
+        }
+        h
+    }
+
+    #[test]
+    fn rate_limits_come_from_x_codex_headers() {
+        let limits = rate_limits_from_headers(&headers(&[
+            ("x-codex-primary-used-percent", "30.5"),
+            ("x-codex-primary-window-minutes", "300"),
+            ("x-codex-primary-reset-at", "1704069000"),
+            ("x-codex-secondary-used-percent", "66"),
+            ("x-codex-secondary-window-minutes", "10080"),
+        ]))
+        .expect("primary present");
+        assert_eq!(limits.primary.used_percent, 30.5);
+        assert_eq!(limits.primary.window_minutes, 300);
+        assert_eq!(limits.primary.resets_at, 1704069000);
+        let weekly = limits.secondary.expect("secondary present");
+        assert_eq!(weekly.used_percent, 66.0);
+        assert_eq!(weekly.resets_at, 0); // absent header defaults to 0
+    }
+
+    #[test]
+    fn no_primary_header_means_no_snapshot() {
+        // Without the used-percent signal there is nothing to show.
+        assert!(
+            rate_limits_from_headers(&headers(&[("x-codex-primary-window-minutes", "300")]))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn primary_only_leaves_secondary_none() {
+        let limits =
+            rate_limits_from_headers(&headers(&[("x-codex-primary-used-percent", "12")])).unwrap();
+        assert!(limits.secondary.is_none());
+    }
 }

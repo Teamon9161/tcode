@@ -37,6 +37,9 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 const WHEEL_STEP: usize = 3;
 /// Visible rows of an expanded tool-output region.
 const OUTPUT_VIEW_ROWS: usize = 12;
+/// Plan panel rows should stay small and predictable; long plans render as a
+/// focused window around the active step instead of stealing scroll focus.
+const PLAN_VISIBLE_STEPS: usize = 5;
 
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
@@ -158,6 +161,12 @@ struct PendingCall {
 struct PlanStep {
     step: String,
     status: String,
+}
+
+impl PlanStep {
+    fn is_completed(&self) -> bool {
+        self.status == "completed"
+    }
 }
 
 struct RewindCandidate {
@@ -682,6 +691,9 @@ impl App {
             return;
         };
         self.clear_live_text();
+        if !self.plan.is_empty() && self.plan.iter().all(PlanStep::is_completed) {
+            self.plan.clear();
+        }
         // Until the provider reports authoritative prompt usage, keep the
         // meter useful with a conservative local estimate. Text attachments
         // count here too; image token accounting is provider-specific.
@@ -923,15 +935,19 @@ impl App {
                 // A batch spanning several tools tags each item with its tool
                 // name so the reader can tell the calls apart; a single-tool
                 // batch (e.g. "Read 5 files") needs no per-item prefix.
-                let mixed = calls.iter().map(|(n, _)| n.as_str()).collect::<HashSet<_>>().len() > 1;
+                let mixed = calls
+                    .iter()
+                    .map(|(n, _)| n.as_str())
+                    .collect::<HashSet<_>>()
+                    .len()
+                    > 1;
                 for (name, input) in calls {
                     let item = batch_item_summary(&name, &input, Some(&self.cwd));
                     let mut row = vec![Span::raw("  ├ ")];
                     if mixed {
-                        row.push(Span::styled(
-                            format!("{} ", self.display_name(&name)),
-                            theme::ok(),
-                        ));
+                        // Keep per-item tool tags subdued: the batch header is
+                        // where display names get title-cased and highlighted.
+                        row.push(Span::styled(format!("{name} "), theme::dim()));
                     }
                     row.push(Span::styled(item, theme::dim()));
                     let mut header = vec![Line::from(row)];
@@ -1006,16 +1022,12 @@ impl App {
                     .or_else(|| self.pending_batch.pop_front());
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
-                let input: Option<serde_json::Value> = entry
-                    .as_ref()
-                    .and_then(|e| serde_json::from_str(&e.detail).ok());
-                // A batch item's `├ summary` was deferred to here: bake it now
-                // so this call renders as item-then-result, not clustered.
-                if let Some(entry) = entry {
-                    if !entry.header.is_empty() {
-                        self.bake(entry.header);
-                    }
-                }
+                let (input, mut batch_header): (Option<serde_json::Value>, Vec<Line<'static>>) =
+                    if let Some(entry) = entry {
+                        (serde_json::from_str(&entry.detail).ok(), entry.header)
+                    } else {
+                        (None, Vec::new())
+                    };
                 // The gated result is exactly what is appended to the next
                 // model request, so it belongs in the in-between estimate.
                 self.context_tokens = self
@@ -1025,6 +1037,9 @@ impl App {
                 // textual "edited … Result:" only repeats it, so a successful
                 // one shows nothing further. (Errors still surface below.)
                 if !is_error && matches!(name.as_str(), "edit" | "write") {
+                    if !batch_header.is_empty() {
+                        self.bake(batch_header);
+                    }
                     self.state_label = "responding".into();
                     return;
                 }
@@ -1033,16 +1048,31 @@ impl App {
                 } else {
                     theme::dim()
                 };
-                // The preview row carries the fold affordance (added by the
-                // transcript). The full output folds out on click.
+                // The head row carries the fold affordance (added by the
+                // transcript). For batch items that head is the `├ summary`
+                // row; for single calls it is the `⎿ preview` row.
                 let detail =
                     self.output_detail(&name, input.as_ref(), &preview, &content, is_error);
                 if detail.is_empty() {
-                    self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
-                } else {
+                    if batch_header.is_empty() {
+                        self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
+                    } else {
+                        append_result_preview(&mut batch_header, &preview, style);
+                        self.bake(batch_header);
+                    }
+                } else if batch_header.is_empty() {
                     let head = vec![self.output_head(&name, &preview, &content, is_error)];
                     self.transcript
                         .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+                } else {
+                    // Batch items already have a compact `├ summary` row. Hang
+                    // the fold affordance off that row instead of adding a
+                    // separate `⎿  ▸ N lines` line beneath every item.
+                    if is_error || !suppress_output_preview(&name) {
+                        append_result_preview(&mut batch_header, &preview, style);
+                    }
+                    self.transcript
+                        .push_with_detail(batch_header, detail, false, OUTPUT_VIEW_ROWS);
                 }
                 self.state_label = "responding".into();
             }
@@ -1337,6 +1367,16 @@ impl App {
             .collect()
     }
 
+    fn editor_visual_up(&mut self) -> bool {
+        let layout = editor_layout(&self.editor, area_width(&self.terminal));
+        move_editor_visual(&mut self.editor, &layout, VisualMove::Up)
+    }
+
+    fn editor_visual_down(&mut self) -> bool {
+        let layout = editor_layout(&self.editor, area_width(&self.terminal));
+        move_editor_visual(&mut self.editor, &layout, VisualMove::Down)
+    }
+
     // ------------------------------------------------------------ keys
 
     fn on_term_event(&mut self, ev: Event) {
@@ -1510,7 +1550,7 @@ impl App {
                 }
             }
             KeyCode::Char('j') if ctrl => self.editor.newline(),
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.editor.newline(),
+            KeyCode::Enter if alt || shift || ctrl => self.editor.newline(),
             KeyCode::Enter => self.submit(running),
             KeyCode::BackTab => {
                 if let Some(session) = self.session.as_mut() {
@@ -1532,14 +1572,14 @@ impl App {
             KeyCode::Up => {
                 if self.popup_active() {
                     self.popup_index = self.popup_index.saturating_sub(1);
-                } else if !self.editor.up() {
+                } else if !self.editor_visual_up() {
                     self.editor.history_prev();
                 }
             }
             KeyCode::Down => {
                 if self.popup_active() {
                     self.popup_index = (self.popup_index + 1).min(self.popup_matches().len() - 1);
-                } else if !self.editor.down() {
+                } else if !self.editor_visual_down() {
                     self.editor.history_next();
                 }
             }
@@ -1946,7 +1986,7 @@ impl App {
                 let mut lines: Vec<Line> =
                     vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
                 for (k, d) in [
-                    ("enter", "send · alt+enter/ctrl+j newline"),
+                    ("enter", "send · shift/ctrl/alt+enter newline"),
                     ("esc", "cancel current turn / clear input"),
                     ("shift+tab", "cycle permission mode"),
                     ("ctrl+v / alt+v", "paste (images become attachments)"),
@@ -2344,7 +2384,6 @@ impl App {
                         status: status.to_string(),
                     })
             })
-            .take(4)
             .collect();
     }
 
@@ -2352,19 +2391,29 @@ impl App {
         if self.plan.is_empty() {
             return Vec::new();
         }
-        let complete = self
-            .plan
-            .iter()
-            .filter(|item| item.status == "completed")
-            .count();
+        let complete = self.plan.iter().filter(|item| item.is_completed()).count();
+        let (start, end) = visible_plan_range(&self.plan, PLAN_VISIBLE_STEPS);
+        let hidden_before = start;
+        let hidden_after = self.plan.len().saturating_sub(end);
         let mut lines = vec![Line::from(vec![
             Span::styled("  plan ", theme::bold().fg(theme::ACCENT)),
             Span::styled(
                 format!("{complete}/{} complete", self.plan.len()),
                 theme::dim(),
             ),
+            if hidden_before + hidden_after > 0 {
+                Span::styled(format!(" · showing {}-{}", start + 1, end), theme::dim())
+            } else {
+                Span::raw("")
+            },
         ])];
-        lines.extend(self.plan.iter().map(|item| {
+        if hidden_before > 0 {
+            lines.push(Line::styled(
+                format!("    … {hidden_before} earlier"),
+                theme::dim(),
+            ));
+        }
+        lines.extend(self.plan[start..end].iter().map(|item| {
             let (marker, style) = match item.status.as_str() {
                 "completed" => ("✓ ", ratatui::style::Style::default().fg(theme::OK)),
                 "in_progress" => ("● ", theme::accent()),
@@ -2382,6 +2431,12 @@ impl App {
                 ),
             ])
         }));
+        if hidden_after > 0 {
+            lines.push(Line::styled(
+                format!("    … {hidden_after} later"),
+                theme::dim(),
+            ));
+        }
         lines
     }
 
@@ -2692,6 +2747,36 @@ impl App {
     }
 }
 
+fn visible_plan_range(plan: &[PlanStep], max_visible: usize) -> (usize, usize) {
+    if plan.len() <= max_visible || max_visible == 0 {
+        return (0, plan.len());
+    }
+    let focus = plan
+        .iter()
+        .position(|item| item.status == "in_progress")
+        .or_else(|| plan.iter().position(|item| item.status == "pending"))
+        .unwrap_or(plan.len() - 1);
+    let mut start = focus.saturating_sub(max_visible / 2);
+    start = start.min(plan.len().saturating_sub(max_visible));
+    (start, start + max_visible)
+}
+
+fn append_result_preview(
+    lines: &mut Vec<Line<'static>>,
+    preview: &str,
+    style: ratatui::style::Style,
+) {
+    if preview.is_empty() {
+        return;
+    }
+    let span = Span::styled(format!("  ⎿ {preview}"), style);
+    if let Some(last) = lines.last_mut() {
+        last.spans.push(span);
+    } else {
+        lines.push(Line::from(vec![span]));
+    }
+}
+
 /// Whether a `read` call targets a Markdown file (so its output is worth
 /// rendering rather than showing raw). Keyed on the tool's `path`/`file_path`.
 fn path_is_markdown(input: &serde_json::Value) -> bool {
@@ -2875,20 +2960,18 @@ fn token_count(tokens: u64) -> String {
 }
 
 fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
-    let weekly = limits.secondary.filter(|limit| limit.used_percent >= 80.0);
-    let (label, limit) = weekly
-        .map(|limit| ("week", limit))
-        .unwrap_or(("5h", limits.primary));
-    let filled = ((limit.used_percent.clamp(0.0, 100.0) / 100.0) * 12.0).round() as usize;
-    let color = if limit.used_percent >= 90.0 {
+    let primary_used = limits.primary.used_percent.clamp(0.0, 100.0);
+    let primary_remaining = 100.0 - primary_used;
+    let filled = ((primary_remaining / 100.0) * 12.0).round() as usize;
+    let color = if primary_remaining <= 10.0 {
         theme::ERROR
-    } else if limit.used_percent >= 75.0 {
+    } else if primary_remaining <= 25.0 {
         theme::WARN
     } else {
         theme::ACCENT
     };
-    Line::from(vec![
-        Span::styled(format!("  OpenAI {label} "), theme::dim()),
+    let mut spans = vec![
+        Span::styled("  Codex 5h left ", theme::dim()),
         Span::styled("▕", ratatui::style::Style::default().fg(color)),
         Span::styled(
             "▰".repeat(filled),
@@ -2896,10 +2979,34 @@ fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
         ),
         Span::styled("▱".repeat(12 - filled), theme::dim()),
         Span::styled(
-            format!("▏ {:.0}%", limit.used_percent),
+            format!("▏ {:.0}%", primary_remaining),
             ratatui::style::Style::default().fg(color),
         ),
-    ])
+    ];
+    if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 65.0) {
+        let weekly_used = weekly.used_percent.clamp(0.0, 100.0);
+        let weekly_filled = ((weekly_used / 100.0) * 12.0).round() as usize;
+        let weekly_color = if weekly_used >= 90.0 {
+            theme::ERROR
+        } else {
+            theme::WARN
+        };
+        spans.push(Span::styled(" · week used ", theme::dim()));
+        spans.push(Span::styled(
+            "▕",
+            ratatui::style::Style::default().fg(weekly_color),
+        ));
+        spans.push(Span::styled(
+            "▰".repeat(weekly_filled),
+            ratatui::style::Style::default().fg(weekly_color),
+        ));
+        spans.push(Span::styled("▱".repeat(12 - weekly_filled), theme::dim()));
+        spans.push(Span::styled(
+            format!("▏ {weekly_used:.0}%"),
+            ratatui::style::Style::default().fg(weekly_color),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn add_usage(left: Usage, right: Usage) -> Usage {
@@ -3048,6 +3155,32 @@ struct LayoutChunk {
     char_end: usize,
 }
 
+enum VisualMove {
+    Up,
+    Down,
+}
+
+fn move_editor_visual(editor: &mut Editor, layout: &EditorLayout, direction: VisualMove) -> bool {
+    let target_row = match direction {
+        VisualMove::Up => match layout.cursor_row.checked_sub(1) {
+            Some(row) => row,
+            None => return false,
+        },
+        VisualMove::Down => {
+            let row = layout.cursor_row + 1;
+            if row >= layout.lines.len() {
+                return false;
+            }
+            row
+        }
+    };
+
+    let target = &layout.lines[target_row];
+    let display_col = (target.start_col + layout.cursor_col).min(target.end_col);
+    editor.set_cursor_by_display_col(target.logical_row, display_col);
+    true
+}
+
 fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
     use unicode_width::UnicodeWidthChar;
 
@@ -3095,7 +3228,7 @@ fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
         if logical_row == cursor_line {
             let cursor_chunk = chunks
                 .iter()
-                .position(|c| c.start_col <= cursor_col && cursor_col <= c.end_col)
+                .rposition(|c| c.start_col <= cursor_col && cursor_col <= c.end_col)
                 .unwrap_or(chunks.len() - 1);
             let start = chunks[cursor_chunk].start_col;
             visual_cursor = (lines.len() + cursor_chunk, cursor_col.saturating_sub(start));
@@ -3207,6 +3340,32 @@ mod tests {
     }
 
     #[test]
+    fn editor_layout_places_boundary_cursor_on_next_soft_wrap() {
+        let mut editor = Editor::new();
+        editor.insert_str("abcdefghi");
+        editor.set_cursor(0, 6);
+        let layout = editor_layout(&editor, 10);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn editor_visual_move_crosses_soft_wrapped_lines() {
+        let mut editor = Editor::new();
+        editor.insert_str("abcdefghi");
+        // Width 10 leaves six cells inside the input border and prompt:
+        // visual rows are "abcdef" and "ghi".
+        let layout = editor_layout(&editor, 10);
+        assert_eq!((layout.cursor_row, layout.cursor_col), (1, 3));
+
+        assert!(move_editor_visual(&mut editor, &layout, VisualMove::Up));
+        assert_eq!(editor.position(), Position { row: 0, col: 3 });
+
+        let layout = editor_layout(&editor, 10);
+        assert!(move_editor_visual(&mut editor, &layout, VisualMove::Down));
+        assert_eq!(editor.position(), Position { row: 0, col: 9 });
+    }
+
+    #[test]
     fn editor_layout_marks_selection_across_a_soft_wrap() {
         let mut editor = Editor::new();
         editor.insert_str("abcdefghi");
@@ -3254,6 +3413,39 @@ mod tests {
     }
 
     #[test]
+    fn visible_plan_range_focuses_in_progress_item() {
+        let plan = (0..8)
+            .map(|i| PlanStep {
+                step: format!("step {i}"),
+                status: if i == 5 { "in_progress" } else { "pending" }.to_string(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_plan_range(&plan, 5), (3, 8));
+    }
+
+    #[test]
+    fn visible_plan_range_falls_back_to_first_pending() {
+        let plan = (0..8)
+            .map(|i| PlanStep {
+                step: format!("step {i}"),
+                status: if i < 4 { "completed" } else { "pending" }.to_string(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_plan_range(&plan, 5), (2, 7));
+    }
+
+    #[test]
+    fn visible_plan_range_shows_tail_when_all_complete() {
+        let plan = (0..8)
+            .map(|i| PlanStep {
+                step: format!("step {i}"),
+                status: "completed".to_string(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(visible_plan_range(&plan, 5), (3, 8));
+    }
+
+    #[test]
     fn context_meter_reports_percent_and_warning_color() {
         let line = context_progress_line(170_000, 200_000, 80, false);
         let text = line
@@ -3266,6 +3458,55 @@ mod tests {
             .spans
             .iter()
             .any(|span| span.style.fg == Some(theme::WARN)));
+    }
+
+    #[test]
+    fn codex_rate_limit_line_shows_5h_remaining_and_week_at_65_percent() {
+        let limits = tcode_core::RateLimits {
+            primary: tcode_core::RateLimit {
+                used_percent: 30.0,
+                window_minutes: 300,
+                resets_at: 0,
+            },
+            secondary: Some(tcode_core::RateLimit {
+                used_percent: 65.0,
+                window_minutes: 10_080,
+                resets_at: 0,
+            }),
+        };
+        let text = rate_limit_line(limits)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(text.contains("Codex 5h left"));
+        assert!(text.contains("70%"));
+        assert!(text.contains("week used ▕"));
+        assert!(text.contains("▏ 65%"));
+    }
+
+    #[test]
+    fn codex_rate_limit_line_hides_week_below_65_percent() {
+        let limits = tcode_core::RateLimits {
+            primary: tcode_core::RateLimit {
+                used_percent: 30.0,
+                window_minutes: 300,
+                resets_at: 0,
+            },
+            secondary: Some(tcode_core::RateLimit {
+                used_percent: 64.9,
+                window_minutes: 10_080,
+                resets_at: 0,
+            }),
+        };
+        let text = rate_limit_line(limits)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(!text.contains("week used"));
     }
 
     #[test]

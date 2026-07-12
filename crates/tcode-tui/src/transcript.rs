@@ -128,11 +128,30 @@ struct Block {
 
 impl Block {
     fn rewrap(&mut self, width: u16) {
-        self.head_wrapped = Wrapped::of(&self.head, width);
+        self.head_wrapped = Wrapped::of(&self.display_head(), width);
         if let Some(detail) = &mut self.detail {
             detail.wrapped = Wrapped::of(&detail.lines, width);
             detail.scroll = detail.scroll.min(detail.max_scroll());
         }
+    }
+
+    fn display_head(&self) -> Vec<Line<'static>> {
+        let mut head = self.head.clone();
+        if let (Some(last), Some(detail)) = (head.last_mut(), &self.detail) {
+            // Keep the fold affordance in the same logical line as the preview,
+            // so wrapping is computed once for the combined row. Appending it
+            // after wrapping lets the terminal/ratatui push it onto a stray
+            // extra row on narrow panes.
+            last.spans.push(if detail.open {
+                Span::styled("  ▾", crate::theme::accent())
+            } else {
+                Span::styled(
+                    format!("  ▸ {} lines", detail.lines.len()),
+                    crate::theme::accent(),
+                )
+            });
+        }
+        head
     }
 
     fn height(&self) -> usize {
@@ -142,23 +161,10 @@ impl Block {
     /// The i-th visible row of this block.
     fn row(&self, i: usize) -> (Line<'static>, bool) {
         if i < self.head_wrapped.len() {
-            let mut line = self.head_wrapped.lines[i].clone();
-            // A foldable block advertises itself on its last head row: a
-            // closed body shows "▸ N lines", an open one a "▾" that a click
-            // collapses. The accent colour marks it as interactive.
-            if i + 1 == self.head_wrapped.len() {
-                if let Some(detail) = &self.detail {
-                    line.spans.push(if detail.open {
-                        Span::styled("  ▾", crate::theme::accent())
-                    } else {
-                        Span::styled(
-                            format!("  ▸ {} lines", detail.lines.len()),
-                            crate::theme::accent(),
-                        )
-                    });
-                }
-            }
-            return (line, self.head_wrapped.starts[i]);
+            return (
+                self.head_wrapped.lines[i].clone(),
+                self.head_wrapped.starts[i],
+            );
         }
         let Some(detail) = &self.detail else {
             return (Line::default(), true);
@@ -518,10 +524,12 @@ impl Transcript {
         let Some((index, _)) = self.block_at(row) else {
             return;
         };
-        let Some(detail) = self.blocks[index].detail.as_mut() else {
+        let block = &mut self.blocks[index];
+        let Some(detail) = block.detail.as_mut() else {
             return;
         };
         detail.open = !detail.open;
+        block.rewrap(self.width);
         self.rebuild_cum();
         self.scroll = self.scroll.min(self.max_scroll());
     }

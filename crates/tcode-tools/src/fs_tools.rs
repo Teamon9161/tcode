@@ -620,9 +620,10 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan>
         return exact;
     }
     // Last resort: models often emit typographic punctuation (– " " …) where
-    // the file has plain ASCII. Match with punctuation normalized, but splice
-    // the *actual* file bytes back in so nothing else is disturbed.
-    let orig = find_punct_normalized(text, old)?;
+    // the file has plain ASCII, or drift a space inside an otherwise-identical
+    // block. Match with those differences normalized away, but splice the
+    // *actual* file bytes back in so nothing else is disturbed.
+    let orig = find_punct_normalized(text, old).or_else(|| find_ws_normalized(text, old))?;
     let count = text.match_indices(&orig).count();
     (count > 0).then_some(ReplacementPlan {
         old: orig,
@@ -662,6 +663,62 @@ fn find_punct_normalized(text: &str, old: &str) -> Option<String> {
             .map(normalize_punct)
             .eq(pat.iter().copied())
             .then(|| window.iter().collect())
+    })
+}
+
+/// Locate `old` in `text` line-by-line, ignoring *every* whitespace difference
+/// (indentation, trailing, and internal runs) plus typographic punctuation, and
+/// return the exact original file substring spanning the matched lines. This is
+/// the pattern behind the most common near-miss: the model reproduces a block
+/// verbatim but drifts one space, so nothing else in the block differs.
+///
+/// Only whole-line blocks match — a sub-line fragment fails here and falls
+/// through (its whitespace rarely differs, and the exact pass already tried it).
+/// Because the real file bytes are spliced back, the file's true formatting is
+/// what survives; the model's whitespace guess is discarded.
+fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
+    let key = |s: &str| -> String {
+        s.chars()
+            .filter(|c| !c.is_whitespace())
+            .map(normalize_punct)
+            .collect()
+    };
+    let old_keys: Vec<String> = old.lines().map(key).collect();
+    // Need at least one line with real content to anchor on; an all-blank
+    // needle would match anywhere.
+    if old_keys.iter().all(String::is_empty) {
+        return None;
+    }
+    // (byte_start, content_without_terminator, full_piece_len) per file line.
+    let mut lines: Vec<(usize, &str, usize)> = Vec::new();
+    let mut off = 0usize;
+    for piece in text.split_inclusive('\n') {
+        let content = piece
+            .strip_suffix('\n')
+            .unwrap_or(piece)
+            .strip_suffix('\r')
+            .unwrap_or_else(|| piece.strip_suffix('\n').unwrap_or(piece));
+        lines.push((off, content, piece.len()));
+        off += piece.len();
+    }
+    let m = old_keys.len();
+    if m == 0 || m > lines.len() {
+        return None;
+    }
+    let include_trailing = old.ends_with('\n');
+    (0..=lines.len() - m).find_map(|w| {
+        let matched = (0..m).all(|k| key(lines[w + k].1) == old_keys[k]);
+        if !matched {
+            return None;
+        }
+        let start = lines[w].0;
+        let (last_off, last_content, last_len) = lines[w + m - 1];
+        let end = if include_trailing {
+            last_off + last_len
+        } else {
+            last_off + last_content.len()
+        };
+        Some(text[start..end].to_string())
     })
 }
 
@@ -725,6 +782,13 @@ fn near_miss_help(text: &str, old: &str) -> String {
                  differs from your old_string):\n{}",
                 numbered(&lines[start..end], start + 1)
             ));
+            // Do not reconstruct old_string from the numbered view above (a
+            // single drifted space is the usual cause of the loop). Copy the
+            // exact bytes below verbatim, trimming to the lines you need.
+            msg.push_str(&format!(
+                "\nExact current text — copy verbatim as old_string:\n{}",
+                lines[start..end].join("\n")
+            ));
             return msg;
         }
     }
@@ -761,6 +825,52 @@ mod tests {
             text.replacen(&plan.old, &plan.new, 1),
             "let x = a + b; // ok\n"
         );
+    }
+
+    #[test]
+    fn edit_matches_through_drifted_internal_space() {
+        // The real loop: model reproduced the block verbatim but added one
+        // space (`["primary"] )` vs `["primary"])`); everything else matches.
+        let text = "\
+fn rate_limits_from() {
+    Some(RateLimits {
+        primary: parse(&value[\"primary\"])?,
+        secondary: parse(&value[\"secondary\"]),
+    })
+}
+";
+        let old = "\
+fn rate_limits_from() {
+    Some(RateLimits {
+        primary: parse(&value[\"primary\"] )?,
+        secondary: parse(&value[\"secondary\"]),
+    })
+}
+";
+        let new = "fn rate_limits_from() { None }\n";
+        let plan = replacement_plan(text, old, new).unwrap();
+        assert_eq!(plan.count, 1);
+        // The spliced `old` is the file's real bytes (no drifted space).
+        assert!(plan.old.contains("[\"primary\"])?"));
+        assert!(!plan.old.contains("[\"primary\"] )?"));
+        assert_eq!(text.replacen(&plan.old, &plan.new, 1), new);
+    }
+
+    #[test]
+    fn edit_matches_through_indentation_diff() {
+        // File is tab-indented; model guessed spaces. Real bytes are restored.
+        let text = "fn f() {\n\treturn 1;\n}\n";
+        let old = "fn f() {\n    return 1;\n}\n";
+        let plan = replacement_plan(text, old, "fn f() {\n\treturn 2;\n}\n").unwrap();
+        assert_eq!(plan.count, 1);
+        assert_eq!(plan.old, "fn f() {\n\treturn 1;\n}\n");
+    }
+
+    #[test]
+    fn edit_ws_fallback_rejects_content_mismatch() {
+        // Same shape, different token — must NOT match on whitespace alone.
+        let text = "fn f() {\n    return 1;\n}\n";
+        assert!(replacement_plan(text, "fn f() {\n    return 2;\n}\n", "x").is_none());
     }
 
     #[test]

@@ -15,7 +15,7 @@ impl Tool for UpdatePlanTool {
         "update_plan"
     }
     fn description(&self) -> &str {
-        "Record and maintain the execution plan for genuinely multi-step work; skip it for simple or localized tasks. Use a short ordered list; each item has a step and a status (pending, in_progress, or completed). Update incrementally as work advances: keep exactly one step in_progress and mark it completed the moment it finishes — never leave everything pending and batch-complete at the end."
+        "Record and maintain the visible execution plan for genuinely multi-step work; skip it for simple or localized tasks. Do not create a generic three-step checklist like inspect/edit/test, locate/change/verify, or read/implement/run tests — those add no information. Use a short ordered list only when the steps reflect the task's real dependencies, risks, or user-visible milestones. Each item has a step and a status (pending, in_progress, or completed). Update incrementally as work advances: keep exactly one step in_progress, mark a step completed the moment it lands, and immediately move the next real step to in_progress when continuing. To complete a specific step, resend the full current list with that step marked completed (and the next step in_progress if work continues). If the plan is done or no longer applies to the user's current request, send an empty plan array to clear the plan display."
     }
     fn input_schema(&self) -> Value {
         json!({

@@ -140,28 +140,6 @@ impl Editor {
         }
     }
 
-    /// Returns false when already on the first row (caller may use the
-    /// key for history navigation instead).
-    pub fn up(&mut self) -> bool {
-        self.clear_selection();
-        if self.row == 0 {
-            return false;
-        }
-        self.row -= 1;
-        self.col = self.col.min(self.lines[self.row].chars().count());
-        true
-    }
-
-    pub fn down(&mut self) -> bool {
-        self.clear_selection();
-        if self.row + 1 >= self.lines.len() {
-            return false;
-        }
-        self.row += 1;
-        self.col = self.col.min(self.lines[self.row].chars().count());
-        true
-    }
-
     pub fn home(&mut self) {
         self.clear_selection();
         self.col = 0;
