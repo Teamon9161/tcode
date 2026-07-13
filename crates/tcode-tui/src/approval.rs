@@ -174,6 +174,23 @@ impl Dialog {
         q.pages[q.page].multi
     }
 
+    pub fn paste_text(&mut self, text: String) {
+        // Dialog notes are a single logical line: terminal bracketed paste can
+        // contain newlines, but preserving them would make the bottom panel
+        // grow without bound and obscure the transcript. Keep every word and
+        // make the note editor the explicit paste target.
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if text.is_empty() {
+            return;
+        }
+        self.note_focused = true;
+        if self.questions.is_some() {
+            self.cur_page().note.insert_str(&text);
+        } else {
+            self.note.insert_str(&text);
+        }
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
         if self.questions.is_some() {
             return self.handle_question_key(key);
@@ -541,6 +558,16 @@ mod tests {
         };
         assert_eq!(a.decision, ApprovalDecision::Yes);
         assert_eq!(a.comment, None);
+    }
+
+    #[test]
+    fn dialog_paste_flattens_newlines_into_its_note() {
+        let mut d = dialog();
+        d.paste_text("keep this\nwith the details".into());
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should confirm");
+        };
+        assert_eq!(a.comment.as_deref(), Some("keep this with the details"));
     }
 
     #[test]

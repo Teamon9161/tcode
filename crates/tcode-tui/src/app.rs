@@ -116,8 +116,25 @@ impl Approver for ChannelApprover {
 }
 
 enum Attachment {
-    Image { png: Vec<u8>, label: String },
-    Text { content: String, label: String },
+    Image { id: u32, png: Vec<u8>, label: String },
+    Text { id: u32, content: String, label: String },
+}
+
+impl Attachment {
+    /// The inline token shown in the editor. Stable per attachment (the id
+    /// never renumbers within a draft) so it can be matched back for deletion.
+    fn placeholder(&self) -> String {
+        match self {
+            Attachment::Image { id, .. } => format!("[Image #{id}]"),
+            Attachment::Text { id, .. } => format!("[Pasted text #{id}]"),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Attachment::Image { label, .. } | Attachment::Text { label, .. } => label,
+        }
+    }
 }
 
 enum Phase {
@@ -216,8 +233,20 @@ pub struct App {
 
     editor: Editor,
     attachments: Vec<Attachment>,
+    /// Monotonic id for the next attachment; keeps inline tokens unique within
+    /// a draft. Reset to 1 once the draft is sent or cleared.
+    next_attachment_id: u32,
+    /// A long-lived system clipboard. Kept alive for the whole session: on
+    /// X11, arboard prints a warning to the terminal (corrupting the alternate
+    /// screen) if a `Clipboard` is dropped within 100ms of a write, so a fresh
+    /// one per copy is not an option. `None` when no local clipboard exists
+    /// (headless/SSH) — copy then falls back to OSC 52.
+    clipboard: Option<arboard::Clipboard>,
     input_hitbox: Option<InputHitbox>,
     input_mouse_active: bool,
+    /// Whether the current prompt press has actually dragged. A plain click
+    /// (no Drag event) must not copy, even if the release cell differs slightly.
+    input_dragged: bool,
     dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
     /// A change diff baked into the transcript while its approval dialog is
     /// open (so the full code is scrollable in the record, not cramped in
@@ -325,8 +354,11 @@ impl App {
             approver: Arc::new(ChannelApprover { tx: ask_tx }),
             editor: Editor::new(),
             attachments: Vec::new(),
+            next_attachment_id: 1,
+            clipboard: arboard::Clipboard::new().ok(),
             input_hitbox: None,
             input_mouse_active: false,
+            input_dragged: false,
             dialog: None,
             change_prebake: None,
             rewind_nav: None,
@@ -726,6 +758,7 @@ impl App {
         let attachment_tokens: u64 = self
             .attachments
             .iter()
+            .filter(|a| input.contains(&a.placeholder()))
             .filter_map(|attachment| match attachment {
                 Attachment::Text { content, .. } => Some(approx_tokens(content) as u64),
                 Attachment::Image { .. } => None,
@@ -749,8 +782,14 @@ impl App {
         }
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for att in self.attachments.drain(..) {
+            let placeholder = att.placeholder();
+            // Dedup: if the user deleted the inline token from the draft, the
+            // attachment goes with it — don't smuggle orphaned content along.
+            if !input.contains(&placeholder) {
+                continue;
+            }
             match att {
-                Attachment::Image { png, label } => {
+                Attachment::Image { png, label, .. } => {
                     echo.push(Line::styled(format!("  ⌞ {label}"), theme::dim()));
                     use base64::Engine as _;
                     blocks.push(ContentBlock::Image {
@@ -758,14 +797,14 @@ impl App {
                         data: base64::engine::general_purpose::STANDARD.encode(png),
                     });
                 }
-                Attachment::Text { content, label } => {
-                    echo.push(Line::styled(format!("  ⌞ {label}"), theme::dim()));
+                Attachment::Text { content, .. } => {
                     blocks.push(ContentBlock::Text {
-                        text: format!("[pasted content]\n{content}"),
+                        text: format!("{placeholder}:\n{content}"),
                     });
                 }
             }
         }
+        self.next_attachment_id = 1;
         echo.push(Line::default());
         self.transcript.push_tagged(echo, entry_index);
         blocks.push(ContentBlock::Text { text: input });
@@ -1419,15 +1458,43 @@ impl App {
             Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
                 self.on_key(key)
             }
-            Event::Paste(text) => self.on_paste_text(text),
+            Event::Paste(text) => {
+                // A dialog owns interaction while it is on screen. In
+                // particular, multiline terminal pastes must not leak into
+                // the hidden main editor and then make the restored panel jump.
+                if let Some((dialog, _)) = self.dialog.as_mut() {
+                    dialog.paste_text(text);
+                } else if self.resume_picker.is_none()
+                    && self.model_picker.is_none()
+                    && self.rewind_nav.is_none()
+                {
+                    self.on_paste_text(text);
+                }
+            }
             Event::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                     let up = mouse.kind == MouseEventKind::ScrollUp;
-                    // The wheel always scrolls the transcript — including
-                    // while an approval dialog is open, so the reviewer can
-                    // scroll back through the full pre-baked diff.
-                    self.transcript
-                        .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                    // Over the input box the wheel scrolls the prompt itself:
+                    // a long multi-line paste only shows six rows at a time, so
+                    // the wheel walks the visual cursor through it without
+                    // clicking or reaching for the arrow keys. The viewport is
+                    // cursor-derived, so moving the cursor scrolls the window.
+                    // Everywhere else — including while an approval dialog is
+                    // open (input hitbox is None then) — the wheel scrolls the
+                    // transcript so the reviewer can scroll the pre-baked diff.
+                    // Over the input the wheel nudges the prompt one line per
+                    // notch (not a page); a short prompt or one already at its
+                    // edge can't consume it, so the transcript scrolls instead.
+                    let moved_input = self.wheel_over_input(mouse.row)
+                        && if up {
+                            self.editor_visual_up()
+                        } else {
+                            self.editor_visual_down()
+                        };
+                    if !moved_input {
+                        self.transcript
+                            .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                    }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
                     if !self.input_mouse_down(mouse.column, mouse.row) {
@@ -1563,8 +1630,7 @@ impl App {
                 if running {
                     self.cancel_turn();
                 } else if !self.editor.is_empty() || !self.attachments.is_empty() {
-                    self.editor.clear();
-                    self.attachments.clear();
+                    self.clear_draft();
                 } else {
                     self.should_exit = true;
                 }
@@ -1579,8 +1645,7 @@ impl App {
                 {
                     self.open_rewind();
                 } else {
-                    self.editor.clear();
-                    self.attachments.clear();
+                    self.clear_draft();
                     self.last_esc = Some(Instant::now());
                 }
             }
@@ -1607,14 +1672,17 @@ impl App {
             KeyCode::Up => {
                 if self.popup_active() {
                     self.popup_index = self.popup_index.saturating_sub(1);
-                } else if !self.editor_visual_up() {
+                } else if !self.editor_visual_up() && self.editor.line_count() == 1 {
+                    // History recall is a single-line convenience. In a
+                    // multi-line prompt the top edge just stops — pressing up
+                    // there must not wipe the draft and jump to a history entry.
                     self.editor.history_prev();
                 }
             }
             KeyCode::Down => {
                 if self.popup_active() {
                     self.popup_index = (self.popup_index + 1).min(self.popup_matches().len() - 1);
-                } else if !self.editor_visual_down() {
+                } else if !self.editor_visual_down() && self.editor.line_count() == 1 {
                     self.editor.history_next();
                 }
             }
@@ -1624,15 +1692,11 @@ impl App {
             KeyCode::End => self.editor.end(),
             KeyCode::PageUp => self.transcript.page_up(),
             KeyCode::PageDown => self.transcript.page_down(),
-            KeyCode::Backspace if self.editor.is_empty() => {
-                if let Some(attachment) = self.attachments.pop() {
-                    let label = match attachment {
-                        Attachment::Image { label, .. } | Attachment::Text { label, .. } => label,
-                    };
-                    self.notice = Some((format!("removed {label}"), Instant::now()));
+            KeyCode::Backspace => {
+                if !self.backspace_attachment_token() {
+                    self.editor.backspace();
                 }
             }
-            KeyCode::Backspace => self.editor.backspace(),
             KeyCode::Delete => self.editor.delete(),
             KeyCode::Char(c) => {
                 self.editor.insert_char(c);
@@ -2040,11 +2104,11 @@ impl App {
                     ("enter", "send · shift/ctrl/alt+enter newline"),
                     ("esc", "cancel current turn / clear input"),
                     ("shift+tab", "cycle permission mode"),
-                    ("ctrl+v / alt+v", "paste (images become attachments)"),
+                    ("ctrl+v / alt+v", "paste (images/long text become inline tokens)"),
                     ("ctrl+a", "select prompt · ctrl+c copy selection"),
                     ("alt+c / alt+x", "copy / cut prompt"),
                     ("mouse", "click prompt to move cursor · drag to copy"),
-                    ("backspace", "delete · empty input removes last paste"),
+                    ("backspace", "delete · after an [attachment] token drops it"),
                     ("ctrl+c", "cancel / clear / exit"),
                 ] {
                     lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
@@ -2066,12 +2130,21 @@ impl App {
 
     // ----------------------------------------------------------- input mouse
 
+    /// Is the mouse row inside the input box? Used to route the wheel to the
+    /// prompt instead of the transcript. None hitbox (a dialog/picker owns the
+    /// panel) means the wheel keeps scrolling the transcript.
+    fn wheel_over_input(&self, y: u16) -> bool {
+        self.input_hitbox
+            .is_some_and(|hit| y >= hit.rect.y && y < hit.rect.bottom())
+    }
+
     fn input_mouse_down(&mut self, x: u16, y: u16) -> bool {
         let Some((row, col)) = self.input_position_at(x, y) else {
             self.input_mouse_active = false;
             return false;
         };
         self.input_mouse_active = true;
+        self.input_dragged = false;
         self.editor.start_selection_by_display_col(row, col);
         self.popup_index = 0;
         true
@@ -2079,13 +2152,19 @@ impl App {
 
     fn input_mouse_drag(&mut self, x: u16, y: u16) {
         if let Some((row, col)) = self.input_position_at(x, y) {
+            self.input_dragged = true;
             self.editor.extend_selection_by_display_col(row, col);
         }
     }
 
     fn input_mouse_up(&mut self, x: u16, y: u16) {
-        self.input_mouse_drag(x, y);
         self.input_mouse_active = false;
+        // A plain click (no drag) only repositions the cursor — never copies,
+        // even if the release cell rounds to a neighbour of the press cell.
+        if !self.input_dragged {
+            return;
+        }
+        self.input_mouse_drag(x, y);
         if let Some(text) = self.editor.selected_text() {
             self.copy_input_text(text);
         }
@@ -2156,9 +2235,10 @@ impl App {
     }
 
     fn copy_text(&mut self, text: String, what: String) {
-        let copied = arboard::Clipboard::new()
-            .and_then(|mut clipboard| clipboard.set_text(text.clone()))
-            .is_ok();
+        let copied = self
+            .clipboard
+            .as_mut()
+            .is_some_and(|clipboard| clipboard.set_text(text.clone()).is_ok());
         if !copied {
             use base64::Engine as _;
             use std::io::Write as _;
@@ -2171,49 +2251,86 @@ impl App {
     }
 
     fn paste_from_clipboard(&mut self) {
-        let Ok(mut clipboard) = arboard::Clipboard::new() else {
+        let Some(clipboard) = self.clipboard.as_mut() else {
             return;
         };
-        if let Ok(img) = clipboard.get_image() {
-            if let Some(rgba) = image::RgbaImage::from_raw(
-                img.width as u32,
-                img.height as u32,
-                img.bytes.into_owned(),
-            ) {
-                let mut png: Vec<u8> = Vec::new();
-                let dynimg = image::DynamicImage::ImageRgba8(rgba);
-                if dynimg
-                    .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-                    .is_ok()
-                {
-                    let label = format!(
-                        "image #{} ({}x{}, {}KB)",
-                        self.attachments.len() + 1,
-                        img.width,
-                        img.height,
-                        png.len() / 1024
-                    );
-                    self.attachments.push(Attachment::Image { png, label });
-                    return;
-                }
-            }
+        // Pull owned data out while the clipboard borrow is held, then release
+        // it before touching other `self` fields.
+        let image = clipboard.get_image().ok().and_then(|img| {
+            let (w, h) = (img.width, img.height);
+            let rgba = image::RgbaImage::from_raw(w as u32, h as u32, img.bytes.into_owned())?;
+            let mut png: Vec<u8> = Vec::new();
+            image::DynamicImage::ImageRgba8(rgba)
+                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                .ok()?;
+            Some((png, w, h))
+        });
+        if let Some((png, w, h)) = image {
+            let kb = png.len() / 1024;
+            self.add_attachment(|id| Attachment::Image {
+                id,
+                png,
+                label: format!("Image #{id} ({w}x{h}, {kb}KB)"),
+            });
+            return;
         }
-        if let Ok(text) = clipboard.get_text() {
+        if let Some(text) = self.clipboard.as_mut().and_then(|c| c.get_text().ok()) {
             self.on_paste_text(text);
         }
+    }
+
+    /// Discard the whole draft: editor text, attachments, and the token
+    /// numbering that ties them together.
+    fn clear_draft(&mut self) {
+        self.editor.clear();
+        self.attachments.clear();
+        self.next_attachment_id = 1;
+    }
+
+    /// Register an attachment and drop its inline token into the editor at the
+    /// cursor. The token is how the user sees, moves, and deletes it — pressing
+    /// backspace right after it removes the whole thing (see `on_key`).
+    fn add_attachment(&mut self, make: impl FnOnce(u32) -> Attachment) {
+        let id = self.next_attachment_id;
+        self.next_attachment_id += 1;
+        let att = make(id);
+        let placeholder = att.placeholder();
+        self.attachments.push(att);
+        self.editor.insert_str(&placeholder);
+    }
+
+    /// If the cursor sits immediately after an attachment's inline token,
+    /// delete the whole token and drop that attachment in one keystroke.
+    fn backspace_attachment_token(&mut self) -> bool {
+        let pos = self.editor.position();
+        let before: String = self.editor.lines()[pos.row]
+            .chars()
+            .take(pos.col)
+            .collect();
+        let Some(idx) = self
+            .attachments
+            .iter()
+            .position(|a| before.ends_with(&a.placeholder()))
+        else {
+            return false;
+        };
+        let token_len = self.attachments[idx].placeholder().chars().count();
+        for _ in 0..token_len {
+            self.editor.backspace();
+        }
+        let label = self.attachments.remove(idx).label().to_string();
+        self.notice = Some((format!("removed {label}"), Instant::now()));
+        true
     }
 
     fn on_paste_text(&mut self, text: String) {
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
         if paste_should_fold(chars, lines) {
-            let label = format!(
-                "pasted #{} ({chars} chars · {lines} lines)",
-                self.attachments.len() + 1
-            );
-            self.attachments.push(Attachment::Text {
+            self.add_attachment(|id| Attachment::Text {
+                id,
                 content: text,
-                label,
+                label: format!("Pasted text #{id} ({chars} chars · {lines} lines)"),
             });
         } else {
             self.editor.insert_str(&text);
@@ -2534,16 +2651,9 @@ impl App {
             Vec::new()
         };
         let popup_index = self.popup_index.min(popup.len().saturating_sub(1));
-        let attach_labels: Vec<String> = self
-            .attachments
-            .iter()
-            .map(|a| match a {
-                Attachment::Image { label, .. } | Attachment::Text { label, .. } => label.clone(),
-            })
-            .collect();
         let plan_lines = self.plan_lines();
 
-        use ratatui::widgets::{Block, BorderType};
+        use ratatui::widgets::{Block, BorderType, Clear};
 
         // The input box geometry is only known during layout; capture it so
         // mouse hit-testing (selection/copy in the prompt) can map screen
@@ -2553,6 +2663,11 @@ impl App {
         let transcript = &mut self.transcript;
         self.terminal.draw(|frame| {
             let area = frame.area();
+            // The lower panel changes height when a dialog opens, a paste is
+            // folded, or the editor wraps. Clear the entire frame first:
+            // widgets paint only their own cells, so otherwise letters from a
+            // previous, taller panel survive after the layout moves.
+            frame.render_widget(Clear, area);
 
             // ------- bottom panel height (transcript gets the rest) -------
             let editor_start = editor.cursor_row.saturating_sub(5);
@@ -2561,11 +2676,11 @@ impl App {
                 lines.len() as u16 + 2
             } else {
                 let mut h = editor_h + 2 + 2; // input box + context meter + hint
+                if running {
+                    h += 1; // spinner/status line above the input box
+                }
                 if !plan_lines.is_empty() {
                     h += plan_lines.len() as u16 + 2;
-                }
-                if !attach_labels.is_empty() {
-                    h += 1;
                 }
                 if self.rate_limits.is_some() {
                     h += 1;
@@ -2684,17 +2799,6 @@ impl App {
                 row(y, 1),
             );
             y += 1;
-
-            if !attach_labels.is_empty() {
-                frame.render_widget(
-                    Paragraph::new(Line::styled(
-                        format!("  ⌞ {}", attach_labels.join(" · ")),
-                        theme::accent(),
-                    )),
-                    row(y, 1),
-                );
-                y += 1;
-            }
 
             if let Some(limits) = self.rate_limits {
                 frame.render_widget(Paragraph::new(rate_limit_line(limits)), row(y, 1));
@@ -3426,6 +3530,40 @@ mod tests {
         assert!(paste_should_fold(PASTE_FOLD_CHARS + 1, 1));
         assert!(!paste_should_fold(1, PASTE_FOLD_LINES));
         assert!(paste_should_fold(1, PASTE_FOLD_LINES + 1));
+    }
+
+    #[test]
+    fn attachment_placeholder_is_stable_per_id() {
+        let img = Attachment::Image {
+            id: 2,
+            png: Vec::new(),
+            label: "Image #2".into(),
+        };
+        let txt = Attachment::Text {
+            id: 7,
+            content: String::new(),
+            label: "Pasted text #7".into(),
+        };
+        assert_eq!(img.placeholder(), "[Image #2]");
+        assert_eq!(txt.placeholder(), "[Pasted text #7]");
+    }
+
+    #[test]
+    fn inline_token_backspaces_as_a_unit() {
+        // Mirrors `backspace_attachment_token`: a backspace right after a
+        // token deletes the whole token, leaving unrelated text (and unicode
+        // before it) intact.
+        let mut e = Editor::new();
+        e.insert_str("你好 ");
+        let token = "[Image #1]";
+        e.insert_str(token);
+        let pos = e.position();
+        let before: String = e.lines()[pos.row].chars().take(pos.col).collect();
+        assert!(before.ends_with(token));
+        for _ in 0..token.chars().count() {
+            e.backspace();
+        }
+        assert_eq!(e.text(), "你好 ");
     }
 
     #[test]

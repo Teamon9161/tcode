@@ -299,7 +299,13 @@ async fn main() -> anyhow::Result<()> {
                     let Some((updated, state)) =
                         tcode_tui::wizard::reconfigure(global, &selection.profile)?
                     else {
-                        anyhow::bail!("setup cancelled — no provider changed")
+                        // Esc only cancels the provider wizard. The existing
+                        // session and active model are still valid, so restore
+                        // the TUI instead of turning a no-op into a process
+                        // error.
+                        session = *returned_session;
+                        menu = build_menu(&config, &selection, model_cell.clone());
+                        continue;
                     };
                     let path = updated.write_global(CONFIG_HEADER)?;
                     state.save();
