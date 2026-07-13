@@ -25,12 +25,14 @@ fn cell(provider: Arc<MockProvider>) -> ModelCell {
 
 struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
+    requests: Mutex<Vec<Request>>,
 }
 
 impl MockProvider {
     fn new(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
+            requests: Mutex::new(Vec::new()),
         })
     }
 }
@@ -48,9 +50,10 @@ impl Provider for MockProvider {
     }
     async fn stream(
         &self,
-        _req: Request,
+        req: Request,
         _cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(req);
         let script = self
             .scripts
             .lock()
@@ -165,6 +168,30 @@ async fn run(
         .expect("turn failed");
     drop(tx);
     collector.await.unwrap()
+}
+
+#[tokio::test]
+async fn first_request_uses_refreshed_opening_context_after_fresh_cd() {
+    let root = tempfile::tempdir().unwrap();
+    let child = root.path().join("child");
+    std::fs::create_dir(&child).unwrap();
+    let provider = MockProvider::new(vec![text_done("ready")]);
+    let agent = agent(provider.clone());
+    let mut session = session(root.path(), PermissionMode::Default);
+    session.set_opening_context("old project map".into());
+
+    let change = session.change_cwd("child").unwrap();
+    assert!(change.refresh_opening_context);
+    assert!(session.ledger.is_empty());
+    session.set_opening_context("new project map".into());
+
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+    run(&agent, &mut session, &approver, "hello").await;
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].system, "test\n\nnew project map");
+    assert!(!requests[0].system.contains("old project map"));
 }
 
 fn tool_results(session: &Session) -> Vec<(String, bool)> {

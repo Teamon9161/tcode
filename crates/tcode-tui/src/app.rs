@@ -19,6 +19,9 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::blobs::approx_tokens;
+use tcode_core::commands::{
+    CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
+};
 use tcode_core::{
     Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock, Session,
     Usage,
@@ -29,7 +32,7 @@ use crate::editor::{Editor, Position};
 use crate::model_picker::{self, ModelMenu};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
-use crate::{diff, markdown, theme};
+use crate::{diff, markdown, theme, OpeningContextFn};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -56,20 +59,13 @@ const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
     ("o", theme::DIM),
 ];
 
-const SLASH_COMMANDS: [(&str, &str); 13] = [
+/// Commands whose substance drives frontend-owned objects (key table, model
+/// picker, provider wizard). Everything else lives in the shared
+/// `CommandRegistry` in tcode-core.
+const UI_COMMANDS: [(&str, &str); 3] = [
     ("/help", "show keys and commands"),
     ("/model", "switch model · adjust reasoning effort"),
     ("/provider", "configure or switch provider"),
-    ("/cd", "change working directory: /cd <path>"),
-    ("/mode", "cycle permission mode"),
-    ("/cost", "show last turn token usage"),
-    ("/compact", "summarize history · /compact <focus>"),
-    ("/clear", "start a fresh conversation"),
-    ("/resume", "resume a session: /resume <id>"),
-    ("/note", "add a durable conversation note"),
-    ("/memory", "show memory sources · /memory on|off"),
-    ("/export", "export transcript: /export [path.md]"),
-    ("/exit", "quit tcode"),
 ];
 
 pub struct AskMsg {
@@ -209,6 +205,8 @@ struct RewindNav {
 
 pub struct App {
     agent: Arc<Agent>,
+    opening_context: OpeningContextFn,
+    registry: CommandRegistry,
     session: Option<Session>,
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
@@ -319,13 +317,18 @@ struct RetryWait {
 }
 
 impl App {
-    pub fn new(agent: Arc<Agent>, mut session: Session, menu: ModelMenu) -> anyhow::Result<Self> {
+    pub fn new(
+        agent: Arc<Agent>,
+        mut session: Session,
+        menu: ModelMenu,
+        opening_context: OpeningContextFn,
+    ) -> anyhow::Result<Self> {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let mode_label = session.mode.label().to_string();
         let cwd = session.tool_ctx.cwd.clone();
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
-            estimate_context_tokens(&agent, &session.ledger)
+            estimate_context_tokens(&agent, &session)
         } else {
             session.last_prompt_tokens
         };
@@ -341,6 +344,8 @@ impl App {
         let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
         Ok(Self {
             agent,
+            opening_context,
+            registry: CommandRegistry::builtin(),
             session: Some(session),
             cwd,
             display_names,
@@ -899,7 +904,7 @@ impl App {
         self.turn_usage = add_usage(session.turn_usage, self.delegated_usage);
         self.context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         if self.context_estimated {
-            session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
+            session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session);
         }
         self.context_tokens = session.last_prompt_tokens;
         self.context_step_start = self.context_tokens;
@@ -1814,7 +1819,7 @@ impl App {
         // echo, e.g. compacted or imported conversations.)
         self.transcript.truncate_from_entry(index);
         session.ledger.truncate_tail(index);
-        session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
+        session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session);
         self.context_tokens = session.last_prompt_tokens;
         self.context_step_start = self.context_tokens;
         self.context_estimated = !session.ledger.is_empty();
@@ -1886,163 +1891,19 @@ impl App {
         }
     }
 
-    /// `/export [path]`: write the conversation as a markdown transcript.
-    fn export_transcript(&mut self, path_arg: &str) {
-        let Some(session) = self.session.as_ref() else {
-            self.bake(vec![Line::styled(
-                "wait for the current turn before exporting",
-                theme::dim(),
-            )]);
-            return;
-        };
-        if session.ledger.is_empty() {
-            self.bake(vec![Line::styled("nothing to export yet", theme::dim())]);
-            return;
-        }
-        let path = if path_arg.is_empty() {
-            let secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-            std::path::PathBuf::from(format!("tcode-transcript-{secs}.md"))
-        } else {
-            std::path::PathBuf::from(path_arg)
-        };
-        let markdown = tcode_core::export_markdown(session.ledger.entries(), "tcode conversation");
-        match std::fs::write(&path, markdown) {
-            Ok(()) => self.bake(vec![Line::styled(
-                format!("transcript exported → {}", path.display()),
-                theme::dim(),
-            )]),
-            Err(e) => self.bake(vec![Line::styled(
-                format!("export failed: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
-        }
-    }
-
-    fn memory_status(&mut self, arg: &str) {
-        let Some(session) = self.session.as_mut() else {
-            self.bake(vec![Line::styled(
-                "wait for the current turn before inspecting memory",
-                theme::dim(),
-            )]);
-            return;
-        };
-        let (status, toggle_note) = {
-            let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
-            memory.restore_from_entries(session.ledger.entries());
-            let note = match arg {
-                "" => None,
-                "on" => Some(memory.set_enabled(true)),
-                "off" => Some(memory.set_enabled(false)),
-                _ => {
-                    drop(memory);
-                    self.bake(vec![Line::styled("usage: /memory [on|off]", theme::dim())]);
-                    return;
-                }
-            };
-            (memory.status(), note)
-        };
-        if let Some(note) = toggle_note {
-            session.ledger.append(tcode_core::Entry::Note(note));
-        }
-        let lines = status
-            .lines()
-            .map(|line| Line::styled(format!("  {line}"), theme::dim()))
-            .collect();
-        self.bake(lines);
-    }
-
-    fn change_cwd(&mut self, arg: &str) {
-        let result = match self.session.as_mut() {
-            Some(session) => session.change_cwd(arg),
-            None => {
-                self.bake(vec![Line::styled(
-                    "wait for the current turn before changing cwd",
-                    theme::dim(),
-                )]);
+    fn run_slash(&mut self, cmd: &str) {
+        // UI-only commands: their substance drives frontend-owned objects
+        // (key table, model picker, provider wizard), so they never reach
+        // the shared registry.
+        match cmd {
+            "/help" => {
+                self.show_help();
                 return;
             }
-        };
-        match result {
-            Ok(change) => {
-                self.cwd = change.new.clone();
-                if change.changed {
-                    let _ = std::env::set_current_dir(&change.new);
-                    self.bake(vec![Line::styled(
-                        format!("cwd → {}", change.new.display()),
-                        theme::dim(),
-                    )]);
-                } else {
-                    self.bake(vec![Line::styled(
-                        format!("cwd: {}", change.new.display()),
-                        theme::dim(),
-                    )]);
-                }
-            }
-            Err(e) => self.bake(vec![Line::styled(
-                e,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
-        }
-    }
-
-    fn run_slash(&mut self, cmd: &str) {
-        if cmd == "/cd" || cmd.starts_with("/cd ") {
-            self.change_cwd(cmd.strip_prefix("/cd").unwrap_or("").trim());
-            return;
-        }
-        if cmd == "/memory" || cmd.starts_with("/memory ") {
-            self.memory_status(cmd.strip_prefix("/memory").unwrap_or("").trim());
-            return;
-        }
-        if cmd == "/resume" {
-            self.open_resume_picker();
-            return;
-        }
-        if let Some(id) = cmd.strip_prefix("/resume ") {
-            self.resume_session(id.trim());
-            return;
-        }
-        if let Some(note) = cmd.strip_prefix("/note ") {
-            let note = note.trim();
-            if note.is_empty() {
-                self.bake(vec![Line::styled("usage: /note <text>", theme::dim())]);
-            } else if let Some(session) = self.session.as_mut() {
-                session
-                    .ledger
-                    .append(tcode_core::Entry::Note(note.to_string()));
-                self.bake(vec![Line::from(vec![
-                    Span::styled("› note to model — ", theme::user_prompt_message()),
-                    Span::styled(note.to_string(), theme::user_message()),
-                ])]);
-            } else {
-                self.bake(vec![Line::styled(
-                    "wait for the current turn before adding a note",
-                    theme::dim(),
-                )]);
-            }
-            return;
-        }
-        if cmd == "/export" || cmd.starts_with("/export ") {
-            self.export_transcript(cmd.strip_prefix("/export").unwrap_or("").trim());
-            return;
-        }
-        if cmd == "/compact" || cmd.starts_with("/compact ") {
-            let focus = cmd
-                .strip_prefix("/compact")
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            self.start_compact((!focus.is_empty()).then_some(focus));
-            return;
-        }
-        match cmd {
-            "/exit" | "/quit" => self.should_exit = true,
             "/provider" => {
                 self.provider_setup_requested = true;
                 self.should_exit = true;
+                return;
             }
             "/model" => {
                 let effort = self.agent.model.snapshot().effort;
@@ -2053,19 +1914,21 @@ impl App {
                         theme::dim(),
                     )]);
                 }
+                return;
             }
-            "/mode" => {
-                if let Some(session) = self.session.as_mut() {
-                    session.mode = session.mode.cycle();
-                    self.mode_label = session.mode.label().to_string();
-                    let label = self.mode_label.clone();
-                    self.bake(vec![Line::styled(
-                        format!("permission mode → {label}"),
-                        theme::dim(),
-                    )]);
-                }
-            }
-            "/cost" => {
+            _ => {}
+        }
+        let Some(command) = self.registry.find(cmd) else {
+            self.bake(vec![Line::styled(
+                format!("unknown command {cmd} — /help lists commands"),
+                theme::dim(),
+            )]);
+            return;
+        };
+        if self.session.is_none() {
+            // A running turn owns the session. /cost stays answerable from
+            // the UI's own tally; everything else waits.
+            if command.name() == "cost" {
                 let u = self.turn_usage;
                 self.bake(vec![Line::styled(
                     format!(
@@ -2074,58 +1937,96 @@ impl App {
                     ),
                     theme::dim(),
                 )]);
-            }
-            "/clear" => {
-                if let Some(session) = self.session.as_mut() {
-                    session.ledger.truncate_tail(0);
-                    session.last_prompt_tokens = 0;
-                    self.context_tokens = 0;
-                    self.context_step_start = 0;
-                    self.context_estimated = false;
-                    session
-                        .tool_ctx
-                        .freshness
-                        .lock()
-                        .expect("freshness lock")
-                        .clear();
-                    self.prev_cache_ratio = None;
-                    self.plan.clear();
-                    self.pending_tool = None;
-                    self.pending_batch.clear();
-                    self.thinking_text.clear();
-                    self.clear_conversation_screen();
-                    self.bake(vec![Line::styled("conversation cleared", theme::dim())]);
-                }
-            }
-            "/help" => {
-                let mut lines: Vec<Line> =
-                    vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
-                for (k, d) in [
-                    ("enter", "send · shift/ctrl/alt+enter newline"),
-                    ("esc", "cancel current turn / clear input"),
-                    ("shift+tab", "cycle permission mode"),
-                    ("ctrl+v / alt+v", "paste (images/long text become inline tokens)"),
-                    ("ctrl+a", "select prompt · ctrl+c copy selection"),
-                    ("alt+c / alt+x", "copy / cut prompt"),
-                    ("mouse", "click prompt to move cursor · drag to copy"),
-                    ("backspace", "delete · after an [attachment] token drops it"),
-                    ("ctrl+c", "cancel / clear / exit"),
-                ] {
-                    lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
-                }
-                lines.push(Line::styled("commands:", theme::bold().fg(theme::ACCENT)));
-                for (c, d) in SLASH_COMMANDS {
-                    lines.push(Line::styled(format!("  {c:<16} {d}"), theme::dim()));
-                }
-                self.bake(lines);
-            }
-            other => {
+            } else {
                 self.bake(vec![Line::styled(
-                    format!("unknown command {other} — /help lists commands"),
+                    "wait for the current turn to finish",
                     theme::dim(),
                 )]);
             }
+            return;
         }
+        let session = self.session.as_mut().expect("checked above");
+        let mut ctx = CommandCtx {
+            session,
+            opening_context: &self.opening_context,
+            turn_usage: self.turn_usage,
+        };
+        let outcome = self
+            .registry
+            .dispatch(&mut ctx, cmd)
+            .expect("command found above");
+        self.apply_command_outcome(outcome);
+    }
+
+    fn show_help(&mut self) {
+        let mut lines: Vec<Line> = vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
+        for (k, d) in [
+            ("enter", "send · shift/ctrl/alt+enter newline"),
+            ("esc", "cancel current turn / clear input"),
+            ("shift+tab", "cycle permission mode"),
+            ("ctrl+v / alt+v", "paste (images/long text become inline tokens)"),
+            ("ctrl+a", "select prompt · ctrl+c copy selection"),
+            ("alt+c / alt+x", "copy / cut prompt"),
+            ("mouse", "click prompt to move cursor · drag to copy"),
+            ("backspace", "delete · after an [attachment] token drops it"),
+            ("ctrl+c", "cancel / clear / exit"),
+        ] {
+            lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
+        }
+        lines.push(Line::styled("commands:", theme::bold().fg(theme::ACCENT)));
+        for (c, d) in UI_COMMANDS {
+            lines.push(Line::styled(format!("  {c:<16} {d}"), theme::dim()));
+        }
+        for (c, d) in self.registry.entries() {
+            lines.push(Line::styled(format!("  {c:<16} {d}"), theme::dim()));
+        }
+        self.bake(lines);
+    }
+
+    /// Interpret a command's effects, then bake its messages. Effects run
+    /// first: /clear must wipe the screen before "conversation cleared"
+    /// appears in the fresh transcript.
+    fn apply_command_outcome(&mut self, outcome: tcode_core::commands::CommandOutcome) {
+        for effect in outcome.effects {
+            match effect {
+                CommandEffect::Exit => self.should_exit = true,
+                CommandEffect::Compact { focus } => self.start_compact(focus),
+                CommandEffect::ConversationCleared => self.reset_conversation_ui(),
+                CommandEffect::ConversationReplaced => {
+                    self.reset_conversation_ui();
+                    self.bake_transcript();
+                }
+                CommandEffect::OpenResumePicker => self.open_resume_picker(),
+            }
+        }
+        for message in outcome.messages {
+            self.bake_command_message(message);
+        }
+        // Cheap mirror sync instead of per-command effects: a command may
+        // have moved the cwd (/cd) or cycled the permission mode (/mode).
+        if let Some(session) = self.session.as_ref() {
+            self.cwd = session.tool_ctx.cwd.clone();
+            self.mode_label = session.mode.label().to_string();
+        }
+    }
+
+    fn bake_command_message(&mut self, message: CommandMessage) {
+        let lines = match message.kind {
+            MessageKind::Info => message
+                .text
+                .lines()
+                .map(|line| Line::styled(line.to_string(), theme::dim()))
+                .collect(),
+            MessageKind::Error => vec![Line::styled(
+                message.text,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )],
+            MessageKind::Note => vec![Line::from(vec![
+                Span::styled("› note to model — ", theme::user_prompt_message()),
+                Span::styled(message.text, theme::user_message()),
+            ])],
+        };
+        self.bake(lines);
     }
 
     // ----------------------------------------------------------- input mouse
@@ -2345,12 +2246,13 @@ impl App {
             && self.editor.text().starts_with('/')
     }
 
-    fn popup_matches(&self) -> Vec<(&'static str, &'static str)> {
+    fn popup_matches(&self) -> Vec<(&str, &str)> {
         let prefix = self.editor.text();
-        SLASH_COMMANDS
+        UI_COMMANDS
             .iter()
-            .filter(|(c, _)| c.starts_with(&prefix))
             .copied()
+            .chain(self.registry.entries())
+            .filter(|(c, _)| c.starts_with(&prefix))
             .collect()
     }
 
@@ -2381,53 +2283,33 @@ impl App {
         self.bake(banner);
     }
 
-    fn resume_session(&mut self, id: &str) {
-        if matches!(self.phase, Phase::Running { .. }) {
-            self.bake(vec![Line::styled(
-                "wait for the current turn before resuming",
-                theme::dim(),
-            )]);
-            return;
-        }
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
-        let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled(
-                "cannot locate tcode session storage",
-                theme::dim(),
-            )]);
-            return;
-        };
-        match tcode_core::SessionStore::resume(&data_dir, Some(id)) {
-            Ok(resumed) => {
-                let ckpt_dir = data_dir.join("checkpoints").join(&resumed.store.id);
-                session.checkpoints =
-                    tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
-                session.ledger = resumed.ledger;
-                session.ledger.attach_sink(Box::new(resumed.store));
-                session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
-                self.context_tokens = session.last_prompt_tokens;
-                self.context_step_start = self.context_tokens;
-                self.context_estimated = !session.ledger.is_empty();
-                self.plan.clear();
-                self.pending_tool = None;
-                self.pending_batch.clear();
-                self.thinking_text.clear();
-                session
-                    .tool_ctx
-                    .freshness
-                    .lock()
-                    .expect("freshness lock")
-                    .clear();
-                self.clear_conversation_screen();
-                self.bake_transcript();
+    /// The ledger was cleared or replaced: drop turn-scoped UI state and
+    /// restart the visual conversation. Shared by /clear, /resume and
+    /// external import.
+    fn reset_conversation_ui(&mut self) {
+        if let Some(session) = self.session.as_mut() {
+            if session.last_prompt_tokens == 0 && !session.ledger.is_empty() {
+                session.last_prompt_tokens = estimate_context_tokens(&self.agent, session);
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot resume session {id}: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            self.context_tokens = session.last_prompt_tokens;
+            self.context_estimated = !session.ledger.is_empty();
+        } else {
+            self.context_tokens = 0;
+            self.context_estimated = false;
         }
+        self.context_step_start = self.context_tokens;
+        self.prev_cache_ratio = None;
+        self.plan.clear();
+        self.pending_tool = None;
+        self.pending_batch.clear();
+        self.thinking_text.clear();
+        self.clear_conversation_screen();
+    }
+
+    /// Resume picker selections route through the same registry command as
+    /// a typed `/resume <id>`.
+    fn resume_session(&mut self, id: &str) {
+        self.run_slash(&format!("/resume {}", id.trim()));
     }
 
     fn open_resume_picker(&mut self) {
@@ -2514,21 +2396,14 @@ impl App {
                 session.checkpoints = tcode_core::CheckpointStore::default();
                 session.ledger = resumed.ledger;
                 session.ledger.attach_sink(Box::new(resumed.store));
-                session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session.ledger);
-                self.context_tokens = session.last_prompt_tokens;
-                self.context_step_start = self.context_tokens;
-                self.context_estimated = !session.ledger.is_empty();
-                self.plan.clear();
-                self.pending_tool = None;
-                self.pending_batch.clear();
-                self.thinking_text.clear();
+                session.last_prompt_tokens = 0;
                 session
                     .tool_ctx
                     .freshness
                     .lock()
                     .expect("freshness lock")
                     .clear();
-                self.clear_conversation_screen();
+                self.reset_conversation_ui();
                 self.bake(vec![Line::styled(
                     format!("imported {} as tcode session {imported_id}", source.label()),
                     theme::dim(),
@@ -3261,8 +3136,8 @@ fn turn_summary_line(elapsed: f32, usage: Usage) -> Line<'static> {
 /// provider receives (system prompt, tool definitions, and conversation).
 /// Image accounting varies by provider, so use a modest fixed placeholder
 /// until the first provider usage event corrects it.
-fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
-    let system = approx_tokens(&agent.system) as u64;
+fn estimate_context_tokens(agent: &Agent, session: &Session) -> u64 {
+    let system = (approx_tokens(&agent.system) + approx_tokens(session.opening_context())) as u64;
     let tool_defs: u64 = agent
         .tools
         .iter()
@@ -3273,7 +3148,8 @@ fn estimate_context_tokens(agent: &Agent, ledger: &tcode_core::Ledger) -> u64 {
                 + approx_tokens(&schema)) as u64
         })
         .sum();
-    let conversation: u64 = ledger
+    let conversation: u64 = session
+        .ledger
         .entries()
         .iter()
         .map(|entry| match entry {

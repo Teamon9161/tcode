@@ -8,6 +8,7 @@ use anyhow::Context;
 use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
+use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
 use tcode_core::config::{Config, ConfigError, ModelState, Selection};
 use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, PermissionRules, Session, ToolCtx};
 
@@ -208,10 +209,7 @@ async fn main() -> anyhow::Result<()> {
     // Everything /model can switch to, with the swap logic attached.
     let mut menu = build_menu(&config, &selection, model_cell.clone());
 
-    let system = format!(
-        "{INTERACTIVE_AGENT_SYSTEM}\n\n{}",
-        tcode_tools::project_map(&cwd)
-    );
+    let system = INTERACTIVE_AGENT_SYSTEM.to_string();
     let mut tools = tcode_tools::builtin_tools();
     tools.push(Arc::new(tcode_tools::TaskTool::new(
         model_cell.clone(),
@@ -262,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         mode,
         rules,
     );
+    session.set_opening_context(tcode_tools::project_map(&cwd));
 
     // Persistence: every ledger mutation is recorded to a JSONL session
     // log; --continue / --resume replay it.
@@ -282,6 +281,8 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let line_approver = approver::LineApprover;
+    let opening_context: tcode_tui::OpeningContextFn =
+        Arc::new(|path| tcode_tools::project_map(path));
 
     if let Some(prompt) = cli.prompt {
         run_turn(&agent, &mut session, prompt, &line_approver).await?;
@@ -292,7 +293,7 @@ async fn main() -> anyhow::Result<()> {
     // (pipes, CI, dumb terminals).
     if interactive {
         loop {
-            match tcode_tui::run(agent.clone(), session, menu).await? {
+            match tcode_tui::run(agent.clone(), session, menu, opening_context.clone()).await? {
                 tcode_tui::Exit::Quit => return Ok(()),
                 tcode_tui::Exit::ConfigureProvider(returned_session) => {
                     let global = Config::load_global()?;
@@ -332,16 +333,17 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    let registry = CommandRegistry::builtin();
     let snapshot = model_cell.snapshot();
     println!(
-        "{DIM}tcode v{} · {} · {} · mode {} · /exit /mode /model /cd /memory /cost{RESET}",
+        "{DIM}tcode v{} · {} · {} · mode {} · /help lists commands{RESET}",
         env!("CARGO_PKG_VERSION"),
         snapshot.provider.name(),
         snapshot.describe(),
         session.mode.label(),
     );
     let stdin = std::io::stdin();
-    loop {
+    'repl: loop {
         print!("\n{CYAN}› {RESET}");
         std::io::stdout().flush()?;
         let mut line = String::new();
@@ -355,82 +357,87 @@ async fn main() -> anyhow::Result<()> {
         if line.is_empty() {
             continue;
         }
-        if line == "/cd" || line.starts_with("/cd ") {
-            let rest = line.strip_prefix("/cd").unwrap_or("").trim();
-            match session.change_cwd(rest) {
-                Ok(change) => {
-                    if change.changed {
-                        let _ = std::env::set_current_dir(&change.new);
-                        println!("{DIM}cwd → {}{RESET}", change.new.display());
-                    } else {
-                        println!("{DIM}cwd: {}{RESET}", change.new.display());
+        if line.starts_with('/') {
+            // REPL-only commands: /model drives the frontend-owned menu,
+            // /help mixes it into the shared command list.
+            if let Some(rest) = line.strip_prefix("/model") {
+                run_model_command(rest.trim(), &menu, &model_cell);
+                continue;
+            }
+            if line == "/help" {
+                println!("{DIM}commands:{RESET}");
+                println!("{DIM}  {:<16} switch model · adjust reasoning effort{RESET}", "/model");
+                for (name, help) in registry.entries() {
+                    println!("{DIM}  {name:<16} {help}{RESET}");
+                }
+                continue;
+            }
+            let turn_usage = session.turn_usage;
+            let outcome = registry.dispatch(
+                &mut CommandCtx {
+                    session: &mut session,
+                    opening_context: &opening_context,
+                    turn_usage,
+                },
+                &line,
+            );
+            let Some(outcome) = outcome else {
+                println!("{DIM}unknown command {line} — /help lists commands{RESET}");
+                continue;
+            };
+            for message in outcome.messages {
+                match message.kind {
+                    MessageKind::Info => println!("{DIM}{}{RESET}", message.text),
+                    MessageKind::Error => eprintln!("{DIM}{}{RESET}", message.text),
+                    MessageKind::Note => {
+                        println!("{DIM}› note to model — {}{RESET}", message.text)
                     }
                 }
-                Err(e) => eprintln!("{DIM}{e}{RESET}"),
             }
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("/model") {
-            run_model_command(rest.trim(), &menu, &model_cell);
-            continue;
-        }
-        if let Some(rest) = line.strip_prefix("/export") {
-            let arg = rest.trim();
-            let path = if arg.is_empty() {
-                let secs = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                format!("tcode-transcript-{secs}.md")
-            } else {
-                arg.to_string()
-            };
-            let markdown =
-                tcode_core::export_markdown(session.ledger.entries(), "tcode conversation");
-            match std::fs::write(&path, markdown) {
-                Ok(()) => println!("{DIM}transcript exported → {path}{RESET}"),
-                Err(e) => eprintln!("{DIM}export failed: {e}{RESET}"),
-            }
-            continue;
-        }
-        if line == "/memory" || line.starts_with("/memory ") {
-            let arg = line.strip_prefix("/memory").unwrap_or("").trim();
-            let (status, toggle_note) = {
-                let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
-                memory.restore_from_entries(session.ledger.entries());
-                let note = match arg {
-                    "" => None,
-                    "on" => Some(memory.set_enabled(true)),
-                    "off" => Some(memory.set_enabled(false)),
-                    _ => {
-                        eprintln!("{DIM}usage: /memory [on|off]{RESET}");
-                        continue;
+            for effect in outcome.effects {
+                match effect {
+                    CommandEffect::Exit => break 'repl,
+                    CommandEffect::Compact { focus } => {
+                        let cancel = CancellationToken::new();
+                        let watcher = {
+                            let cancel = cancel.clone();
+                            tokio::spawn(async move {
+                                if tokio::signal::ctrl_c().await.is_ok() {
+                                    cancel.cancel();
+                                }
+                            })
+                        };
+                        println!("{DIM}compacting…{RESET}");
+                        match agent
+                            .compact_with_focus(&mut session, focus.as_deref(), &cancel)
+                            .await
+                        {
+                            Ok(()) => {
+                                let u = &session.turn_usage;
+                                println!(
+                                    "{DIM}history compacted · in {} | out {}{RESET}",
+                                    u.input_tokens, u.output_tokens
+                                );
+                            }
+                            Err(e) => eprintln!("{DIM}compact failed: {e}{RESET}"),
+                        }
+                        watcher.abort();
                     }
-                };
-                (memory.status(), note)
-            };
-            if let Some(note) = toggle_note {
-                session.ledger.append(tcode_core::Entry::Note(note));
+                    CommandEffect::ConversationCleared => {}
+                    CommandEffect::ConversationReplaced => {
+                        println!(
+                            "{DIM}session resumed · {} entries{RESET}",
+                            session.ledger.len()
+                        );
+                    }
+                    CommandEffect::OpenResumePicker => {
+                        println!(
+                            "{DIM}interactive resume picker needs the full TUI — use /resume <id>{RESET}"
+                        );
+                    }
+                }
             }
-            println!("{DIM}{status}{RESET}");
             continue;
-        }
-        match line.as_str() {
-            "/exit" | "/quit" => break,
-            "/mode" => {
-                session.mode = session.mode.cycle();
-                println!("{DIM}permission mode → {}{RESET}", session.mode.label());
-                continue;
-            }
-            "/cost" => {
-                let u = &session.turn_usage;
-                println!(
-                    "{DIM}last turn: in {} | out {} | cache r {} w {}{RESET}",
-                    u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
-                );
-                continue;
-            }
-            _ => {}
         }
         if let Err(e) = run_turn(&agent, &mut session, line, &line_approver).await {
             eprintln!("{DIM}error: {e}{RESET}");

@@ -4,6 +4,7 @@ pub mod background;
 pub mod blobs;
 pub mod checkpoint;
 pub mod codex;
+pub mod commands;
 pub mod config;
 pub mod export;
 pub mod external;

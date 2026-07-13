@@ -28,6 +28,7 @@ use crossterm::terminal::{
 use tcode_core::{Agent, Session};
 
 pub use app::App;
+pub use tcode_core::commands::OpeningContextFn;
 pub use model_picker::{ModelMenu, ModelOption, SwitchFn};
 
 pub enum Exit {
@@ -40,7 +41,12 @@ pub enum Exit {
 
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
 /// the terminal is restored even if the app errors or panics.
-pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow::Result<Exit> {
+pub async fn run(
+    agent: Arc<Agent>,
+    session: Session,
+    menu: ModelMenu,
+    opening_context: OpeningContextFn,
+) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -56,7 +62,7 @@ pub async fn run(agent: Arc<Agent>, session: Session, menu: ModelMenu) -> anyhow
         default_hook(info);
     }));
 
-    let result = match App::new(agent, session, menu) {
+    let result = match App::new(agent, session, menu, opening_context) {
         Ok(mut app) => match app.run().await {
             Ok(()) if app.provider_setup_requested() => app
                 .take_session()

@@ -1,3 +1,11 @@
+mod compact;
+mod session;
+mod summarize;
+
+pub use session::{CwdChange, Session};
+pub use summarize::summarize_call;
+use summarize::{compact_successful_test_output, preview, split_malformed};
+
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -9,18 +17,11 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accumulate::ResponseAccumulator;
 use crate::config::WatchdogConfig;
-use crate::ledger::{Entry, Ledger};
-use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode, PermissionRules};
+use crate::ledger::Entry;
+use crate::permission::{ApprovalDecision, Approver, Decision};
 use crate::provider::{ProviderError, Request, StreamEvent};
-use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
-
-#[derive(Debug, Clone)]
-pub struct CwdChange {
-    pub old: PathBuf,
-    pub new: PathBuf,
-    pub changed: bool,
-}
 
 /// Default ceiling on model round-trips per user turn; a runaway loop
 /// should never bill unbounded. Configurable via `limits.max_steps_per_turn`.
@@ -102,154 +103,6 @@ pub enum AgentError {
     ChannelClosed,
 }
 
-/// Mutable per-conversation state.
-pub struct Session {
-    pub ledger: Ledger,
-    pub mode: PermissionMode,
-    pub rules: PermissionRules,
-    pub tool_ctx: ToolCtx,
-    /// File snapshots for rewind; no-op unless persistence is set up.
-    pub checkpoints: crate::checkpoint::CheckpointStore,
-    /// Prompt size of the latest request (for the context status line).
-    pub last_prompt_tokens: u64,
-    pub turn_usage: Usage,
-}
-
-impl Session {
-    pub fn new(tool_ctx: ToolCtx, mode: PermissionMode, rules: PermissionRules) -> Self {
-        Self {
-            ledger: Ledger::new(),
-            mode,
-            rules,
-            tool_ctx,
-            checkpoints: crate::checkpoint::CheckpointStore::default(),
-            last_prompt_tokens: 0,
-            turn_usage: Usage::default(),
-        }
-    }
-
-    /// Change the conversation working directory. This is append-only: when the
-    /// cwd changes mid-conversation, a harness note tells the model that future
-    /// relative paths resolve against the new directory and includes any newly
-    /// discovered directory-scoped instructions for that location.
-    pub fn change_cwd(&mut self, arg: &str) -> Result<CwdChange, String> {
-        let old = self.tool_ctx.cwd.clone();
-        let Some(new) = resolve_cd_target(&old, arg)? else {
-            return Ok(CwdChange {
-                old: old.clone(),
-                new: old,
-                changed: false,
-            });
-        };
-        if same_path(&old, &new) {
-            return Ok(CwdChange {
-                old,
-                new,
-                changed: false,
-            });
-        }
-
-        self.tool_ctx.cwd = new.clone();
-        let memory_note = {
-            let mut memory = self.tool_ctx.memory.lock().expect("memory lock");
-            memory.restore_from_entries(self.ledger.entries());
-            memory
-                .discover_for_paths(std::slice::from_ref(&new))
-                .map(|update| update.note)
-        };
-        let mut note = format!(
-            "Working directory changed by the user from {} to {}. Future relative tool paths, default shell cwd, grep/glob defaults, and cwd-relative operations now resolve against {}. Do not rely on the startup project map or earlier cwd-specific assumptions for the new directory; inspect as needed.",
-            old.display(),
-            new.display(),
-            new.display()
-        );
-        if let Some(memory_note) = memory_note {
-            note.push_str("\n\n");
-            note.push_str(&memory_note);
-        }
-        self.ledger.append(Entry::Note(note));
-        Ok(CwdChange {
-            old,
-            new,
-            changed: true,
-        })
-    }
-
-    /// Tail self-awareness line: the model can only manage its context
-    /// budget if it knows it. Appended inside the newest user entry, so
-    /// the prompt prefix never changes retroactively (cache-safe).
-    fn status_block(&self, context_window: u64) -> Option<ContentBlock> {
-        if self.last_prompt_tokens == 0 {
-            return None;
-        }
-        let pct = (self.last_prompt_tokens as f64 / context_window as f64 * 100.0).round();
-        let background = {
-            let tasks = self.tool_ctx.background.lock().expect("background lock");
-            let running = tasks.running();
-            if running.is_empty() {
-                String::new()
-            } else {
-                format!(" · background tasks running: {}", running.join(", "))
-            }
-        };
-        Some(ContentBlock::Text {
-            text: format!(
-                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}</tcode-status>",
-                context_window / 1000,
-                self.mode.label()
-            ),
-        })
-    }
-}
-
-fn resolve_cd_target(current: &Path, arg: &str) -> Result<Option<PathBuf>, String> {
-    let arg = strip_matching_quotes(arg.trim());
-    if arg.is_empty() {
-        return Ok(None);
-    }
-    let raw = if arg == "~" {
-        dirs::home_dir().ok_or_else(|| "cannot expand ~: no home directory found".to_string())?
-    } else if let Some(rest) = arg.strip_prefix("~/").or_else(|| arg.strip_prefix("~\\")) {
-        dirs::home_dir()
-            .ok_or_else(|| "cannot expand ~: no home directory found".to_string())?
-            .join(rest)
-    } else {
-        PathBuf::from(arg)
-    };
-    let candidate = if raw.is_absolute() {
-        raw
-    } else {
-        current.join(raw)
-    };
-    let resolved = candidate
-        .canonicalize()
-        .map_err(|e| format!("cannot cd to {}: {e}", candidate.display()))?;
-    if !resolved.is_dir() {
-        return Err(format!("not a directory: {}", resolved.display()));
-    }
-    Ok(Some(resolved))
-}
-
-fn strip_matching_quotes(s: &str) -> &str {
-    if s.len() >= 2 {
-        let bytes = s.as_bytes();
-        if (bytes[0] == b'\"' && bytes[s.len() - 1] == b'\"')
-            || (bytes[0] == b'\'' && bytes[s.len() - 1] == b'\'')
-        {
-            return &s[1..s.len() - 1];
-        }
-    }
-    s
-}
-
-fn same_path(a: &Path, b: &Path) -> bool {
-    path_key(a) == path_key(b)
-}
-
-fn path_key(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/").to_lowercase()
-}
-
 pub struct Agent {
     /// Swappable model handle; each turn snapshots it once.
     pub model: crate::provider::ModelCell,
@@ -269,6 +122,14 @@ impl Agent {
 
     fn tool_defs(&self) -> Vec<crate::ToolDef> {
         self.tools.iter().map(|t| t.as_ref().def()).collect()
+    }
+
+    pub(super) fn system_prompt(&self, session: &Session) -> String {
+        if session.opening_context().is_empty() {
+            self.system.clone()
+        } else {
+            format!("{}\n\n{}", self.system, session.opening_context())
+        }
     }
 
     /// Drive one user turn to completion: stream → run tools → repeat
@@ -381,81 +242,6 @@ impl Agent {
         Ok(())
     }
 
-    /// Summarize the whole ledger into one entry — the single deliberate
-    /// cache-invalidating operation. Also used by `/compact`.
-    pub async fn compact(
-        &self,
-        session: &mut Session,
-        cancel: &CancellationToken,
-    ) -> Result<(), AgentError> {
-        self.compact_with_focus(session, None, cancel).await
-    }
-
-    /// Compact with an optional user-requested emphasis. The focus guides the
-    /// summary but never replaces the baseline continuation requirements.
-    pub async fn compact_with_focus(
-        &self,
-        session: &mut Session,
-        focus: Option<&str>,
-        cancel: &CancellationToken,
-    ) -> Result<(), AgentError> {
-        if session.ledger.is_empty() {
-            return Ok(());
-        }
-        let mut messages = session.ledger.as_messages();
-        messages.push(crate::Message {
-            role: crate::Role::User,
-            content: vec![ContentBlock::Text {
-                text: compact_prompt(focus),
-            }],
-        });
-        let model = self.model.snapshot();
-        let req = Request {
-            model: model.provider.model().to_string(),
-            system: self.system.clone(),
-            messages,
-            tools: Vec::new(),
-            max_tokens: model.max_tokens,
-            effort: model.effort.clone(),
-        };
-        let mut stream = model.provider.stream(req, cancel.clone()).await?;
-        let mut acc = ResponseAccumulator::new();
-        while let Some(item) = stream.next().await {
-            acc.feed(&item?);
-        }
-        let (blocks, usage, _) = acc.finish();
-        let summary: String = blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        // A cancelled or empty summary must not wipe the history.
-        if cancel.is_cancelled() || summary.trim().is_empty() {
-            return Ok(());
-        }
-        let upto = session.ledger.len();
-        session.ledger.compact(summary, upto);
-        let memory_note = session
-            .tool_ctx
-            .memory
-            .lock()
-            .expect("memory lock")
-            .post_compact_note();
-        if let Some(note) = memory_note {
-            session.ledger.append(Entry::Note(note));
-        }
-        session.turn_usage.input_tokens += usage.input_tokens;
-        session.turn_usage.output_tokens += usage.output_tokens;
-        session.turn_usage.cache_read_tokens += usage.cache_read_tokens;
-        session.turn_usage.cache_write_tokens += usage.cache_write_tokens;
-        // Unknown until the next request reports it.
-        session.last_prompt_tokens = 0;
-        Ok(())
-    }
-
     /// One model request with watchdog retries. Text emitted by a failed
     /// attempt is preserved as transcript-only history before the retry.
     async fn stream_step(
@@ -469,7 +255,7 @@ impl Agent {
         'retry: loop {
             let req = Request {
                 model: model.provider.model().to_string(),
-                system: self.system.clone(),
+                system: self.system_prompt(session),
                 messages: session.ledger.as_messages(),
                 tools: self.tool_defs(),
                 max_tokens: model.max_tokens,
@@ -1565,21 +1351,6 @@ impl Agent {
     }
 }
 
-const COMPACT_PROMPT: &str = include_str!("../../../prompts/compact.md");
-
-fn compact_prompt(focus: Option<&str>) -> String {
-    let focus = focus
-        .map(str::trim)
-        .filter(|focus| !focus.is_empty())
-        .map(|focus| {
-            format!(
-                "Additional user-requested summary focus (this supplements, not replaces, the required continuation details):\n{focus}\n\n"
-            )
-        })
-        .unwrap_or_default();
-    COMPACT_PROMPT.replace("{{USER_FOCUS}}", &focus)
-}
-
 struct ToolsOutcome {
     interrupted: bool,
     awaiting_user_input: bool,
@@ -1625,27 +1396,6 @@ fn normalize_path(path: PathBuf) -> PathBuf {
     normalized
 }
 
-/// An interrupted stream can leave a tool_use whose input JSON never
-/// finished; the accumulator falls back to a raw string for those.
-/// They must not be replayed to the API.
-fn split_malformed(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, bool) {
-    let mut dropped = false;
-    let kept = blocks
-        .into_iter()
-        .filter(|b| match b {
-            ContentBlock::ToolUse {
-                input: Value::String(_),
-                ..
-            } => {
-                dropped = true;
-                false
-            }
-            _ => true,
-        })
-        .collect();
-    (kept, dropped)
-}
-
 fn tool_result(id: &str, content: &str, is_error: bool) -> ContentBlock {
     tool_result_with_images(id, content, is_error, Vec::new())
 }
@@ -1664,146 +1414,3 @@ fn tool_result_with_images(
     }
 }
 
-fn preview(s: &str) -> String {
-    let mut line = s.lines().next().unwrap_or("").to_string();
-    if line.chars().count() > 120 {
-        line = line.chars().take(120).collect::<String>() + "…";
-    }
-    let extra = s.lines().count().saturating_sub(1);
-    if extra > 0 {
-        line.push_str(&format!(" (+{extra} lines)"));
-    }
-    line
-}
-
-/// Successful test runs often contain several nearly-identical target blocks
-/// (especially doctests and crates with zero tests).  Keep the evidence that
-/// matters to both the human and model while avoiding needless context use.
-/// Any error-like marker leaves the original output untouched for diagnosis.
-fn compact_successful_test_output(output: String) -> String {
-    if !(output.contains("test result: ok.")
-        && output.contains("running ")
-        && !output.contains("test result: FAILED")
-        && !output.contains("error:")
-        && !output.contains("failures:"))
-    {
-        return output;
-    }
-    let running: Vec<&str> = output
-        .lines()
-        .filter(|line| line.trim_start().starts_with("running ") && line.contains(" tests"))
-        .collect();
-    let Some(first) = running
-        .iter()
-        .copied()
-        .find(|line| !line.contains("running 0 tests"))
-    else {
-        return output;
-    };
-    let passed = output
-        .lines()
-        .filter(|line| line.trim_start().starts_with("test result: ok."))
-        .find(|line| !line.contains("0 passed"))
-        .unwrap_or("test result: ok.");
-    format!("{first}\n… successful test output folded …\n{passed}")
-}
-
-/// One-line description of a call for the UI, e.g. `shell(cargo build)`.
-pub fn summarize_call(name: &str, input: &Value) -> String {
-    // "file_path" covers imported Claude Code calls (Read/Edit/Write).
-    let arg = [
-        "command",
-        "path",
-        "file_path",
-        "pattern",
-        "id",
-        "agent",
-        "url",
-        "query",
-    ]
-    .iter()
-    .find_map(|k| input.get(k).and_then(|v| v.as_str()))
-    .unwrap_or("");
-    if arg.is_empty() {
-        name.to_string()
-    } else {
-        format!("{name}({arg})")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{compact_prompt, compact_successful_test_output, Session};
-    use crate::{Entry, PermissionMode, PermissionRules, ToolCtx};
-
-    #[test]
-    fn change_cwd_appends_model_visible_note() {
-        let root = std::env::temp_dir().join(format!(
-            "tcode-cd-test-{}-{}",
-            std::process::id(),
-            "change-cwd"
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(root.join("child")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let child = root.join("child").canonicalize().unwrap();
-
-        let mut session = Session::new(
-            ToolCtx::new(root.clone(), 1_000),
-            PermissionMode::Default,
-            PermissionRules::default(),
-        );
-        let change = session.change_cwd("child").unwrap();
-
-        assert!(change.changed);
-        assert_eq!(change.old, root);
-        assert_eq!(change.new, child);
-        assert_eq!(session.tool_ctx.cwd, child);
-        assert!(matches!(
-            session.ledger.entries().last(),
-            Some(Entry::Note(text))
-                if text.contains("Working directory changed by the user")
-                    && text.contains("Future relative tool paths")
-        ));
-
-        let entries = session.ledger.len();
-        let change = session.change_cwd(".").unwrap();
-        assert!(!change.changed);
-        assert_eq!(session.ledger.len(), entries);
-
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn folds_repeated_successful_test_blocks() {
-        let output = "running 24 tests\n........................\ntest result: ok. 24 passed; 0 failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed";
-        let folded = compact_successful_test_output(output.into());
-        assert!(folded.contains("running 24 tests"));
-        assert!(folded.contains("folded"));
-        assert!(!folded.contains("running 0 tests"));
-    }
-
-    #[test]
-    fn compact_prompt_omits_focus_section_when_none_is_given() {
-        let prompt = compact_prompt(None);
-        assert!(!prompt.contains("Additional user-requested summary focus"));
-        assert!(!prompt.contains("{{USER_FOCUS}}"));
-    }
-
-    #[test]
-    fn compact_focus_supplements_required_summary_details() {
-        let prompt = compact_prompt(Some("prioritize API decisions and migration risks"));
-        assert!(prompt.contains("**Current state**"));
-        assert!(prompt.contains("**Next steps**"));
-        assert!(prompt.contains("prioritize API decisions and migration risks"));
-        assert!(prompt.contains("supplements, not replaces"));
-        assert!(!prompt.contains("{{USER_FOCUS}}"));
-        assert!(prompt.ends_with("Output only the summary text.\n"));
-    }
-
-    #[test]
-    fn retains_failed_test_output() {
-        let output = "running 2 tests\ntest result: FAILED. 1 passed; 1 failed";
-        assert_eq!(compact_successful_test_output(output.into()), output);
-    }
-}
