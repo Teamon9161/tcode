@@ -76,16 +76,21 @@ impl AnthropicProvider {
                 })
             })
             .collect();
+        let mut system = vec![json!({
+            "type": "text",
+            "text": req.system,
+            "cache_control": { "type": "ephemeral" },
+        })];
+        if let Some(suffix) = &req.system_suffix {
+            system.push(json!({ "type": "text", "text": suffix }));
+        }
         let mut body = json!({
             "model": req.model,
             "max_tokens": req.max_tokens,
             "stream": true,
-            // Breakpoint after system covers tools + system prefix.
-            "system": [{
-                "type": "text",
-                "text": req.system,
-                "cache_control": { "type": "ephemeral" },
-            }],
+            // Breakpoint after the stable system prefix; classifier stages put
+            // their differing instruction into an uncached tail block.
+            "system": system,
             "messages": messages,
         });
         if !tools.is_empty() {
@@ -342,6 +347,8 @@ mod tests {
         Request {
             model: "m".into(),
             system: "sys".into(),
+            system_suffix: None,
+            cache_scope: None,
             messages: vec![Message {
                 role: Role::User,
                 content: vec![ContentBlock::Text { text: "hi".into() }],
@@ -399,6 +406,19 @@ mod tests {
             )
             .native
         );
+    }
+
+    #[test]
+    fn classifier_suffix_follows_the_cached_system_prefix() {
+        let mut request = req(Some("off"));
+        request.system_suffix = Some("stage-specific verdict instruction".into());
+        let system = native().build_body(&request)["system"].clone();
+        let blocks = system.as_array().expect("system blocks");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0]["text"], "sys");
+        assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
+        assert_eq!(blocks[1]["text"], "stage-specific verdict instruction");
+        assert!(blocks[1].get("cache_control").is_none());
     }
 
     #[test]

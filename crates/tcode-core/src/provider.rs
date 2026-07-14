@@ -10,7 +10,18 @@ use crate::types::{Message, RateLimits, StopReason, ToolDef, Usage};
 #[derive(Debug, Clone)]
 pub struct Request {
     pub model: String,
+    /// Stable, cacheable system prefix.
     pub system: String,
+    /// Optional per-request system tail. Classifier stage two changes only this
+    /// field, preserving `system` as a cacheable prefix.
+    pub system_suffix: Option<String>,
+    /// Which conversation this request belongs to. `None` is the main session.
+    /// Anything with its own prefix — the Auto Mode classifier, a sub-agent —
+    /// must name its own scope: providers keyed by an explicit cache id (Codex)
+    /// give distinct scopes distinct ids, because interleaving unrelated
+    /// prefixes on one id costs all of them cache affinity. Providers whose
+    /// cache is addressed by the prefix itself (Anthropic, OpenAI) ignore it.
+    pub cache_scope: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
     pub max_tokens: u32,
@@ -129,9 +140,10 @@ impl ModelCell {
     }
 }
 
-/// Which model each sub-agent kind runs on, when it is not simply following
-/// the main one. Shared between the `task` tool and the frontend that edits
-/// the pins (`/agents`), and swappable for the same reason `ModelCell` is:
+/// Which auxiliary model role runs on a pinned model rather than following
+/// the main one. Roles cover sub-agents and the Auto Mode classifier. Shared
+/// between the consumers and the frontend that edits pins (`/agents`), and
+/// swappable for the same reason `ModelCell` is:
 /// a pick must apply to the next sub-agent, not the next process.
 ///
 /// Absent kind = inherit: that sub-agent uses the parent's `ModelCell` and so

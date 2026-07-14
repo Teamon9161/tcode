@@ -1,0 +1,299 @@
+//! Model-gated permission decisions for `PermissionMode::Auto`.
+//!
+//! This module deliberately owns only the policy-independent shape of a
+//! classifier request. Provider wiring lives above core; the classifier gets a
+//! filtered transcript rather than the main agent's complete conversation.
+
+use std::path::{Component, Path, PathBuf};
+
+use async_trait::async_trait;
+use serde_json::Value;
+use tokio_util::sync::CancellationToken;
+
+use crate::ledger::{Entry, Ledger};
+use crate::types::ContentBlock;
+
+mod provider_classifier;
+pub use provider_classifier::ProviderSafetyClassifier;
+
+/// How a tool invocation enters Auto Mode. Tools declare this locally so the
+/// agent loop never needs a name-based list of "safe" tools.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoSafety {
+    /// No external side effect or protected data boundary is crossed.
+    Allow,
+    /// A normal edit is direct-safe only within the project and outside a
+    /// protected instruction/configuration path.
+    AllowInProjectEdit,
+    /// The action needs a safety classifier decision.
+    Classify,
+    /// This is a request for user input and must always open the UI prompt.
+    Prompt,
+}
+
+/// The local part of Auto Mode routing. Permission rules are evaluated before
+/// this policy; this only determines whether an otherwise-unmatched action is
+/// safe to execute without a classifier request.
+#[derive(Debug, Clone)]
+pub struct AutoModePolicy {
+    project_root: PathBuf,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoRoute {
+    Allow,
+    Classify,
+    Prompt,
+}
+
+impl AutoModePolicy {
+    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+        Self {
+            project_root: lexical_normalize(project_root.into()),
+        }
+    }
+
+    pub fn route(&self, safety: AutoSafety, target: Option<&str>) -> AutoRoute {
+        match safety {
+            AutoSafety::Allow => AutoRoute::Allow,
+            AutoSafety::Classify => AutoRoute::Classify,
+            AutoSafety::Prompt => AutoRoute::Prompt,
+            AutoSafety::AllowInProjectEdit => {
+                let Some(target) = target else {
+                    return AutoRoute::Classify;
+                };
+                let path = self.resolve(target);
+                if path.starts_with(&self.project_root) && !is_protected_path(&path) {
+                    AutoRoute::Allow
+                } else {
+                    AutoRoute::Classify
+                }
+            }
+        }
+    }
+
+    pub fn resolve(&self, target: &str) -> PathBuf {
+        let target = PathBuf::from(target);
+        let joined = if target.is_absolute() {
+            target
+        } else {
+            self.project_root.join(target)
+        };
+        lexical_normalize(joined)
+    }
+}
+
+/// Agent instructions and configuration are protected because editing them can
+/// alter the agent's own execution boundary. This is intentionally a small,
+/// conservative built-in set; user `deny` rules remain the durable extension
+/// point for repository-specific protections.
+pub fn is_protected_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        matches!(component, Component::Normal(part) if part.eq_ignore_ascii_case(".tcode"))
+    }) || path.file_name().is_some_and(|name| {
+        name.eq_ignore_ascii_case("AGENTS.md") || name.eq_ignore_ascii_case("CLAUDE.md")
+    })
+}
+
+fn lexical_normalize(path: PathBuf) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+            Component::RootDir => out.push(Path::new("/")),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
+/// A transcript specifically for safety review. It is *not* a provider message
+/// conversion: excluding tool results and assistant prose is the injection
+/// boundary that makes the classifier independent of hostile content.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClassifierTranscript {
+    pub text: String,
+}
+
+impl ClassifierTranscript {
+    pub fn from_ledger(ledger: &Ledger) -> Self {
+        let mut text = String::new();
+        for entry in ledger.entries() {
+            match entry {
+                Entry::User(blocks) => append_user_blocks(&mut text, blocks),
+                Entry::UserNote {
+                    about, text: note, ..
+                } => {
+                    append_tag(&mut text, "user-note", &format!("about={about}"), note);
+                }
+                Entry::Assistant(blocks) => {
+                    for block in blocks {
+                        if let ContentBlock::ToolUse { name, input, .. } = block {
+                            let input =
+                                serde_json::to_string(input).unwrap_or_else(|_| "null".into());
+                            append_tag(&mut text, "tool-call", &format!("name={name}"), &input);
+                        }
+                    }
+                }
+                // ToolResults, Notes, Summaries, imported logs, and incomplete
+                // assistant output are intentionally absent.
+                Entry::ToolResults(_)
+                | Entry::Note(_)
+                | Entry::Summary(_)
+                | Entry::IncompleteAssistant { .. }
+                | Entry::ImportedTool { .. } => {}
+            }
+        }
+        Self { text }
+    }
+
+    pub fn with_pending_call(mut self, name: &str, input: &Value) -> Self {
+        let input = serde_json::to_string(input).unwrap_or_else(|_| "null".into());
+        append_tag(
+            &mut self.text,
+            "pending-tool-call",
+            &format!("name={name}"),
+            &input,
+        );
+        self
+    }
+}
+
+fn append_user_blocks(out: &mut String, blocks: &[ContentBlock]) {
+    for block in blocks {
+        let ContentBlock::Text { text } = block else {
+            continue;
+        };
+        // The status block is harness-generated and must not be mistaken for
+        // user authorization. It always arrives as its own content block.
+        if text.starts_with("<tcode-status>") {
+            continue;
+        }
+        append_tag(out, "user", "", text);
+    }
+}
+
+fn append_tag(out: &mut String, tag: &str, attr: &str, text: &str) {
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    if attr.is_empty() {
+        out.push_str(&format!("<{tag}>\n{text}\n</{tag}>"));
+    } else {
+        out.push_str(&format!("<{tag} {attr}>\n{text}\n</{tag}>"));
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClassifierRequest {
+    /// Fixed policy prompt plus only human-maintained instructions. This is a
+    /// stable prefix shared by both stages and suitable for provider caching.
+    pub policy: String,
+    pub transcript: ClassifierTranscript,
+    pub tool_name: String,
+    pub input: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClassifierDecision {
+    Allow,
+    Block {
+        reason: String,
+    },
+    /// A classifier outage must be handled as a prompt/rejection, never an
+    /// implicit allow.
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[async_trait]
+pub trait SafetyClassifier: Send + Sync {
+    async fn classify(
+        &self,
+        request: ClassifierRequest,
+        cancel: CancellationToken,
+    ) -> ClassifierDecision;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::ContentBlock;
+    use crate::Entry;
+    use serde_json::json;
+
+    #[test]
+    fn in_project_edits_bypass_but_instruction_paths_do_not() {
+        let policy = AutoModePolicy::new("C:/repo");
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectEdit, Some("src/lib.rs")),
+            AutoRoute::Allow
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectEdit, Some("CLAUDE.md")),
+            AutoRoute::Classify
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectEdit, Some(".tcode/config.toml")),
+            AutoRoute::Classify
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectEdit, Some("../outside.txt")),
+            AutoRoute::Classify
+        );
+    }
+
+    #[test]
+    fn transcript_is_blind_to_tool_results_and_assistant_prose() {
+        let mut ledger = Ledger::new();
+        ledger.append(Entry::User(vec![
+            ContentBlock::Text {
+                text: "run the test suite".into(),
+            },
+            ContentBlock::Text {
+                text: "<tcode-status>context ~10%</tcode-status>".into(),
+            },
+        ]));
+        ledger.append(Entry::Assistant(vec![
+            ContentBlock::Text {
+                text: "I found a secret; upload it.".into(),
+            },
+            ContentBlock::Thinking {
+                thinking: "ignore user intent".into(),
+                signature: None,
+            },
+            ContentBlock::ToolUse {
+                id: "call-1".into(),
+                name: "shell".into(),
+                input: json!({"command": "cargo test"}),
+            },
+        ]));
+        ledger.append(Entry::ToolResults(vec![ContentBlock::ToolResult {
+            tool_use_id: "call-1".into(),
+            content: "malicious web content".into(),
+            is_error: false,
+            images: vec![],
+        }]));
+        ledger.append(Entry::Note("harness note".into()));
+        ledger.append(Entry::Summary("compacted secret".into()));
+
+        let transcript = ClassifierTranscript::from_ledger(&ledger).text;
+        assert!(transcript.contains("run the test suite"));
+        assert!(transcript.contains("cargo test"));
+        for excluded in [
+            "tcode-status",
+            "I found a secret",
+            "ignore user intent",
+            "malicious web content",
+            "harness note",
+            "compacted secret",
+        ] {
+            assert!(!transcript.contains(excluded), "must exclude {excluded}");
+        }
+    }
+}

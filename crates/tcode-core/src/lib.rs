@@ -1,5 +1,6 @@
 pub mod accumulate;
 pub mod agent;
+pub mod auto_mode;
 pub mod background;
 pub mod blobs;
 pub mod checkpoint;
@@ -18,7 +19,14 @@ pub mod store;
 pub mod tool;
 pub mod types;
 
-pub use agent::{Agent, AgentError, AgentEvent, CwdChange, Session, DEFAULT_MAX_STEPS};
+pub use agent::{
+    Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, Session,
+    DEFAULT_MAX_STEPS,
+};
+pub use auto_mode::{
+    AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision, ClassifierRequest,
+    ClassifierTranscript, ProviderSafetyClassifier, SafetyClassifier,
+};
 pub use background::{BackgroundTasks, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
 pub use export::export_markdown;

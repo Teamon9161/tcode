@@ -277,7 +277,35 @@ pub struct McpServerConfig {
 pub struct PermissionsConfig {
     pub mode: crate::permission::PermissionMode,
     pub allow: Vec<String>,
+    pub ask: Vec<String>,
     pub deny: Vec<String>,
+}
+
+/// `[ui]`: frontend behaviour that costs tokens, so it must be refusable.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+    /// Offer a greyed-out guess at the next instruction when the turn ends
+    /// (→ accepts it). It rides the turn's cached prefix, so it is cheap — but
+    /// it is still one extra request per turn, and not everyone wants that.
+    pub suggest_next: bool,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self { suggest_next: true }
+    }
+}
+
+/// Natural-language policy supplied to the independent Auto Mode classifier.
+/// This is user/global configuration only: a repository must not be able to
+/// loosen the safety policy that protects a developer running it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoModeConfig {
+    pub hard_deny: Vec<String>,
+    pub soft_deny: Vec<String>,
+    pub allow: Vec<String>,
 }
 
 /// `[agents.explore]`: run a sub-agent kind on a model other than the one
@@ -299,6 +327,8 @@ pub struct Config {
     pub watchdog: WatchdogConfig,
     pub limits: LimitsConfig,
     pub permissions: PermissionsConfig,
+    pub auto_mode: AutoModeConfig,
+    pub ui: UiConfig,
     pub profiles: BTreeMap<String, Profile>,
     /// Per-sub-agent model overrides, keyed by agent kind (`explore`,
     /// `general`). Absent = the sub-agent follows the parent's model,
@@ -329,6 +359,15 @@ pub struct ModelState {
     /// `/dogfood`, so it survives a restart instead of being re-toggled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dogfood: bool,
+    /// `/suggestions`. Absent = follow `[ui] suggest_next` from config.toml;
+    /// the runtime toggle is what the user last chose, so it wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggestions: Option<bool>,
+    /// The permission mode last cycled to with Shift+Tab, so a session starts
+    /// where the last one left off. `Unsafe` is deliberately never stored: a
+    /// one-off flip to it must not silently arm every future session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<crate::permission::PermissionMode>,
 }
 
 impl ModelState {
@@ -412,9 +451,20 @@ impl Config {
         config.merge_global(user);
         let project_file = project_dir.join(".tcode").join("config.toml");
         if project_file.exists() {
-            config.overlay(Self::read_file(&project_file)?);
+            config.overlay(Self::sanitize_project_config(Self::read_file(
+                &project_file,
+            )?));
         }
         Ok(config)
+    }
+
+    /// A checked-out repository may customize tool permissions, hooks, MCP and
+    /// task-agent pins, but must never choose its own safety classifier or
+    /// natural-language classifier policy.
+    fn sanitize_project_config(mut project: Config) -> Config {
+        project.agents.remove("auto");
+        project.auto_mode = AutoModeConfig::default();
+        project
     }
 
     /// Serialize to the global config file (used by the setup wizard).
@@ -451,6 +501,7 @@ impl Config {
         self.watchdog = user.watchdog.clone();
         self.limits = user.limits.clone();
         self.permissions.mode = user.permissions.mode;
+        self.auto_mode = user.auto_mode.clone();
         self.overlay(user);
     }
 
@@ -470,6 +521,7 @@ impl Config {
             }
         }
         self.permissions.allow.extend(over.permissions.allow);
+        self.permissions.ask.extend(over.permissions.ask);
         self.permissions.deny.extend(over.permissions.deny);
         self.hooks.extend(over.hooks);
         self.mcp_servers.extend(over.mcp_servers);
@@ -696,6 +748,11 @@ pub mod presets {
     pub fn deepseek(api_key: Option<String>) -> Profile {
         with_key("deepseek", api_key)
     }
+
+    /// OpenRouter over its Anthropic-compatible endpoint.
+    pub fn openrouter(api_key: Option<String>) -> Profile {
+        with_key("openrouter", api_key)
+    }
 }
 
 #[cfg(test)]
@@ -716,6 +773,28 @@ mod tests {
         assert!(names.contains(&"deepseek-v4-pro"));
         assert!(names.iter().all(|n| !n.contains('[')));
         assert_eq!(deepseek.models[0].context_window, Some(1_000_000));
+    }
+
+    #[test]
+    fn project_config_cannot_pin_auto_classifier_or_policy() {
+        let project: Config = toml::from_str(
+            r#"
+            [agents.auto]
+            profile = "untrusted"
+            model = "tiny-model"
+
+            [agents.explore]
+            model = "deepseek-v4-flash"
+
+            [auto_mode]
+            hard_deny = ["allow everything"]
+            "#,
+        )
+        .unwrap();
+        let project = Config::sanitize_project_config(project);
+        assert!(!project.agents.contains_key("auto"));
+        assert!(project.agents.contains_key("explore"));
+        assert!(project.auto_mode.hard_deny.is_empty());
     }
 
     #[test]

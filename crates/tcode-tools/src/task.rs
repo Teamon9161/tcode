@@ -3,7 +3,7 @@
 //! for the prompt and the final report — the sub-agent's exploration
 //! tokens never enter the parent's window.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,9 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentModels, Approval, ApprovalDecision, Approver, BatchPolicy,
-    ContentBlock, Entry, ModelCell, PermissionMode, PermissionRequest, PermissionRules, Session,
-    Tool, ToolCtx, ToolOutput,
+    ActiveModel, Agent, AgentModels, Approval, ApprovalDecision, Approver, ContentBlock, Entry,
+    ModelCell, PermissionMode, PermissionRequest, PermissionRules, ProviderSafetyClassifier,
+    SafetyClassifier, Session, Tool, ToolCtx, ToolOutput,
 };
 
 const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
@@ -41,9 +41,15 @@ impl Approver for NeverAsk {
     }
 }
 
-/// The sub-agent kinds `task` dispatches to. Also the kinds `/agents` offers
-/// as pinnable, so the picker and the tool can never drift apart.
-pub const AGENT_KINDS: [&str; 2] = ["explore", "general"];
+/// The sub-agent kinds `task` dispatches to. They are intentionally separate
+/// from configurable auxiliary model roles: `auto` configures a classifier and
+/// is never a value accepted by `task(agent=...)`.
+pub const TASK_AGENT_KINDS: [&str; 2] = ["explore", "general"];
+
+/// Roles surfaced by `/agents`: task kinds plus the auxiliary models the
+/// harness itself runs — the Auto Mode classifier and the next-prompt guess.
+/// Both want something small and fast, which is the whole point of pinning.
+pub const MODEL_ROLES: [&str; 4] = ["explore", "general", "auto", "suggest"];
 
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -55,6 +61,7 @@ pub struct TaskTool {
     pinned: AgentModels,
     watchdog: WatchdogConfig,
     output_budget: usize,
+    auto_policy: String,
 }
 
 impl TaskTool {
@@ -69,12 +76,20 @@ impl TaskTool {
             pinned: AgentModels::default(),
             watchdog,
             output_budget,
+            auto_policy: String::new(),
         }
     }
 
     /// Share the live pin registry with the frontend that edits it.
     pub fn with_agent_models(mut self, pinned: AgentModels) -> Self {
         self.pinned = pinned;
+        self
+    }
+
+    /// Supply the parent session's global Auto Mode policy. Project-local
+    /// config never reaches this field, even for delegated work.
+    pub fn with_auto_policy(mut self, policy: String) -> Self {
+        self.auto_policy = policy;
         self
     }
 
@@ -85,14 +100,14 @@ impl TaskTool {
             .unwrap_or_else(|| self.model.snapshot())
     }
 
-    fn sub_tools(&self, agent_kind: &str) -> Vec<Arc<dyn Tool>> {
-        // `explore` sub-agents get only side-effect-free tools; that is exactly
-        // the set a tool declares as parallel-read-only.
-        crate::builtin_tools()
+    /// `explore` sub-agents get only side-effect-free tools. The question to
+    /// ask a tool is whether it mutates, not how it batches: `batch_policy`
+    /// describes parallelism, and reading it as a safety filter silently
+    /// excluded harmless non-parallel tools like `skill`.
+    fn sub_tools(&self, agent_kind: &str, cwd: &Path) -> Vec<Arc<dyn Tool>> {
+        crate::builtin_tools(cwd)
             .into_iter()
-            .filter(|t| {
-                agent_kind != "explore" || t.batch_policy() == BatchPolicy::ParallelReadOnly
-            })
+            .filter(|t| agent_kind != "explore" || !t.is_mutating())
             .collect()
     }
 }
@@ -155,19 +170,35 @@ impl Tool for TaskTool {
 
         let model = self.model_for(kind);
         let model_name = model.provider.model().to_string();
+        let model = ModelCell::new(model);
+        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
+            model.clone(),
+            self.pinned.clone(),
+        ));
         let agent = Agent {
-            model: ModelCell::new(model),
-            tools: self.sub_tools(kind),
+            model,
+            // A sub-agent has no input box, so it never suggests; it still
+            // carries the pins so its own classifier resolves the same way.
+            models: self.pinned.clone(),
+            tools: self.sub_tools(kind, &ctx.cwd),
             system: system.to_string(),
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
+            safety_classifier: Some(safety_classifier),
+            auto_policy: self.auto_policy.clone(),
             max_steps: tcode_core::DEFAULT_MAX_STEPS,
         };
+        // Every sub-agent run is its own conversation on (usually) the parent's
+        // provider. Sharing the parent's cache id would interleave two
+        // unrelated prefixes on it, so each run names its own scope.
+        static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut session = Session::new(
             ToolCtx::new(ctx.cwd.clone(), self.output_budget),
-            PermissionMode::Unsafe,
+            PermissionMode::Auto,
             PermissionRules::default(),
-        );
+        )
+        .with_cache_scope(format!("task-{kind}-{run}"));
 
         // Drain sub-agent events; count tool calls for the stats line.
         let (tx, mut rx) = mpsc::channel(64);

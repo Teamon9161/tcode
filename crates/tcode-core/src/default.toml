@@ -64,6 +64,28 @@ default_effort = "medium"
 [profiles.codex]
 provider = "codex"
 
+# OpenRouter, reached over its Anthropic-compatible Messages endpoint
+# (`/api/v1/messages`, which this base_url + the provider's `/v1/messages`
+# suffix produce). It accepts our `x-api-key` auth, streams the standard
+# Anthropic SSE shape, and passes tool calls through, so no new wire is
+# needed — this is the same shape as the DeepSeek profile below.
+# For the OpenAI wire instead, use `provider = "openai"` with
+# `base_url = "https://openrouter.ai/api/v1"`.
+#
+# OpenRouter fronts hundreds of models; only the free test model ships here.
+# Add the ids you use (from openrouter.ai/models) to ~/.tcode/config.toml.
+[profiles.openrouter]
+provider = "anthropic"
+api_key_env = "OPENROUTER_API_KEY"
+base_url = "https://openrouter.ai/api"
+
+# Hy3 thinks unconditionally: it ignores `thinking: {type: disabled}` and
+# answers after a reasoning preamble, so it has no effort dial here.
+[[profiles.openrouter.models]]
+name = "tencent/hy3:free"
+label = "Tencent Hy3 (free)"
+context_window = 262144
+
 # DeepSeek's Anthropic-compatible endpoint. `deepseek-v4-pro` and
 # `deepseek-v4-flash` are the real model ids (the 1M context is a property
 # recorded here, not a suffix on the id). Thinking is ON by default

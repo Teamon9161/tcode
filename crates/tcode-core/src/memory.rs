@@ -151,6 +151,22 @@ impl MemoryManager {
         out
     }
 
+    /// Human-maintained instructions currently in force, for the Auto Mode
+    /// classifier. Deliberately excludes `MEMORY.md` and the auto-memory
+    /// maintenance prompt: classifier policy must not be steered by model-
+    /// maintained content.
+    pub fn classifier_instructions(&self) -> String {
+        let mut out = String::new();
+        append_sources(
+            &mut out,
+            self.loaded_sources
+                .iter()
+                .filter(|path| path.file_name().is_some_and(|name| name != "MEMORY.md")),
+            INSTRUCTION_CAP,
+        );
+        out
+    }
+
     /// Rebuild the loaded set from the immutable startup sources plus durable
     /// ledger markers. This makes resume and rewind agree with visible history.
     pub fn restore_from_entries(&mut self, entries: &[Entry]) {

@@ -1,8 +1,10 @@
 mod compact;
 mod session;
+mod suggest;
 mod summarize;
 
-pub use session::{CwdChange, Session};
+pub use session::{CwdChange, PendingInput, PendingMessage, Session};
+pub use suggest::SuggestRequest;
 pub use summarize::summarize_call;
 use summarize::{compact_successful_test_output, preview, split_malformed};
 
@@ -16,6 +18,10 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accumulate::ResponseAccumulator;
+use crate::auto_mode::{
+    is_protected_path, AutoModePolicy, AutoRoute, ClassifierDecision, ClassifierRequest,
+    ClassifierTranscript, SafetyClassifier,
+};
 use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
 use crate::permission::{ApprovalDecision, Approver, Decision};
@@ -23,9 +29,11 @@ use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 
-/// Default ceiling on model round-trips per user turn; a runaway loop
-/// should never bill unbounded. Configurable via `limits.max_steps_per_turn`.
-pub const DEFAULT_MAX_STEPS: usize = 100;
+/// Default ceiling on model round-trips per user turn; a runaway loop should
+/// never bill unbounded. It is a backstop, not a budget: set high enough that
+/// honest long tasks never see it, because a ceiling the model can feel is a
+/// ceiling that distorts its work. Configurable via `limits.max_steps_per_turn`.
+pub const DEFAULT_MAX_STEPS: usize = 500;
 
 /// Appended to the system prompt while `/dogfood` is on.
 const DOGFOOD_SYSTEM: &str = include_str!("../../../../prompts/dogfood.md");
@@ -77,6 +85,19 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+    /// A message the user typed while the turn was running, now delivered into
+    /// the ledger at a safe boundary (see `PendingInput`). It is a real user
+    /// entry — the model reads it on its next step, and Auto Mode treats it as
+    /// authorization, exactly like any other thing the user says.
+    QueuedInput {
+        text: String,
+        /// Attachment labels, so the delivered prompt renders with the images
+        /// and pasted files that were part of it.
+        attachments: Vec<String>,
+        /// Ledger index of the entry, so the transcript can tag it for rewind
+        /// like a normal prompt.
+        entry_index: usize,
+    },
     /// The original text of a user's approval annotation. Sent only after its
     /// tool result has committed, matching the ledger order used by resume.
     UserNote {
@@ -94,6 +115,13 @@ pub enum AgentEvent {
     /// Context grew past the auto-compact threshold; a summary request
     /// is running before the actual turn.
     Compacting,
+    /// History was replaced by this summary. It carries the text because the
+    /// summary is now the only record of everything before it — the user must
+    /// be able to read what the model is standing on.
+    Compacted(String),
+    /// The classifier was unavailable repeatedly, so the session falls back
+    /// to ordinary human approvals until Auto Mode is explicitly re-enabled.
+    AutoModePaused(String),
     /// A mutating call was declined without guidance. The turn is over so the
     /// user can provide the missing direction instead of the model guessing.
     AwaitingUserInput,
@@ -117,13 +145,32 @@ pub enum AgentError {
 pub struct Agent {
     /// Swappable model handle; each turn snapshots it once.
     pub model: crate::provider::ModelCell,
+    /// Pinned auxiliary model roles (`[agents.<role>]`, `/agents`). Only the
+    /// roles the agent itself runs are read here — `suggest` today; sub-agent
+    /// kinds are resolved by the `task` tool, which shares the same handle.
+    /// An unpinned role follows `model`.
+    pub models: crate::provider::AgentModels,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
     pub watchdog: WatchdogConfig,
     pub hooks: crate::hooks::Hooks,
+    /// Independent model used only to gate Auto Mode actions. `None` keeps Auto
+    /// Mode fail-closed by falling back to the normal human approval prompt.
+    pub safety_classifier: Option<Arc<dyn SafetyClassifier>>,
+    /// Fixed classifier policy assembled from global configuration. It is
+    /// intentionally not taken from project-local configuration.
+    pub auto_policy: String,
     /// Runaway guard: model round-trips per user turn before the harness
     /// ends the turn gracefully.
     pub max_steps: usize,
+}
+
+struct PermissionCheck<'a> {
+    name: &'a str,
+    input: &'a Value,
+    request: &'a PermissionRequest,
+    cancel: &'a CancellationToken,
+    events: &'a mpsc::Sender<AgentEvent>,
 }
 
 impl Agent {
@@ -133,6 +180,86 @@ impl Agent {
 
     fn tool_defs(&self) -> Vec<crate::ToolDef> {
         self.tools.iter().map(|t| t.as_ref().def()).collect()
+    }
+
+    /// Apply Auto Mode's tool-declared fast paths and, only when necessary,
+    /// ask the independent classifier. The caller still owns interactive
+    /// approval: unavailable classification deliberately becomes `Ask`.
+    async fn permission_decision(
+        &self,
+        session: &mut Session,
+        tool: &dyn Tool,
+        check: PermissionCheck<'_>,
+    ) -> Decision {
+        let initial = session.rules.decide(session.mode, check.request);
+        let mut decision = initial;
+        if matches!(decision, Decision::Allow)
+            && matches!(session.mode, crate::permission::PermissionMode::Auto)
+            && tool
+                .touches(check.input)
+                .is_some_and(|path| is_protected_path(&session.tool_ctx.resolve(&path)))
+        {
+            // A broad allow rule may pre-approve ordinary work, but must not
+            // bypass agent instruction/configuration protection.
+            decision = Decision::Auto;
+        }
+        if !matches!(decision, Decision::Auto) {
+            return decision;
+        }
+
+        let target = tool.touches(check.input);
+        match AutoModePolicy::new(&session.tool_ctx.cwd)
+            .route(tool.auto_safety(check.input), target.as_deref())
+        {
+            AutoRoute::Allow => Decision::Allow,
+            AutoRoute::Prompt => Decision::Ask,
+            AutoRoute::Classify => {
+                let Some(classifier) = &self.safety_classifier else {
+                    return Decision::Ask;
+                };
+                let instructions = session
+                    .tool_ctx
+                    .memory
+                    .lock()
+                    .expect("memory lock")
+                    .classifier_instructions();
+                let policy = if instructions.is_empty() {
+                    self.auto_policy.clone()
+                } else {
+                    format!(
+                        "{}\n\n# Active project instructions\n{}",
+                        self.auto_policy, instructions
+                    )
+                };
+                let request = ClassifierRequest {
+                    policy,
+                    transcript: ClassifierTranscript::from_ledger(&session.ledger),
+                    tool_name: check.name.to_string(),
+                    input: check.input.clone(),
+                };
+                match classifier.classify(request, check.cancel.clone()).await {
+                    ClassifierDecision::Allow => {
+                        session.record_auto_classification(true);
+                        Decision::Allow
+                    }
+                    ClassifierDecision::Block { reason } => {
+                        let paused = session.record_auto_classification(false);
+                        let paused = paused
+                            .map(|notice| format!("\n{notice}"))
+                            .unwrap_or_default();
+                        Decision::Deny(format!(
+                            "Blocked by Auto Mode safety classifier: {reason}\nFind a safer alternative. Do not try to route around this boundary.{paused}"
+                        ))
+                    }
+                    ClassifierDecision::Unavailable { .. } => {
+                        if let Some(notice) = session.record_auto_classifier_unavailable() {
+                            let _ = check.events.send(AgentEvent::AutoModePaused(notice)).await;
+                        }
+                        Decision::Ask
+                    }
+                }
+            }
+        }
     }
 
     pub(super) fn system_prompt(&self, session: &Session) -> String {
@@ -163,7 +290,7 @@ impl Agent {
         // context overflows, not after.
         if session.last_prompt_tokens > model.context_window * 85 / 100 {
             self.emit(events, AgentEvent::Compacting).await?;
-            self.compact(session, &cancel).await?;
+            self.compact(session, events, &cancel).await?;
         }
         // Background tasks that finished between turns: tell the model
         // before its new instruction (pure append, cache-safe).
@@ -184,10 +311,7 @@ impl Agent {
         session.turn_usage = Usage::default();
 
         let max_steps = self.max_steps.max(1);
-        // One-shot heads-up at ~80% so the model wraps up instead of being
-        // cut off mid-exploration.
-        let warn_at = max_steps * 4 / 5;
-        for step in 0..max_steps {
+        for _ in 0..max_steps {
             let (blocks, usage, stop) = self.stream_step(&model, session, events, &cancel).await?;
             session.last_prompt_tokens = usage.total_input() + usage.output_tokens;
             session.turn_usage.input_tokens += usage.input_tokens;
@@ -233,16 +357,9 @@ impl Agent {
                 return Ok(());
             }
             // End of a tool batch is a safe append boundary for background
-            // task completion notes.
+            // task completion notes and for anything the user said meanwhile.
             self.note_finished_background_tasks(session);
-            if step + 1 == warn_at {
-                session.ledger.append(Entry::Note(format!(
-                    "step {} of {max_steps} for this turn; the harness ends \
-                     the turn at the limit. Finish up or report progress \
-                     instead of starting new exploration.",
-                    step + 1
-                )));
-            }
+            self.deliver_pending_input(session, events).await?;
         }
         // Runaway guard tripped. The ledger is consistent (the last tool
         // batch committed its results), so end the turn instead of erroring:
@@ -272,6 +389,8 @@ impl Agent {
             let req = Request {
                 model: model.provider.model().to_string(),
                 system: self.system_prompt(session),
+                system_suffix: None,
+                cache_scope: session.cache_scope(),
                 messages: session.ledger.as_messages(),
                 tools: self.tool_defs(),
                 max_tokens: model.max_tokens,
@@ -474,13 +593,26 @@ impl Agent {
             let request = tool.permission(input);
             let mut approval_note: Option<String> = None;
             let is_user_question = matches!(request, PermissionRequest::UserInput { .. });
-            match session.rules.decide(session.mode, &request) {
+            match self
+                .permission_decision(
+                    session,
+                    tool.as_ref(),
+                    PermissionCheck {
+                        name,
+                        input,
+                        request: &request,
+                        cancel,
+                        events,
+                    },
+                )
+                .await
+            {
                 Decision::Allow => {}
                 Decision::Deny(reason) => {
                     results.push(tool_result(&id.clone(), &reason, true));
                     continue;
                 }
-                Decision::Ask => {
+                Decision::Ask | Decision::Auto => {
                     let (descriptor, summary) = match &request {
                         PermissionRequest::Ask {
                             descriptor,
@@ -829,12 +961,26 @@ impl Agent {
                 return self.cancel_unstarted_batch(session, calls, true);
             }
             let tool = self.tool(name).expect("preflighted tool").clone();
-            match session.rules.decide(session.mode, &tool.permission(input)) {
+            let request = tool.permission(input);
+            match self
+                .permission_decision(
+                    session,
+                    tool.as_ref(),
+                    PermissionCheck {
+                        name,
+                        input,
+                        request: &request,
+                        cancel,
+                        events,
+                    },
+                )
+                .await
+            {
                 Decision::Allow => {}
                 Decision::Deny(reason) => {
                     return self.abort_file_batch(session, calls, id, &reason, false);
                 }
-                Decision::Ask => {
+                Decision::Ask | Decision::Auto => {
                     let PermissionRequest::Ask {
                         descriptor,
                         summary,
@@ -959,36 +1105,26 @@ impl Agent {
             lanes[lane].push(index);
         }
 
-        // Each lane stops at its first failed mutation. Other files continue,
-        // and every model-issued call still receives a result in call order.
+        // Every call runs and gets its own result. A lane does not stop at a
+        // failure: `edit` and `write` are atomic, so a failed one leaves the
+        // file byte-for-byte as the calls after it expect — skipping them
+        // would discard work that was never in danger (one no-op edit used to
+        // cost the seven independent edits queued behind it). Calls on one
+        // file still run in the model's order; only cancellation halts a lane.
         let lane_outputs = join_all(lanes.iter().map(|lane| {
             let prepared = &prepared;
             let tool_ctx = &session.tool_ctx;
             async move {
                 let mut outputs = Vec::with_capacity(lane.len());
-                let mut failed_at: Option<usize> = None;
                 for &index in lane {
                     let (_, _, input, tool) = &prepared[index];
-                    let (output, ran) = match failed_at {
-                        Some(previous) => (
-                            ToolOutput::err(format!(
-                                "Not executed: step {} ({}) failed earlier while mutating this file; this call made no changes.",
-                                previous + 1,
-                                prepared[previous].0,
-                            )),
-                            false,
-                        ),
-                        None if cancel.is_cancelled() => (
+                    let (output, ran) = if cancel.is_cancelled() {
+                        (
                             ToolOutput::err("Cancelled by user before execution."),
                             false,
-                        ),
-                        None => {
-                            let output = tool.run(input.clone(), tool_ctx, cancel).await;
-                            if output.is_error {
-                                failed_at = Some(index);
-                            }
-                            (output, true)
-                        }
+                        )
+                    } else {
+                        (tool.run(input.clone(), tool_ctx, cancel).await, true)
                     };
                     outputs.push((index, output, ran));
                 }
@@ -1132,7 +1268,20 @@ impl Agent {
         // Combined approval: ask once for the whole batch.
         for (id, name, input, tool) in &prepared {
             let request = tool.permission(input);
-            match session.rules.decide(session.mode, &request) {
+            match self
+                .permission_decision(
+                    session,
+                    tool.as_ref(),
+                    PermissionCheck {
+                        name,
+                        input,
+                        request: &request,
+                        cancel,
+                        events,
+                    },
+                )
+                .await
+            {
                 Decision::Allow => {}
                 Decision::Deny(reason) => {
                     let results: Vec<ContentBlock> = calls
@@ -1155,7 +1304,7 @@ impl Agent {
                         awaiting_user_input: false,
                     });
                 }
-                Decision::Ask => {
+                Decision::Ask | Decision::Auto => {
                     let (PermissionRequest::Ask {
                         descriptor,
                         summary,
@@ -1403,6 +1552,33 @@ impl Agent {
         for note in notes {
             session.ledger.append(Entry::Note(note));
         }
+    }
+
+    /// Hand the model whatever the user said while it was working.
+    ///
+    /// Only callable where a user entry is legal — after a tool batch's results
+    /// are committed, never between a `tool_use` and its result. The ledger
+    /// merges it into that same user message, so this stays a pure append and
+    /// the model reads it on its next step rather than after the whole turn.
+    async fn deliver_pending_input(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<(), AgentError> {
+        for message in session.pending.take() {
+            let entry_index = session.ledger.len();
+            session.ledger.append(Entry::User(message.blocks));
+            self.emit(
+                events,
+                AgentEvent::QueuedInput {
+                    text: message.text,
+                    attachments: message.attachments,
+                    entry_index,
+                },
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     fn preflight_memory(

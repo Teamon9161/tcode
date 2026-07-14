@@ -42,8 +42,8 @@ pub struct ModelMenu {
 pub type PinFn =
     Box<dyn Fn(&str, Option<(&ModelOption, Option<&str>)>) -> Result<String, String> + Send + Sync>;
 
-/// `/agents`: the sub-agent kinds, what each currently runs on, and how to
-/// change it.
+/// `/agents`: auxiliary model roles (sub-agents plus Auto Mode), what each
+/// currently runs on, and how to change it.
 pub struct AgentMenu {
     pub kinds: Vec<String>,
     /// Per kind: the menu option it is pinned to and that pin's effort.

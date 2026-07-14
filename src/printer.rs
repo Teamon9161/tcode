@@ -99,6 +99,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 let color = if is_error { RED } else { DIM };
                 println!("  {color}⎿ {preview}{RESET}");
             }
+            AgentEvent::QueuedInput { text, .. } => println!("{CYAN}›{RESET} {text}"),
             AgentEvent::UserNote {
                 text,
                 answer: false,
@@ -107,6 +108,15 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             AgentEvent::Usage(_) | AgentEvent::DelegatedUsage(_) | AgentEvent::RateLimits(_) => {}
             AgentEvent::Compacting => {
                 println!("{YELLOW}[context near limit — compacting]{RESET}");
+            }
+            // Plain mode has no folds, so the summary prints in full: it is now
+            // the model's only record of the conversation so far.
+            AgentEvent::Compacted(summary) => {
+                println!("{DIM}── earlier conversation compacted ──{RESET}");
+                println!("{DIM}{summary}{RESET}");
+            }
+            AgentEvent::AutoModePaused(notice) => {
+                println!("{YELLOW}[{notice}]{RESET}");
             }
             AgentEvent::AwaitingUserInput => {
                 println!("{YELLOW}[change declined — add guidance to continue]{RESET}");

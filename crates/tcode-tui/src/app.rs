@@ -23,8 +23,8 @@ use tcode_core::commands::{
     CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
 };
 use tcode_core::{
-    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock, Session,
-    Usage,
+    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock,
+    PendingMessage, Session, Usage,
 };
 
 use crate::approval::{Dialog, DialogResult};
@@ -72,7 +72,10 @@ const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
 const UI_COMMANDS: [(&str, &str); 4] = [
     ("/help", "show keys and commands"),
     ("/model", "switch model · adjust reasoning effort"),
-    ("/agents", "choose the model each sub-agent runs on"),
+    (
+        "/agents",
+        "choose models for sub-agents and Auto Mode safety",
+    ),
     ("/provider", "configure or switch provider"),
 ];
 
@@ -275,6 +278,21 @@ pub struct App {
     approver: Arc<ChannelApprover>,
 
     editor: Editor,
+    /// Prompts submitted while a turn was running. The agent loop takes them at
+    /// its next safe boundary; until then they show, dimmed, above the input.
+    pending: tcode_core::PendingInput,
+    /// The idle guess at the next instruction: ghost text in an empty input,
+    /// accepted with →. It belongs to the turn that produced it and survives
+    /// typing — the ghost hides while the input has text and comes back when it
+    /// is empty again, without a second request. Whether to ask for one at all
+    /// is `Session::suggestions` (`/suggestions`).
+    suggestion: Option<String>,
+    suggest_cancel: Option<CancellationToken>,
+    /// Which guess is current. A reply carrying an older generation is a guess
+    /// about a conversation that no longer exists, and is dropped.
+    suggest_gen: u64,
+    suggest_tx: mpsc::Sender<(u64, Option<String>)>,
+    suggest_rx: mpsc::Receiver<(u64, Option<String>)>,
     attachments: Vec<Attachment>,
     /// Monotonic id for the next attachment; keeps inline tokens unique within
     /// a draft. Reset to 1 once the draft is sent or cleared.
@@ -375,6 +393,7 @@ impl App {
         opening_context: OpeningContextFn,
     ) -> anyhow::Result<Self> {
         let (ask_tx, ask_rx) = mpsc::channel(4);
+        let (suggest_tx, suggest_rx) = mpsc::channel(1);
         let mode_label = session.mode.label().to_string();
         let session_dogfood = session.dogfood();
         let cwd = session.tool_ctx.cwd.clone();
@@ -390,11 +409,15 @@ impl App {
         let renderers = RenderRegistry::from_tools(&agent.tools);
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
+        // The running turn owns the Session; this handle is how input typed
+        // meanwhile still reaches it.
+        let pending = session.pending.clone();
         Ok(Self {
             agent,
             opening_context,
             registry: CommandRegistry::builtin(),
             session: Some(session),
+            pending,
             cwd,
             renderers,
             terminal,
@@ -406,6 +429,11 @@ impl App {
             ask_rx,
             approver: Arc::new(ChannelApprover { tx: ask_tx }),
             editor: Editor::new(),
+            suggestion: None,
+            suggest_cancel: None,
+            suggest_gen: 0,
+            suggest_tx,
+            suggest_rx,
             attachments: Vec::new(),
             next_attachment_id: 1,
             clipboard: arboard::Clipboard::new().ok(),
@@ -472,6 +500,14 @@ impl App {
                     self.on_agent_event(ev);
                     // Drain whatever is already queued to batch redraws.
                     self.drain_agent_events();
+                }
+                Some((generation, suggestion)) = self.suggest_rx.recv() => {
+                    // Keep it even if the user is mid-word: the ghost simply
+                    // stays hidden until the input is empty again. Only a guess
+                    // about a conversation that has moved on is discarded.
+                    if generation == self.suggest_gen {
+                        self.suggestion = suggestion;
+                    }
                 }
                 Some(ask) = self.ask_rx.recv() => {
                     if self.user_wait_started.is_none() {
@@ -712,11 +748,12 @@ impl App {
                     ));
                     lines.push(Line::default());
                 }
-                tcode_core::Entry::Summary(_) => {
-                    lines.push(Line::styled(
-                        "── earlier conversation compacted ──",
-                        theme::dim(),
-                    ));
+                tcode_core::Entry::Summary(summary) => {
+                    // Flush the prose above so the divider bakes as its own
+                    // foldable block, exactly as the live path lays it out.
+                    self.transcript.push(std::mem::take(&mut lines));
+                    let summary = summary.clone();
+                    self.bake_compacted(&summary);
                 }
                 tcode_core::Entry::ImportedTool {
                     name,
@@ -827,47 +864,22 @@ impl App {
 
     // ------------------------------------------------------------ turn
 
-    fn start_turn(&mut self, input: String) {
-        let Some(mut session) = self.session.take() else {
-            return;
-        };
-        self.clear_live_text();
-        if !self.plan.is_empty() && self.plan.iter().all(PlanStep::is_completed) {
-            self.plan.clear();
-        }
-        // Until the provider reports authoritative prompt usage, keep the
-        // meter useful with a conservative local estimate. Text attachments
-        // count here too; image token accounting is provider-specific.
-        let attachment_tokens: u64 = self
-            .attachments
-            .iter()
-            .filter(|a| input.contains(&a.placeholder()))
-            .filter_map(|attachment| match attachment {
-                Attachment::Text { content, .. } => Some(approx_tokens(content) as u64),
-                Attachment::Image { .. } => None,
-            })
-            .sum();
-        self.context_tokens = session
-            .last_prompt_tokens
-            .saturating_add(approx_tokens(&input) as u64)
-            .saturating_add(attachment_tokens);
-        self.context_step_start = self.context_tokens;
-        // Echo the user input into the transcript, tagged with the ledger
-        // index its User entry is about to occupy (rewind jumps to it).
-        let entry_index = session.ledger.entries().len();
-        let mut echo: Vec<Line> = vec![Line::default()];
-        echo.extend(quote_lines(None, &input));
+    /// Freeze the draft into the message it will stay: the blocks that go on
+    /// the wire, plus what the transcript renders it from. Attachments are
+    /// consumed here, so a queued prompt keeps the image that was pasted into
+    /// it — and one whose inline token the user deleted drops it, exactly as
+    /// when sending immediately.
+    fn compose_draft(&mut self, input: String) -> PendingMessage {
+        let mut attachments: Vec<String> = Vec::new();
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for att in self.attachments.drain(..) {
             let placeholder = att.placeholder();
-            // Dedup: if the user deleted the inline token from the draft, the
-            // attachment goes with it — don't smuggle orphaned content along.
             if !input.contains(&placeholder) {
                 continue;
             }
             match att {
                 Attachment::Image { png, label, .. } => {
-                    echo.push(quote_attachment_line(&label));
+                    attachments.push(label);
                     use base64::Engine as _;
                     blocks.push(ContentBlock::Image {
                         media_type: "image/png".into(),
@@ -882,9 +894,47 @@ impl App {
             }
         }
         self.next_attachment_id = 1;
-        echo.push(Line::default());
-        self.transcript.push_tagged(echo, entry_index);
-        blocks.push(ContentBlock::Text { text: input });
+        blocks.push(ContentBlock::Text {
+            text: input.clone(),
+        });
+        PendingMessage {
+            text: input,
+            attachments,
+            blocks,
+        }
+    }
+
+    fn start_turn(&mut self, message: PendingMessage) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        // The user just answered the question the guess was asking.
+        self.drop_suggestion();
+        self.clear_live_text();
+        if !self.plan.is_empty() && self.plan.iter().all(PlanStep::is_completed) {
+            self.plan.clear();
+        }
+        // Until the provider reports authoritative prompt usage, keep the meter
+        // useful with a conservative local estimate. Pasted text counts here
+        // too; image token accounting is provider-specific.
+        let prompt_tokens: u64 = message
+            .blocks
+            .iter()
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(approx_tokens(text.as_str()) as u64),
+                _ => None,
+            })
+            .sum();
+        self.context_tokens = session.last_prompt_tokens.saturating_add(prompt_tokens);
+        self.context_step_start = self.context_tokens;
+        // Echo the user input into the transcript, tagged with the ledger
+        // index its User entry is about to occupy (rewind jumps to it).
+        let entry_index = session.ledger.entries().len();
+        self.transcript.push_tagged(
+            prompt_echo(&message.text, &message.attachments),
+            entry_index,
+        );
+        let blocks = message.blocks;
 
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
@@ -931,14 +981,19 @@ impl App {
         self.user_wait_started = None;
         self.user_wait_total = Duration::ZERO;
         self.out_tokens = 0;
+        // Legitimate prefix rewrite: don't false-alarm next turn.
         self.prev_cache_ratio = None;
         self.state_label = "compacting".into();
+        // Compaction reports through the same event channel a turn does, so
+        // its summary is baked by the one `Compacted` handler either way.
+        let (tx, rx) = mpsc::channel(64);
+        self.events_rx = Some(rx);
         let cancel = CancellationToken::new();
         let agent = self.agent.clone();
         let cancel2 = cancel.clone();
         let handle = tokio::spawn(async move {
             let result = agent
-                .compact_with_focus(&mut session, focus.as_deref(), &cancel2)
+                .compact_with_focus(&mut session, focus.as_deref(), &tx, &cancel2)
                 .await;
             (session, result)
         });
@@ -984,6 +1039,7 @@ impl App {
         self.phase = Phase::Idle;
         self.events_rx = None;
         self.state_label.clear();
+        let landed = result.is_ok();
         if let Err(e) = result {
             self.bake(vec![Line::styled(
                 format!("error: {e}"),
@@ -1010,6 +1066,20 @@ impl App {
                 }
             }
             self.prev_cache_ratio = Some(ratio);
+        }
+        // Whatever the loop never reached a boundary to deliver — a message
+        // queued during the closing answer, or one queued right before ctrl+c —
+        // becomes the next turn immediately. The user already pressed enter on
+        // it; they should not have to press it again.
+        if let Some(message) = merge(self.pending.take()) {
+            self.start_turn(message);
+            return;
+        }
+        // A turn that errored out leaves the user reading a failure, not
+        // choosing a next step. `suggest_request` refuses interrupted turns on
+        // the same principle; this catches the broken-stream case too.
+        if landed {
+            self.start_suggestion();
         }
     }
 
@@ -1171,6 +1241,20 @@ impl App {
                 );
                 self.state_label = "responding".into();
             }
+            AgentEvent::QueuedInput {
+                text,
+                attachments,
+                entry_index,
+            } => {
+                // It has left the queue and is now history: same renderer as a
+                // prompt sent at the start of a turn, tagged with its ledger
+                // index so rewind can jump to it. The dim waiting row goes away
+                // on its own — it was only ever a view of the queue.
+                self.bake_live_text();
+                self.finish_thinking();
+                self.transcript
+                    .push_tagged(prompt_echo(&text, &attachments), entry_index);
+            }
             AgentEvent::UserNote { text, answer } => {
                 // `ask_user` already has a dedicated Q&A record. Approval
                 // annotations arrive after ToolEnd and use the exact helper
@@ -1239,6 +1323,14 @@ impl App {
                 self.state_label = "compacting".into();
                 // Legitimate prefix rewrite: don't false-alarm next turn.
                 self.prev_cache_ratio = None;
+            }
+            AgentEvent::Compacted(summary) => self.bake_compacted(&summary),
+            AgentEvent::AutoModePaused(notice) => {
+                self.bake(vec![Line::styled(
+                    format!("⊙ {notice}"),
+                    ratatui::style::Style::default().fg(theme::WARN),
+                )]);
+                self.state_label = "manual approvals required".into();
             }
             AgentEvent::AwaitingUserInput => {
                 self.bake(vec![Line::styled(
@@ -1358,6 +1450,24 @@ impl App {
         let detail = self.md.render(text);
         self.transcript
             .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+    }
+
+    /// The `── earlier conversation compacted ──` divider, folding open to the
+    /// summary that replaced the history. Announcing the compaction is not
+    /// enough: that summary is now the model's entire record of everything
+    /// before it, so the user has to be able to read what it is working from.
+    /// Live and replay share this entry point.
+    fn bake_compacted(&mut self, summary: &str) {
+        // The blank belongs to the head so the fold affordance still lands on
+        // the divider — `display_head` appends it to the last head line.
+        let head = vec![
+            Line::default(),
+            Line::styled("── earlier conversation compacted ──", theme::dim()),
+        ];
+        let detail = self.md.render(summary);
+        self.transcript
+            .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+        self.bake(vec![Line::default()]);
     }
 
     fn refresh_live_text(&mut self) {
@@ -1820,18 +1930,30 @@ impl App {
         }
         match key.code {
             KeyCode::Char('c') if ctrl => {
-                // Ctrl+C is the single terminal-standard interrupt ladder:
-                // cancel a running turn, else clear the input, else exit.
-                // Copy lives on Ctrl+Shift+C / Alt+C and mouse-release, so
-                // this key never has to disambiguate copy vs interrupt.
+                // Ctrl+C interrupts, it never quits: a reflexive ctrl+c to stop
+                // a runaway turn must not also throw the session away. `/exit`
+                // (or ctrl+d) is the way out, and the footer says so.
+                // Copy lives on Ctrl+Shift+C / Alt+C and mouse-release, so this
+                // key never has to disambiguate copy vs interrupt.
                 if running {
+                    // Anything queued was queued to be said *now* — cancelling
+                    // hands it to the turn that starts on the way out.
                     self.cancel_turn();
                 } else if !self.editor.is_empty() || !self.attachments.is_empty() {
                     self.clear_draft();
                 } else {
-                    self.should_exit = true;
+                    self.bake(vec![Line::styled(
+                        "ctrl+c interrupts; /exit or ctrl+d quits",
+                        theme::dim(),
+                    )]);
                 }
             }
+            KeyCode::Char('d') if ctrl && self.editor.is_empty() => self.should_exit = true,
+            // Esc peels off the newest thing first: a queued prompt, then the
+            // turn, then the draft. So esc takes a message back without killing
+            // the work in flight, and esc-esc does both — while ctrl+c always
+            // means "stop now, and say what I queued".
+            KeyCode::Esc if running && !self.pending.is_empty() => self.discard_queued(),
             KeyCode::Esc => {
                 if running {
                     self.cancel_turn();
@@ -1853,6 +1975,13 @@ impl App {
                 if let Some(session) = self.session.as_mut() {
                     session.mode = session.mode.cycle();
                     self.mode_label = session.mode.label().to_string();
+                    // Remembered across restarts, except Unsafe: a one-off flip
+                    // to it must not silently arm every future session, so
+                    // landing there clears the stored choice instead.
+                    let mode = session.mode;
+                    tcode_core::config::ModelState::update(|state| {
+                        state.mode = (mode != tcode_core::PermissionMode::Unsafe).then_some(mode);
+                    });
                 } else {
                     self.bake(vec![Line::styled(
                         "mode can be changed when idle",
@@ -1884,6 +2013,16 @@ impl App {
                 }
             }
             KeyCode::Left => self.editor.left(),
+            // → on an empty input takes the ghost suggestion; everywhere else
+            // it is still just a cursor move. Accepting copies rather than
+            // consumes: the ghost then hides because the input is no longer
+            // empty, exactly as if the user had typed it — so clearing the
+            // input brings it back, and nothing needs to be re-requested.
+            KeyCode::Right if self.editor.is_empty() && self.suggestion.is_some() => {
+                if let Some(suggestion) = self.suggestion.clone() {
+                    self.editor.insert_str(&suggestion);
+                }
+            }
             KeyCode::Right => self.editor.right(),
             KeyCode::Home => self.editor.home(),
             KeyCode::End => self.editor.end(),
@@ -1902,6 +2041,10 @@ impl App {
             }
             _ => {}
         }
+        // Typing does *not* destroy the guess — it only hides it (the ghost
+        // draws on an empty input). Type two characters, delete them, and it is
+        // back, with no second request: it stays valid until the thing it was
+        // predicting actually happens (a submit, a clear, a rewind).
     }
 
     fn submit(&mut self, running: bool) {
@@ -1917,12 +2060,20 @@ impl App {
             return;
         }
         if running {
-            return; // M3: queued follow-up messages
+            // The turn owns the Session, and a user entry cannot be spliced
+            // between a tool call and its result anyway. Queue the finished
+            // message — attachments and all — for the loop's next boundary;
+            // ctrl+c sends it right away.
+            self.editor.take();
+            let message = self.compose_draft(trimmed);
+            self.pending.push(message);
+            return;
         }
         let input = self.editor.take();
         // Sending a message means the user is done reading history.
         self.transcript.scroll_to_bottom();
-        self.start_turn(input);
+        let message = self.compose_draft(input);
+        self.start_turn(message);
     }
 
     // ---------------------------------------------------------- rewind
@@ -2004,6 +2155,8 @@ impl App {
     }
 
     fn do_rewind(&mut self, index: usize, restore_files: bool, text: String) {
+        // The turn it was predicting from is about to stop existing.
+        self.drop_suggestion();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -2191,8 +2344,11 @@ impl App {
     fn show_help(&mut self) {
         let mut lines: Vec<Line> = vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
         for (k, d) in [
-            ("enter", "send · shift/ctrl/alt+enter newline"),
-            ("esc", "cancel current turn / clear input"),
+            ("enter", "send · during a turn: queue · shift+enter newline"),
+            (
+                "esc",
+                "take back a queued prompt / cancel turn / clear input",
+            ),
             ("shift+tab", "cycle permission mode"),
             (
                 "ctrl+v / alt+v",
@@ -2202,7 +2358,11 @@ impl App {
             ("alt+c / alt+x", "copy / cut prompt"),
             ("mouse", "click prompt to move cursor · drag to copy"),
             ("backspace", "delete · after an [attachment] token drops it"),
-            ("ctrl+c", "cancel / clear / exit"),
+            (
+                "ctrl+c",
+                "interrupt turn (sends anything queued) / clear input",
+            ),
+            ("ctrl+d", "quit · /exit also works"),
         ] {
             lines.push(Line::styled(format!("  {k:<16} {d}"), theme::dim()));
         }
@@ -2232,6 +2392,12 @@ impl App {
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
                 CommandEffect::PersistDogfood(on) => {
                     tcode_core::config::ModelState::update(|state| state.dogfood = on)
+                }
+                CommandEffect::PersistSuggestions(on) => {
+                    tcode_core::config::ModelState::update(|state| state.suggestions = Some(on));
+                    // Off means the pending guess is stale; on means the next
+                    // turn's end starts one.
+                    self.drop_suggestion();
                 }
             }
         }
@@ -2518,6 +2684,7 @@ impl App {
     /// restart the visual conversation. Shared by /clear, /resume and
     /// external import.
     fn reset_conversation_ui(&mut self) {
+        self.drop_suggestion();
         if let Some(session) = self.session.as_mut() {
             if session.last_prompt_tokens == 0 && !session.ledger.is_empty() {
                 session.last_prompt_tokens = estimate_context_tokens(&self.agent, session);
@@ -2723,6 +2890,112 @@ impl App {
         lines
     }
 
+    /// Ask, off-thread, what the user probably wants next. It runs on its own
+    /// small prose conversation and its own model role (see `Agent::suggest`),
+    /// so a turn only pays for its newest pair — but it is still a request,
+    /// hence `[ui] suggest_next` and `/suggestions`.
+    fn start_suggestion(&mut self) {
+        self.drop_suggestion();
+        if !self.editor.is_empty() {
+            return;
+        }
+        let Some(session) = self.session.as_ref().filter(|s| s.suggestions()) else {
+            return;
+        };
+        let Some(request) = self.agent.suggest_request(session) else {
+            return;
+        };
+        let agent = self.agent.clone();
+        let tx = self.suggest_tx.clone();
+        let cancel = CancellationToken::new();
+        let generation = self.suggest_gen;
+        self.suggest_cancel = Some(cancel.clone());
+        tokio::spawn(async move {
+            let suggestion = agent.suggest(request, cancel).await;
+            let _ = tx.send((generation, suggestion)).await;
+        });
+    }
+
+    /// Submitting, clearing, compacting or rewinding makes a guess stale — the
+    /// conversation it was predicting from is no longer the one on screen.
+    /// Typing does not: see `on_key`.
+    ///
+    /// Bumping the generation retires any request still in flight, so a reply
+    /// that lands after this point cannot resurrect a guess about a past turn.
+    fn drop_suggestion(&mut self) {
+        if let Some(cancel) = self.suggest_cancel.take() {
+            cancel.cancel();
+        }
+        self.suggest_gen += 1;
+        self.suggestion = None;
+    }
+
+    /// Take the queued prompts back. The turn keeps running: this cancels what
+    /// the user said, not what the agent is doing.
+    ///
+    /// The newest message returns to the input box rather than evaporating —
+    /// "take it back" should not mean "retype it". Anything that cannot be put
+    /// back (an older message, or the draft's attachments, which were already
+    /// encoded into blocks) leaves a dim record instead of vanishing silently.
+    fn discard_queued(&mut self) {
+        let mut queued = self.pending.take();
+        let Some(last) = queued.pop() else {
+            return;
+        };
+        let mut lines: Vec<Line> = queued
+            .iter()
+            .map(|message| Line::styled(format!("⏳ discarded: {}", message.text), theme::dim()))
+            .collect();
+        if self.editor.is_empty() {
+            self.editor.insert_str(&last.text);
+            if !last.attachments.is_empty() {
+                lines.push(Line::styled(
+                    format!("re-paste to restore: {}", last.attachments.join(", ")),
+                    theme::dim(),
+                ));
+            }
+        } else {
+            lines.push(Line::styled(
+                format!("⏳ discarded: {}", last.text),
+                theme::dim(),
+            ));
+        }
+        if !lines.is_empty() {
+            self.bake(lines);
+        }
+    }
+
+    /// What the user has already sent but the model has not yet seen: the
+    /// prompt itself, dimmed, waiting above the input box it came from. It is a
+    /// view of the queue, not a copy — delivery drains the queue and the row
+    /// disappears by itself, replaced by the real prompt in the transcript.
+    fn queued_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let queued = self.pending.queued();
+        if queued.is_empty() {
+            return Vec::new();
+        }
+        let budget = (width as usize).saturating_sub(6).max(16);
+        let mut lines: Vec<Line> = queued
+            .iter()
+            .map(|message| {
+                let mut text = one_line(&message.text, budget);
+                for label in &message.attachments {
+                    text.push_str(&format!(" ⌞ {label}"));
+                }
+                Line::from(vec![
+                    Span::styled("⏳ ", theme::dim()),
+                    Span::styled(text, theme::dim()),
+                ])
+            })
+            .collect();
+        // The two ways out of the wait, where the waiting is.
+        lines.push(Line::styled(
+            "   ctrl+c to send now · esc to take it back",
+            theme::dim(),
+        ));
+        lines
+    }
+
     /// Tool inputs are canonical absolute paths, but repeating the current
     /// project root adds noise without adding information in the TUI.
     fn display_summary(&self, summary: &str) -> String {
@@ -2753,6 +3026,11 @@ impl App {
                     .map(|(d, _)| d.render(area_width(&self.terminal)))
             });
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
+        // Ghost text only ever occupies the empty first row of the input.
+        let ghost = self
+            .suggestion
+            .clone()
+            .filter(|_| self.editor.is_empty() && !running);
         let popup: Vec<(String, String)> = if self.popup_active() {
             self.popup_matches()
                 .into_iter()
@@ -2763,6 +3041,7 @@ impl App {
         };
         let popup_index = self.popup_index.min(popup.len().saturating_sub(1));
         let plan_lines = self.plan_lines();
+        let queued_lines = self.queued_lines(area_width(&self.terminal));
 
         use ratatui::widgets::{Block, BorderType, Clear};
 
@@ -2790,6 +3069,7 @@ impl App {
                 if running {
                     h += 1; // spinner/status line above the input box
                 }
+                h += queued_lines.len() as u16;
                 if !plan_lines.is_empty() {
                     h += plan_lines.len() as u16 + 2;
                 }
@@ -2850,10 +3130,19 @@ impl App {
                 y += 1;
             }
 
+            // Prompts already sent by the user but not yet by us: they sit
+            // between the spinner and the input box, where the next thing to
+            // reach the model belongs.
+            if !queued_lines.is_empty() {
+                let h = queued_lines.len() as u16;
+                frame.render_widget(Paragraph::new(Text::from(queued_lines)), row(y, h));
+                y += h;
+            }
+
             // Input inside a rounded box, Claude Code style.
             // Show the cursor even when a long multi-line prompt exceeds
             // the six-row input box.
-            let inner: Vec<Line> = editor.lines[editor_start..]
+            let mut inner: Vec<Line> = editor.lines[editor_start..]
                 .iter()
                 .take(6)
                 .map(|vl| {
@@ -2880,6 +3169,13 @@ impl App {
                     Line::from(spans)
                 })
                 .collect();
+            if let Some(ghost) = &ghost {
+                inner[0] = Line::from(vec![
+                    Span::styled("› ", theme::user_prompt()),
+                    Span::styled(ghost.clone(), theme::dim()),
+                    Span::styled("  → to accept", theme::dim()),
+                ]);
+            }
             let box_y = y;
             let input_rect = row(y, editor_h + 2);
             captured_input = Some(InputHitbox {
@@ -3246,6 +3542,43 @@ fn add_usage(left: Usage, right: Usage) -> Usage {
 /// human speaking too — and is told apart by a coloured `Note:` opening its
 /// first row. Live echo, ledger replay and approval notes all bake through
 /// here, so the three paths cannot drift apart.
+/// A multi-line prompt collapsed to one dim row: the queue is a status display,
+/// not a second transcript. The real message is rendered in full once it is
+/// delivered.
+fn one_line(text: &str, budget: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    match flat.char_indices().nth(budget) {
+        Some((cut, _)) => format!("{}…", &flat[..cut]),
+        None => flat,
+    }
+}
+
+/// Several prompts queued behind one turn become one prompt when that turn ends
+/// — starting a turn per queued line would make the model answer the first one
+/// with the rest still unsaid.
+fn merge(queued: Vec<PendingMessage>) -> Option<PendingMessage> {
+    let mut queued = queued.into_iter();
+    let mut merged = queued.next()?;
+    for next in queued {
+        merged.text.push('\n');
+        merged.text.push_str(&next.text);
+        merged.attachments.extend(next.attachments);
+        merged.blocks.extend(next.blocks);
+    }
+    Some(merged)
+}
+
+/// How a prompt appears in the transcript. The single renderer for both paths:
+/// a prompt sent immediately and one that waited in the queue must be
+/// indistinguishable once they land.
+fn prompt_echo(text: &str, attachments: &[String]) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line> = vec![Line::default()];
+    lines.extend(quote_lines(None, text));
+    lines.extend(attachments.iter().map(|label| quote_attachment_line(label)));
+    lines.push(Line::default());
+    lines
+}
+
 fn quote_lines(label: Option<&str>, text: &str) -> Vec<Line<'static>> {
     text.lines()
         .enumerate()

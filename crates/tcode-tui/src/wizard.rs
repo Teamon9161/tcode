@@ -61,6 +61,7 @@ fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Can
     let (a_status, a_found) = env_or_inline("ANTHROPIC_API_KEY", "anthropic");
     let (o_status, o_found) = env_or_inline("OPENAI_API_KEY", "openai");
     let (d_status, d_found) = env_or_inline("DEEPSEEK_API_KEY", "deepseek");
+    let (r_status, r_found) = env_or_inline("OPENROUTER_API_KEY", "openrouter");
     vec![
         Candidate {
             id: "codex",
@@ -93,6 +94,13 @@ fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Can
             status: d_status,
             detected: d_found,
             key_env: Some("DEEPSEEK_API_KEY"),
+        },
+        Candidate {
+            id: "openrouter",
+            title: "OpenRouter (Anthropic-compatible endpoint)",
+            status: r_status,
+            detected: r_found,
+            key_env: Some("OPENROUTER_API_KEY"),
         },
     ]
 }
@@ -150,6 +158,7 @@ fn run_with(
                 "anthropic" => presets::anthropic(inline_key.clone()),
                 "openai" => presets::openai(inline_key.clone()),
                 "deepseek" => presets::deepseek(inline_key.clone()),
+                "openrouter" => presets::openrouter(inline_key.clone()),
                 _ => unreachable!(),
             };
             config.profiles.insert(cand.id.to_string(), profile);

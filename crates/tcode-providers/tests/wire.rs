@@ -101,6 +101,8 @@ fn request() -> Request {
     Request {
         model: "test-model".into(),
         system: "test".into(),
+        system_suffix: None,
+        cache_scope: None,
         messages: vec![Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: "hi".into() }],

@@ -14,8 +14,11 @@ pub enum PermissionMode {
     Default,
     /// File edits auto-approved; shell etc. still prompt.
     AcceptEdits,
-    /// Everything runs without asking (deny rules still apply).
-    #[serde(alias = "auto")]
+    /// Actions run without routine prompts; non-safe calls are reviewed by the
+    /// configured safety classifier.
+    Auto,
+    /// Everything runs without asking (deny rules still apply). This is an
+    /// explicit bypass for isolated environments, not Auto Mode.
     Unsafe,
 }
 
@@ -25,6 +28,7 @@ impl PermissionMode {
             PermissionMode::Plan => "plan",
             PermissionMode::Default => "default",
             PermissionMode::AcceptEdits => "accept-edits",
+            PermissionMode::Auto => "auto",
             PermissionMode::Unsafe => "unsafe",
         }
     }
@@ -33,7 +37,8 @@ impl PermissionMode {
         match self {
             PermissionMode::Default => PermissionMode::AcceptEdits,
             PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Unsafe,
+            PermissionMode::Plan => PermissionMode::Auto,
+            PermissionMode::Auto => PermissionMode::Unsafe,
             PermissionMode::Unsafe => PermissionMode::Default,
         }
     }
@@ -45,6 +50,9 @@ impl PermissionMode {
 #[serde(default)]
 pub struct PermissionRules {
     pub allow: Vec<String>,
+    /// Explicit human checkpoints. Matches here always prompt, including in
+    /// Auto and Unsafe mode.
+    pub ask: Vec<String>,
     pub deny: Vec<String>,
 }
 
@@ -53,6 +61,9 @@ pub enum Decision {
     Allow,
     Deny(String),
     Ask,
+    /// Auto Mode still needs tool-specific routing and possibly a model
+    /// decision. The agent resolves this with `Tool::auto_safety`.
+    Auto,
 }
 
 impl PermissionRules {
@@ -72,12 +83,24 @@ impl PermissionRules {
         if let Some(rule) = self.deny.iter().find(|r| pattern_match(r, descriptor)) {
             return Decision::Deny(format!("denied by rule '{rule}'"));
         }
+        // Explicit human checkpoints cannot be auto-approved by either an
+        // allow rule or the classifier.
+        if self.ask.iter().any(|r| pattern_match(r, descriptor)) {
+            return Decision::Ask;
+        }
         match mode {
             PermissionMode::Plan => {
                 Decision::Deny("blocked: plan mode is active; only read-only tools may run".into())
             }
             PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
+            PermissionMode::Auto => {
+                if self.allow.iter().any(|r| pattern_match(r, descriptor)) {
+                    Decision::Allow
+                } else {
+                    Decision::Auto
+                }
+            }
             _ => {
                 if self.allow.iter().any(|r| pattern_match(r, descriptor)) {
                     Decision::Allow
@@ -154,6 +177,7 @@ mod tests {
     fn deny_beats_everything() {
         let rules = PermissionRules {
             allow: vec!["shell(*)".into()],
+            ask: vec![],
             deny: vec!["shell(rm *)".into()],
         };
         assert!(matches!(

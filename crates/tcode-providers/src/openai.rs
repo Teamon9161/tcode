@@ -45,6 +45,9 @@ impl OpenAiProvider {
 
     fn build_body(&self, req: &Request) -> Value {
         let mut messages = vec![json!({ "role": "system", "content": req.system })];
+        if let Some(suffix) = &req.system_suffix {
+            messages.push(json!({ "role": "system", "content": suffix }));
+        }
         for msg in &req.messages {
             flatten_message(msg, &mut messages);
         }

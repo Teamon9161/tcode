@@ -21,8 +21,22 @@ struct Record {
 #[derive(Debug, Default)]
 pub struct CheckpointStore {
     dir: Option<PathBuf>,
-    seq: u64,
     records: Vec<Record>,
+}
+
+/// 128-bit FNV-1a. Names a pre-image by what it contains, so identical content
+/// saved twice is stored once. Width chosen for the consequence of a collision:
+/// two different pre-images sharing a name would restore the wrong file, so the
+/// 64-bit variant used for directory keys is not good enough here.
+fn content_hash(bytes: &[u8]) -> u128 {
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    let mut h = OFFSET;
+    for b in bytes {
+        h ^= *b as u128;
+        h = h.wrapping_mul(PRIME);
+    }
+    h
 }
 
 /// Outcome of restoring one file during a rewind.
@@ -37,7 +51,6 @@ impl CheckpointStore {
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir: Some(dir),
-            seq: 0,
             records: Vec::new(),
         }
     }
@@ -52,16 +65,19 @@ impl CheckpointStore {
                 saved,
             })
             .collect();
-        let seq = records.len() as u64;
         Self {
             dir: Some(dir),
-            seq,
             records,
         }
     }
 
     /// Save the current content of `path` (or note its absence) before a
     /// mutation. Returns the log event to persist, if checkpointing is on.
+    ///
+    /// Named by content hash, so the twentieth edit of one file adds a record,
+    /// not a twentieth copy of it: a session that rewrites a large file all day
+    /// costs one pre-image per *distinct* state it passed through. Records still
+    /// point at names, so rewind is unaffected by the sharing.
     pub fn save(&mut self, ledger_len: usize, path: &Path) -> Option<LogEvent> {
         let dir = self.dir.as_ref()?;
         let saved = match fs::read(path) {
@@ -69,11 +85,11 @@ impl CheckpointStore {
                 if fs::create_dir_all(dir).is_err() {
                     return None;
                 }
-                let name = format!("{:06}.orig", self.seq);
-                if fs::write(dir.join(&name), content).is_err() {
+                let name = format!("{:032x}.orig", content_hash(&content));
+                let file = dir.join(&name);
+                if !file.exists() && fs::write(&file, content).is_err() {
                     return None;
                 }
-                self.seq += 1;
                 Some(name)
             }
             // New file: restoring means deleting it.
@@ -154,6 +170,11 @@ mod tests {
         let new_file = base.join("new.txt");
         assert!(store.save(4, &new_file).is_some());
         fs::write(&new_file, "brand new").unwrap();
+
+        // Three saves of two distinct pre-images ("v1", "v2", "v3") plus a
+        // missing file: content addressing means copies, not calls, cost disk.
+        let saved = fs::read_dir(base.join("ckpts")).unwrap().count();
+        assert_eq!(saved, 3, "one file per distinct pre-image");
 
         assert!(store.dirty_since(4));
         // Rewind to len 3: keep the len-2 edits, undo the len-4 ones.

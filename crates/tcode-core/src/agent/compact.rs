@@ -1,4 +1,5 @@
 use futures::StreamExt;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accumulate::ResponseAccumulator;
@@ -6,7 +7,7 @@ use crate::ledger::Entry;
 use crate::provider::Request;
 use crate::types::ContentBlock;
 
-use super::{Agent, AgentError, Session};
+use super::{Agent, AgentError, AgentEvent, Session};
 
 const COMPACT_PROMPT: &str = include_str!("../../../../prompts/compact.md");
 
@@ -16,17 +17,24 @@ impl Agent {
     pub async fn compact(
         &self,
         session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        self.compact_with_focus(session, None, cancel).await
+        self.compact_with_focus(session, None, events, cancel).await
     }
 
     /// Compact with an optional user-requested emphasis. The focus guides the
     /// summary but never replaces the baseline continuation requirements.
+    ///
+    /// On success it emits `AgentEvent::Compacted` carrying the summary: that
+    /// text is now the only record of everything before it, so both callers —
+    /// the auto-compact in `user_turn` and `/compact` — must be able to show
+    /// the user what the model is left standing on.
     pub async fn compact_with_focus(
         &self,
         session: &mut Session,
         focus: Option<&str>,
+        events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
         if session.ledger.is_empty() {
@@ -43,8 +51,16 @@ impl Agent {
         let req = Request {
             model: model.provider.model().to_string(),
             system: self.system_prompt(session),
+            system_suffix: None,
+            // Compaction shares the session's prefix, so it stays in its scope.
+            cache_scope: session.cache_scope(),
             messages,
-            tools: Vec::new(),
+            // Byte-identical to the turn requests, tools included: the tool
+            // definitions sit inside the cached prefix, so dropping them would
+            // miss the entire prefix — and compaction fires exactly when that
+            // prefix is at its largest. The model is told to summarize and any
+            // tool_use it returns anyway is ignored below.
+            tools: self.tool_defs(),
             max_tokens: model.max_tokens,
             effort: model.effort.clone(),
         };
@@ -67,7 +83,7 @@ impl Agent {
             return Ok(());
         }
         let upto = session.ledger.len();
-        session.ledger.compact(summary, upto);
+        session.ledger.compact(summary.clone(), upto);
         let memory_note = session
             .tool_ctx
             .memory
@@ -83,6 +99,7 @@ impl Agent {
         session.turn_usage.cache_write_tokens += usage.cache_write_tokens;
         // Unknown until the next request reports it.
         session.last_prompt_tokens = 0;
+        self.emit(events, AgentEvent::Compacted(summary)).await?;
         Ok(())
     }
 }

@@ -42,9 +42,7 @@ pub fn user_prompt() -> Style {
 pub const USER_GUTTER: &str = "▌ ";
 
 pub fn user_gutter() -> Style {
-    Style::default()
-        .fg(Color::LightCyan)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(Color::LightCyan)
 }
 
 /// A note is not a turn: an aside the human slipped to the model mid-turn
@@ -55,16 +53,15 @@ pub fn note_label() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
 
-/// A human turn must outweigh the assistant prose it sits among, which is
-/// drawn in the terminal's default foreground. Weight, not hue, does that
-/// work: colour already carries meaning here (cyan = interactive, green =
-/// tool, dim = aside), and washing a long paste in a fifth colour shouts.
-/// A filled background is out for the same reason — it would compete with
-/// the diff blocks.
+/// A human turn must stand out from the assistant prose it sits among, which
+/// is drawn in the terminal's default foreground. The rail does most of that
+/// work; the text only lifts one notch of brightness above default. Weight is
+/// deliberately not used: bold reads as a larger font on a long paste and
+/// shouts over the whole screen. Hue is out too — colour already carries
+/// meaning here (cyan = interactive, green = tool, dim = aside) — and a filled
+/// background would compete with the diff blocks.
 pub fn user_message() -> Style {
-    Style::default()
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(Color::White)
 }
 
 pub fn thinking() -> Style {

@@ -11,8 +11,8 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
 use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Selection};
 use tcode_core::{
-    ActiveModel, Agent, AgentError, AgentModels, ContentBlock, ModelCell, PermissionRules, Session,
-    ToolCtx,
+    ActiveModel, Agent, AgentError, AgentModels, ContentBlock, ModelCell, PermissionRules,
+    ProviderSafetyClassifier, SafetyClassifier, Session, ToolCtx,
 };
 
 const CYAN: &str = "\x1b[36m";
@@ -20,6 +20,43 @@ const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
 const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("../prompts/interactive-agent-system.md");
+const AUTO_CLASSIFIER_POLICY: &str = include_str!("../prompts/auto-classifier-policy.md");
+
+/// Fixed classifier policy with optional user-owned global refinements. The
+/// classifier never receives project-local config, because a repository must
+/// not be able to relax the safety gate that protects it.
+fn auto_policy(config: &Config) -> String {
+    let mut policy = format!("{AUTO_CLASSIFIER_POLICY}\n");
+    let append = |policy: &mut String, heading: &str, rules: &[String]| {
+        if rules.is_empty() {
+            return;
+        }
+        policy.push_str(heading);
+        policy.push('\n');
+        for rule in rules {
+            policy.push_str("- ");
+            policy.push_str(rule);
+            policy.push('\n');
+        }
+        policy.push('\n');
+    };
+    append(
+        &mut policy,
+        "Hard deny rules (never override):",
+        &config.auto_mode.hard_deny,
+    );
+    append(
+        &mut policy,
+        "Soft deny rules (specific user intent may override):",
+        &config.auto_mode.soft_deny,
+    );
+    append(
+        &mut policy,
+        "Allowed exceptions to soft denies:",
+        &config.auto_mode.allow,
+    );
+    policy
+}
 
 const CONFIG_HEADER: &str = "\
 # tcode global configuration — created by the setup wizard.
@@ -67,7 +104,7 @@ fn build_agent_menu(
     menu: &tcode_tui::ModelMenu,
     pinned: AgentModels,
 ) -> tcode_tui::AgentMenu {
-    let kinds: Vec<String> = tcode_tools::AGENT_KINDS
+    let kinds: Vec<String> = tcode_tools::MODEL_ROLES
         .iter()
         .map(|k| k.to_string())
         .collect();
@@ -310,7 +347,7 @@ struct Cli {
     /// One-shot prompt: run the full agent loop, print, exit
     #[arg(short = 'p', long)]
     prompt: Option<String>,
-    /// Start in a specific permission mode (plan/default/accept-edits/unsafe)
+    /// Start in a specific permission mode (plan/default/accept-edits/auto/unsafe)
     #[arg(long)]
     mode: Option<String>,
     /// Continue the most recent session in this project
@@ -386,7 +423,8 @@ async fn main() -> anyhow::Result<()> {
     let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone());
 
     let system = INTERACTIVE_AGENT_SYSTEM.to_string();
-    let mut tools = tcode_tools::builtin_tools();
+    let classifier_policy = auto_policy(&config);
+    let mut tools = tcode_tools::builtin_tools(&cwd);
     tools.push(Arc::new(
         tcode_tools::TaskTool::new(
             model_cell.clone(),
@@ -394,16 +432,12 @@ async fn main() -> anyhow::Result<()> {
             config.limits.tool_output_tokens,
             cwd.clone(),
         )
-        .with_agent_models(pinned.clone()),
+        .with_agent_models(pinned.clone())
+        .with_auto_policy(classifier_policy.clone()),
     ));
     tools.push(Arc::new(tcode_tools::UpdatePlanTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
     tools.push(Arc::new(tcode_tools::AddNoteTool));
-    // Registered only when skills exist, so skill-less projects pay zero
-    // prompt tokens for the feature.
-    if let Some(skill_tool) = tcode_tools::SkillTool::discover(&cwd) {
-        tools.push(Arc::new(skill_tool));
-    }
     // MCP servers from config; a broken server warns instead of blocking.
     if !config.mcp_servers.is_empty() {
         let (mcp_tools, warnings) =
@@ -413,25 +447,36 @@ async fn main() -> anyhow::Result<()> {
         }
         tools.extend(mcp_tools);
     }
+    let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
+        model_cell.clone(),
+        pinned.clone(),
+    ));
     let agent = Arc::new(Agent {
         model: model_cell.clone(),
+        models: pinned.clone(),
         tools,
         system,
         watchdog: config.watchdog.clone(),
         hooks: tcode_core::Hooks::new(config.hooks.clone()),
+        safety_classifier: Some(safety_classifier),
+        auto_policy: classifier_policy,
         max_steps: config.limits.max_steps_per_turn,
     });
 
     let mode = match cli.mode.as_deref() {
         Some("plan") => tcode_core::PermissionMode::Plan,
         Some("accept-edits") => tcode_core::PermissionMode::AcceptEdits,
-        Some("unsafe") | Some("auto") => tcode_core::PermissionMode::Unsafe,
+        Some("auto") => tcode_core::PermissionMode::Auto,
+        Some("unsafe") => tcode_core::PermissionMode::Unsafe,
         Some("default") => tcode_core::PermissionMode::Default,
         Some(other) => anyhow::bail!("unknown mode '{other}'"),
-        None => config.permissions.mode,
+        // Same precedence as the model choice: CLI flag > what the user last
+        // switched to (state.toml) > the configured default.
+        None => state.mode.unwrap_or(config.permissions.mode),
     };
     let rules = PermissionRules {
         allow: config.permissions.allow.clone(),
+        ask: config.permissions.ask.clone(),
         deny: config.permissions.deny.clone(),
     };
     let mut session = Session::new(
@@ -442,10 +487,16 @@ async fn main() -> anyhow::Result<()> {
     session.set_opening_context(tcode_tools::project_map(&cwd));
     // The dogfood switch is a mode, not a per-session whim: restore it.
     session.set_dogfood(state.dogfood);
+    // `/suggestions` last, else the config default. Same precedence as the
+    // model choice: what the user last chose beats what the file says.
+    session.set_suggestions(state.suggestions.unwrap_or(config.ui.suggest_next));
 
     // Persistence: every ledger mutation is recorded to a JSONL session
     // log; --continue / --resume replay it.
     if let Some(data_dir) = tcode_core::store::project_data_dir(&cwd) {
+        // Before this run's log exists, so the empty log we are about to create
+        // is not mistaken for one of the abandoned ones it collects.
+        tcode_core::store::sweep_old_sessions(&data_dir);
         if cli.r#continue || cli.resume.is_some() {
             let resumed = tcode_core::SessionStore::resume(&data_dir, cli.resume.as_deref())
                 .context("cannot resume session")?;
@@ -461,7 +512,7 @@ async fn main() -> anyhow::Result<()> {
             session.ledger.attach_sink(Box::new(store));
         }
     }
-    let line_approver = approver::LineApprover;
+    let line_approver = approver::LineApprover::new(cli.prompt.is_none());
     let opening_context: tcode_tui::OpeningContextFn = Arc::new(tcode_tools::project_map);
 
     if let Some(prompt) = cli.prompt {
@@ -565,7 +616,7 @@ async fn main() -> anyhow::Result<()> {
                     "/model"
                 );
                 println!(
-                    "{DIM}  {:<16} choose the model each sub-agent runs on{RESET}",
+                    "{DIM}  {:<16} choose models for sub-agents and Auto Mode safety{RESET}",
                     "/agents"
                 );
                 for (name, help) in registry.entries() {
@@ -601,6 +652,11 @@ async fn main() -> anyhow::Result<()> {
                     CommandEffect::PersistDogfood(on) => {
                         ModelState::update(|state| state.dogfood = on)
                     }
+                    // The plain REPL has no input box to ghost into, so the
+                    // toggle only has to be remembered, not acted on.
+                    CommandEffect::PersistSuggestions(on) => {
+                        ModelState::update(|state| state.suggestions = Some(on))
+                    }
                     CommandEffect::Compact { focus } => {
                         let cancel = CancellationToken::new();
                         let watcher = {
@@ -612,10 +668,16 @@ async fn main() -> anyhow::Result<()> {
                             })
                         };
                         println!("{DIM}compacting…{RESET}");
-                        match agent
-                            .compact_with_focus(&mut session, focus.as_deref(), &cancel)
-                            .await
-                        {
+                        // Same event stream a turn uses, so the summary prints
+                        // through the one `Compacted` handler in the printer.
+                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                        let printer = tokio::spawn(printer::print_events(rx));
+                        let outcome = agent
+                            .compact_with_focus(&mut session, focus.as_deref(), &tx, &cancel)
+                            .await;
+                        drop(tx);
+                        let _ = printer.await;
+                        match outcome {
                             Ok(()) => {
                                 let u = &session.turn_usage;
                                 println!(

@@ -9,7 +9,7 @@ use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, Si
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_MATCH_LIMIT: usize = 200;
 /// Cap each matched line so a single giant line (minified JS, JSONL session
@@ -242,6 +242,10 @@ impl Tool for GrepTool {
 
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::None
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::Allow
     }
 
     fn context_paths(&self, input: &Value) -> Vec<String> {
@@ -487,6 +491,10 @@ impl Tool for GlobTool {
 
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::None
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::Allow
     }
 
     fn context_paths(&self, input: &Value) -> Vec<String> {

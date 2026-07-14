@@ -12,11 +12,35 @@ const RESET: &str = "\x1b[0m";
 /// Line-based approval prompt. The M2 TUI replaces this with the
 /// arrow-key + Tab-annotation dialog; the semantics are already final:
 /// yes / yes-always / no, each with an optional free-text note.
-pub struct LineApprover;
+pub struct LineApprover {
+    /// Whether anyone is on the other end of stdin. A one-shot `-p` run is a
+    /// conversation of one turn: nobody is waiting to type `y`, so prompting
+    /// there blocks on stdin forever (a TTY still exists, so EOF never comes).
+    /// Denying is the only honest answer, and it fails closed.
+    interactive: bool,
+}
+
+impl LineApprover {
+    pub fn new(interactive: bool) -> Self {
+        Self { interactive }
+    }
+}
 
 #[async_trait]
 impl Approver for LineApprover {
     async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval {
+        if !self.interactive {
+            println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
+            println!("{DIM}  denied — a one-shot run (-p) has nobody to approve it{RESET}");
+            return Approval {
+                decision: ApprovalDecision::No,
+                comment: Some(format!(
+                    "Denied: this action needs approval, and a one-shot run has no one to give it. \
+                     Re-run interactively, start with a permission mode that covers it \
+                     (--mode auto or --mode accept-edits), or add an allow rule for {descriptor}."
+                )),
+            };
+        }
         if tool == "ask_user" {
             return ask_user_plain(summary, input).await;
         }

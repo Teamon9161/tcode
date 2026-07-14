@@ -83,6 +83,16 @@ impl ToolRenderer for DefaultRenderer {
     }
 }
 
+/// A sub-agent's report is prose the model wrote for a human to read — it
+/// arrives as Markdown and must not be shown as literal `#` and `**`.
+struct TaskRenderer;
+
+impl ToolRenderer for TaskRenderer {
+    fn markdown_detail(&self, _input: Option<&Value>) -> bool {
+        true
+    }
+}
+
 struct ShellRenderer;
 
 impl ToolRenderer for ShellRenderer {
@@ -250,6 +260,7 @@ impl RenderRegistry {
                 "read" => Box::new(ReadRenderer { quiet }),
                 "grep" | "glob" => Box::new(PatternRenderer { quiet }),
                 "web_fetch" => Box::new(WebFetchRenderer),
+                "task" => Box::new(TaskRenderer),
                 "update_plan" => Box::new(PlanRenderer),
                 "ask_user" => Box::new(SilentRenderer),
                 _ => Box::new(DefaultRenderer { quiet }),
@@ -362,7 +373,7 @@ mod tests {
     use serde_json::json;
 
     fn registry() -> RenderRegistry {
-        RenderRegistry::from_tools(&tcode_tools::builtin_tools())
+        RenderRegistry::from_tools(&tcode_tools::builtin_tools(&std::env::temp_dir()))
     }
 
     /// The machine-checked replacement for the old "keep this list in sync

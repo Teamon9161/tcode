@@ -17,6 +17,7 @@ mod memory;
 mod mode;
 mod note;
 mod resume;
+mod suggestions;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -67,6 +68,7 @@ pub enum CommandEffect {
     /// already owns it for the `/model` choice, and core's own tests must not
     /// write the developer's home directory to exercise a command.
     PersistDogfood(bool),
+    PersistSuggestions(bool),
 }
 
 #[derive(Debug, Default)]
@@ -164,6 +166,7 @@ impl CommandRegistry {
             Box::new(memory::MemoryCommand),
             Box::new(export::ExportCommand),
             Box::new(exit::ExitCommand),
+            Box::new(suggestions::SuggestionsCommand),
             Box::new(dogfood::DogfoodCommand),
         ])
     }
@@ -260,8 +263,17 @@ mod tests {
         assert_eq!(
             names,
             [
-                "/cd", "/mode", "/cost", "/compact", "/clear", "/resume", "/note", "/memory",
-                "/export", "/exit"
+                "/cd",
+                "/mode",
+                "/cost",
+                "/compact",
+                "/clear",
+                "/resume",
+                "/note",
+                "/memory",
+                "/export",
+                "/exit",
+                "/suggestions",
             ]
         );
     }

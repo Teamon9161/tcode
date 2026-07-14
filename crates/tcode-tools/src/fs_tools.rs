@@ -6,7 +6,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::freshness::{content_hash, ReadStatus};
-use tcode_core::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
 /// Requests below this are widened: extra lines are cheap, but a model
@@ -179,6 +179,10 @@ impl Tool for ReadTool {
 
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::None
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::Allow
     }
 
     fn context_paths(&self, input: &Value) -> Vec<String> {
@@ -416,6 +420,10 @@ impl Tool for WriteTool {
         }
     }
 
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::AllowInProjectEdit
+    }
+
     fn touches(&self, input: &Value) -> Option<String> {
         input["path"].as_str().map(String::from)
     }
@@ -544,6 +552,10 @@ impl Tool for EditTool {
             summary: format!("edit {path}"),
             is_edit: true,
         }
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::AllowInProjectEdit
     }
 
     fn touches(&self, input: &Value) -> Option<String> {

@@ -39,8 +39,10 @@ pub struct CodexProvider {
     http: reqwest::Client,
     model: String,
     watchdog: WatchdogConfig,
-    /// Stable per-session id; doubles as the prompt cache key.
-    session_id: String,
+    /// Stable per-session id. The backend *overwrites* the body's
+    /// `prompt_cache_key` with this header, so it — not the body — is what
+    /// scopes the prompt cache.
+    session_id: uuid::Uuid,
 }
 
 impl CodexProvider {
@@ -49,7 +51,17 @@ impl CodexProvider {
             http: crate::http::client(),
             model,
             watchdog,
-            session_id: uuid::Uuid::new_v4().to_string(),
+            session_id: uuid::Uuid::new_v4(),
+        }
+    }
+
+    /// One cache id per conversation. Derived rather than random so a scope
+    /// keeps its cache across calls, and distinct so the classifier and the
+    /// sub-agents never share the main session's id.
+    fn session_id(&self, req: &Request) -> String {
+        match req.cache_scope.as_deref() {
+            None => self.session_id.to_string(),
+            Some(scope) => uuid::Uuid::new_v5(&self.session_id, scope.as_bytes()).to_string(),
         }
     }
 
@@ -71,23 +83,34 @@ impl CodexProvider {
                 })
             })
             .collect();
+        let instructions = match &req.system_suffix {
+            Some(suffix) => format!("{}\n\n{suffix}", req.system),
+            None => req.system.clone(),
+        };
         let mut body = json!({
             "model": req.model,
-            "instructions": req.system,
+            "instructions": instructions,
             "input": input,
             "tools": tools,
             "tool_choice": "auto",
             "parallel_tool_calls": true,
             "store": false,
             "stream": true,
+            // The subscription endpoint 400s on `max_output_tokens` at any
+            // value, so `req.max_tokens` cannot be honoured here. Callers that
+            // need a short answer (the Auto Mode classifier) must get it from
+            // the prompt, not from a cap.
             // Without this the reasoning items come back unreplayable.
             "include": ["reasoning.encrypted_content"],
-            "prompt_cache_key": self.session_id,
+            "prompt_cache_key": self.session_id(req),
         });
-        if let Some(effort) = req.effort.as_deref() {
-            body["reasoning"] = json!({ "effort": effort, "summary": "auto" });
-        } else {
-            body["reasoning"] = json!({ "summary": "auto" });
+        match req.effort.as_deref() {
+            // `off` is our name for "do not reason"; the Responses API spells
+            // it `none`. Sending `off` verbatim is a 400. Absent effort stays
+            // absent: that means "server default", which is not the same thing.
+            Some("off") => body["reasoning"] = json!({ "effort": "none", "summary": "auto" }),
+            Some(effort) => body["reasoning"] = json!({ "effort": effort, "summary": "auto" }),
+            None => body["reasoning"] = json!({ "summary": "auto" }),
         }
         body
     }
@@ -96,6 +119,7 @@ impl CodexProvider {
         &self,
         auth: &codex::CodexAuth,
         body: &Value,
+        session_id: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
         self.http
             .post(BACKEND_URL)
@@ -104,7 +128,7 @@ impl CodexProvider {
             .header("OpenAI-Beta", "responses=experimental")
             .header("originator", "codex_cli_rs")
             .header("accept", "text/event-stream")
-            .header("session_id", &self.session_id)
+            .header("session_id", session_id)
             .json(body)
             .send()
             .await
@@ -165,6 +189,7 @@ impl CodexProvider {
     async fn connect(
         &self,
         body: &Value,
+        session_id: &str,
     ) -> Result<(reqwest::Response, Option<RateLimits>), ProviderError> {
         let mut auth = codex::load_auth().ok_or_else(|| {
             ProviderError::Config(
@@ -173,7 +198,7 @@ impl CodexProvider {
         })?;
         let mut refreshed = false;
         loop {
-            match self.send(&auth, body).await {
+            match self.send(&auth, body, session_id).await {
                 Ok(resp) if resp.status().is_success() => {
                     let limits = rate_limits_from_headers(resp.headers());
                     return Ok((resp, limits));
@@ -308,8 +333,12 @@ impl Provider for CodexProvider {
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         let body = self.build_body(&req);
-        let (resp, header_limits) =
-            with_connect_timeout(self.watchdog.connect_timeout(), self.connect(&body)).await?;
+        let session_id = self.session_id(&req);
+        let (resp, header_limits) = with_connect_timeout(
+            self.watchdog.connect_timeout(),
+            self.connect(&body, &session_id),
+        )
+        .await?;
 
         let mut sse = idle_guard(resp.bytes_stream(), self.watchdog.idle_timeout()).eventsource();
         let raw: EventStream = Box::pin(stream! {
@@ -453,6 +482,73 @@ mod tests {
             );
         }
         h
+    }
+
+    fn request(effort: Option<&str>, cache_scope: Option<&str>) -> Request {
+        Request {
+            model: "gpt-5.6-luna".into(),
+            system: "stable policy".into(),
+            system_suffix: Some("fast stage".into()),
+            cache_scope: cache_scope.map(String::from),
+            messages: vec![],
+            tools: vec![],
+            max_tokens: 16,
+            effort: effort.map(String::from),
+        }
+    }
+
+    fn body_with_effort(effort: Option<&str>) -> Value {
+        let provider = CodexProvider::new("gpt-5.6-luna".into(), WatchdogConfig::default());
+        provider.build_body(&request(effort, None))
+    }
+
+    /// The backend 400s on both `max_output_tokens` and `"effort":"off"`, which
+    /// took Auto Mode's fast stage offline on every classification.
+    #[test]
+    fn classifier_fast_stage_maps_off_to_none_and_sends_no_output_cap() {
+        let body = body_with_effort(Some("off"));
+        assert!(body.get("max_output_tokens").is_none());
+        assert_eq!(
+            body["reasoning"],
+            json!({ "effort": "none", "summary": "auto" })
+        );
+        assert_eq!(body["instructions"], json!("stable policy\n\nfast stage"));
+    }
+
+    /// The backend keys the prompt cache off the `session_id` header, which it
+    /// also writes back over the body's `prompt_cache_key`. A scope must
+    /// therefore keep one id across calls, and never borrow another's.
+    #[test]
+    fn each_cache_scope_gets_its_own_stable_session_id() {
+        let provider = CodexProvider::new("gpt-5.6-luna".into(), WatchdogConfig::default());
+        let main = provider.session_id(&request(None, None));
+        let classifier = provider.session_id(&request(None, Some("auto-classifier")));
+        let sub_agent = provider.session_id(&request(None, Some("task-explore-0")));
+
+        assert_eq!(main, provider.session_id(&request(Some("high"), None)));
+        assert_eq!(
+            classifier,
+            provider.session_id(&request(Some("off"), Some("auto-classifier")))
+        );
+        assert_ne!(main, classifier);
+        assert_ne!(main, sub_agent);
+        assert_ne!(classifier, sub_agent);
+        assert_eq!(
+            provider.build_body(&request(None, Some("auto-classifier")))["prompt_cache_key"],
+            json!(classifier)
+        );
+    }
+
+    #[test]
+    fn absent_effort_means_server_default_not_none() {
+        assert_eq!(
+            body_with_effort(None)["reasoning"],
+            json!({ "summary": "auto" })
+        );
+        assert_eq!(
+            body_with_effort(Some("high"))["reasoning"],
+            json!({ "effort": "high", "summary": "auto" })
+        );
     }
 
     #[test]

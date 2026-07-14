@@ -11,6 +11,7 @@ use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
 use crate::types::Usage;
 
+use crate::auto_mode::AutoSafety;
 pub use crate::permission::{Approval, ApprovalDecision, Approver};
 
 #[derive(Debug, Clone)]
@@ -101,9 +102,11 @@ impl ToolCtx {
     pub fn new(cwd: PathBuf, output_budget_tokens: usize) -> Self {
         let memory = crate::memory::MemoryManager::new(&cwd);
         // Overflowed output and background logs share one per-project scratch
-        // dir that `read`/`grep` can reach; sweep stale files at startup.
+        // dir that `read`/`grep` can reach. Sweeping starts one level up: the
+        // model's own throwaway files live in the same scratchpad and go stale
+        // by the same clock.
         let tool_output = crate::store::tool_output_dir(&cwd);
-        crate::store::sweep_old_tool_output(&tool_output);
+        crate::store::sweep_scratchpad(&crate::store::scratchpad_dir(&cwd));
         Self {
             freshness: Mutex::new(FreshnessTracker::default()),
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
@@ -148,6 +151,11 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn input_schema(&self) -> Value;
     fn permission(&self, input: &Value) -> PermissionRequest;
+    /// How this invocation enters model-gated Auto Mode. The conservative
+    /// default sends side effects to the classifier; direct-safe tools opt in.
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::Classify
+    }
     /// Path this call will mutate, if any. The harness checkpoints it
     /// before running so rewind can restore the file.
     fn touches(&self, _input: &Value) -> Option<String> {

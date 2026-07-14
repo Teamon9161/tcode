@@ -19,7 +19,7 @@ fn ctx() -> Session {
 #[ignore = "hits the real network"]
 async fn web_fetch_reads_a_real_page() {
     let session = ctx();
-    let tools = tcode_tools::builtin_tools();
+    let tools = tcode_tools::builtin_tools(&std::env::temp_dir());
     let fetch = tools.iter().find(|t| t.name() == "web_fetch").unwrap();
     let out = fetch
         .run(
@@ -36,7 +36,7 @@ async fn web_fetch_reads_a_real_page() {
 #[ignore = "hits the real network"]
 async fn web_search_returns_results() {
     let session = ctx();
-    let tools = tcode_tools::builtin_tools();
+    let tools = tcode_tools::builtin_tools(&std::env::temp_dir());
     let search = tools.iter().find(|t| t.name() == "web_search").unwrap();
     let out = search
         .run(

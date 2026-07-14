@@ -11,7 +11,8 @@ use tcode_core::config::WatchdogConfig;
 use tcode_core::{
     ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
     CacheStrategy, ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules,
-    Provider, ProviderError, Request, Session, StopReason, StreamEvent, ToolCtx, Usage,
+    Provider, ProviderError, ProviderSafetyClassifier, Request, SafetyClassifier, Session,
+    StopReason, StreamEvent, ToolCtx, Usage,
 };
 
 fn cell(provider: Arc<MockProvider>) -> ModelCell {
@@ -152,10 +153,210 @@ fn text_done(text: &str) -> Vec<StreamEvent> {
 fn agent(provider: Arc<MockProvider>) -> Agent {
     Agent {
         model: cell(provider),
-        tools: tcode_tools::builtin_tools(),
+        models: AgentModels::default(),
+        tools: tcode_tools::builtin_tools(&std::env::temp_dir()),
         system: "test".into(),
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),
+        safety_classifier: None,
+        auto_policy: String::new(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
+    }
+}
+
+/// The guess runs a conversation of its own — prose pairs, on its own pinnable
+/// model, under its own cache scope — and that conversation is append-only: a
+/// second turn adds one pair and leaves every earlier message byte-identical.
+/// That is what makes it cost a cached prefix plus one pair instead of a turn.
+#[tokio::test]
+async fn the_next_prompt_guess_grows_a_prose_conversation_of_its_own() {
+    let root = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![
+        // A turn with tool traffic: none of it may reach the guess.
+        tool_use("t1", "read", r#"{"file_path":"lib.rs"}"#),
+        text_done("## Fixed\nThe off-by-one is gone. Tests not run yet."),
+        text_done("All 42 tests pass."),
+    ]);
+    let small = MockProvider::named(
+        "small-1",
+        vec![text_done("run the tests"), text_done("commit it")],
+    );
+    let roles = AgentModels::default();
+    roles.pin(
+        "suggest",
+        ActiveModel {
+            provider: small.clone(),
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        },
+    );
+    let agent = Agent {
+        models: roles,
+        ..agent(main.clone())
+    };
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "fix the bug").await;
+    let request = agent.suggest_request(&session).expect("a finished turn");
+    let first = agent.suggest(request, CancellationToken::new()).await;
+    assert_eq!(first.as_deref(), Some("run the tests"));
+
+    run(&agent, &mut session, &approver, "now run them").await;
+    let request = agent.suggest_request(&session).expect("a second turn");
+    let second = agent.suggest(request, CancellationToken::new()).await;
+    assert_eq!(second.as_deref(), Some("commit it"));
+
+    let requests = small.requests.lock().unwrap();
+    let (one, two) = (&requests[0], &requests[1]);
+
+    // Its own model, its own scope, no tools.
+    assert_eq!(one.model, "small-1");
+    assert_eq!(one.cache_scope.as_deref(), Some("suggest"));
+    assert!(one.tools.is_empty());
+    assert_eq!(one.system, two.system);
+
+    // One (asked, answered) pair per turn, plus the constant closing ask.
+    assert_eq!(one.messages.len(), 3);
+    assert_eq!(two.messages.len(), 5);
+
+    let texts = |messages: &[tcode_core::Message]| {
+        messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    // Append-only: turn two left turn one's pair byte-identical, which is the
+    // whole reason its prefix stays in the provider's cache.
+    assert_eq!(texts(&two.messages[..2]), texts(&one.messages[..2]));
+
+    let text = texts(&two.messages).join("\n");
+    assert!(text.contains("fix the bug") && text.contains("The off-by-one is gone"));
+    assert!(text.contains("now run them") && text.contains("All 42 tests pass"));
+    // The tool call and its result are the expensive part, and they never enter.
+    assert!(!text.contains("lib.rs") && !text.contains("read"));
+}
+
+/// A prompt typed while the agent works is delivered at the first point where a
+/// user entry is legal — after the tool batch commits — never between a tool
+/// call and its result. The ledger merges it into that same user message, so
+/// the model reads it on its very next step and the prefix stays append-only.
+#[tokio::test]
+async fn a_prompt_queued_mid_turn_lands_after_the_tool_results() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("lib.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"file_path":"lib.rs"}"#),
+        text_done("Stopping there, as you asked."),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    // Typed while the turn was running (the frontend holds this same handle).
+    // A queued prompt is a whole message: the screenshot pasted into it travels
+    // with it, exactly as it would have if the user had waited to press enter.
+    session.pending.push(tcode_core::PendingMessage {
+        text: "actually, stop after the read".into(),
+        attachments: vec!["screenshot 1".into()],
+        blocks: vec![
+            ContentBlock::Image {
+                media_type: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+            ContentBlock::Text {
+                text: "actually, stop after the read".into(),
+            },
+        ],
+    });
+    let events = run(&agent, &mut session, &approver, "read lib.rs").await;
+
+    assert!(session.pending.is_empty(), "the queue was drained");
+    let kinds: Vec<&str> = session
+        .ledger
+        .entries()
+        .iter()
+        .map(|entry| match entry {
+            Entry::User(_) => "user",
+            Entry::Assistant(_) => "assistant",
+            Entry::ToolResults(_) => "results",
+            _ => "other",
+        })
+        .collect();
+    // Not between the call and its result: the tool_use must be answered first.
+    assert_eq!(
+        kinds,
+        ["user", "assistant", "results", "user", "assistant"],
+        "queued input lands only after the batch commits"
+    );
+
+    // On the wire it rides in the same user message as the tool results, which
+    // is what makes it legal to append there at all.
+    let messages = session.ledger.as_messages();
+    let carrier = &messages[2];
+    let has_result = carrier
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { .. }));
+    let has_prompt = carrier.content.iter().any(
+        |block| matches!(block, ContentBlock::Text { text } if text.contains("actually, stop")),
+    );
+    let has_image = carrier
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::Image { .. }));
+    assert!(has_result && has_prompt && has_image);
+
+    // And the model actually saw it on its next request, not after the turn.
+    let second = &provider.requests.lock().unwrap()[1];
+    let seen = second
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("actually, stop")),
+        );
+    assert!(seen, "the next model step carries the queued prompt");
+
+    // The frontend renders it as a normal prompt — attachments and all —
+    // tagged with its ledger index so rewind can jump to it.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::QueuedInput { text, attachments, entry_index }
+            if text.contains("actually, stop")
+                && attachments == &["screenshot 1".to_string()]
+                && *entry_index == 3
+    )));
+}
+
+fn auto_agent(main: Arc<MockProvider>, classifier: Arc<MockProvider>) -> Agent {
+    let model = cell(main);
+    let roles = AgentModels::default();
+    roles.pin(
+        "auto",
+        ActiveModel {
+            provider: classifier,
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        },
+    );
+    let safety_classifier: Arc<dyn SafetyClassifier> =
+        Arc::new(ProviderSafetyClassifier::new(model.clone(), roles.clone()));
+    Agent {
+        model,
+        models: roles,
+        tools: tcode_tools::builtin_tools(&std::env::temp_dir()),
+        system: "test".into(),
+        watchdog: WatchdogConfig::default(),
+        hooks: Default::default(),
+        safety_classifier: Some(safety_classifier),
+        auto_policy: "Classify dangerous actions conservatively.".into(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
     }
 }
@@ -846,7 +1047,7 @@ async fn edit_succeeds_without_prior_read() {
 }
 
 #[tokio::test]
-async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
+async fn edit_lanes_continue_after_a_same_file_no_op_failure() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
     std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
@@ -865,7 +1066,7 @@ async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
             (
                 "t3",
                 "edit",
-                r#"{"path":"a.txt","old_string":"missing","new_string":"MISSING"}"#,
+                r#"{"path":"a.txt","old_string":"ALPHA","new_string":"ALPHA"}"#,
             ),
             (
                 "t4",
@@ -883,7 +1084,7 @@ async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
 
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "ALPHA"
+        "FINAL"
     );
     assert_eq!(
         std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
@@ -901,10 +1102,17 @@ async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
         "independent file lane must complete: {}",
         results[1].0
     );
-    assert!(results[2].1, "failing edit must be reported");
     assert!(
-        results[3].1 && results[3].0.contains("step 3 (t3)"),
-        "{}",
+        results[2].1
+            && results[2]
+                .0
+                .contains("old_string and new_string are identical"),
+        "no-op edit must be reported as an error: {}",
+        results[2].0
+    );
+    assert!(
+        !results[3].1,
+        "a later same-file edit must still run: {}",
         results[3].0
     );
     assert!(events.iter().any(|event| matches!(
@@ -917,7 +1125,7 @@ async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
             if note.contains("step 1 (t1, edit): succeeded")
                 && note.contains("step 2 (t2, edit): succeeded")
                 && note.contains("step 3 (t3, edit): failed")
-                && note.contains("step 4 (t4, edit): skipped")
+                && note.contains("step 4 (t4, edit): succeeded")
     )));
 }
 
@@ -1046,13 +1254,14 @@ async fn connect_failure_is_retried_and_reported() {
         inner: MockProvider::new(vec![text_done("recovered")]),
     });
     let agent = Agent {
+        models: AgentModels::default(),
         model: ModelCell::new(ActiveModel {
             provider,
             max_tokens: 1024,
             context_window: 200_000,
             effort: None,
         }),
-        tools: tcode_tools::builtin_tools(),
+        tools: tcode_tools::builtin_tools(&std::env::temp_dir()),
         system: "test".into(),
         watchdog: WatchdogConfig {
             idle_timeout_secs: 5,
@@ -1062,6 +1271,8 @@ async fn connect_failure_is_retried_and_reported() {
             max_backoff_ms: 5,
         },
         hooks: Default::default(),
+        safety_classifier: None,
+        auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
     };
     let mut session = session(dir.path(), PermissionMode::Default);
@@ -1135,13 +1346,14 @@ async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
         requests: Mutex::new(Vec::new()),
     });
     let agent = Agent {
+        models: AgentModels::default(),
         model: ModelCell::new(ActiveModel {
             provider: provider.clone(),
             max_tokens: 1024,
             context_window: 200_000,
             effort: None,
         }),
-        tools: tcode_tools::builtin_tools(),
+        tools: tcode_tools::builtin_tools(&std::env::temp_dir()),
         system: "test".into(),
         watchdog: WatchdogConfig {
             idle_timeout_secs: 5,
@@ -1151,6 +1363,8 @@ async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
             max_backoff_ms: 5,
         },
         hooks: Default::default(),
+        safety_classifier: None,
+        auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
     };
     let mut session = session(dir.path(), PermissionMode::Default);
@@ -1359,10 +1573,13 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
     });
     let agent = Agent {
         model: cell(parent.clone()),
+        models: AgentModels::default(),
         tools: vec![Arc::new(task)],
         system: "test".into(),
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),
+        safety_classifier: None,
+        auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
     };
     let mut session = session(root.path(), PermissionMode::Default);
@@ -1388,4 +1605,122 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
         "{report}"
     );
     assert!(report.contains("the report"), "{report}");
+}
+
+#[tokio::test]
+async fn auto_mode_bypasses_classifier_for_normal_project_edits() {
+    let root = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "write",
+            r#"{"path":"src/new.rs","content":"pub fn new() {}"}"#,
+        ),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![]);
+    let agent = auto_agent(main.clone(), classifier.clone());
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "add a source file").await;
+
+    assert!(root.path().join("src/new.rs").is_file());
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert!(classifier.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
+    let root = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![
+        tool_use("t1", "shell", r#"{"command":"echo auto-ok"}"#),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW")]);
+    let agent = auto_agent(main.clone(), classifier.clone());
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "run the test command").await;
+
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert_eq!(main.requests.lock().unwrap().len(), 2);
+    let requests = classifier.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].effort.as_deref(), Some("off"));
+    // A cap that only fits the verdict truncates models that think first.
+    assert_eq!(requests[0].max_tokens, 1_024);
+    // The classifier runs on the agent's provider but not its prefix.
+    assert_eq!(requests[0].cache_scope.as_deref(), Some("auto-classifier"));
+}
+
+#[tokio::test]
+async fn auto_mode_classifier_outages_pause_and_notify_the_frontend() {
+    let root = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![
+        tool_use("t1", "shell", r#"{"command":"Write-Output first"}"#),
+        text_done("first done"),
+        tool_use("t2", "shell", r#"{"command":"Write-Output second"}"#),
+        text_done("second done"),
+        tool_use("t3", "shell", r#"{"command":"Write-Output third"}"#),
+        text_done("third done"),
+    ]);
+    let classifier = MockProvider::new(vec![
+        text_done("not a verdict"),
+        text_done("not a verdict"),
+        text_done("not a verdict"),
+    ]);
+    let agent = auto_agent(main, classifier);
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "run first").await;
+    run(&agent, &mut session, &approver, "run second").await;
+    let events = run(&agent, &mut session, &approver, "run third").await;
+
+    assert_eq!(session.mode, PermissionMode::Default);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutoModePaused(notice)
+            if notice.contains("classifier failures") && notice.contains("/agents")
+    )));
+}
+
+#[tokio::test]
+async fn auto_mode_stage_two_block_prevents_shell_execution() {
+    let root = tempfile::tempdir().unwrap();
+    let target = root.path().join("blocked.txt");
+    let command = format!("Set-Content -Path '{}' -Value blocked", target.display());
+    let main = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "shell",
+            &serde_json::json!({"command": command}).to_string(),
+        ),
+        text_done("found a safer route"),
+    ]);
+    let classifier = MockProvider::new(vec![
+        text_done("BLOCK"),
+        text_done("BLOCK\nThe command writes a file without direct authorization."),
+    ]);
+    let agent = auto_agent(main.clone(), classifier.clone());
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "inspect the project").await;
+
+    assert!(!target.exists());
+    assert!(approver.asked.lock().unwrap().is_empty());
+    let requests = classifier.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    // Both stages share one cacheable policy prefix and differ only in the
+    // suffix, so stage two can reuse stage one's cached prefix.
+    assert_eq!(requests[0].system, requests[1].system);
+    assert_ne!(requests[0].system_suffix, requests[1].system_suffix);
+    assert_eq!(requests[0].cache_scope, requests[1].cache_scope);
+    assert!(session.ledger.as_messages().iter().any(|message| message
+        .content
+        .iter()
+        .any(|block| matches!(block, ContentBlock::ToolResult { content, is_error: true, .. } if content.contains("Auto Mode safety classifier")))));
 }

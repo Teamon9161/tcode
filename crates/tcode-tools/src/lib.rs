@@ -13,15 +13,21 @@ pub use interaction::{AddNoteTool, AskUserTool, UpdatePlanTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
 pub use skills::SkillTool;
-pub use task::{TaskTool, AGENT_KINDS};
+pub use task::{TaskTool, MODEL_ROLES, TASK_AGENT_KINDS};
 
+use std::path::Path;
 use std::sync::Arc;
 
 use tcode_core::Tool;
 
 /// Built-in toolset. On Windows PowerShell is the primary shell and a
 /// `bash` tool appears when Git Bash is on PATH; on Unix there is bash.
-pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
+///
+/// `skill` is part of the registry rather than something the frontend bolts
+/// on, so everything that runs tools — the main agent and every sub-agent —
+/// gets it from one place. It appears only when the project actually has
+/// skills, so a skill-less project pays no prompt tokens for the feature.
+pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs_tools::ReadTool),
         Arc::new(fs_tools::WriteTool),
@@ -40,6 +46,9 @@ pub fn builtin_tools() -> Vec<Arc<dyn Tool>> {
     } else {
         tools.push(Arc::new(shell::ShellTool::new(ShellKind::Bash)));
     }
+    if let Some(skills) = SkillTool::discover(cwd) {
+        tools.push(Arc::new(skills));
+    }
     tools
 }
 
@@ -51,7 +60,7 @@ mod tests {
     /// bypass the blob gate; command/fetch tools keep it (unpredictable size).
     #[test]
     fn output_gating_is_scoped_to_command_tools() {
-        let tools = builtin_tools();
+        let tools = builtin_tools(&std::env::temp_dir());
         let gates: std::collections::HashMap<&str, bool> =
             tools.iter().map(|t| (t.name(), t.gates_output())).collect();
         for tool in ["read", "grep", "glob", "web_search"] {
