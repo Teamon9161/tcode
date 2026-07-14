@@ -148,10 +148,10 @@ impl Renderer {
                             out.push(Line::default());
                         }
                     }
-                    TagEnd::Item => {
-                        if !spans.is_empty() {
-                            flush(&mut spans, &mut out, quote_depth);
-                        }
+                    // An empty item has nothing to flush, and flushing it would
+                    // emit a blank line.
+                    TagEnd::Item if !spans.is_empty() => {
+                        flush(&mut spans, &mut out, quote_depth);
                     }
                     _ => {}
                 },

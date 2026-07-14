@@ -99,6 +99,17 @@ pub fn diff_del_bg() -> Color {
     Color::Rgb(78, 30, 34)
 }
 
+/// The words that actually differ inside a changed line. Same hue as the
+/// line's background, lifted enough to be found at a glance — a replaced
+/// paragraph is mostly unchanged text, and the eye should not have to diff it.
+pub fn diff_add_emph_bg() -> Color {
+    Color::Rgb(34, 110, 66)
+}
+
+pub fn diff_del_emph_bg() -> Color {
+    Color::Rgb(132, 46, 52)
+}
+
 pub fn inline_code() -> Style {
     Style::default().fg(Color::LightCyan)
 }

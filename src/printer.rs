@@ -61,7 +61,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                     print!("{RESET}");
                     in_thinking = false;
                 }
-                let secs = (delay_ms + 999) / 1000;
+                let secs = delay_ms.div_ceil(1000);
                 let retained = if partial_output_retained {
                     " — incomplete response above retained; not sent back to model"
                 } else {

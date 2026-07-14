@@ -144,16 +144,15 @@ impl Sink for GroupSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, mat: &SinkMatch<'_>) -> Result<bool, Self::Error> {
-        let mut lnum = mat.line_number().unwrap_or(0);
-        for line in mat.lines() {
+        let first = mat.line_number().unwrap_or(0);
+        for (offset, line) in mat.lines().enumerate() {
             self.cur.push(Line {
-                lnum,
+                lnum: first + offset as u64,
                 text: cap_line(&String::from_utf8_lossy(line)),
                 is_match: true,
             });
             self.cur_matches += 1;
             self.total.fetch_add(1, Ordering::Relaxed);
-            lnum += 1;
         }
         // Stop this file once the requested page is full; the walk quits too.
         Ok(self.total.load(Ordering::Relaxed) < self.want)
@@ -542,7 +541,7 @@ impl Tool for GlobTool {
             }
             return ToolOutput::ok(m);
         }
-        hits.sort_by(|a, b| b.0.cmp(&a.0));
+        hits.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
         let total = hits.len();
         let page: Vec<String> = hits
             .into_iter()

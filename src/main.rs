@@ -462,8 +462,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let line_approver = approver::LineApprover;
-    let opening_context: tcode_tui::OpeningContextFn =
-        Arc::new(|path| tcode_tools::project_map(path));
+    let opening_context: tcode_tui::OpeningContextFn = Arc::new(tcode_tools::project_map);
 
     if let Some(prompt) = cli.prompt {
         run_turn(&agent, &mut session, prompt, &line_approver).await?;

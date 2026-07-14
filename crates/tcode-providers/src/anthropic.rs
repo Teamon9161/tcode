@@ -42,7 +42,7 @@ impl AnthropicProvider {
         // api.anthropic.com but not e.g. api.deepseek.com/anthropic).
         let native = base_url
             .as_deref()
-            .map_or(true, |u| u.contains("anthropic.com"));
+            .is_none_or(|u| u.contains("anthropic.com"));
         Self {
             http: crate::http::client(),
             api_key,

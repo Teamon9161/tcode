@@ -6,6 +6,7 @@ use std::sync::OnceLock;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use similar::ChangeTag;
+use std::ops::Range;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
@@ -121,29 +122,118 @@ pub fn edit_diff(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     let diff = similar::TextDiff::from_lines(old, new);
     let mut old_line = edit_start_line(path, old);
     let mut new_line = old_line;
-    diff.iter_all_changes()
-        .map(|change| {
-            let text = change.value().trim_end_matches('\n');
-            match change.tag() {
+    let mut lines = Vec::new();
+    for op in diff.ops() {
+        for change in diff.iter_inline_changes(op) {
+            let (marker, number, background, emphasis_bg) = match change.tag() {
                 ChangeTag::Delete => {
                     let line = old_line;
                     old_line += 1;
-                    code_line(path, "- ", Some(line), text, Some(theme::diff_del_bg()))
+                    (
+                        "- ",
+                        line,
+                        Some(theme::diff_del_bg()),
+                        theme::diff_del_emph_bg(),
+                    )
                 }
                 ChangeTag::Insert => {
                     let line = new_line;
                     new_line += 1;
-                    code_line(path, "+ ", Some(line), text, Some(theme::diff_add_bg()))
+                    (
+                        "+ ",
+                        line,
+                        Some(theme::diff_add_bg()),
+                        theme::diff_add_emph_bg(),
+                    )
                 }
                 ChangeTag::Equal => {
                     let line = old_line;
                     old_line += 1;
                     new_line += 1;
-                    code_line(path, "  ", Some(line), text, None)
+                    ("  ", line, None, theme::diff_add_emph_bg())
                 }
-            }
-        })
-        .collect()
+            };
+            let (text, ranges) = inline_emphasis(&change);
+            let emphasis = (!ranges.is_empty()).then_some(Emphasis {
+                ranges,
+                bg: emphasis_bg,
+            });
+            lines.push(code_line_emphasized(
+                path,
+                marker,
+                Some(number),
+                &text,
+                background,
+                emphasis.as_ref(),
+            ));
+        }
+    }
+    lines
+}
+
+/// Flatten one inline change into its text plus the byte ranges that actually
+/// differ from the other side. A wholly-rewritten line reports no ranges: the
+/// line background already says "all of this changed", and lifting every byte
+/// would only make the emphasis meaningless everywhere else.
+fn inline_emphasis(change: &similar::InlineChange<'_, str>) -> (String, Vec<Range<usize>>) {
+    let mut text = String::new();
+    let mut ranges: Vec<Range<usize>> = Vec::new();
+    for (emphasized, value) in change.iter_strings_lossy() {
+        let start = text.len();
+        text.push_str(&value);
+        if emphasized {
+            ranges.push(start..text.len());
+        }
+    }
+    let trimmed = text.trim_end_matches('\n').len();
+    text.truncate(trimmed);
+    ranges.retain_mut(|range| {
+        range.end = range.end.min(trimmed);
+        range.start < range.end
+    });
+    let emphasized: usize = ranges.iter().map(|range| range.end - range.start).sum();
+    if emphasized == trimmed {
+        ranges.clear();
+    }
+    (text, ranges)
+}
+
+/// The parts of a changed line that differ, and the background that lifts them
+/// out of the line's own.
+struct Emphasis {
+    ranges: Vec<Range<usize>>,
+    bg: Color,
+}
+
+/// Split one syntax-highlighted token at the emphasis boundaries that fall
+/// inside it, so a changed word keeps its syntax colour and only swaps
+/// background. `start` is the token's byte offset within the line.
+fn emphasis_pieces<'a>(
+    token: &'a str,
+    start: usize,
+    emphasis: Option<&Emphasis>,
+) -> Vec<(&'a str, bool)> {
+    let Some(emphasis) = emphasis else {
+        return vec![(token, false)];
+    };
+    let end = start + token.len();
+    let mut pieces = Vec::new();
+    let mut cursor = start;
+    for range in &emphasis.ranges {
+        if range.end <= cursor || range.start >= end {
+            continue;
+        }
+        let hit = range.start.max(cursor)..range.end.min(end);
+        if hit.start > cursor {
+            pieces.push((&token[cursor - start..hit.start - start], false));
+        }
+        pieces.push((&token[hit.start - start..hit.end - start], true));
+        cursor = hit.end;
+    }
+    if cursor < end {
+        pieces.push((&token[cursor - start..], false));
+    }
+    pieces
 }
 
 fn edit_start_line(path: &str, old: &str) -> usize {
@@ -165,6 +255,17 @@ fn code_line(
     line_number: Option<usize>,
     text: &str,
     background: Option<Color>,
+) -> Line<'static> {
+    code_line_emphasized(path, marker, line_number, text, background, None)
+}
+
+fn code_line_emphasized(
+    path: &str,
+    marker: &str,
+    line_number: Option<usize>,
+    text: &str,
+    background: Option<Color>,
+    emphasis: Option<&Emphasis>,
 ) -> Line<'static> {
     let highlighter = highlighter();
     let extension = std::path::Path::new(path)
@@ -201,15 +302,23 @@ fn code_line(
         Span::styled(" │ ", marker_style),
     ];
     match line_highlighter.highlight_line(text, &highlighter.syntaxes) {
-        Ok(ranges) => spans.extend(ranges.into_iter().map(|(style, token)| {
-            let foreground = style.foreground;
-            let mut style =
-                Style::default().fg(Color::Rgb(foreground.r, foreground.g, foreground.b));
-            if let Some(background) = background {
-                style = style.bg(background);
+        Ok(ranges) => {
+            let mut offset = 0;
+            for (style, token) in ranges {
+                let foreground = style.foreground;
+                for (piece, emphasized) in emphasis_pieces(token, offset, emphasis) {
+                    let mut style =
+                        Style::default().fg(Color::Rgb(foreground.r, foreground.g, foreground.b));
+                    match (emphasized, emphasis, background) {
+                        (true, Some(emphasis), _) => style = style.bg(emphasis.bg),
+                        (_, _, Some(background)) => style = style.bg(background),
+                        _ => {}
+                    }
+                    spans.push(Span::styled(piece.to_string(), style));
+                }
+                offset += token.len();
             }
-            Span::styled(token.to_string(), style)
-        })),
+        }
         Err(_) => spans.push(Span::styled(
             text.to_string(),
             Style::default().bg(background.unwrap_or(Color::Reset)),
@@ -235,6 +344,50 @@ mod tests {
             .iter()
             .skip(1)
             .any(|span| span.style.fg.is_some()));
+    }
+
+    /// The whole point: in a mostly-unchanged line the eye should land on the
+    /// words that differ, not have to diff the sentence itself.
+    #[test]
+    fn changed_words_inside_a_line_get_the_emphasis_background() {
+        let lines = edit_diff(
+            "notes.md",
+            "the quick brown fox jumps over the lazy dog\n",
+            "the quick red fox jumps over the lazy dog\n",
+        );
+        let added = lines
+            .iter()
+            .find(|line| line.spans[0].content.contains('+'))
+            .unwrap();
+        let emphasized: String = added
+            .spans
+            .iter()
+            .filter(|span| span.style.bg == Some(theme::diff_add_emph_bg()))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(emphasized.trim(), "red");
+        let plain: String = added
+            .spans
+            .iter()
+            .skip(3)
+            .filter(|span| span.style.bg == Some(theme::diff_add_bg()))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(plain.contains("quick"), "unchanged words keep the base bg");
+        assert!(plain.contains("jumps over the lazy dog"));
+    }
+
+    /// A line with nothing in common is already wholly marked by its own
+    /// background; emphasising every byte of it would just be a brighter line.
+    /// These two words are similar enough that `similar` emphasises the whole
+    /// token rather than falling back — so this pins our own guard, not its.
+    #[test]
+    fn a_wholly_rewritten_line_gets_no_word_emphasis() {
+        let lines = edit_diff("notes.md", "abcdefgh\n", "abcdefgi\n");
+        assert!(lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
+            span.style.bg != Some(theme::diff_add_emph_bg())
+                && span.style.bg != Some(theme::diff_del_emph_bg())
+        }));
     }
 
     #[test]

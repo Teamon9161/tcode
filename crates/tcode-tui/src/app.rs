@@ -1014,11 +1014,8 @@ impl App {
     }
 
     fn drain_agent_events(&mut self) {
-        loop {
-            let ev = match self.events_rx.as_mut() {
-                Some(rx) => rx.try_recv(),
-                None => break,
-            };
+        while let Some(rx) = self.events_rx.as_mut() {
+            let ev = rx.try_recv();
             match ev {
                 Ok(ev) => self.on_agent_event(ev),
                 Err(tokio::sync::mpsc::error::TryRecvError::Empty)
@@ -1197,9 +1194,11 @@ impl App {
                 self.context_tokens = self.context_step_start;
                 // Record the failure in red scrollback, then show a live
                 // countdown in the status line until the next attempt fires.
-                let retained = partial_output_retained
-                    .then_some(" — incomplete response retained; not sent back to model")
-                    .unwrap_or("");
+                let retained = if partial_output_retained {
+                    " — incomplete response retained; not sent back to model"
+                } else {
+                    ""
+                };
                 self.bake(vec![Line::styled(
                     format!("↻ API error ({attempt}/{max}): {error}{retained}"),
                     theme::error_highlight(),
@@ -1675,7 +1674,8 @@ impl App {
                     }
                 }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    if !self.input_mouse_down(mouse.column, mouse.row) {
+                    let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
+                    if !taken_by_input {
                         self.transcript.mouse_down(mouse.column, mouse.row);
                     }
                 }
@@ -1890,7 +1890,8 @@ impl App {
             KeyCode::PageUp => self.transcript.page_up(),
             KeyCode::PageDown => self.transcript.page_down(),
             KeyCode::Backspace => {
-                if !self.backspace_attachment_token() {
+                let consumed_attachment = self.backspace_attachment_token();
+                if !consumed_attachment {
                     self.editor.backspace();
                 }
             }
@@ -2011,7 +2012,7 @@ impl App {
         // echo, e.g. compacted or imported conversations.)
         self.transcript.truncate_from_entry(index);
         session.ledger.truncate_tail(index);
-        session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session);
+        session.last_prompt_tokens = estimate_context_tokens(&self.agent, session);
         self.context_tokens = session.last_prompt_tokens;
         self.context_step_start = self.context_tokens;
         self.context_estimated = !session.ledger.is_empty();
