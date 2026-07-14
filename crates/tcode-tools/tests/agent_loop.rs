@@ -122,6 +122,24 @@ fn tool_use(id: &str, name: &str, json: &str) -> Vec<StreamEvent> {
     ]
 }
 
+fn tool_uses(calls: &[(&str, &str, &str)]) -> Vec<StreamEvent> {
+    let mut events = vec![StreamEvent::Started];
+    for (index, (id, name, json)) in calls.iter().enumerate() {
+        events.push(StreamEvent::ToolUseStart {
+            index,
+            id: (*id).into(),
+            name: (*name).into(),
+        });
+        events.push(StreamEvent::ToolUseInputDelta {
+            index,
+            fragment: (*json).into(),
+        });
+    }
+    events.push(StreamEvent::Usage(Usage::default()));
+    events.push(StreamEvent::Done(StopReason::ToolUse));
+    events
+}
+
 fn text_done(text: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::Started,
@@ -825,6 +843,82 @@ async fn edit_succeeds_without_prior_read() {
         results[0].0
     );
     assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha BETA gamma");
+}
+
+#[tokio::test]
+async fn edit_lanes_preserve_same_file_order_and_report_partial_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"alpha","new_string":"ALPHA"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":"b.txt","old_string":"beta","new_string":"BETA"}"#,
+            ),
+            (
+                "t3",
+                "edit",
+                r#"{"path":"a.txt","old_string":"missing","new_string":"MISSING"}"#,
+            ),
+            (
+                "t4",
+                "edit",
+                r#"{"path":"a.txt","old_string":"ALPHA","new_string":"FINAL"}"#,
+            ),
+        ]),
+        text_done("reported"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "batch edits").await;
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "BETA"
+    );
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 4);
+    assert!(
+        !results[0].1,
+        "first same-file edit must succeed: {}",
+        results[0].0
+    );
+    assert!(
+        !results[1].1,
+        "independent file lane must complete: {}",
+        results[1].0
+    );
+    assert!(results[2].1, "failing edit must be reported");
+    assert!(
+        results[3].1 && results[3].0.contains("step 3 (t3)"),
+        "{}",
+        results[3].0
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolBatchStart { label, .. } if label == "Edit 4 changes across 2 files"
+    )));
+    assert!(session.ledger.entries().iter().any(|entry| matches!(
+        entry,
+        Entry::Note(note)
+            if note.contains("step 1 (t1, edit): succeeded")
+                && note.contains("step 2 (t2, edit): succeeded")
+                && note.contains("step 3 (t3, edit): failed")
+                && note.contains("step 4 (t4, edit): skipped")
+    )));
 }
 
 #[tokio::test]

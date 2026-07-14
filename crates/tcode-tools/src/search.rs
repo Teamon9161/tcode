@@ -216,12 +216,11 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "Search file contents with a regex (ripgrep engine, respects \
-         .gitignore). Matches are `path:line: text`. Pull surrounding code \
-         with `context` (-C, both sides), `before` (-B) or `after` (-A); \
-         context lines show as `path:line- text` and blocks are separated by \
-         `--`, so one search often gives enough to edit without a follow-up \
-         read. Filter files with `glob`; cap matches with head_limit \
-         (default 200) and page with offset."
+         .gitignore). Pull surrounding code with `context` (-C, both sides), \
+         `before` (-B) or `after` (-A) — one search with context often gives \
+         you enough to edit without a follow-up read. Filter files with \
+         `glob`; cap matches with head_limit (default 200) and page with \
+         offset."
     }
 
     fn input_schema(&self) -> Value {

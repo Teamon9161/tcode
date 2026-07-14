@@ -681,7 +681,7 @@ impl Tool for WebSearchTool {
     fn description(&self) -> &str {
         "Search the web. Returns page text (Exa) or titles/URLs/snippets \
          (DuckDuckGo fallback); with Exa you often do not need a follow-up \
-         web_fetch. Use for current information beyond your knowledge cutoff."
+         web_fetch."
     }
 
     fn input_schema(&self) -> Value {

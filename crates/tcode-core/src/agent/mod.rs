@@ -6,7 +6,7 @@ pub use session::{CwdChange, Session};
 pub use summarize::summarize_call;
 use summarize::{compact_successful_test_output, preview, split_malformed};
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -412,13 +412,11 @@ impl Agent {
                 .run_read_only_tools_parallel(session, calls, events, cancel, memory_note)
                 .await;
         }
-        // Edits to distinct files are the other safe parallel case.  Do not
-        // optimistically start any write: every permission prompt, hook and
-        // collision check completes first, so a declined sibling can never
-        // leave a partially-applied batch behind.
-        if calls.len() > 1 && self.is_parallel_file_mutation_batch(session, calls) {
+        // File mutations are scheduled per normalized path: calls within one
+        // file retain model order, while independent file lanes run together.
+        if calls.len() > 1 && self.is_file_mutation_batch(calls) {
             return self
-                .run_file_mutations_parallel(session, calls, events, approver, cancel)
+                .run_file_mutation_lanes(session, calls, events, approver, cancel)
                 .await;
         }
         // Shell / bash: batch the approval (show all commands at once),
@@ -758,26 +756,14 @@ impl Agent {
         })
     }
 
-    /// `edit`/`write` calls targeting different normalized paths can safely
-    /// share a turn.  This remains deliberately narrow: shell commands and
-    /// arbitrary tools keep their normal, ordered semantics.
-    fn is_parallel_file_mutation_batch(
-        &self,
-        session: &Session,
-        calls: &[(String, String, Value)],
-    ) -> bool {
-        let mut paths = HashSet::new();
+    /// `edit`/`write` calls form a file-mutation batch. The executor uses
+    /// each normalized path as an ordered lane, so only calls within a file
+    /// serialize while independent files remain concurrent.
+    fn is_file_mutation_batch(&self, calls: &[(String, String, Value)]) -> bool {
         calls.iter().all(|(_, name, input)| {
-            let Some(tool) = self.tool(name) else {
-                return false;
-            };
-            if tool.batch_policy() != BatchPolicy::ParallelPerFile {
-                return false;
-            }
-            let Some(path) = tool.touches(input) else {
-                return false;
-            };
-            paths.insert(normalize_path(session.tool_ctx.resolve(&path)))
+            self.tool(name).is_some_and(|tool| {
+                tool.batch_policy() == BatchPolicy::ParallelPerFile && tool.touches(input).is_some()
+            })
         })
     }
 
@@ -788,7 +774,7 @@ impl Agent {
     /// they were executed.
     pub fn batch_display_label(
         &self,
-        session: &Session,
+        _session: &Session,
         calls: &[(String, String, Value)],
     ) -> Option<String> {
         if calls.len() < 2 {
@@ -798,7 +784,7 @@ impl Agent {
             return Some(sequential_batch_label(calls.len()));
         }
         if !self.all_calls_have_policy(calls, BatchPolicy::ParallelReadOnly)
-            && !self.is_parallel_file_mutation_batch(session, calls)
+            && !self.is_file_mutation_batch(calls)
         {
             return None;
         }
@@ -823,10 +809,11 @@ impl Agent {
             .all(|(_, name, _)| self.tool(name).is_some_and(|t| t.batch_policy() == policy))
     }
 
-    /// Execute a preflighted, independent edit/write batch.  The preflight is
-    /// intentionally all-or-nothing: approval, pre-hook vetoes and snapshots
-    /// happen before the first file is touched.
-    async fn run_file_mutations_parallel(
+    /// Execute an edit/write batch in per-file lanes. Approval, pre-hooks and
+    /// checkpoints are deliberately all complete before the first mutation;
+    /// after that, calls to one path preserve the model's order, while separate
+    /// paths run concurrently.
+    async fn run_file_mutation_lanes(
         &self,
         session: &mut Session,
         calls: &[(String, String, Value)],
@@ -841,7 +828,6 @@ impl Agent {
             if cancel.is_cancelled() {
                 return self.cancel_unstarted_batch(session, calls, true);
             }
-            // `is_parallel_file_mutation_batch` established this already.
             let tool = self.tool(name).expect("preflighted tool").clone();
             match session.rules.decide(session.mode, &tool.permission(input)) {
                 Decision::Allow => {}
@@ -924,15 +910,21 @@ impl Agent {
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
         }
 
-        // Save every original before a concurrent task gets a chance to
-        // change it. `touches` is guaranteed by the batch predicate.
+        // Save each original once before any lane starts. A checkpoint at this
+        // ledger position restores the state before the entire batch, not an
+        // intermediate state after an earlier same-file call.
+        let mut checkpointed = HashSet::new();
         for (_, _, input, tool) in &prepared {
-            let path = session
-                .tool_ctx
-                .resolve(&tool.touches(input).expect("preflighted path"));
-            let len = session.ledger.len();
-            if let Some(ev) = session.checkpoints.save(len, &path) {
-                session.ledger.record_aux(&ev);
+            let path = normalize_path(
+                session
+                    .tool_ctx
+                    .resolve(&tool.touches(input).expect("preflighted path")),
+            );
+            if checkpointed.insert(path.clone()) {
+                let len = session.ledger.len();
+                if let Some(ev) = session.checkpoints.save(len, &path) {
+                    session.ledger.record_aux(&ev);
+                }
             }
         }
         self.emit(
@@ -947,41 +939,109 @@ impl Agent {
         )
         .await?;
 
-        let outputs = join_all(
-            prepared
-                .iter()
-                .map(|(_, _, input, tool)| tool.run(input.clone(), &session.tool_ctx, cancel)),
-        )
+        let mut lane_by_path: HashMap<PathBuf, usize> = HashMap::new();
+        let mut lanes: Vec<Vec<usize>> = Vec::new();
+        for (index, (_, _, input, tool)) in prepared.iter().enumerate() {
+            let path = normalize_path(
+                session
+                    .tool_ctx
+                    .resolve(&tool.touches(input).expect("preflighted path")),
+            );
+            let lane = match lane_by_path.get(&path) {
+                Some(&lane) => lane,
+                None => {
+                    let lane = lanes.len();
+                    lane_by_path.insert(path, lane);
+                    lanes.push(Vec::new());
+                    lane
+                }
+            };
+            lanes[lane].push(index);
+        }
+
+        // Each lane stops at its first failed mutation. Other files continue,
+        // and every model-issued call still receives a result in call order.
+        let lane_outputs = join_all(lanes.iter().map(|lane| {
+            let prepared = &prepared;
+            let tool_ctx = &session.tool_ctx;
+            async move {
+                let mut outputs = Vec::with_capacity(lane.len());
+                let mut failed_at: Option<usize> = None;
+                for &index in lane {
+                    let (_, _, input, tool) = &prepared[index];
+                    let (output, ran) = match failed_at {
+                        Some(previous) => (
+                            ToolOutput::err(format!(
+                                "Not executed: step {} ({}) failed earlier while mutating this file; this call made no changes.",
+                                previous + 1,
+                                prepared[previous].0,
+                            )),
+                            false,
+                        ),
+                        None if cancel.is_cancelled() => (
+                            ToolOutput::err("Cancelled by user before execution."),
+                            false,
+                        ),
+                        None => {
+                            let output = tool.run(input.clone(), tool_ctx, cancel).await;
+                            if output.is_error {
+                                failed_at = Some(index);
+                            }
+                            (output, true)
+                        }
+                    };
+                    outputs.push((index, output, ran));
+                }
+                outputs
+            }
+        }))
         .await;
+        let mut outputs: Vec<(usize, ToolOutput, bool)> =
+            lane_outputs.into_iter().flatten().collect();
+        outputs.sort_by_key(|(index, _, _)| *index);
+
         let mut results = Vec::new();
-        for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
-            if !output.is_error {
-                if let Some(tool) = self.tool(&name) {
-                    if let Some(raw) = tool.touches(&input) {
-                        let path = session.tool_ctx.resolve(&raw);
-                        session
-                            .tool_ctx
-                            .memory
-                            .lock()
-                            .expect("memory lock")
-                            .mark_written(&path);
-                    }
+        let mut status = Vec::new();
+        let mut had_failure = false;
+        for ((index, (id, name, input, tool)), (_, mut output, ran)) in
+            prepared.into_iter().enumerate().zip(outputs)
+        {
+            if ran && !output.is_error {
+                let path = session
+                    .tool_ctx
+                    .resolve(&tool.touches(&input).expect("preflighted path"));
+                session
+                    .tool_ctx
+                    .memory
+                    .lock()
+                    .expect("memory lock")
+                    .mark_written(&path);
+            }
+            if ran {
+                let post = self
+                    .hooks
+                    .run(
+                        crate::hooks::HookEvent::PostToolUse,
+                        &name,
+                        &input,
+                        Some(&output.content),
+                        &session.tool_ctx.cwd,
+                    )
+                    .await;
+                for note in post.notes {
+                    output.content.push_str(&format!("\n[hook] {note}"));
                 }
             }
-            let post = self
-                .hooks
-                .run(
-                    crate::hooks::HookEvent::PostToolUse,
-                    &name,
-                    &input,
-                    Some(&output.content),
-                    &session.tool_ctx.cwd,
-                )
-                .await;
-            for note in post.notes {
-                output.content.push_str(&format!("\n[hook] {note}"));
-            }
             let output = self.gate(session, &name, output);
+            let state = if !ran {
+                "skipped"
+            } else if output.is_error {
+                "failed"
+            } else {
+                "succeeded"
+            };
+            had_failure |= output.is_error;
+            status.push(format!("step {} ({id}, {name}): {state}", index + 1));
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
@@ -1000,6 +1060,12 @@ impl Agent {
             ));
         }
         session.ledger.append(Entry::ToolResults(results));
+        if had_failure {
+            notes.push(Entry::Note(format!(
+                "File mutation batch status (model call order): {}. See each tool result for exact failure details.",
+                status.join("; "),
+            )));
+        }
         self.append_notes(session, events, notes).await?;
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),

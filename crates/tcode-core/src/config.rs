@@ -208,7 +208,7 @@ impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 30,
-            connect_timeout_secs: 30,
+            connect_timeout_secs: 60,
             max_retries: 5,
             initial_backoff_ms: 1000,
             max_backoff_ms: 30_000,
@@ -701,6 +701,11 @@ pub mod presets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn default_connect_timeout_allows_slow_first_tokens() {
+        assert_eq!(WatchdogConfig::default().connect_timeout_secs, 60);
+    }
 
     #[test]
     fn embedded_defaults_parse_and_carry_clean_model_ids() {

@@ -56,9 +56,9 @@ pub enum BatchPolicy {
     Isolated,
     /// Read-only, no side effects — run every call concurrently, no approval.
     ParallelReadOnly,
-    /// Mutates a single file (see `touches`) — run concurrently only when the
-    /// calls target distinct paths; approvals, hooks and snapshots all
-    /// complete before the first write.
+    /// Mutates one file (see `touches`). Calls to the same normalized path run
+    /// in model order; calls targeting other paths may run concurrently. All
+    /// approvals, hooks and snapshots complete before the first write.
     ParallelPerFile,
     /// Side effects must be visible to later calls — approve the whole batch
     /// once, then run the calls sequentially.

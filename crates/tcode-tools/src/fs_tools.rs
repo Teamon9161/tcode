@@ -157,11 +157,9 @@ impl Tool for ReadTool {
     fn description(&self) -> &str {
         "Read a file with line numbers. Use offset/limit for large files; \
          limits under 120 lines are widened to 120, so read generous windows \
-         instead of many small slices. Images (png/jpeg/gif/webp) are read \
-         straight into context so you can see them; other binaries are \
-         refused. Need several files or regions? Issue all reads in one \
-         message — they run in parallel. If the harness reports the file \
-         unchanged since your last read, the content is already in your \
+         instead of many small slices. Images (png/jpeg/gif/webp) come \
+         straight into context so you can see them. If the harness reports the \
+         file unchanged since your last read, the content is already in your \
          context — do not re-read; pass force=true only if you have a \
          specific reason."
     }
@@ -494,19 +492,36 @@ impl Tool for EditTool {
     }
 
     fn batch_label(&self, inputs: &[&Value]) -> String {
-        let count = inputs.len();
-        format!("Edit {count} {}", if count == 1 { "file" } else { "files" })
+        let changes = inputs.len();
+        let files: HashSet<&str> = inputs
+            .iter()
+            .filter_map(|input| input["path"].as_str())
+            .collect();
+        if changes == files.len() {
+            format!(
+                "Edit {changes} {}",
+                if changes == 1 { "file" } else { "files" }
+            )
+        } else {
+            format!(
+                "Edit {changes} {} across {} {}",
+                if changes == 1 { "change" } else { "changes" },
+                files.len(),
+                if files.len() == 1 { "file" } else { "files" },
+            )
+        }
     }
 
     fn description(&self) -> &str {
         "Exact string replacement in a UTF-8 text file. `old_string` must match the \
          current content exactly (including whitespace; line endings may be \
          LF/CRLF and are normalized to the file's style) and be unique unless \
-         replace_all is set. Non-UTF-8 files and empty old_string are rejected. \
+         replace_all is set. \
          Only edit text you have actually seen in this session (read or grep \
          output both count) and whose surroundings you understand; if you are \
          unsure of the exact content or the impact of the change, read the file \
-         first instead of guessing."
+         first instead of guessing. A separate read is not required when grep \
+         already showed you the exact text with enough context around it."
     }
 
     fn input_schema(&self) -> Value {
