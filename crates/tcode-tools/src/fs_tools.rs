@@ -42,6 +42,41 @@ fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
     path.strip_prefix(cwd).unwrap_or(path)
 }
 
+/// Windows rejects a write while another process has the file memory-mapped
+/// with `ERROR_USER_MAPPED_FILE` (1224). This is normally transient (for
+/// example, an editor or indexer releasing a just-read file).
+#[cfg(windows)]
+fn is_windows_user_mapped_file(error: &std::io::Error) -> bool {
+    error.raw_os_error() == Some(1224)
+}
+
+#[cfg(not(windows))]
+fn is_windows_user_mapped_file(_error: &std::io::Error) -> bool {
+    false
+}
+
+async fn write_with_windows_retry(path: &Path, content: &[u8]) -> std::io::Result<()> {
+    match tokio::fs::write(path, content).await {
+        Err(error) if is_windows_user_mapped_file(&error) => {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::fs::write(path, content).await
+        }
+        result => result,
+    }
+}
+
+fn write_error(path: &Path, error: &std::io::Error) -> String {
+    if is_windows_user_mapped_file(error) {
+        format!(
+            "cannot write {}: {error}. Windows has the file temporarily mapped or locked \
+             (os error 1224); retried once after 50ms. Close the program holding it and retry.",
+            path.display()
+        )
+    } else {
+        format!("cannot write {}: {error}", path.display())
+    }
+}
+
 /// Render numbered lines until the line count runs out or the byte budget is
 /// hit. Returns the text and how many lines were actually emitted, so the
 /// caller can tell the model where to resume.
@@ -470,8 +505,8 @@ impl Tool for WriteTool {
                 return ToolOutput::err(format!("cannot create {}: {e}", parent.display()));
             }
         }
-        if let Err(e) = tokio::fs::write(&path, content).await {
-            return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
+        if let Err(error) = write_with_windows_retry(&path, content.as_bytes()).await {
+            return ToolOutput::err(write_error(&path, &error));
         }
         ctx.freshness
             .lock()
@@ -652,8 +687,8 @@ impl Tool for EditTool {
         } else {
             text.replacen(&plan.old, &plan.new, 1)
         };
-        if let Err(e) = tokio::fs::write(&path, &new_text).await {
-            return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
+        if let Err(error) = write_with_windows_retry(&path, new_text.as_bytes()).await {
+            return ToolOutput::err(write_error(&path, &error));
         }
         // `edit` proves and changes one exact region, but it does not make the
         // rest of the current file visible to the model. Do not call
@@ -939,6 +974,17 @@ fn near_miss_help(text: &str, old: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn mapped_file_errors_explain_the_windows_lock() {
+        let error = std::io::Error::from_raw_os_error(1224);
+        assert!(is_windows_user_mapped_file(&error));
+
+        let message = write_error(Path::new("locked.txt"), &error);
+        assert!(message.contains("temporarily mapped or locked"));
+        assert!(message.contains("retried once after 50ms"));
+    }
 
     #[test]
     fn edit_match_accepts_lf_old_string_in_crlf_file() {

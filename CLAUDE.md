@@ -58,7 +58,7 @@ tcode 是一个类 Claude Code / Codex 的 Rust agent harness CLI。**`plan.md` 
 - **ctrl+c 只中断，永不退出**：慌张地按 ctrl+c 停飞车不该把会话一起扔掉。退出走 `/exit` 或 ctrl+d。运行中两个键分工明确：ctrl+c = 停下并把排队的话立刻说出去；esc = 由新到旧逐层剥（先撤回排队的 prompt 且不打断 turn，再按才取消 turn），撤回的文本回填输入框，回填不了的（更早的消息、已编码成 block 的附件）留一行灰字记录，不许静默丢失。
 - 批次分组的判定属于 agent loop（`BatchPolicy` + 路径冲突检查），重放要还原批次显示就调 `Agent::batch_display_label` 问 core，**禁止在 TUI 里重新推导规则**（测试 `batch_display_label_matches_the_live_batch_header` 钉住实时与重放同一标题）。
 - 斜杠命令归属：语义作用于 `Session`/`Ledger`/文件系统 → core `commands/`（TUI 与 REPL 共享，自动获得 /help 与补全）；语义是操纵前端专属对象（model picker、provider wizard）→ 留在前端。开发者用的命令实现 `SlashCommand::hidden()`：照常 dispatch，但不进 /help 与补全（如 `/dogfood`）。`/model` 与 `/agents` 驱动的是前端自己的选择器，故留在前端；两者共用一个 `Picker`（`/agents` 只是多套一层"选哪个 agent"和一行 inherit），别为第二个选择器再写一套网格。前端只是 effect 解释器；`CommandEffect` 新增变体的准入标准：要么每个前端都有非平凡解释，要么有明确降级语义，否则逻辑该留在命令自己里。
-- update_plan 不套骨架：多数任务不必 plan；要 plan 时步骤按真实结构增量维护，同时只一个 in_progress，做完即标 completed。
+- update_progress 不套骨架：多数任务不必追踪进度；需要时按真实结构分阶段维护，同时只一个 in_progress，做完即标 completed。它不同于只读的 plan permission mode。
 
 ## 常用命令
 

@@ -15,13 +15,13 @@ use tcode_core::{BatchPolicy, Tool};
 
 use crate::diff;
 
-/// Where a tool call's rendering goes. `Plan` feeds the plan pane instead of
-/// the transcript (update_plan); `Silent` renders nothing because another
-/// mechanism already told the story (ask_user's approval record).
+/// Where a tool call's rendering goes. `Progress` feeds the execution-progress
+/// pane instead of the transcript (`update_progress`); `Silent` renders nothing
+/// because another mechanism already told the story (ask_user's approval record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallRoute {
     Transcript,
-    Plan,
+    Progress,
     Silent,
 }
 
@@ -221,11 +221,11 @@ impl ToolRenderer for WebFetchRenderer {
     }
 }
 
-struct PlanRenderer;
+struct ProgressRenderer;
 
-impl ToolRenderer for PlanRenderer {
+impl ToolRenderer for ProgressRenderer {
     fn route(&self) -> CallRoute {
-        CallRoute::Plan
+        CallRoute::Progress
     }
 }
 
@@ -261,11 +261,17 @@ impl RenderRegistry {
                 "grep" | "glob" => Box::new(PatternRenderer { quiet }),
                 "web_fetch" => Box::new(WebFetchRenderer),
                 "task" => Box::new(TaskRenderer),
-                "update_plan" => Box::new(PlanRenderer),
+                "update_progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),
                 _ => Box::new(DefaultRenderer { quiet }),
             };
             renderers.insert(name.to_string(), renderer);
+        }
+        // Existing JSONL sessions retain the retired call name and schema. Keep
+        // their progress pane visible on resume without exposing that name to
+        // new model requests.
+        if renderers.contains_key("update_progress") {
+            renderers.insert("update_plan".into(), Box::new(ProgressRenderer));
         }
         Self {
             renderers,
@@ -393,11 +399,16 @@ mod tests {
     }
 
     #[test]
-    fn routes_split_plan_and_silent_tools_from_the_transcript() {
+    fn routes_split_progress_and_silent_tools_from_the_transcript() {
         let registry = RenderRegistry::from_tools(&[]);
         assert_eq!(registry.get("unknown").route(), CallRoute::Transcript);
-        assert_eq!(PlanRenderer.route(), CallRoute::Plan);
+        assert_eq!(ProgressRenderer.route(), CallRoute::Progress);
         assert_eq!(SilentRenderer.route(), CallRoute::Silent);
+
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tcode_tools::UpdateProgressTool)];
+        let registry = RenderRegistry::from_tools(&tools);
+        assert_eq!(registry.get("update_progress").route(), CallRoute::Progress);
+        assert_eq!(registry.get("update_plan").route(), CallRoute::Progress);
     }
 
     #[test]

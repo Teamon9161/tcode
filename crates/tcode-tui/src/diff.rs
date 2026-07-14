@@ -14,6 +14,9 @@ use syntect::parsing::SyntaxSet;
 use crate::theme;
 
 const MAX_DIFF_LINES: usize = 80;
+/// Inline emphasis is for a word-level correction, not a rewritten sentence.
+const MAX_INLINE_EMPHASIS_CHARS: usize = 24;
+const MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR: usize = 4;
 
 struct Highlighter {
     syntaxes: SyntaxSet,
@@ -191,11 +194,61 @@ fn inline_emphasis(change: &similar::InlineChange<'_, str>) -> (String, Vec<Rang
         range.end = range.end.min(trimmed);
         range.start < range.end
     });
-    let emphasized: usize = ranges.iter().map(|range| range.end - range.start).sum();
-    if emphasized == trimmed {
+    if inline_emphasis_is_local(&text, &ranges) {
+        ranges = non_whitespace_ranges(&text, ranges);
+    } else {
         ranges.clear();
     }
     (text, ranges)
+}
+
+/// Emphasis is useful only for a small, local change inside an otherwise stable
+/// line. `similar` can emit a large changed suffix after a shared prefix; that
+/// is a line rewrite, not a word-level edit. Keep the accent to at most a
+/// quarter of the visible text and 24 visible characters.
+fn inline_emphasis_is_local(text: &str, ranges: &[Range<usize>]) -> bool {
+    let mut visible = 0usize;
+    let mut changed = 0usize;
+    for (start, ch) in text.char_indices() {
+        if ch.is_whitespace() {
+            continue;
+        }
+        visible += 1;
+        let end = start + ch.len_utf8();
+        if ranges
+            .iter()
+            .any(|range| range.start <= start && end <= range.end)
+        {
+            changed += 1;
+        }
+    }
+    changed > 0
+        && changed <= MAX_INLINE_EMPHASIS_CHARS
+        && changed * MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR <= visible
+}
+
+/// Emphasis is a signal for changed text, not for the whitespace which carries
+/// its layout. Keeping only non-whitespace runs prevents a short changed prefix
+/// plus trailing spaces from painting the entire line more brightly.
+fn non_whitespace_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    let mut result = Vec::new();
+    for range in ranges {
+        let mut run_start = None;
+        for (offset, ch) in text[range.clone()].char_indices() {
+            let index = range.start + offset;
+            if ch.is_whitespace() {
+                if let Some(start) = run_start.take() {
+                    result.push(start..index);
+                }
+            } else if run_start.is_none() {
+                run_start = Some(index);
+            }
+        }
+        if let Some(start) = run_start {
+            result.push(start..range.end);
+        }
+    }
+    result
 }
 
 /// The parts of a changed line that differ, and the background that lifts them
@@ -388,6 +441,28 @@ mod tests {
             span.style.bg != Some(theme::diff_add_emph_bg())
                 && span.style.bg != Some(theme::diff_del_emph_bg())
         }));
+    }
+
+    #[test]
+    fn inline_emphasis_requires_a_small_local_change() {
+        let local = "the quick red fox jumps over the lazy dog";
+        assert!(inline_emphasis_is_local(local, &[10..13]));
+
+        let rewrite = "stable prefix followed by an extensively rewritten paragraph";
+        assert!(!inline_emphasis_is_local(rewrite, &[14..rewrite.len()]));
+        assert!(!inline_emphasis_is_local(
+            "delete this line",
+            &[0..6, 7..11, 12..16]
+        ));
+    }
+
+    #[test]
+    fn whitespace_does_not_receive_inline_emphasis() {
+        let text = "prefix  suffix";
+        assert_eq!(
+            non_whitespace_ranges(text, vec![0..text.len()]),
+            vec![0..6, 8..14]
+        );
     }
 
     #[test]

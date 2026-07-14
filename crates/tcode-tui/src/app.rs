@@ -41,9 +41,9 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 const WHEEL_STEP: usize = 3;
 /// Visible rows of an expanded tool-output region.
 const OUTPUT_VIEW_ROWS: usize = 12;
-/// Plan panel rows should stay small and predictable; long plans render as a
-/// focused window around the active step instead of stealing scroll focus.
-const PLAN_VISIBLE_STEPS: usize = 5;
+/// Progress panel rows should stay small and predictable; long phase lists
+/// render as a focused window around the active phase instead of stealing scroll focus.
+const PROGRESS_VISIBLE_PHASES: usize = 5;
 
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
@@ -221,12 +221,12 @@ enum ResultRender {
     },
 }
 
-struct PlanStep {
-    step: String,
+struct ProgressPhase {
+    phase: String,
     status: String,
 }
 
-impl PlanStep {
+impl ProgressPhase {
     fn is_completed(&self) -> bool {
         self.status == "completed"
     }
@@ -328,7 +328,7 @@ pub struct App {
     /// Entries belonging to a concurrent group, completed in model-call
     /// order. Keeping them queued lets each result retain its own input.
     pending_batch: VecDeque<PendingCall>,
-    plan: Vec<PlanStep>,
+    progress: Vec<ProgressPhase>,
     last_esc: Option<Instant>,
     popup_index: usize,
 
@@ -451,7 +451,7 @@ impl App {
             dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
-            plan: Vec::new(),
+            progress: Vec::new(),
             last_esc: None,
             popup_index: 0,
             live_text: String::new(),
@@ -667,7 +667,7 @@ impl App {
 
     fn replay_ledger(&mut self, session: &Session) {
         let mut lines: Vec<Line<'static>> = Vec::new();
-        let mut resumed_plan: Option<serde_json::Value> = None;
+        let mut resumed_progress: Option<serde_json::Value> = None;
         let mut calls: HashMap<String, ReplayCall> = HashMap::new();
         for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
@@ -714,8 +714,8 @@ impl App {
                                 // entry so each call renders directly above its
                                 // own result, not all headers then all results.
                                 group.push((id.clone(), name.clone(), input.clone()));
-                                if matches!(self.renderers.get(name).route(), CallRoute::Plan) {
-                                    resumed_plan = Some(input.clone());
+                                if matches!(self.renderers.get(name).route(), CallRoute::Progress) {
+                                    resumed_progress = Some(input.clone());
                                 }
                             }
                             _ => {}
@@ -856,8 +856,8 @@ impl App {
             }
         }
         lines.push(Line::styled("── resumed ──", theme::dim()));
-        if let Some(plan) = resumed_plan {
-            self.update_plan(&plan);
+        if let Some(progress) = resumed_progress {
+            self.update_progress(&progress);
         }
         self.bake(lines);
     }
@@ -911,8 +911,8 @@ impl App {
         // The user just answered the question the guess was asking.
         self.drop_suggestion();
         self.clear_live_text();
-        if !self.plan.is_empty() && self.plan.iter().all(PlanStep::is_completed) {
-            self.plan.clear();
+        if !self.progress.is_empty() && self.progress.iter().all(ProgressPhase::is_completed) {
+            self.progress.clear();
         }
         // Until the provider reports authoritative prompt usage, keep the meter
         // useful with a conservative local estimate. Pasted text counts here
@@ -1166,9 +1166,9 @@ impl App {
                 input,
             } => {
                 match self.renderers.get(&name).route() {
-                    CallRoute::Plan => {
-                        self.update_plan(&input);
-                        self.state_label = "updating plan".into();
+                    CallRoute::Progress => {
+                        self.update_progress(&input);
+                        self.state_label = "updating progress".into();
                         return;
                     }
                     // The question and its answer are already baked by the
@@ -1564,7 +1564,9 @@ impl App {
     }
 
     /// One batch item's `├ summary` row (plus any diff). Baked not here but
-    /// at the item's own result, so each call sits above its own output.
+    /// at the item's own result, so each call sits above its own output. A
+    /// change body gets a trailing separator, otherwise adjacent file diffs
+    /// would visually merge into one block.
     fn batch_item_lines(
         &self,
         name: &str,
@@ -1583,7 +1585,11 @@ impl App {
             theme::dim(),
         ));
         let mut lines = vec![Line::from(row)];
-        lines.extend(renderer.body(input));
+        let body = renderer.body(input);
+        if !body.is_empty() {
+            lines.extend(body);
+            lines.push(Line::default());
+        }
         lines
     }
 
@@ -2697,7 +2703,7 @@ impl App {
         }
         self.context_step_start = self.context_tokens;
         self.prev_cache_ratio = None;
-        self.plan.clear();
+        self.progress.clear();
         self.pending_tool = None;
         self.pending_batch.clear();
         self.thinking_text.clear();
@@ -2815,36 +2821,48 @@ impl App {
         }
     }
 
-    fn update_plan(&mut self, input: &serde_json::Value) {
-        let Some(items) = input["plan"].as_array() else {
+    fn update_progress(&mut self, input: &serde_json::Value) {
+        // `plan` / `step` keep resumed sessions created before the rename
+        // readable; live calls use `phases` / `phase` exclusively.
+        let Some(items) = input["phases"]
+            .as_array()
+            .or_else(|| input["plan"].as_array())
+        else {
             return;
         };
-        self.plan = items
+        self.progress = items
             .iter()
             .filter_map(|item| {
-                let step = item["step"].as_str()?.trim();
+                let phase = item["phase"]
+                    .as_str()
+                    .or_else(|| item["step"].as_str())?
+                    .trim();
                 let status = item["status"].as_str()?;
-                (!step.is_empty() && matches!(status, "pending" | "in_progress" | "completed"))
-                    .then(|| PlanStep {
-                        step: step.to_string(),
+                (!phase.is_empty() && matches!(status, "pending" | "in_progress" | "completed"))
+                    .then(|| ProgressPhase {
+                        phase: phase.to_string(),
                         status: status.to_string(),
                     })
             })
             .collect();
     }
 
-    fn plan_lines(&self) -> Vec<Line<'static>> {
-        if self.plan.is_empty() {
+    fn progress_lines(&self) -> Vec<Line<'static>> {
+        if self.progress.is_empty() {
             return Vec::new();
         }
-        let complete = self.plan.iter().filter(|item| item.is_completed()).count();
-        let (start, end) = visible_plan_range(&self.plan, PLAN_VISIBLE_STEPS);
+        let complete = self
+            .progress
+            .iter()
+            .filter(|item| item.is_completed())
+            .count();
+        let (start, end) = visible_phase_range(&self.progress, PROGRESS_VISIBLE_PHASES);
         let hidden_before = start;
-        let hidden_after = self.plan.len().saturating_sub(end);
+        let hidden_after = self.progress.len().saturating_sub(end);
         let mut lines = vec![Line::from(vec![
-            Span::styled("  plan ", theme::bold().fg(theme::ACCENT)),
+            Span::styled("  progress ", theme::bold().fg(theme::ACCENT)),
             Span::styled(
-                format!("{complete}/{} complete", self.plan.len()),
+                format!("{complete}/{} phases complete", self.progress.len()),
                 theme::dim(),
             ),
             if hidden_before + hidden_after > 0 {
@@ -2859,7 +2877,7 @@ impl App {
                 theme::dim(),
             ));
         }
-        lines.extend(self.plan[start..end].iter().map(|item| {
+        lines.extend(self.progress[start..end].iter().map(|item| {
             let (marker, style) = match item.status.as_str() {
                 "completed" => ("✓ ", ratatui::style::Style::default().fg(theme::OK)),
                 "in_progress" => ("● ", theme::accent()),
@@ -2868,7 +2886,7 @@ impl App {
             Line::from(vec![
                 Span::styled(format!("    {marker}"), style),
                 Span::styled(
-                    item.step.clone(),
+                    item.phase.clone(),
                     if item.status == "completed" {
                         ratatui::style::Style::default()
                             .fg(theme::OK)
@@ -3040,7 +3058,7 @@ impl App {
             Vec::new()
         };
         let popup_index = self.popup_index.min(popup.len().saturating_sub(1));
-        let plan_lines = self.plan_lines();
+        let progress_lines = self.progress_lines();
         let queued_lines = self.queued_lines(area_width(&self.terminal));
 
         use ratatui::widgets::{Block, BorderType, Clear};
@@ -3070,8 +3088,8 @@ impl App {
                     h += 1; // spinner/status line above the input box
                 }
                 h += queued_lines.len() as u16;
-                if !plan_lines.is_empty() {
-                    h += plan_lines.len() as u16 + 2;
+                if !progress_lines.is_empty() {
+                    h += progress_lines.len() as u16 + 2;
                 }
                 if self.rate_limits.is_some() {
                     h += 1;
@@ -3112,10 +3130,10 @@ impl App {
                 return;
             }
 
-            if !plan_lines.is_empty() {
-                let h = plan_lines.len() as u16 + 2;
+            if !progress_lines.is_empty() {
+                let h = progress_lines.len() as u16 + 2;
                 frame.render_widget(
-                    Paragraph::new(Text::from(plan_lines)).block(
+                    Paragraph::new(Text::from(progress_lines)).block(
                         Block::bordered()
                             .border_type(BorderType::Rounded)
                             .border_style(theme::border()),
@@ -3322,17 +3340,17 @@ impl App {
     }
 }
 
-fn visible_plan_range(plan: &[PlanStep], max_visible: usize) -> (usize, usize) {
-    if plan.len() <= max_visible || max_visible == 0 {
-        return (0, plan.len());
+fn visible_phase_range(phases: &[ProgressPhase], max_visible: usize) -> (usize, usize) {
+    if phases.len() <= max_visible || max_visible == 0 {
+        return (0, phases.len());
     }
-    let focus = plan
+    let focus = phases
         .iter()
         .position(|item| item.status == "in_progress")
-        .or_else(|| plan.iter().position(|item| item.status == "pending"))
-        .unwrap_or(plan.len() - 1);
+        .or_else(|| phases.iter().position(|item| item.status == "pending"))
+        .unwrap_or(phases.len() - 1);
     let mut start = focus.saturating_sub(max_visible / 2);
-    start = start.min(plan.len().saturating_sub(max_visible));
+    start = start.min(phases.len().saturating_sub(max_visible));
     (start, start + max_visible)
 }
 
@@ -4013,36 +4031,36 @@ mod tests {
     }
 
     #[test]
-    fn visible_plan_range_focuses_in_progress_item() {
-        let plan = (0..8)
-            .map(|i| PlanStep {
-                step: format!("step {i}"),
+    fn visible_phase_range_focuses_in_progress_item() {
+        let phases = (0..8)
+            .map(|i| ProgressPhase {
+                phase: format!("Phase {i}"),
                 status: if i == 5 { "in_progress" } else { "pending" }.to_string(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(visible_plan_range(&plan, 5), (3, 8));
+        assert_eq!(visible_phase_range(&phases, 5), (3, 8));
     }
 
     #[test]
-    fn visible_plan_range_falls_back_to_first_pending() {
-        let plan = (0..8)
-            .map(|i| PlanStep {
-                step: format!("step {i}"),
+    fn visible_phase_range_falls_back_to_first_pending() {
+        let phases = (0..8)
+            .map(|i| ProgressPhase {
+                phase: format!("Phase {i}"),
                 status: if i < 4 { "completed" } else { "pending" }.to_string(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(visible_plan_range(&plan, 5), (2, 7));
+        assert_eq!(visible_phase_range(&phases, 5), (2, 7));
     }
 
     #[test]
-    fn visible_plan_range_shows_tail_when_all_complete() {
-        let plan = (0..8)
-            .map(|i| PlanStep {
-                step: format!("step {i}"),
+    fn visible_phase_range_shows_tail_when_all_complete() {
+        let phases = (0..8)
+            .map(|i| ProgressPhase {
+                phase: format!("Phase {i}"),
                 status: "completed".to_string(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(visible_plan_range(&plan, 5), (3, 8));
+        assert_eq!(visible_phase_range(&phases, 5), (3, 8));
     }
 
     #[test]

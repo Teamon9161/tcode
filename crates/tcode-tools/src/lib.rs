@@ -9,7 +9,7 @@ mod task;
 mod web;
 
 pub use grounding::project_map;
-pub use interaction::{AddNoteTool, AskUserTool, UpdatePlanTool};
+pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
 pub use skills::SkillTool;

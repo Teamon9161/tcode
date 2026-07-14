@@ -435,7 +435,7 @@ async fn main() -> anyhow::Result<()> {
         .with_agent_models(pinned.clone())
         .with_auto_policy(classifier_policy.clone()),
     ));
-    tools.push(Arc::new(tcode_tools::UpdatePlanTool));
+    tools.push(Arc::new(tcode_tools::UpdateProgressTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
     tools.push(Arc::new(tcode_tools::AddNoteTool));
     // MCP servers from config; a broken server warns instead of blocking.

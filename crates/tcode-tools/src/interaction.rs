@@ -1,5 +1,5 @@
-//! Small, provider-neutral interaction tools. They turn plans and user
-//! questions into structured calls rather than relying on brittle prose.
+//! Small, provider-neutral interaction tools. They turn execution progress and
+//! user questions into structured calls rather than relying on brittle prose.
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -7,31 +7,33 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
 
-pub struct UpdatePlanTool;
+/// Records the model's visible execution progress. This is deliberately
+/// distinct from the read-only `plan` permission mode.
+pub struct UpdateProgressTool;
 
 #[async_trait]
-impl Tool for UpdatePlanTool {
+impl Tool for UpdateProgressTool {
     fn name(&self) -> &str {
-        "update_plan"
+        "update_progress"
     }
     fn description(&self) -> &str {
-        "Record and maintain the visible execution plan for genuinely multi-step work; skip it for simple or localized tasks. Do not create a generic three-step checklist like inspect/edit/test, locate/change/verify, or read/implement/run tests — those add no information. Use a short ordered list only when the steps reflect the task's real dependencies, risks, or user-visible milestones. Update incrementally as work advances: keep exactly one step in_progress, mark a step completed the moment it lands, and immediately move the next real step to in_progress when continuing. Never leave every step pending and then flip them all to completed at the end — a plan that is only accurate once the work is over told the user nothing. To complete a specific step, resend the full current list with that step marked completed (and the next step in_progress if work continues). If the plan is done or no longer applies to the user's current request, send an empty plan array to clear the plan display."
+        "Record and maintain visible execution progress for genuinely multi-phase work; skip it for simple or localized tasks. This is a progress tracker, not a proposal or a generic inspect/edit/test checklist. Use a short ordered `phases` list only when it reflects the work's real dependencies, risks, or user-visible milestones. Name each item as a concrete phase, for example `Phase 1 — inspect the migration boundary`. Update incrementally as work advances: keep exactly one phase in_progress, mark a phase completed the moment it lands, and immediately move the next real phase to in_progress when continuing. Never leave every phase pending and then flip them all to completed at the end — progress that is only accurate once the work is over told the user nothing. To complete a phase, resend the full current list with that phase marked completed (and the next phase in_progress if work continues). If the work is done or no longer needs tracking, send an empty phases array to clear the progress display."
     }
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "plan": { "type": "array", "items": { "type": "object", "properties": {
-                "step": { "type": "string" },
+            "properties": { "phases": { "type": "array", "items": { "type": "object", "properties": {
+                "phase": { "type": "string" },
                 "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
-            }, "required": ["step", "status"] } } },
-            "required": ["plan"]
+            }, "required": ["phase", "status"] } } },
+            "required": ["phases"]
         })
     }
     fn permission(&self, _: &Value) -> PermissionRequest {
         PermissionRequest::None
     }
     async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
-        ToolOutput::ok("plan updated")
+        ToolOutput::ok("progress updated")
     }
 }
 

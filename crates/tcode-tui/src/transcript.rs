@@ -656,6 +656,14 @@ fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Lin
             .first()
             .filter(|span| span.content == crate::theme::USER_GUTTER)
             .cloned();
+        // The inline-emphasis span can be the first thing on a wrapped
+        // continuation. Padding must retain the logical diff line's base
+        // background, not make the remainder of that continuation emphatic.
+        let padding_background = line
+            .spans
+            .iter()
+            .find_map(|span| span.style.bg)
+            .map(base_diff_background);
         let mut first = true;
         let mut current: Vec<Span<'static>> = Vec::new();
         let mut current_width = 0usize;
@@ -680,7 +688,12 @@ fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Lin
                     if !current.is_empty() && current_width + char_width > width {
                         out.push((
                             std::mem::replace(&mut first, false),
-                            pad_background_line(std::mem::take(&mut current), current_width, width),
+                            pad_background_line(
+                                std::mem::take(&mut current),
+                                current_width,
+                                width,
+                                padding_background,
+                            ),
                         ));
                         current_width = 0;
                         if let Some(gutter) = &gutter {
@@ -693,15 +706,37 @@ fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Lin
                 }
             }
         }
-        out.push((first, pad_background_line(current, current_width, width)));
+        out.push((
+            first,
+            pad_background_line(current, current_width, width, padding_background),
+        ));
     }
     out
 }
 
+/// Return a diff line's ordinary background when given one of its brighter
+/// inline-emphasis colors; all other backgrounds are already their own base.
+fn base_diff_background(background: ratatui::style::Color) -> ratatui::style::Color {
+    if background == crate::theme::diff_add_emph_bg() {
+        crate::theme::diff_add_bg()
+    } else if background == crate::theme::diff_del_emph_bg() {
+        crate::theme::diff_del_bg()
+    } else {
+        background
+    }
+}
+
 /// Ratatui backgrounds otherwise stop at the final code character. Extend
 /// diff lines to the terminal edge, including every wrapped chunk.
-fn pad_background_line(mut spans: Vec<Span<'static>>, used: usize, width: usize) -> Line<'static> {
-    if let Some(background) = spans.iter().find_map(|span| span.style.bg) {
+fn pad_background_line(
+    mut spans: Vec<Span<'static>>,
+    used: usize,
+    width: usize,
+    padding_background: Option<ratatui::style::Color>,
+) -> Line<'static> {
+    if let Some(background) =
+        padding_background.or_else(|| spans.iter().find_map(|span| span.style.bg))
+    {
         spans.push(Span::styled(
             " ".repeat(width.saturating_sub(used)),
             ratatui::style::Style::default().bg(background),
@@ -741,6 +776,33 @@ mod tests {
         // A leading tab expands to a full eight-column stop.
         let lines = wrap_lines(vec![Line::raw("\ty")], 40);
         assert_eq!(text_of(&lines), ["        y"]);
+    }
+
+    #[test]
+    fn wrapped_diff_emphasis_pads_with_the_base_background() {
+        let line = Line::from(vec![
+            Span::styled(
+                "base ",
+                ratatui::style::Style::default().bg(crate::theme::diff_add_bg()),
+            ),
+            Span::styled(
+                "changed",
+                ratatui::style::Style::default().bg(crate::theme::diff_add_emph_bg()),
+            ),
+        ]);
+        // Usable width is one less than the supplied width. The continuation
+        // therefore begins inside the emphatic word and exposes the old bug.
+        let rows = wrap_lines(vec![line], 8);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[1].spans[0].style.bg,
+            Some(crate::theme::diff_add_emph_bg())
+        );
+        assert_eq!(
+            rows[1].spans.last().unwrap().style.bg,
+            Some(crate::theme::diff_add_bg()),
+            "trailing cells must stay at the ordinary diff color"
+        );
     }
 
     #[test]
