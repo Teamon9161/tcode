@@ -120,6 +120,29 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+/// Convert approval comments written by versions before `Entry::UserNote`.
+/// The literal prefix makes this deliberately narrow: ordinary harness notes
+/// must retain their original meaning on resume.
+fn upgrade_legacy_entry(entry: Entry) -> Entry {
+    let Entry::Note(note) = entry else {
+        return entry;
+    };
+    let Some(rest) = note.strip_prefix("Note from the user when approving ") else {
+        return Entry::Note(note);
+    };
+    let Some((about, text)) = rest.split_once(": ") else {
+        return Entry::Note(note);
+    };
+    if about.is_empty() {
+        return Entry::Note(note);
+    }
+    Entry::UserNote {
+        about: about.into(),
+        answer: false,
+        text: text.into(),
+    }
+}
+
 pub struct SessionStore {
     pub id: String,
     writer: BufWriter<File>,
@@ -245,7 +268,12 @@ impl SessionStore {
             }
             match serde_json::from_str::<LogEvent>(&line)? {
                 LogEvent::Meta { id: meta_id, .. } => id = meta_id,
-                LogEvent::Append { entry } => ledger.append(entry),
+                // Before `Entry::UserNote` existed, approval annotations were
+                // persisted as a pre-formatted machine note. Upgrade that
+                // unambiguous legacy shape while replaying so resumed
+                // transcripts show the person's own words, just like live
+                // annotations and newly-created sessions.
+                LogEvent::Append { entry } => ledger.append(upgrade_legacy_entry(entry)),
                 LogEvent::TruncateTail { len } => ledger.truncate_tail(len),
                 LogEvent::Compact { summary, upto } => ledger.compact(summary, upto),
                 LogEvent::Checkpoint {
@@ -316,6 +344,29 @@ mod tests {
         assert_eq!(resumed.ledger.len(), 2);
         assert!(matches!(&resumed.ledger.entries()[0], Entry::Summary(s) if s == "sum"));
         assert!(matches!(&resumed.ledger.entries()[1], Entry::User(_)));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resume_upgrades_legacy_approval_notes() {
+        let dir =
+            std::env::temp_dir().join(format!("tcode-store-legacy-note-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let store = SessionStore::create(&dir, Path::new("C:/proj")).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(Entry::Note(
+            "Note from the user when approving bash: use 4 spaces".into(),
+        ));
+
+        let resumed = SessionStore::resume(&dir, None).unwrap();
+        assert!(matches!(
+            &resumed.ledger.entries()[0],
+            Entry::UserNote { about, answer, text }
+                if about == "bash" && !answer && text == "use 4 spaces"
+        ));
 
         let _ = fs::remove_dir_all(&dir);
     }

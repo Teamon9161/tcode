@@ -39,13 +39,59 @@ struct Questions {
 /// paging back and forth preserves each answer.
 struct QuestionPage {
     question: String,
-    options: Vec<String>,
+    options: Vec<Choice>,
     multi: bool,
     /// Highlighted option (also the selected one for single-select).
     cursor: usize,
     /// Membership set for multi-select; ignored when `multi` is false.
     chosen: Vec<bool>,
     note: Editor,
+}
+
+/// One option. `preview` is the artifact the option would produce — a
+/// mockup, a snippet, a config — shown beside the list so a choice between
+/// concrete things is made by looking rather than by imagining.
+struct Choice {
+    label: String,
+    description: String,
+    preview: Option<String>,
+    /// The escape hatch the harness appends to every question. The model
+    /// never supplies it: a menu it wrote cannot contain the answer it
+    /// failed to think of.
+    other: bool,
+}
+
+impl Choice {
+    /// Tolerates a bare string option: earlier sessions (and the plain
+    /// approver) only ever had a label.
+    fn from_value(v: &Value) -> Self {
+        if let Some(label) = v.as_str() {
+            return Self {
+                label: label.to_string(),
+                description: String::new(),
+                preview: None,
+                other: false,
+            };
+        }
+        Self {
+            label: v["label"].as_str().unwrap_or_default().to_string(),
+            description: v["description"].as_str().unwrap_or_default().to_string(),
+            preview: v["preview"]
+                .as_str()
+                .filter(|p| !p.trim().is_empty())
+                .map(str::to_owned),
+            other: false,
+        }
+    }
+
+    fn other() -> Self {
+        Self {
+            label: OTHER_LABEL.into(),
+            description: "none of these — type your own answer".into(),
+            preview: None,
+            other: true,
+        }
+    }
 }
 
 const OPTIONS: [(&str, ApprovalDecision); 3] = [
@@ -57,6 +103,16 @@ const OPTIONS: [(&str, ApprovalDecision); 3] = [
 /// "  note: " prefix width; continuation rows are indented to match.
 const NOTE_INDENT: usize = 8;
 
+/// The dialog grows downward at the transcript's expense, so a preview is
+/// capped rather than allowed to push the conversation off screen. A longer
+/// artifact is a sign the choice wants a diff or a file, not a dialog.
+const MAX_PREVIEW_ROWS: usize = 14;
+/// Below this the two columns stop being readable; the compact list is used.
+const MIN_COLUMNS: usize = 50;
+const OPTION_COLUMN_MIN: usize = 16;
+
+const OTHER_LABEL: &str = "Other";
+
 pub enum DialogResult {
     Pending,
     Done(Approval),
@@ -65,19 +121,21 @@ pub enum DialogResult {
 impl QuestionPage {
     fn from_value(v: &Value) -> Self {
         let question = v["question"].as_str().unwrap_or_default().to_string();
-        let options: Vec<String> = v["options"]
+        let options: Vec<Choice> = v["options"]
             .as_array()
             .map(|a| {
                 a.iter()
-                    .filter_map(|o| o.as_str().map(str::to_owned))
+                    .map(Choice::from_value)
+                    .filter(|c| !c.label.is_empty())
                     .collect()
             })
             .unwrap_or_default();
-        let options = if options.is_empty() {
-            vec!["Continue".into()]
+        let mut options = if options.is_empty() {
+            vec![Choice::from_value(&Value::String("Continue".into()))]
         } else {
             options
         };
+        options.push(Choice::other());
         let chosen = vec![false; options.len()];
         Self {
             question,
@@ -89,27 +147,55 @@ impl QuestionPage {
         }
     }
 
-    /// This question's answer: the selected option(s) plus any note. A
-    /// multi-select with nothing ticked falls back to the highlighted one.
-    fn answer(&self) -> String {
-        let picks: Vec<&str> = if self.multi {
-            let ticked: Vec<&str> = self
-                .options
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| self.chosen[*i])
-                .map(|(_, o)| o.as_str())
+    /// A preview panel opens only when this question actually has artifacts to
+    /// compare. Several selections have no single preview, so a multi-select
+    /// keeps the compact list even if the model supplied previews.
+    fn previewing(&self) -> bool {
+        !self.multi && self.options.iter().any(|o| o.preview.is_some())
+    }
+
+    /// Options the answer is built from: the ticked ones on a multi-select
+    /// (falling back to the highlighted one), else the highlighted one.
+    fn picked(&self) -> Vec<usize> {
+        if self.multi {
+            let ticked: Vec<usize> = (0..self.options.len())
+                .filter(|i| self.chosen[*i])
                 .collect();
-            if ticked.is_empty() {
-                vec![self.options[self.cursor].as_str()]
-            } else {
-                ticked
+            if !ticked.is_empty() {
+                return ticked;
             }
-        } else {
-            vec![self.options[self.cursor].as_str()]
-        };
-        let mut ans = picks.join(", ");
+        }
+        vec![self.cursor]
+    }
+
+    fn chose_other(&self) -> bool {
+        self.picked().iter().any(|i| self.options[*i].other)
+    }
+
+    /// "Other" with nothing typed is not an answer. Submitting it would tell
+    /// the model the user chose something they explicitly did not choose.
+    fn needs_text(&self) -> bool {
+        self.chose_other() && self.note.text().trim().is_empty()
+    }
+
+    /// This question's answer: the selected option(s) plus any note.
+    /// "Other" is the exception — there the typed text *is* the answer, and
+    /// no label may be reported alongside it, or the model would read the
+    /// rejected menu item as the user's choice.
+    fn answer(&self) -> String {
         let note = self.note.text().trim().to_string();
+        let picked = self.picked();
+        let mut picks: Vec<&str> = picked
+            .iter()
+            .map(|i| &self.options[*i])
+            .filter(|o| !o.other)
+            .map(|o| o.label.as_str())
+            .collect();
+        if self.chose_other() {
+            picks.push(note.as_str());
+            return picks.join(", ");
+        }
+        let mut ans = picks.join(", ");
         if !note.is_empty() {
             ans.push_str(&format!(" — {note}"));
         }
@@ -277,12 +363,16 @@ impl Dialog {
             K::Up => {
                 let p = self.cur_page();
                 p.cursor = p.cursor.checked_sub(1).unwrap_or(p.options.len() - 1);
+                self.focus_note_on_other();
             }
             K::Down => {
                 let p = self.cur_page();
                 p.cursor = (p.cursor + 1) % p.options.len();
+                self.focus_note_on_other();
             }
-            K::Char(' ') if self.cur_page_multi() => {
+            // Only a space aimed at the list toggles: while the note has focus
+            // a space is a space, or a multi-select note could hold no words.
+            K::Char(' ') if !focused && self.cur_page_multi() => {
                 let p = self.cur_page();
                 let c = p.cursor;
                 p.chosen[c] = !p.chosen[c];
@@ -295,6 +385,7 @@ impl Dialog {
                     if p.multi {
                         p.chosen[index] = !p.chosen[index];
                     }
+                    self.focus_note_on_other();
                 } else {
                     self.note_focused = true;
                     self.cur_page().note.insert_char(c);
@@ -308,6 +399,16 @@ impl Dialog {
             _ => {}
         }
         DialogResult::Pending
+    }
+
+    /// On "Other" the note editor *is* the answer field, so landing there
+    /// aims the keyboard at it. Moving off leaves the focus alone: the text
+    /// stays a note on whatever the user settles on.
+    fn focus_note_on_other(&mut self) {
+        let p = self.cur_page();
+        if p.options[p.cursor].other {
+            self.note_focused = true;
+        }
     }
 
     /// Move to an adjacent question (clamped); paging always leaves the note
@@ -324,6 +425,14 @@ impl Dialog {
     /// a single note.
     fn submit_or_advance(&mut self) -> DialogResult {
         let q = self.questions.as_mut().expect("question dialog");
+        // An empty "Other" is not an answer: hold the dialog on the offending
+        // page with the cursor in the note rather than send the model a
+        // choice the user did not make.
+        if let Some(page) = q.pages.iter().position(QuestionPage::needs_text) {
+            q.page = page;
+            self.note_focused = true;
+            return DialogResult::Pending;
+        }
         if q.page + 1 < q.pages.len() {
             q.page += 1;
             self.note_focused = false;
@@ -470,28 +579,39 @@ impl Dialog {
                 out.push(Line::styled(format!("  {row}"), theme::dim()));
             }
         }
-        for (i, label) in page.options.iter().enumerate() {
-            let marker = if i == page.cursor { "▸ " } else { "  " };
-            let check = if page.multi {
-                if page.chosen[i] {
-                    "[x] "
+        // A narrow terminal cannot hold two readable columns; the compact list
+        // is the graceful degradation, not a squeezed preview.
+        if page.previewing() && (width as usize) >= MIN_COLUMNS {
+            out.extend(option_columns(page, width));
+        } else {
+            for (i, opt) in page.options.iter().enumerate() {
+                let marker = if i == page.cursor { "▸ " } else { "  " };
+                let check = if page.multi {
+                    if page.chosen[i] {
+                        "[x] "
+                    } else {
+                        "[ ] "
+                    }
                 } else {
-                    "[ ] "
+                    ""
+                };
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{marker}{}. {check}{}", i + 1, opt.label),
+                        option_style(i == page.cursor),
+                    ),
+                ]));
+                // Only the highlighted option explains itself: showing every
+                // description at once turns the dialog into a wall of text.
+                if i == page.cursor {
+                    for row in wrap_cells(&opt.description, avail.saturating_sub(6)) {
+                        if !row.is_empty() {
+                            out.push(Line::styled(format!("      {row}"), theme::dim()));
+                        }
+                    }
                 }
-            } else {
-                ""
-            };
-            let style = if i == page.cursor {
-                ratatui::style::Style::default()
-                    .fg(theme::ACCENT)
-                    .add_modifier(ratatui::style::Modifier::BOLD)
-            } else {
-                theme::dim()
-            };
-            out.push(Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("{marker}{}. {check}{label}", i + 1), style),
-            ]));
+            }
         }
         self.render_note(&page.note, width, &mut out);
         let enter = if q.page + 1 == total {
@@ -510,6 +630,104 @@ impl Dialog {
 }
 
 /// Split into rows of at most `width` display cells (never mid-char).
+fn option_style(cursor: bool) -> ratatui::style::Style {
+    if cursor {
+        ratatui::style::Style::default()
+            .fg(theme::ACCENT)
+            .add_modifier(ratatui::style::Modifier::BOLD)
+    } else {
+        theme::dim()
+    }
+}
+
+/// Options on the left, the highlighted option's preview on the right. The
+/// dialog is a flat line list inside a bordered box, so the two columns are
+/// composed here rather than laid out as widgets — which also keeps the
+/// preview honest about its cost: every row it adds is a row the transcript
+/// above loses.
+fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
+    use unicode_width::UnicodeWidthStr;
+
+    let total = (width as usize).saturating_sub(4).max(20);
+    // Wide enough for the labels, but never so wide that the artifact it
+    // exists to show gets squeezed. Descriptions are prose and need room to
+    // breathe, so a question that has them spends the whole left budget;
+    // bare labels give their slack back to the preview.
+    let budget = total * 2 / 5;
+    let widest = page
+        .options
+        .iter()
+        .map(|o| o.label.width() + 5)
+        .max()
+        .unwrap_or(OPTION_COLUMN_MIN);
+    let wanted = if page.options.iter().any(|o| !o.description.is_empty()) {
+        widest.max(budget)
+    } else {
+        widest
+    };
+    let left = wanted.clamp(OPTION_COLUMN_MIN, budget);
+    let right = total.saturating_sub(left + 3).max(1);
+
+    let mut rows: Vec<(Vec<Span<'static>>, usize)> = Vec::new();
+    for (i, opt) in page.options.iter().enumerate() {
+        let marker = if i == page.cursor { "▸ " } else { "  " };
+        let head = format!("{marker}{}. {}", i + 1, opt.label);
+        for row in wrap_cells(&head, left) {
+            let used = row.width();
+            rows.push((
+                vec![Span::styled(row, option_style(i == page.cursor))],
+                used,
+            ));
+        }
+        if i == page.cursor {
+            for row in wrap_cells(&opt.description, left.saturating_sub(4)) {
+                if row.is_empty() {
+                    continue;
+                }
+                let row = format!("    {row}");
+                let used = row.width();
+                rows.push((vec![Span::styled(row, theme::dim())], used));
+            }
+        }
+    }
+
+    // An option with no artifact to show leaves the panel blank rather than
+    // filling it with prose; "Other" says what the panel is for instead.
+    let current = &page.options[page.cursor];
+    let (body, body_style) = match current.preview.as_deref() {
+        Some(preview) => (preview, ratatui::style::Style::default()),
+        None if current.other => ("type your answer in the note below", theme::dim()),
+        None => ("", ratatui::style::Style::default()),
+    };
+    let mut preview: Vec<String> = body
+        .lines()
+        .flat_map(|line| wrap_cells(line, right))
+        .collect();
+    if preview.len() > MAX_PREVIEW_ROWS {
+        preview.truncate(MAX_PREVIEW_ROWS);
+        preview.push("…".into());
+    }
+
+    let mut out = Vec::new();
+    for i in 0..rows.len().max(preview.len()) {
+        let mut spans = vec![Span::raw("  ")];
+        let used = match rows.get(i) {
+            Some((option, used)) => {
+                spans.extend(option.iter().cloned());
+                *used
+            }
+            None => 0,
+        };
+        spans.push(Span::raw(" ".repeat(left.saturating_sub(used) + 1)));
+        spans.push(Span::styled("│ ", theme::dim()));
+        if let Some(row) = preview.get(i) {
+            spans.push(Span::styled(row.clone(), body_style));
+        }
+        out.push(Line::from(spans));
+    }
+    out
+}
+
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut rows = vec![String::new()];
@@ -548,6 +766,159 @@ mod tests {
         for c in s.chars() {
             d.handle_key(key(KeyCode::Char(c)));
         }
+    }
+
+    fn screen(d: &Dialog, width: u16) -> String {
+        d.render(width)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn previewed() -> Dialog {
+        Dialog::questions(
+            "Which rail?".into(),
+            &json!({"questions": [{
+                "question": "Which rail?",
+                "options": [
+                    { "label": "Bar", "description": "a left rail", "preview": "BAR-PREVIEW" },
+                    { "label": "Caret", "description": "a caret", "preview": "CARET-PREVIEW" }
+                ]
+            }]}),
+        )
+    }
+
+    #[test]
+    fn a_previewed_option_renders_beside_the_list_and_follows_the_cursor() {
+        let mut d = previewed();
+        let text = screen(&d, 80);
+        assert!(text.contains('│'), "previews open a second column");
+        assert!(text.contains("BAR-PREVIEW"), "the highlighted option shows");
+        assert!(
+            !text.contains("CARET-PREVIEW"),
+            "only one preview at a time: {text}"
+        );
+
+        d.handle_key(key(KeyCode::Down));
+        let text = screen(&d, 80);
+        assert!(text.contains("CARET-PREVIEW"), "moving swaps the preview");
+        assert!(!text.contains("BAR-PREVIEW"));
+    }
+
+    fn menu() -> Dialog {
+        Dialog::questions(
+            "Pick one".into(),
+            &json!({"questions": [{ "question": "Pick one", "options": ["A", "B"] }]}),
+        )
+    }
+
+    /// Down past the last model-supplied option lands on the appended "Other".
+    fn to_other(d: &mut Dialog) {
+        d.handle_key(key(KeyCode::Down));
+        d.handle_key(key(KeyCode::Down));
+    }
+
+    #[test]
+    fn other_reports_the_typed_text_alone_and_never_a_rejected_option() {
+        let mut d = menu();
+        to_other(&mut d);
+        type_str(&mut d, "neither, do X");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer");
+        };
+        // Not "A — neither, do X": the user rejected the menu, and the model
+        // must not read a menu item as their choice.
+        assert_eq!(a.comment.as_deref(), Some("neither, do X"));
+    }
+
+    #[test]
+    fn landing_on_other_aims_the_keyboard_at_the_note() {
+        let mut d = menu();
+        to_other(&mut d);
+        // No Tab needed: typing goes straight into the answer field.
+        type_str(&mut d, "mine");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer");
+        };
+        assert_eq!(a.comment.as_deref(), Some("mine"));
+    }
+
+    #[test]
+    fn an_empty_other_holds_the_dialog_instead_of_answering() {
+        let mut d = menu();
+        to_other(&mut d);
+        assert!(
+            matches!(d.handle_key(key(KeyCode::Enter)), DialogResult::Pending),
+            "an empty Other is not an answer"
+        );
+        type_str(&mut d, "now it is");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer once text exists");
+        };
+        assert_eq!(a.comment.as_deref(), Some("now it is"));
+    }
+
+    #[test]
+    fn other_ticked_beside_a_real_option_contributes_its_text() {
+        let mut d = Dialog::questions(
+            "Pick many".into(),
+            &json!({"questions": [
+                { "question": "Pick many", "options": ["A", "B"], "multiSelect": true }
+            ]}),
+        );
+        d.handle_key(key(KeyCode::Char('1'))); // tick A
+        to_other(&mut d);
+        d.handle_key(key(KeyCode::Tab)); // leave the note to tick the row
+        d.handle_key(key(KeyCode::Char(' ')));
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "and Z");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer");
+        };
+        assert_eq!(a.comment.as_deref(), Some("A, and Z"));
+    }
+
+    #[test]
+    fn the_answer_is_the_label_not_the_preview() {
+        let mut d = previewed();
+        d.handle_key(key(KeyCode::Down));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer");
+        };
+        assert_eq!(a.comment.as_deref(), Some("Caret"));
+    }
+
+    #[test]
+    fn a_narrow_terminal_falls_back_to_the_compact_list() {
+        let d = previewed();
+        let text = screen(&d, 40);
+        assert!(!text.contains('│'));
+        assert!(!text.contains("BAR-PREVIEW"));
+        assert!(text.contains("Bar"), "the options are still choosable");
+    }
+
+    #[test]
+    fn a_multi_select_keeps_the_compact_list_since_previews_cannot_be_merged() {
+        let d = Dialog::questions(
+            "Which?".into(),
+            &json!({"questions": [{
+                "question": "Which?",
+                "multiSelect": true,
+                "options": [
+                    { "label": "Bar", "preview": "BAR-PREVIEW" },
+                    { "label": "Caret", "preview": "CARET-PREVIEW" }
+                ]
+            }]}),
+        );
+        let text = screen(&d, 80);
+        assert!(!text.contains("BAR-PREVIEW"), "{text}");
+        assert!(text.contains("[ ] Bar"));
     }
 
     #[test]

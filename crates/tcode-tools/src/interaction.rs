@@ -43,7 +43,7 @@ impl Tool for AskUserTool {
         "ask_user"
     }
     fn description(&self) -> &str {
-        "Ask the user one or more blocking questions when a choice is required to continue. Provide a `questions` array; each question has 2–4 concise `options` and an optional `multiSelect` to let the user pick several. Usually one question is enough — use multiple only for independent choices; they are shown as a paged dialog. All answers come back as a single harness note."
+        "Ask the user one or more blocking questions when a choice is required to continue. Provide a `questions` array; each question has 2–4 `options` and an optional `multiSelect` to let the user pick several. Usually one question is enough — use multiple only for independent choices; they are shown as a paged dialog. All answers come back as a single harness note.\n\nAn option is `{label, description?, preview?}`: `label` is the choice in 1–5 words, `description` says what picking it means. `preview` is shown in a panel beside the options and re-rendered as the user moves between them — give it only when the choice is between concrete artifacts the user must SEE to decide: layout mockups, code snippets, diffs, config samples. Write the preview as the artifact itself, not prose about it. Omit it for plain preference questions, where label and description already say everything; it is also ignored on a multiSelect question, since several selections have no single preview."
     }
     fn input_schema(&self) -> Value {
         json!({
@@ -56,7 +56,20 @@ impl Tool for AskUserTool {
                         "type": "object",
                         "properties": {
                             "question": { "type": "string" },
-                            "options": { "type": "array", "items": { "type": "string" }, "minItems": 2, "maxItems": 4 },
+                            "options": {
+                                "type": "array",
+                                "minItems": 2,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": { "type": "string", "description": "The choice itself, 1–5 words." },
+                                        "description": { "type": "string", "description": "What picking this option means." },
+                                        "preview": { "type": "string", "description": "The artifact this option produces, shown beside the options. Multi-line text. Single-select questions only." }
+                                    },
+                                    "required": ["label"]
+                                }
+                            },
                             "multiSelect": { "type": "boolean" }
                         },
                         "required": ["question", "options"]
