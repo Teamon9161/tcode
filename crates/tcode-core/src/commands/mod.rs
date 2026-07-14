@@ -57,7 +57,9 @@ pub enum CommandEffect {
     ConversationReplaced,
     /// Run compaction like a turn (spinner, cancellation and usage reporting
     /// are frontend concerns).
-    Compact { focus: Option<String> },
+    Compact {
+        focus: Option<String>,
+    },
     OpenResumePicker,
 }
 
@@ -152,7 +154,9 @@ impl CommandRegistry {
 
     /// `("/name", help)` pairs in registration order.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &'static str)> + '_ {
-        self.entries.iter().map(|(name, help)| (name.as_str(), *help))
+        self.entries
+            .iter()
+            .map(|(name, help)| (name.as_str(), *help))
     }
 
     /// The command a line like `/cd ../foo` addresses, if registered.
@@ -204,7 +208,10 @@ mod tests {
     fn dispatch_splits_name_and_args() {
         assert_eq!(split_line("/cd ../foo"), Some(("cd", "../foo")));
         assert_eq!(split_line("/cd"), Some(("cd", "")));
-        assert_eq!(split_line("  /note  hello world "), Some(("note", "hello world")));
+        assert_eq!(
+            split_line("  /note  hello world "),
+            Some(("note", "hello world"))
+        );
         assert_eq!(split_line("plain text"), None);
     }
 
@@ -217,7 +224,9 @@ mod tests {
             opening_context: &opening,
             turn_usage: Usage::default(),
         };
-        assert!(registry.dispatch(&mut ctx, "/definitely-not-a-command").is_none());
+        assert!(registry
+            .dispatch(&mut ctx, "/definitely-not-a-command")
+            .is_none());
         assert!(registry.find("/cdfoo").is_none());
     }
 

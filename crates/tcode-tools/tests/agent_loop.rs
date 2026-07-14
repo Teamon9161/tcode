@@ -1070,3 +1070,124 @@ async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
         }
     )));
 }
+
+/// Two tool calls in one assistant message.
+fn two_tool_uses(a: (&str, &str, &str), b: (&str, &str, &str)) -> Vec<StreamEvent> {
+    let call = |index: u32, (id, name, json): (&str, &str, &str)| {
+        vec![
+            StreamEvent::ToolUseStart {
+                index: index as usize,
+                id: id.into(),
+                name: name.into(),
+            },
+            StreamEvent::ToolUseInputDelta {
+                index: index as usize,
+                fragment: json.into(),
+            },
+        ]
+    };
+    let mut events = vec![StreamEvent::Started];
+    events.extend(call(0, a));
+    events.extend(call(1, b));
+    events.push(StreamEvent::Usage(Usage::default()));
+    events.push(StreamEvent::Done(StopReason::ToolUse));
+    events
+}
+
+/// The calls of the last assistant message, as replay recovers them.
+fn assistant_calls(session: &Session) -> Vec<(String, String, serde_json::Value)> {
+    session
+        .ledger
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            Entry::Assistant(blocks) => {
+                let calls: Vec<_> = blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolUse { id, name, input } => {
+                            Some((id.clone(), name.clone(), input.clone()))
+                        }
+                        _ => None,
+                    })
+                    .collect();
+                (!calls.is_empty()).then_some(calls)
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Transcript replay reconstructs a batch by asking the agent which calls ran
+/// as one — so a resumed conversation must show the very label the live turn
+/// emitted, never a re-derived guess.
+#[tokio::test]
+async fn batch_display_label_matches_the_live_batch_header() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "b\n").unwrap();
+    let provider = MockProvider::new(vec![
+        two_tool_uses(
+            ("t1", "read", r#"{"path":"a.txt"}"#),
+            ("t2", "read", r#"{"path":"b.txt"}"#),
+        ),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "read both").await;
+
+    let live_label = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolBatchStart { label, .. } => Some(label.clone()),
+            _ => None,
+        })
+        .expect("parallel reads emit a batch header");
+    let calls = assistant_calls(&session);
+    assert_eq!(
+        agent.batch_display_label(&session, &calls),
+        Some(live_label)
+    );
+}
+
+#[tokio::test]
+async fn lone_and_unbatchable_calls_have_no_batch_label() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "a\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"a.txt"}"#),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "read one").await;
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ToolBatchStart { .. })));
+    assert_eq!(
+        agent.batch_display_label(&session, &assistant_calls(&session)),
+        None
+    );
+
+    // A read alongside a shell command is neither parallel-read-only nor a
+    // shell batch: the loop runs them one by one, and so must replay.
+    let mixed = vec![
+        (
+            "t1".to_string(),
+            "read".to_string(),
+            serde_json::json!({"path":"a.txt"}),
+        ),
+        (
+            "t2".to_string(),
+            "shell".to_string(),
+            serde_json::json!({"command":"echo hi"}),
+        ),
+    ];
+    assert_eq!(agent.batch_display_label(&session, &mixed), None);
+}

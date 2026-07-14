@@ -106,7 +106,10 @@ mod tests {
     async fn idle_fires_when_no_bytes() {
         let inner = futures::stream::pending::<Result<Vec<u8>, std::io::Error>>();
         let mut s = idle_guard(inner, Duration::from_millis(20));
-        assert!(matches!(s.next().await, Some(Err(StreamByteError::Idle(_)))));
+        assert!(matches!(
+            s.next().await,
+            Some(Err(StreamByteError::Idle(_)))
+        ));
         assert!(s.next().await.is_none());
     }
 

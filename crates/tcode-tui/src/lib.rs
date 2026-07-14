@@ -10,6 +10,7 @@ mod diff;
 mod editor;
 mod markdown;
 mod model_picker;
+mod render;
 mod resume;
 mod theme;
 mod transcript;
@@ -28,8 +29,8 @@ use crossterm::terminal::{
 use tcode_core::{Agent, Session};
 
 pub use app::App;
-pub use tcode_core::commands::OpeningContextFn;
 pub use model_picker::{ModelMenu, ModelOption, SwitchFn};
+pub use tcode_core::commands::OpeningContextFn;
 
 pub enum Exit {
     Quit,

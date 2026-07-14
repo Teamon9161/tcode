@@ -20,3 +20,8 @@ arboard = "3"
 image = { version = "0.25", default-features = false, features = ["png"] }
 base64 = "0.22"
 unicode-width = "0.2"
+
+[dev-dependencies]
+# Test-only: render.rs asserts registry behaviour against the real builtin
+# tool set (quiet-output ↔ BatchPolicy alignment). No production dependency.
+tcode-tools = { path = "../tcode-tools" }

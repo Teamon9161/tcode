@@ -366,7 +366,10 @@ async fn main() -> anyhow::Result<()> {
             }
             if line == "/help" {
                 println!("{DIM}commands:{RESET}");
-                println!("{DIM}  {:<16} switch model · adjust reasoning effort{RESET}", "/model");
+                println!(
+                    "{DIM}  {:<16} switch model · adjust reasoning effort{RESET}",
+                    "/model"
+                );
                 for (name, help) in registry.entries() {
                     println!("{DIM}  {name:<16} {help}{RESET}");
                 }

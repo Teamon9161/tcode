@@ -397,7 +397,11 @@ impl Tool for GrepTool {
                 }
                 return m;
             }
-            let joiner = if before > 0 || after > 0 { "\n--\n" } else { "\n" };
+            let joiner = if before > 0 || after > 0 {
+                "\n--\n"
+            } else {
+                "\n"
+            };
             let mut out = selected
                 .iter()
                 .map(|g| {
@@ -621,9 +625,17 @@ mod tests {
     #[tokio::test]
     async fn before_and_after_are_independent() {
         let dir = scratch("ba", BODY);
-        let before = grep(&dir, json!({ "pattern": "TARGET", "before": 1, "after": 0 })).await;
+        let before = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "before": 1, "after": 0 }),
+        )
+        .await;
         assert_eq!(before, "a.rs:2- line2\na.rs:3: TARGET");
-        let after = grep(&dir, json!({ "pattern": "TARGET", "after": 2, "before": 0 })).await;
+        let after = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "after": 2, "before": 0 }),
+        )
+        .await;
         assert_eq!(after, "a.rs:3: TARGET\na.rs:4- line4\na.rs:5- line5");
         let _ = std::fs::remove_dir_all(&dir);
     }

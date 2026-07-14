@@ -763,6 +763,37 @@ impl Agent {
         })
     }
 
+    /// The batch header these calls (all from one assistant message) ran
+    /// under, or `None` if they ran as ordinary sequential calls. The live
+    /// loop decides batching right below; replay asks *this* instead of
+    /// re-deriving the rule, so a resumed transcript groups calls exactly as
+    /// they were executed.
+    pub fn batch_display_label(
+        &self,
+        session: &Session,
+        calls: &[(String, String, Value)],
+    ) -> Option<String> {
+        if calls.len() < 2 {
+            return None;
+        }
+        if self.all_calls_have_policy(calls, BatchPolicy::SequentialBatch) {
+            return Some(sequential_batch_label(calls.len()));
+        }
+        if !self.all_calls_have_policy(calls, BatchPolicy::ParallelReadOnly)
+            && !self.is_parallel_file_mutation_batch(session, calls)
+        {
+            return None;
+        }
+        let prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = calls
+            .iter()
+            .map(|(id, name, input)| {
+                self.tool(name)
+                    .map(|tool| (id.clone(), name.clone(), input.clone(), tool.clone()))
+            })
+            .collect::<Option<_>>()?;
+        Some(batch_label(&prepared))
+    }
+
     /// Whether every call in the batch belongs to a tool declaring `policy`.
     fn all_calls_have_policy(
         &self,
@@ -1010,15 +1041,7 @@ impl Agent {
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
         }
 
-        let batch_label = format!(
-            "Run {} {}",
-            prepared.len(),
-            if prepared.len() == 1 {
-                "command"
-            } else {
-                "commands"
-            }
-        );
+        let batch_label = sequential_batch_label(prepared.len());
 
         // Combined approval: ask once for the whole batch.
         for (id, name, input, tool) in &prepared {
@@ -1376,6 +1399,15 @@ fn batch_label(prepared: &[(String, String, Value, Arc<dyn Tool>)]) -> String {
         .join(" · ")
 }
 
+/// Header for a shell batch, which is approved as a group and then run in
+/// order (the commands themselves are listed as batch items).
+fn sequential_batch_label(count: usize) -> String {
+    format!(
+        "Run {count} {}",
+        if count == 1 { "command" } else { "commands" }
+    )
+}
+
 /// Lexically normalize paths for the batch collision check.  We cannot rely
 /// on `canonicalize`: a `write` target may not exist yet.  Resolving relative
 /// paths against the session cwd first makes this conservative enough to spot
@@ -1413,4 +1445,3 @@ fn tool_result_with_images(
         images,
     }
 }
-

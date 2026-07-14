@@ -2479,6 +2479,7 @@ dependencies = [
  "similar",
  "syntect",
  "tcode-core",
+ "tcode-tools",
  "tokio",
  "tokio-util",
  "unicode-width 0.2.0",

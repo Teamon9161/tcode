@@ -24,8 +24,7 @@ impl SlashCommand for ExportCommand {
         } else {
             std::path::PathBuf::from(args)
         };
-        let markdown =
-            crate::export_markdown(ctx.session.ledger.entries(), "tcode conversation");
+        let markdown = crate::export_markdown(ctx.session.ledger.entries(), "tcode conversation");
         match std::fs::write(&path, markdown) {
             Ok(()) => CommandOutcome::info(format!("transcript exported → {}", path.display())),
             Err(e) => CommandOutcome::error(format!("export failed: {e}")),
@@ -54,7 +53,8 @@ mod tests {
         );
 
         session.ledger.append(Entry::Note("hello".into()));
-        let target = std::env::temp_dir().join(format!("tcode-cmd-export-{}.md", std::process::id()));
+        let target =
+            std::env::temp_dir().join(format!("tcode-cmd-export-{}.md", std::process::id()));
         let _ = std::fs::remove_file(&target);
         let mut ctx = CommandCtx {
             session: &mut session,

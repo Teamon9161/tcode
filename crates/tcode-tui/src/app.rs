@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Stdout;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -30,6 +30,7 @@ use tcode_core::{
 use crate::approval::{Dialog, DialogResult};
 use crate::editor::{Editor, Position};
 use crate::model_picker::{self, ModelMenu};
+use crate::render::{shorten_summary_path, CallRoute, RenderRegistry};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
 use crate::{diff, markdown, theme, OpeningContextFn};
@@ -112,8 +113,16 @@ impl Approver for ChannelApprover {
 }
 
 enum Attachment {
-    Image { id: u32, png: Vec<u8>, label: String },
-    Text { id: u32, content: String, label: String },
+    Image {
+        id: u32,
+        png: Vec<u8>,
+        label: String,
+    },
+    Text {
+        id: u32,
+        content: String,
+        label: String,
+    },
 }
 
 impl Attachment {
@@ -174,6 +183,34 @@ struct PendingCall {
     header: Vec<Line<'static>>,
 }
 
+/// A tool call recovered from the ledger during replay, with the batch it
+/// was executed in (asked of core, never re-derived here).
+struct ReplayCall {
+    name: String,
+    input: serde_json::Value,
+    batch: Option<ReplayBatch>,
+}
+
+struct ReplayBatch {
+    /// The `● label` header, carried by the batch's first call only.
+    header: Option<String>,
+    /// Several tools in one batch: tag each item with its tool name.
+    mixed: bool,
+}
+
+/// One tool result's rendering, shared by live `ToolEnd` and replay.
+enum ResultRender {
+    /// The call site already told the story (successful edit/write diff).
+    Nothing,
+    /// A single `⎿ preview` row.
+    Inline(Line<'static>),
+    /// A head row carrying the fold affordance plus the collapsed body.
+    Foldable {
+        head: Vec<Line<'static>>,
+        detail: Vec<Line<'static>>,
+    },
+}
+
 struct PlanStep {
     step: String,
     status: String,
@@ -211,9 +248,10 @@ pub struct App {
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
     cwd: PathBuf,
-    /// Tool name → its UI display name, snapshotted from the agent's tools
-    /// so headers can label calls without a live `Tool` handle.
-    display_names: HashMap<String, String>,
+    /// Per-tool renderers + display names, built from the agent's live tools
+    /// so rendering behaviour (quiet output, routes, diffs) can never drift
+    /// from core's tool contracts.
+    renderers: RenderRegistry,
     terminal: Term,
     transcript: Transcript,
     md: markdown::Renderer,
@@ -335,11 +373,7 @@ impl App {
         // Keep the agent's automatic-compaction guard and status block in
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
-        let display_names = agent
-            .tools
-            .iter()
-            .map(|t| (t.name().to_string(), t.display_name()))
-            .collect();
+        let renderers = RenderRegistry::from_tools(&agent.tools);
         let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
         let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
         Ok(Self {
@@ -348,7 +382,7 @@ impl App {
             registry: CommandRegistry::builtin(),
             session: Some(session),
             cwd,
-            display_names,
+            renderers,
             terminal,
             transcript,
             md: markdown::Renderer::default(),
@@ -438,7 +472,7 @@ impl App {
                         let call_summary = self.display_summary(
                             &tcode_core::agent::summarize_call(&ask.tool, &ask.input),
                         );
-                        let change = diff::render_change(&ask.tool, &ask.input);
+                        let change = self.renderers.get(&ask.tool).body(&ask.input);
                         if !change.is_empty() {
                             self.bake_live_text();
                             self.finish_thinking();
@@ -567,15 +601,21 @@ impl App {
     /// Replay a resumed conversation into the scrollback so the user
     /// sees where they left off.
     fn bake_transcript(&mut self) {
-        let Some(session) = self.session.as_ref() else {
+        // Moved out for the walk so the bake helpers below can take `&mut
+        // self`; restored before returning.
+        let Some(session) = self.session.take() else {
             return;
         };
-        if session.ledger.is_empty() {
-            return;
+        if !session.ledger.is_empty() {
+            self.replay_ledger(&session);
         }
+        self.session = Some(session);
+    }
+
+    fn replay_ledger(&mut self, session: &Session) {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_plan: Option<serde_json::Value> = None;
-        let mut tool_calls: HashMap<String, (String, serde_json::Value)> = HashMap::new();
+        let mut calls: HashMap<String, ReplayCall> = HashMap::new();
         for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
                 tcode_core::Entry::User(blocks) => {
@@ -609,6 +649,7 @@ impl App {
                     self.transcript.push_tagged(echo, entry_index);
                 }
                 tcode_core::Entry::Assistant(blocks) => {
+                    let mut group: Vec<(String, String, serde_json::Value)> = Vec::new();
                     for b in blocks {
                         match b {
                             ContentBlock::Text { text } => {
@@ -619,13 +660,29 @@ impl App {
                                 // Defer the header to the matching ToolResults
                                 // entry so each call renders directly above its
                                 // own result, not all headers then all results.
-                                tool_calls.insert(id.clone(), (name.clone(), input.clone()));
-                                if name == "update_plan" {
+                                group.push((id.clone(), name.clone(), input.clone()));
+                                if matches!(self.renderers.get(name).route(), CallRoute::Plan) {
                                     resumed_plan = Some(input.clone());
                                 }
                             }
                             _ => {}
                         }
+                    }
+                    // Ask core whether these calls ran as a batch: the loop
+                    // that made that call is the only place that knows.
+                    let label = self.agent.batch_display_label(session, &group);
+                    let mixed = group
+                        .iter()
+                        .map(|(_, name, _)| name.as_str())
+                        .collect::<HashSet<_>>()
+                        .len()
+                        > 1;
+                    for (index, (id, name, input)) in group.into_iter().enumerate() {
+                        let batch = label.as_ref().map(|label| ReplayBatch {
+                            header: (index == 0).then(|| label.clone()),
+                            mixed,
+                        });
+                        calls.insert(id, ReplayCall { name, input, batch });
                     }
                 }
                 tcode_core::Entry::IncompleteAssistant { text, error } => {
@@ -649,6 +706,9 @@ impl App {
                     input,
                     content,
                 } => {
+                    // These names come from external logs (Codex / Claude
+                    // Code) and are never in the render registry; imported
+                    // rendering stays hardcoded by design.
                     if name.contains("apply_patch") {
                         lines.push(Line::from(vec![
                             Span::styled("● ", theme::accent()),
@@ -690,38 +750,41 @@ impl App {
                         else {
                             continue;
                         };
-                        let (name, input) = tool_calls
-                            .get(tool_use_id)
-                            .map(|(name, input)| (name.as_str(), Some(input)))
-                            .unwrap_or(("tool", None));
-                        // Bake this call's header (+ diff / command block) right
-                        // above its result. update_plan renders via the plan
-                        // pane and ask_user via its own record — no tool header.
-                        if let Some(input) = input {
-                            if name != "update_plan" && name != "ask_user" {
-                                let summary = self.display_summary(&call_header(name, input));
-                                let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
-                                spans.insert(0, Span::styled("● ", theme::accent()));
-                                lines.push(Line::from(spans));
-                                lines.extend(diff::render_change(name, input));
-                                lines.extend(diff::render_command(name, input));
+                        let call = calls.get(tool_use_id);
+                        let name = call.map(|c| c.name.as_str()).unwrap_or("tool");
+                        // Plan/Silent calls render via the plan pane or their
+                        // approval record, exactly like the live path.
+                        if !matches!(self.renderers.get(name).route(), CallRoute::Transcript) {
+                            continue;
+                        }
+                        // Flush the prose above so this call bakes as its own
+                        // block, exactly as the live path lays it out.
+                        self.transcript.push(std::mem::take(&mut lines));
+                        // Bake this call's header (+ diff / command block)
+                        // right above its own result.
+                        let mut batch_header = Vec::new();
+                        if let Some(call) = call {
+                            match &call.batch {
+                                Some(batch) => {
+                                    if let Some(label) = &batch.header {
+                                        let header = self.batch_header_lines(label);
+                                        self.bake(header);
+                                    }
+                                    batch_header =
+                                        self.batch_item_lines(name, &call.input, batch.mixed);
+                                }
+                                None => self.bake_call_start(name, &call.input),
                             }
                         }
                         let preview = result_preview(content);
-                        let style = if *is_error {
-                            ratatui::style::Style::default().fg(theme::ERROR)
-                        } else {
-                            theme::dim()
-                        };
-                        let detail = self.output_detail(name, input, &preview, content, *is_error);
-                        if detail.is_empty() {
-                            lines.push(Line::styled(format!("  ⎿ {preview}"), style));
-                        } else {
-                            let head = vec![self.output_head(name, &preview, content, *is_error)];
-                            self.transcript.push(std::mem::take(&mut lines));
-                            self.transcript
-                                .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
-                        }
+                        self.bake_call_result(
+                            name,
+                            call.map(|c| &c.input),
+                            &preview,
+                            content,
+                            *is_error,
+                            batch_header,
+                        );
                     }
                 }
                 tcode_core::Entry::Note(text) => {
@@ -1001,9 +1064,8 @@ impl App {
                 }
                 self.bake_live_text();
                 self.finish_thinking();
-                let mut header_spans = vec![Span::styled("● ", theme::accent())];
-                header_spans.extend(colored_batch_label(&label));
-                self.bake(vec![Line::default(), Line::from(header_spans)]);
+                let header = self.batch_header_lines(&label);
+                self.bake(header);
                 self.pending_batch.clear();
                 // A batch spanning several tools tags each item with its tool
                 // name so the reader can tell the calls apart; a single-tool
@@ -1015,19 +1077,9 @@ impl App {
                     .len()
                     > 1;
                 for (name, input) in calls {
-                    let item = batch_item_summary(&name, &input, Some(&self.cwd));
-                    let mut row = vec![Span::raw("  ├ ")];
-                    if mixed {
-                        // Keep per-item tool tags subdued: the batch header is
-                        // where display names get title-cased and highlighted.
-                        row.push(Span::styled(format!("{name} "), theme::dim()));
-                    }
-                    row.push(Span::styled(item, theme::dim()));
-                    let mut header = vec![Line::from(row)];
-                    header.extend(diff::render_change(&name, &input));
                     self.pending_batch.push_back(PendingCall {
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                        header,
+                        header: self.batch_item_lines(&name, &input, mixed),
                     });
                 }
                 self.state_label = format!("running: {label}");
@@ -1037,21 +1089,26 @@ impl App {
                 summary,
                 input,
             } => {
-                if name == "update_plan" {
-                    self.update_plan(&input);
-                    self.state_label = "updating plan".into();
-                    return;
-                }
-                // The question and its answer are already baked by the
-                // approval dialog; a second ask_user(...) header is noise.
-                if name == "ask_user" {
-                    return;
+                match self.renderers.get(&name).route() {
+                    CallRoute::Plan => {
+                        self.update_plan(&input);
+                        self.state_label = "updating plan".into();
+                        return;
+                    }
+                    // The question and its answer are already baked by the
+                    // approval dialog; a second header is noise.
+                    CallRoute::Silent => return,
+                    CallRoute::Transcript => {}
                 }
                 // Recompute the header from name+input so a long/multi-line
                 // shell command collapses to `Shell` and renders as a block,
                 // instead of the raw command string core put in `summary`.
                 let _ = summary;
-                let summary = self.display_summary(&call_header(&name, &input));
+                let summary = self.display_summary(&self.renderers.get(&name).header(
+                    &name,
+                    &input,
+                    Some(&self.cwd),
+                ));
                 self.bake_live_text();
                 self.finish_thinking();
                 if !self.pending_batch.is_empty() {
@@ -1066,15 +1123,7 @@ impl App {
                 // approval dialog was open, keep that block — don't render a
                 // second, capped copy.
                 if self.change_prebake.take().is_none() {
-                    let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
-                    spans.insert(0, Span::styled("● ", theme::accent()));
-                    let mut lines = vec![Line::default(), Line::from(spans)];
-                    lines.extend(diff::render_change(&name, &input));
-                    lines.extend(diff::render_command(&name, &input));
-                    if lines.len() > 2 {
-                        lines.push(Line::default());
-                    }
-                    self.bake(lines);
+                    self.bake_call_start(&name, &input);
                 }
                 self.state_label = format!("running: {summary}");
             }
@@ -1085,7 +1134,7 @@ impl App {
                 is_error,
                 ..
             } => {
-                if name == "update_plan" || name == "ask_user" {
+                if !matches!(self.renderers.get(&name).route(), CallRoute::Transcript) {
                     self.state_label = "responding".into();
                     return;
                 }
@@ -1095,7 +1144,7 @@ impl App {
                     .or_else(|| self.pending_batch.pop_front());
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
-                let (input, mut batch_header): (Option<serde_json::Value>, Vec<Line<'static>>) =
+                let (input, batch_header): (Option<serde_json::Value>, Vec<Line<'static>>) =
                     if let Some(entry) = entry {
                         (serde_json::from_str(&entry.detail).ok(), entry.header)
                     } else {
@@ -1106,47 +1155,14 @@ impl App {
                 self.context_tokens = self
                     .context_tokens
                     .saturating_add(approx_tokens(&content) as u64);
-                // edit/write already rendered their diff at the call site; the
-                // textual "edited … Result:" only repeats it, so a successful
-                // one shows nothing further. (Errors still surface below.)
-                if !is_error && matches!(name.as_str(), "edit" | "write") {
-                    if !batch_header.is_empty() {
-                        self.bake(batch_header);
-                    }
-                    self.state_label = "responding".into();
-                    return;
-                }
-                let style = if is_error {
-                    ratatui::style::Style::default().fg(theme::ERROR)
-                } else {
-                    theme::dim()
-                };
-                // The head row carries the fold affordance (added by the
-                // transcript). For batch items that head is the `├ summary`
-                // row; for single calls it is the `⎿ preview` row.
-                let detail =
-                    self.output_detail(&name, input.as_ref(), &preview, &content, is_error);
-                if detail.is_empty() {
-                    if batch_header.is_empty() {
-                        self.bake(vec![Line::styled(format!("  ⎿ {preview}"), style)]);
-                    } else {
-                        append_result_preview(&mut batch_header, &preview, style);
-                        self.bake(batch_header);
-                    }
-                } else if batch_header.is_empty() {
-                    let head = vec![self.output_head(&name, &preview, &content, is_error)];
-                    self.transcript
-                        .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
-                } else {
-                    // Batch items already have a compact `├ summary` row. Hang
-                    // the fold affordance off that row instead of adding a
-                    // separate `⎿  ▸ N lines` line beneath every item.
-                    if is_error || !suppress_output_preview(&name) {
-                        append_result_preview(&mut batch_header, &preview, style);
-                    }
-                    self.transcript
-                        .push_with_detail(batch_header, detail, false, OUTPUT_VIEW_ROWS);
-                }
+                self.bake_call_result(
+                    &name,
+                    input.as_ref(),
+                    &preview,
+                    &content,
+                    is_error,
+                    batch_header,
+                );
                 self.state_label = "responding".into();
             }
             AgentEvent::Retrying {
@@ -1353,44 +1369,169 @@ impl App {
     /// Tool's UI name, resolved from its own `display_name` when it belongs
     /// to this session; falls back to title-case for imported/unknown tools.
     fn display_name(&self, name: &str) -> String {
-        self.display_names
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| title_case_tool_name(name))
+        self.renderers.display_name(name)
     }
 
     /// Split a tool summary like `shell(cargo test)` into colored spans: the
     /// tool's display name is green, the arguments are dim.
     fn colored_tool_summary(&self, summary: &str) -> Vec<Span<'static>> {
-        if let Some(paren) = summary.find('(') {
-            vec![
+        // The tool name is always the accent-colored part, argument or not: a
+        // long shell command collapses to a bare `Run`, and an argument-less
+        // summary (MCP tools) must not read as a different kind of record.
+        match summary.find('(') {
+            Some(paren) => vec![
                 Span::styled(self.display_name(&summary[..paren]), theme::ok()),
                 Span::styled(summary[paren..].to_string(), theme::dim()),
-            ]
-        } else {
-            vec![Span::styled(self.display_name(summary), theme::bold())]
+            ],
+            None => vec![Span::styled(self.display_name(summary), theme::ok())],
         }
     }
 
-    fn output_head(
+    /// `●` header (+ change body + command block) for one tool call. Shared
+    /// by the live `ToolStart` path and transcript replay so they can never
+    /// drift apart.
+    fn call_lines(&self, name: &str, input: &serde_json::Value) -> Vec<Line<'static>> {
+        let renderer = self.renderers.get(name);
+        let summary = self.display_summary(&renderer.header(name, input, Some(&self.cwd)));
+        let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
+        spans.insert(0, Span::styled("● ", theme::accent()));
+        let mut lines = vec![Line::from(spans)];
+        lines.extend(renderer.body(input));
+        lines.extend(renderer.header_block(input));
+        lines
+    }
+
+    /// Bake a single call's `●` block. The blank row above (and, when the
+    /// call carries a diff or command block, the one below) is what keeps
+    /// consecutive calls from running together — live and replayed alike.
+    fn bake_call_start(&mut self, name: &str, input: &serde_json::Value) {
+        let mut lines = vec![Line::default()];
+        lines.extend(self.call_lines(name, input));
+        if lines.len() > 2 {
+            lines.push(Line::default());
+        }
+        self.bake(lines);
+    }
+
+    /// The `● label` row opening a batch, with its separating blank above.
+    fn batch_header_lines(&self, label: &str) -> Vec<Line<'static>> {
+        let mut spans = vec![Span::styled("● ", theme::accent())];
+        spans.extend(colored_batch_label(label));
+        vec![Line::default(), Line::from(spans)]
+    }
+
+    /// One batch item's `├ summary` row (plus any diff). Baked not here but
+    /// at the item's own result, so each call sits above its own output.
+    fn batch_item_lines(
         &self,
         name: &str,
+        input: &serde_json::Value,
+        mixed: bool,
+    ) -> Vec<Line<'static>> {
+        let renderer = self.renderers.get(name);
+        let mut row = vec![Span::raw("  ├ ")];
+        if mixed {
+            // Keep per-item tool tags subdued: the batch header is where
+            // display names get title-cased and highlighted.
+            row.push(Span::styled(format!("{name} "), theme::dim()));
+        }
+        row.push(Span::styled(
+            renderer.batch_item(name, input, Some(&self.cwd)),
+            theme::dim(),
+        ));
+        let mut lines = vec![Line::from(row)];
+        lines.extend(renderer.body(input));
+        lines
+    }
+
+    /// Bake one call's result, shared by live `ToolEnd` and replay.
+    /// `batch_header` is the item's deferred `├ summary` block when the call
+    /// belongs to a batch, empty for a single call (whose header is already
+    /// baked). The head row carries the fold affordance: for a batch item
+    /// that is the `├` row, for a single call the `⎿ preview` row.
+    fn bake_call_result(
+        &mut self,
+        name: &str,
+        input: Option<&serde_json::Value>,
         preview: &str,
         content: &str,
         is_error: bool,
-    ) -> Line<'static> {
+        mut batch_header: Vec<Line<'static>>,
+    ) {
         let style = if is_error {
             ratatui::style::Style::default().fg(theme::ERROR)
         } else {
             theme::dim()
         };
-        if !is_error && suppress_output_preview(name) {
-            // The fold affordance already carries the line count ("▸ N lines"),
-            // so the head only marks the result — no duplicate count here.
-            let _ = content;
-            Line::styled("  ⎿", style)
+        match self.result_render(name, input, preview, content, is_error) {
+            ResultRender::Nothing => {
+                if !batch_header.is_empty() {
+                    self.bake(batch_header);
+                }
+            }
+            ResultRender::Inline(line) => {
+                if batch_header.is_empty() {
+                    self.bake(vec![line]);
+                } else {
+                    append_result_preview(&mut batch_header, preview, style);
+                    self.bake(batch_header);
+                }
+            }
+            ResultRender::Foldable { head, detail } => {
+                if batch_header.is_empty() {
+                    self.transcript
+                        .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+                } else {
+                    // Batch items already have a compact `├ summary` row. Hang
+                    // the fold affordance off that row instead of adding a
+                    // separate `⎿  ▸ N lines` line beneath every item.
+                    if is_error || !self.renderers.get(name).quiet_output() {
+                        append_result_preview(&mut batch_header, preview, style);
+                    }
+                    self.transcript
+                        .push_with_detail(batch_header, detail, false, OUTPUT_VIEW_ROWS);
+                }
+            }
+        }
+    }
+
+    /// How one tool result renders, shared by live `ToolEnd` and replay.
+    /// `Nothing`: the call site already told the story (successful edit/write
+    /// diffs). `Inline`: a single `⎿ preview` row. `Foldable`: a head row
+    /// carrying the fold affordance plus the collapsed body.
+    fn result_render(
+        &self,
+        name: &str,
+        input: Option<&serde_json::Value>,
+        preview: &str,
+        content: &str,
+        is_error: bool,
+    ) -> ResultRender {
+        let renderer = self.renderers.get(name);
+        if !is_error && renderer.hide_success_result() {
+            return ResultRender::Nothing;
+        }
+        let style = if is_error {
+            ratatui::style::Style::default().fg(theme::ERROR)
         } else {
-            Line::styled(format!("  ⎿ {preview}"), style)
+            theme::dim()
+        };
+        let detail = self.output_detail(name, input, preview, content, is_error);
+        if detail.is_empty() {
+            ResultRender::Inline(Line::styled(format!("  ⎿ {preview}"), style))
+        } else {
+            let quiet = !is_error && renderer.quiet_output();
+            // The fold affordance already carries the line count ("▸ N
+            // lines"); a quiet tool's head only marks the result.
+            let head = if quiet {
+                Line::styled("  ⎿", style)
+            } else {
+                Line::styled(format!("  ⎿ {preview}"), style)
+            };
+            ResultRender::Foldable {
+                head: vec![head],
+                detail,
+            }
         }
     }
 
@@ -1407,13 +1548,13 @@ impl App {
         content: &str,
         is_error: bool,
     ) -> Vec<Line<'static>> {
-        if content.trim() == preview.trim() && (is_error || !suppress_output_preview(name)) {
+        let renderer = self.renderers.get(name);
+        let quiet = renderer.quiet_output();
+        if content.trim() == preview.trim() && (is_error || !quiet) {
             return Vec::new(); // nothing beyond the preview
         }
         let gutter = || Span::styled("  │ ", theme::dim());
-        let is_markdown = !is_error
-            && (name == "web_fetch" || (name == "read" && input.is_some_and(path_is_markdown)));
-        if is_markdown {
+        if !is_error && renderer.markdown_detail(input) {
             return self
                 .md
                 .render(content)
@@ -1434,11 +1575,8 @@ impl App {
         // foldout; quiet tools such as read/grep use a generic head, so the
         // expanded body must include line 1.
         let first = content.lines().next().unwrap_or("");
-        let skip = usize::from(
-            !suppress_output_preview(name)
-                && first.chars().count() <= 120
-                && content.lines().count() > 1,
-        );
+        let skip =
+            usize::from(!quiet && first.chars().count() <= 120 && content.lines().count() > 1);
         content
             .lines()
             .skip(skip)
@@ -1964,7 +2102,10 @@ impl App {
             ("enter", "send · shift/ctrl/alt+enter newline"),
             ("esc", "cancel current turn / clear input"),
             ("shift+tab", "cycle permission mode"),
-            ("ctrl+v / alt+v", "paste (images/long text become inline tokens)"),
+            (
+                "ctrl+v / alt+v",
+                "paste (images/long text become inline tokens)",
+            ),
             ("ctrl+a", "select prompt · ctrl+c copy selection"),
             ("alt+c / alt+x", "copy / cut prompt"),
             ("mouse", "click prompt to move cursor · drag to copy"),
@@ -2204,10 +2345,7 @@ impl App {
     /// delete the whole token and drop that attachment in one keystroke.
     fn backspace_attachment_token(&mut self) -> bool {
         let pos = self.editor.position();
-        let before: String = self.editor.lines()[pos.row]
-            .chars()
-            .take(pos.col)
-            .collect();
+        let before: String = self.editor.lines()[pos.row].chars().take(pos.col).collect();
         let Some(idx) = self
             .attachments
             .iter()
@@ -2816,27 +2954,6 @@ fn append_result_preview(
     }
 }
 
-/// Whether a `read` call targets a Markdown file (so its output is worth
-/// rendering rather than showing raw). Keyed on the tool's `path`/`file_path`.
-fn path_is_markdown(input: &serde_json::Value) -> bool {
-    input["path"]
-        .as_str()
-        .or_else(|| input["file_path"].as_str())
-        .map(|p| p.rsplit('.').next().unwrap_or("").to_ascii_lowercase())
-        .is_some_and(|ext| matches!(ext.as_str(), "md" | "markdown" | "mdx"))
-}
-
-/// Fallback UI name for a tool whose handle we no longer hold: title-case.
-/// The authoritative name is `Tool::display_name`, resolved via
-/// `App::display_name` when the tool is in this session's set.
-fn title_case_tool_name(name: &str) -> String {
-    let mut chars = name.chars();
-    let Some(first) = chars.next() else {
-        return String::new();
-    };
-    first.to_uppercase().collect::<String>() + chars.as_str()
-}
-
 /// Color a batch label such as "Read 5 files · Search 2 patterns": each
 /// fragment's leading tool name is green, matching a single call's header.
 fn colored_batch_label(label: &str) -> Vec<Span<'static>> {
@@ -2866,78 +2983,6 @@ fn result_preview(s: &str) -> String {
         line.push_str(&format!(" (+{extra} lines)"));
     }
     line
-}
-
-// These are the parallel-read-only tools (core's `BatchPolicy::ParallelReadOnly`):
-// their output is a precise, self-explanatory listing, so the transcript hides
-// the preview. The TUI only sees the tool name (no `Tool` handle), so this list
-// must track that set by hand — keep them in sync.
-fn suppress_output_preview(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "glob")
-}
-
-/// Header text for a tool call. A long or multi-line shell command collapses
-/// to the bare tool name; its full command renders below via
-/// `diff::render_command`, so the header line stays intact.
-fn call_header(name: &str, input: &serde_json::Value) -> String {
-    if diff::command_is_block(name, input) {
-        name.to_string()
-    } else {
-        tcode_core::agent::summarize_call(name, input)
-    }
-}
-
-/// First line of a command, capped, with a note when more lines follow. Keeps
-/// a multi-line command from corrupting a compact one-line batch row.
-fn command_first_line(cmd: &str) -> String {
-    let mut line = cmd.lines().next().unwrap_or("").to_string();
-    if line.chars().count() > 120 {
-        line = line.chars().take(120).collect::<String>() + "…";
-    }
-    let extra = cmd.lines().count().saturating_sub(1);
-    if extra > 0 {
-        line.push_str(&format!(" (+{extra} lines)"));
-    }
-    line
-}
-
-fn batch_item_summary(name: &str, input: &serde_json::Value, cwd: Option<&Path>) -> String {
-    match name {
-        "shell" | "bash" => command_first_line(input["command"].as_str().unwrap_or(name)),
-        "read" => {
-            let path = input_path(input)
-                .map(|path| shorten_path(path, cwd))
-                .unwrap_or_else(|| "<missing path>".into());
-            let offset = input["offset"].as_u64().unwrap_or(1);
-            match input["limit"].as_u64() {
-                Some(limit) => format!("{path}:{offset}-{}", offset + limit - 1),
-                None if offset > 1 => format!("{path}:{offset}-"),
-                None => path,
-            }
-        }
-        "edit" | "write" => input_path(input)
-            .map(|path| shorten_path(path, cwd))
-            .unwrap_or_else(|| name.to_string()),
-        "grep" => input["pattern"].as_str().unwrap_or("grep").to_string(),
-        "glob" => input["pattern"].as_str().unwrap_or("glob").to_string(),
-        _ => shorten_summary_path(&tcode_core::agent::summarize_call(name, input), cwd),
-    }
-}
-
-fn input_path(input: &serde_json::Value) -> Option<&str> {
-    input["path"]
-        .as_str()
-        .or_else(|| input["file_path"].as_str())
-}
-
-fn shorten_path(path: &str, cwd: Option<&Path>) -> String {
-    let Some(cwd) = cwd else {
-        return path.to_string();
-    };
-    Path::new(path)
-        .strip_prefix(cwd)
-        .map(|relative| relative.display().to_string())
-        .unwrap_or_else(|_| path.to_string())
 }
 
 /// One compact row below the editor. The meter intentionally reports the
@@ -3193,22 +3238,6 @@ fn estimate_context_tokens(agent: &Agent, session: &Session) -> u64 {
     system
         .saturating_add(tool_defs)
         .saturating_add(conversation)
-}
-
-fn shorten_summary_path(summary: &str, cwd: Option<&Path>) -> String {
-    let Some(cwd) = cwd else {
-        return summary.to_string();
-    };
-    let Some((tool, argument)) = summary.split_once('(') else {
-        return summary.to_string();
-    };
-    let Some(argument) = argument.strip_suffix(')') else {
-        return summary.to_string();
-    };
-    let Ok(relative) = Path::new(argument).strip_prefix(cwd) else {
-        return summary.to_string();
-    };
-    format!("{tool}({})", relative.display())
 }
 
 fn area_width(terminal: &Term) -> u16 {
@@ -3512,23 +3541,6 @@ mod tests {
                 .map(|vl| (vl.first_logical_line, vl.text.as_str()))
                 .collect::<Vec<_>>(),
             [(true, "abc"), (true, "def")]
-        );
-    }
-
-    #[test]
-    fn project_paths_are_shortened_but_other_arguments_are_unchanged() {
-        let cwd = Path::new("/work/tcode");
-        assert_eq!(
-            shorten_summary_path("read(/work/tcode/crates/core.rs)", Some(cwd)),
-            "read(crates/core.rs)"
-        );
-        assert_eq!(
-            shorten_summary_path("shell(cargo test)", Some(cwd)),
-            "shell(cargo test)"
-        );
-        assert_eq!(
-            shorten_summary_path("read(/tmp/other.rs)", Some(cwd)),
-            "read(/tmp/other.rs)"
         );
     }
 

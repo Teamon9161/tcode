@@ -322,10 +322,8 @@ mod tests {
 
     #[test]
     fn roundtrips_incomplete_assistant_without_prompt_replay() {
-        let dir = std::env::temp_dir().join(format!(
-            "tcode-store-incomplete-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("tcode-store-incomplete-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
         let store = SessionStore::create(&dir, Path::new("C:/proj")).unwrap();

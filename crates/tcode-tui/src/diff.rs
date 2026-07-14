@@ -5,7 +5,6 @@ use std::sync::OnceLock;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use serde_json::Value;
 use similar::ChangeTag;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
@@ -37,24 +36,18 @@ const COMMAND_HEADER_MAX: usize = 72;
 /// Cap on command-block lines so a giant heredoc can't flood the transcript.
 const MAX_COMMAND_LINES: usize = 40;
 
-/// True when a shell/bash command is long or multi-line enough that cramming
-/// it into the one-line call header would truncate or corrupt the display.
-pub fn command_is_block(tool: &str, input: &Value) -> bool {
-    if tool != "shell" && tool != "bash" {
-        return false;
-    }
-    let cmd = input["command"].as_str().unwrap_or("");
+/// True when a command is long or multi-line enough that cramming it into
+/// the one-line call header would truncate or corrupt the display.
+pub fn command_is_block(cmd: &str) -> bool {
     cmd.contains('\n') || cmd.chars().count() > COMMAND_HEADER_MAX
 }
 
-/// Render a shell/bash command as an indented block, shown under a terse
-/// header. Empty for short single-line commands or non-shell tools, so callers
-/// can extend unconditionally.
-pub fn render_command(tool: &str, input: &Value) -> Vec<Line<'static>> {
-    if !command_is_block(tool, input) {
+/// Render a command as an indented block, shown under a terse header. Empty
+/// for short single-line commands, so callers can extend unconditionally.
+pub fn command_block(cmd: &str) -> Vec<Line<'static>> {
+    if !command_is_block(cmd) {
         return Vec::new();
     }
-    let cmd = input["command"].as_str().unwrap_or("");
     let total = cmd.lines().count();
     let mut lines: Vec<Line<'static>> = cmd
         .lines()
@@ -70,32 +63,21 @@ pub fn render_command(tool: &str, input: &Value) -> Vec<Line<'static>> {
     lines
 }
 
-/// Render the file-change preview for an edit/write call, if applicable.
-pub fn render_change(tool: &str, input: &Value) -> Vec<Line<'static>> {
-    let path = input["path"].as_str().unwrap_or("");
-    match tool {
-        "edit" => diff_lines(
-            path,
-            input["old_string"].as_str().unwrap_or(""),
-            input["new_string"].as_str().unwrap_or(""),
-        ),
-        "write" => input["content"]
-            .as_str()
-            .unwrap_or("")
-            .lines()
-            .enumerate()
-            .map(|(index, line)| {
-                code_line(
-                    path,
-                    "+ ",
-                    Some(index + 1),
-                    line,
-                    Some(theme::diff_add_bg()),
-                )
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
+/// Full new-content preview for a `write` call: every line is an addition.
+pub fn write_preview(path: &str, content: &str) -> Vec<Line<'static>> {
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            code_line(
+                path,
+                "+ ",
+                Some(index + 1),
+                line,
+                Some(theme::diff_add_bg()),
+            )
+        })
+        .collect()
 }
 
 /// Render a unified patch imported from another agent's transcript.  It uses
@@ -132,10 +114,10 @@ pub fn render_unified_patch(patch: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Live edit/write diffs render in full: the user is approving this exact
-/// change and must be able to see all of it. Imported historical patches stay
+/// Live edit diffs render in full: the user is approving this exact change
+/// and must be able to see all of it. Imported historical patches stay
 /// capped separately because they are only transcript context.
-fn diff_lines(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
+pub fn edit_diff(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     let diff = similar::TextDiff::from_lines(old, new);
     let mut old_line = edit_start_line(path, old);
     let mut new_line = old_line;
@@ -242,12 +224,7 @@ mod tests {
 
     #[test]
     fn diff_uses_background_without_losing_syntax_foreground() {
-        let lines = render_change(
-            "edit",
-            &serde_json::json!({
-                "path": "src/main.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
-            }),
-        );
+        let lines = edit_diff("src/main.rs", "let x = 1;", "let x = 2;");
         let added = lines
             .iter()
             .find(|line| line.spans[0].content.contains('+'))
@@ -269,14 +246,7 @@ mod tests {
 
     #[test]
     fn live_diff_shows_left_gutter_line_numbers() {
-        let lines = render_change(
-            "edit",
-            &serde_json::json!({
-                "path": "missing.rs",
-                "old_string": "alpha\nbeta\n",
-                "new_string": "alpha\ngamma\n",
-            }),
-        );
+        let lines = edit_diff("missing.rs", "alpha\nbeta\n", "alpha\ngamma\n");
         let changed = lines
             .iter()
             .find(|line| line.spans[0].content.contains('-'))
@@ -293,14 +263,7 @@ mod tests {
         let new = (0..81)
             .map(|line| format!("let value_{line} = 2;\n"))
             .collect::<String>();
-        let lines = render_change(
-            "edit",
-            &serde_json::json!({
-                "path": "src/main.rs",
-                "old_string": old,
-                "new_string": new,
-            }),
-        );
+        let lines = edit_diff("src/main.rs", &old, &new);
 
         assert!(lines.len() > MAX_DIFF_LINES);
         assert!(!lines.iter().any(|line| line
@@ -314,13 +277,7 @@ mod tests {
         let content = (0..81)
             .map(|line| format!("let value_{line} = 1;\n"))
             .collect::<String>();
-        let lines = render_change(
-            "write",
-            &serde_json::json!({
-                "path": "src/main.rs",
-                "content": content,
-            }),
-        );
+        let lines = write_preview("src/main.rs", &content);
 
         assert!(lines.len() > MAX_DIFF_LINES);
         assert!(!lines.iter().any(|line| line
@@ -331,18 +288,15 @@ mod tests {
 
     #[test]
     fn short_single_line_command_stays_in_header() {
-        let input = serde_json::json!({ "command": "git status" });
-        assert!(!command_is_block("shell", &input));
-        assert!(render_command("shell", &input).is_empty());
+        assert!(!command_is_block("git status"));
+        assert!(command_block("git status").is_empty());
     }
 
     #[test]
     fn multiline_command_renders_as_a_block() {
-        let input = serde_json::json!({
-            "command": "python - <<'PY'\nimport sys\nprint(sys.version)\nPY",
-        });
-        assert!(command_is_block("shell", &input));
-        let lines = render_command("shell", &input);
+        let cmd = "python - <<'PY'\nimport sys\nprint(sys.version)\nPY";
+        assert!(command_is_block(cmd));
+        let lines = command_block(cmd);
         assert_eq!(lines.len(), 4);
         // Each block row is indented.
         assert!(lines[0].spans[0].content.starts_with("    python"));
@@ -351,15 +305,7 @@ mod tests {
     #[test]
     fn long_single_line_command_becomes_a_block() {
         let cmd = format!("echo {}", "x".repeat(100));
-        let input = serde_json::json!({ "command": cmd });
-        assert!(command_is_block("bash", &input));
-        assert_eq!(render_command("bash", &input).len(), 1);
-    }
-
-    #[test]
-    fn non_shell_tools_never_block() {
-        let input = serde_json::json!({ "path": "src/main.rs" });
-        assert!(!command_is_block("read", &input));
-        assert!(render_command("read", &input).is_empty());
+        assert!(command_is_block(&cmd));
+        assert_eq!(command_block(&cmd).len(), 1);
     }
 }
