@@ -35,10 +35,7 @@ impl OpenAiProvider {
         watchdog: WatchdogConfig,
     ) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
+            http: crate::http::client(),
             api_key,
             model,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),

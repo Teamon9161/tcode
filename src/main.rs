@@ -9,8 +9,11 @@ use clap::Parser;
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
-use tcode_core::config::{Config, ConfigError, ModelState, Selection};
-use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, PermissionRules, Session, ToolCtx};
+use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Selection};
+use tcode_core::{
+    ActiveModel, Agent, AgentError, AgentModels, ContentBlock, ModelCell, PermissionRules, Session,
+    ToolCtx,
+};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
@@ -24,6 +27,109 @@ const CONFIG_HEADER: &str = "\
 # (written by /model). Keys: prefer api_key_env over inline api_key.
 
 ";
+
+/// Build the provider for one sub-agent pin.
+fn build_agent_model(
+    config: &Config,
+    kind: &str,
+    parent: &Selection,
+) -> Option<Result<ActiveModel, ConfigError>> {
+    let resolved = config.agent_selection(kind, parent)?;
+    Some(resolved.and_then(|selection| {
+        let profile = config
+            .profiles
+            .get(&selection.profile)
+            .expect("agent_selection validated the profile");
+        tcode_providers::build_active(profile, &selection, &config.watchdog)
+    }))
+}
+
+/// Resolve every `[agents.<kind>]` / `/agents` pin into the live registry the
+/// `task` tool reads. A broken pin warns and leaves that kind following the
+/// main model — a typo in a sub-agent's profile must not stop the session.
+fn agent_models(config: &Config, parent: &Selection) -> AgentModels {
+    let pinned = AgentModels::default();
+    for kind in config.agents.keys() {
+        match build_agent_model(config, kind, parent) {
+            Some(Ok(model)) => pinned.pin(kind, model),
+            Some(Err(e)) => eprintln!("{DIM}warning: [agents.{kind}] ignored: {e}{RESET}"),
+            None => {}
+        }
+    }
+    pinned
+}
+
+/// The `/agents` menu: the pinnable kinds, what each runs on now, and the
+/// action that applies a pick — hot-swap the shared registry, then persist to
+/// state.toml (never to the hand-written config.toml).
+fn build_agent_menu(
+    config: &Config,
+    menu: &tcode_tui::ModelMenu,
+    pinned: AgentModels,
+) -> tcode_tui::AgentMenu {
+    let kinds: Vec<String> = tcode_tools::AGENT_KINDS
+        .iter()
+        .map(|k| k.to_string())
+        .collect();
+    let watchdog = config.watchdog.clone();
+    let profiles = config.profiles.clone();
+    // Where each pinned kind sits in the /model menu, so the picker opens on
+    // it. Read off the menu rather than re-deriving its order — a pin whose
+    // model the menu does not list simply shows as inherit.
+    let pins = kinds
+        .iter()
+        .map(|kind| {
+            let model = pinned.get(kind)?;
+            let index = menu
+                .options
+                .iter()
+                .position(|opt| opt.def.name == model.provider.model())?;
+            Some((index, model.effort.clone()))
+        })
+        .collect();
+
+    let pin: tcode_tui::PinFn = Box::new(move |kind, choice| {
+        let Some((option, effort)) = choice else {
+            pinned.unpin(kind);
+            persist_agent_pin(kind, None);
+            return Ok("inherit (follows /model)".to_string());
+        };
+        let profile = profiles
+            .get(&option.profile)
+            .ok_or_else(|| format!("unknown profile '{}'", option.profile))?;
+        let selection = Selection {
+            profile: option.profile.clone(),
+            model: option.def.clone(),
+            effort: effort.map(String::from),
+        };
+        let active = tcode_providers::build_active(profile, &selection, &watchdog)
+            .map_err(|e| e.to_string())?;
+        let label = active.describe();
+        pinned.pin(kind, active);
+        persist_agent_pin(kind, Some(&selection));
+        Ok(label)
+    });
+    tcode_tui::AgentMenu { kinds, pins, pin }
+}
+
+/// An empty entry means "inherit", which is how the picker un-pins a kind that
+/// config.toml pinned: state.toml overlays config, so it must be able to say
+/// "nothing" as well as "something".
+fn persist_agent_pin(kind: &str, selection: Option<&Selection>) {
+    ModelState::update(|state| {
+        state.agents.insert(
+            kind.to_string(),
+            match selection {
+                Some(s) => AgentConfig {
+                    profile: Some(s.profile.clone()),
+                    model: Some(s.model.name.clone()),
+                    effort: s.effort.clone(),
+                },
+                None => AgentConfig::default(),
+            },
+        );
+    });
+}
 
 /// Flatten every profile's models into the /model menu, wiring the
 /// switch action (rebuild provider + persist choice).
@@ -65,12 +171,13 @@ fn build_menu(
         };
         let active =
             tcode_providers::build_active(profile, &sel, &watchdog).map_err(|e| e.to_string())?;
-        ModelState {
-            profile: Some(opt.profile.clone()),
-            model: Some(opt.def.name.clone()),
-            effort: effort.map(String::from),
-        }
-        .save();
+        // Read-modify-write: the state file also holds the agent pins and the
+        // dogfood switch, which a whole-struct save would silently drop.
+        ModelState::update(|state| {
+            state.profile = Some(opt.profile.clone());
+            state.model = Some(opt.def.name.clone());
+            state.effort = effort.map(String::from);
+        });
         Ok(active)
     });
     tcode_tui::ModelMenu {
@@ -129,6 +236,68 @@ fn run_model_command(args: &str, menu: &tcode_tui::ModelMenu, cell: &ModelCell) 
     }
 }
 
+/// Plain-REPL `/agents`: bare lists the kinds and what each runs on;
+/// `/agents <kind> <n|name|inherit> [effort]` assigns one. The TUI does the
+/// same thing through the picker.
+fn run_agents_command(args: &str, menu: &tcode_tui::ModelMenu, agents: &mut tcode_tui::AgentMenu) {
+    if args.is_empty() {
+        for (i, kind) in agents.kinds.iter().enumerate() {
+            let what = match &agents.pins[i] {
+                None => "inherit (follows /model)".to_string(),
+                Some((option, effort)) => {
+                    let name = menu.options[*option].def.display();
+                    match effort {
+                        Some(e) => format!("{name} ({e})"),
+                        None => name.to_string(),
+                    }
+                }
+            };
+            println!("{DIM} {kind}: {what}{RESET}");
+        }
+        println!("{DIM}usage: /agents <kind> <number|name|inherit> [effort]{RESET}");
+        return;
+    }
+    let mut parts = args.split_whitespace();
+    let (Some(kind), Some(which)) = (parts.next(), parts.next()) else {
+        println!("{DIM}usage: /agents <kind> <number|name|inherit> [effort]{RESET}");
+        return;
+    };
+    let Some(slot) = agents.kinds.iter().position(|k| k == kind) else {
+        println!(
+            "{DIM}unknown agent '{kind}' — known: {}{RESET}",
+            agents.kinds.join(", ")
+        );
+        return;
+    };
+    let effort = parts.next();
+    let choice = if which == "inherit" {
+        None
+    } else {
+        let found = which
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| menu.options.get(i).map(|opt| (i, opt)))
+            .or_else(|| {
+                menu.options
+                    .iter()
+                    .enumerate()
+                    .find(|(_, o)| o.def.name == which)
+            });
+        let Some((index, opt)) = found else {
+            println!("{DIM}unknown model '{which}' — /model lists options{RESET}");
+            return;
+        };
+        Some((index, opt, effort))
+    };
+    match (agents.pin)(kind, choice.map(|(_, opt, effort)| (opt, effort))) {
+        Ok(label) => {
+            agents.pins[slot] = choice.map(|(index, _, effort)| (index, effort.map(String::from)));
+            println!("{DIM}{kind} → {label}{RESET}");
+        }
+        Err(e) => println!("{DIM}cannot pin {kind}: {e}{RESET}"),
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "tcode", version, about = "tcode — a terminal agent harness")]
 struct Cli {
@@ -175,16 +344,20 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (config, selection, active_model) = loop {
-        let config = Config::load(&cwd)?;
+    let (config, selection, active_model, state) = loop {
+        let mut config = Config::load(&cwd)?;
         let state = ModelState::load();
+        // `/agents` picks live in state.toml and overlay the hand-written
+        // `[agents.*]`, exactly as the saved model choice overlays the
+        // configured default.
+        config.agents.extend(state.agents.clone());
         let selection = config.select(cli.profile.as_deref(), cli.model.as_deref(), &state)?;
         let profile = config
             .profiles
             .get(&selection.profile)
             .context("selected profile disappeared")?;
         match tcode_providers::build_active(profile, &selection, &config.watchdog) {
-            Ok(active) => break (config, selection, active),
+            Ok(active) => break (config, selection, active, state),
             Err(ConfigError::MissingApiKey {
                 profile: missing_profile,
                 ..
@@ -208,15 +381,21 @@ async fn main() -> anyhow::Result<()> {
 
     // Everything /model can switch to, with the swap logic attached.
     let mut menu = build_menu(&config, &selection, model_cell.clone());
+    // Live sub-agent pins, shared by the `task` tool and `/agents`.
+    let pinned = agent_models(&config, &selection);
+    let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone());
 
     let system = INTERACTIVE_AGENT_SYSTEM.to_string();
     let mut tools = tcode_tools::builtin_tools();
-    tools.push(Arc::new(tcode_tools::TaskTool::new(
-        model_cell.clone(),
-        config.watchdog.clone(),
-        config.limits.tool_output_tokens,
-        cwd.clone(),
-    )));
+    tools.push(Arc::new(
+        tcode_tools::TaskTool::new(
+            model_cell.clone(),
+            config.watchdog.clone(),
+            config.limits.tool_output_tokens,
+            cwd.clone(),
+        )
+        .with_agent_models(pinned.clone()),
+    ));
     tools.push(Arc::new(tcode_tools::UpdatePlanTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
     tools.push(Arc::new(tcode_tools::AddNoteTool));
@@ -261,6 +440,8 @@ async fn main() -> anyhow::Result<()> {
         rules,
     );
     session.set_opening_context(tcode_tools::project_map(&cwd));
+    // The dogfood switch is a mode, not a per-session whim: restore it.
+    session.set_dogfood(state.dogfood);
 
     // Persistence: every ledger mutation is recorded to a JSONL session
     // log; --continue / --resume replay it.
@@ -293,7 +474,15 @@ async fn main() -> anyhow::Result<()> {
     // (pipes, CI, dumb terminals).
     if interactive {
         loop {
-            match tcode_tui::run(agent.clone(), session, menu, opening_context.clone()).await? {
+            match tcode_tui::run(
+                agent.clone(),
+                session,
+                menu,
+                agent_menu,
+                opening_context.clone(),
+            )
+            .await?
+            {
                 tcode_tui::Exit::Quit => return Ok(()),
                 tcode_tui::Exit::ConfigureProvider(returned_session) => {
                     let global = Config::load_global()?;
@@ -306,6 +495,7 @@ async fn main() -> anyhow::Result<()> {
                         // error.
                         session = *returned_session;
                         menu = build_menu(&config, &selection, model_cell.clone());
+                        agent_menu = build_agent_menu(&config, &menu, pinned.clone());
                         continue;
                     };
                     let path = updated.write_global(CONFIG_HEADER)?;
@@ -326,6 +516,7 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     model_cell.swap(active);
                     menu = build_menu(&runtime_config, &runtime_selection, model_cell.clone());
+                    agent_menu = build_agent_menu(&runtime_config, &menu, pinned.clone());
                     session = *returned_session;
                     println!("{DIM}updated {}; reopening tcode{RESET}", path.display());
                 }
@@ -360,6 +551,10 @@ async fn main() -> anyhow::Result<()> {
         if line.starts_with('/') {
             // REPL-only commands: /model drives the frontend-owned menu,
             // /help mixes it into the shared command list.
+            if let Some(rest) = line.strip_prefix("/agents") {
+                run_agents_command(rest.trim(), &menu, &mut agent_menu);
+                continue;
+            }
             if let Some(rest) = line.strip_prefix("/model") {
                 run_model_command(rest.trim(), &menu, &model_cell);
                 continue;
@@ -369,6 +564,10 @@ async fn main() -> anyhow::Result<()> {
                 println!(
                     "{DIM}  {:<16} switch model · adjust reasoning effort{RESET}",
                     "/model"
+                );
+                println!(
+                    "{DIM}  {:<16} choose the model each sub-agent runs on{RESET}",
+                    "/agents"
                 );
                 for (name, help) in registry.entries() {
                     println!("{DIM}  {name:<16} {help}{RESET}");
@@ -400,6 +599,9 @@ async fn main() -> anyhow::Result<()> {
             for effect in outcome.effects {
                 match effect {
                     CommandEffect::Exit => break 'repl,
+                    CommandEffect::PersistDogfood(on) => {
+                        ModelState::update(|state| state.dogfood = on)
+                    }
                     CommandEffect::Compact { focus } => {
                         let cancel = CancellationToken::new();
                         let watcher = {

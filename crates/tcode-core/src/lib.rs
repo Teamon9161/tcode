@@ -30,8 +30,8 @@ pub use ledger::{Entry, Ledger, LedgerSink};
 pub use memory::{MemoryManager, MemoryUpdate};
 pub use permission::{Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules};
 pub use provider::{
-    ActiveModel, CacheStrategy, EventStream, ModelCell, Provider, ProviderError, Request,
-    StreamEvent,
+    ActiveModel, AgentModels, CacheStrategy, EventStream, ModelCell, Provider, ProviderError,
+    Request, StreamEvent,
 };
 pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};

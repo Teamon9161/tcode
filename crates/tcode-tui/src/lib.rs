@@ -29,7 +29,7 @@ use crossterm::terminal::{
 use tcode_core::{Agent, Session};
 
 pub use app::App;
-pub use model_picker::{ModelMenu, ModelOption, SwitchFn};
+pub use model_picker::{AgentMenu, ModelMenu, ModelOption, PinFn, SwitchFn};
 pub use tcode_core::commands::OpeningContextFn;
 
 pub enum Exit {
@@ -46,6 +46,7 @@ pub async fn run(
     agent: Arc<Agent>,
     session: Session,
     menu: ModelMenu,
+    agents: AgentMenu,
     opening_context: OpeningContextFn,
 ) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
@@ -63,7 +64,7 @@ pub async fn run(
         default_hook(info);
     }));
 
-    let result = match App::new(agent, session, menu, opening_context) {
+    let result = match App::new(agent, session, menu, agents, opening_context) {
         Ok(mut app) => match app.run().await {
             Ok(()) if app.provider_setup_requested() => app
                 .take_session()

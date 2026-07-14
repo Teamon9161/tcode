@@ -189,6 +189,13 @@ pub struct WatchdogConfig {
     /// on the HTTP client only bounds TCP setup; this bounds the "time to
     /// first byte" so a server that accepts but never replies is retried
     /// instead of hanging for minutes.
+    ///
+    /// It must stay well above the slowest *legitimate* first byte, not just
+    /// above a healthy one: many gateways flush no headers until the model's
+    /// first token, so a reasoning model chewing on a large prompt can take
+    /// tens of seconds to answer at all. Cutting that off does not rescue a
+    /// stuck request — it kills a live one, throws away the prompt processing
+    /// the server already billed, and retries into the same wait.
     pub connect_timeout_secs: u64,
     pub max_retries: u32,
     pub initial_backoff_ms: u64,
@@ -201,7 +208,7 @@ impl Default for WatchdogConfig {
     fn default() -> Self {
         Self {
             idle_timeout_secs: 30,
-            connect_timeout_secs: 20,
+            connect_timeout_secs: 30,
             max_retries: 5,
             initial_backoff_ms: 1000,
             max_backoff_ms: 30_000,
@@ -273,6 +280,18 @@ pub struct PermissionsConfig {
     pub deny: Vec<String>,
 }
 
+/// `[agents.explore]`: run a sub-agent kind on a model other than the one
+/// driving the conversation. Reconnaissance is bulk reading and summarizing —
+/// a cheap, fast model does it well, and its context never enters the parent's
+/// window anyway. Unset fields inherit the parent's active selection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AgentConfig {
+    pub profile: Option<String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -281,6 +300,10 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub permissions: PermissionsConfig,
     pub profiles: BTreeMap<String, Profile>,
+    /// Per-sub-agent model overrides, keyed by agent kind (`explore`,
+    /// `general`). Absent = the sub-agent follows the parent's model,
+    /// including later `/model` switches.
+    pub agents: BTreeMap<String, AgentConfig>,
     /// External commands around tool calls, e.g. a formatter after edit:
     /// `[[hooks]] event = "post_tool_use", matcher = "edit|write",
     /// command = "cargo fmt"`.
@@ -288,14 +311,35 @@ pub struct Config {
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
-/// The active (profile, model, effort) choice. `/model` writes it here so
-/// the hand-edited config.toml is never rewritten by the program.
+/// Everything the program itself decides and must remember: the active
+/// (profile, model, effort), the sub-agent pins, and the dogfood switch.
+/// It is written here precisely so the hand-edited config.toml is never
+/// rewritten by the program.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelState {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    /// `/agents` picks, keyed by agent kind. Overlays `[agents.*]` from
+    /// config.toml; an entry with every field unset means "inherit", which is
+    /// how the picker un-pins a kind the config file had pinned.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentConfig>,
+    /// `/dogfood`, so it survives a restart instead of being re-toggled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dogfood: bool,
+}
+
+impl ModelState {
+    /// Read the file, apply `edit`, write it back. Callers that persist one
+    /// field must not clobber the others (the picker's model choice and the
+    /// dogfood switch are written from different places).
+    pub fn update(edit: impl FnOnce(&mut Self)) {
+        let mut state = Self::load();
+        edit(&mut state);
+        state.save();
+    }
 }
 
 impl ModelState {
@@ -429,6 +473,98 @@ impl Config {
         self.permissions.deny.extend(over.permissions.deny);
         self.hooks.extend(over.hooks);
         self.mcp_servers.extend(over.mcp_servers);
+        self.agents.extend(over.agents);
+    }
+
+    /// The model a sub-agent kind runs on. `None` = no override configured;
+    /// the caller keeps sharing the parent's model handle (and its `/model`
+    /// switches). Fields left unset in `[agents.<kind>]` inherit from `parent`.
+    pub fn agent_selection(
+        &self,
+        kind: &str,
+        parent: &Selection,
+    ) -> Option<Result<Selection, ConfigError>> {
+        let over = self.agents.get(kind)?;
+        if over.profile.is_none() && over.model.is_none() && over.effort.is_none() {
+            return None;
+        }
+        Some(self.resolve_agent(over, parent))
+    }
+
+    /// The profile that offers `model`, preferring `parent` when it does. This
+    /// is what makes a bare `model = "..."` pin work: without it, naming a
+    /// model that lives in another profile would keep the parent's profile and
+    /// send, say, a DeepSeek model id to a ChatGPT endpoint — an error the user
+    /// would only meet at the first sub-agent call. `--model` without
+    /// `--profile` resolves the same way.
+    fn profile_offering(&self, model: &str, parent: &str) -> Option<String> {
+        let offers = |name: &str| {
+            self.profiles
+                .get(name)
+                .is_some_and(|p| p.model_defs().iter().any(|d| d.name == model))
+        };
+        if offers(parent) {
+            return Some(parent.to_string());
+        }
+        self.profiles
+            .keys()
+            .find(|name| offers(name))
+            .map(String::from)
+    }
+
+    fn resolve_agent(
+        &self,
+        over: &AgentConfig,
+        parent: &Selection,
+    ) -> Result<Selection, ConfigError> {
+        let name = match (&over.profile, &over.model) {
+            (Some(profile), _) => profile.clone(),
+            // An uncatalogued model name stays in the parent's profile and is
+            // passed through verbatim (the endpoint may know models we do not).
+            (None, Some(model)) => self
+                .profile_offering(model, &parent.profile)
+                .unwrap_or_else(|| parent.profile.clone()),
+            (None, None) => parent.profile.clone(),
+        };
+        let profile = self.profiles.get(&name).ok_or_else(|| {
+            ConfigError::UnknownProfile(
+                name.clone(),
+                self.profiles.keys().cloned().collect::<Vec<_>>().join(", "),
+            )
+        })?;
+        let defs = profile.model_defs();
+        let model = match &over.model {
+            // An unknown name is passed through verbatim, as `select` does:
+            // the endpoint may know models we have not catalogued.
+            Some(wanted) => defs
+                .iter()
+                .find(|d| &d.name == wanted)
+                .cloned()
+                .unwrap_or_else(|| ModelDef::bare(wanted.clone())),
+            // Same profile as the parent and no model named: keep the
+            // parent's model and only the effort changes.
+            None if name == parent.profile => parent.model.clone(),
+            None => defs
+                .first()
+                .cloned()
+                .ok_or_else(|| ConfigError::NoModels(name.clone()))?,
+        };
+        let effort = over
+            .effort
+            .clone()
+            .or_else(|| model.default_effort.clone())
+            // Carrying the parent's effort across a model switch would be a
+            // guess; only an unchanged model keeps it.
+            .or_else(|| {
+                (model.name == parent.model.name)
+                    .then(|| parent.effort.clone())
+                    .flatten()
+            });
+        Ok(Selection {
+            profile: name,
+            model,
+            effort,
+        })
     }
 
     pub fn profile(&self, name: Option<&str>) -> Result<(String, &Profile), ConfigError> {
@@ -615,6 +751,81 @@ mod tests {
             .models
             .iter()
             .any(|m| m.name == "deepseek-v4-flash"));
+    }
+
+    #[test]
+    fn agent_overrides_inherit_the_parent_selection_field_by_field() {
+        let mut config = Config::defaults();
+        let user: Config = toml::from_str(
+            r#"
+            [agents.explore]
+            model = "deepseek-v4-flash"
+
+            [agents.general]
+            profile = "deepseek"
+            "#,
+        )
+        .unwrap();
+        config.merge_global(user);
+
+        let parent = Selection {
+            profile: "anthropic".into(),
+            model: ModelDef::bare("claude-opus-4-8"),
+            effort: Some("high".into()),
+        };
+
+        // Only `model` set: resolves to the profile that actually offers it,
+        // not the parent's (which would send this id to the wrong endpoint).
+        // The parent's effort is dropped — it was another model's dial.
+        let explore = config.agent_selection("explore", &parent).unwrap().unwrap();
+        assert_eq!(explore.profile, "deepseek");
+        assert_eq!(explore.model.name, "deepseek-v4-flash");
+        assert_eq!(explore.effort, None);
+
+        // Only `profile` set: takes that profile's first model.
+        let general = config.agent_selection("general", &parent).unwrap().unwrap();
+        assert_eq!(general.profile, "deepseek");
+        assert_eq!(
+            general.model.name,
+            config.profiles["deepseek"].models[0].name
+        );
+
+        // Nothing configured for a kind: no override, the sub-agent shares the
+        // parent's live model handle.
+        assert!(config.agent_selection("nobody", &parent).is_none());
+    }
+
+    #[test]
+    fn agent_pin_of_an_uncatalogued_model_stays_in_the_parent_profile() {
+        let mut config = Config::defaults();
+        let user: Config =
+            toml::from_str("[agents.explore]\nmodel = \"some-unreleased-model\"\n").unwrap();
+        config.merge_global(user);
+        let parent = Selection {
+            profile: "openai".into(),
+            model: ModelDef::bare("gpt-5.4"),
+            effort: None,
+        };
+
+        let explore = config.agent_selection("explore", &parent).unwrap().unwrap();
+        assert_eq!(explore.profile, "openai");
+        assert_eq!(explore.model.name, "some-unreleased-model");
+    }
+
+    #[test]
+    fn agent_override_with_an_unknown_profile_is_an_error_not_a_panic() {
+        let mut config = Config::defaults();
+        let user: Config = toml::from_str("[agents.explore]\nprofile = \"typo\"\n").unwrap();
+        config.merge_global(user);
+        let parent = Selection {
+            profile: "anthropic".into(),
+            model: ModelDef::bare("claude-opus-4-8"),
+            effort: None,
+        };
+        assert!(matches!(
+            config.agent_selection("explore", &parent),
+            Some(Err(ConfigError::UnknownProfile(name, _))) if name == "typo"
+        ));
     }
 
     #[test]

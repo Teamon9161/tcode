@@ -46,10 +46,7 @@ pub struct CodexProvider {
 impl CodexProvider {
     pub fn new(model: String, watchdog: WatchdogConfig) -> Self {
         Self {
-            http: reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build()
-                .expect("reqwest client"),
+            http: crate::http::client(),
             model,
             watchdog,
             session_id: uuid::Uuid::new_v4().to_string(),

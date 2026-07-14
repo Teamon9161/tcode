@@ -29,7 +29,7 @@ use tcode_core::{
 
 use crate::approval::{Dialog, DialogResult};
 use crate::editor::{Editor, Position};
-use crate::model_picker::{self, ModelMenu};
+use crate::model_picker::{self, AgentMenu, ModelMenu};
 use crate::render::{shorten_summary_path, CallRoute, RenderRegistry};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
@@ -63,9 +63,10 @@ const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
 /// Commands whose substance drives frontend-owned objects (key table, model
 /// picker, provider wizard). Everything else lives in the shared
 /// `CommandRegistry` in tcode-core.
-const UI_COMMANDS: [(&str, &str); 3] = [
+const UI_COMMANDS: [(&str, &str); 4] = [
     ("/help", "show keys and commands"),
     ("/model", "switch model · adjust reasoning effort"),
+    ("/agents", "choose the model each sub-agent runs on"),
     ("/provider", "configure or switch provider"),
 ];
 
@@ -294,6 +295,11 @@ pub struct App {
     resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
     model_picker: Option<model_picker::Picker>,
+    agents: AgentMenu,
+    agent_picker: Option<model_picker::AgentPicker>,
+    /// Mirror of `Session::dogfood` for the status line: a running turn owns
+    /// the session, so the hint cannot read it directly.
+    dogfood: bool,
     pending_tool: Option<PendingCall>,
     /// Entries belonging to a concurrent group, completed in model-call
     /// order. Keeping them queued lets each result retain its own input.
@@ -359,10 +365,12 @@ impl App {
         agent: Arc<Agent>,
         mut session: Session,
         menu: ModelMenu,
+        agents: AgentMenu,
         opening_context: OpeningContextFn,
     ) -> anyhow::Result<Self> {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let mode_label = session.mode.label().to_string();
+        let session_dogfood = session.dogfood();
         let cwd = session.tool_ctx.cwd.clone();
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
@@ -404,6 +412,9 @@ impl App {
             resume_picker: None,
             menu,
             model_picker: None,
+            agents,
+            agent_picker: None,
+            dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
             plan: Vec::new(),
@@ -652,6 +663,15 @@ impl App {
                     let mut group: Vec<(String, String, serde_json::Value)> = Vec::new();
                     for b in blocks {
                         match b {
+                            ContentBlock::Thinking { thinking, .. } => {
+                                // Its own foldable block, like live streaming.
+                                // The duration is not recorded, so the head
+                                // states only the size.
+                                self.transcript.push(std::mem::take(&mut lines));
+                                let title =
+                                    format!("reasoning (~{} tok)", thinking.chars().count() / 3);
+                                self.bake_thinking(&title, thinking);
+                            }
                             ContentBlock::Text { text } => {
                                 lines.extend(self.md.render(text));
                                 lines.push(Line::default());
@@ -1320,11 +1340,26 @@ impl App {
     fn finish_thinking(&mut self) {
         if let Some(since) = self.thinking_since.take() {
             let secs = since.elapsed().as_secs().max(1);
-            let title = format!("thought for {secs}s (~{} tok)", self.thinking_chars / 3);
-            self.bake(vec![Line::styled(format!("✻ {title}"), theme::thinking())]);
-            self.thinking_text.clear();
+            let text = std::mem::take(&mut self.thinking_text);
+            self.bake_thinking(
+                &format!("reasoning for {secs}s (~{} tok)", self.thinking_chars / 3),
+                &text,
+            );
             self.thinking_chars = 0;
         }
+    }
+
+    /// The `✻ reasoning …` block: a one-line head that folds open to the
+    /// provider's reasoning output (Anthropic thinking blocks, DeepSeek
+    /// `reasoning_content`, or a Codex reasoning summary). Rendering it as
+    /// Markdown keeps provider-supplied headings, emphasis and lists readable.
+    /// Live and replay share this entry point, so a resumed session displays
+    /// the same foldable record.
+    fn bake_thinking(&mut self, title: &str, text: &str) {
+        let head = vec![Line::styled(format!("✻ {title}"), theme::thinking())];
+        let detail = self.md.render(text);
+        self.transcript
+            .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
     }
 
     fn refresh_live_text(&mut self) {
@@ -1609,6 +1644,7 @@ impl App {
                     dialog.paste_text(text);
                 } else if self.resume_picker.is_none()
                     && self.model_picker.is_none()
+                    && self.agent_picker.is_none()
                     && self.rewind_nav.is_none()
                 {
                     self.on_paste_text(text);
@@ -1690,9 +1726,28 @@ impl App {
             match picker.handle_key(key) {
                 model_picker::PickResult::Pending => {}
                 model_picker::PickResult::Cancelled => self.model_picker = None,
-                model_picker::PickResult::Picked { index, effort } => {
+                model_picker::PickResult::Picked { option, effort } => {
                     self.model_picker = None;
-                    self.apply_model(index, effort);
+                    // `/model` has no inherit row, so the option is always set.
+                    if let Some(index) = option {
+                        self.apply_model(index, effort);
+                    }
+                }
+            }
+            return;
+        }
+
+        if let Some(picker) = self.agent_picker.as_mut() {
+            match picker.handle_key(key, &self.menu, &self.agents) {
+                model_picker::AgentPick::Pending => {}
+                model_picker::AgentPick::Cancelled => self.agent_picker = None,
+                model_picker::AgentPick::Picked {
+                    kind,
+                    option,
+                    effort,
+                } => {
+                    self.agent_picker = None;
+                    self.apply_agent_model(&kind, option, effort);
                 }
             }
             return;
@@ -2029,6 +2084,39 @@ impl App {
         }
     }
 
+    /// `/agents`: pin a sub-agent kind to a model, or (option = None) let it
+    /// go back to following the main one. The binary applies and persists it;
+    /// we only mirror the result so the kind list stays truthful.
+    fn apply_agent_model(&mut self, kind: &str, option: Option<usize>, effort: Option<String>) {
+        let choice = option.and_then(|index| {
+            self.menu
+                .options
+                .get(index)
+                .map(|opt| (opt, effort.as_deref()))
+        });
+        match (self.agents.pin)(kind, choice) {
+            Ok(label) => {
+                if let Some(slot) = self
+                    .agents
+                    .kinds
+                    .iter()
+                    .position(|k| k == kind)
+                    .map(|i| &mut self.agents.pins[i])
+                {
+                    *slot = option.map(|index| (index, effort.clone()));
+                }
+                self.bake(vec![Line::styled(
+                    format!("{kind} → {label}"),
+                    theme::dim(),
+                )]);
+            }
+            Err(e) => self.bake(vec![Line::styled(
+                format!("cannot pin {kind}: {e}"),
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
     fn run_slash(&mut self, cmd: &str) {
         // UI-only commands: their substance drives frontend-owned objects
         // (key table, model picker, provider wizard), so they never reach
@@ -2052,6 +2140,10 @@ impl App {
                         theme::dim(),
                     )]);
                 }
+                return;
+            }
+            "/agents" => {
+                self.agent_picker = model_picker::AgentPicker::new(&self.agents);
                 return;
             }
             _ => {}
@@ -2138,6 +2230,9 @@ impl App {
                     self.bake_transcript();
                 }
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
+                CommandEffect::PersistDogfood(on) => {
+                    tcode_core::config::ModelState::update(|state| state.dogfood = on)
+                }
             }
         }
         for message in outcome.messages {
@@ -2148,6 +2243,7 @@ impl App {
         if let Some(session) = self.session.as_ref() {
             self.cwd = session.tool_ctx.cwd.clone();
             self.mode_label = session.mode.label().to_string();
+            self.dogfood = session.dogfood();
         }
     }
 
@@ -2650,6 +2746,11 @@ impl App {
             .map(|p| p.render())
             .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
             .or_else(|| {
+                self.agent_picker
+                    .as_ref()
+                    .map(|p| p.render(&self.menu, &self.agents))
+            })
+            .or_else(|| {
                 self.dialog
                     .as_ref()
                     .map(|(d, _)| d.render(area_width(&self.terminal)))
@@ -2913,10 +3014,14 @@ impl App {
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
             .map(|(text, _)| format!(" · {text}"))
             .unwrap_or_default();
+        // A mode that silently changes what the model does must be visible
+        // while it is on, not only in the line that switched it on.
+        let dogfood = if self.dogfood { " · dogfood" } else { "" };
         format!(
-            "  mode {} · {}{}{}{} · /help",
+            "  mode {} · {}{}{}{}{} · /help",
             self.mode_label,
             self.agent.model.snapshot().describe(),
+            dogfood,
             cache,
             scrolled,
             notice

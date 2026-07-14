@@ -13,8 +13,9 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    Agent, Approval, ApprovalDecision, Approver, BatchPolicy, ContentBlock, Entry, ModelCell,
-    PermissionMode, PermissionRequest, PermissionRules, Session, Tool, ToolCtx, ToolOutput,
+    ActiveModel, Agent, AgentModels, Approval, ApprovalDecision, Approver, BatchPolicy,
+    ContentBlock, Entry, ModelCell, PermissionMode, PermissionRequest, PermissionRules, Session,
+    Tool, ToolCtx, ToolOutput,
 };
 
 const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
@@ -40,9 +41,18 @@ impl Approver for NeverAsk {
     }
 }
 
+/// The sub-agent kinds `task` dispatches to. Also the kinds `/agents` offers
+/// as pinnable, so the picker and the tool can never drift apart.
+pub const AGENT_KINDS: [&str; 2] = ["explore", "general"];
+
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
     model: ModelCell,
+    /// Per-kind pins (`[agents.<kind>]`, or `/agents`). A pinned kind does
+    /// *not* follow `/model` — that is the point: "explore always runs on the
+    /// cheap model". The registry is shared with the frontend that edits it,
+    /// so a pick takes effect on the next sub-agent, not the next process.
+    pinned: AgentModels,
     watchdog: WatchdogConfig,
     output_budget: usize,
 }
@@ -56,9 +66,23 @@ impl TaskTool {
     ) -> Self {
         Self {
             model,
+            pinned: AgentModels::default(),
             watchdog,
             output_budget,
         }
+    }
+
+    /// Share the live pin registry with the frontend that edits it.
+    pub fn with_agent_models(mut self, pinned: AgentModels) -> Self {
+        self.pinned = pinned;
+        self
+    }
+
+    /// The pinned model for `kind`, else a snapshot of the parent's.
+    fn model_for(&self, kind: &str) -> ActiveModel {
+        self.pinned
+            .get(kind)
+            .unwrap_or_else(|| self.model.snapshot())
     }
 
     fn sub_tools(&self, agent_kind: &str) -> Vec<Arc<dyn Tool>> {
@@ -129,8 +153,10 @@ impl Tool for TaskTool {
             }
         };
 
+        let model = self.model_for(kind);
+        let model_name = model.provider.model().to_string();
         let agent = Agent {
-            model: self.model.clone(),
+            model: ModelCell::new(model),
             tools: self.sub_tools(kind),
             system: system.to_string(),
             watchdog: self.watchdog.clone(),
@@ -209,7 +235,8 @@ impl Tool for TaskTool {
 
         let u = session.turn_usage;
         ToolOutput::ok(format!(
-            "[{kind} sub-agent: {tool_calls} tool calls, in {} | out {} tokens]\n{report}",
+            "[{kind} sub-agent on {model_name}: {tool_calls} tool calls, \
+             in {} | out {} tokens]\n{report}",
             u.total_input(),
             u.output_tokens
         ))

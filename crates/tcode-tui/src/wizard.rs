@@ -203,6 +203,7 @@ fn run_with(
         profile: Some(profile),
         model: Some(model),
         effort,
+        ..ModelState::default()
     };
     Ok(Some((config, state)))
 }

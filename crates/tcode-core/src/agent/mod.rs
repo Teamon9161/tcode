@@ -27,6 +27,9 @@ use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 /// should never bill unbounded. Configurable via `limits.max_steps_per_turn`.
 pub const DEFAULT_MAX_STEPS: usize = 100;
 
+/// Appended to the system prompt while `/dogfood` is on.
+const DOGFOOD_SYSTEM: &str = include_str!("../../../../prompts/dogfood.md");
+
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
 #[derive(Debug, Clone)]
@@ -125,11 +128,16 @@ impl Agent {
     }
 
     pub(super) fn system_prompt(&self, session: &Session) -> String {
-        if session.opening_context().is_empty() {
-            self.system.clone()
-        } else {
-            format!("{}\n\n{}", self.system, session.opening_context())
+        let mut prompt = self.system.clone();
+        if !session.opening_context().is_empty() {
+            prompt.push_str("\n\n");
+            prompt.push_str(session.opening_context());
         }
+        if session.dogfood() {
+            prompt.push_str("\n\n");
+            prompt.push_str(DOGFOOD_SYSTEM);
+        }
+        prompt
     }
 
     /// Drive one user turn to completion: stream → run tools → repeat

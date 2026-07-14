@@ -9,9 +9,9 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentEvent, Approval, ApprovalDecision, Approver, CacheStrategy,
-    ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules, Provider,
-    ProviderError, Request, Session, StopReason, StreamEvent, ToolCtx, Usage,
+    ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
+    CacheStrategy, ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules,
+    Provider, ProviderError, Request, Session, StopReason, StreamEvent, ToolCtx, Usage,
 };
 
 fn cell(provider: Arc<MockProvider>) -> ModelCell {
@@ -24,13 +24,21 @@ fn cell(provider: Arc<MockProvider>) -> ModelCell {
 }
 
 struct MockProvider {
+    model: String,
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
     requests: Mutex<Vec<Request>>,
 }
 
 impl MockProvider {
     fn new(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+        Self::named("mock-1", scripts)
+    }
+
+    /// A distinguishable model id, for tests that must prove *which* model a
+    /// request went to (e.g. a sub-agent pinned to its own).
+    fn named(model: &str, scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
         Arc::new(Self {
+            model: model.to_string(),
             scripts: Mutex::new(scripts.into()),
             requests: Mutex::new(Vec::new()),
         })
@@ -43,7 +51,7 @@ impl Provider for MockProvider {
         "mock"
     }
     fn model(&self) -> &str {
-        "mock-1"
+        &self.model
     }
     fn cache_strategy(&self) -> CacheStrategy {
         CacheStrategy::ImplicitPrefix
@@ -1190,4 +1198,87 @@ async fn lone_and_unbatchable_calls_have_no_batch_label() {
         ),
     ];
     assert_eq!(agent.batch_display_label(&session, &mixed), None);
+}
+
+/// `/dogfood` is a hidden command, so nothing but the system prompt tells the
+/// model to critique the tools. Pin that it lands there — and only when on.
+#[tokio::test]
+async fn dogfood_toggle_adds_the_tool_feedback_directive_to_the_system_prompt() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![text_done("ok"), text_done("ok")]);
+    let agent = agent(provider.clone());
+    let mut session = session(root.path(), PermissionMode::Default);
+
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "first").await;
+
+    session.set_dogfood(true);
+    run(&agent, &mut session, &approver, "second").await;
+
+    let requests = provider.requests.lock().unwrap();
+    assert!(!requests[0].system.contains("Tool feedback"));
+    assert!(requests[1].system.contains("Tool feedback"));
+    // The directive is appended, so everything cached before it is unchanged.
+    assert!(requests[1].system.starts_with(&requests[0].system));
+}
+
+/// `[agents.explore]` pins a sub-agent kind to its own model. The pin must
+/// hold for that kind and for nothing else: the parent keeps its model, and
+/// the sub-agent's request never reaches the parent's provider.
+#[tokio::test]
+async fn a_pinned_sub_agent_runs_on_its_own_model() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "task",
+            r#"{"agent":"explore","prompt":"survey the repo"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let explore = MockProvider::named("cheap-scout-1", vec![text_done("the report")]);
+
+    let task = tcode_tools::TaskTool::new(
+        cell(parent.clone()),
+        WatchdogConfig::default(),
+        2000,
+        root.path().to_path_buf(),
+    )
+    .with_agent_models({
+        let pins = AgentModels::default();
+        pins.pin("explore", cell(explore.clone()).snapshot());
+        pins
+    });
+    let agent = Agent {
+        model: cell(parent.clone()),
+        tools: vec![Arc::new(task)],
+        system: "test".into(),
+        watchdog: WatchdogConfig::default(),
+        hooks: Default::default(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
+    };
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "explore this").await;
+
+    // The sub-agent ran on the pinned provider, exactly once...
+    assert_eq!(explore.requests.lock().unwrap().len(), 1);
+    // ...and the parent only served its own two steps.
+    assert_eq!(parent.requests.lock().unwrap().len(), 2);
+
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("task returned a report");
+    // The model that actually did the work is named in the report.
+    assert!(
+        report.contains("explore sub-agent on cheap-scout-1"),
+        "{report}"
+    );
+    assert!(report.contains("the report"), "{report}");
 }

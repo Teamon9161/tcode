@@ -13,7 +13,7 @@ pub use interaction::{AddNoteTool, AskUserTool, UpdatePlanTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
 pub use skills::SkillTool;
-pub use task::TaskTool;
+pub use task::{TaskTool, AGENT_KINDS};
 
 use std::sync::Arc;
 

@@ -46,23 +46,37 @@ fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
 /// hit. Returns the text and how many lines were actually emitted, so the
 /// caller can tell the model where to resume.
 fn numbered_capped(lines: &[&str], start: usize, budget: usize) -> (String, usize) {
+    use std::fmt::Write as _;
+
+    // One buffer for the whole read; a `format!` per line would allocate once
+    // per line of every file the model reads.
     let mut out = String::new();
     let mut emitted = 0;
     for (i, line) in lines.iter().enumerate() {
-        let clipped: String = if line.chars().count() > MAX_LINE_CHARS {
-            line.chars().take(MAX_LINE_CHARS).collect::<String>() + "…"
-        } else {
-            (*line).to_string()
-        };
-        let row = format!("{:>6}\t{clipped}\n", start + i);
-        // Always emit at least one line so a single huge line still makes progress.
-        if emitted > 0 && out.len() + row.len() > budget {
+        let clipped = clip(line);
+        // A row is the number, a tab, the line and a newline. Always emit at
+        // least one so a single huge line still makes progress.
+        if emitted > 0 && out.len() + clipped.len() + 8 > budget {
             break;
         }
-        out.push_str(&row);
+        let _ = writeln!(out, "{:>6}\t{clipped}", start + i);
         emitted += 1;
     }
     (out, emitted)
+}
+
+/// Long lines are clipped by *character* count, so a wide line cannot blow the
+/// output budget. Borrowed unless it actually needs clipping.
+fn clip(line: &str) -> std::borrow::Cow<'_, str> {
+    // Cheap reject: a line can only exceed the char limit if it exceeds it in
+    // bytes, and most lines are far below.
+    if line.len() <= MAX_LINE_CHARS {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    match line.char_indices().nth(MAX_LINE_CHARS) {
+        Some((cut, _)) => std::borrow::Cow::Owned(format!("{}…", &line[..cut])),
+        None => std::borrow::Cow::Borrowed(line),
+    }
 }
 
 fn numbered(lines: &[&str], start: usize) -> String {
@@ -183,7 +197,7 @@ impl Tool for ReadTool {
         };
         let path = ctx.resolve(path_str);
         // Stat first so a huge file is rejected before it is loaded into memory.
-        let meta = match std::fs::metadata(&path) {
+        let meta = match tokio::fs::metadata(&path).await {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return ToolOutput::err(not_found_help(&path));
@@ -213,7 +227,7 @@ impl Tool for ReadTool {
                 meta.len() as f64 / (1024.0 * 1024.0),
             ));
         }
-        let bytes = match std::fs::read(&path) {
+        let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return ToolOutput::err(not_found_help(&path));
@@ -413,9 +427,18 @@ impl Tool for WriteTool {
             return ToolOutput::err("missing required parameters: path, content");
         };
         let path = ctx.resolve(path_str);
-        let mut freshness = ctx.freshness.lock().expect("freshness lock");
-        if let Ok(existing) = std::fs::read(&path) {
-            if !freshness.seen_current(&path, content_hash(&existing)) {
+        // The freshness lock is taken in short scopes rather than held across
+        // the IO: a `std::sync::MutexGuard` alive across an `.await` would make
+        // this future non-Send, and holding it would serialize a whole
+        // parallel write batch behind one file's disk latency. Batched writes
+        // are guaranteed to target distinct paths, so nothing needs the lock
+        // held across the read-modify-write.
+        if let Ok(existing) = tokio::fs::read(&path).await {
+            let seen = {
+                let freshness = ctx.freshness.lock().expect("freshness lock");
+                freshness.seen_current(&path, content_hash(&existing))
+            };
+            if !seen {
                 return ToolOutput::err(format!(
                     "{} already exists and you have not read its current version; \
                      read it first so no content is destroyed unknowingly.",
@@ -424,14 +447,17 @@ impl Tool for WriteTool {
             }
         }
         if let Some(parent) = path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
                 return ToolOutput::err(format!("cannot create {}: {e}", parent.display()));
             }
         }
-        if let Err(e) = std::fs::write(&path, content) {
+        if let Err(e) = tokio::fs::write(&path, content).await {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
         }
-        freshness.record_write(&path, content_hash(content.as_bytes()));
+        ctx.freshness
+            .lock()
+            .expect("freshness lock")
+            .record_write(&path, content_hash(content.as_bytes()));
         ToolOutput::ok(format!(
             "wrote {} ({} lines)",
             rel(&path, &ctx.cwd).display(),
@@ -519,7 +545,7 @@ impl Tool for EditTool {
             return ToolOutput::err("old_string and new_string are identical");
         }
         let path = ctx.resolve(path_str);
-        let bytes = match std::fs::read(&path) {
+        let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return ToolOutput::err(not_found_help(&path));
@@ -528,9 +554,11 @@ impl Tool for EditTool {
         };
         // No read-before-edit gate: the exact, unique match against current
         // disk content is the verification. A stale or guessed old_string
-        // fails safely below.
-        let mut freshness = ctx.freshness.lock().expect("freshness lock");
-        let seen = freshness.seen_current(&path, content_hash(&bytes));
+        // fails safely below. (Lock scope: see the note in `write`.)
+        let seen = {
+            let freshness = ctx.freshness.lock().expect("freshness lock");
+            freshness.seen_current(&path, content_hash(&bytes))
+        };
         let text = String::from_utf8_lossy(&bytes).into_owned();
 
         let Some(plan) = replacement_plan(&text, old, new) else {
@@ -563,19 +591,23 @@ impl Tool for EditTool {
         } else {
             text.replacen(&plan.old, &plan.new, 1)
         };
-        if let Err(e) = std::fs::write(&path, &new_text) {
+        if let Err(e) = tokio::fs::write(&path, &new_text).await {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
         }
-        freshness.record_write(&path, content_hash(new_text.as_bytes()));
+        ctx.freshness
+            .lock()
+            .expect("freshness lock")
+            .record_write(&path, content_hash(new_text.as_bytes()));
 
         // Show the edited region so the model sees the result without
-        // re-reading the file.
-        let pos = new_text.find(&plan.new).unwrap_or(0);
-        let line_no = new_text[..pos].lines().count().max(1);
-        let lines: Vec<&str> = new_text.lines().collect();
+        // re-reading the file. Everything before the first replacement is
+        // untouched, so its offset in the new text is the one the plan already
+        // found — no second search of the file, and no `Vec` of all its lines.
+        let line_no = new_text[..plan.at].bytes().filter(|b| *b == b'\n').count() + 1;
         let start = line_no.saturating_sub(3).max(1);
-        let end = (line_no + plan.new.lines().count() + 2).min(lines.len());
-        let snippet = numbered(&lines[start - 1..end], start);
+        let window = plan.new.lines().count() + 5;
+        let shown: Vec<&str> = new_text.lines().skip(start - 1).take(window).collect();
+        let snippet = numbered(&shown, start);
         ToolOutput::ok(format!(
             "edited {} ({} replacement{}). Result:\n{snippet}",
             rel(&path, &ctx.cwd).display(),
@@ -593,6 +625,23 @@ struct ReplacementPlan {
     old: String,
     new: String,
     count: usize,
+    /// Byte offset of the first match. The text before it survives the
+    /// replacement unchanged, so this is also where the new text lands.
+    at: usize,
+}
+
+impl ReplacementPlan {
+    /// `old` must be a substring of `text`; `None` when it does not occur.
+    fn locate(text: &str, old: String, new: String) -> Option<Self> {
+        let mut matches = text.match_indices(&old);
+        let at = matches.next()?.0;
+        Some(ReplacementPlan {
+            count: 1 + matches.count(),
+            old,
+            new,
+            at,
+        })
+    }
 }
 
 fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan> {
@@ -613,8 +662,7 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan>
         if !seen.insert(old.clone()) {
             return None;
         }
-        let count = text.match_indices(&old).count();
-        (count > 0).then_some(ReplacementPlan { old, new, count })
+        ReplacementPlan::locate(text, old, new)
     });
     if exact.is_some() {
         return exact;
@@ -624,12 +672,7 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan>
     // block. Match with those differences normalized away, but splice the
     // *actual* file bytes back in so nothing else is disturbed.
     let orig = find_punct_normalized(text, old).or_else(|| find_ws_normalized(text, old))?;
-    let count = text.match_indices(&orig).count();
-    (count > 0).then_some(ReplacementPlan {
-        old: orig,
-        new: normalize_newlines(new, eol),
-        count,
-    })
+    ReplacementPlan::locate(text, orig, normalize_newlines(new, eol))
 }
 
 /// Map common typographic punctuation to its ASCII equivalent. Only 1-char →
@@ -689,8 +732,11 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
     if old_keys.iter().all(String::is_empty) {
         return None;
     }
-    // (byte_start, content_without_terminator, full_piece_len) per file line.
-    let mut lines: Vec<(usize, &str, usize)> = Vec::new();
+    // (byte_start, content_without_terminator, full_piece_len, key) per file
+    // line. The key is computed once per line, not once per (window, line):
+    // re-keying inside the sliding comparison below made a failed edit on a
+    // large file quadratic in allocations.
+    let mut lines: Vec<(usize, &str, usize, String)> = Vec::new();
     let mut off = 0usize;
     for piece in text.split_inclusive('\n') {
         let content = piece
@@ -698,7 +744,7 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
             .unwrap_or(piece)
             .strip_suffix('\r')
             .unwrap_or_else(|| piece.strip_suffix('\n').unwrap_or(piece));
-        lines.push((off, content, piece.len()));
+        lines.push((off, content, piece.len(), key(content)));
         off += piece.len();
     }
     let m = old_keys.len();
@@ -707,12 +753,12 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
     }
     let include_trailing = old.ends_with('\n');
     (0..=lines.len() - m).find_map(|w| {
-        let matched = (0..m).all(|k| key(lines[w + k].1) == old_keys[k]);
+        let matched = (0..m).all(|k| lines[w + k].3 == old_keys[k]);
         if !matched {
             return None;
         }
         let start = lines[w].0;
-        let (last_off, last_content, last_len) = lines[w + m - 1];
+        let (last_off, last_content, last_len, _) = lines[w + m - 1];
         let end = if include_trailing {
             last_off + last_len
         } else {
@@ -881,6 +927,52 @@ fn rate_limits_from() {
             occurrence_help(text, needle, 8),
             vec!["  line 2: alpha", "  line 4: alpha"]
         );
+    }
+
+    #[tokio::test]
+    async fn edit_result_snippet_is_anchored_at_the_replacement() {
+        let dir = std::env::temp_dir().join(format!("tcode-edit-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("many.rs");
+        // The needle sits deep in the file, and an identical-looking `new`
+        // string also occurs earlier — a naive `find(new)` would report the
+        // wrong region.
+        let mut body = String::from("target\n");
+        for i in 1..=200 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&file, &body).unwrap();
+
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let out = EditTool
+            .run(
+                json!({
+                    "path": file.to_str().unwrap(),
+                    "old_string": "line 150",
+                    "new_string": "target",
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        // Anchored at line 151 (the file's line 1 is "target"), not line 1.
+        assert!(out.content.contains("   151\ttarget"), "{}", out.content);
+        assert!(out.content.contains("   148\tline 147"), "{}", out.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn long_lines_clip_on_char_boundaries() {
+        // Multi-byte chars: clipping by byte index would panic or corrupt.
+        let line = "の".repeat(MAX_LINE_CHARS + 10);
+        let clipped = clip(&line);
+        assert_eq!(clipped.chars().count(), MAX_LINE_CHARS + 1); // + the ellipsis
+        assert!(clipped.ends_with('…'));
+        // A line at the limit is passed through untouched, without allocating.
+        let short = "の".repeat(4);
+        assert!(matches!(clip(&short), std::borrow::Cow::Borrowed(_)));
     }
 
     #[test]

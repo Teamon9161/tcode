@@ -10,6 +10,7 @@ mod cd;
 mod clear;
 mod compact;
 mod cost;
+mod dogfood;
 mod exit;
 mod export;
 mod memory;
@@ -61,6 +62,11 @@ pub enum CommandEffect {
         focus: Option<String>,
     },
     OpenResumePicker,
+    /// The dogfood switch flipped: write it to state.toml so it survives a
+    /// restart. Persisting program state is the frontend's job here — it
+    /// already owns it for the `/model` choice, and core's own tests must not
+    /// write the developer's home directory to exercise a command.
+    PersistDogfood(bool),
 }
 
 #[derive(Debug, Default)]
@@ -119,12 +125,20 @@ pub trait SlashCommand: Send + Sync {
         &[]
     }
     fn help(&self) -> &'static str;
+    /// Keep the command out of /help and completion while leaving it
+    /// dispatchable. For developer instruments whose surface would only
+    /// confuse a user who has no reason to run them.
+    fn hidden(&self) -> bool {
+        false
+    }
     fn run(&self, ctx: &mut CommandCtx<'_>, args: &str) -> CommandOutcome;
 }
 
 pub struct CommandRegistry {
     commands: Vec<Box<dyn SlashCommand>>,
-    /// `("/name", help)` in registration order, for /help and completion.
+    /// `("/name", help)` for the advertised commands, in registration order:
+    /// what /help lists and what completion offers. Hidden commands are
+    /// absent here but still resolve through `find` / `dispatch`.
     entries: Vec<(String, &'static str)>,
 }
 
@@ -132,6 +146,7 @@ impl CommandRegistry {
     pub fn new(commands: Vec<Box<dyn SlashCommand>>) -> Self {
         let entries = commands
             .iter()
+            .filter(|c| !c.hidden())
             .map(|c| (format!("/{}", c.name()), c.help()))
             .collect();
         Self { commands, entries }
@@ -149,6 +164,7 @@ impl CommandRegistry {
             Box::new(memory::MemoryCommand),
             Box::new(export::ExportCommand),
             Box::new(exit::ExitCommand),
+            Box::new(dogfood::DogfoodCommand),
         ])
     }
 

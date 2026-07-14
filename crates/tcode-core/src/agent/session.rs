@@ -29,6 +29,8 @@ pub struct Session {
     /// Prompt size of the latest request (for the context status line).
     pub last_prompt_tokens: u64,
     pub turn_usage: Usage,
+    /// `/dogfood`: also report harness tool defects while working.
+    dogfood: bool,
 }
 
 impl Session {
@@ -42,12 +44,25 @@ impl Session {
             checkpoints: crate::checkpoint::CheckpointStore::default(),
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
+            dogfood: false,
         }
     }
 
     /// Cwd-specific portion of the system prompt used for request construction.
     pub fn opening_context(&self) -> &str {
         &self.opening_context
+    }
+
+    pub fn dogfood(&self) -> bool {
+        self.dogfood
+    }
+
+    /// Toggling changes the system prompt, i.e. the cached prefix. That is a
+    /// one-time re-prime, the same class of cost as `/compact` — deliberately
+    /// preferred over re-sending the directive in every turn's tail, which
+    /// would pay for it forever and bloat the history it lands in.
+    pub fn set_dogfood(&mut self, on: bool) {
+        self.dogfood = on;
     }
 
     /// Set the cwd-specific part of the system prompt before a first turn.

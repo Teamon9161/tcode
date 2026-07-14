@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -51,7 +52,10 @@ pub enum ProviderError {
     Api { status: u16, message: String },
     #[error("stream stalled: no data for {0:?}")]
     IdleTimeout(Duration),
-    #[error("no response headers within {0:?}")]
+    /// The request was accepted but the server sent no reply at all — not one
+    /// header — within the budget. Distinct from `IdleTimeout`, which is a
+    /// stream that started and then stalled.
+    #[error("no reply from the API within {0:?} (request sent, nothing came back)")]
     ConnectTimeout(Duration),
     #[error("malformed response: {0}")]
     BadResponse(String),
@@ -122,6 +126,43 @@ impl ModelCell {
 
     pub fn set_effort(&self, effort: Option<String>) {
         self.0.write().expect("model cell lock").effort = effort;
+    }
+}
+
+/// Which model each sub-agent kind runs on, when it is not simply following
+/// the main one. Shared between the `task` tool and the frontend that edits
+/// the pins (`/agents`), and swappable for the same reason `ModelCell` is:
+/// a pick must apply to the next sub-agent, not the next process.
+///
+/// Absent kind = inherit: that sub-agent uses the parent's `ModelCell` and so
+/// follows `/model`. A pinned kind deliberately does not.
+#[derive(Clone, Default)]
+pub struct AgentModels(std::sync::Arc<std::sync::RwLock<BTreeMap<String, ActiveModel>>>);
+
+impl AgentModels {
+    pub fn get(&self, kind: &str) -> Option<ActiveModel> {
+        self.0.read().expect("agent models lock").get(kind).cloned()
+    }
+
+    pub fn pin(&self, kind: &str, model: ActiveModel) {
+        self.0
+            .write()
+            .expect("agent models lock")
+            .insert(kind.to_string(), model);
+    }
+
+    pub fn unpin(&self, kind: &str) {
+        self.0.write().expect("agent models lock").remove(kind);
+    }
+
+    /// `(kind,描述)` for every pin, for status/summary lines.
+    pub fn describe(&self) -> Vec<(String, String)> {
+        self.0
+            .read()
+            .expect("agent models lock")
+            .iter()
+            .map(|(kind, model)| (kind.clone(), model.describe()))
+            .collect()
     }
 }
 
