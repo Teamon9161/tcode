@@ -317,18 +317,31 @@ async fn approval_comment_becomes_note_for_the_model() {
     let mut session = session(dir.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, Some("keep it ASCII only"));
 
-    run(&agent, &mut session, &approver, "create a.txt").await;
+    let events = run(&agent, &mut session, &approver, "create a.txt").await;
 
     assert_eq!(approver.asked.lock().unwrap().len(), 1);
     assert!(dir.path().join("a.txt").exists());
     let note = session.ledger.entries().iter().find_map(|e| match e {
-        Entry::Note(n) => Some(n.clone()),
+        Entry::UserNote {
+            about,
+            answer,
+            text,
+        } => Some((about, answer, text)),
         _ => None,
     });
-    assert!(
-        note.as_deref().unwrap_or("").contains("keep it ASCII only"),
-        "approval comment must reach the model: {note:?}"
-    );
+    assert!(matches!(
+        note,
+        Some((about, false, text)) if about == "write" && text == "keep it ASCII only"
+    ));
+    let tool_end = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::ToolEnd { name, .. } if name == "write"))
+        .expect("write must finish");
+    let note_event = events
+        .iter()
+        .position(|event| matches!(event, AgentEvent::UserNote { text, answer: false } if text == "keep it ASCII only"))
+        .expect("approval comment must reach the UI");
+    assert!(tool_end < note_event, "note must follow the tool result");
 }
 
 #[tokio::test]

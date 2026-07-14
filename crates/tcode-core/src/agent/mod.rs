@@ -77,6 +77,14 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+    /// The original text of a user's approval annotation. Sent only after its
+    /// tool result has committed, matching the ledger order used by resume.
+    UserNote {
+        text: String,
+        /// `ask_user` answers have their own question-and-answer transcript
+        /// record; approval annotations render as `Note:`.
+        answer: bool,
+    },
     /// Per-step usage (one model request).
     Usage(Usage),
     RateLimits(RateLimits),
@@ -429,7 +437,7 @@ impl Agent {
                 .await;
         }
         let mut results: Vec<ContentBlock> = Vec::new();
-        let mut notes: Vec<String> = memory_note.into_iter().collect();
+        let mut notes: Vec<Entry> = memory_note.into_iter().map(Entry::Note).collect();
         let mut executed: Vec<String> = Vec::new();
         let mut declined = false;
         let mut awaiting_user_input = false;
@@ -537,7 +545,7 @@ impl Agent {
                 ));
                 continue;
             }
-            notes.extend(pre.notes);
+            notes.extend(pre.notes.into_iter().map(Entry::Note));
 
             self.emit(
                 events,
@@ -617,18 +625,20 @@ impl Agent {
                 output.images.clone(),
             ));
             if let Some(note) = approval_note {
-                if is_user_question {
-                    notes.push(format!("User answered {name}: {note}"));
-                } else {
-                    notes.push(format!("Note from the user when approving {name}: {note}"));
-                }
+                // The human's words go in whole. Which call they were about is
+                // a fact the entry carries, not a sentence baked into it: the
+                // model gets that framing from `Entry::blocks`, a transcript
+                // renders the note under the call and needs no reminder.
+                notes.push(Entry::UserNote {
+                    about: name.clone(),
+                    answer: is_user_question,
+                    text: note,
+                });
             }
         }
 
         session.ledger.append(Entry::ToolResults(results));
-        for note in notes {
-            session.ledger.append(Entry::Note(note));
-        }
+        self.append_notes(session, events, notes).await?;
 
         if let Some(at) = interrupted_at {
             let cancelled: Vec<String> = calls[at..].iter().map(|(_, n, _)| n.clone()).collect();
@@ -825,7 +835,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
         let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
-        let mut notes = Vec::new();
+        let mut notes: Vec<Entry> = Vec::new();
 
         for (id, name, input) in calls {
             if cancel.is_cancelled() {
@@ -851,17 +861,21 @@ impl Agent {
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
-                                notes.push(format!(
-                                    "Note from the user when approving {name}: {note}"
-                                ));
+                                notes.push(Entry::UserNote {
+                                    about: name.clone(),
+                                    answer: false,
+                                    text: note,
+                                });
                             }
                         }
                         ApprovalDecision::YesAlways => {
                             session.rules.allow.push(descriptor);
                             if let Some(note) = approval.comment {
-                                notes.push(format!(
-                                    "Note from the user when approving {name}: {note}"
-                                ));
+                                notes.push(Entry::UserNote {
+                                    about: name.clone(),
+                                    answer: false,
+                                    text: note,
+                                });
                             }
                         }
                         ApprovalDecision::No => {
@@ -906,7 +920,7 @@ impl Agent {
                     false,
                 );
             }
-            notes.extend(pre.notes);
+            notes.extend(pre.notes.into_iter().map(Entry::Note));
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
         }
 
@@ -986,9 +1000,7 @@ impl Agent {
             ));
         }
         session.ledger.append(Entry::ToolResults(results));
-        for note in notes {
-            session.ledger.append(Entry::Note(note));
-        }
+        self.append_notes(session, events, notes).await?;
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
@@ -1009,7 +1021,7 @@ impl Agent {
     ) -> Result<ToolsOutcome, AgentError> {
         // Pre-flight: gather tools, hooks, and build the batch label.
         let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
-        let mut notes: Vec<String> = memory_note.into_iter().collect();
+        let mut notes: Vec<Entry> = memory_note.into_iter().map(Entry::Note).collect();
         for (id, name, input) in calls {
             let Some(tool) = self.tool(name).cloned() else {
                 return Ok(ToolsOutcome {
@@ -1027,7 +1039,7 @@ impl Agent {
                     &session.tool_ctx.cwd,
                 )
                 .await;
-            notes.extend(pre.notes);
+            notes.extend(pre.notes.into_iter().map(Entry::Note));
             if let Some(reason) = pre.block {
                 let results: Vec<ContentBlock> = calls
                     .iter()
@@ -1094,9 +1106,11 @@ impl Agent {
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
-                                notes.push(format!(
-                                    "Note from the user when approving {name}: {note}"
-                                ));
+                                notes.push(Entry::UserNote {
+                                    about: name.clone(),
+                                    answer: false,
+                                    text: note,
+                                });
                             }
                         }
                         ApprovalDecision::YesAlways => {
@@ -1104,9 +1118,11 @@ impl Agent {
                                 session.rules.allow.push(descriptor.clone());
                             }
                             if let Some(note) = approval.comment {
-                                notes.push(format!(
-                                    "Note from the user when approving {name}: {note}"
-                                ));
+                                notes.push(Entry::UserNote {
+                                    about: name.clone(),
+                                    answer: false,
+                                    text: note,
+                                });
                             }
                         }
                         ApprovalDecision::No => {
@@ -1221,10 +1237,8 @@ impl Agent {
             ));
         }
 
-        for note in notes {
-            session.ledger.append(Entry::Note(note));
-        }
         session.ledger.append(Entry::ToolResults(results));
+        self.append_notes(session, events, notes).await?;
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
@@ -1371,6 +1385,26 @@ impl Agent {
             is_error,
             images,
         }
+    }
+
+    async fn append_notes(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+        notes: Vec<Entry>,
+    ) -> Result<(), AgentError> {
+        for note in notes {
+            let user_note = match &note {
+                Entry::UserNote { text, answer, .. } => Some((text.clone(), *answer)),
+                _ => None,
+            };
+            session.ledger.append(note);
+            if let Some((text, answer)) = user_note {
+                self.emit(events, AgentEvent::UserNote { text, answer })
+                    .await?;
+            }
+        }
+        Ok(())
     }
 
     async fn emit(

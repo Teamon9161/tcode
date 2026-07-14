@@ -48,6 +48,12 @@ const PLAN_VISIBLE_STEPS: usize = 5;
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
 
+/// Opens a note the human slipped to the model mid-turn (approval comment,
+/// `/note`), distinguishing it from a full user turn under the same rail.
+/// The note's own text already says what it is about — see
+/// `Agent`'s approval notes — so the label stays a bare marker.
+const NOTE_LABEL: &str = "Note: ";
+
 const PASTE_FOLD_LINES: usize = 15;
 /// Long one-line pastes should not make the editor visibly type character by
 /// character. They are sent as a text attachment instead.
@@ -633,23 +639,14 @@ impl App {
                     // User echoes are their own entry-tagged blocks so
                     // rewind can jump to and truncate from them.
                     self.transcript.push(std::mem::take(&mut lines));
-                    let mut echo: Vec<Line<'static>> = Vec::new();
+                    let mut echo: Vec<Line<'static>> = vec![Line::default()];
                     for b in blocks {
                         match b {
                             ContentBlock::Text { text } if !text.starts_with("<tcode-status>") => {
-                                for (i, l) in text.lines().enumerate() {
-                                    let prefix = if i == 0 { "› " } else { "  " };
-                                    echo.push(Line::from(vec![
-                                        Span::styled(
-                                            prefix.to_string(),
-                                            theme::user_prompt_message(),
-                                        ),
-                                        Span::styled(l.to_string(), theme::user_message()),
-                                    ]));
-                                }
+                                echo.extend(quote_lines(None, text));
                             }
                             ContentBlock::Image { .. } => {
-                                echo.push(Line::styled("  ⌞ [image]", theme::dim()));
+                                echo.push(quote_attachment_line("[image]"));
                             }
                             _ => {}
                         }
@@ -807,18 +804,16 @@ impl App {
                         );
                     }
                 }
+                tcode_core::Entry::UserNote { text, .. } => {
+                    // Approval annotations and `ask_user` answers both retain
+                    // the person's original wording on resume. Live questions
+                    // have a richer Q&A record, but that UI-only shape is not
+                    // persisted in the ledger.
+                    self.bake_user_note(text);
+                }
                 tcode_core::Entry::Note(text) => {
-                    for (i, line) in text.lines().enumerate() {
-                        let prefix = if i == 0 {
-                            "› note to model — "
-                        } else {
-                            "  "
-                        };
-                        lines.push(Line::from(vec![
-                            Span::styled(prefix.to_string(), theme::user_prompt_message()),
-                            Span::styled(line.to_string(), theme::user_message()),
-                        ]));
-                    }
+                    lines.push(Line::default());
+                    lines.extend(quote_lines(Some(NOTE_LABEL), text));
                     lines.push(Line::default());
                 }
             }
@@ -860,14 +855,8 @@ impl App {
         // Echo the user input into the transcript, tagged with the ledger
         // index its User entry is about to occupy (rewind jumps to it).
         let entry_index = session.ledger.entries().len();
-        let mut echo: Vec<Line> = Vec::new();
-        for (i, l) in input.lines().enumerate() {
-            let prefix = if i == 0 { "› " } else { "  " };
-            echo.push(Line::from(vec![
-                Span::styled(prefix.to_string(), theme::user_prompt_message()),
-                Span::styled(l.to_string(), theme::user_message()),
-            ]));
-        }
+        let mut echo: Vec<Line> = vec![Line::default()];
+        echo.extend(quote_lines(None, &input));
         let mut blocks: Vec<ContentBlock> = Vec::new();
         for att in self.attachments.drain(..) {
             let placeholder = att.placeholder();
@@ -878,7 +867,7 @@ impl App {
             }
             match att {
                 Attachment::Image { png, label, .. } => {
-                    echo.push(Line::styled(format!("  ⌞ {label}"), theme::dim()));
+                    echo.push(quote_attachment_line(&label));
                     use base64::Engine as _;
                     blocks.push(ContentBlock::Image {
                         media_type: "image/png".into(),
@@ -1185,6 +1174,14 @@ impl App {
                 );
                 self.state_label = "responding".into();
             }
+            AgentEvent::UserNote { text, answer } => {
+                // `ask_user` already has a dedicated Q&A record. Approval
+                // annotations arrive after ToolEnd and use the exact helper
+                // replay calls for Entry::UserNote.
+                if !answer {
+                    self.bake_user_note(&text);
+                }
+            }
             AgentEvent::Retrying {
                 attempt,
                 max,
@@ -1273,10 +1270,20 @@ impl App {
         }
     }
 
-    /// Transcript record of a consent decision. An approved call renders
-    /// via its ToolStart (header + diff), so approval bakes nothing but the
-    /// user's note; a declined call (which never emits ToolStart) leaves a
-    /// one-line record — the proposed diff never reaches the transcript.
+    /// Bake the original human wording of an approved annotation. Both the
+    /// post-result core event and resumed `Entry::UserNote` reach this path.
+    fn bake_user_note(&mut self, text: &str) {
+        let mut lines = vec![Line::default()];
+        lines.extend(quote_lines(Some(NOTE_LABEL), text));
+        lines.push(Line::default());
+        self.bake(lines);
+    }
+
+    /// Transcript record of a consent decision. An approved call renders via
+    /// its ToolStart (header + diff); its annotation arrives only after the
+    /// result through `AgentEvent::UserNote`. A declined call (which never
+    /// emits ToolStart) leaves a one-line record — the proposed diff never
+    /// reaches the transcript.
     fn bake_approval_record(&mut self, dialog: &Dialog, approval: &Approval) {
         // Flush streamed text so the record keeps chronological order.
         self.bake_live_text();
@@ -1301,17 +1308,9 @@ impl App {
             return;
         }
         match approval.decision {
-            ApprovalDecision::Yes | ApprovalDecision::YesAlways => {
-                if let Some(note) = approval.comment.as_deref() {
-                    self.bake(vec![
-                        Line::default(),
-                        Line::from(vec![
-                            Span::styled("› note to model — ", theme::user_prompt_message()),
-                            Span::styled(note.to_string(), theme::user_message()),
-                        ]),
-                    ]);
-                }
-            }
+            // The agent emits `UserNote` only after its tool result commits;
+            // drawing it here would put live scrollback ahead of replay.
+            ApprovalDecision::Yes | ApprovalDecision::YesAlways => {}
             ApprovalDecision::No => {
                 // Retract the diff baked while the dialog was open — a
                 // declined change leaves only its one-line record.
@@ -2258,10 +2257,7 @@ impl App {
                 message.text,
                 ratatui::style::Style::default().fg(theme::ERROR),
             )],
-            MessageKind::Note => vec![Line::from(vec![
-                Span::styled("› note to model — ", theme::user_prompt_message()),
-                Span::styled(message.text, theme::user_message()),
-            ])],
+            MessageKind::Note => quote_lines(Some(NOTE_LABEL), &message.text),
         };
         self.bake(lines);
     }
@@ -3244,6 +3240,36 @@ fn add_usage(left: Usage, right: Usage) -> Usage {
     }
 }
 
+/// A human turn renders as a quoted block: an accent rail down the left, the
+/// text otherwise unadorned. A note stays under the same rail — it is the
+/// human speaking too — and is told apart by a coloured `Note:` opening its
+/// first row. Live echo, ledger replay and approval notes all bake through
+/// here, so the three paths cannot drift apart.
+fn quote_lines(label: Option<&str>, text: &str) -> Vec<Line<'static>> {
+    text.lines()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = vec![Span::styled(theme::USER_GUTTER, theme::user_gutter())];
+            match label {
+                Some(label) if i == 0 => {
+                    spans.push(Span::styled(label.to_string(), theme::note_label()));
+                }
+                _ => {}
+            }
+            spans.push(Span::styled(row.to_string(), theme::user_message()));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Attachments hang off the message they arrived with, under the same rail.
+fn quote_attachment_line(label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(theme::USER_GUTTER, theme::user_gutter()),
+        Span::styled(format!("⌞ {label}"), theme::dim()),
+    ])
+}
+
 /// A turn boundary should read as a small receipt, not as an unstructured
 /// diagnostic log line. The numbers stay selectable/copyable terminal text,
 /// while colour and arrows make input, output and cache scannable.
@@ -3335,6 +3361,9 @@ fn estimate_context_tokens(agent: &Agent, session: &Session) -> u64 {
             // These variants grow into small XML-like wrappers before the
             // provider sees them, so reserve a little structural overhead.
             tcode_core::Entry::Note(text) => approx_tokens(text) as u64 + 12,
+            tcode_core::Entry::UserNote { about, text, .. } => {
+                (approx_tokens(about) + approx_tokens(text)) as u64 + 24
+            }
             tcode_core::Entry::Summary(text) => approx_tokens(text) as u64 + 24,
             tcode_core::Entry::ImportedTool { .. }
             | tcode_core::Entry::IncompleteAssistant { .. } => 0,

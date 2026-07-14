@@ -99,6 +99,11 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 let color = if is_error { RED } else { DIM };
                 println!("  {color}⎿ {preview}{RESET}");
             }
+            AgentEvent::UserNote {
+                text,
+                answer: false,
+            } => println!("{CYAN}Note:{RESET} {text}"),
+            AgentEvent::UserNote { answer: true, .. } => {}
             AgentEvent::Usage(_) | AgentEvent::DelegatedUsage(_) | AgentEvent::RateLimits(_) => {}
             AgentEvent::Compacting => {
                 println!("{YELLOW}[context near limit — compacting]{RESET}");

@@ -288,6 +288,12 @@ impl Tool for ReadTool {
             .max(MIN_READ_WINDOW);
         let start = (offset - 1).min(total);
         let end = start.saturating_add(limit).min(total);
+        if start == end && total != 0 {
+            return ToolOutput::ok(format!(
+                "{} has {total} lines; offset {offset} is past the end of the file.",
+                rel(&path, &ctx.cwd).display()
+            ));
+        }
         let whole_file = start == 0 && end == total;
         let range = if whole_file {
             None
@@ -323,8 +329,6 @@ impl Tool for ReadTool {
                 ));
             }
         }
-        freshness.record_read(&path, hash, range);
-        drop(freshness);
 
         let mut out = String::new();
         if status == ReadStatus::ChangedOnDisk {
@@ -340,6 +344,15 @@ impl Tool for ReadTool {
         );
         out.push_str(&body);
         let shown_end = view_start + emitted;
+        let recorded_range = if view_start == 0 && shown_end == total {
+            None
+        } else {
+            Some((view_start + 1, shown_end))
+        };
+        // Freshness represents what reached the model, not what was requested:
+        // `numbered_capped` can stop early on the output-byte budget.
+        freshness.record_read(&path, hash, recorded_range);
+        drop(freshness);
         if shown_end < total {
             out.push_str(&format!(
                 "[showing lines {}-{shown_end} of {total}; continue with offset={}]",
@@ -486,13 +499,14 @@ impl Tool for EditTool {
     }
 
     fn description(&self) -> &str {
-        "Exact string replacement in a file. `old_string` must match the \
+        "Exact string replacement in a UTF-8 text file. `old_string` must match the \
          current content exactly (including whitespace; line endings may be \
          LF/CRLF and are normalized to the file's style) and be unique unless \
-         replace_all is set. Only edit text you have actually seen in this \
-         session (read or grep output both count) and whose surroundings you \
-         understand; if you are unsure of the exact content or the impact of \
-         the change, read the file first instead of guessing."
+         replace_all is set. Non-UTF-8 files and empty old_string are rejected. \
+         Only edit text you have actually seen in this session (read or grep \
+         output both count) and whose surroundings you understand; if you are \
+         unsure of the exact content or the impact of the change, read the file \
+         first instead of guessing."
     }
 
     fn input_schema(&self) -> Value {
@@ -541,6 +555,9 @@ impl Tool for EditTool {
         ) else {
             return ToolOutput::err("missing required parameters: path, old_string, new_string");
         };
+        if old.is_empty() {
+            return ToolOutput::err("old_string must not be empty");
+        }
         if old == new {
             return ToolOutput::err("old_string and new_string are identical");
         }
@@ -559,17 +576,34 @@ impl Tool for EditTool {
             let freshness = ctx.freshness.lock().expect("freshness lock");
             freshness.seen_current(&path, content_hash(&bytes))
         };
-        let text = String::from_utf8_lossy(&bytes).into_owned();
+        let text = match String::from_utf8(bytes) {
+            Ok(text) => text,
+            Err(_) => {
+                return ToolOutput::err(format!(
+                    "{} is not valid UTF-8; edit only supports text files and will not rewrite bytes lossily",
+                    rel(&path, &ctx.cwd).display()
+                ));
+            }
+        };
 
-        let Some(plan) = replacement_plan(&text, old, new) else {
-            let mut msg = near_miss_help(&text, old);
-            if !seen {
-                msg.push_str(
-                    "\nnote: you have not read the current version of this \
-                         file; read it to get the exact text.",
+        let plan = match replacement_plan(&text, old, new) {
+            Ok(Some(plan)) => plan,
+            Ok(None) => {
+                let mut msg = near_miss_help(&text, old);
+                if !seen {
+                    msg.push_str(
+                        "\nnote: you have not read the current version of this \
+                             file; read it to get the exact text.",
+                    );
+                }
+                return ToolOutput::err(msg);
+            }
+            Err(()) => {
+                return ToolOutput::err(
+                    "old_string has multiple whitespace/punctuation-normalized matches; \
+                     add enough exact surrounding context to identify one occurrence.",
                 );
             }
-            return ToolOutput::err(msg);
         };
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
         match plan.count {
@@ -594,10 +628,10 @@ impl Tool for EditTool {
         if let Err(e) = tokio::fs::write(&path, &new_text).await {
             return ToolOutput::err(format!("cannot write {}: {e}", path.display()));
         }
-        ctx.freshness
-            .lock()
-            .expect("freshness lock")
-            .record_write(&path, content_hash(new_text.as_bytes()));
+        // `edit` proves and changes one exact region, but it does not make the
+        // rest of the current file visible to the model. Do not call
+        // `record_write` here: that marks the whole file as seen and would let
+        // a later offset read incorrectly return an unchanged stub.
 
         // Show the edited region so the model sees the result without
         // re-reading the file. Everything before the first replacement is
@@ -630,6 +664,15 @@ struct ReplacementPlan {
     at: usize,
 }
 
+/// A non-exact recovery match is safe only when it identifies one location.
+/// It must never silently pick the first of several whitespace-equivalent
+/// blocks: that would violate edit's public uniqueness contract.
+enum NormalizedMatch {
+    NotFound,
+    Unique(String),
+    Ambiguous,
+}
+
 impl ReplacementPlan {
     /// `old` must be a substring of `text`; `None` when it does not occur.
     fn locate(text: &str, old: String, new: String) -> Option<Self> {
@@ -644,7 +687,7 @@ impl ReplacementPlan {
     }
 }
 
-fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan> {
+fn replacement_plan(text: &str, old: &str, new: &str) -> Result<Option<ReplacementPlan>, ()> {
     let eol = dominant_line_ending(text);
     let mut candidates = Vec::new();
     candidates.push((old.to_string(), normalize_newlines(new, eol)));
@@ -665,14 +708,27 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Option<ReplacementPlan>
         ReplacementPlan::locate(text, old, new)
     });
     if exact.is_some() {
-        return exact;
+        return Ok(exact);
     }
     // Last resort: models often emit typographic punctuation (– " " …) where
     // the file has plain ASCII, or drift a space inside an otherwise-identical
     // block. Match with those differences normalized away, but splice the
-    // *actual* file bytes back in so nothing else is disturbed.
-    let orig = find_punct_normalized(text, old).or_else(|| find_ws_normalized(text, old))?;
-    ReplacementPlan::locate(text, orig, normalize_newlines(new, eol))
+    // *actual* file bytes back in so nothing else is disturbed. Recovery is
+    // intentionally stricter than exact replacement: a choice among several
+    // normalized matches is a guess, not a self-heal.
+    let normalized = match find_punct_normalized(text, old) {
+        NormalizedMatch::NotFound => find_ws_normalized(text, old),
+        found => found,
+    };
+    match normalized {
+        NormalizedMatch::NotFound => Ok(None),
+        NormalizedMatch::Unique(orig) => Ok(ReplacementPlan::locate(
+            text,
+            orig,
+            normalize_newlines(new, eol),
+        )),
+        NormalizedMatch::Ambiguous => Err(()),
+    }
 }
 
 /// Map common typographic punctuation to its ASCII equivalent. Only 1-char →
@@ -688,25 +744,31 @@ fn normalize_punct(c: char) -> char {
 
 /// Find `old` in `text` comparing with punctuation normalized, and return the
 /// exact original substring at that location (so the real bytes are replaced).
-/// Returns None when `old` has no typographic punctuation to normalize.
-fn find_punct_normalized(text: &str, old: &str) -> Option<String> {
+/// Returns `Ambiguous` rather than silently choosing when multiple file ranges
+/// normalize to the same requested text.
+fn find_punct_normalized(text: &str, old: &str) -> NormalizedMatch {
     let pat: Vec<char> = old.chars().map(normalize_punct).collect();
     if pat.iter().copied().eq(old.chars()) {
-        return None; // nothing was normalized — the exact pass already tried this
+        return NormalizedMatch::NotFound; // exact pass already tried this
     }
     let tchars: Vec<char> = text.chars().collect();
     if pat.is_empty() || pat.len() > tchars.len() {
-        return None;
+        return NormalizedMatch::NotFound;
     }
-    (0..=tchars.len() - pat.len()).find_map(|i| {
+    let mut matches = (0..=tchars.len() - pat.len()).filter_map(|i| {
         let window = &tchars[i..i + pat.len()];
         window
             .iter()
             .copied()
             .map(normalize_punct)
             .eq(pat.iter().copied())
-            .then(|| window.iter().collect())
-    })
+            .then(|| window.iter().collect::<String>())
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => NormalizedMatch::NotFound,
+        (Some(found), None) => NormalizedMatch::Unique(found),
+        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    }
 }
 
 /// Locate `old` in `text` line-by-line, ignoring *every* whitespace difference
@@ -719,7 +781,7 @@ fn find_punct_normalized(text: &str, old: &str) -> Option<String> {
 /// through (its whitespace rarely differs, and the exact pass already tried it).
 /// Because the real file bytes are spliced back, the file's true formatting is
 /// what survives; the model's whitespace guess is discarded.
-fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
+fn find_ws_normalized(text: &str, old: &str) -> NormalizedMatch {
     let key = |s: &str| -> String {
         s.chars()
             .filter(|c| !c.is_whitespace())
@@ -730,7 +792,7 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
     // Need at least one line with real content to anchor on; an all-blank
     // needle would match anywhere.
     if old_keys.iter().all(String::is_empty) {
-        return None;
+        return NormalizedMatch::NotFound;
     }
     // (byte_start, content_without_terminator, full_piece_len, key) per file
     // line. The key is computed once per line, not once per (window, line):
@@ -749,10 +811,10 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
     }
     let m = old_keys.len();
     if m == 0 || m > lines.len() {
-        return None;
+        return NormalizedMatch::NotFound;
     }
     let include_trailing = old.ends_with('\n');
-    (0..=lines.len() - m).find_map(|w| {
+    let mut matches = (0..=lines.len() - m).filter_map(|w| {
         let matched = (0..m).all(|k| lines[w + k].3 == old_keys[k]);
         if !matched {
             return None;
@@ -765,7 +827,12 @@ fn find_ws_normalized(text: &str, old: &str) -> Option<String> {
             last_off + last_content.len()
         };
         Some(text[start..end].to_string())
-    })
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => NormalizedMatch::NotFound,
+        (Some(found), None) => NormalizedMatch::Unique(found),
+        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    }
 }
 
 fn normalize_newlines(s: &str, eol: &str) -> String {
@@ -849,7 +916,9 @@ mod tests {
     #[test]
     fn edit_match_accepts_lf_old_string_in_crlf_file() {
         let text = "one\r\ntwo\r\nthree\r\n";
-        let plan = replacement_plan(text, "two\nthree\n", "deux\ntrois\n").unwrap();
+        let plan = replacement_plan(text, "two\nthree\n", "deux\ntrois\n")
+            .unwrap()
+            .unwrap();
 
         assert_eq!(plan.old, "two\r\nthree\r\n");
         assert_eq!(plan.new, "deux\r\ntrois\r\n");
@@ -864,7 +933,9 @@ mod tests {
         // File has ASCII; model's old_string uses an en-dash and curly quotes.
         let text = "let x = a - b; // \"note\"\n";
         let old = "a \u{2013} b; // \u{201C}note\u{201D}";
-        let plan = replacement_plan(text, old, "a + b; // ok").unwrap();
+        let plan = replacement_plan(text, old, "a + b; // ok")
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.count, 1);
         assert_eq!(plan.old, "a - b; // \"note\"");
         assert_eq!(
@@ -894,7 +965,7 @@ fn rate_limits_from() {
 }
 ";
         let new = "fn rate_limits_from() { None }\n";
-        let plan = replacement_plan(text, old, new).unwrap();
+        let plan = replacement_plan(text, old, new).unwrap().unwrap();
         assert_eq!(plan.count, 1);
         // The spliced `old` is the file's real bytes (no drifted space).
         assert!(plan.old.contains("[\"primary\"])?"));
@@ -907,7 +978,9 @@ fn rate_limits_from() {
         // File is tab-indented; model guessed spaces. Real bytes are restored.
         let text = "fn f() {\n\treturn 1;\n}\n";
         let old = "fn f() {\n    return 1;\n}\n";
-        let plan = replacement_plan(text, old, "fn f() {\n\treturn 2;\n}\n").unwrap();
+        let plan = replacement_plan(text, old, "fn f() {\n\treturn 2;\n}\n")
+            .unwrap()
+            .unwrap();
         assert_eq!(plan.count, 1);
         assert_eq!(plan.old, "fn f() {\n\treturn 1;\n}\n");
     }
@@ -916,7 +989,71 @@ fn rate_limits_from() {
     fn edit_ws_fallback_rejects_content_mismatch() {
         // Same shape, different token — must NOT match on whitespace alone.
         let text = "fn f() {\n    return 1;\n}\n";
-        assert!(replacement_plan(text, "fn f() {\n    return 2;\n}\n", "x").is_none());
+        assert!(matches!(
+            replacement_plan(text, "fn f() {\n    return 2;\n}\n", "x"),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn edit_fallback_rejects_ambiguous_whitespace_matches() {
+        let text = "fn f() {\n\treturn 1;\n}\n\nfn f() {\n    return 1;\n}\n";
+        let old = "fn f() {\n  return 1;\n}\n";
+        assert!(matches!(replacement_plan(text, old, "x"), Err(())));
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_non_utf8_without_mutating_the_file() {
+        let dir = std::env::temp_dir().join(format!("tcode-edit-binary-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("data.bin");
+        let original = b"before\xffafter";
+        std::fs::write(&file, original).unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "data.bin",
+                    "old_string": "before",
+                    "new_string": "changed",
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(out.is_error);
+        assert!(out.content.contains("not valid UTF-8"));
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_an_empty_old_string() {
+        let dir = std::env::temp_dir().join(format!("tcode-edit-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("text.txt");
+        std::fs::write(&file, "unchanged").unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "text.txt",
+                    "old_string": "",
+                    "new_string": "insert everywhere",
+                    "replace_all": true,
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(out.is_error);
+        assert_eq!(out.content, "old_string must not be empty");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -960,6 +1097,107 @@ fn rate_limits_from() {
         // Anchored at line 151 (the file's line 1 is "target"), not line 1.
         assert!(out.content.contains("   151\ttarget"), "{}", out.content);
         assert!(out.content.contains("   148\tline 147"), "{}", out.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_does_not_mark_unshown_lines_as_read() {
+        let dir = std::env::temp_dir().join(format!("tcode-edit-freshness-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("many.txt");
+        let body = (1..=300)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, body).unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let edited = EditTool
+            .run(
+                json!({
+                    "path": "many.txt",
+                    "old_string": "line 1\n",
+                    "new_string": "changed 1\n",
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!edited.is_error, "{}", edited.content);
+
+        let unseen = ReadTool
+            .run(
+                json!({ "path": "many.txt", "offset": 200, "limit": 120 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!unseen.is_error, "{}", unseen.content);
+        assert!(unseen.content.contains("line 200"), "{}", unseen.content);
+        assert!(
+            !unseen.content.starts_with("unchanged:"),
+            "an edit snippet must not make distant lines fresh: {}",
+            unseen.content
+        );
+
+        let repeated = ReadTool
+            .run(
+                json!({ "path": "many.txt", "offset": 200, "limit": 120 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(repeated.content.starts_with("unchanged:"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn capped_read_does_not_mark_unemitted_tail_as_seen() {
+        let dir = std::env::temp_dir().join(format!("tcode-read-cap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("long.txt");
+        let body = (1..=600)
+            .map(|line| format!("line {line}: {}\n", "x".repeat(600)))
+            .collect::<String>();
+        std::fs::write(&file, body).unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let first = ReadTool
+            .run(
+                json!({ "path": "long.txt" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!first.is_error, "{}", first.content);
+        assert!(
+            first.content.contains("[showing lines"),
+            "{}",
+            first.content
+        );
+
+        let tail = ReadTool
+            .run(
+                json!({ "path": "long.txt", "offset": 500, "limit": 120 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!tail.is_error, "{}", tail.content);
+        assert!(tail.content.contains("line 500:"), "{}", tail.content);
+        assert!(
+            !tail.content.starts_with("unchanged:"),
+            "the capped tail was never emitted: {}",
+            tail.content
+        );
+
+        let repeated_tail = ReadTool
+            .run(
+                json!({ "path": "long.txt", "offset": 500, "limit": 120 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(repeated_tail.content.starts_with("unchanged:"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

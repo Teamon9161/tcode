@@ -642,11 +642,20 @@ pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>>
 /// The flag marks rows that start a logical line; soft-wrap continuations
 /// carry `false` so copied text joins them without a newline.
 fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Line<'static>)> {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     let width = width.saturating_sub(1).max(1);
+    let gutter_width = crate::theme::USER_GUTTER.width();
     let mut out = Vec::new();
     for line in lines {
+        // A human turn's left rail is display furniture: carry it onto every
+        // continuation row so a wrapped message reads as one quoted block
+        // instead of spilling flush-left into the surrounding prose.
+        let gutter = line
+            .spans
+            .first()
+            .filter(|span| span.content == crate::theme::USER_GUTTER)
+            .cloned();
         let mut first = true;
         let mut current: Vec<Span<'static>> = Vec::new();
         let mut current_width = 0usize;
@@ -674,6 +683,10 @@ fn wrap_lines_flagged(lines: Vec<Line<'static>>, width: usize) -> Vec<(bool, Lin
                             pad_background_line(std::mem::take(&mut current), current_width, width),
                         ));
                         current_width = 0;
+                        if let Some(gutter) = &gutter {
+                            current.push(gutter.clone());
+                            current_width = gutter_width;
+                        }
                     }
                     current.push(Span::styled(c.to_string(), span.style));
                     current_width += char_width;
@@ -963,6 +976,21 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert_eq!(t.total(), 3);
+    }
+
+    #[test]
+    fn the_user_rail_continues_onto_wrapped_rows() {
+        let line = Line::from(vec![
+            Span::styled(crate::theme::USER_GUTTER, crate::theme::user_gutter()),
+            Span::raw("aaaa bbbb cccc"),
+        ]);
+        let rows = wrap_lines_flagged(vec![line], 10);
+        assert!(rows.len() > 1);
+        for (index, (starts, row)) in rows.iter().enumerate() {
+            assert_eq!(*starts, index == 0);
+            let text: String = row.spans.iter().map(|span| span.content.as_ref()).collect();
+            assert!(text.starts_with(crate::theme::USER_GUTTER), "row {index}");
+        }
     }
 
     #[test]

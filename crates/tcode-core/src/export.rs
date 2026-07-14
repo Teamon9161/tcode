@@ -50,6 +50,9 @@ pub fn export_markdown(entries: &[Entry], title: &str) -> String {
                 }
             }
             Entry::Note(text) => out.push_str(&format!("\n> ⚑ {}\n", text.replace('\n', "\n> "))),
+            Entry::UserNote { text, .. } => {
+                out.push_str(&format!("\n> ⚑ Note: {}\n", text.replace('\n', "\n> ")))
+            }
             Entry::Summary(text) => {
                 out.push_str("\n---\n\n## Compacted summary of earlier conversation\n\n");
                 out.push_str(text);

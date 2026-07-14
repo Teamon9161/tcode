@@ -14,8 +14,25 @@ pub enum Entry {
     /// Tool results produced by the harness (sent with user role).
     ToolResults(Vec<ContentBlock>),
     /// Harness-injected note the model should see (interrupt contract,
-    /// freshness notices, user annotations on approvals...).
+    /// freshness notices, background-task completions...). Machine-authored:
+    /// the text is the whole fact.
     Note(String),
+    /// The human's own words attached to a tool decision. The ledger keeps
+    /// the fact — whose words, about which call — rather than a pre-baked
+    /// sentence, because the two consumers need different things: the model
+    /// reads the note as a standalone block detached from the call, so it
+    /// must be told what the note is about, while a transcript already shows
+    /// the note under the call it belongs to and would only stutter. Baking
+    /// the sentence into the ledger forced replay to reverse-engineer the
+    /// human's words back out of it.
+    UserNote {
+        /// The tool the decision was about.
+        about: String,
+        /// The words answer an `ask_user` question form, rather than annotate
+        /// an approval.
+        answer: bool,
+        text: String,
+    },
     /// Product of a compaction; replaces everything before it.
     Summary(String),
     /// Assistant text from a streaming attempt that failed before the
@@ -53,6 +70,20 @@ impl Entry {
             Entry::User(b) | Entry::Assistant(b) | Entry::ToolResults(b) => b.clone(),
             Entry::Note(text) => vec![ContentBlock::Text {
                 text: format!("<harness-note>\n{text}\n</harness-note>"),
+            }],
+            Entry::UserNote {
+                about,
+                answer,
+                text,
+            } => vec![ContentBlock::Text {
+                text: format!(
+                    "<harness-note>\n{}\n</harness-note>",
+                    if *answer {
+                        format!("User answered {about}: {text}")
+                    } else {
+                        format!("From the user, approving {about}: {text}")
+                    }
+                ),
             }],
             Entry::Summary(text) => vec![ContentBlock::Text {
                 text: format!(
@@ -208,6 +239,27 @@ mod tests {
         assert_eq!(msgs[1].role, Role::Assistant);
         assert_eq!(msgs[2].role, Role::User);
         assert_eq!(msgs[2].content.len(), 2); // tool result + note merged
+    }
+
+    #[test]
+    fn user_note_keeps_original_words_and_frames_prompt_context() {
+        let mut l = Ledger::new();
+        l.append(Entry::UserNote {
+            about: "bash".into(),
+            answer: false,
+            text: "use 4 spaces".into(),
+        });
+
+        assert!(matches!(
+            &l.entries()[0],
+            Entry::UserNote { text, .. } if text == "use 4 spaces"
+        ));
+        let messages = l.as_messages();
+        assert!(matches!(
+            &messages[0].content[..],
+            [ContentBlock::Text { text }]
+                if text == "<harness-note>\nFrom the user, approving bash: use 4 spaces\n</harness-note>"
+        ));
     }
 
     #[test]

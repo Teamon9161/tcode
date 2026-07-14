@@ -592,7 +592,7 @@ async fn main() -> anyhow::Result<()> {
                     MessageKind::Info => println!("{DIM}{}{RESET}", message.text),
                     MessageKind::Error => eprintln!("{DIM}{}{RESET}", message.text),
                     MessageKind::Note => {
-                        println!("{DIM}› note to model — {}{RESET}", message.text)
+                        println!("{CYAN}Note:{RESET} {}", message.text)
                     }
                 }
             }
