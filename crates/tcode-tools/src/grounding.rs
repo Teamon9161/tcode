@@ -1,17 +1,16 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Opening project map: the facts every session starts by rediscovering
-/// (directory layout, git state, project memory), collected once at
-/// startup and baked into the cached system-prompt prefix.
-pub fn project_map(cwd: &Path) -> String {
+/// Build the opening context using a caller-supplied session-private scratch
+/// root. `project_map` remains a convenience for tests and standalone callers.
+pub fn project_map_with_scratch(cwd: &Path, scratch: &Path) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "# Environment\nplatform: {}\ncwd: {}\ndate: {}\nscratch: {}\n",
         std::env::consts::OS,
         cwd.display(),
         chrono_date(),
-        tcode_core::store::scratchpad_dir(cwd).display(),
+        scratch.display(),
     ));
 
     match git_summary(cwd) {
@@ -28,6 +27,11 @@ pub fn project_map(cwd: &Path) -> String {
 
     out.push_str(&tcode_core::MemoryManager::new(cwd).startup_prompt());
     out
+}
+
+/// Convenience wrapper for callers that do not own a live `ToolCtx`.
+pub fn project_map(cwd: &Path) -> String {
+    project_map_with_scratch(cwd, &tcode_core::store::scratchpad_dir(cwd))
 }
 
 fn chrono_date() -> String {

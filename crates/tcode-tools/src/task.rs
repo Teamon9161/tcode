@@ -184,6 +184,13 @@ impl Tool for TaskTool {
         })
     }
 
+    fn batch_policy_for(&self, input: &Value) -> tcode_core::BatchPolicy {
+        match input["agent"].as_str() {
+            Some("explore" | "plan") => tcode_core::BatchPolicy::ParallelReadOnly,
+            _ => tcode_core::BatchPolicy::Isolated,
+        }
+    }
+
     fn permission(&self, input: &Value) -> PermissionRequest {
         match input["agent"].as_str() {
             // Read-only: never prompts.
@@ -241,7 +248,8 @@ impl Tool for TaskTool {
         static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut session = Session::new(
-            ToolCtx::new(ctx.cwd.clone(), self.output_budget).with_model(model.clone()),
+            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
+                .with_model(model.clone()),
             PermissionMode::Auto,
             PermissionRules::default(),
         )

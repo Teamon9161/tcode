@@ -318,6 +318,21 @@ impl Session {
         self.opening_context = context;
     }
 
+    /// Replace the startup context when a whole conversation is restored or
+    /// imported before its next request. Ordinary cwd changes must use
+    /// `set_opening_context`'s empty-ledger guard instead, preserving the
+    /// append-only cached prefix invariant.
+    pub fn replace_opening_context_for_resume(&mut self, context: String) {
+        self.opening_context = context;
+    }
+
+    /// Bind ephemeral tool state to the persistent conversation currently held
+    /// in the ledger. `/resume` calls this before another tool can run.
+    pub fn bind_scratch_session(&mut self, session_id: &str) {
+        let scratch = crate::store::session_scratchpad_dir(&self.tool_ctx.cwd, session_id);
+        self.tool_ctx.rebind_scratch_dir(scratch);
+    }
+
     /// Change the conversation working directory. Before any model-visible
     /// history exists, the caller refreshes the opening context for the new
     /// directory. Later changes are append-only notes so cached history stays

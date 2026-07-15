@@ -472,7 +472,7 @@ impl Tool for WriteTool {
     }
 
     fn auto_safety(&self, _input: &Value) -> AutoSafety {
-        AutoSafety::AllowInProjectEdit
+        AutoSafety::AllowInProjectOrScratchEdit
     }
 
     fn touches(&self, input: &Value) -> Option<String> {
@@ -606,7 +606,7 @@ impl Tool for EditTool {
     }
 
     fn auto_safety(&self, _input: &Value) -> AutoSafety {
-        AutoSafety::AllowInProjectEdit
+        AutoSafety::AllowInProjectOrScratchEdit
     }
 
     fn touches(&self, input: &Value) -> Option<String> {

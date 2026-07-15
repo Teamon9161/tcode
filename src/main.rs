@@ -488,8 +488,6 @@ async fn main() -> anyhow::Result<()> {
         mode,
         rules,
     );
-    session.set_opening_context(tcode_tools::project_map(&cwd));
-    // The dogfood switch is a mode, not a per-session whim: restore it.
     session.set_dogfood(state.dogfood);
     // `/suggestions` last, else the config default. Same precedence as the
     // model choice: what the user last chose beats what the file says.
@@ -504,20 +502,29 @@ async fn main() -> anyhow::Result<()> {
         if cli.r#continue || cli.resume.is_some() {
             let resumed = tcode_core::SessionStore::resume(&data_dir, cli.resume.as_deref())
                 .context("cannot resume session")?;
-            let ckpt_dir = data_dir.join("checkpoints").join(&resumed.store.id);
+            let session_id = resumed.store.id.clone();
+            let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
             session.checkpoints = tcode_core::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
             session.ledger = resumed.ledger;
             session.ledger.attach_sink(Box::new(resumed.store));
+            session.bind_scratch_session(&session_id);
         } else {
             let store = tcode_core::SessionStore::create(&data_dir, &cwd)
                 .context("cannot create session log")?;
+            let session_id = store.id.clone();
             session.checkpoints =
-                tcode_core::CheckpointStore::new(data_dir.join("checkpoints").join(&store.id));
+                tcode_core::CheckpointStore::new(data_dir.join("checkpoints").join(&session_id));
             session.ledger.attach_sink(Box::new(store));
+            session.bind_scratch_session(&session_id);
         }
     }
+    session.replace_opening_context_for_resume(tcode_tools::project_map_with_scratch(
+        &cwd,
+        &session.tool_ctx.scratch_dir,
+    ));
     let line_approver = approver::LineApprover::new(cli.prompt.is_none());
-    let opening_context: tcode_tui::OpeningContextFn = Arc::new(tcode_tools::project_map);
+    let opening_context: tcode_tui::OpeningContextFn =
+        Arc::new(tcode_tools::project_map_with_scratch);
 
     if let Some(prompt) = cli.prompt {
         run_turn(&agent, &mut session, prompt, &line_approver).await?;

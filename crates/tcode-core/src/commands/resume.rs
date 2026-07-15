@@ -20,11 +20,18 @@ impl SlashCommand for ResumeCommand {
         };
         match crate::store::SessionStore::resume(&data_dir, Some(args)) {
             Ok(resumed) => {
-                let ckpt_dir = data_dir.join("checkpoints").join(&resumed.store.id);
+                let session_id = resumed.store.id.clone();
+                let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
                 ctx.session.checkpoints =
                     crate::checkpoint::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
                 ctx.session.ledger = resumed.ledger;
                 ctx.session.ledger.attach_sink(Box::new(resumed.store));
+                ctx.session.bind_scratch_session(&session_id);
+                let opening = (ctx.opening_context)(
+                    &ctx.session.tool_ctx.cwd,
+                    &ctx.session.tool_ctx.scratch_dir,
+                );
+                ctx.session.replace_opening_context_for_resume(opening);
                 // Unknown until the next usage event; the TUI re-estimates in
                 // its ConversationReplaced handler.
                 ctx.session.last_prompt_tokens = 0;

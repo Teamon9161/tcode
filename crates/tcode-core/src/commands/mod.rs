@@ -28,7 +28,9 @@ use crate::types::Usage;
 
 /// Rebuilds the cwd-specific opening context (project map, instructions)
 /// when `/cd` runs before any model-visible history exists.
-pub type OpeningContextFn = Arc<dyn Fn(&Path) -> String + Send + Sync>;
+/// Rebuild cwd-specific startup context. The second argument is the current
+/// session's private scratch root and remains stable across `/cd`.
+pub type OpeningContextFn = Arc<dyn Fn(&Path, &Path) -> String + Send + Sync>;
 
 /// How a frontend should style a command's feedback. `Note` marks text the
 /// user addressed to the model (e.g. `/note`), not harness status output.
@@ -217,7 +219,7 @@ pub(crate) fn test_ctx_parts() -> (Session, OpeningContextFn) {
         PermissionMode::Default,
         PermissionRules::default(),
     );
-    let opening: OpeningContextFn = Arc::new(|_| String::new());
+    let opening: OpeningContextFn = Arc::new(|_, _| String::new());
     (session, opening)
 }
 

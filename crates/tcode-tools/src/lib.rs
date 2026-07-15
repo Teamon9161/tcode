@@ -13,7 +13,7 @@ mod web;
 #[cfg(test)]
 mod view_image_tests;
 
-pub use grounding::project_map;
+pub use grounding::{project_map, project_map_with_scratch};
 pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;

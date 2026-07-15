@@ -65,18 +65,24 @@ pub fn project_data_dir(cwd: &Path) -> Option<PathBuf> {
     )
 }
 
-/// Scratch space for this project the model and harness can write to:
-/// `<project-data>/scratchpad/`. Overflowed tool output and background task
-/// logs live under `scratchpad/tool-output/`. Falls back to a temp dir when
-/// there is no home directory. The directory is created lazily by writers.
+/// Project-wide parent for ephemeral session scratch directories. Writers must
+/// use [`session_scratchpad_dir`] rather than placing new artifacts directly
+/// here, so one conversation cannot clean up another's temporary work.
 pub fn scratchpad_dir(cwd: &Path) -> PathBuf {
     project_data_dir(cwd)
         .unwrap_or_else(|| std::env::temp_dir().join("tcode"))
         .join("scratchpad")
 }
 
-/// Where oversized tool output and background logs are parked so `read`/`grep`
-/// can reach them — no separate paging tool needed.
+/// Scratch root owned by exactly one conversation. Persistent sessions use the
+/// session-log id; ephemeral sessions receive a unique process-local id. The
+/// directory is created lazily by writers.
+pub fn session_scratchpad_dir(cwd: &Path, session_id: &str) -> PathBuf {
+    scratchpad_dir(cwd).join("runs").join(session_id)
+}
+
+/// Legacy location for project-wide overflow logs. New `ToolCtx` instances use
+/// their session root's `tool-output/` directory instead.
 pub fn tool_output_dir(cwd: &Path) -> PathBuf {
     scratchpad_dir(cwd).join("tool-output")
 }

@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{BatchPolicy, PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput};
+use tcode_core::{
+    AutoSafety, BatchPolicy, PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput,
+};
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
@@ -248,6 +250,14 @@ impl Tool for ShellTool {
             },
             "required": ["command"]
         })
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::AllowInScratch
+    }
+
+    fn safety_target(&self, input: &Value) -> Option<String> {
+        Some(input["cwd"].as_str().unwrap_or(".").to_string())
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {

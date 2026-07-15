@@ -1,5 +1,7 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -124,6 +126,9 @@ impl PermissionRequest {
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx {
     pub cwd: PathBuf,
+    /// Session-private temporary workspace. This is the only scratch path
+    /// exposed to the model, and the boundary Auto Mode may fast-allow.
+    pub scratch_dir: PathBuf,
     pub freshness: Mutex<FreshnessTracker>,
     pub blobs: Mutex<BlobStore>,
     pub background: Mutex<BackgroundTasks>,
@@ -131,30 +136,65 @@ pub struct ToolCtx {
     /// The model active for this invocation. Tools may use its capabilities
     /// without owning model selection or provider construction.
     pub model: Option<ModelCell>,
-    /// A parent agent installs this only while a tool is running. Nested
-    /// agents use it to report their own billable usage without pretending it
-    /// occupies the parent's context window.
+    /// Budget reused when a resume/import binds this context to another
+    /// session's scratch root.
+    output_budget_tokens: usize,
     usage_reporter: Mutex<Option<mpsc::UnboundedSender<Usage>>>,
+}
+
+static EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(0);
+
+fn ephemeral_session_id() -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let sequence = EPHEMERAL_SESSION.fetch_add(1, Ordering::Relaxed);
+    format!("ephemeral-{}-{millis:x}-{sequence:x}", std::process::id())
 }
 
 impl ToolCtx {
     pub fn new(cwd: PathBuf, output_budget_tokens: usize) -> Self {
+        let scratch_dir = crate::store::session_scratchpad_dir(&cwd, &ephemeral_session_id());
+        Self::with_scratch_dir(cwd, output_budget_tokens, scratch_dir)
+    }
+
+    /// Bind this context to a persistent session's private temporary workspace.
+    /// Call this before any tool work begins (or immediately after `/resume`).
+    pub fn with_scratch_dir(
+        cwd: PathBuf,
+        output_budget_tokens: usize,
+        scratch_dir: PathBuf,
+    ) -> Self {
         let memory = crate::memory::MemoryManager::new(&cwd);
-        // Overflowed output and background logs share one per-project scratch
-        // dir that `read`/`grep` can reach. Sweeping starts one level up: the
-        // model's own throwaway files live in the same scratchpad and go stale
-        // by the same clock.
-        let tool_output = crate::store::tool_output_dir(&cwd);
+        // Sweep every session's stale files from the shared parent; this run's
+        // blobs and background logs then stay inside its own child directory.
         crate::store::sweep_scratchpad(&crate::store::scratchpad_dir(&cwd));
+        let tool_output = scratch_dir.join("tool-output");
         Self {
             freshness: Mutex::new(FreshnessTracker::default()),
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
             model: None,
+            output_budget_tokens,
             usage_reporter: Mutex::new(None),
             cwd,
+            scratch_dir,
         }
+    }
+
+    /// Move a live context onto a resumed/imported session's scratch root.
+    /// No task may be running when this is called: background logs and output
+    /// blobs deliberately belong to the conversation that created them.
+    pub fn rebind_scratch_dir(&mut self, scratch_dir: PathBuf) {
+        self.scratch_dir = scratch_dir.clone();
+        let tool_output = scratch_dir.join("tool-output");
+        self.blobs = Mutex::new(BlobStore::new(
+            tool_output.clone(),
+            self.output_budget_tokens,
+        ));
+        self.background = Mutex::new(BackgroundTasks::new(tool_output));
     }
 
     pub fn with_model(mut self, model: ModelCell) -> Self {
@@ -206,6 +246,12 @@ pub trait Tool: Send + Sync {
     fn touches(&self, _input: &Value) -> Option<String> {
         None
     }
+    /// Path used exclusively for Auto Mode's safety boundary. Defaults to a
+    /// file mutation target, but side-effecting tools such as shell can expose
+    /// their working directory without pretending it is checkpointable.
+    fn safety_target(&self, input: &Value) -> Option<String> {
+        self.touches(input)
+    }
     /// Files or directories whose scoped instructions apply to this call.
     fn context_paths(&self, _input: &Value) -> Vec<String> {
         Vec::new()
@@ -218,6 +264,12 @@ pub trait Tool: Send + Sync {
     /// default keeps calls isolated (approved and run one at a time).
     fn batch_policy(&self) -> BatchPolicy {
         BatchPolicy::Isolated
+    }
+    /// Per-invocation scheduling contract. Most tools are static; tools whose
+    /// input selects different capabilities (such as `task`) override this
+    /// instead of forcing the agent loop to match on names.
+    fn batch_policy_for(&self, _input: &Value) -> BatchPolicy {
+        self.batch_policy()
     }
     /// Human-facing name for this tool in the UI, e.g. `shell` → "Run".
     /// Defaults to the title-cased tool name; override for a clearer verb.

@@ -268,6 +268,9 @@ pub struct App {
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
     cwd: PathBuf,
+    /// Session-private scratch root mirrored for UI-owned temporary files while
+    /// a running turn owns the `Session`.
+    scratch_dir: PathBuf,
     /// Per-tool renderers + display names, built from the agent's live tools
     /// so rendering behaviour (quiet output, routes, diffs) can never drift
     /// from core's tool contracts.
@@ -419,6 +422,7 @@ impl App {
         let pending_mode = session.pending_mode.clone();
         let session_dogfood = session.dogfood();
         let cwd = session.tool_ctx.cwd.clone();
+        let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
             estimate_context_tokens(&agent, &session)
@@ -443,6 +447,7 @@ impl App {
             pending_mode,
             committed_mode,
             cwd,
+            scratch_dir,
             renderers,
             terminal,
             transcript,
@@ -941,7 +946,7 @@ impl App {
                             data: base64::engine::general_purpose::STANDARD.encode(bytes),
                         });
                     } else {
-                        let dir = tcode_core::store::scratchpad_dir(&self.cwd).join("pasted");
+                        let dir = self.scratch_dir.join("pasted");
                         let ext = match media_type {
                             "image/jpeg" => "jpg",
                             "image/png" => "png",
@@ -1576,7 +1581,8 @@ impl App {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or_default();
-        let path = tcode_core::store::scratchpad_dir(&self.cwd)
+        let path = self
+            .scratch_dir
             .join(format!("plan-review-{}-{nonce}.md", std::process::id()));
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -2722,6 +2728,7 @@ impl App {
         // have moved the cwd (/cd) or cycled the permission mode (/mode).
         if let Some(session) = self.session.as_ref() {
             self.cwd = session.tool_ctx.cwd.clone();
+            self.scratch_dir = session.tool_ctx.scratch_dir.clone();
             self.mode_label = session.mode.label().to_string();
             self.committed_mode = session.mode;
             self.pending_mode.clear();
@@ -3098,6 +3105,7 @@ impl App {
     ) {
         self.external_import = None;
         self.state_label.clear();
+        let opening_context = self.opening_context.clone();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -3107,6 +3115,10 @@ impl App {
                 session.checkpoints = tcode_core::CheckpointStore::default();
                 session.ledger = resumed.ledger;
                 session.ledger.attach_sink(Box::new(resumed.store));
+                session.bind_scratch_session(&imported_id);
+                let opening = opening_context(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir);
+                session.replace_opening_context_for_resume(opening);
+                self.scratch_dir = session.tool_ctx.scratch_dir.clone();
                 session.last_prompt_tokens = 0;
                 session
                     .tool_ctx

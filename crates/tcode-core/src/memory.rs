@@ -39,6 +39,9 @@ fn enabled_by_default() -> bool {
 #[derive(Debug)]
 pub struct MemoryUpdate {
     pub note: String,
+    /// Directories whose newly loaded instructions apply to mutations. Kept
+    /// structured so the agent never has to parse its own ledger prose.
+    pub affected_roots: Vec<PathBuf>,
 }
 
 /// Per-session memory discovery and maintenance state. Instruction files are
@@ -241,6 +244,18 @@ impl MemoryManager {
             return None;
         }
 
+        let mut affected_roots: Vec<PathBuf> = new_sources
+            .iter()
+            .filter(|source| source.file_name().is_none_or(|name| name != "MEMORY.md"))
+            .filter_map(|source| instruction_scope(source))
+            .collect();
+        affected_roots.extend(
+            new_projects
+                .iter()
+                .map(|(project, _, _)| project.root.clone()),
+        );
+        dedup_paths(&mut affected_roots);
+
         let mut note = String::from(
             "New directory-scoped instructions were discovered for the requested tool paths. Apply them before any mutation is retried.\n",
         );
@@ -259,7 +274,10 @@ impl MemoryManager {
         }
         append_source_markers(&mut note, new_sources.iter());
         append_sources(&mut note, new_sources.iter(), INSTRUCTION_CAP);
-        Some(MemoryUpdate { note })
+        Some(MemoryUpdate {
+            note,
+            affected_roots,
+        })
     }
 
     pub fn maintenance_reminder(&mut self) -> Option<String> {
@@ -460,6 +478,16 @@ fn read_auto_memory(path: &Path) -> String {
     } else {
         truncated
     }
+}
+
+fn instruction_scope(source: &Path) -> Option<PathBuf> {
+    let parent = source.parent()?;
+    // `.tcode/AGENTS.md` governs its containing project directory, not only
+    // the implementation directory that stores the instruction file.
+    if parent.file_name().is_some_and(|name| name == ".tcode") {
+        return parent.parent().map(canonical_or_normal);
+    }
+    Some(canonical_or_normal(parent))
 }
 
 fn instruction_sources(root: &Path, target: &Path) -> Vec<PathBuf> {

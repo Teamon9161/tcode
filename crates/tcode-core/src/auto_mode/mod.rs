@@ -22,9 +22,13 @@ pub use provider_classifier::ProviderSafetyClassifier;
 pub enum AutoSafety {
     /// No external side effect or protected data boundary is crossed.
     Allow,
-    /// A normal edit is direct-safe only within the project and outside a
-    /// protected instruction/configuration path.
-    AllowInProjectEdit,
+    /// A normal file edit is direct-safe only within the project or this
+    /// session's private scratch root, outside protected instruction paths.
+    AllowInProjectOrScratchEdit,
+    /// A shell command is direct-safe only when its working directory is this
+    /// session's private scratch root. This is intentionally not a shell
+    /// parser: commands that run elsewhere still reach the classifier.
+    AllowInScratch,
     /// The action needs a safety classifier decision.
     Classify,
     /// This is a request for user input and must always open the UI prompt.
@@ -37,6 +41,7 @@ pub enum AutoSafety {
 #[derive(Debug, Clone)]
 pub struct AutoModePolicy {
     project_root: PathBuf,
+    scratch_root: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +52,10 @@ pub enum AutoRoute {
 }
 
 impl AutoModePolicy {
-    pub fn new(project_root: impl Into<PathBuf>) -> Self {
+    pub fn new(project_root: impl Into<PathBuf>, scratch_root: impl Into<PathBuf>) -> Self {
         Self {
             project_root: lexical_normalize(project_root.into()),
+            scratch_root: lexical_normalize(scratch_root.into()),
         }
     }
 
@@ -58,16 +64,27 @@ impl AutoModePolicy {
             AutoSafety::Allow => AutoRoute::Allow,
             AutoSafety::Classify => AutoRoute::Classify,
             AutoSafety::Prompt => AutoRoute::Prompt,
-            AutoSafety::AllowInProjectEdit => {
+            AutoSafety::AllowInProjectOrScratchEdit => {
                 let Some(target) = target else {
                     return AutoRoute::Classify;
                 };
                 let path = self.resolve(target);
-                if path.starts_with(&self.project_root) && !is_protected_path(&path) {
+                if (path.starts_with(&self.project_root) || path.starts_with(&self.scratch_root))
+                    && !is_protected_path(&path)
+                {
                     AutoRoute::Allow
                 } else {
                     AutoRoute::Classify
                 }
+            }
+            AutoSafety::AllowInScratch => {
+                let Some(target) = target else {
+                    return AutoRoute::Classify;
+                };
+                self.resolve(target)
+                    .starts_with(&self.scratch_root)
+                    .then_some(AutoRoute::Allow)
+                    .unwrap_or(AutoRoute::Classify)
             }
         }
     }
@@ -228,22 +245,43 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn in_project_edits_bypass_but_instruction_paths_do_not() {
-        let policy = AutoModePolicy::new("C:/repo");
+    fn in_project_or_session_scratch_edits_bypass_but_other_paths_do_not() {
+        let policy = AutoModePolicy::new("/repo", "/scratch/runs/session");
         assert_eq!(
-            policy.route(AutoSafety::AllowInProjectEdit, Some("src/lib.rs")),
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some("src/lib.rs")),
             AutoRoute::Allow
         );
         assert_eq!(
-            policy.route(AutoSafety::AllowInProjectEdit, Some("CLAUDE.md")),
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some("CLAUDE.md")),
             AutoRoute::Classify
         );
         assert_eq!(
-            policy.route(AutoSafety::AllowInProjectEdit, Some(".tcode/config.toml")),
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some(".tcode/config.toml")
+            ),
             AutoRoute::Classify
         );
         assert_eq!(
-            policy.route(AutoSafety::AllowInProjectEdit, Some("../outside.txt")),
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some("../outside.txt")
+            ),
+            AutoRoute::Classify
+        );
+        assert_eq!(
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some("/scratch/runs/session/probe.rs")
+            ),
+            AutoRoute::Allow
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInScratch, Some("/scratch/runs/session")),
+            AutoRoute::Allow
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInScratch, Some("/scratch/runs/other")),
             AutoRoute::Classify
         );
     }

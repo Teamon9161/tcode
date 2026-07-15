@@ -44,17 +44,32 @@ const PRUNE_DIRS: &[&str] = &[
     "node_modules",
     "target",
     "dist",
-    "build", //
+    "build",
+    "zig-cache",
+    "zig-out",
+    ".zig-cache", //
     // language / tool caches
     ".venv",
     "venv",
     "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".tox",
+    ".nox",
     ".cargo",
     ".rustup",
     ".cache",
     ".npm",
+    ".pnpm-store",
+    ".yarn",
     ".gradle",
     ".m2",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".turbo",
+    ".parcel-cache",
     // OS
     "AppData",
 ];
@@ -603,6 +618,18 @@ mod tests {
             .content
     }
 
+    async fn glob(dir: &Path, pattern: &str) -> String {
+        let ctx = ToolCtx::new(dir.to_path_buf(), 100_000);
+        GlobTool
+            .run(
+                json!({ "pattern": pattern }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await
+            .content
+    }
+
     fn scratch(name: &str, body: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("tcode-grep-{}-{name}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -643,6 +670,29 @@ mod tests {
         )
         .await;
         assert_eq!(after, "a.rs:3: TARGET\na.rs:4- line4\na.rs:5- line5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn cache_directories_are_pruned_for_grep_and_glob() {
+        let dir = scratch("cache-prune", "TARGET\n");
+        for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
+            let cache_dir = dir.join(cache);
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(cache_dir.join("hidden.rs"), "TARGET\n").unwrap();
+        }
+
+        let grep_out = grep(&dir, json!({ "pattern": "TARGET" })).await;
+        assert!(grep_out.contains("a.rs:1: TARGET"), "{grep_out}");
+        for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
+            assert!(!grep_out.contains(cache), "{grep_out}");
+        }
+
+        let glob_out = glob(&dir, "*.rs").await;
+        assert!(glob_out.contains("a.rs"), "{glob_out}");
+        for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
+            assert!(!glob_out.contains(cache), "{glob_out}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

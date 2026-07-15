@@ -532,9 +532,62 @@ async fn first_external_write_is_blocked_then_retry_executes() {
 
     let results = tool_results(&session);
     assert!(results[0].1);
-    assert!(results[0].0.contains("no side effects occurred"));
+    assert!(results[0]
+        .0
+        .contains("newly discovered directory-scoped instructions"));
     assert!(!results[1].1, "retry should execute: {}", results[1].0);
     assert_eq!(std::fs::read_to_string(target).unwrap(), "written once");
+}
+
+#[tokio::test]
+async fn new_directory_instructions_block_only_their_mutations() {
+    let base = tempfile::tempdir().unwrap();
+    let current = base.path().join("current");
+    let external = base.path().join("external");
+    std::fs::create_dir_all(current.join(".git")).unwrap();
+    std::fs::create_dir_all(external.join(".git")).unwrap();
+    std::fs::write(external.join("AGENTS.md"), "external write rule").unwrap();
+    std::fs::write(external.join("input.txt"), "inspect me").unwrap();
+    let external_write = external.join("blocked.txt");
+    let safe_write = current.join("allowed.txt");
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "read",
+                &serde_json::json!({ "path": external.join("input.txt") }).to_string(),
+            ),
+            (
+                "t2",
+                "write",
+                &serde_json::json!({ "path": external_write, "content": "blocked" }).to_string(),
+            ),
+            (
+                "t3",
+                "write",
+                &serde_json::json!({ "path": safe_write, "content": "allowed" }).to_string(),
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(&current, PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "inspect then write").await;
+
+    let results = tool_results(&session);
+    assert!(!results[0].1, "read must still run: {}", results[0].0);
+    assert!(results[1].1);
+    assert!(results[1]
+        .0
+        .contains("newly discovered directory-scoped instructions"));
+    assert!(!results[2].1, "unrelated write must run: {}", results[2].0);
+    assert!(!external.join("blocked.txt").exists());
+    assert_eq!(
+        std::fs::read_to_string(current.join("allowed.txt")).unwrap(),
+        "allowed"
+    );
 }
 
 #[tokio::test]
@@ -748,7 +801,7 @@ async fn oversized_tool_output_spills_to_a_readable_file() {
     assert!(tcode_core::blobs::approx_tokens(&results[0].0) < 9000);
 
     // The saved file holds the complete output.
-    let overflow = std::fs::read_dir(tcode_core::store::tool_output_dir(dir.path()))
+    let overflow = std::fs::read_dir(session.tool_ctx.scratch_dir.join("tool-output"))
         .unwrap()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .find(|p| p.extension().is_some_and(|x| x == "txt"))
@@ -809,6 +862,50 @@ async fn explore_sub_agent_returns_only_the_report() {
     assert!(out.content.contains("report: lib.rs defines f()"));
     assert!(out.content.contains("1 tool calls"));
     assert!(!out.content.contains("pub fn f()"));
+}
+
+#[tokio::test]
+async fn explore_tasks_share_the_parallel_read_only_batch_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "task",
+                r#"{"agent":"explore","prompt":"inspect first"}"#,
+            ),
+            (
+                "t2",
+                "task",
+                r#"{"agent":"plan","prompt":"inspect second"}"#,
+            ),
+        ]),
+        text_done("first report"),
+        text_done("second report"),
+        text_done("done"),
+    ]);
+    let mut agent = agent(parent);
+    agent.tools.push(Arc::new(tcode_tools::TaskTool::new(
+        agent.model.clone(),
+        WatchdogConfig::default(),
+        2_000,
+        dir.path().to_path_buf(),
+    )));
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    let events = run(&agent, &mut session, &approver, "delegate two inspections").await;
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolBatchStart { label, calls }
+            if label == "Task 2 calls" && calls.len() == 2
+    )));
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert_eq!(
+        agent.batch_display_label(&session, &assistant_calls(&session)),
+        Some("Task 2 calls".into())
+    );
 }
 
 #[tokio::test]
@@ -996,7 +1093,11 @@ async fn background_shell_task_reports_completion_next_turn() {
     );
 
     // Its output streamed to a log file the model reads with `read`.
-    let log = tcode_core::store::tool_output_dir(dir.path()).join("b1.log");
+    let log = session
+        .tool_ctx
+        .scratch_dir
+        .join("tool-output")
+        .join("b1.log");
     let logged = std::fs::read_to_string(&log).unwrap();
     assert!(logged.contains("bg-done"), "{logged}");
 
@@ -1675,6 +1776,41 @@ async fn auto_mode_bypasses_classifier_for_normal_project_edits() {
     assert!(root.path().join("src/new.rs").is_file());
     assert!(approver.asked.lock().unwrap().is_empty());
     assert!(classifier.requests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let scratch = session.tool_ctx.scratch_dir.clone();
+    let command = if cfg!(windows) {
+        "Set-Content probe.txt scratch; Remove-Item probe.txt".to_string()
+    } else {
+        "printf scratch > probe.txt && rm probe.txt".to_string()
+    };
+    let main = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": command, "cwd": scratch }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![]);
+    let agent = auto_agent(main, classifier.clone());
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(
+        &agent,
+        &mut session,
+        &approver,
+        "clean up the temporary probe",
+    )
+    .await;
+
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert!(classifier.requests.lock().unwrap().is_empty());
+    assert!(!session.tool_ctx.scratch_dir.join("probe.txt").exists());
 }
 
 #[tokio::test]

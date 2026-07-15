@@ -24,6 +24,7 @@ use crate::auto_mode::{
 };
 use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
+use crate::memory::MemoryUpdate;
 use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode};
 use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
@@ -212,8 +213,8 @@ impl Agent {
             return decision;
         }
 
-        let target = tool.touches(check.input);
-        match AutoModePolicy::new(&session.tool_ctx.cwd)
+        let target = tool.safety_target(check.input);
+        match AutoModePolicy::new(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir)
             .route(tool.auto_safety(check.input), target.as_deref())
         {
             AutoRoute::Allow => Decision::Allow,
@@ -518,34 +519,30 @@ impl Agent {
         approver: &dyn Approver,
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
-        let memory_note = self.preflight_memory(session, calls);
-        if let Some(note) = &memory_note {
-            let has_mutation = calls.iter().any(|(_, name, input)| {
-                self.tool(name)
-                    .is_some_and(|tool| tool.is_mutating() && !tool.context_paths(input).is_empty())
-            });
-            if has_mutation {
-                let message = "Not executed: new directory-scoped instructions were loaded for this tool batch. Review them and retry only the actions that still comply; no side effects occurred.";
-                let results = calls
-                    .iter()
-                    .map(|(id, _, _)| tool_result(id, message, true))
-                    .collect();
-                session.ledger.append(Entry::ToolResults(results));
-                session.ledger.append(Entry::Note(note.clone()));
-                return Ok(ToolsOutcome {
-                    interrupted: false,
-                    awaiting_user_input: false,
-                });
-            }
-        }
-        if calls.len() > 1 && self.all_calls_have_policy(calls, BatchPolicy::ParallelReadOnly) {
+        let memory_update = self.preflight_memory(session, calls);
+        let blocked_by_new_instructions = memory_update
+            .as_ref()
+            .map(|update| self.affected_mutations(session, calls, update))
+            .unwrap_or_default();
+        let memory_note = memory_update.map(|update| update.note);
+        // A newly discovered instruction must stop mutations it governs, but
+        // it must not discard unrelated work or read-only reconnaissance from
+        // the same model batch. Blocked batches use the ordinary per-call path
+        // below, preserving approval, hook and ledger ordering semantics.
+        if blocked_by_new_instructions.is_empty()
+            && calls.len() > 1
+            && self.all_calls_have_policy(calls, BatchPolicy::ParallelReadOnly)
+        {
             return self
                 .run_read_only_tools_parallel(session, calls, events, cancel, memory_note)
                 .await;
         }
         // File mutations are scheduled per normalized path: calls within one
         // file retain model order, while independent file lanes run together.
-        if calls.len() > 1 && self.is_file_mutation_batch(calls) {
+        if blocked_by_new_instructions.is_empty()
+            && calls.len() > 1
+            && self.is_file_mutation_batch(calls)
+        {
             return self
                 .run_file_mutation_lanes(session, calls, events, approver, cancel)
                 .await;
@@ -553,7 +550,10 @@ impl Agent {
         // Shell / bash: batch the approval (show all commands at once),
         // then run sequentially so side effects from earlier commands
         // are visible to later ones.
-        if calls.len() > 1 && self.all_calls_have_policy(calls, BatchPolicy::SequentialBatch) {
+        if blocked_by_new_instructions.is_empty()
+            && calls.len() > 1
+            && self.all_calls_have_policy(calls, BatchPolicy::SequentialBatch)
+        {
             return self
                 .run_sequential_batch_combined_approval(
                     session,
@@ -576,6 +576,14 @@ impl Agent {
             if cancel.is_cancelled() {
                 interrupted_at = Some(i);
                 results.push(tool_result(id, "Cancelled by user before execution.", true));
+                continue;
+            }
+            if blocked_by_new_instructions.contains(&i) {
+                results.push(tool_result(
+                    id,
+                    "Not executed: newly discovered directory-scoped instructions apply to this mutation. Review the instruction note and retry this action only if it complies.",
+                    true,
+                ));
                 continue;
             }
             if declined {
@@ -822,9 +830,10 @@ impl Agent {
     }
 
     /// Models often request several independent reads/searches at once. Run
-    /// only this read-only subset concurrently; all mutating, shell, question
-    /// and sub-agent calls remain ordered so their approvals and side effects
-    /// are unambiguous. Results are still appended in model-call order.
+    /// only this read-only subset concurrently; all mutating, shell, question,
+    /// and capability-changing sub-agent calls remain ordered so their approvals
+    /// and side effects are unambiguous. Results are still appended in
+    /// model-call order.
     async fn run_read_only_tools_parallel(
         &self,
         session: &mut Session,
@@ -929,7 +938,8 @@ impl Agent {
     fn is_file_mutation_batch(&self, calls: &[(String, String, Value)]) -> bool {
         calls.iter().all(|(_, name, input)| {
             self.tool(name).is_some_and(|tool| {
-                tool.batch_policy() == BatchPolicy::ParallelPerFile && tool.touches(input).is_some()
+                tool.batch_policy_for(input) == BatchPolicy::ParallelPerFile
+                    && tool.touches(input).is_some()
             })
         })
     }
@@ -941,10 +951,13 @@ impl Agent {
     /// they were executed.
     pub fn batch_display_label(
         &self,
-        _session: &Session,
+        session: &Session,
         calls: &[(String, String, Value)],
     ) -> Option<String> {
         if calls.len() < 2 {
+            return None;
+        }
+        if self.calls_were_blocked_by_new_instructions(session, calls) {
             return None;
         }
         if self.all_calls_have_policy(calls, BatchPolicy::SequentialBatch) {
@@ -971,9 +984,40 @@ impl Agent {
         calls: &[(String, String, Value)],
         policy: BatchPolicy,
     ) -> bool {
-        calls
-            .iter()
-            .all(|(_, name, _)| self.tool(name).is_some_and(|t| t.batch_policy() == policy))
+        calls.iter().all(|(_, name, input)| {
+            self.tool(name)
+                .is_some_and(|tool| tool.batch_policy_for(input) == policy)
+        })
+    }
+
+    fn calls_were_blocked_by_new_instructions(
+        &self,
+        session: &Session,
+        calls: &[(String, String, Value)],
+    ) -> bool {
+        let call_ids: HashSet<&str> = calls.iter().map(|(id, _, _)| id.as_str()).collect();
+        session.ledger.entries().windows(2).any(|pair| {
+            let Entry::Assistant(blocks) = &pair[0] else {
+                return false;
+            };
+            let assistant_ids: HashSet<&str> = blocks
+                .iter()
+                .filter_map(|block| match block {
+                    ContentBlock::ToolUse { id, .. } => Some(id.as_str()),
+                    _ => None,
+                })
+                .collect();
+            if assistant_ids != call_ids {
+                return false;
+            }
+            let Entry::ToolResults(results) = &pair[1] else {
+                return false;
+            };
+            results.iter().any(|block| {
+                matches!(block, ContentBlock::ToolResult { content, is_error: true, .. }
+                    if content.starts_with("Not executed: newly discovered directory-scoped instructions"))
+            })
+        })
     }
 
     /// Execute an edit/write batch in per-file lanes. Approval, pre-hooks and
@@ -1638,7 +1682,7 @@ impl Agent {
         &self,
         session: &mut Session,
         calls: &[(String, String, Value)],
-    ) -> Option<String> {
+    ) -> Option<MemoryUpdate> {
         let paths: Vec<PathBuf> = calls
             .iter()
             .filter_map(|(_, name, input)| self.tool(name).map(|tool| (tool, input)))
@@ -1650,7 +1694,35 @@ impl Agent {
         }
         let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
         memory.restore_from_entries(session.ledger.entries());
-        memory.discover_for_paths(&paths).map(|update| update.note)
+        memory.discover_for_paths(&paths)
+    }
+
+    fn affected_mutations(
+        &self,
+        session: &Session,
+        calls: &[(String, String, Value)],
+        update: &MemoryUpdate,
+    ) -> HashSet<usize> {
+        let roots: Vec<PathBuf> = update
+            .affected_roots
+            .iter()
+            .map(|root| normalize_path(root.clone()))
+            .collect();
+        calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, name, input))| {
+                let tool = self.tool(name)?;
+                if !tool.is_mutating() {
+                    return None;
+                }
+                tool.context_paths(input)
+                    .into_iter()
+                    .map(|path| normalize_path(session.tool_ctx.resolve(&path)))
+                    .any(|path| roots.iter().any(|root| path.starts_with(root)))
+                    .then_some(index)
+            })
+            .collect()
     }
 
     /// Central token-budget gate for tool outputs. Locating/content tools
