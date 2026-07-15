@@ -14,9 +14,10 @@ use syntect::parsing::SyntaxSet;
 use crate::theme;
 
 const MAX_DIFF_LINES: usize = 80;
-/// Inline emphasis is for a word-level correction, not a rewritten sentence.
-const MAX_INLINE_EMPHASIS_CHARS: usize = 24;
-const MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR: usize = 4;
+/// Word-level emphasis earns its brightness only when the two sides are similar
+/// enough that the change is a minority of the line. Past this share it is a
+/// rewrite, not a correction, and the whole line is filled calmly instead.
+const MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR: usize = 2;
 
 struct Highlighter {
     syntaxes: SyntaxSet,
@@ -128,39 +129,45 @@ pub fn edit_diff(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for op in diff.ops() {
         for change in diff.iter_inline_changes(op) {
-            let (marker, number, background, emphasis_bg) = match change.tag() {
+            let (marker, number, base_bg, emphasis_bg) = match change.tag() {
                 ChangeTag::Delete => {
                     let line = old_line;
                     old_line += 1;
-                    (
-                        "- ",
-                        line,
-                        Some(theme::diff_del_bg()),
-                        theme::diff_del_emph_bg(),
-                    )
+                    ("- ", line, theme::diff_del_bg(), theme::diff_del_emph_bg())
                 }
                 ChangeTag::Insert => {
                     let line = new_line;
                     new_line += 1;
-                    (
-                        "+ ",
-                        line,
-                        Some(theme::diff_add_bg()),
-                        theme::diff_add_emph_bg(),
-                    )
+                    ("+ ", line, theme::diff_add_bg(), theme::diff_add_emph_bg())
                 }
                 ChangeTag::Equal => {
                     let line = old_line;
                     old_line += 1;
                     new_line += 1;
-                    ("  ", line, None, theme::diff_add_emph_bg())
+                    ("  ", line, Color::Reset, Color::Reset)
                 }
             };
             let (text, ranges) = inline_emphasis(&change);
-            let emphasis = (!ranges.is_empty()).then_some(Emphasis {
-                ranges,
-                bg: emphasis_bg,
-            });
+            // One rule, two outcomes, chosen by whether the pair is similar
+            // enough to pinpoint the change:
+            //   similar (ranges present) -> leave shared text plain and light
+            //       up only the differing bytes;
+            //   rewrite (ranges empty)   -> fill the whole line with the calm
+            //       base colour and emphasise nothing.
+            // Equal lines carry Color::Reset and empty ranges, so they land on
+            // the "no fill, no emphasis" corner and stay untouched.
+            let (background, emphasis) = if ranges.is_empty() {
+                let fill = (change.tag() != ChangeTag::Equal).then_some(base_bg);
+                (fill, None)
+            } else {
+                (
+                    None,
+                    Some(Emphasis {
+                        ranges,
+                        bg: emphasis_bg,
+                    }),
+                )
+            };
             lines.push(code_line_emphasized(
                 path,
                 marker,
@@ -202,10 +209,11 @@ fn inline_emphasis(change: &similar::InlineChange<'_, str>) -> (String, Vec<Rang
     (text, ranges)
 }
 
-/// Emphasis is useful only for a small, local change inside an otherwise stable
-/// line. `similar` can emit a large changed suffix after a shared prefix; that
-/// is a line rewrite, not a word-level edit. Keep the accent to at most a
-/// quarter of the visible text and 24 visible characters.
+/// Emphasis is useful only when the change is a minority of the line: the two
+/// sides are similar and the eye should land on the few bytes that differ.
+/// `similar` can emit a large changed run after a shared prefix; once the
+/// changed (non-whitespace) characters reach half the visible line, that is a
+/// rewrite, and the caller fills the line calmly instead of lighting it up.
 fn inline_emphasis_is_local(text: &str, ranges: &[Range<usize>]) -> bool {
     let mut visible = 0usize;
     let mut changed = 0usize;
@@ -222,9 +230,7 @@ fn inline_emphasis_is_local(text: &str, ranges: &[Range<usize>]) -> bool {
             changed += 1;
         }
     }
-    changed > 0
-        && changed <= MAX_INLINE_EMPHASIS_CHARS
-        && changed * MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR <= visible
+    changed > 0 && changed * MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR <= visible
 }
 
 /// Emphasis is a signal for changed text, not for the whitespace which carries
@@ -391,7 +397,12 @@ mod tests {
             .iter()
             .find(|line| line.spans[0].content.contains('+'))
             .unwrap();
-        assert_eq!(added.spans[0].style.bg, Some(theme::diff_add_bg()));
+        // The single changed byte carries a diff background...
+        assert!(added
+            .spans
+            .iter()
+            .any(|span| span.style.bg == Some(theme::diff_add_emph_bg())));
+        // ...while syntax colouring still drives the foreground.
         assert!(added
             .spans
             .iter()
@@ -423,24 +434,27 @@ mod tests {
             .spans
             .iter()
             .skip(3)
-            .filter(|span| span.style.bg == Some(theme::diff_add_bg()))
+            .filter(|span| span.style.bg.is_none())
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(plain.contains("quick"), "unchanged words keep the base bg");
+        assert!(plain.contains("quick"), "shared words carry no background");
         assert!(plain.contains("jumps over the lazy dog"));
     }
 
-    /// A line with nothing in common is already wholly marked by its own
-    /// background; emphasising every byte of it would just be a brighter line.
-    /// These two words are similar enough that `similar` emphasises the whole
-    /// token rather than falling back — so this pins our own guard, not its.
+    /// A line with nothing in common can't pinpoint a difference, so it gets a
+    /// calm full-line fill rather than a scatter of bright emphasis.
     #[test]
     fn a_wholly_rewritten_line_gets_no_word_emphasis() {
-        let lines = edit_diff("notes.md", "abcdefgh\n", "abcdefgi\n");
+        let lines = edit_diff("notes.md", "alpha alpha alpha\n", "zulu victor tango\n");
         assert!(lines.iter().flat_map(|line| line.spans.iter()).all(|span| {
             span.style.bg != Some(theme::diff_add_emph_bg())
                 && span.style.bg != Some(theme::diff_del_emph_bg())
         }));
+        // It still carries the base fill so the change stays visible.
+        assert!(lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.style.bg == Some(theme::diff_del_bg())));
     }
 
     #[test]

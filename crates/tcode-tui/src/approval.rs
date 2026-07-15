@@ -48,10 +48,14 @@ struct PlanReview {
     blocks: Vec<PlanBlock>,
     /// The block the keyboard is on (comment / navigation target).
     focus: usize,
-    /// First visible wrapped plan row; follows the focus, so it is derived at
-    /// render time (interior mutability) rather than driven by key handling
-    /// which has no display width.
+    /// First visible wrapped plan row. Keyboard focus moves keep their block in
+    /// view; direct scrolling deliberately keeps its own position so reviewers
+    /// can inspect surrounding context without changing their comment target.
     scroll: Cell<usize>,
+    /// The focus used for the last scroll reconciliation. A changed focus means
+    /// keyboard navigation should bring that block into view; an unchanged focus
+    /// leaves a mouse-chosen scroll position alone.
+    rendered_focus: Cell<usize>,
     /// Selected decision option.
     cursor: usize,
     /// Whether ↑/↓ currently move through the decision options rather than plan
@@ -272,6 +276,14 @@ const PLAN_EDITOR_ROWS: usize = 2;
 /// The plan body never shrinks below this many rows, even on a short terminal.
 const PLAN_MIN_VIEWPORT: usize = 3;
 
+fn plan_viewport(height: u16, row_count: usize) -> usize {
+    let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
+    (height as usize)
+        .saturating_sub(overhead)
+        .max(PLAN_MIN_VIEWPORT)
+        .min(row_count)
+}
+
 pub enum DialogResult {
     Pending,
     Done(Approval),
@@ -405,6 +417,7 @@ impl Dialog {
                 blocks,
                 focus: 0,
                 scroll: Cell::new(0),
+                rendered_focus: Cell::new(0),
                 cursor: 0,
                 options_focused: false,
                 compose: None,
@@ -453,6 +466,7 @@ impl Dialog {
             .collect();
         plan.focus = 0;
         plan.scroll.set(0);
+        plan.rendered_focus.set(0);
         plan.revised = (!restores_original).then_some(revised);
     }
 
@@ -809,11 +823,7 @@ impl Dialog {
         height: u16,
     ) -> Option<(PlanMousePosition, Vec<(usize, usize)>)> {
         let (rows, spans) = self.plan_rows(width);
-        let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
-        let viewport = (height as usize)
-            .saturating_sub(overhead)
-            .max(PLAN_MIN_VIEWPORT)
-            .min(rows.len());
+        let viewport = plan_viewport(height, rows.len());
         let scroll = self.plan_scroll(&spans, viewport, rows.len());
         let body_row = row.checked_sub(1)?;
         let absolute_row = scroll + body_row;
@@ -958,9 +968,13 @@ impl Dialog {
         if plan.options_focused {
             match key.code {
                 K::Enter => return self.submit_plan(),
+                // Every plan decision may carry a user note. Approval notes
+                // follow the normal append-only UserNote path; the
+                // keep-planning choice sends the same text back as feedback.
+                K::Tab => plan.feedback_focused = true,
                 // Leave the choices and resume reviewing the plan. A second Esc
                 // from plan browsing is the explicit keep-planning action.
-                K::Esc | K::Tab | K::Right => plan.options_focused = false,
+                K::Esc | K::Right => plan.options_focused = false,
                 K::Up | K::Char('k') => plan.cursor = plan.cursor.saturating_sub(1),
                 K::Down | K::Char('j') => {
                     plan.cursor = (plan.cursor + 1).min(PLAN_OPTIONS.len() - 1)
@@ -1160,20 +1174,42 @@ impl Dialog {
         (rows, spans)
     }
 
-    /// Scroll offset that keeps the focused block's first row visible, showing
-    /// as much of its body as the viewport `k` holds; a block taller than the
-    /// viewport is pinned to its start.
+    /// Move the plan viewport without changing the focused block. This is kept
+    /// available while composing feedback: review and annotation are independent
+    /// activities, so the text field must not trap the reviewer at its cursor.
+    pub fn plan_mouse_wheel(&self, up: bool, width: u16, height: u16) {
+        let (rows, _) = self.plan_rows(width);
+        let viewport = plan_viewport(height, rows.len());
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let max_scroll = rows.len().saturating_sub(viewport);
+        let next = if up {
+            plan.scroll.get().saturating_sub(PLAN_PAGE)
+        } else {
+            (plan.scroll.get() + PLAN_PAGE).min(max_scroll)
+        };
+        plan.scroll.set(next);
+        // The focus is already visible on screen. Mark it reconciled so the
+        // next render preserves this deliberate scroll instead of snapping back.
+        plan.rendered_focus.set(plan.focus);
+    }
+
+    /// Scroll offset that keeps a newly focused block visible. Mouse scrolling
+    /// is intentionally independent: the review target need not be the same
+    /// part of the plan the user is currently rereading.
     fn plan_scroll(&self, spans: &[(usize, usize)], k: usize, total: usize) -> usize {
         let plan = self.plan.as_ref().expect("plan dialog");
         let mut scroll = plan.scroll.get();
-        let (fs, fl) = spans.get(plan.focus).copied().unwrap_or((0, 0));
-        if fs < scroll {
-            scroll = fs;
-        } else if fs + fl > scroll + k {
-            scroll = (fs + fl).saturating_sub(k);
+        if plan.rendered_focus.replace(plan.focus) != plan.focus {
+            let (fs, fl) = spans.get(plan.focus).copied().unwrap_or((0, 0));
+            if fs < scroll {
+                scroll = fs;
+            } else if fs + fl > scroll + k {
+                scroll = (fs + fl).saturating_sub(k);
+            }
         }
-        scroll = scroll.min(fs);
-        scroll.min(total.saturating_sub(k))
+        scroll = scroll.min(total.saturating_sub(k));
+        plan.scroll.set(scroll);
+        scroll
     }
 
     fn render_plan(&self, width: u16, height: u16) -> Vec<Line<'static>> {
@@ -1196,11 +1232,7 @@ impl Dialog {
         // Plan body, scrolled to keep the focus visible. Reserve the rest of
         // the panel for the options, the editor row, and the hint.
         let (rows, spans) = self.plan_rows(width);
-        let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
-        let k = (height as usize)
-            .saturating_sub(overhead)
-            .max(PLAN_MIN_VIEWPORT)
-            .min(rows.len());
+        let k = plan_viewport(height, rows.len());
         let scroll = self.plan_scroll(&spans, k, rows.len());
         plan.scroll.set(scroll);
         out.extend(rows.into_iter().skip(scroll).take(k));
@@ -1276,9 +1308,13 @@ impl Dialog {
         let hint = if plan.compose.is_some() {
             "  type comment · enter save · esc discard comment"
         } else if plan.feedback_focused {
-            "  type feedback · enter send · esc return to plan"
+            if PLAN_OPTIONS[plan.cursor].requires_feedback {
+                "  type feedback · enter send · esc return to plan"
+            } else {
+                "  type note · enter confirm · esc return to plan"
+            }
         } else if plan.options_focused {
-            "  ↑↓/1-4 choose · enter confirm · →/esc return to plan"
+            "  ↑↓/1-4 choose · tab note · enter confirm · →/esc return to plan"
         } else if plan.has_revision() {
             "  ↑↓ blocks · c comment · e edit · ←/1-4 choose · esc = keep planning"
         } else {
@@ -2211,6 +2247,73 @@ mod tests {
         assert!(
             !feedback.contains("First block"),
             "only the selection is quoted: {feedback}"
+        );
+    }
+
+    #[test]
+    fn plan_keep_planning_tab_opens_its_feedback_editor() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Tab));
+        assert!(
+            d.plan.as_ref().expect("plan dialog").feedback_focused,
+            "Tab on keep-planning must edit its feedback, not return to the plan"
+        );
+        type_str(&mut d, "cover the error path");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter sends the keep-planning feedback");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.comment.as_deref(), Some("cover the error path"));
+    }
+
+    #[test]
+    fn plan_tab_opens_a_note_editor_for_approval_options() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('2'))); // auto-accept edits
+        d.handle_key(key(KeyCode::Tab));
+        assert!(
+            d.plan.as_ref().expect("plan dialog").feedback_focused,
+            "Tab on an approval choice must open its note editor"
+        );
+        type_str(&mut d, "run the focused tests afterwards");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves the plan with the note");
+        };
+        assert_eq!(a.decision, ApprovalDecision::Yes);
+        assert_eq!(a.set_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(
+            a.comment.as_deref(),
+            Some("run the focused tests afterwards")
+        );
+    }
+
+    #[test]
+    fn plan_wheel_scrolls_without_moving_the_comment_target() {
+        let src = (1..=20)
+            .map(|i| format!("Block number {i}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut d = plan_dialog(&src);
+        let _ = render_text(&d, 60, 14); // establish the initial viewport
+        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Tab));
+        assert!(d.plan.as_ref().expect("plan dialog").feedback_focused);
+
+        d.plan_mouse_wheel(false, 60, 14);
+        let text = render_text(&d, 60, 14);
+        assert!(
+            text.contains("Block number 4."),
+            "wheel advances the body: {text}"
+        );
+        assert!(
+            !text.contains("Block number 1."),
+            "the old top row has scrolled away: {text}"
+        );
+        assert_eq!(
+            d.plan.as_ref().expect("plan dialog").focus,
+            0,
+            "scrolling does not move the comment target"
         );
     }
 

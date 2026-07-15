@@ -2007,6 +2007,11 @@ impl App {
         let row = mouse.row.saturating_sub(panel_top + 1) as usize;
         let col = mouse.column.saturating_sub(1) as usize;
         match mouse.kind {
+            // The plan pane owns its own viewport, including while its feedback
+            // editor has focus. Do not let the modal trap the reviewer at the
+            // current block while they are composing the keep-planning reason.
+            MouseEventKind::ScrollUp => dialog.plan_mouse_wheel(true, width, budget),
+            MouseEventKind::ScrollDown => dialog.plan_mouse_wheel(false, width, budget),
             MouseEventKind::Down(MouseButton::Left) => {
                 dialog.plan_mouse_down(row, col, width, budget)
             }
