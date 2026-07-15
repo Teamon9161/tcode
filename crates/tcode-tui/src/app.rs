@@ -125,7 +125,8 @@ impl Approver for ChannelApprover {
 enum Attachment {
     Image {
         id: u32,
-        png: Vec<u8>,
+        bytes: Vec<u8>,
+        media_type: &'static str,
         label: String,
     },
     Text {
@@ -878,13 +879,48 @@ impl App {
                 continue;
             }
             match att {
-                Attachment::Image { png, label, .. } => {
+                Attachment::Image {
+                    id,
+                    bytes,
+                    media_type,
+                    label,
+                } => {
                     attachments.push(label);
-                    use base64::Engine as _;
-                    blocks.push(ContentBlock::Image {
-                        media_type: "image/png".into(),
-                        data: base64::engine::general_purpose::STANDARD.encode(png),
-                    });
+                    if self.agent.model.snapshot().provider.supports_vision() {
+                        use base64::Engine as _;
+                        blocks.push(ContentBlock::Image {
+                            media_type: media_type.into(),
+                            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                        });
+                    } else {
+                        let dir = tcode_core::store::scratchpad_dir(&self.cwd).join("pasted");
+                        let ext = match media_type {
+                            "image/jpeg" => "jpg",
+                            "image/png" => "png",
+                            _ => "img",
+                        };
+                        let stamp = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis();
+                        let path = dir.join(format!("paste-{stamp}-{id}.{ext}"));
+                        match std::fs::create_dir_all(&dir)
+                            .and_then(|()| std::fs::write(&path, bytes))
+                        {
+                            Ok(()) => blocks.push(ContentBlock::Text {
+                                text: format!("[image saved to {}]", path.display()),
+                            }),
+                            Err(error) => {
+                                self.notice = Some((
+                                    format!("could not save pasted image: {error}"),
+                                    Instant::now(),
+                                ));
+                                blocks.push(ContentBlock::Text {
+                                    text: "[pasted image could not be saved; the current model cannot view it]".into(),
+                                });
+                            }
+                        }
+                    }
                 }
                 Attachment::Text { content, .. } => {
                     blocks.push(ContentBlock::Text {
@@ -2564,20 +2600,17 @@ impl App {
         // Pull owned data out while the clipboard borrow is held, then release
         // it before touching other `self` fields.
         let image = clipboard.get_image().ok().and_then(|img| {
-            let (w, h) = (img.width, img.height);
-            let rgba = image::RgbaImage::from_raw(w as u32, h as u32, img.bytes.into_owned())?;
-            let mut png: Vec<u8> = Vec::new();
-            image::DynamicImage::ImageRgba8(rgba)
-                .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
-                .ok()?;
-            Some((png, w, h))
+            let width = u32::try_from(img.width).ok()?;
+            let height = u32::try_from(img.height).ok()?;
+            tcode_core::images::normalize_rgba(width, height, img.bytes.into_owned()).ok()
         });
-        if let Some((png, w, h)) = image {
-            let kb = png.len() / 1024;
+        if let Some(image) = image {
+            let kb = image.bytes.len() / 1024;
             self.add_attachment(|id| Attachment::Image {
                 id,
-                png,
-                label: format!("Image #{id} ({w}x{h}, {kb}KB)"),
+                bytes: image.bytes,
+                media_type: image.media_type,
+                label: format!("Image #{id} ({}x{}, {kb}KB)", image.width, image.height),
             });
             return;
         }
@@ -3927,7 +3960,8 @@ mod tests {
     fn attachment_placeholder_is_stable_per_id() {
         let img = Attachment::Image {
             id: 2,
-            png: Vec::new(),
+            bytes: Vec::new(),
+            media_type: "image/png",
             label: "Image #2".into(),
         };
         let txt = Attachment::Text {

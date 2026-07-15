@@ -6,6 +6,7 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::freshness::{content_hash, ReadStatus};
+use tcode_core::images::detect_image_mime;
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const DEFAULT_READ_LIMIT: usize = 2000;
@@ -19,24 +20,10 @@ const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Cap the bytes a single read emits into context, independent of the line
 /// count — 2000 lines of long lines would otherwise be ~1 MB.
 const MAX_READ_OUTPUT_BYTES: usize = 128 * 1024;
-/// Largest image inlined into a tool result. Anthropic caps images near 5 MB;
-/// bigger ones are rejected with a resize hint rather than silently failing.
-const MAX_IMAGE_INLINE_BYTES: u64 = 5 * 1024 * 1024;
-
-/// Sniff a supported raster image by magic bytes; the extension is not trusted.
-fn detect_image_mime(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]) {
-        Some("image/png")
-    } else if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        Some("image/jpeg")
-    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        Some("image/gif")
-    } else if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        Some("image/webp")
-    } else {
-        None
-    }
-}
+/// Largest encoded image accepted before decode/normalization. This coarse
+/// source-byte gate avoids spending CPU on absurd uploads; the normalized
+/// result still has the stricter inline-byte limit in `core::images`.
+const MAX_IMAGE_SOURCE_BYTES: u64 = 20 * 1024 * 1024;
 
 fn rel<'a>(path: &'a Path, cwd: &Path) -> &'a Path {
     path.strip_prefix(cwd).unwrap_or(path)
@@ -256,12 +243,12 @@ impl Tool for ReadTool {
                 path.display()
             ));
         }
-        if meta.len() > MAX_READ_FILE_BYTES {
+        if meta.len() > MAX_IMAGE_SOURCE_BYTES {
             return ToolOutput::err(format!(
-                "{} is {:.1} MB — too large to load into context. Search it with \
-                 grep, or read a specific range via shell, e.g. `sed -n '2000,2100p'`.",
+                "{} is {:.1} MB — too large to load safely. Images must be below {} MB before normalization; use a smaller source file.",
                 rel(&path, &ctx.cwd).display(),
                 meta.len() as f64 / (1024.0 * 1024.0),
+                MAX_IMAGE_SOURCE_BYTES / (1024 * 1024),
             ));
         }
         let bytes = match tokio::fs::read(&path).await {
@@ -271,14 +258,26 @@ impl Tool for ReadTool {
             }
             Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
         };
-        // Supported images are read into context as image blocks, deduped by
-        // content hash like a text read. This must come before the binary
-        // rejection below, since images are binary.
         if let Some(mime) = detect_image_mime(&bytes) {
+            // A text-only model must not record this read: after `/model` swaps
+            // to a vision model, freshness must not hide the image as unchanged.
+            if ctx
+                .model
+                .as_ref()
+                .is_some_and(|model| !model.snapshot().provider.supports_vision())
+            {
+                return ToolOutput::err(format!(
+                    "{} is an image, but the current model cannot view images. Delegate it: view_image(paths=[\"{}\"], prompt=\"<specific question>\")",
+                    rel(&path, &ctx.cwd).display(),
+                    path_str,
+                ));
+            }
             let hash = content_hash(&bytes);
             let force = input["force"].as_bool().unwrap_or(false);
-            let mut freshness = ctx.freshness.lock().expect("freshness lock");
-            let status = freshness.check_read(&path, hash, None);
+            let status = {
+                let freshness = ctx.freshness.lock().expect("freshness lock");
+                freshness.check_read(&path, hash, None)
+            };
             if status == ReadStatus::Unchanged && !force {
                 return ToolOutput::ok(format!(
                     "unchanged: {} has not changed since you last read it; the image \
@@ -286,28 +285,45 @@ impl Tool for ReadTool {
                     rel(&path, &ctx.cwd).display()
                 ));
             }
-            freshness.record_read(&path, hash, None);
-            drop(freshness);
-            if bytes.len() as u64 > MAX_IMAGE_INLINE_BYTES {
-                return ToolOutput::err(format!(
-                    "{} is a {mime} image but {:.1} MB exceeds the {} MB inline limit; \
-                     resize it smaller before reading.",
-                    rel(&path, &ctx.cwd).display(),
-                    bytes.len() as f64 / (1024.0 * 1024.0),
-                    MAX_IMAGE_INLINE_BYTES / (1024 * 1024),
-                ));
+            let normalized = match tokio::task::spawn_blocking(move || {
+                tcode_core::images::normalize_image(&bytes)
+            })
+            .await
+            {
+                Ok(Ok(image)) => image,
+                Ok(Err(error)) => {
+                    return ToolOutput::err(format!(
+                        "{} is a {mime} image but could not be normalized: {error}",
+                        rel(&path, &ctx.cwd).display()
+                    ));
+                }
+                Err(error) => {
+                    return ToolOutput::err(format!("image normalization failed: {error}"))
+                }
+            };
+            {
+                let mut freshness = ctx.freshness.lock().expect("freshness lock");
+                freshness.record_read(&path, hash, None);
             }
-            use base64::Engine as _;
-            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let dimensions = if normalized.resized {
+                format!(" → {}x{}", normalized.width, normalized.height)
+            } else {
+                format!(" {}x{}", normalized.width, normalized.height)
+            };
             let text = format!(
-                "Read image {} ({mime}, {:.0} KB).",
+                "Read image {} ({mime},{dimensions}, {:.0} KB).",
                 rel(&path, &ctx.cwd).display(),
-                bytes.len() as f64 / 1024.0,
+                normalized.bytes.len() as f64 / 1024.0,
             );
-            return ToolOutput::ok(text).with_images(vec![tcode_core::ContentBlock::Image {
-                media_type: mime.to_string(),
-                data,
-            }]);
+            return ToolOutput::ok(text).with_images(vec![normalized.into_block()]);
+        }
+        if bytes.len() as u64 > MAX_READ_FILE_BYTES {
+            return ToolOutput::err(format!(
+                "{} is {:.1} MB — too large to load into context. Search it with \
+                 grep, or read a specific range via shell, e.g. `sed -n '2000,2100p'`.",
+                rel(&path, &ctx.cwd).display(),
+                bytes.len() as f64 / (1024.0 * 1024.0),
+            ));
         }
         if bytes[..bytes.len().min(8192)].contains(&0) {
             return ToolOutput::err(format!(
@@ -974,6 +990,41 @@ fn near_miss_help(text: &str, old: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    struct TextOnlyProvider;
+
+    #[async_trait::async_trait]
+    impl tcode_core::Provider for TextOnlyProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn model(&self) -> &str {
+            "text-only"
+        }
+        fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+            tcode_core::CacheStrategy::ImplicitPrefix
+        }
+        fn supports_vision(&self) -> bool {
+            false
+        }
+        async fn stream(
+            &self,
+            _request: tcode_core::Request,
+            _cancel: CancellationToken,
+        ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+            unreachable!("read routing test never streams")
+        }
+    }
+
+    fn text_only_model() -> tcode_core::ModelCell {
+        tcode_core::ModelCell::new(tcode_core::ActiveModel {
+            provider: Arc::new(TextOnlyProvider),
+            max_tokens: 1024,
+            context_window: 16_000,
+            effort: None,
+        })
+    }
 
     #[cfg(windows)]
     #[test]
@@ -1306,14 +1357,40 @@ fn rate_limits_from() {
     }
 
     #[tokio::test]
+    async fn text_only_models_are_routed_to_view_image_without_freshness() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(
+            &image,
+            tcode_core::images::normalize_rgba(1, 1, vec![0; 4])
+                .unwrap()
+                .bytes,
+        )
+        .unwrap();
+        let ctx = ToolCtx::new(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
+
+        for _ in 0..2 {
+            let result = ReadTool
+                .run(
+                    json!({ "path": "shot.png" }),
+                    &ctx,
+                    &CancellationToken::new(),
+                )
+                .await;
+            assert!(result.is_error);
+            assert!(result.content.contains("view_image"));
+        }
+    }
+
+    #[tokio::test]
     async fn read_inlines_a_png_as_an_image_block() {
         let dir = std::env::temp_dir().join(format!("tcode-img-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let png = dir.join("shot.png");
-        // Valid PNG magic + arbitrary payload (incl. null bytes) is enough:
-        // detection is by magic bytes and the body is base64-encoded verbatim.
-        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
-        bytes.extend_from_slice(&[0u8; 32]);
+        // A complete 1×1 PNG: normalization decodes images before inlining.
+        let bytes = tcode_core::images::normalize_rgba(1, 1, vec![0; 4])
+            .unwrap()
+            .bytes;
         std::fs::write(&png, &bytes).unwrap();
 
         let ctx = ToolCtx::new(dir.clone(), 10_000);

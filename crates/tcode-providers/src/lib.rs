@@ -23,19 +23,28 @@ pub fn build(
     watchdog: &WatchdogConfig,
 ) -> Result<Arc<dyn Provider>, tcode_core::config::ConfigError> {
     Ok(match profile.provider {
-        ProviderKind::Anthropic => Arc::new(AnthropicProvider::new(
-            profile.api_key(profile_name)?,
-            model.name.clone(),
-            profile.base_url.clone(),
-            watchdog.clone(),
-        )),
-        ProviderKind::Openai => Arc::new(OpenAiProvider::new(
-            profile.api_key(profile_name)?,
-            model.name.clone(),
-            profile.base_url.clone(),
-            watchdog.clone(),
-        )),
-        ProviderKind::Codex => Arc::new(CodexProvider::new(model.name.clone(), watchdog.clone())),
+        ProviderKind::Anthropic => Arc::new(
+            AnthropicProvider::new(
+                profile.api_key(profile_name)?,
+                model.name.clone(),
+                profile.base_url.clone(),
+                watchdog.clone(),
+            )
+            .with_vision(model.vision.or(profile.vision).unwrap_or(true)),
+        ),
+        ProviderKind::Openai => Arc::new(
+            OpenAiProvider::new(
+                profile.api_key(profile_name)?,
+                model.name.clone(),
+                profile.base_url.clone(),
+                watchdog.clone(),
+            )
+            .with_vision(model.vision.or(profile.vision).unwrap_or(true)),
+        ),
+        ProviderKind::Codex => Arc::new(
+            CodexProvider::new(model.name.clone(), watchdog.clone())
+                .with_vision(model.vision.or(profile.vision).unwrap_or(true)),
+        ),
     })
 }
 

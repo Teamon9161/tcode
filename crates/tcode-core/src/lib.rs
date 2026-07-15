@@ -11,6 +11,7 @@ pub mod export;
 pub mod external;
 pub mod freshness;
 pub mod hooks;
+pub mod images;
 pub mod ledger;
 pub mod memory;
 pub mod permission;

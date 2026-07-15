@@ -63,6 +63,8 @@ default_effort = "medium"
 # local cache at runtime, so an empty list stays current automatically.
 [profiles.codex]
 provider = "codex"
+# Codex Responses accepts input_image; keep pasted/read images inline.
+vision = true
 
 # OpenRouter, reached over its Anthropic-compatible Messages endpoint
 # (`/api/v1/messages`, which this base_url + the provider's `/v1/messages`
@@ -94,6 +96,8 @@ context_window = 262144
 provider = "anthropic"
 api_key_env = "DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com/anthropic"
+# Text-only: save pasted images to scratch and delegate with view_image.
+vision = false
 
 [[profiles.deepseek.models]]
 name = "deepseek-v4-pro"

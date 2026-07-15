@@ -58,6 +58,9 @@ pub struct ModelDef {
     pub efforts: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
+    /// Explicitly mark text-only models so image paths can self-heal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 impl ModelDef {
@@ -69,6 +72,7 @@ impl ModelDef {
             max_tokens: None,
             efforts: Vec::new(),
             default_effort: None,
+            vision: None,
         }
     }
 
@@ -97,6 +101,9 @@ pub struct Profile {
     /// Fallback context window for models that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
+    /// Default vision capability for models in this profile.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
 }
 
 impl Profile {
@@ -161,6 +168,9 @@ impl Profile {
         }
         if over.context_window.is_some() {
             self.context_window = over.context_window;
+        }
+        if over.vision.is_some() {
+            self.vision = over.vision;
         }
         for model in over.models {
             match self.models.iter_mut().find(|d| d.name == model.name) {

@@ -49,7 +49,7 @@ pub const TASK_AGENT_KINDS: [&str; 2] = ["explore", "general"];
 /// Roles surfaced by `/agents`: task kinds plus the auxiliary models the
 /// harness itself runs — the Auto Mode classifier and the next-prompt guess.
 /// Both want something small and fast, which is the whole point of pinning.
-pub const MODEL_ROLES: [&str; 4] = ["explore", "general", "auto", "suggest"];
+pub const MODEL_ROLES: [&str; 5] = ["explore", "general", "auto", "suggest", "vision"];
 
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -104,8 +104,13 @@ impl TaskTool {
     /// ask a tool is whether it mutates, not how it batches: `batch_policy`
     /// describes parallelism, and reading it as a safety filter silently
     /// excluded harmless non-parallel tools like `skill`.
-    fn sub_tools(&self, agent_kind: &str, cwd: &Path) -> Vec<Arc<dyn Tool>> {
-        crate::builtin_tools(cwd)
+    fn sub_tools(&self, agent_kind: &str, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
+        let mut tools = crate::builtin_tools(cwd);
+        tools.push(Arc::new(crate::ViewImageTool::new(
+            model,
+            self.pinned.clone(),
+        )));
+        tools
             .into_iter()
             .filter(|t| agent_kind != "explore" || !t.is_mutating())
             .collect()
@@ -176,11 +181,11 @@ impl Tool for TaskTool {
             self.pinned.clone(),
         ));
         let agent = Agent {
-            model,
+            model: model.clone(),
             // A sub-agent has no input box, so it never suggests; it still
             // carries the pins so its own classifier resolves the same way.
             models: self.pinned.clone(),
-            tools: self.sub_tools(kind, &ctx.cwd),
+            tools: self.sub_tools(kind, &ctx.cwd, model.clone()),
             system: system.to_string(),
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
@@ -194,7 +199,7 @@ impl Tool for TaskTool {
         static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut session = Session::new(
-            ToolCtx::new(ctx.cwd.clone(), self.output_budget),
+            ToolCtx::new(ctx.cwd.clone(), self.output_budget).with_model(model.clone()),
             PermissionMode::Auto,
             PermissionRules::default(),
         )

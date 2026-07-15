@@ -110,3 +110,15 @@ pub fn diff_del_emph_bg() -> Color {
 pub fn inline_code() -> Style {
     Style::default().fg(Color::LightCyan)
 }
+
+/// TeX source is more reliable than attempting terminal typesetting, but it
+/// must remain visibly distinct from prose and code.
+pub fn math_inline() -> Style {
+    Style::default()
+        .fg(Color::LightMagenta)
+        .add_modifier(Modifier::ITALIC)
+}
+
+pub fn math_block() -> Style {
+    Style::default().fg(Color::LightMagenta)
+}

@@ -28,6 +28,7 @@ pub struct AnthropicProvider {
     /// compatible backends still take the classic `thinking.budget_tokens`.
     native: bool,
     watchdog: WatchdogConfig,
+    vision: bool,
 }
 
 impl AnthropicProvider {
@@ -50,11 +51,21 @@ impl AnthropicProvider {
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             native,
             watchdog,
+            vision: true,
         }
     }
 
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
+    }
+
     fn build_body(&self, req: &Request) -> Value {
-        let mut messages: Vec<Value> = req.messages.iter().map(message_to_json).collect();
+        let mut messages: Vec<Value> = req
+            .messages
+            .iter()
+            .map(|message| message_to_json(message, self.vision))
+            .collect();
         // Moving cache breakpoint: last content block of the last message.
         // Together with the breakpoint on system this covers the whole
         // prefix; append-only history means the next turn extends it.
@@ -134,16 +145,20 @@ impl AnthropicProvider {
     }
 }
 
-fn message_to_json(msg: &Message) -> Value {
+fn message_to_json(msg: &Message, vision: bool) -> Value {
     let role = match msg.role {
         tcode_core::Role::User => "user",
         tcode_core::Role::Assistant => "assistant",
     };
-    let blocks: Vec<Value> = msg.content.iter().filter_map(block_to_json).collect();
+    let blocks: Vec<Value> = msg
+        .content
+        .iter()
+        .filter_map(|block| block_to_json(block, vision))
+        .collect();
     json!({ "role": role, "content": blocks })
 }
 
-fn block_to_json(block: &ContentBlock) -> Option<Value> {
+fn block_to_json(block: &ContentBlock, vision: bool) -> Option<Value> {
     Some(match block {
         ContentBlock::Text { text } => json!({ "type": "text", "text": text }),
         ContentBlock::Thinking {
@@ -154,9 +169,13 @@ fn block_to_json(block: &ContentBlock) -> Option<Value> {
             let signature = signature.as_ref()?;
             json!({ "type": "thinking", "thinking": thinking, "signature": signature })
         }
-        ContentBlock::Image { media_type, data } => json!({
+        ContentBlock::Image { media_type, data } if vision => json!({
             "type": "image",
             "source": { "type": "base64", "media_type": media_type, "data": data },
+        }),
+        ContentBlock::Image { .. } => json!({
+            "type": "text",
+            "text": "[image omitted: this model cannot view images; use the view_image tool to delegate]",
         }),
         ContentBlock::ToolUse { id, name, input } => {
             json!({ "type": "tool_use", "id": id, "name": name, "input": input })
@@ -221,6 +240,10 @@ impl Provider for AnthropicProvider {
 
     fn cache_strategy(&self) -> CacheStrategy {
         CacheStrategy::ExplicitBreakpoints
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
 
     async fn stream(
@@ -370,7 +393,7 @@ mod tests {
                 data: "AAAA".into(),
             }],
         };
-        let v = block_to_json(&block).unwrap();
+        let v = block_to_json(&block, true).unwrap();
         let parts = v["content"].as_array().unwrap();
         assert_eq!(parts.len(), 2);
         assert_eq!(parts[0]["type"], "text");

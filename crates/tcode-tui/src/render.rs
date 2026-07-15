@@ -221,6 +221,43 @@ impl ToolRenderer for WebFetchRenderer {
     }
 }
 
+struct ViewImageRenderer;
+
+impl ToolRenderer for ViewImageRenderer {
+    fn header(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        let paths = input["paths"].as_array();
+        let first = paths
+            .and_then(|paths| paths.first())
+            .and_then(Value::as_str)
+            .map(|path| shorten_path(path, cwd))
+            .unwrap_or_else(|| "<missing image>".into());
+        let extra = paths.map_or(0, |paths| paths.len().saturating_sub(1));
+        let prompt: String = input["prompt"]
+            .as_str()
+            .unwrap_or("")
+            .chars()
+            .take(40)
+            .collect();
+        let images = if extra == 0 {
+            first
+        } else {
+            format!("{first} (+{extra} more)")
+        };
+        if prompt.is_empty() {
+            format!("{name}({images})")
+        } else {
+            format!("{name}({images}: \"{prompt}\")")
+        }
+    }
+
+    fn batch_item(&self, _name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        self.header("", input, cwd)
+            .trim_start_matches('(')
+            .trim_end_matches(')')
+            .to_string()
+    }
+}
+
 struct ProgressRenderer;
 
 impl ToolRenderer for ProgressRenderer {
@@ -260,6 +297,7 @@ impl RenderRegistry {
                 "read" => Box::new(ReadRenderer { quiet }),
                 "grep" | "glob" => Box::new(PatternRenderer { quiet }),
                 "web_fetch" => Box::new(WebFetchRenderer),
+                "view_image" => Box::new(ViewImageRenderer),
                 "task" => Box::new(TaskRenderer),
                 "update_progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),

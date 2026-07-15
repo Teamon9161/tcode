@@ -43,6 +43,7 @@ pub struct CodexProvider {
     /// `prompt_cache_key` with this header, so it — not the body — is what
     /// scopes the prompt cache.
     session_id: uuid::Uuid,
+    vision: bool,
 }
 
 impl CodexProvider {
@@ -52,7 +53,13 @@ impl CodexProvider {
             model,
             watchdog,
             session_id: uuid::Uuid::new_v4(),
+            vision: true,
         }
+    }
+
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
     }
 
     /// One cache id per conversation. Derived rather than random so a scope
@@ -68,7 +75,7 @@ impl CodexProvider {
     fn build_body(&self, req: &Request) -> Value {
         let mut input: Vec<Value> = Vec::new();
         for msg in &req.messages {
-            push_items(msg, &mut input);
+            push_items(msg, &mut input, self.vision);
         }
         let tools: Vec<Value> = req
             .tools
@@ -223,7 +230,7 @@ impl CodexProvider {
 }
 
 /// Our neutral message → Responses API items.
-fn push_items(msg: &Message, out: &mut Vec<Value>) {
+fn push_items(msg: &Message, out: &mut Vec<Value>, vision: bool) {
     match msg.role {
         Role::Assistant => {
             for block in &msg.content {
@@ -267,9 +274,13 @@ fn push_items(msg: &Message, out: &mut Vec<Value>) {
                         content.clone()
                     } else {
                         format!(
-                            "{content}\n[{} image(s) omitted: images returned from a tool \
-                             cannot be viewed by this model]",
-                            images.len()
+                            "{content}\n[{} image(s) omitted: {}]",
+                            images.len(),
+                            if vision {
+                                "this API cannot carry images returned from a tool"
+                            } else {
+                                "this model cannot view images; use the view_image tool to delegate"
+                            }
                         )
                     };
                     out.push(json!({
@@ -286,9 +297,13 @@ fn push_items(msg: &Message, out: &mut Vec<Value>) {
                     ContentBlock::Text { text } => {
                         Some(json!({ "type": "input_text", "text": text }))
                     }
-                    ContentBlock::Image { media_type, data } => Some(json!({
+                    ContentBlock::Image { media_type, data } if vision => Some(json!({
                         "type": "input_image",
                         "image_url": format!("data:{media_type};base64,{data}"),
+                    })),
+                    ContentBlock::Image { .. } => Some(json!({
+                        "type": "input_text",
+                        "text": "[image omitted: this model cannot view images; use the view_image tool to delegate]",
                     })),
                     _ => None,
                 })
@@ -325,6 +340,10 @@ impl Provider for CodexProvider {
 
     fn cache_strategy(&self) -> CacheStrategy {
         CacheStrategy::ImplicitPrefix
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
 
     async fn stream(

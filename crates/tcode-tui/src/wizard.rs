@@ -529,6 +529,7 @@ fn read_custom_provider(out: &mut std::io::Stdout) -> anyhow::Result<Option<Cust
         base_url: (!base_url.is_empty()).then_some(base_url),
         max_tokens: None,
         context_window: None,
+        vision: None,
     };
     Ok(Some((name, profile)))
 }

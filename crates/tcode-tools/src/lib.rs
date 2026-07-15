@@ -6,7 +6,11 @@ mod search;
 mod shell;
 mod skills;
 mod task;
+mod view_image;
 mod web;
+
+#[cfg(test)]
+mod view_image_tests;
 
 pub use grounding::project_map;
 pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
@@ -14,6 +18,7 @@ pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
 pub use skills::SkillTool;
 pub use task::{TaskTool, MODEL_ROLES, TASK_AGENT_KINDS};
+pub use view_image::ViewImageTool;
 
 use std::path::Path;
 use std::sync::Arc;

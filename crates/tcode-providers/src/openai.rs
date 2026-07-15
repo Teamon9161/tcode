@@ -25,6 +25,7 @@ pub struct OpenAiProvider {
     model: String,
     base_url: String,
     watchdog: WatchdogConfig,
+    vision: bool,
 }
 
 impl OpenAiProvider {
@@ -40,7 +41,13 @@ impl OpenAiProvider {
             model,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
             watchdog,
+            vision: true,
         }
+    }
+
+    pub fn with_vision(mut self, vision: bool) -> Self {
+        self.vision = vision;
+        self
     }
 
     fn build_body(&self, req: &Request) -> Value {
@@ -49,7 +56,7 @@ impl OpenAiProvider {
             messages.push(json!({ "role": "system", "content": suffix }));
         }
         for msg in &req.messages {
-            flatten_message(msg, &mut messages);
+            flatten_message(msg, &mut messages, self.vision);
         }
         let tools: Vec<Value> = req
             .tools
@@ -89,7 +96,7 @@ impl OpenAiProvider {
 
 /// Our neutral message maps to 1..n OpenAI messages: tool results become
 /// separate `role:"tool"` messages, everything else stays in place.
-fn flatten_message(msg: &Message, out: &mut Vec<Value>) {
+fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool) {
     match msg.role {
         Role::Assistant => {
             let mut text = String::new();
@@ -139,9 +146,13 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>) {
                         content.clone()
                     } else {
                         format!(
-                            "{content}\n[{} image(s) omitted: this model cannot view images \
-                             returned from a tool]",
-                            images.len()
+                            "{content}\n[{} image(s) omitted: {}]",
+                            images.len(),
+                            if vision {
+                                "this API cannot carry images returned from a tool"
+                            } else {
+                                "this model cannot view images; use the view_image tool to delegate"
+                            }
                         )
                     };
                     out.push(json!({
@@ -158,13 +169,17 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>) {
                     ContentBlock::Text { text } => {
                         parts.push(json!({ "type": "text", "text": text }))
                     }
-                    ContentBlock::Image { media_type, data } => {
+                    ContentBlock::Image { media_type, data } if vision => {
                         has_image = true;
                         parts.push(json!({
                             "type": "image_url",
                             "image_url": { "url": format!("data:{media_type};base64,{data}") },
                         }));
                     }
+                    ContentBlock::Image { .. } => parts.push(json!({
+                        "type": "text",
+                        "text": "[image omitted: this model cannot view images; use the view_image tool to delegate]",
+                    })),
                     _ => {}
                 }
             }
@@ -223,6 +238,10 @@ impl Provider for OpenAiProvider {
 
     fn cache_strategy(&self) -> CacheStrategy {
         CacheStrategy::ImplicitPrefix
+    }
+
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
 
     async fn stream(

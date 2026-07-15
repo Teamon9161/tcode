@@ -183,6 +183,11 @@ pub trait Provider: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
     fn cache_strategy(&self) -> CacheStrategy;
+    /// Whether this model can accept image blocks in user messages. The default
+    /// preserves existing multimodal behavior; text-only models opt out in config.
+    fn supports_vision(&self) -> bool {
+        true
+    }
     /// Open a streaming request. Establishing the connection retries
     /// internally; mid-stream failures surface as an `Err` item and the
     /// caller decides whether to re-send the turn.

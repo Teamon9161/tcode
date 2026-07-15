@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::background::BackgroundTasks;
 use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
+use crate::provider::ModelCell;
 use crate::types::Usage;
 
 use crate::auto_mode::AutoSafety;
@@ -92,6 +93,9 @@ pub struct ToolCtx {
     pub blobs: Mutex<BlobStore>,
     pub background: Mutex<BackgroundTasks>,
     pub memory: Mutex<crate::memory::MemoryManager>,
+    /// The model active for this invocation. Tools may use its capabilities
+    /// without owning model selection or provider construction.
+    pub model: Option<ModelCell>,
     /// A parent agent installs this only while a tool is running. Nested
     /// agents use it to report their own billable usage without pretending it
     /// occupies the parent's context window.
@@ -112,9 +116,15 @@ impl ToolCtx {
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
+            model: None,
             usage_reporter: Mutex::new(None),
             cwd,
         }
+    }
+
+    pub fn with_model(mut self, model: ModelCell) -> Self {
+        self.model = Some(model);
+        self
     }
 
     /// Resolve a model-supplied path against the working directory.

@@ -125,6 +125,7 @@ fn read_models_cache() -> Option<Vec<ModelDef>> {
                     })
                     .unwrap_or_default(),
                 default_effort: m["default_reasoning_level"].as_str().map(String::from),
+                vision: None,
             })
         })
         .collect();
@@ -144,6 +145,7 @@ pub fn default_models() -> Vec<ModelDef> {
                 .map(|s| s.to_string())
                 .collect(),
             default_effort: Some("medium".into()),
+            vision: None,
         })
         .collect()
 }

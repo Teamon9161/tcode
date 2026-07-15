@@ -17,7 +17,7 @@ pulldown-cmark = { version = "0.12", default-features = false }
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 similar = { version = "2", features = ["inline"] }
 arboard = "3"
-image = { version = "0.25", default-features = false, features = ["png"] }
+image = { workspace = true }
 base64 = "0.22"
 unicode-width = "0.2"
 

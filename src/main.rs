@@ -425,6 +425,10 @@ async fn main() -> anyhow::Result<()> {
     let system = INTERACTIVE_AGENT_SYSTEM.to_string();
     let classifier_policy = auto_policy(&config);
     let mut tools = tcode_tools::builtin_tools(&cwd);
+    tools.push(Arc::new(tcode_tools::ViewImageTool::new(
+        model_cell.clone(),
+        pinned.clone(),
+    )));
     tools.push(Arc::new(
         tcode_tools::TaskTool::new(
             model_cell.clone(),
@@ -480,7 +484,7 @@ async fn main() -> anyhow::Result<()> {
         deny: config.permissions.deny.clone(),
     };
     let mut session = Session::new(
-        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens),
+        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens).with_model(model_cell.clone()),
         mode,
         rules,
     );
