@@ -342,6 +342,7 @@ impl Tool for WebFetchTool {
             .unwrap_or_else(|| "?".into());
         PermissionRequest::Ask {
             descriptor: format!("web_fetch({host})"),
+            aliases: Vec::new(),
             summary: format!("fetch {url}"),
             is_edit: false,
         }
@@ -700,6 +701,7 @@ impl Tool for WebSearchTool {
         PermissionRequest::Ask {
             // No argument in the descriptor: one always-allow covers all searches.
             descriptor: "web_search".into(),
+            aliases: Vec::new(),
             summary: format!("search: {query}"),
             is_edit: false,
         }

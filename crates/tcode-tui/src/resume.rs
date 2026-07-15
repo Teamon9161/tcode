@@ -7,6 +7,7 @@ use tcode_core::{ExternalSessionInfo, ExternalSource, SessionInfo};
 use crate::theme;
 
 enum Item {
+    Import,
     Current(SessionInfo),
     Source(ExternalSource),
     External(ExternalSessionInfo),
@@ -23,6 +24,7 @@ const VISIBLE_ROWS: usize = 8;
 pub enum PickResult {
     Pending,
     Cancelled,
+    Import,
     Current(String),
     Source(ExternalSource),
     External(ExternalSessionInfo),
@@ -30,14 +32,24 @@ pub enum PickResult {
 
 impl Picker {
     pub fn new(sessions: Vec<SessionInfo>) -> Self {
-        // Resuming one's own latest session is the common case; keep it on
-        // the default selection and park the import entry points below.
-        let mut items: Vec<Item> = sessions.into_iter().map(Item::Current).collect();
-        items.push(Item::Source(ExternalSource::Codex));
-        items.push(Item::Source(ExternalSource::Claude));
+        // Import is a stable first row and `i` shortcut, so it remains reachable
+        // even when the project accumulated more local sessions than fit here.
+        let mut items = vec![Item::Import];
+        items.extend(sessions.into_iter().map(Item::Current));
         Self {
             title: "resume conversation".into(),
             items,
+            selected: 0,
+        }
+    }
+
+    pub fn sources() -> Self {
+        Self {
+            title: "import external conversation".into(),
+            items: vec![
+                Item::Source(ExternalSource::Codex),
+                Item::Source(ExternalSource::Claude),
+            ],
             selected: 0,
         }
     }
@@ -61,7 +73,9 @@ impl Picker {
                 self.selected = (self.selected + 1).min(self.items.len() - 1);
                 PickResult::Pending
             }
+            KeyCode::Char('i') => PickResult::Import,
             KeyCode::Enter => match &self.items[self.selected] {
+                Item::Import => PickResult::Import,
                 Item::Current(session) => PickResult::Current(session.id.clone()),
                 Item::Source(source) => PickResult::Source(*source),
                 Item::External(session) => PickResult::External(session.clone()),
@@ -87,6 +101,7 @@ impl Picker {
                 theme::dim()
             };
             let text = match item {
+                Item::Import => "⇣ import external conversation…".to_string(),
                 Item::Current(session) => format!(
                     "{}{} · {}",
                     session.id,
@@ -109,7 +124,7 @@ impl Picker {
             String::new()
         };
         lines.push(Line::styled(
-            format!("  {position}↑↓ choose · enter select · esc cancel"),
+            format!("  {position}↑↓ choose · enter select · i import · esc cancel"),
             theme::dim(),
         ));
         lines
@@ -160,5 +175,41 @@ fn truncate(text: &str, limit: usize) -> String {
         format!("{prefix}…")
     } else {
         prefix
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn import_is_first_and_has_a_shortcut() {
+        let mut picker = Picker::new(vec![SessionInfo {
+            id: "session".into(),
+            last_user_preview: "hello".into(),
+            modified: None,
+        }]);
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            PickResult::Import
+        ));
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Char('i'))),
+            PickResult::Import
+        ));
+    }
+
+    #[test]
+    fn import_source_picker_lists_supported_sources() {
+        let mut picker = Picker::sources();
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            PickResult::Source(ExternalSource::Codex)
+        ));
+        picker.handle_key(KeyEvent::from(KeyCode::Down));
+        assert!(matches!(
+            picker.handle_key(KeyEvent::from(KeyCode::Enter)),
+            PickResult::Source(ExternalSource::Claude)
+        ));
     }
 }

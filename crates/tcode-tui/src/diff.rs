@@ -148,26 +148,14 @@ pub fn edit_diff(path: &str, old: &str, new: &str) -> Vec<Line<'static>> {
                 }
             };
             let (text, ranges) = inline_emphasis(&change);
-            // One rule, two outcomes, chosen by whether the pair is similar
-            // enough to pinpoint the change:
-            //   similar (ranges present) -> leave shared text plain and light
-            //       up only the differing bytes;
-            //   rewrite (ranges empty)   -> fill the whole line with the calm
-            //       base colour and emphasise nothing.
-            // Equal lines carry Color::Reset and empty ranges, so they land on
-            // the "no fill, no emphasis" corner and stay untouched.
-            let (background, emphasis) = if ranges.is_empty() {
-                let fill = (change.tag() != ChangeTag::Equal).then_some(base_bg);
-                (fill, None)
-            } else {
-                (
-                    None,
-                    Some(Emphasis {
-                        ranges,
-                        bg: emphasis_bg,
-                    }),
-                )
-            };
+            // Changed lines always retain their polarity. A local correction
+            // overlays only its changed words; a rewrite keeps the calm base
+            // fill without pretending it has useful token-level matches.
+            let background = (change.tag() != ChangeTag::Equal).then_some(base_bg);
+            let emphasis = (!ranges.is_empty()).then_some(Emphasis {
+                ranges,
+                bg: emphasis_bg,
+            });
             lines.push(code_line_emphasized(
                 path,
                 marker,
@@ -430,15 +418,20 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(emphasized.trim(), "red");
-        let plain: String = added
+        let shared: String = added
             .spans
             .iter()
             .skip(3)
-            .filter(|span| span.style.bg.is_none())
+            .filter(|span| span.style.bg == Some(theme::diff_add_bg()))
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(plain.contains("quick"), "shared words carry no background");
-        assert!(plain.contains("jumps over the lazy dog"));
+        assert!(
+            shared.contains("quick"),
+            "shared words keep the add base background"
+        );
+        assert!(shared.contains("jumps over the lazy dog"));
+        assert_eq!(added.spans[0].style.bg, Some(theme::diff_add_bg()));
+        assert_eq!(added.spans[1].style.bg, Some(theme::diff_add_bg()));
     }
 
     /// A line with nothing in common can't pinpoint a difference, so it gets a

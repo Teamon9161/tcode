@@ -289,6 +289,7 @@ impl Tool for McpTool {
     fn permission(&self, _input: &Value) -> PermissionRequest {
         PermissionRequest::Ask {
             descriptor: self.full_name.clone(),
+            aliases: Vec::new(),
             summary: format!("{} (mcp server '{}')", self.tool_name, self.client.server),
             is_edit: false,
         }

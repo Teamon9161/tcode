@@ -49,6 +49,9 @@ pub struct Transcript {
     selection: Option<Selection>,
     /// Block emphasized by rewind navigation.
     highlight: Option<usize>,
+    /// Collapsible block currently under the pointer. The only visual change is
+    /// its fold affordance and a light underline, so diff polarity remains intact.
+    hovered: Option<usize>,
 }
 
 /// Lines wrapped at a width. `starts` is aligned with `lines`: true where
@@ -179,14 +182,14 @@ struct Block {
 }
 
 impl Block {
-    fn rewrap(&mut self, width: u16) {
+    fn rewrap(&mut self, width: u16, hovered: bool) {
         if let Some(detail) = &mut self.detail {
             detail.rewrap(width);
         }
-        self.head_wrapped = Wrapped::of(&self.display_head(width), width);
+        self.head_wrapped = Wrapped::of(&self.display_head(width, hovered), width);
     }
 
-    fn display_head(&self, width: u16) -> Vec<Line<'static>> {
+    fn display_head(&self, width: u16, hovered: bool) -> Vec<Line<'static>> {
         let mut head = self.head.lines_at(width);
         if let (Some(last), Some(detail)) = (head.last_mut(), &self.detail) {
             // Keep the fold affordance in the same logical line as the preview,
@@ -195,11 +198,13 @@ impl Block {
             // extra row on narrow panes.
             last.spans.push(if detail.open {
                 Span::styled("  ▾", crate::theme::accent())
-            } else {
+            } else if hovered {
                 Span::styled(
                     format!("  ▸ {} lines", detail.lines.len()),
                     crate::theme::accent(),
                 )
+            } else {
+                Span::raw("")
             });
         }
         head
@@ -241,6 +246,7 @@ impl Transcript {
             view_top: 0,
             selection: None,
             highlight: None,
+            hovered: None,
         }
     }
 
@@ -359,7 +365,7 @@ impl Transcript {
         block.head = head;
         block.detail = None;
         block.entry = None;
-        block.rewrap(self.width);
+        block.rewrap(self.width, self.hovered == Some(index));
         let new_height = block.height();
         if self.scroll > 0 {
             if new_height >= old_height {
@@ -372,7 +378,7 @@ impl Transcript {
     }
 
     fn push_block(&mut self, mut block: Block) {
-        block.rewrap(self.width);
+        block.rewrap(self.width, false);
         let height = block.height();
         self.cum.push(self.total() + height);
         self.blocks.push(block);
@@ -389,6 +395,7 @@ impl Transcript {
         self.scroll = 0;
         self.selection = None;
         self.highlight = None;
+        self.hovered = None;
     }
 
     /// Number of blocks — a stable mark to `truncate_blocks` back to.
@@ -405,6 +412,7 @@ impl Transcript {
         self.blocks.truncate(n);
         self.selection = None;
         self.highlight = None;
+        self.hovered = None;
         self.scroll = 0;
         self.rebuild_cum();
     }
@@ -444,6 +452,7 @@ impl Transcript {
         self.blocks.truncate(index);
         self.selection = None;
         self.highlight = None;
+        self.hovered = None;
         self.scroll = 0;
         self.rebuild_cum();
         true
@@ -457,8 +466,9 @@ impl Transcript {
         self.width = width;
         // Row coordinates shift when everything rewraps.
         self.selection = None;
+        self.hovered = None;
         for block in &mut self.blocks {
-            block.rewrap(width);
+            block.rewrap(width, false);
         }
         self.rebuild_cum();
     }
@@ -550,6 +560,11 @@ impl Transcript {
                     },
                     buf,
                 );
+                if self.hovered == Some(index) {
+                    for x in area.left()..area.right() {
+                        buf[(x, y)].modifier.insert(Modifier::UNDERLINED);
+                    }
+                }
                 if self.highlight == Some(index) {
                     for x in area.left()..area.right() {
                         buf[(x, y)].set_style(
@@ -604,6 +619,34 @@ impl Transcript {
         ))
     }
 
+    /// Update hover state from a terminal mouse-move event. Closed details keep
+    /// their line count quiet until the pointer makes the block actionable.
+    pub fn mouse_moved(&mut self, x: u16, y: u16) {
+        let hovered = self
+            .pos_at(x, y)
+            .and_then(|(row, _)| self.block_at(row))
+            .map(|(index, _)| index)
+            .filter(|&index| self.blocks[index].detail.is_some());
+        if hovered == self.hovered {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.hovered, hovered);
+        for index in [previous, hovered].into_iter().flatten() {
+            self.blocks[index].rewrap(self.width, self.hovered == Some(index));
+        }
+        self.rebuild_cum();
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    pub fn clear_hover(&mut self) {
+        let Some(index) = self.hovered.take() else {
+            return;
+        };
+        self.blocks[index].rewrap(self.width, false);
+        self.rebuild_cum();
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
     /// Wheel input: an open, overflowing detail region under the cursor
     /// scrolls internally; everywhere else scrolls the transcript.
     pub fn wheel(&mut self, x: u16, y: u16, up: bool, step: usize) {
@@ -632,12 +675,13 @@ impl Transcript {
         let Some((index, _)) = self.block_at(row) else {
             return;
         };
+        let hovered = self.hovered == Some(index);
         let block = &mut self.blocks[index];
         let Some(detail) = block.detail.as_mut() else {
             return;
         };
         detail.open = !detail.open;
-        block.rewrap(self.width);
+        block.rewrap(self.width, hovered);
         self.rebuild_cum();
         self.scroll = self.scroll.min(self.max_scroll());
     }
@@ -979,7 +1023,11 @@ mod tests {
         assert_eq!(t.drag_edge(0), None);
         t.mouse_down(0, 1);
         assert_eq!(t.drag_edge(0), Some(true), "top row scrolls toward history");
-        assert_eq!(t.drag_edge(3), Some(false), "bottom row scrolls toward tail");
+        assert_eq!(
+            t.drag_edge(3),
+            Some(false),
+            "bottom row scrolls toward tail"
+        );
         assert_eq!(t.drag_edge(2), None, "inside the view does not scroll");
     }
 
@@ -1167,7 +1215,11 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
-        // Closed: affordance advertises how much is hidden.
+        // Closed details stay quiet until the block is actionable under the pointer.
+        assert!(!buffer_text(&buf, area).contains("▸ 3 lines"));
+        t.mouse_moved(0, 0);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
         assert!(buffer_text(&buf, area).contains("▸ 3 lines"));
 
         t.mouse_down(0, 0);

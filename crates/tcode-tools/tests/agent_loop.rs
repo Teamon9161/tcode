@@ -103,6 +103,7 @@ impl Approver for ScriptedApprover {
         _tool: &str,
         _summary: &str,
         descriptor: &str,
+        _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
         self.asked.lock().unwrap().push(descriptor.to_string());
@@ -381,6 +382,64 @@ fn session(dir: &std::path::Path, mode: PermissionMode) -> Session {
     )
 }
 
+#[test]
+fn resumed_compacted_history_estimates_only_summary_and_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let discarded = "obsolete implementation detail ".repeat(20_000);
+    let summary = "Kept decision: use the shared context estimator.";
+    let tail = "Implement the regression test next.";
+
+    let mut persisted = session(dir.path(), PermissionMode::Default);
+    persisted.set_opening_context("project map".into());
+    let store = tcode_core::SessionStore::create(dir.path(), dir.path()).unwrap();
+    persisted.ledger.attach_sink(Box::new(store));
+    persisted
+        .ledger
+        .append(Entry::User(vec![ContentBlock::Text {
+            text: discarded.clone(),
+        }]));
+    persisted.ledger.compact(summary.into(), 1);
+    persisted
+        .ledger
+        .append(Entry::User(vec![ContentBlock::Text { text: tail.into() }]));
+    drop(persisted);
+
+    let resumed = tcode_core::SessionStore::resume(dir.path(), None).unwrap();
+    let provider = MockProvider::new(Vec::new());
+    let agent = agent(provider);
+    let mut restored = session(dir.path(), PermissionMode::Default);
+    restored.replace_opening_context_for_resume("project map".into());
+    restored.ledger = resumed.ledger;
+
+    let mut expected = session(dir.path(), PermissionMode::Default);
+    expected.set_opening_context("project map".into());
+    expected.ledger.append(Entry::Summary(summary.into()));
+    expected
+        .ledger
+        .append(Entry::User(vec![ContentBlock::Text { text: tail.into() }]));
+
+    let mut uncompacted = session(dir.path(), PermissionMode::Default);
+    uncompacted.set_opening_context("project map".into());
+    uncompacted
+        .ledger
+        .append(Entry::User(vec![ContentBlock::Text { text: discarded }]));
+    uncompacted
+        .ledger
+        .append(Entry::User(vec![ContentBlock::Text { text: tail.into() }]));
+
+    assert_eq!(restored.ledger.entries().len(), 2);
+    assert!(matches!(restored.ledger.entries()[0], Entry::Summary(_)));
+    assert_eq!(
+        agent.estimate_context_tokens(&restored),
+        agent.estimate_context_tokens(&expected),
+        "resume must estimate the compacted request shape, not replayed source history"
+    );
+    assert!(
+        agent.estimate_context_tokens(&restored) < agent.estimate_context_tokens(&uncompacted),
+        "the compacted-away prefix must not consume context"
+    );
+}
+
 async fn run(
     agent: &Agent,
     session: &mut Session,
@@ -476,6 +535,37 @@ async fn loop_runs_tool_and_feeds_result_back() {
         .iter()
         .any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "read")));
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
+}
+
+#[tokio::test]
+async fn at_reference_expands_project_file_into_the_user_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("context.txt"), "reference payload").unwrap();
+    let provider = MockProvider::new(vec![text_done("understood")]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "review @context.txt").await;
+
+    let Entry::User(blocks) = &session.ledger.entries()[0] else {
+        panic!("first ledger entry must be the user prompt");
+    };
+    let text = blocks
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(text.contains("review @context.txt"));
+    assert!(text.contains("Project reference file `context.txt`"));
+    assert!(text.contains("reference payload"));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ReferencesExpanded { labels, .. } if labels == &["context.txt"]
+    )));
 }
 
 #[tokio::test]
@@ -824,7 +914,7 @@ async fn yes_always_adds_session_rule() {
     ]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Default);
-    let approver = ScriptedApprover::new(ApprovalDecision::YesAlways, None);
+    let approver = ScriptedApprover::new(ApprovalDecision::YesSession, None);
 
     run(&agent, &mut session, &approver, "write twice").await;
 
@@ -1928,6 +2018,7 @@ impl Approver for StagingApprover {
         _tool: &str,
         _summary: &str,
         _descriptor: &str,
+        _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
         self.pending_mode.set(self.stage);

@@ -15,11 +15,14 @@ use serde_json::Value;
 use tcode_core::{Approval, ApprovalDecision, PermissionMode};
 
 use crate::editor::Editor;
+use crate::markdown::Document;
 use crate::theme;
 
 pub struct Dialog {
     pub summary: String,
     pub descriptor: String,
+    /// Only ordinary tool authorization requests can add a project rule.
+    project_option: bool,
     /// ToolStart-format call summary. A declined call never emits
     /// ToolStart, so the dialog supplies the line to bake instead.
     pub call_summary: String,
@@ -38,6 +41,17 @@ pub struct Dialog {
     /// OS IME composition window has an anchor that tracks the caret; the
     /// in-buffer `▏` is only the visual marker. `None` when no note is focused.
     cursor_cell: Cell<Option<(u16, u16)>>,
+    /// Rows occupied by the visible note editor in the most recent render.
+    /// This lets mouse clicks use the same wrapped geometry as the caret.
+    note_hitbox: Cell<Option<NoteHitbox>>,
+    /// Current panel width, captured during render so ↑↓ follows visual wraps.
+    note_width: Cell<u16>,
+}
+
+#[derive(Clone, Copy)]
+struct NoteHitbox {
+    first_row: usize,
+    rows: usize,
 }
 
 /// The plan-review surface: the plan itself rendered inside the panel,
@@ -103,12 +117,11 @@ struct PlanMousePosition {
 }
 
 /// One plan block (a heading, paragraph, code block, table, or list item) with
-/// its pre-rendered markdown and any review comments anchored to it.
+/// its parsed Markdown retained until the review pane knows its actual width.
 struct PlanBlock {
     /// Verbatim markdown source, for quoting into feedback.
     source: String,
-    /// Rendered markdown, unwrapped; wrapped to display width at render time.
-    lines: Vec<Line<'static>>,
+    document: Document,
     comments: Vec<PlanComment>,
 }
 
@@ -254,11 +267,13 @@ impl Choice {
     }
 }
 
-const OPTIONS: [(&str, ApprovalDecision); 3] = [
+const OPTIONS: [(&str, ApprovalDecision); 2] = [
     ("Yes", ApprovalDecision::Yes),
-    ("Yes, don't ask again for this", ApprovalDecision::YesAlways),
-    ("No", ApprovalDecision::No),
+    ("Yes, for this session", ApprovalDecision::YesSession),
 ];
+const PROJECT_OPTION: (&str, ApprovalDecision) =
+    ("Yes, allow in this project", ApprovalDecision::YesProject);
+const DENY_OPTION: (&str, ApprovalDecision) = ("No", ApprovalDecision::No);
 
 /// "  note: " prefix width; continuation rows are indented to match.
 const NOTE_INDENT: usize = 8;
@@ -383,10 +398,16 @@ impl QuestionPage {
 }
 
 impl Dialog {
-    pub fn new(summary: String, descriptor: String, call_summary: String) -> Self {
+    pub fn new(
+        summary: String,
+        descriptor: String,
+        call_summary: String,
+        project_option: bool,
+    ) -> Self {
         Self {
             summary,
             descriptor,
+            project_option,
             call_summary,
             selected: 0,
             note: Editor::new(),
@@ -394,25 +415,28 @@ impl Dialog {
             questions: None,
             plan: None,
             cursor_cell: Cell::new(None),
+            note_hitbox: Cell::new(None),
+            note_width: Cell::new(80),
         }
     }
 
     /// A plan-review prompt. The plan itself is the review surface: it renders
     /// inside this pane, navigable block by block. `title` names the plan;
     /// `input` is the verbatim `exit_plan` tool input; `blocks` pairs each
-    /// block's verbatim source with its pre-rendered markdown lines.
-    pub fn plan(title: String, input: Value, blocks: Vec<(String, Vec<Line<'static>>)>) -> Self {
+    /// block's verbatim source with its parsed Markdown.
+    pub fn plan(title: String, input: Value, blocks: Vec<(String, Document)>) -> Self {
         let blocks: Vec<PlanBlock> = blocks
             .into_iter()
-            .map(|(source, lines)| PlanBlock {
+            .map(|(source, document)| PlanBlock {
                 source,
-                lines,
+                document,
                 comments: Vec::new(),
             })
             .collect();
         Self {
             summary: title,
             descriptor: "exit_plan".into(),
+            project_option: false,
             call_summary: String::new(),
             selected: 0,
             note: Editor::new(),
@@ -434,6 +458,8 @@ impl Dialog {
                 revised: None,
             }),
             cursor_cell: Cell::new(None),
+            note_hitbox: Cell::new(None),
+            note_width: Cell::new(80),
         }
     }
 
@@ -453,7 +479,7 @@ impl Dialog {
     /// pre-rendered by the frontend, which owns the markdown renderer), and
     /// earlier per-block comments are dropped because their anchors may be stale.
     /// Reopening the editor and restoring the original clears a prior revision.
-    pub fn revise_plan(&mut self, revised: String, blocks: Vec<(String, Vec<Line<'static>>)>) {
+    pub fn revise_plan(&mut self, revised: String, blocks: Vec<(String, Document)>) {
         let Some(plan) = self.plan.as_mut() else {
             return;
         };
@@ -465,9 +491,9 @@ impl Dialog {
         let restores_original = revised.trim() == plan.original().trim();
         plan.blocks = blocks
             .into_iter()
-            .map(|(source, lines)| PlanBlock {
+            .map(|(source, document)| PlanBlock {
                 source,
-                lines,
+                document,
                 comments: Vec::new(),
             })
             .collect();
@@ -495,6 +521,7 @@ impl Dialog {
         Self {
             summary,
             descriptor: "ask_user".into(),
+            project_option: false,
             call_summary: String::new(),
             selected: 0,
             note: Editor::new(),
@@ -502,6 +529,8 @@ impl Dialog {
             questions: Some(Questions { pages, page: 0 }),
             plan: None,
             cursor_cell: Cell::new(None),
+            note_hitbox: Cell::new(None),
+            note_width: Cell::new(80),
         }
     }
 
@@ -511,6 +540,13 @@ impl Dialog {
 
     pub fn is_plan(&self) -> bool {
         self.plan.is_some()
+    }
+
+    /// Only plan review owns a scrollable body. Ordinary tool approvals keep
+    /// their choices compact while the pre-baked change remains scrollable in
+    /// the transcript behind the dialog.
+    pub fn owns_wheel(&self) -> bool {
+        self.is_plan()
     }
 
     fn note_text(&self) -> String {
@@ -549,6 +585,15 @@ impl Dialog {
         }
     }
 
+    fn approval_options(&self) -> Vec<(&'static str, ApprovalDecision)> {
+        let mut options = OPTIONS.to_vec();
+        if self.project_option {
+            options.push(PROJECT_OPTION);
+        }
+        options.push(DENY_OPTION);
+        options
+    }
+
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
         if self.plan.is_some() {
             return self.handle_plan_key(key);
@@ -557,11 +602,13 @@ impl Dialog {
             return self.handle_question_key(key);
         }
         use crossterm::event::KeyCode as K;
+        let options = self.approval_options();
+        let note_width = self.note_width.get();
         match key.code {
             K::Tab => self.note_focused = !self.note_focused,
             K::Enter => {
                 let note = self.note_text();
-                let decision = OPTIONS[self.selected].1;
+                let decision = options[self.selected].1;
                 return DialogResult::Done(Approval::simple(
                     decision,
                     Some(note).filter(|s| !s.is_empty()),
@@ -580,15 +627,21 @@ impl Dialog {
             K::End if self.note_focused => self.note.end(),
             K::Delete if self.note_focused => self.note.delete(),
             K::Backspace if self.note_focused => self.note.backspace(),
+            K::Up if self.note_focused => {
+                move_wrapped_note_cursor(&mut self.note, false, note_width)
+            }
+            K::Down if self.note_focused => {
+                move_wrapped_note_cursor(&mut self.note, true, note_width)
+            }
             K::Up if !self.note_focused => {
-                self.selected = self.selected.checked_sub(1).unwrap_or(OPTIONS.len() - 1)
+                self.selected = self.selected.checked_sub(1).unwrap_or(options.len() - 1)
             }
             K::Down if !self.note_focused => {
-                self.selected = (self.selected + 1) % OPTIONS.len();
+                self.selected = (self.selected + 1) % options.len();
             }
             K::Char(c) if !self.note_focused && c.is_ascii_digit() => {
                 let index = (c as usize).wrapping_sub('1' as usize);
-                if index < OPTIONS.len() {
+                if index < options.len() {
                     self.selected = index;
                 } else {
                     // A digit with no matching option is note text, not a hotkey.
@@ -610,6 +663,7 @@ impl Dialog {
     fn handle_question_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
         use crossterm::event::KeyCode as K;
         let focused = self.note_focused;
+        let note_width = self.note_width.get();
         match key.code {
             K::Tab => self.note_focused = !self.note_focused,
             K::Enter => return self.submit_or_advance(),
@@ -626,6 +680,12 @@ impl Dialog {
             K::End if focused => self.cur_page().note.end(),
             K::Delete if focused => self.cur_page().note.delete(),
             K::Backspace if focused => self.cur_page().note.backspace(),
+            K::Up if focused => {
+                move_wrapped_note_cursor(&mut self.cur_page().note, false, note_width)
+            }
+            K::Down if focused => {
+                move_wrapped_note_cursor(&mut self.cur_page().note, true, note_width)
+            }
             // Not editing a note: ←→ page between questions.
             K::Left => self.page_by(-1),
             K::Right => self.page_by(1),
@@ -720,12 +780,28 @@ impl Dialog {
         DialogResult::Done(Approval::simple(ApprovalDecision::Yes, Some(comment)))
     }
 
-    /// The note as display rows: cursor bar inserted when focused, then
-    /// soft-wrapped to the available width so long notes stay visible.
+    pub fn note_mouse_down(&mut self, row: usize, col: usize, width: u16) -> bool {
+        let Some(hitbox) = self.note_hitbox.get() else {
+            return false;
+        };
+        if row < hitbox.first_row || row >= hitbox.first_row + hitbox.rows {
+            return false;
+        }
+        let row = row - hitbox.first_row;
+        let display_col = col.saturating_sub(NOTE_INDENT);
+        self.note_focused = true;
+        if self.questions.is_some() {
+            set_wrapped_note_cursor(&mut self.cur_page().note, row, display_col, width);
+        } else {
+            set_wrapped_note_cursor(&mut self.note, row, display_col, width);
+        }
+        true
+    }
+
     fn note_rows(&self, note: &Editor, width: u16) -> Vec<String> {
         let text = note.text();
         let display = if self.note_focused {
-            let (_, col) = note.cursor();
+            let col = note.position().col;
             let byte = text
                 .char_indices()
                 .nth(col)
@@ -746,7 +822,13 @@ impl Dialog {
         } else {
             theme::dim()
         };
-        for (i, row) in self.note_rows(note, width).iter().enumerate() {
+        let first_row = out.len();
+        let rows = self.note_rows(note, width);
+        self.note_hitbox.set(Some(NoteHitbox {
+            first_row,
+            rows: rows.len(),
+        }));
+        for (i, row) in rows.iter().enumerate() {
             // The `▏` sentinel marks the caret; record its cell (before pushing,
             // so `out.len()` is this row's index) so the terminal cursor — and
             // the IME anchored to it — lands on it. NOTE_INDENT is the prefix.
@@ -774,6 +856,8 @@ impl Dialog {
     pub fn render(&self, width: u16, height: u16) -> Vec<Line<'static>> {
         // Recomputed below only when a note is focused; stale between renders.
         self.cursor_cell.set(None);
+        self.note_hitbox.set(None);
+        self.note_width.set(width);
         if self.plan.is_some() {
             return self.render_plan(width, height);
         }
@@ -802,19 +886,19 @@ impl Dialog {
         if out.is_empty() {
             out.push(Line::styled("● ", theme::accent()));
         }
-        for (i, (label, _)) in OPTIONS.iter().enumerate() {
+        let options = self.approval_options();
+        for (i, (label, decision)) in options.iter().enumerate() {
             let marker = if i == self.selected { "▸ " } else { "  " };
-            let label = if i == 1 {
-                format!("{label} ({})", self.descriptor)
-            } else {
-                (*label).to_string()
+            let label = match decision {
+                ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
+                    format!("{label} ({})", self.descriptor)
+                }
+                _ => (*label).to_string(),
             };
-            // Consent colours: approve is green, standing approval cyan,
-            // decline red.
-            let color = match i {
-                0 => theme::OK,
-                1 => theme::ACCENT,
-                _ => theme::ERROR,
+            let color = match decision {
+                ApprovalDecision::Yes => theme::OK,
+                ApprovalDecision::YesSession | ApprovalDecision::YesProject => theme::ACCENT,
+                ApprovalDecision::No => theme::ERROR,
             };
             let style = if i == self.selected {
                 ratatui::style::Style::default()
@@ -832,7 +916,7 @@ impl Dialog {
         out.push(Line::styled(
             format!(
                 "  ↑↓/1-{} choose · type/tab note · enter confirm · esc = no",
-                OPTIONS.len()
+                options.len()
             ),
             theme::dim(),
         ));
@@ -1160,7 +1244,10 @@ impl Dialog {
             } else {
                 Span::raw("  ")
             };
-            let mut wrapped = crate::transcript::wrap_lines(block.lines.clone(), text_w);
+            let mut wrapped = crate::transcript::wrap_lines(
+                block.document.lines_at(text_w.saturating_sub(1)),
+                text_w,
+            );
             if wrapped.is_empty() {
                 wrapped.push(Line::default());
             }
@@ -1700,6 +1787,52 @@ fn selected_plan_text(rows: &[Line<'_>], a: PlanMousePosition, b: PlanMousePosit
     selected.join("\n")
 }
 
+fn move_wrapped_note_cursor(editor: &mut Editor, down: bool, width: u16) {
+    use unicode_width::UnicodeWidthStr;
+
+    let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
+    let rows = wrap_cells(&editor.text(), avail);
+    let display_col = editor.cursor().1;
+    let mut base = 0usize;
+    let current = rows
+        .iter()
+        .position(|line| {
+            let end = base + line.width();
+            let found = display_col <= end;
+            if !found {
+                base = end;
+            }
+            found
+        })
+        .unwrap_or_else(|| rows.len().saturating_sub(1));
+    let target = if down {
+        (current + 1).min(rows.len().saturating_sub(1))
+    } else {
+        current.saturating_sub(1)
+    };
+    if target == current {
+        return;
+    }
+    let target_base: usize = rows.iter().take(target).map(|line| line.width()).sum();
+    editor.set_cursor_by_display_col(
+        0,
+        target_base + (display_col - base).min(rows[target].width()),
+    );
+}
+
+fn set_wrapped_note_cursor(editor: &mut Editor, row: usize, col: usize, width: u16) {
+    use unicode_width::UnicodeWidthStr;
+
+    let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
+    let rows = wrap_cells(&editor.text(), avail);
+    let base: usize = rows
+        .iter()
+        .take(row.min(rows.len().saturating_sub(1)))
+        .map(|line| line.width())
+        .sum();
+    editor.set_cursor_by_display_col(0, base + col);
+}
+
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut rows = vec![String::new()];
@@ -1727,7 +1860,22 @@ mod tests {
             "edit src/main.rs".into(),
             "edit(src/main.rs)".into(),
             "edit(src/main.rs)".into(),
+            false,
         )
+    }
+
+    #[test]
+    fn only_plan_review_owns_the_mouse_wheel() {
+        assert!(!dialog().owns_wheel());
+        let plan = Dialog::plan(
+            "Review plan".into(),
+            json!({ "plan": "# Plan" }),
+            vec![(
+                "# Plan".into(),
+                crate::markdown::Renderer::default().parse("# Plan"),
+            )],
+        );
+        assert!(plan.owns_wheel());
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1976,6 +2124,50 @@ mod tests {
     }
 
     #[test]
+    fn note_caret_uses_logical_columns_for_wide_characters() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "a中b");
+        d.handle_key(key(KeyCode::Left));
+        let _ = d.render(80, 40);
+        let (_, col) = d.cursor_cell().expect("caret after wide character");
+        assert_eq!(col, (NOTE_INDENT + 3) as u16);
+    }
+
+    #[test]
+    fn clicking_a_note_moves_its_editor_cursor() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "a中b");
+        let _ = d.render(80, 40);
+        let (row, _) = d.cursor_cell().expect("note cursor cell");
+        assert!(d.note_mouse_down(row as usize, NOTE_INDENT + 1, 80));
+        type_str(&mut d, "X");
+        let DialogResult::Done(approval) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should submit the annotation");
+        };
+        assert_eq!(approval.comment.as_deref(), Some("aX中b"));
+    }
+
+    #[test]
+    fn note_up_and_down_follow_visual_wrapping() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, &"x".repeat(25));
+        let _ = d.render(30, 40);
+        d.handle_key(key(KeyCode::Up));
+        type_str(&mut d, "A");
+        d.handle_key(key(KeyCode::Home));
+        d.handle_key(key(KeyCode::Down));
+        type_str(&mut d, "B");
+        let DialogResult::Done(approval) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should submit the annotation");
+        };
+        let expected = format!("{}A{}B{}", "x".repeat(5), "x".repeat(14), "x".repeat(6));
+        assert_eq!(approval.comment.as_deref(), Some(expected.as_str()));
+    }
+
+    #[test]
     fn long_note_wraps_and_grows_height() {
         let mut d = dialog();
         d.handle_key(key(KeyCode::Tab));
@@ -2014,7 +2206,7 @@ mod tests {
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter should confirm");
         };
-        assert_eq!(a.decision, ApprovalDecision::YesAlways);
+        assert_eq!(a.decision, ApprovalDecision::YesSession);
     }
 
     fn question_dialog(input: Value) -> Dialog {
@@ -2115,14 +2307,14 @@ mod tests {
         assert_eq!(a.comment, None);
     }
 
-    /// Blocks where each renders to a single line of its own source (enough to
-    /// exercise navigation, scrolling, quoting, and revision).
-    fn blocks_for(src: &str) -> Vec<(String, Vec<Line<'static>>)> {
+    /// Parsed blocks retain table structure until the dialog has its final width.
+    fn blocks_for(src: &str) -> Vec<(String, Document)> {
+        let markdown = crate::markdown::Renderer::default();
         crate::markdown::split_blocks(src)
             .into_iter()
-            .map(|b| {
-                let line = Line::from(b.clone());
-                (b, vec![line])
+            .map(|block| {
+                let document = markdown.parse(&block);
+                (block, document)
             })
             .collect()
     }

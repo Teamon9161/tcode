@@ -24,7 +24,7 @@ use tcode_core::commands::{
 };
 use tcode_core::{
     Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock,
-    PendingMessage, Session, Usage,
+    PendingMessage, ReferenceCandidate, ReferenceKind, Session, Usage,
 };
 
 use crate::approval::{Dialog, DialogResult};
@@ -83,6 +83,7 @@ pub struct AskMsg {
     pub tool: String,
     pub summary: String,
     pub descriptor: String,
+    pub allows_project: bool,
     pub input: serde_json::Value,
     pub reply: oneshot::Sender<Approval>,
 }
@@ -99,6 +100,7 @@ impl Approver for ChannelApprover {
         tool: &str,
         summary: &str,
         descriptor: &str,
+        allows_project: bool,
         input: &serde_json::Value,
     ) -> Approval {
         let (reply, rx) = oneshot::channel();
@@ -106,6 +108,7 @@ impl Approver for ChannelApprover {
             tool: tool.to_string(),
             summary: summary.to_string(),
             descriptor: descriptor.to_string(),
+            allows_project,
             input: input.clone(),
             reply,
         };
@@ -172,6 +175,20 @@ struct EditorVisualLine {
     start_col: usize,
     end_col: usize,
     selection: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
+enum CompletionKind {
+    Slash,
+    Reference { start: Position, end: Position },
+}
+
+#[derive(Clone)]
+struct CompletionMatch {
+    label: String,
+    description: String,
+    replacement: String,
+    kind: CompletionKind,
 }
 
 #[derive(Clone, Copy)]
@@ -291,6 +308,12 @@ pub struct App {
     approver: Arc<ChannelApprover>,
 
     editor: Editor,
+    /// Ignored-aware project paths used only for local `@` completion. The
+    /// core agent resolves selected markers at send time, so an old index can
+    /// never read a stale or outside-project path.
+    reference_index: Vec<ReferenceCandidate>,
+    reference_tx: mpsc::Sender<(PathBuf, Vec<ReferenceCandidate>)>,
+    reference_rx: mpsc::Receiver<(PathBuf, Vec<ReferenceCandidate>)>,
     /// Prompts submitted while a turn was running. The agent loop takes them at
     /// its next safe boundary; until then they show, dimmed, above the input.
     pending: tcode_core::PendingInput,
@@ -359,6 +382,9 @@ pub struct App {
     progress: Vec<ProgressPhase>,
     last_esc: Option<Instant>,
     popup_index: usize,
+    /// Tab accepted this exact `@` marker. Keep its completion closed until the
+    /// user changes the draft, rather than immediately matching it again.
+    dismissed_reference: Option<Position>,
 
     // Live streaming state: kept as a replace-in-place transcript block until
     // the provider finishes this assistant message.
@@ -370,6 +396,7 @@ pub struct App {
     thinking_chars: usize,
     thinking_text: String,
     thinking_since: Option<Instant>,
+    show_reasoning: bool,
     out_tokens: usize,
     delegated_usage: Usage,
     rate_limits: Option<tcode_core::RateLimits>,
@@ -419,9 +446,11 @@ impl App {
         menu: ModelMenu,
         agents: AgentMenu,
         opening_context: OpeningContextFn,
+        show_reasoning: bool,
     ) -> anyhow::Result<Self> {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
+        let (reference_tx, reference_rx) = mpsc::channel(1);
         let mode_label = session.mode.label().to_string();
         let committed_mode = session.mode;
         let pending_mode = session.pending_mode.clone();
@@ -430,7 +459,7 @@ impl App {
         let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
-            estimate_context_tokens(&agent, &session)
+            agent.estimate_context_tokens(&session)
         } else {
             session.last_prompt_tokens
         };
@@ -463,6 +492,9 @@ impl App {
             ask_rx,
             approver: Arc::new(ChannelApprover { tx: ask_tx }),
             editor: Editor::new(),
+            reference_index: Vec::new(),
+            reference_tx,
+            reference_rx,
             suggestion: None,
             suggest_cancel: None,
             suggest_gen: 0,
@@ -489,11 +521,13 @@ impl App {
             progress: Vec::new(),
             last_esc: None,
             popup_index: 0,
+            dismissed_reference: None,
             live_text: String::new(),
             live_block: None,
             thinking_chars: 0,
             thinking_text: String::new(),
             thinking_since: None,
+            show_reasoning,
             out_tokens: 0,
             delegated_usage: Usage::default(),
             rate_limits: None,
@@ -518,6 +552,7 @@ impl App {
         let banner = self.banner();
         self.bake(banner);
         self.bake_transcript();
+        self.refresh_reference_index();
         let mut term_events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -549,6 +584,12 @@ impl App {
                         self.suggestion = suggestion;
                     }
                 }
+                Some((cwd, index)) = self.reference_rx.recv() => {
+                    if cwd == self.cwd {
+                        self.reference_index = index;
+                        self.popup_index = 0;
+                    }
+                }
                 Some(ask) = self.ask_rx.recv() => {
                     if self.user_wait_started.is_none() {
                         self.user_wait_started = Some(Instant::now());
@@ -570,8 +611,8 @@ impl App {
                         let blocks = markdown::split_blocks(source)
                             .into_iter()
                             .map(|block| {
-                                let lines = self.md.render(&block);
-                                (block, lines)
+                                let document = self.md.parse(&block);
+                                (block, document)
                             })
                             .collect();
                         Dialog::plan(ask.summary, ask.input.clone(), blocks)
@@ -599,8 +640,14 @@ impl App {
                         }
                         // Diff lives in the transcript; the dialog carries only
                         // the choices.
-                        Dialog::new(ask.summary, ask.descriptor, call_summary)
+                        Dialog::new(
+                            ask.summary,
+                            ask.descriptor,
+                            call_summary,
+                            ask.allows_project,
+                        )
                     };
+                    self.transcript.clear_hover();
                     self.dialog = Some((dialog, ask.reply));
                 }
                 done = join_phase(&mut self.phase) => {
@@ -1134,7 +1181,7 @@ impl App {
         self.turn_usage = add_usage(session.turn_usage, self.delegated_usage);
         self.context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         if self.context_estimated {
-            session.last_prompt_tokens = estimate_context_tokens(&self.agent, &session);
+            session.last_prompt_tokens = self.agent.estimate_context_tokens(&session);
         }
         self.context_tokens = session.last_prompt_tokens;
         self.context_step_start = self.context_tokens;
@@ -1325,6 +1372,15 @@ impl App {
                 is_error,
                 ..
             } => {
+                if !is_error
+                    && self
+                        .agent
+                        .tools
+                        .iter()
+                        .any(|tool| tool.name() == name && tool.is_mutating())
+                {
+                    self.refresh_reference_index();
+                }
                 if !matches!(self.renderers.get(&name).route(), CallRoute::Transcript) {
                     self.state_label = "responding".into();
                     return;
@@ -1355,6 +1411,18 @@ impl App {
                     batch_header,
                 );
                 self.state_label = "responding".into();
+            }
+            AgentEvent::ReferencesExpanded {
+                labels,
+                added_tokens,
+            } => {
+                self.context_tokens = self.context_tokens.saturating_add(added_tokens as u64);
+                let count = labels.len();
+                let summary = labels.into_iter().take(2).collect::<Vec<_>>().join(", ");
+                let more = (count > 2)
+                    .then(|| format!(" +{}", count - 2))
+                    .unwrap_or_default();
+                self.notice = Some((format!("referenced {summary}{more}"), Instant::now()));
             }
             AgentEvent::QueuedInput {
                 text,
@@ -1510,7 +1578,9 @@ impl App {
                 // Approved: the tool runs, so its ToolStart bakes the plan and
                 // its ToolEnd result + the ModeChanged event carry the record.
                 // Nothing to add here.
-                ApprovalDecision::Yes | ApprovalDecision::YesAlways => {}
+                ApprovalDecision::Yes
+                | ApprovalDecision::YesSession
+                | ApprovalDecision::YesProject => {}
                 ApprovalDecision::No => {
                     // Keep-planning: no ToolStart/ToolEnd will fire, so bake the
                     // plan here (through the same ExitPlanRenderer path replay
@@ -1553,7 +1623,8 @@ impl App {
         match approval.decision {
             // The agent emits `UserNote` only after its tool result commits;
             // drawing it here would put live scrollback ahead of replay.
-            ApprovalDecision::Yes | ApprovalDecision::YesAlways => {}
+            ApprovalDecision::Yes | ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
+            }
             ApprovalDecision::No => {
                 // Retract the diff baked while the dialog was open — a
                 // declined change leaves only its one-line record.
@@ -1656,8 +1727,8 @@ impl App {
         let blocks = markdown::split_blocks(edited.trim())
             .into_iter()
             .map(|block| {
-                let lines = self.md.render(&block);
-                (block, lines)
+                let document = self.md.parse(&block);
+                (block, document)
             })
             .collect();
         if let Some((dialog, _)) = self.dialog.as_mut() {
@@ -1677,21 +1748,20 @@ impl App {
         }
     }
 
-    /// The `✻ reasoning …` block: a one-line head that folds open to the
-    /// provider's reasoning output (Anthropic thinking blocks, DeepSeek
-    /// `reasoning_content`, or a Codex reasoning summary). Rendering it as
-    /// Markdown keeps provider-supplied headings, emphasis and lists readable.
-    /// Live and replay share this entry point, so a resumed session displays
-    /// the same foldable record.
+    /// Provider reasoning remains in the ledger for replay, but is opt-in in the
+    /// transcript. When shown it is deliberately plain text rather than
+    /// Markdown, so an expanded detail does not compete with the answer.
     fn bake_thinking(&mut self, title: &str, text: &str) {
-        let head = vec![Line::styled(format!("✻ {title}"), theme::thinking())];
-        self.transcript.push_with_markdown_detail(
-            head,
-            self.md.parse(text),
-            Vec::new(),
-            false,
-            OUTPUT_VIEW_ROWS,
-        );
+        if !self.show_reasoning || text.trim().is_empty() {
+            return;
+        }
+        let head = vec![Line::styled(format!("✻ {title}"), theme::dim())];
+        let detail = text
+            .lines()
+            .map(|line| Line::raw(line.to_string()))
+            .collect();
+        self.transcript
+            .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
     }
 
     /// The `── earlier conversation compacted ──` divider, folding open to the
@@ -1998,17 +2068,37 @@ impl App {
     // ------------------------------------------------------------ keys
 
     fn on_dialog_mouse(&mut self, mouse: MouseEvent) {
+        // A proposed edit/write is deliberately baked into the transcript in
+        // full before its compact approval dialog opens. The dialog must not
+        // trap the wheel, or a long diff becomes visible only through the few
+        // transcript rows left above the panel with no way to inspect it.
+        let plan_owns_wheel = self
+            .dialog
+            .as_ref()
+            .is_some_and(|(dialog, _)| dialog.owns_wheel());
+        if !plan_owns_wheel {
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.transcript.wheel(
+                        mouse.column,
+                        mouse.row,
+                        mouse.kind == MouseEventKind::ScrollUp,
+                        WHEEL_STEP,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         let width = area_width(&self.terminal);
         let height = area_height(&self.terminal);
         let budget = height.saturating_sub(6);
         let Some((dialog, _)) = self.dialog.as_mut() else {
             return;
         };
-        if !dialog.is_plan() {
-            return;
-        }
         // Match `redraw`'s panel geometry so a screen coordinate is translated
-        // to the plan pane's border-free content row, not the transcript behind
+        // to the panel's border-free content row, not the transcript behind
         // the modal.
         let lines = dialog.render(width, budget);
         let panel_h = (lines.len() as u16 + 2)
@@ -2020,6 +2110,12 @@ impl App {
         }
         let row = mouse.row.saturating_sub(panel_top + 1) as usize;
         let col = mouse.column.saturating_sub(1) as usize;
+        if !dialog.is_plan() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                dialog.note_mouse_down(row, col, width);
+            }
+            return;
+        }
         match mouse.kind {
             // The plan pane owns its own viewport, including while its feedback
             // editor has focus. Do not let the modal trap the reviewer at the
@@ -2065,6 +2161,7 @@ impl App {
                     return;
                 }
                 match mouse.kind {
+                    MouseEventKind::Moved => self.transcript.mouse_moved(mouse.column, mouse.row),
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = mouse.kind == MouseEventKind::ScrollUp;
                         // Over the input box the wheel scrolls the prompt itself:
@@ -2117,7 +2214,7 @@ impl App {
             }
             // ratatui's autoresize adapts on the next draw; the transcript
             // rewraps lazily from the new area width.
-            Event::Resize(..) => {}
+            Event::Resize(..) => self.transcript.clear_hover(),
             _ => {}
         }
     }
@@ -2128,6 +2225,7 @@ impl App {
             match picker.handle_key(key) {
                 ResumePickResult::Pending => {}
                 ResumePickResult::Cancelled => self.resume_picker = None,
+                ResumePickResult::Import => self.resume_picker = Some(resume::Picker::sources()),
                 ResumePickResult::Current(id) => {
                     self.resume_picker = None;
                     self.resume_session(&id);
@@ -2297,9 +2395,20 @@ impl App {
             KeyCode::Enter => self.submit(running),
             KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Tab => {
-                if let Some(cmd) = self.popup_selection() {
-                    self.editor.clear();
-                    self.editor.insert_str(&cmd);
+                if let Some(completion) = self.popup_selection() {
+                    match completion.kind {
+                        CompletionKind::Slash => {
+                            self.dismissed_reference = None;
+                            self.editor.clear();
+                            self.editor.insert_str(&completion.replacement);
+                        }
+                        CompletionKind::Reference { start, end } => {
+                            self.editor
+                                .replace_range(start, end, &completion.replacement);
+                            self.dismissed_reference = Some(start);
+                        }
+                    }
+                    self.popup_index = 0;
                 }
             }
             KeyCode::Up => {
@@ -2314,7 +2423,8 @@ impl App {
             }
             KeyCode::Down => {
                 if self.popup_active() {
-                    self.popup_index = (self.popup_index + 1).min(self.popup_matches().len() - 1);
+                    self.popup_index =
+                        (self.popup_index + 1).min(self.completion_matches().len() - 1);
                 } else if !self.editor_visual_down() && self.editor.line_count() == 1 {
                     self.editor.history_next();
                 }
@@ -2336,13 +2446,18 @@ impl App {
             KeyCode::PageUp => self.transcript.page_up(),
             KeyCode::PageDown => self.transcript.page_down(),
             KeyCode::Backspace => {
+                self.dismissed_reference = None;
                 let consumed_attachment = self.backspace_attachment_token();
                 if !consumed_attachment {
                     self.editor.backspace();
                 }
             }
-            KeyCode::Delete => self.editor.delete(),
+            KeyCode::Delete => {
+                self.dismissed_reference = None;
+                self.editor.delete();
+            }
             KeyCode::Char(c) => {
+                self.dismissed_reference = None;
                 self.editor.insert_char(c);
                 self.popup_index = 0;
             }
@@ -2361,7 +2476,11 @@ impl App {
             return;
         }
         if trimmed.starts_with('/') {
-            let cmd = self.popup_selection().unwrap_or_else(|| trimmed.clone());
+            let cmd = self
+                .popup_selection()
+                .filter(|completion| matches!(&completion.kind, CompletionKind::Slash))
+                .map(|completion| completion.replacement)
+                .unwrap_or_else(|| trimmed.clone());
             self.editor.take();
             self.run_slash(&cmd);
             return;
@@ -2507,7 +2626,7 @@ impl App {
         // echo, e.g. compacted or imported conversations.)
         self.transcript.truncate_from_entry(index);
         session.ledger.truncate_tail(index);
-        session.last_prompt_tokens = estimate_context_tokens(&self.agent, session);
+        session.last_prompt_tokens = self.agent.estimate_context_tokens(session);
         self.context_tokens = session.last_prompt_tokens;
         self.context_step_start = self.context_tokens;
         self.context_estimated = !session.ledger.is_empty();
@@ -2748,6 +2867,7 @@ impl App {
         }
         // Cheap mirror sync instead of per-command effects: a command may
         // have moved the cwd (/cd) or cycled the permission mode (/mode).
+        let old_cwd = self.cwd.clone();
         if let Some(session) = self.session.as_ref() {
             self.cwd = session.tool_ctx.cwd.clone();
             self.scratch_dir = session.tool_ctx.scratch_dir.clone();
@@ -2755,6 +2875,10 @@ impl App {
             self.committed_mode = session.mode;
             self.pending_mode.clear();
             self.dogfood = session.dogfood();
+        }
+        if self.cwd != old_cwd {
+            self.reference_index.clear();
+            self.refresh_reference_index();
         }
     }
 
@@ -2904,6 +3028,7 @@ impl App {
     }
 
     fn cut_editor_selection_or_prompt(&mut self) {
+        self.dismissed_reference = None;
         if let Some(text) = self.editor.selected_text() {
             self.copy_input_text(text);
             self.editor.delete_selection();
@@ -2941,6 +3066,21 @@ impl App {
         self.notice = Some((format!("copied {what}"), Instant::now()));
     }
 
+    /// Schedule a fresh ignored-aware index without blocking terminal input.
+    /// Results carry their cwd, so a slow scan that finishes after `/cd` is
+    /// harmlessly discarded.
+    fn refresh_reference_index(&self) {
+        let cwd = self.cwd.clone();
+        let tx = self.reference_tx.clone();
+        tokio::spawn(async move {
+            let scan_cwd = cwd.clone();
+            let index = tokio::task::spawn_blocking(move || tcode_core::index_project(&scan_cwd))
+                .await
+                .unwrap_or_default();
+            let _ = tx.send((cwd, index)).await;
+        });
+    }
+
     fn paste_from_clipboard(&mut self) {
         let Some(clipboard) = self.clipboard.as_mut() else {
             return;
@@ -2970,6 +3110,7 @@ impl App {
     /// Discard the whole draft: editor text, attachments, and the token
     /// numbering that ties them together.
     fn clear_draft(&mut self) {
+        self.dismissed_reference = None;
         self.editor.clear();
         self.attachments.clear();
         self.next_attachment_id = 1;
@@ -2979,6 +3120,7 @@ impl App {
     /// cursor. The token is how the user sees, moves, and deletes it — pressing
     /// backspace right after it removes the whole thing (see `on_key`).
     fn add_attachment(&mut self, make: impl FnOnce(u32) -> Attachment) {
+        self.dismissed_reference = None;
         let id = self.next_attachment_id;
         self.next_attachment_id += 1;
         let att = make(id);
@@ -3009,6 +3151,7 @@ impl App {
     }
 
     fn on_paste_text(&mut self, text: String) {
+        self.dismissed_reference = None;
         let lines = text.lines().count().max(1);
         let chars = text.chars().count();
         if paste_should_fold(chars, lines) {
@@ -3025,29 +3168,129 @@ impl App {
     // ------------------------------------------------------- rendering
 
     fn popup_active(&self) -> bool {
-        self.dialog.is_none()
-            && self.editor.line_count() == 1
-            && self.editor.text().starts_with('/')
+        self.dialog.is_none() && !self.completion_matches().is_empty()
     }
 
-    fn popup_matches(&self) -> Vec<(&str, &str)> {
-        let prefix = self.editor.text();
-        UI_COMMANDS
+    fn completion_matches(&self) -> Vec<CompletionMatch> {
+        if self.dialog.is_some() {
+            return Vec::new();
+        }
+        if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {
+            let prefix = self.editor.text();
+            return UI_COMMANDS
+                .iter()
+                .copied()
+                .chain(self.registry.entries())
+                .filter(|(command, _)| command.starts_with(&prefix))
+                .map(|(command, description)| CompletionMatch {
+                    label: command.to_string(),
+                    description: description.to_string(),
+                    replacement: command.to_string(),
+                    kind: CompletionKind::Slash,
+                })
+                .collect();
+        }
+        let Some((start, end, query)) = self.active_reference() else {
+            return Vec::new();
+        };
+        if self.dismissed_reference == Some(start) {
+            return Vec::new();
+        }
+        let mut matches: Vec<(usize, &ReferenceCandidate)> = self
+            .reference_index
             .iter()
-            .copied()
-            .chain(self.registry.entries())
-            .filter(|(c, _)| c.starts_with(&prefix))
+            .filter_map(|candidate| {
+                reference_score(&candidate.path, &query).map(|score| (score, candidate))
+            })
+            .collect();
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            left_score
+                .cmp(right_score)
+                .then_with(|| left.path.cmp(&right.path))
+        });
+        let mut basename_counts = HashMap::new();
+        for (_, candidate) in &matches {
+            *basename_counts
+                .entry(reference_basename(&candidate.path))
+                .or_insert(0usize) += 1;
+        }
+        matches
+            .into_iter()
+            .take(8)
+            .map(|(_, candidate)| {
+                let path = reference_candidate_path(candidate);
+                let label_path = if basename_counts
+                    .get(reference_basename(&candidate.path))
+                    .copied()
+                    .unwrap_or_default()
+                    > 1
+                {
+                    path.clone()
+                } else {
+                    reference_basename_path(candidate)
+                };
+                let replacement = reference_marker(&path);
+                let size = candidate
+                    .bytes
+                    .map(format_bytes)
+                    .map(|size| format!(" · {size}"))
+                    .unwrap_or_default();
+                CompletionMatch {
+                    label: reference_marker(&label_path),
+                    description: format!("{}{}", candidate.display_kind(), size),
+                    replacement,
+                    kind: CompletionKind::Reference { start, end },
+                }
+            })
             .collect()
     }
 
-    fn popup_selection(&self) -> Option<String> {
-        if !self.popup_active() {
+    fn active_reference(&self) -> Option<(Position, Position, String)> {
+        let cursor = self.editor.position();
+        let line = self.editor.lines().get(cursor.row)?;
+        let chars: Vec<char> = line.chars().collect();
+        let at = (0..cursor.col)
+            .rev()
+            .find(|&index| chars[index] == '@' && reference_boundary(&chars, index))?;
+        let quoted = chars.get(at + 1) == Some(&'"');
+        let content_start = at + 1 + usize::from(quoted);
+        let mut token_end = content_start;
+        if quoted {
+            while token_end < chars.len() && chars[token_end] != '"' {
+                token_end += 1;
+            }
+            if token_end < chars.len() {
+                token_end += 1;
+            }
+        } else {
+            while token_end < chars.len() && reference_token_char(chars[token_end]) {
+                token_end += 1;
+            }
+        }
+        if cursor.col < content_start || cursor.col > token_end {
             return None;
         }
-        let matches = self.popup_matches();
+        let query: String = chars[content_start..cursor.col.min(token_end)]
+            .iter()
+            .collect();
+        Some((
+            Position {
+                row: cursor.row,
+                col: at,
+            },
+            Position {
+                row: cursor.row,
+                col: token_end,
+            },
+            query,
+        ))
+    }
+
+    fn popup_selection(&self) -> Option<CompletionMatch> {
+        let matches = self.completion_matches();
         matches
             .get(self.popup_index.min(matches.len().saturating_sub(1)))
-            .map(|(c, _)| (*c).to_string())
+            .cloned()
     }
 
     /// Finalize content into the transcript. Name kept from the inline era;
@@ -3074,7 +3317,7 @@ impl App {
         self.drop_suggestion();
         if let Some(session) = self.session.as_mut() {
             if session.last_prompt_tokens == 0 && !session.ledger.is_empty() {
-                session.last_prompt_tokens = estimate_context_tokens(&self.agent, session);
+                session.last_prompt_tokens = self.agent.estimate_context_tokens(session);
             }
             self.context_tokens = session.last_prompt_tokens;
             self.context_estimated = !session.ledger.is_empty();
@@ -3451,9 +3694,9 @@ impl App {
             .clone()
             .filter(|_| self.editor.is_empty() && !running);
         let popup: Vec<(String, String)> = if self.popup_active() {
-            self.popup_matches()
+            self.completion_matches()
                 .into_iter()
-                .map(|(c, d)| (c.to_string(), d.to_string()))
+                .map(|completion| (completion.label, completion.description))
                 .collect()
         } else {
             Vec::new()
@@ -3576,20 +3819,8 @@ impl App {
                         theme::user_prompt(),
                     )];
                     match vl.selection {
-                        Some((from, to)) => {
-                            let chars: Vec<char> = vl.text.chars().collect();
-                            let pre: String = chars[..from].iter().collect();
-                            let mid: String = chars[from..to].iter().collect();
-                            let post: String = chars[to..].iter().collect();
-                            if !pre.is_empty() {
-                                spans.push(Span::raw(pre));
-                            }
-                            spans.push(Span::styled(mid, theme::selection()));
-                            if !post.is_empty() {
-                                spans.push(Span::raw(post));
-                            }
-                        }
-                        None => spans.push(Span::raw(vl.text.clone())),
+                        Some(selection) => spans.extend(input_spans(&vl.text, Some(selection))),
+                        None => spans.extend(input_spans(&vl.text, None)),
                     }
                     Line::from(spans)
                 })
@@ -4066,73 +4297,6 @@ fn turn_summary_line(elapsed: f32, usage: Usage) -> Line<'static> {
     ])
 }
 
-/// JSONL persists the ledger but provider usage counters are deliberately
-/// ephemeral. On resume, estimate the request shape from the same pieces the
-/// provider receives (system prompt, tool definitions, and conversation).
-/// Image accounting varies by provider, so use a modest fixed placeholder
-/// until the first provider usage event corrects it.
-fn estimate_context_tokens(agent: &Agent, session: &Session) -> u64 {
-    let system = (approx_tokens(&agent.system) + approx_tokens(session.opening_context())) as u64;
-    let tool_defs: u64 = agent
-        .tools
-        .iter()
-        .map(|tool| {
-            let schema = serde_json::to_string(&tool.input_schema()).unwrap_or_default();
-            (approx_tokens(tool.name())
-                + approx_tokens(tool.description())
-                + approx_tokens(&schema)) as u64
-        })
-        .sum();
-    let conversation: u64 = session
-        .ledger
-        .entries()
-        .iter()
-        .map(|entry| match entry {
-            tcode_core::Entry::User(blocks)
-            | tcode_core::Entry::Assistant(blocks)
-            | tcode_core::Entry::ToolResults(blocks) => blocks
-                .iter()
-                .map(|block| match block {
-                    ContentBlock::Text { text } => approx_tokens(text) as u64,
-                    ContentBlock::Thinking {
-                        thinking,
-                        signature,
-                    } => {
-                        (approx_tokens(thinking)
-                            + signature.as_deref().map(approx_tokens).unwrap_or_default())
-                            as u64
-                    }
-                    ContentBlock::Image { .. } => 1_000,
-                    ContentBlock::ToolUse { id, name, input } => {
-                        (approx_tokens(id)
-                            + approx_tokens(name)
-                            + serde_json::to_string(input)
-                                .map(|json| approx_tokens(&json))
-                                .unwrap_or_default()) as u64
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content,
-                        ..
-                    } => (approx_tokens(tool_use_id) + approx_tokens(content)) as u64,
-                })
-                .sum(),
-            // These variants grow into small XML-like wrappers before the
-            // provider sees them, so reserve a little structural overhead.
-            tcode_core::Entry::Note(text) => approx_tokens(text) as u64 + 12,
-            tcode_core::Entry::UserNote { about, text, .. } => {
-                (approx_tokens(about) + approx_tokens(text)) as u64 + 24
-            }
-            tcode_core::Entry::Summary(text) => approx_tokens(text) as u64 + 24,
-            tcode_core::Entry::ImportedTool { .. }
-            | tcode_core::Entry::IncompleteAssistant { .. } => 0,
-        })
-        .sum();
-    system
-        .saturating_add(tool_defs)
-        .saturating_add(conversation)
-}
-
 fn area_width(terminal: &Term) -> u16 {
     terminal.size().map(|s| s.width).unwrap_or(80)
 }
@@ -4299,6 +4463,175 @@ fn selection_span(
 
 fn paste_should_fold(chars: usize, lines: usize) -> bool {
     chars > PASTE_FOLD_CHARS || lines > PASTE_FOLD_LINES
+}
+
+fn reference_boundary(chars: &[char], at: usize) -> bool {
+    at == 0 || (!chars[at - 1].is_alphanumeric() && chars[at - 1] != '_')
+}
+
+fn reference_token_char(c: char) -> bool {
+    !c.is_whitespace()
+        && !matches!(
+            c,
+            '@' | '`' | '"' | '\'' | ')' | '(' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
+        )
+}
+
+fn reference_score(path: &str, query: &str) -> Option<usize> {
+    let path = path.to_lowercase();
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return Some(0);
+    }
+    let basename = path.rsplit('/').next().unwrap_or(&path);
+    if basename.starts_with(&query) {
+        return Some(0);
+    }
+    if path.starts_with(&query) {
+        return Some(1);
+    }
+    let mut next = 0;
+    let mut gaps = 0;
+    for wanted in query.chars() {
+        let found = path[next..].find(wanted)?;
+        gaps += found;
+        next += found + wanted.len_utf8();
+    }
+    Some(10 + gaps)
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn reference_candidate_path(candidate: &ReferenceCandidate) -> String {
+    match candidate.kind {
+        ReferenceKind::Directory => format!("{}/", candidate.path),
+        ReferenceKind::File => candidate.path.clone(),
+    }
+}
+
+fn reference_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn reference_basename_path(candidate: &ReferenceCandidate) -> String {
+    let mut name = reference_basename(&candidate.path).to_string();
+    if matches!(candidate.kind, ReferenceKind::Directory) {
+        name.push('/');
+    }
+    name
+}
+
+fn reference_marker(path: &str) -> String {
+    if path.chars().any(char::is_whitespace) {
+        format!("@\"{path}\"")
+    } else {
+        format!("@{path}")
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum InputSpanStyle {
+    Plain,
+    Token,
+    Selection,
+}
+
+/// Style references and attachment placeholders directly in the input, while
+/// preserving selection highlighting as the higher-priority interaction state.
+fn input_spans(text: &str, selection: Option<(usize, usize)>) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let token_ranges = input_token_ranges(&chars);
+    let style_at = |index| {
+        if selection.is_some_and(|(from, to)| from <= index && index < to) {
+            InputSpanStyle::Selection
+        } else if token_ranges
+            .iter()
+            .any(|&(from, to)| from <= index && index < to)
+        {
+            InputSpanStyle::Token
+        } else {
+            InputSpanStyle::Plain
+        }
+    };
+
+    let mut spans = Vec::new();
+    let mut start = 0;
+    let mut style = style_at(0);
+    for index in 1..=chars.len() {
+        let next_style = (index < chars.len()).then(|| style_at(index));
+        if next_style == Some(style) {
+            continue;
+        }
+        let segment: String = chars[start..index].iter().collect();
+        let span = match style {
+            InputSpanStyle::Plain => Span::raw(segment),
+            InputSpanStyle::Token => Span::styled(segment, theme::accent()),
+            InputSpanStyle::Selection => Span::styled(segment, theme::selection()),
+        };
+        spans.push(span);
+        start = index;
+        if let Some(next_style) = next_style {
+            style = next_style;
+        }
+    }
+    spans
+}
+
+fn input_token_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+    let mut ranges = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '@' && reference_boundary(chars, index) {
+            let mut end = index + 1;
+            if chars.get(end) == Some(&'"') {
+                end += 1;
+                while end < chars.len() && chars[end] != '"' {
+                    end += 1;
+                }
+                if end < chars.len() {
+                    end += 1;
+                }
+            } else {
+                while end < chars.len() && reference_token_char(chars[end]) {
+                    end += 1;
+                }
+            }
+            ranges.push((index, end));
+            index = end;
+            continue;
+        }
+        let attachment_end = ["[Image #", "[Pasted text #"].iter().find_map(|prefix| {
+            let prefix_len = prefix.chars().count();
+            (chars[index..]
+                .iter()
+                .take(prefix_len)
+                .copied()
+                .eq(prefix.chars()))
+            .then(|| {
+                let mut end = index + prefix_len;
+                while end < chars.len() && chars[end].is_ascii_digit() {
+                    end += 1;
+                }
+                (end > index + prefix_len && chars.get(end) == Some(&']')).then_some(end + 1)
+            })
+            .flatten()
+        });
+        if let Some(end) = attachment_end {
+            ranges.push((index, end));
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    ranges
 }
 
 fn key_char_eq(key: &KeyEvent, target: char) -> bool {
@@ -4485,6 +4818,66 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(visible_phase_range(&phases, 5), (2, 7));
+    }
+
+    #[test]
+    fn input_tokens_are_accented_without_styling_email_text() {
+        let spans = input_spans("see @src/app.rs [Image #2] and me@example.com", None);
+        let accented: Vec<_> = spans
+            .iter()
+            .filter(|span| span.style.fg == Some(theme::ACCENT))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(accented, ["@src/app.rs", "[Image #2]"]);
+    }
+
+    #[test]
+    fn selection_overrides_input_token_accent() {
+        let spans = input_spans("@src/app.rs", Some((0, 11)));
+        assert_eq!(spans.len(), 1);
+        assert_ne!(spans[0].style.fg, Some(theme::ACCENT));
+    }
+
+    #[test]
+    fn reference_labels_use_basenames_unless_they_conflict() {
+        let file = ReferenceCandidate {
+            path: "crates/tcode-tui/src/app.rs".into(),
+            kind: ReferenceKind::File,
+            bytes: Some(1),
+        };
+        let directory = ReferenceCandidate {
+            path: "crates/tcode-tui/src".into(),
+            kind: ReferenceKind::Directory,
+            bytes: None,
+        };
+        assert_eq!(reference_basename_path(&file), "app.rs");
+        assert_eq!(reference_basename_path(&directory), "src/");
+        assert_eq!(
+            reference_marker(&reference_candidate_path(&file)),
+            "@crates/tcode-tui/src/app.rs"
+        );
+    }
+
+    #[test]
+    fn reference_matching_prefers_basenames_then_fuzzy_paths() {
+        assert_eq!(
+            reference_score("crates/tcode-tui/src/app.rs", "app"),
+            Some(0)
+        );
+        assert_eq!(
+            reference_score("crates/tcode-tui/src/app.rs", "crates"),
+            Some(1)
+        );
+        assert!(reference_score("crates/tcode-tui/src/app.rs", "tuiapp").is_some());
+        assert!(reference_score("crates/tcode-tui/src/app.rs", "xyz").is_none());
+    }
+
+    #[test]
+    fn reference_token_avoids_email_addresses() {
+        let email: Vec<char> = "me@example.com".chars().collect();
+        assert!(!reference_boundary(&email, 2));
+        let mention: Vec<char> = "read @src".chars().collect();
+        assert!(reference_boundary(&mention, 5));
     }
 
     #[test]

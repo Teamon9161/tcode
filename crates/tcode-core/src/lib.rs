@@ -16,6 +16,7 @@ pub mod ledger;
 pub mod memory;
 pub mod permission;
 pub mod provider;
+pub mod references;
 pub mod store;
 pub mod tool;
 pub mod types;
@@ -42,6 +43,7 @@ pub use provider::{
     ActiveModel, AgentModels, CacheStrategy, EventStream, ModelCell, Provider, ProviderError,
     Request, StreamEvent,
 };
+pub use references::{expand_references, index_project, ReferenceCandidate, ReferenceKind};
 pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

@@ -19,6 +19,7 @@ pub mod wizard;
 use std::io::stdout;
 use std::sync::Arc;
 
+use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
 };
@@ -48,13 +49,15 @@ pub async fn run(
     menu: ModelMenu,
     agents: AgentMenu,
     opening_context: OpeningContextFn,
+    show_reasoning: bool,
 ) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
     execute!(
         stdout(),
         EnterAlternateScreen,
         EnableBracketedPaste,
-        EnableMouseCapture
+        EnableMouseCapture,
+        SetCursorStyle::SteadyBar,
     )?;
 
     // Restore the terminal on panic, then let the default hook print.
@@ -64,7 +67,14 @@ pub async fn run(
         default_hook(info);
     }));
 
-    let result = match App::new(agent, session, menu, agents, opening_context) {
+    let result = match App::new(
+        agent,
+        session,
+        menu,
+        agents,
+        opening_context,
+        show_reasoning,
+    ) {
         Ok(mut app) => match app.run().await {
             Ok(()) if app.provider_setup_requested() => app
                 .take_session()

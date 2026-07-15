@@ -28,7 +28,14 @@ impl LineApprover {
 
 #[async_trait]
 impl Approver for LineApprover {
-    async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval {
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        allows_project: bool,
+        input: &Value,
+    ) -> Approval {
         if !self.interactive {
             println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
             println!("{DIM}  denied — a one-shot run (-p) has nobody to approve it{RESET}");
@@ -49,8 +56,11 @@ impl Approver for LineApprover {
         }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
+        let project_choice = allows_project
+            .then(|| format!(" / p (allow in this project: {descriptor})"))
+            .unwrap_or_default();
         print!(
-            "{DIM}  allow? y / a (always: {descriptor}) / n — append a note after y or n, e.g. \"y but use --dry-run\"{RESET}\n  > "
+            "{DIM}  allow? y / a (this session: {descriptor}){project_choice} / n — append a note after y or n, e.g. \"y but use --dry-run\"{RESET}\n  > "
         );
         let _ = std::io::stdout().flush();
         loop {
@@ -74,10 +84,16 @@ impl Approver for LineApprover {
             };
             let decision = match head.to_lowercase().as_str() {
                 "y" | "yes" | "" => ApprovalDecision::Yes,
-                "a" | "always" => ApprovalDecision::YesAlways,
+                "a" | "always" => ApprovalDecision::YesSession,
+                "p" | "project" if allows_project => ApprovalDecision::YesProject,
                 "n" | "no" => ApprovalDecision::No,
                 _ => {
-                    print!("{DIM}  y / a / n (+ optional note) > {RESET}");
+                    let choices = if allows_project {
+                        "y / a / p / n"
+                    } else {
+                        "y / a / n"
+                    };
+                    print!("{DIM}  {choices} (+ optional note) > {RESET}");
                     let _ = std::io::stdout().flush();
                     continue;
                 }

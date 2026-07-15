@@ -99,6 +99,9 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 let color = if is_error { RED } else { DIM };
                 println!("  {color}⎿ {preview}{RESET}");
             }
+            // The original @ marker is already visible in the prompt. Plain
+            // mode deliberately does not duplicate its bounded context block.
+            AgentEvent::ReferencesExpanded { .. } => {}
             AgentEvent::QueuedInput { text, .. } => println!("{CYAN}›{RESET} {text}"),
             AgentEvent::UserNote {
                 text,

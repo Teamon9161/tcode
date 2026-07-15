@@ -86,6 +86,13 @@ pub enum AgentEvent {
         content: String,
         is_error: bool,
     },
+    /// Reference context expanded from explicit `@path` markers immediately
+    /// before a user entry is appended. The transcript keeps the concise marker;
+    /// this event lets UI context meters count the hidden snapshot accurately.
+    ReferencesExpanded {
+        labels: Vec<String>,
+        added_tokens: usize,
+    },
     /// A message the user typed while the turn was running, now delivered into
     /// the ledger at a safe boundary (see `PendingInput`). It is a real user
     /// entry — the model reads it on its next step, and Auto Mode treats it as
@@ -186,6 +193,74 @@ impl Agent {
 
     fn tool_defs(&self) -> Vec<crate::ToolDef> {
         self.tools.iter().map(|t| t.as_ref().def()).collect()
+    }
+
+    /// Estimate the current request's context occupancy before a provider has
+    /// returned authoritative usage. Request construction belongs here, so
+    /// every frontend and resume path counts the same system prompt, tool
+    /// definitions and model-visible ledger entries.
+    pub fn estimate_context_tokens(&self, session: &Session) -> u64 {
+        use crate::blobs::approx_tokens;
+
+        let system = approx_tokens(&self.system_prompt(session)) as u64;
+        let tool_defs: u64 = self
+            .tool_defs()
+            .iter()
+            .map(|tool| {
+                let schema = serde_json::to_string(&tool.input_schema).unwrap_or_default();
+                (approx_tokens(&tool.name)
+                    + approx_tokens(&tool.description)
+                    + approx_tokens(&schema)) as u64
+            })
+            .sum();
+        let conversation: u64 = session
+            .ledger
+            .entries()
+            .iter()
+            .map(|entry| match entry {
+                Entry::User(blocks) | Entry::Assistant(blocks) | Entry::ToolResults(blocks) => {
+                    blocks
+                        .iter()
+                        .map(|block| match block {
+                            ContentBlock::Text { text } => approx_tokens(text) as u64,
+                            ContentBlock::Thinking {
+                                thinking,
+                                signature,
+                            } => {
+                                (approx_tokens(thinking)
+                                    + signature.as_deref().map(approx_tokens).unwrap_or_default())
+                                    as u64
+                            }
+                            // Provider-specific image accounting is unavailable
+                            // until usage arrives; reserve a conservative budget.
+                            ContentBlock::Image { .. } => 1_000,
+                            ContentBlock::ToolUse { id, name, input } => {
+                                (approx_tokens(id)
+                                    + approx_tokens(name)
+                                    + serde_json::to_string(input)
+                                        .map(|json| approx_tokens(&json))
+                                        .unwrap_or_default()) as u64
+                            }
+                            ContentBlock::ToolResult {
+                                tool_use_id,
+                                content,
+                                ..
+                            } => (approx_tokens(tool_use_id) + approx_tokens(content)) as u64,
+                        })
+                        .sum()
+                }
+                // These variants grow XML-like wrappers in Ledger::as_messages.
+                Entry::Note(text) => approx_tokens(text) as u64 + 12,
+                Entry::UserNote { about, text, .. } => {
+                    (approx_tokens(about) + approx_tokens(text)) as u64 + 24
+                }
+                Entry::Summary(text) => approx_tokens(text) as u64 + 24,
+                Entry::ImportedTool { .. } | Entry::IncompleteAssistant { .. } => 0,
+            })
+            .sum();
+        system
+            .saturating_add(tool_defs)
+            .saturating_add(conversation)
     }
 
     /// Apply Auto Mode's tool-declared fast paths and, only when necessary,
@@ -304,6 +379,22 @@ impl Agent {
         // Commit a mode staged before this turn and, if it just entered plan
         // mode, inject the plan-enter note ahead of the user's instruction.
         self.commit_mode(session, events).await?;
+        let expanded = crate::references::expand_references(
+            session.tool_ctx.cwd.clone(),
+            std::mem::take(&mut input),
+        )
+        .await;
+        input = expanded.blocks;
+        if !expanded.labels.is_empty() {
+            self.emit(
+                events,
+                AgentEvent::ReferencesExpanded {
+                    labels: expanded.labels,
+                    added_tokens: expanded.added_tokens,
+                },
+            )
+            .await?;
+        }
         if let Some(reminder) = session
             .tool_ctx
             .memory
@@ -640,7 +731,13 @@ impl Agent {
                 }
                 Decision::Ask | Decision::Auto => {
                     let approval = approver
-                        .ask(name, request.summary(), request.descriptor(), input)
+                        .ask(
+                            name,
+                            request.summary(),
+                            &request.approval_label(),
+                            request.allows_rule(),
+                            input,
+                        )
                         .await;
                     match approval.decision {
                         ApprovalDecision::Yes => {
@@ -648,10 +745,14 @@ impl Agent {
                             applied_mode = approval.set_mode;
                             approved_input = approval.approved_input;
                         }
-                        ApprovalDecision::YesAlways => {
-                            if request.allows_rule() {
-                                session.rules.allow.push(request.descriptor().to_string());
-                            }
+                        ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
+                            self.persist_approval_rule(
+                                session,
+                                &request,
+                                approval.decision,
+                                &mut notes,
+                            )
+                            .await;
                             approval_note = approval.comment;
                             applied_mode = approval.set_mode;
                             approved_input = approval.approved_input;
@@ -1061,14 +1162,22 @@ impl Agent {
                 }
                 Decision::Ask | Decision::Auto => {
                     let PermissionRequest::Ask {
-                        descriptor,
+                        descriptor: _,
                         summary,
                         ..
                     } = tool.permission(input)
                     else {
                         unreachable!("file mutation needs an edit approval")
                     };
-                    let approval = approver.ask(name, &summary, &descriptor, input).await;
+                    let approval = approver
+                        .ask(
+                            name,
+                            &summary,
+                            &request.approval_label(),
+                            request.allows_rule(),
+                            input,
+                        )
+                        .await;
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1079,8 +1188,14 @@ impl Agent {
                                 });
                             }
                         }
-                        ApprovalDecision::YesAlways => {
-                            session.rules.allow.push(descriptor);
+                        ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
+                            self.persist_approval_rule(
+                                session,
+                                &request,
+                                approval.decision,
+                                &mut notes,
+                            )
+                            .await;
                             if let Some(note) = approval.comment {
                                 notes.push(Entry::UserNote {
                                     about: name.clone(),
@@ -1385,18 +1500,26 @@ impl Agent {
                 }
                 Decision::Ask | Decision::Auto => {
                     let (PermissionRequest::Ask {
-                        descriptor,
+                        descriptor: _,
                         summary,
                         ..
                     }
                     | PermissionRequest::UserInput {
-                        descriptor,
+                        descriptor: _,
                         summary,
                     }) = &request
                     else {
                         unreachable!()
                     };
-                    let approval = approver.ask(name, summary, descriptor, input).await;
+                    let approval = approver
+                        .ask(
+                            name,
+                            summary,
+                            &request.approval_label(),
+                            request.allows_rule(),
+                            input,
+                        )
+                        .await;
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1407,10 +1530,14 @@ impl Agent {
                                 });
                             }
                         }
-                        ApprovalDecision::YesAlways => {
-                            if !matches!(request, PermissionRequest::UserInput { .. }) {
-                                session.rules.allow.push(descriptor.clone());
-                            }
+                        ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
+                            self.persist_approval_rule(
+                                session,
+                                &request,
+                                approval.decision,
+                                &mut notes,
+                            )
+                            .await;
                             if let Some(note) = approval.comment {
                                 notes.push(Entry::UserNote {
                                     about: name.clone(),
@@ -1663,8 +1790,21 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
         for message in session.pending.take() {
+            let expanded =
+                crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)
+                    .await;
             let entry_index = session.ledger.len();
-            session.ledger.append(Entry::User(message.blocks));
+            session.ledger.append(Entry::User(expanded.blocks));
+            if !expanded.labels.is_empty() {
+                self.emit(
+                    events,
+                    AgentEvent::ReferencesExpanded {
+                        labels: expanded.labels,
+                        added_tokens: expanded.added_tokens,
+                    },
+                )
+                .await?;
+            }
             self.emit(
                 events,
                 AgentEvent::QueuedInput {
@@ -1751,6 +1891,41 @@ impl Agent {
             content: blobs.gate(tool, content),
             is_error,
             images,
+        }
+    }
+
+    async fn persist_approval_rule(
+        &self,
+        session: &mut Session,
+        request: &PermissionRequest,
+        decision: ApprovalDecision,
+        notes: &mut Vec<Entry>,
+    ) {
+        if !request.allows_rule()
+            || !matches!(
+                decision,
+                ApprovalDecision::YesSession | ApprovalDecision::YesProject
+            )
+        {
+            return;
+        }
+        let descriptor = request.descriptor().to_string();
+        if !session.rules.allow.iter().any(|rule| rule == &descriptor) {
+            session.rules.allow.push(descriptor.clone());
+        }
+        if decision != ApprovalDecision::YesProject {
+            return;
+        }
+        match crate::config::Config::add_project_allow(session.tool_ctx.cwd.clone(), descriptor).await {
+            Ok(true) => notes.push(Entry::Note(
+                "Permission saved to .tcode/config.toml and allowed for this session.".into(),
+            )),
+            Ok(false) => notes.push(Entry::Note(
+                "Permission was already present in .tcode/config.toml and is allowed for this session.".into(),
+            )),
+            Err(error) => notes.push(Entry::Note(format!(
+                "Could not save the project permission ({error}); this approval remains effective for this session only."
+            ))),
         }
     }
 

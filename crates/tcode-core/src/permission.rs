@@ -83,21 +83,25 @@ impl PermissionRules {
                 )
             };
         }
-        let PermissionRequest::Ask {
-            descriptor,
-            is_edit,
-            ..
-        } = request
-        else {
+        let PermissionRequest::Ask { is_edit, .. } = request else {
             return Decision::Allow;
         };
-        // Deny always wins, regardless of mode.
-        if let Some(rule) = self.deny.iter().find(|r| pattern_match(r, descriptor)) {
+        let descriptors = request.rule_descriptors();
+        // Deny and explicit checkpoints span the canonical concept and every
+        // raw alias. This prevents a broad `run(*)` allow from bypassing a
+        // deliberate `bash(rm *)` denial.
+        if let Some(rule) = self.deny.iter().find(|rule| {
+            descriptors
+                .iter()
+                .any(|descriptor| pattern_match(rule, descriptor))
+        }) {
             return Decision::Deny(format!("denied by rule '{rule}'"));
         }
-        // Explicit human checkpoints cannot be auto-approved by either an
-        // allow rule or the classifier.
-        if self.ask.iter().any(|r| pattern_match(r, descriptor)) {
+        if self.ask.iter().any(|rule| {
+            descriptors
+                .iter()
+                .any(|descriptor| pattern_match(rule, descriptor))
+        }) {
             return Decision::Ask;
         }
         match mode {
@@ -107,14 +111,22 @@ impl PermissionRules {
             PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
             PermissionMode::Auto => {
-                if self.allow.iter().any(|r| pattern_match(r, descriptor)) {
+                if self.allow.iter().any(|rule| {
+                    descriptors
+                        .iter()
+                        .any(|descriptor| pattern_match(rule, descriptor))
+                }) {
                     Decision::Allow
                 } else {
                     Decision::Auto
                 }
             }
             _ => {
-                if self.allow.iter().any(|r| pattern_match(r, descriptor)) {
+                if self.allow.iter().any(|rule| {
+                    descriptors
+                        .iter()
+                        .any(|descriptor| pattern_match(rule, descriptor))
+                }) {
                     Decision::Allow
                 } else {
                     Decision::Ask
@@ -174,8 +186,11 @@ impl Approval {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalDecision {
     Yes,
-    /// Yes + persist an allow rule for this session.
-    YesAlways,
+    /// Yes + persist an allow rule until this session ends.
+    YesSession,
+    /// Yes + add the canonical descriptor to `.tcode/config.toml` while also
+    /// allowing this current call even if writing the config fails.
+    YesProject,
     No,
 }
 
@@ -184,7 +199,14 @@ pub enum ApprovalDecision {
 pub trait Approver: Send + Sync {
     /// `input` is included so an interactive front end can show the exact
     /// file change before asking for consent.
-    async fn ask(&self, tool: &str, summary: &str, descriptor: &str, input: &Value) -> Approval;
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        allows_project: bool,
+        input: &Value,
+    ) -> Approval;
 }
 
 #[cfg(test)]
@@ -194,9 +216,80 @@ mod tests {
     fn ask(descriptor: &str, is_edit: bool) -> PermissionRequest {
         PermissionRequest::Ask {
             descriptor: descriptor.into(),
+            aliases: Vec::new(),
             summary: String::new(),
             is_edit,
         }
+    }
+
+    fn shell_request(kind: &str, command: &str) -> PermissionRequest {
+        PermissionRequest::Ask {
+            descriptor: format!("run({command})"),
+            aliases: vec![format!("{kind}({command})")],
+            summary: String::new(),
+            is_edit: false,
+        }
+    }
+
+    #[test]
+    fn canonical_run_allows_both_shells_but_raw_rules_stay_specific() {
+        let canonical = PermissionRules {
+            allow: vec!["run(cargo *)".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            canonical.decide(
+                PermissionMode::Default,
+                &shell_request("shell", "cargo test")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            canonical.decide(
+                PermissionMode::Default,
+                &shell_request("bash", "cargo test")
+            ),
+            Decision::Allow
+        );
+
+        let legacy = PermissionRules {
+            allow: vec!["shell(cargo *)".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            legacy.decide(
+                PermissionMode::Default,
+                &shell_request("shell", "cargo test")
+            ),
+            Decision::Allow
+        );
+        assert_eq!(
+            legacy.decide(
+                PermissionMode::Default,
+                &shell_request("bash", "cargo test")
+            ),
+            Decision::Ask
+        );
+    }
+
+    #[test]
+    fn raw_deny_and_ask_override_a_canonical_allow() {
+        let rules = PermissionRules {
+            allow: vec!["run(*)".into()],
+            ask: vec!["bash(cargo *)".into()],
+            deny: vec!["shell(rm *)".into()],
+        };
+        assert!(matches!(
+            rules.decide(PermissionMode::Unsafe, &shell_request("shell", "rm -rf x")),
+            Decision::Deny(_)
+        ));
+        assert_eq!(
+            rules.decide(
+                PermissionMode::Default,
+                &shell_request("bash", "cargo test")
+            ),
+            Decision::Ask
+        );
     }
 
     #[test]

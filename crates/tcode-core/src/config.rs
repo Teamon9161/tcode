@@ -18,6 +18,8 @@ pub enum ConfigError {
         path: PathBuf,
         source: Box<toml::de::Error>,
     },
+    #[error("failed to update {path}: {message}")]
+    Update { path: PathBuf, message: String },
     #[error("unknown profile '{0}' (available: {1})")]
     UnknownProfile(String, String),
     #[error("profile '{profile}': environment variable {var} is not set")]
@@ -299,11 +301,17 @@ pub struct UiConfig {
     /// (→ accepts it). It rides the turn's cached prefix, so it is cheap — but
     /// it is still one extra request per turn, and not everyone wants that.
     pub suggest_next: bool,
+    /// Show provider reasoning summaries in the transcript. Reasoning remains
+    /// in the persisted ledger for provider replay regardless of this setting.
+    pub show_reasoning: bool,
 }
 
 impl Default for UiConfig {
     fn default() -> Self {
-        Self { suggest_next: true }
+        Self {
+            suggest_next: true,
+            show_reasoning: false,
+        }
     }
 }
 
@@ -475,6 +483,24 @@ impl Config {
         project.agents.remove("auto");
         project.auto_mode = AutoModeConfig::default();
         project
+    }
+
+    /// Add a project-scoped allow rule without rewriting the user's hand-edited
+    /// TOML. The document is read immediately before writing so a later approval
+    /// merges with fields, comments and rules already on disk; the replacement
+    /// itself is staged in the same directory and atomically renamed.
+    pub async fn add_project_allow(
+        project_dir: PathBuf,
+        descriptor: String,
+    ) -> Result<bool, ConfigError> {
+        let error_path = project_dir.join(".tcode").join("config.toml");
+        let write_dir = project_dir.clone();
+        tokio::task::spawn_blocking(move || add_project_allow_blocking(&write_dir, &descriptor))
+            .await
+            .map_err(|error| ConfigError::Update {
+                path: error_path,
+                message: format!("project permission update task failed: {error}"),
+            })?
     }
 
     /// Serialize to the global config file (used by the setup wizard).
@@ -765,13 +791,119 @@ pub mod presets {
     }
 }
 
+fn add_project_allow_blocking(project_dir: &Path, descriptor: &str) -> Result<bool, ConfigError> {
+    use toml_edit::{Array, DocumentMut, Item, Table, Value};
+
+    let dir = project_dir.join(".tcode");
+    let path = dir.join("config.toml");
+    std::fs::create_dir_all(&dir).map_err(|source| ConfigError::Io {
+        path: dir.clone(),
+        source,
+    })?;
+    let source = if path.exists() {
+        std::fs::read_to_string(&path).map_err(|source| ConfigError::Io {
+            path: path.clone(),
+            source,
+        })?
+    } else {
+        String::new()
+    };
+    let mut document = source
+        .parse::<DocumentMut>()
+        .map_err(|error| ConfigError::Update {
+            path: path.clone(),
+            message: format!("invalid TOML: {error}"),
+        })?;
+    if document["permissions"].is_none() {
+        document["permissions"] = Item::Table(Table::new());
+    }
+    let permissions =
+        document["permissions"]
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::Update {
+                path: path.clone(),
+                message: "`permissions` must be a TOML table".into(),
+            })?;
+    if permissions["allow"].is_none() {
+        permissions["allow"] = Item::Value(Value::Array(Array::new()));
+    }
+    let allow = permissions["allow"]
+        .as_array_mut()
+        .ok_or_else(|| ConfigError::Update {
+            path: path.clone(),
+            message: "`permissions.allow` must be a TOML array".into(),
+        })?;
+    if allow.iter().any(|value| value.as_str() == Some(descriptor)) {
+        return Ok(false);
+    }
+    allow.push(descriptor);
+
+    let temporary = dir.join(format!(
+        ".config.toml.{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&temporary, document.to_string()).map_err(|source| ConfigError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    std::fs::rename(&temporary, &path).map_err(|source| {
+        let _ = std::fs::remove_file(&temporary);
+        ConfigError::Io {
+            path: path.clone(),
+            source,
+        }
+    })?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn project_allow_update_preserves_existing_toml_and_deduplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_dir = dir.path().join(".tcode");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        let file = config_dir.join("config.toml");
+        std::fs::write(
+            &file,
+            "# keep this comment\n[permissions]\nallow = [\"edit(src/lib.rs)\"]\n\n[custom]\nvalue = 1\n",
+        )
+        .unwrap();
+
+        assert!(
+            Config::add_project_allow(dir.path().to_path_buf(), "run(cargo test)".into())
+                .await
+                .unwrap()
+        );
+        assert!(
+            !Config::add_project_allow(dir.path().to_path_buf(), "run(cargo test)".into())
+                .await
+                .unwrap()
+        );
+
+        let text = std::fs::read_to_string(file).unwrap();
+        assert!(text.contains("# keep this comment"));
+        assert!(text.contains("edit(src/lib.rs)"));
+        assert!(text.contains("run(cargo test)"));
+        assert!(text.contains("[custom]"));
+    }
+
     #[test]
     fn default_connect_timeout_allows_slow_first_tokens() {
         assert_eq!(WatchdogConfig::default().connect_timeout_secs, 60);
+    }
+
+    #[test]
+    fn reasoning_display_is_hidden_unless_enabled() {
+        assert!(!UiConfig::default().show_reasoning);
+        let configured: UiConfig = toml::from_str("show_reasoning = true").unwrap();
+        assert!(configured.show_reasoning);
     }
 
     #[test]

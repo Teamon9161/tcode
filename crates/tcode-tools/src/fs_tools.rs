@@ -463,6 +463,7 @@ impl Tool for WriteTool {
         let path = input["path"].as_str().unwrap_or("?");
         PermissionRequest::Ask {
             descriptor: format!("write({path})"),
+            aliases: Vec::new(),
             summary: format!(
                 "write {path} ({} bytes)",
                 input["content"].as_str().map_or(0, |c| c.len())
@@ -600,6 +601,7 @@ impl Tool for EditTool {
         let path = input["path"].as_str().unwrap_or("?");
         PermissionRequest::Ask {
             descriptor: format!("edit({path})"),
+            aliases: Vec::new(),
             summary: format!("edit {path}"),
             is_edit: true,
         }
@@ -1196,7 +1198,10 @@ fn t() {
         let new = "assert_eq!(left, expected);";
         let plan = replacement_plan(text, old, new).unwrap().unwrap();
         assert_eq!(plan.count, 1);
-        assert!(plan.old.contains('\n'), "spliced real bytes stay multi-line");
+        assert!(
+            plan.old.contains('\n'),
+            "spliced real bytes stay multi-line"
+        );
         assert!(plan.old.starts_with("assert_eq!("));
         assert_eq!(
             text.replacen(&plan.old, &plan.new, 1),

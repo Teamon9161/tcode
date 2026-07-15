@@ -75,8 +75,11 @@ pub enum PermissionRequest {
     /// Read-only; never prompts.
     None,
     Ask {
-        /// Matched against permission rules, e.g. "shell(git status)".
+        /// Canonical descriptor used for new session/project allow rules.
         descriptor: String,
+        /// Legacy or interpreter-specific descriptors which keep old rules
+        /// working and remain valid for explicit ask/deny constraints.
+        aliases: Vec<String>,
         /// One line shown in the approval prompt.
         summary: String,
         /// File mutation — auto-allowed in accept-edits mode.
@@ -113,6 +116,39 @@ impl PermissionRequest {
             | PermissionRequest::UserInput { descriptor, .. } => descriptor,
             PermissionRequest::PlanReview { .. } => "exit_plan",
             PermissionRequest::None => "",
+        }
+    }
+
+    /// All descriptors that must be considered for deny/ask rules. Allow rules
+    /// may match either too, preserving existing interpreter-specific rules.
+    pub fn rule_descriptors(&self) -> Vec<&str> {
+        match self {
+            PermissionRequest::Ask {
+                descriptor,
+                aliases,
+                ..
+            } => std::iter::once(descriptor.as_str())
+                .chain(aliases.iter().map(String::as_str))
+                .collect(),
+            _ => vec![self.descriptor()],
+        }
+    }
+
+    /// Human-facing name for the permission being granted. The saved rule still
+    /// uses `descriptor`, so shell variants persist as canonical `run(...)`.
+    pub fn approval_label(&self) -> String {
+        match self {
+            PermissionRequest::Ask { aliases, .. } => aliases
+                .first()
+                .and_then(|alias| alias.strip_prefix("shell(").map(|_| "Run (PowerShell)"))
+                .or_else(|| {
+                    aliases
+                        .first()
+                        .and_then(|alias| alias.strip_prefix("bash(").map(|_| "Run (Git Bash)"))
+                })
+                .unwrap_or_else(|| self.descriptor())
+                .to_string(),
+            _ => self.descriptor().to_string(),
         }
     }
 

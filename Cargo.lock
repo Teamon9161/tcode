@@ -2452,6 +2452,7 @@ dependencies = [
  "base64",
  "dirs",
  "futures",
+ "ignore",
  "image",
  "serde",
  "serde_json",
@@ -2460,6 +2461,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

@@ -263,7 +263,8 @@ impl Tool for ShellTool {
     fn permission(&self, input: &Value) -> PermissionRequest {
         let command = input["command"].as_str().unwrap_or("?");
         PermissionRequest::Ask {
-            descriptor: format!("{}({command})", self.name()),
+            descriptor: format!("run({command})"),
+            aliases: vec![format!("{}({command})", self.name())],
             summary: format!("run: {command}"),
             is_edit: false,
         }

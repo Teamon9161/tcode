@@ -64,10 +64,6 @@ pub fn user_message() -> Style {
     Style::default().fg(Color::White)
 }
 
-pub fn thinking() -> Style {
-    Style::default().fg(DIM).add_modifier(Modifier::ITALIC)
-}
-
 /// Text selection in the input box — matches the transcript's reversed
 /// selection so the two read as one selection model.
 pub fn selection() -> Style {

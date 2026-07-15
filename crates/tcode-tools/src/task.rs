@@ -33,6 +33,7 @@ impl Approver for NeverAsk {
         _tool: &str,
         _summary: &str,
         _descriptor: &str,
+        _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
         Approval::simple(
@@ -200,6 +201,7 @@ impl Tool for TaskTool {
                 let preview: String = prompt.chars().take(60).collect();
                 PermissionRequest::Ask {
                     descriptor: "task(general)".into(),
+                    aliases: Vec::new(),
                     summary: format!("delegate to sub-agent: {preview}"),
                     is_edit: false,
                 }

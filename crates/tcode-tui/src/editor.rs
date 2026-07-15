@@ -249,6 +249,45 @@ impl Editor {
         self.col = self.lines[self.row].chars().count();
     }
 
+    /// Replace a known logical range without routing through selection state.
+    /// Completion uses this to swap only its current token inside a multi-line
+    /// draft, leaving all surrounding user text alone.
+    pub fn replace_range(&mut self, start: Position, end: Position, text: &str) {
+        let start = Position {
+            row: start.row.min(self.lines.len() - 1),
+            col: start.col.min(
+                self.lines[start.row.min(self.lines.len() - 1)]
+                    .chars()
+                    .count(),
+            ),
+        };
+        let end = Position {
+            row: end.row.min(self.lines.len() - 1),
+            col: end.col.min(
+                self.lines[end.row.min(self.lines.len() - 1)]
+                    .chars()
+                    .count(),
+            ),
+        };
+        let (start, end) = if start <= end {
+            (start, end)
+        } else {
+            (end, start)
+        };
+        let prefix = line_slice(&self.lines[start.row], 0, start.col);
+        let suffix = line_slice(
+            &self.lines[end.row],
+            end.col,
+            self.lines[end.row].chars().count(),
+        );
+        self.lines
+            .splice(start.row..=end.row, [format!("{prefix}{text}{suffix}")]);
+        self.row = start.row;
+        self.col = prefix.chars().count() + text.chars().count();
+        self.selection_anchor = None;
+        self.history_pos = None;
+    }
+
     pub fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selection_bounds()?;
         let mut out = String::new();
@@ -410,6 +449,19 @@ mod tests {
         e.select_all();
         assert!(e.delete_selection());
         assert!(e.is_empty());
+    }
+
+    #[test]
+    fn replace_range_preserves_multiline_surroundings() {
+        let mut e = Editor::new();
+        e.insert_str("review @src/a.rs\nthen 中文");
+        e.replace_range(
+            Position { row: 0, col: 7 },
+            Position { row: 0, col: 16 },
+            "@src/lib.rs",
+        );
+        assert_eq!(e.text(), "review @src/lib.rs\nthen 中文");
+        assert_eq!(e.position(), Position { row: 0, col: 18 });
     }
 
     #[test]

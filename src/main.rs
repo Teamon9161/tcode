@@ -522,6 +522,12 @@ async fn main() -> anyhow::Result<()> {
         &cwd,
         &session.tool_ctx.scratch_dir,
     ));
+    // Resume restores only persistent ledger events. Re-estimate from the
+    // reconstructed request before the first turn so plain REPL and --prompt
+    // can auto-compact a near-full compacted session just like the TUI.
+    if !session.ledger.is_empty() {
+        session.last_prompt_tokens = agent.estimate_context_tokens(&session);
+    }
     let line_approver = approver::LineApprover::new(cli.prompt.is_none());
     let opening_context: tcode_tui::OpeningContextFn =
         Arc::new(tcode_tools::project_map_with_scratch);
@@ -541,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
                 menu,
                 agent_menu,
                 opening_context.clone(),
+                config.ui.show_reasoning,
             )
             .await?
             {
@@ -702,6 +709,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                     CommandEffect::ConversationCleared => {}
                     CommandEffect::ConversationReplaced => {
+                        session.last_prompt_tokens = agent.estimate_context_tokens(&session);
                         println!(
                             "{DIM}session resumed · {} entries{RESET}",
                             session.ledger.len()
