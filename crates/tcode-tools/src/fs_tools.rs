@@ -795,7 +795,13 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Result<Option<Replaceme
     // intentionally stricter than exact replacement: a choice among several
     // normalized matches is a guess, not a self-heal.
     let normalized = match find_punct_normalized(text, old) {
-        NormalizedMatch::NotFound => find_ws_normalized(text, old),
+        NormalizedMatch::NotFound => match find_ws_normalized(text, old) {
+            // Reflow (cargo fmt joining/splitting lines) changes the line
+            // count, which the line-anchored matcher above cannot follow.
+            // Fall through to a whitespace-insensitive match across newlines.
+            NormalizedMatch::NotFound => find_reflow_normalized(text, old),
+            found => found,
+        },
         found => found,
     };
     match normalized {
@@ -905,6 +911,54 @@ fn find_ws_normalized(text: &str, old: &str) -> NormalizedMatch {
             last_off + last_content.len()
         };
         Some(text[start..end].to_string())
+    });
+    match (matches.next(), matches.next()) {
+        (None, _) => NormalizedMatch::NotFound,
+        (Some(found), None) => NormalizedMatch::Unique(found),
+        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    }
+}
+
+/// Match `old` in `text` ignoring *all* whitespace, newlines included, plus
+/// typographic punctuation, and return the exact original file substring at the
+/// match. This is the reflow case the line-anchored `find_ws_normalized` cannot
+/// reach: cargo fmt joined a call onto one line or split it across several, so
+/// the line *count* changed and nothing lines up.
+///
+/// Deliberately the loosest rung of the recovery ladder, hence last: collapsing
+/// newlines lets a needle straddle token boundaries. It stays safe because the
+/// exact/punct/ws passes ran first, the `Ambiguous` guard rejects a
+/// looks-unique-but-isn't match, and only the real file bytes are spliced back
+/// so the file's true formatting — not the model's whitespace guess — survives.
+fn find_reflow_normalized(text: &str, old: &str) -> NormalizedMatch {
+    // (normalized char, original byte start, original char len). The original
+    // len is kept because punctuation normalization is 1-char but not 1-byte
+    // (an em-dash is 3 bytes, its ASCII '-' is 1), so the byte offset must span
+    // the original character.
+    let haystack: Vec<(char, usize, usize)> = text
+        .char_indices()
+        .filter(|(_, c)| !c.is_whitespace())
+        .map(|(i, c)| (normalize_punct(c), i, c.len_utf8()))
+        .collect();
+    let needle: Vec<char> = old
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .map(normalize_punct)
+        .collect();
+    let m = needle.len();
+    // An all-whitespace needle carries no anchor and would match anywhere.
+    if m == 0 || m > haystack.len() {
+        return NormalizedMatch::NotFound;
+    }
+    // Slide char-by-char, comparing without allocating; only a hit materializes
+    // the original substring (same shape as `find_punct_normalized`).
+    let mut matches = (0..=haystack.len() - m).filter_map(|i| {
+        if !(0..m).all(|k| haystack[i + k].0 == needle[k]) {
+            return None;
+        }
+        let start = haystack[i].1;
+        let (_, last_start, last_len) = haystack[i + m - 1];
+        Some(text[start..last_start + last_len].to_string())
     });
     match (matches.next(), matches.next()) {
         (None, _) => NormalizedMatch::NotFound,
@@ -1124,6 +1178,81 @@ fn rate_limits_from() {
         let text = "fn f() {\n\treturn 1;\n}\n\nfn f() {\n    return 1;\n}\n";
         let old = "fn f() {\n  return 1;\n}\n";
         assert!(matches!(replacement_plan(text, old, "x"), Err(())));
+    }
+
+    #[test]
+    fn edit_recovers_single_line_old_string_against_reflowed_block() {
+        // cargo fmt split the call across lines; model still has the pre-fmt
+        // single line. Match anyway and splice the file's real (multi-line) bytes.
+        let text = "\
+fn t() {
+    assert_eq!(
+        left,
+        right
+    );
+}
+";
+        let old = "assert_eq!(left, right);";
+        let new = "assert_eq!(left, expected);";
+        let plan = replacement_plan(text, old, new).unwrap().unwrap();
+        assert_eq!(plan.count, 1);
+        assert!(plan.old.contains('\n'), "spliced real bytes stay multi-line");
+        assert!(plan.old.starts_with("assert_eq!("));
+        assert_eq!(
+            text.replacen(&plan.old, &plan.new, 1),
+            "fn t() {\n    assert_eq!(left, expected);\n}\n"
+        );
+    }
+
+    #[test]
+    fn edit_recovers_multi_line_old_string_against_collapsed_line() {
+        // Reverse reflow: file is one line, model has the pre-fmt multi-line form.
+        let text = "    assert_eq!(left, right);\n";
+        let old = "assert_eq!(\n    left,\n    right\n);";
+        let plan = replacement_plan(text, old, "assert_eq!(left, expected);")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.count, 1);
+        assert_eq!(plan.old, "assert_eq!(left, right);");
+    }
+
+    #[test]
+    fn edit_reflow_match_reports_ambiguous_when_block_repeats() {
+        // Two differently-wrapped copies, neither an exact match — the reflow
+        // rung must refuse to guess rather than silently pick the first.
+        let text = "\
+fn a() {
+    assert_eq!(
+        a,
+        b
+    );
+}
+fn c() {
+    assert_eq!(a,
+        b);
+}
+";
+        let old = "assert_eq!(a, b);";
+        assert!(matches!(replacement_plan(text, old, "x"), Err(())));
+    }
+
+    #[test]
+    fn edit_exact_match_short_circuits_before_reflow() {
+        // An exact single-line hit must win outright; the reflowed decoy below
+        // would otherwise make the loose reflow rung report ambiguity.
+        let text = "\
+assert_eq!(a, b);
+assert_eq!(
+    a,
+    b
+);
+";
+        let old = "assert_eq!(a, b);";
+        let plan = replacement_plan(text, old, "assert_eq!(a, c);")
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.count, 1);
+        assert_eq!(plan.old, old);
     }
 
     #[tokio::test]

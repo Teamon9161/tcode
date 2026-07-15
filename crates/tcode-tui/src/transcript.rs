@@ -488,6 +488,12 @@ impl Transcript {
         self.scroll = self.scroll.saturating_sub(n);
     }
 
+    /// Distance from the tail. Auto-scroll compares this before/after a step to
+    /// detect that it has reached the top or bottom and should stop.
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll
+    }
+
     pub fn page_up(&mut self) {
         self.scroll_up(self.view_height.saturating_sub(2).max(1));
     }
@@ -665,6 +671,26 @@ impl Transcript {
         let y = y.clamp(area.y, area.bottom().saturating_sub(1));
         if let (Some(pos), Some(selection)) = (self.pos_at(x, y), self.selection.as_mut()) {
             selection.head = pos;
+        }
+    }
+
+    /// While a selection drag rests at the top or bottom edge of the view, the
+    /// selection should keep growing in that direction — but a pointer held
+    /// still sends no events, so the frontend drives it from a timer instead.
+    /// `Some(true)` = scroll toward older content (top edge), `Some(false)` =
+    /// toward newer (bottom edge), `None` = inside the view (no auto-scroll).
+    /// Only armed while a selection is active.
+    pub fn drag_edge(&self, y: u16) -> Option<bool> {
+        let area = self.view_area;
+        if area.height == 0 || self.selection.is_none() {
+            return None;
+        }
+        if y <= area.y {
+            Some(true)
+        } else if y >= area.bottom().saturating_sub(1) {
+            Some(false)
+        } else {
+            None
         }
     }
 
@@ -938,6 +964,54 @@ mod tests {
             .collect();
         assert!(visible.contains("line 0"));
         assert!(!visible.contains("line 9"));
+    }
+
+    #[test]
+    fn drag_edge_reports_direction_only_at_the_view_edges() {
+        let mut t = Transcript::new(20);
+        for i in 0..10 {
+            t.push(vec![Line::raw(format!("line {i}"))]);
+        }
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        // No selection yet: nothing to auto-scroll.
+        assert_eq!(t.drag_edge(0), None);
+        t.mouse_down(0, 1);
+        assert_eq!(t.drag_edge(0), Some(true), "top row scrolls toward history");
+        assert_eq!(t.drag_edge(3), Some(false), "bottom row scrolls toward tail");
+        assert_eq!(t.drag_edge(2), None, "inside the view does not scroll");
+    }
+
+    #[test]
+    fn edge_autoscroll_extends_the_selection_through_revealed_rows() {
+        let mut t = Transcript::new(20);
+        for i in 0..10 {
+            t.push(vec![Line::raw(format!("line {i}"))]);
+        }
+        let area = Rect::new(0, 0, 20, 4);
+        let mut buf = Buffer::empty(area);
+        // Look at history (rows 2..5), then start selecting at the top and drag
+        // to the bottom edge.
+        t.scroll_up(4);
+        t.render(&mut buf, area);
+        t.mouse_down(0, 0);
+        // Drag along the right edge so whole rows fall inside the selection.
+        t.mouse_drag(19, 3);
+        assert_eq!(t.drag_edge(3), Some(false));
+        // Each timer step scrolls a line toward the tail; the redraw that
+        // follows updates the view, and the next extend reaches the new bottom.
+        for _ in 0..4 {
+            t.scroll_down(1);
+            t.render(&mut buf, area);
+            t.mouse_drag(19, 3);
+        }
+        let text = t.mouse_up().expect("a multi-row selection");
+        assert!(text.contains("line 2"), "anchor retained: {text:?}");
+        assert!(
+            text.contains("line 9"),
+            "auto-scroll grew the selection to the tail: {text:?}"
+        );
     }
 
     #[test]

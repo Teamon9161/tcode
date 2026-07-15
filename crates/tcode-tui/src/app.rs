@@ -331,6 +331,11 @@ pub struct App {
     /// Whether the current prompt press has actually dragged. A plain click
     /// (no Drag event) must not copy, even if the release cell differs slightly.
     input_dragged: bool,
+    /// Armed while a transcript selection drag rests at a view edge: `(toward
+    /// older, x, y)`. A timer then scrolls and extends the selection, since a
+    /// pointer held still at the edge emits no further mouse events. Cleared on
+    /// release or when the drag returns inside the view.
+    drag_scroll: Option<(bool, u16, u16)>,
     dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
     /// A change diff baked into the transcript while its approval dialog is
     /// open (so the full code is scrollable in the record, not cramped in
@@ -469,6 +474,7 @@ impl App {
             input_hitbox: None,
             input_mouse_active: false,
             input_dragged: false,
+            drag_scroll: None,
             dialog: None,
             change_prebake: None,
             rewind_nav: None,
@@ -515,6 +521,11 @@ impl App {
         let mut term_events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drives selection auto-scroll while the pointer is held at a view edge.
+        // Its select arm is gated on `drag_scroll`, so it only wakes the loop
+        // while a drag is actually parked at an edge — never when idle.
+        let mut drag_tick = tokio::time::interval(Duration::from_millis(50));
+        drag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !self.should_exit {
             self.redraw()?;
@@ -602,6 +613,9 @@ impl App {
                     if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
                         self.spinner = (self.spinner + 1) % CALM_SPINNER.len();
                     }
+                }
+                _ = drag_tick.tick(), if self.drag_scroll.is_some() => {
+                    self.drag_autoscroll_step();
                 }
             }
         }
@@ -2076,6 +2090,7 @@ impl App {
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
+                        self.drag_scroll = None;
                         let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
                         if !taken_by_input {
                             self.transcript.mouse_down(mouse.column, mouse.row);
@@ -2086,15 +2101,17 @@ impl App {
                             self.input_mouse_drag(mouse.column, mouse.row);
                         } else {
                             self.transcript.mouse_drag(mouse.column, mouse.row);
+                            // Arm edge auto-scroll when the drag reaches a view
+                            // edge; disarm the moment it returns inside.
+                            self.drag_scroll = self
+                                .transcript
+                                .drag_edge(mouse.row)
+                                .map(|up| (up, mouse.column, mouse.row));
                         }
                     }
-                    MouseEventKind::Up(MouseButton::Left) => {
-                        if self.input_mouse_active {
-                            self.input_mouse_up(mouse.column, mouse.row);
-                        } else if let Some(text) = self.transcript.mouse_up() {
-                            self.copy_selection(text);
-                        }
-                    }
+                    // Any button release ends the drag (defensive: some terminals
+                    // report the release with a non-Left button code).
+                    MouseEventKind::Up(_) => self.finish_drag(mouse.column, mouse.row),
                     _ => {}
                 }
             }
@@ -2786,6 +2803,51 @@ impl App {
         }
     }
 
+    /// End a selection drag: stop any auto-scroll, then copy like a normal
+    /// mouse-up. Reached from a real `Up`; a click anywhere always lands here
+    /// (or in `mouse_down`), so a stuck auto-scroll is one click away from
+    /// clearing — the timer never traps input.
+    fn finish_drag(&mut self, x: u16, y: u16) {
+        self.drag_scroll = None;
+        if self.input_mouse_active {
+            self.input_mouse_up(x, y);
+        } else if let Some(text) = self.transcript.mouse_up() {
+            self.copy_selection(text);
+        }
+    }
+
+    /// One timer step of edge auto-scroll: scroll the transcript a line in the
+    /// armed direction, then re-extend the selection to the (now different)
+    /// edge row. Self-terminates once the view reaches the top or bottom of the
+    /// content — nothing more to reveal — so a release the terminal never
+    /// reported (button let go outside the window) cannot scroll forever. A
+    /// dialog opening mid-drag takes over the mouse, so disarm.
+    fn drag_autoscroll_step(&mut self) {
+        let Some((toward_older, x, y)) = self.drag_scroll else {
+            return;
+        };
+        if self.dialog.is_some() {
+            self.drag_scroll = None;
+            return;
+        }
+        let before = self.transcript.scroll_offset();
+        if toward_older {
+            self.transcript.scroll_up(1);
+        } else {
+            self.transcript.scroll_down(1);
+        }
+        if self.transcript.scroll_offset() == before {
+            // Hit the content edge: stop and copy what is now selected, so the
+            // gesture completes even if its release was lost outside the window.
+            self.drag_scroll = None;
+            if let Some(text) = self.transcript.mouse_up() {
+                self.copy_selection(text);
+            }
+            return;
+        }
+        self.transcript.mouse_drag(x, y);
+    }
+
     fn input_mouse_up(&mut self, x: u16, y: u16) {
         self.input_mouse_active = false;
         // A plain click (no drag) only repositions the cursor — never copies,
@@ -3371,6 +3433,17 @@ impl App {
                     d.render(area_width(&self.terminal), budget)
                 })
             });
+        // A focused note in the approval dialog exposes its caret cell (set by
+        // the `render` just above). Anchoring the real terminal cursor there
+        // keeps the OS IME composition window tracking the caret. Only valid
+        // when the dialog — not a picker — produced the lines this frame.
+        let dialog_owns_panel = dialog_lines.is_some()
+            && self.resume_picker.is_none()
+            && self.model_picker.is_none()
+            && self.agent_picker.is_none();
+        let dialog_cursor = dialog_owns_panel
+            .then(|| self.dialog.as_ref().and_then(|(d, _)| d.cursor_cell()))
+            .flatten();
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
         // Ghost text only ever occupies the empty first row of the input.
         let ghost = self
@@ -3455,6 +3528,12 @@ impl App {
                     ),
                     row(y, h),
                 );
+                // Place the terminal cursor on the focused note caret (+1 for
+                // the block border) so the IME follows it. Without this the
+                // hardware cursor stays hidden and IME composition detaches.
+                if let Some((crow, ccol)) = dialog_cursor {
+                    frame.set_cursor_position((area.x + 1 + ccol, y + 1 + crow));
+                }
                 return;
             }
 

@@ -33,6 +33,11 @@ pub struct Dialog {
     /// execution runs under, declining returns feedback to keep planning. The
     /// plan body itself is baked into the transcript, not shown here.
     plan: Option<PlanReview>,
+    /// The focused note caret's cell within the rendered dialog lines, set on
+    /// each `render`. The frontend places the real terminal cursor there so the
+    /// OS IME composition window has an anchor that tracks the caret; the
+    /// in-buffer `▏` is only the visual marker. `None` when no note is focused.
+    cursor_cell: Cell<Option<(u16, u16)>>,
 }
 
 /// The plan-review surface: the plan itself rendered inside the panel,
@@ -388,6 +393,7 @@ impl Dialog {
             note_focused: false,
             questions: None,
             plan: None,
+            cursor_cell: Cell::new(None),
         }
     }
 
@@ -427,6 +433,7 @@ impl Dialog {
                 feedback_focused: false,
                 revised: None,
             }),
+            cursor_cell: Cell::new(None),
         }
     }
 
@@ -494,6 +501,7 @@ impl Dialog {
             note_focused: false,
             questions: Some(Questions { pages, page: 0 }),
             plan: None,
+            cursor_cell: Cell::new(None),
         }
     }
 
@@ -732,12 +740,22 @@ impl Dialog {
     }
 
     fn render_note(&self, note: &Editor, width: u16, out: &mut Vec<Line<'static>>) {
+        use unicode_width::UnicodeWidthStr;
         let note_style = if self.note_focused {
             theme::accent()
         } else {
             theme::dim()
         };
         for (i, row) in self.note_rows(note, width).iter().enumerate() {
+            // The `▏` sentinel marks the caret; record its cell (before pushing,
+            // so `out.len()` is this row's index) so the terminal cursor — and
+            // the IME anchored to it — lands on it. NOTE_INDENT is the prefix.
+            if self.note_focused {
+                if let Some(bar) = row.find('▏') {
+                    let col = NOTE_INDENT + UnicodeWidthStr::width(&row[..bar]);
+                    self.cursor_cell.set(Some((out.len() as u16, col as u16)));
+                }
+            }
             let prefix = if i == 0 { "  note: " } else { "        " };
             out.push(Line::from(vec![
                 Span::styled(prefix.to_string(), note_style),
@@ -746,7 +764,16 @@ impl Dialog {
         }
     }
 
+    /// The focused note caret's (row, col) within the lines from the last
+    /// `render`, so the frontend can anchor the terminal cursor (and thus the
+    /// IME) there. `None` when no note is focused.
+    pub fn cursor_cell(&self) -> Option<(u16, u16)> {
+        self.cursor_cell.get()
+    }
+
     pub fn render(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+        // Recomputed below only when a note is focused; stale between renders.
+        self.cursor_cell.set(None);
         if self.plan.is_some() {
             return self.render_plan(width, height);
         }
@@ -1925,6 +1952,27 @@ mod tests {
             panic!("enter should confirm");
         };
         assert_eq!(a.comment.as_deref(), Some("bXc"));
+    }
+
+    #[test]
+    fn note_caret_cell_tracks_the_focused_cursor() {
+        let mut d = dialog();
+        // No focused note yet: nothing for the terminal cursor to anchor to.
+        let _ = d.render(80, 40);
+        assert_eq!(d.cursor_cell(), None);
+
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "abc");
+        let _ = d.render(80, 40);
+        // Caret sits after "abc": col = NOTE_INDENT (8) + 3.
+        let (_, col) = d.cursor_cell().expect("focused note exposes a caret cell");
+        assert_eq!(col, (NOTE_INDENT + 3) as u16);
+
+        // Moving the caret left shifts the reported cell left too.
+        d.handle_key(key(KeyCode::Left));
+        let _ = d.render(80, 40);
+        let (_, col) = d.cursor_cell().expect("caret cell after Left");
+        assert_eq!(col, (NOTE_INDENT + 2) as u16);
     }
 
     #[test]
