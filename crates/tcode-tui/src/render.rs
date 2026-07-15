@@ -93,6 +93,33 @@ impl ToolRenderer for TaskRenderer {
     }
 }
 
+/// The plan a model submits with `exit_plan`: a heading plus the plan body as
+/// rendered markdown. The same block appears live (baked while the review
+/// dialog is open) and on replay (from the ledgered call), so both paths must
+/// go through here.
+struct ExitPlanRenderer;
+
+impl ToolRenderer for ExitPlanRenderer {
+    fn header(&self, _name: &str, input: &Value, _cwd: Option<&Path>) -> String {
+        match input["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some(title) => format!("Proposed plan: {title}"),
+            None => "Proposed plan".to_string(),
+        }
+    }
+
+    fn body(&self, input: &Value) -> Vec<Line<'static>> {
+        let plan = input["plan"].as_str().unwrap_or("").trim();
+        if plan.is_empty() {
+            return Vec::new();
+        }
+        crate::markdown::Renderer::default().render(plan)
+    }
+}
+
 struct ShellRenderer;
 
 impl ToolRenderer for ShellRenderer {
@@ -301,6 +328,7 @@ impl RenderRegistry {
                 "task" => Box::new(TaskRenderer),
                 "update_progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),
+                "exit_plan" => Box::new(ExitPlanRenderer),
                 _ => Box::new(DefaultRenderer { quiet }),
             };
             renderers.insert(name.to_string(), renderer);

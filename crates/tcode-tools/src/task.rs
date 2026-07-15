@@ -19,6 +19,7 @@ use tcode_core::{
 };
 
 const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
+const PLAN_SYSTEM: &str = include_str!("../../../prompts/task-plan-system.md");
 const GENERAL_SYSTEM: &str = include_str!("../../../prompts/task-general-system.md");
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
@@ -34,22 +35,22 @@ impl Approver for NeverAsk {
         _descriptor: &str,
         _input: &serde_json::Value,
     ) -> Approval {
-        Approval {
-            decision: ApprovalDecision::No,
-            comment: Some("sub-agents cannot prompt the user".into()),
-        }
+        Approval::simple(
+            ApprovalDecision::No,
+            Some("sub-agents cannot prompt the user".into()),
+        )
     }
 }
 
 /// The sub-agent kinds `task` dispatches to. They are intentionally separate
 /// from configurable auxiliary model roles: `auto` configures a classifier and
 /// is never a value accepted by `task(agent=...)`.
-pub const TASK_AGENT_KINDS: [&str; 2] = ["explore", "general"];
+pub const TASK_AGENT_KINDS: [&str; 3] = ["explore", "plan", "general"];
 
 /// Roles surfaced by `/agents`: task kinds plus the auxiliary models the
 /// harness itself runs — the Auto Mode classifier and the next-prompt guess.
 /// Both want something small and fast, which is the whole point of pinning.
-pub const MODEL_ROLES: [&str; 5] = ["explore", "general", "auto", "suggest", "vision"];
+pub const MODEL_ROLES: [&str; 6] = ["explore", "plan", "general", "auto", "suggest", "vision"];
 
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -100,10 +101,9 @@ impl TaskTool {
             .unwrap_or_else(|| self.model.snapshot())
     }
 
-    /// `explore` sub-agents get only side-effect-free tools. The question to
-    /// ask a tool is whether it mutates, not how it batches: `batch_policy`
-    /// describes parallelism, and reading it as a safety filter silently
-    /// excluded harmless non-parallel tools like `skill`.
+    /// Read-only sub-agents get only side-effect-free tools. `plan` has the
+    /// same exploration surface as `explore`, except it cannot submit a plan:
+    /// approval and the plan-mode transition remain exclusive to the parent.
     fn sub_tools(&self, agent_kind: &str, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
         let mut tools = crate::builtin_tools(cwd);
         tools.push(Arc::new(crate::ViewImageTool::new(
@@ -112,8 +112,47 @@ impl TaskTool {
         )));
         tools
             .into_iter()
-            .filter(|t| agent_kind != "explore" || !t.is_mutating())
+            .filter(|tool| keeps_sub_tool(agent_kind, tool.as_ref()))
             .collect()
+    }
+}
+
+fn keeps_sub_tool(agent_kind: &str, tool: &dyn Tool) -> bool {
+    !matches!(agent_kind, "explore" | "plan")
+        || (!tool.is_mutating() && (agent_kind != "plan" || tool.name() != "exit_plan"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keeps_sub_tool, TASK_AGENT_KINDS};
+
+    #[test]
+    fn plan_kind_is_registered_and_has_explore_tools_except_exit_plan() {
+        assert!(TASK_AGENT_KINDS.contains(&"plan"));
+        let tools = crate::builtin_tools(&std::env::temp_dir());
+        let explore: Vec<&str> = tools
+            .iter()
+            .filter(|tool| keeps_sub_tool("explore", tool.as_ref()))
+            .map(|tool| tool.name())
+            .collect();
+        let plan: Vec<&str> = tools
+            .iter()
+            .filter(|tool| keeps_sub_tool("plan", tool.as_ref()))
+            .map(|tool| tool.name())
+            .collect();
+
+        assert!(plan.iter().all(|name| *name != "exit_plan"));
+        assert!(tools
+            .iter()
+            .filter(|tool| keeps_sub_tool("plan", tool.as_ref()))
+            .all(|tool| !tool.is_mutating()));
+        assert_eq!(
+            plan,
+            explore
+                .into_iter()
+                .filter(|name| *name != "exit_plan")
+                .collect::<Vec<_>>()
+        );
     }
 }
 
@@ -127,16 +166,18 @@ impl Tool for TaskTool {
         "Delegate a bounded subtask to a sub-agent with its own fresh \
          context. Use agent='explore' for read-only reconnaissance that \
          returns a report (cheap: its exploration never enters your \
-         context). Use agent='general' for independent multi-step work. \
-         Give a complete, self-contained prompt; the sub-agent sees \
-         nothing of this conversation and cannot ask questions."
+         context). Use agent='plan' for a read-only implementation-plan \
+         draft that the parent must still review and submit. Use \
+         agent='general' for independent multi-step work. Give a complete, \
+         self-contained prompt; the sub-agent sees nothing of this \
+         conversation and cannot ask questions."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "agent": { "type": "string", "enum": ["explore", "general"] },
+                "agent": { "type": "string", "enum": ["explore", "plan", "general"] },
                 "prompt": { "type": "string" }
             },
             "required": ["agent", "prompt"]
@@ -146,7 +187,7 @@ impl Tool for TaskTool {
     fn permission(&self, input: &Value) -> PermissionRequest {
         match input["agent"].as_str() {
             // Read-only: never prompts.
-            Some("explore") => PermissionRequest::None,
+            Some("explore" | "plan") => PermissionRequest::None,
             _ => {
                 let prompt = input["prompt"].as_str().unwrap_or("?");
                 let preview: String = prompt.chars().take(60).collect();
@@ -165,10 +206,11 @@ impl Tool for TaskTool {
         };
         let system = match kind {
             "explore" => EXPLORE_SYSTEM,
+            "plan" => PLAN_SYSTEM,
             "general" => GENERAL_SYSTEM,
             other => {
                 return ToolOutput::err(format!(
-                    "unknown agent '{other}'; use 'explore' or 'general'"
+                    "unknown agent '{other}'; use 'explore', 'plan', or 'general'"
                 ))
             }
         };

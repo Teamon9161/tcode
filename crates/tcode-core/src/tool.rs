@@ -84,6 +84,41 @@ pub enum PermissionRequest {
     /// unsafe mode. It is not an authorization request and can never become a
     /// persistent allow rule.
     UserInput { descriptor: String, summary: String },
+    /// A completed plan submitted from plan mode for review. The human either
+    /// approves it — carrying a permission-mode transition back in the
+    /// `Approval` — or returns feedback to keep planning. Only reachable in
+    /// plan mode (see `PermissionRules::decide`); it never becomes an allow
+    /// rule. The plan body travels in the tool input, not here.
+    PlanReview { title: String },
+}
+
+impl PermissionRequest {
+    /// One-line summary shown in an approval prompt, if this request prompts.
+    pub fn summary(&self) -> &str {
+        match self {
+            PermissionRequest::Ask { summary, .. }
+            | PermissionRequest::UserInput { summary, .. } => summary,
+            PermissionRequest::PlanReview { title } => title,
+            PermissionRequest::None => "",
+        }
+    }
+
+    /// Rule-matching descriptor. Non-authorization requests (questions, plan
+    /// review) use a stable name and can never become a persistent allow rule.
+    pub fn descriptor(&self) -> &str {
+        match self {
+            PermissionRequest::Ask { descriptor, .. }
+            | PermissionRequest::UserInput { descriptor, .. } => descriptor,
+            PermissionRequest::PlanReview { .. } => "exit_plan",
+            PermissionRequest::None => "",
+        }
+    }
+
+    /// Whether approving this may persist an allow rule. Questions and plan
+    /// review never can.
+    pub fn allows_rule(&self) -> bool {
+        matches!(self, PermissionRequest::Ask { .. })
+    }
 }
 
 /// Shared context handed to every tool invocation.

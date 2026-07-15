@@ -16,6 +16,7 @@ mod export;
 mod memory;
 mod mode;
 mod note;
+mod plan;
 mod resume;
 mod suggestions;
 
@@ -163,6 +164,7 @@ impl CommandRegistry {
             Box::new(clear::ClearCommand),
             Box::new(resume::ResumeCommand),
             Box::new(note::NoteCommand),
+            Box::new(plan::PlanCommand),
             Box::new(memory::MemoryCommand),
             Box::new(export::ExportCommand),
             Box::new(exit::ExitCommand),
@@ -270,6 +272,7 @@ mod tests {
                 "/clear",
                 "/resume",
                 "/note",
+                "/plan",
                 "/memory",
                 "/export",
                 "/exit",

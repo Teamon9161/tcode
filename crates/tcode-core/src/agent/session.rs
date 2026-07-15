@@ -69,6 +69,42 @@ impl PendingInput {
     }
 }
 
+/// A permission-mode switch the user requested while a turn was running.
+///
+/// Like [`PendingInput`], it is a shared handle the frontend keeps while the
+/// running turn owns the `Session`. A key press never mutates the ledger and
+/// never flips the live mode mid-batch; it only writes the staged target here.
+/// The agent loop commits it at the next batch boundary (and at turn start and
+/// end), where permission for a whole batch is judged under one mode.
+///
+/// Pressing shift+tab repeatedly while running leaves only the final target:
+/// the cycle reads staged-else-committed, so intermediate stops collapse.
+#[derive(Clone, Default)]
+pub struct PendingMode(Arc<Mutex<Option<PermissionMode>>>);
+
+impl PendingMode {
+    /// Stage a target mode, replacing any earlier unstaged target.
+    pub fn set(&self, mode: PermissionMode) {
+        *self.0.lock().expect("pending mode lock") = Some(mode);
+    }
+
+    /// The staged target, if any (for the frontend's cycle base and status).
+    pub fn get(&self) -> Option<PermissionMode> {
+        *self.0.lock().expect("pending mode lock")
+    }
+
+    /// Take the staged target, clearing it.
+    pub fn take(&self) -> Option<PermissionMode> {
+        self.0.lock().expect("pending mode lock").take()
+    }
+
+    /// Drop any staged target, e.g. when an approval dialog set the mode
+    /// itself and a stale earlier staging must not override it.
+    pub fn clear(&self) {
+        *self.0.lock().expect("pending mode lock") = None;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CwdChange {
     pub old: PathBuf,
@@ -91,6 +127,14 @@ pub struct Session {
     /// Messages typed while the turn was running, delivered at the next safe
     /// append boundary. The frontend holds a clone of this handle.
     pub pending: PendingInput,
+    /// A permission-mode switch staged while the turn was running, committed
+    /// at the next batch boundary. The frontend holds a clone of this handle.
+    pub pending_mode: PendingMode,
+    /// The mode the model was last told about. Comparing it to `mode` at a
+    /// delivery point yields the plan-enter note without a per-keypress event
+    /// stream — flipping through modes and landing back where you started
+    /// produces no note at all.
+    last_notified_mode: PermissionMode,
     /// File snapshots for rewind; no-op unless persistence is set up.
     pub checkpoints: crate::checkpoint::CheckpointStore,
     /// Prompt size of the latest request (for the context status line).
@@ -125,6 +169,16 @@ impl Session {
             rules,
             tool_ctx,
             pending: PendingInput::default(),
+            pending_mode: PendingMode::default(),
+            // Seed as "not yet in plan" so a session started in plan mode still
+            // injects the plan-enter note with its first prompt. Only entering
+            // plan ever injects, so any non-plan seed is equivalent for the
+            // other modes.
+            last_notified_mode: if mode == PermissionMode::Plan {
+                PermissionMode::Default
+            } else {
+                mode
+            },
             checkpoints: crate::checkpoint::CheckpointStore::default(),
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
@@ -216,6 +270,46 @@ impl Session {
         Some(
             "Auto Mode paused after 3 consecutive classifier failures; permission mode is now default. Check the auto model in /agents or its connection, then re-enable Auto Mode when it is working.".into(),
         )
+    }
+
+    /// Guidance injected into the ledger the first time the model is in plan
+    /// mode after a delivery point. Raw text; the ledger wraps it as a note.
+    const PLAN_ENTER_NOTE: &'static str = include_str!("../../../../prompts/plan-mode-enter.md");
+
+    /// Commit a staged permission-mode switch, if one is pending. Returns the
+    /// new mode only when it differs from the current one, so a net-zero cycle
+    /// (staging that flipped back to the live mode) reports no change. Called
+    /// at every safe boundary: turn start, batch boundary, turn end.
+    pub fn commit_pending_mode(&mut self) -> Option<PermissionMode> {
+        let staged = self.pending_mode.take()?;
+        if staged == self.mode {
+            return None;
+        }
+        self.mode = staged;
+        Some(staged)
+    }
+
+    /// Apply a mode transition an approval dialog chose (e.g. `exit_plan`
+    /// approved with "auto-accept edits"). Syncs `last_notified_mode` — the
+    /// tool result already states the new mode, so no note is owed — and drops
+    /// any staged switch so a stale earlier keypress cannot override it.
+    pub fn apply_approved_mode(&mut self, mode: PermissionMode) {
+        self.mode = mode;
+        self.last_notified_mode = mode;
+        self.pending_mode.clear();
+    }
+
+    /// The note owed to the model at a delivery point, evaluated by comparing
+    /// the live mode with the one it was last told about. Only *entering* plan
+    /// mode injects guidance; every other transition is absorbed by the
+    /// permission gate and needs no model-visible note. Always resyncs the
+    /// last-notified mode, so back-and-forth switching never restacks notes.
+    pub fn take_mode_note(&mut self) -> Option<String> {
+        let note = (self.mode == PermissionMode::Plan
+            && self.last_notified_mode != PermissionMode::Plan)
+            .then(|| Self::PLAN_ENTER_NOTE.trim().to_string());
+        self.last_notified_mode = self.mode;
+        note
     }
 
     /// Set the cwd-specific part of the system prompt before a first turn.
@@ -398,6 +492,84 @@ mod tests {
             .expect("pause notice");
         assert!(notice.contains("3 consecutive"));
         assert_eq!(session.mode, PermissionMode::Default);
+    }
+
+    fn plan_session() -> Session {
+        Session::new(
+            ToolCtx::new(std::env::temp_dir(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        )
+    }
+
+    #[test]
+    fn staging_keeps_only_the_final_target_and_commits_the_net_change() {
+        let mut session = plan_session();
+        // Repeated presses while running leave only the last staged target.
+        session.pending_mode.set(PermissionMode::AcceptEdits);
+        session.pending_mode.set(PermissionMode::Plan);
+        assert_eq!(session.pending_mode.get(), Some(PermissionMode::Plan));
+        assert_eq!(session.commit_pending_mode(), Some(PermissionMode::Plan));
+        assert_eq!(session.mode, PermissionMode::Plan);
+        // The staging is consumed.
+        assert_eq!(session.commit_pending_mode(), None);
+    }
+
+    #[test]
+    fn a_net_zero_cycle_commits_nothing() {
+        let mut session = plan_session();
+        // Staged back to the live mode: no change reported, mode untouched.
+        session.pending_mode.set(PermissionMode::Default);
+        assert_eq!(session.commit_pending_mode(), None);
+        assert_eq!(session.mode, PermissionMode::Default);
+    }
+
+    #[test]
+    fn only_entering_plan_injects_a_note_and_only_once() {
+        let mut session = plan_session();
+        // default → no note.
+        assert!(session.take_mode_note().is_none());
+        // enter plan → one note.
+        session.mode = PermissionMode::Plan;
+        assert!(session.take_mode_note().is_some());
+        // still plan, already notified → no restacking.
+        assert!(session.take_mode_note().is_none());
+        // leaving plan → no note.
+        session.mode = PermissionMode::AcceptEdits;
+        assert!(session.take_mode_note().is_none());
+    }
+
+    #[test]
+    fn a_session_started_in_plan_mode_injects_the_opening_note() {
+        let mut session = Session::new(
+            ToolCtx::new(std::env::temp_dir(), 1_000),
+            PermissionMode::Plan,
+            PermissionRules::default(),
+        );
+        assert!(session.take_mode_note().is_some());
+        assert!(session.take_mode_note().is_none());
+    }
+
+    #[test]
+    fn back_and_forth_between_notes_yields_no_note() {
+        let mut session = plan_session();
+        session.mode = PermissionMode::AcceptEdits;
+        session.mode = PermissionMode::Default;
+        // Never landed on plan between delivery points → nothing owed.
+        assert!(session.take_mode_note().is_none());
+    }
+
+    #[test]
+    fn an_approved_transition_owes_no_note() {
+        let mut session = plan_session();
+        session.mode = PermissionMode::Plan;
+        // Simulate the plan-enter note already delivered.
+        assert!(session.take_mode_note().is_some());
+        // exit_plan approved into accept-edits: result already states the mode.
+        session.apply_approved_mode(PermissionMode::AcceptEdits);
+        assert!(session.take_mode_note().is_none());
+        // A stale staged switch cannot override the approved mode.
+        assert_eq!(session.pending_mode.get(), None);
     }
 
     #[test]

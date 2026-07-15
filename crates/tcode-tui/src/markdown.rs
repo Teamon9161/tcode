@@ -79,8 +79,9 @@ impl Default for Renderer {
 
 impl Renderer {
     /// Compatibility path for callers that have no layout context. The
-    /// transcript uses `parse` so tables can reflow on resize.
-    #[cfg(test)]
+    /// transcript uses `parse` so tables can reflow on resize. This renders
+    /// without premature wrapping (the transcript re-wraps at display width),
+    /// so it suits pre-baked blocks like a plan body.
     pub fn render(&self, text: &str) -> Vec<Line<'static>> {
         self.parse(text).lines_at(usize::MAX)
     }
@@ -494,9 +495,179 @@ fn cell_width(cell: &[Span<'_>]) -> usize {
     cell.iter().map(|span| span.content.width()).sum()
 }
 
+/// Split plan markdown into top-level block source strings: a heading, a
+/// paragraph, a code block, a block quote, or a table each becomes one block,
+/// while a list is split into its items so a comment can anchor to a single
+/// bullet. The returned slices are verbatim source (indentation and fences
+/// preserved) so each renders on its own and `$EDITOR` round-trips losslessly.
+/// Inter-block whitespace is dropped — it belongs to no block.
+pub fn split_blocks(text: &str) -> Vec<String> {
+    let parser = Parser::new_ext(
+        text,
+        Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TABLES
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_MATH,
+    )
+    .into_offset_iter();
+
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    // Depth of open block-level containers; inline tags never count, so a
+    // top-level block opens at depth 0→1 and closes at 1→0.
+    let mut depth = 0usize;
+    let mut block_start: Option<usize> = None;
+    // Inside a top-level list, items — not the list — are the blocks.
+    let mut top_list = false;
+
+    for (ev, range) in parser {
+        match ev {
+            Event::Start(tag) => {
+                if !is_block_container(&tag) {
+                    continue;
+                }
+                if depth == 0 {
+                    if matches!(tag, Tag::List(_)) {
+                        top_list = true;
+                    } else {
+                        block_start = Some(range.start);
+                    }
+                } else if depth == 1 && top_list && matches!(tag, Tag::Item) {
+                    block_start = Some(range.start);
+                }
+                depth += 1;
+            }
+            Event::End(tag) => {
+                if !is_block_container_end(&tag) {
+                    continue;
+                }
+                depth = depth.saturating_sub(1);
+                if matches!(tag, TagEnd::List(_)) {
+                    // Only the top-level list ending leaves item mode; a nested
+                    // list closing at depth > 0 must not clear the flag.
+                    if depth == 0 {
+                        top_list = false;
+                    }
+                } else {
+                    let closes_block =
+                        depth == 0 || (depth == 1 && top_list && matches!(tag, TagEnd::Item));
+                    if closes_block {
+                        if let Some(start) = block_start.take() {
+                            ranges.push((start, range.end));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    ranges
+        .into_iter()
+        .map(|(s, e)| text[s..e].trim_end().to_string())
+        .filter(|b| !b.is_empty())
+        .collect()
+}
+
+/// Block-level container start tags (everything that nests block content);
+/// inline tags (emphasis, links, images, …) are excluded so they never move
+/// the container depth.
+fn is_block_container(tag: &Tag) -> bool {
+    matches!(
+        tag,
+        Tag::Paragraph
+            | Tag::Heading { .. }
+            | Tag::BlockQuote(_)
+            | Tag::CodeBlock(_)
+            | Tag::List(_)
+            | Tag::Item
+            | Tag::FootnoteDefinition(_)
+            | Tag::Table(_)
+            | Tag::TableHead
+            | Tag::TableRow
+            | Tag::TableCell
+            | Tag::HtmlBlock
+            | Tag::MetadataBlock(_)
+            | Tag::DefinitionList
+            | Tag::DefinitionListTitle
+            | Tag::DefinitionListDefinition
+    )
+}
+
+fn is_block_container_end(tag: &TagEnd) -> bool {
+    matches!(
+        tag,
+        TagEnd::Paragraph
+            | TagEnd::Heading(_)
+            | TagEnd::BlockQuote(_)
+            | TagEnd::CodeBlock
+            | TagEnd::List(_)
+            | TagEnd::Item
+            | TagEnd::FootnoteDefinition
+            | TagEnd::Table
+            | TagEnd::TableHead
+            | TagEnd::TableRow
+            | TagEnd::TableCell
+            | TagEnd::HtmlBlock
+            | TagEnd::MetadataBlock(_)
+            | TagEnd::DefinitionList
+            | TagEnd::DefinitionListTitle
+            | TagEnd::DefinitionListDefinition
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_blocks_separates_heading_paragraph_and_code() {
+        let blocks = split_blocks("# Title\n\nA paragraph.\n\n```rust\nfn main() {}\n```");
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], "# Title");
+        assert_eq!(blocks[1], "A paragraph.");
+        assert_eq!(blocks[2], "```rust\nfn main() {}\n```");
+    }
+
+    #[test]
+    fn split_blocks_breaks_a_list_into_items() {
+        let blocks = split_blocks("Intro\n\n- first\n- second\n- third");
+        // Intro paragraph plus three separately-anchorable items.
+        assert_eq!(blocks.len(), 4);
+        assert_eq!(blocks[0], "Intro");
+        assert_eq!(blocks[1], "- first");
+        assert_eq!(blocks[2], "- second");
+        assert_eq!(blocks[3], "- third");
+    }
+
+    #[test]
+    fn split_blocks_keeps_a_nested_list_with_its_parent_item() {
+        let blocks = split_blocks("- parent\n  - child\n- sibling");
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[0].contains("parent"));
+        assert!(
+            blocks[0].contains("child"),
+            "nested list stays with its item"
+        );
+        assert_eq!(blocks[1], "- sibling");
+    }
+
+    #[test]
+    fn split_blocks_keeps_a_table_as_one_block() {
+        let src = "Before\n\n| a | b |\n| --- | --- |\n| 1 | 2 |\n\nAfter";
+        let blocks = split_blocks(src);
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(blocks[0], "Before");
+        assert!(blocks[1].contains("| a | b |"));
+        assert!(blocks[1].contains("| 1 | 2 |"));
+        assert_eq!(blocks[2], "After");
+    }
+
+    #[test]
+    fn split_blocks_ignores_inline_markup() {
+        // Emphasis/link tags must not open a block.
+        let blocks = split_blocks("Some *emph* and [a](b) link in one paragraph.");
+        assert_eq!(blocks.len(), 1);
+    }
 
     #[test]
     fn renders_basic_markdown() {

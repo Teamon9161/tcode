@@ -3,7 +3,7 @@ mod session;
 mod suggest;
 mod summarize;
 
-pub use session::{CwdChange, PendingInput, PendingMessage, Session};
+pub use session::{CwdChange, PendingInput, PendingMessage, PendingMode, Session};
 pub use suggest::SuggestRequest;
 pub use summarize::summarize_call;
 use summarize::{compact_successful_test_output, preview, split_malformed};
@@ -24,7 +24,7 @@ use crate::auto_mode::{
 };
 use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
-use crate::permission::{ApprovalDecision, Approver, Decision};
+use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode};
 use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
@@ -119,6 +119,11 @@ pub enum AgentEvent {
     /// summary is now the only record of everything before it — the user must
     /// be able to read what the model is standing on.
     Compacted(String),
+    /// A staged permission-mode switch was committed at a safe boundary (turn
+    /// start, batch boundary, turn end). The frontend promotes its pending
+    /// status marker and bakes a record — the transcript is the source of
+    /// truth for which boundary a mode took effect at.
+    ModeChanged(crate::permission::PermissionMode),
     /// The classifier was unavailable repeatedly, so the session falls back
     /// to ordinary human approvals until Auto Mode is explicitly re-enabled.
     AutoModePaused(String),
@@ -295,6 +300,9 @@ impl Agent {
         // Background tasks that finished between turns: tell the model
         // before its new instruction (pure append, cache-safe).
         self.note_finished_background_tasks(session);
+        // Commit a mode staged before this turn and, if it just entered plan
+        // mode, inject the plan-enter note ahead of the user's instruction.
+        self.commit_mode(session, events).await?;
         if let Some(reminder) = session
             .tool_ctx
             .memory
@@ -357,8 +365,12 @@ impl Agent {
                 return Ok(());
             }
             // End of a tool batch is a safe append boundary for background
-            // task completion notes and for anything the user said meanwhile.
+            // task completion notes, a staged mode switch, and anything the
+            // user said meanwhile. The mode commits before pending input so a
+            // switch to plan takes effect for the next batch and its note lands
+            // ahead of whatever the user queued.
             self.note_finished_background_tasks(session);
+            self.commit_mode(session, events).await?;
             self.deliver_pending_input(session, events).await?;
         }
         // Runaway guard tripped. The ledger is consistent (the last tool
@@ -592,6 +604,12 @@ impl Agent {
 
             let request = tool.permission(input);
             let mut approval_note: Option<String> = None;
+            // An approval may replace the artifact that actually runs (the
+            // original tool use stays immutable in the ledger).
+            let mut approved_input: Option<Value> = None;
+            // A mode transition an approval carried (only the plan-review
+            // dialog sets one). Applied generically before the tool runs.
+            let mut applied_mode: Option<PermissionMode> = None;
             let is_user_question = matches!(request, PermissionRequest::UserInput { .. });
             match self
                 .permission_decision(
@@ -613,26 +631,22 @@ impl Agent {
                     continue;
                 }
                 Decision::Ask | Decision::Auto => {
-                    let (descriptor, summary) = match &request {
-                        PermissionRequest::Ask {
-                            descriptor,
-                            summary,
-                            ..
-                        }
-                        | PermissionRequest::UserInput {
-                            descriptor,
-                            summary,
-                        } => (descriptor, summary),
-                        PermissionRequest::None => unreachable!("Ask decision implies a prompt"),
-                    };
-                    let approval = approver.ask(name, summary, descriptor, input).await;
+                    let approval = approver
+                        .ask(name, request.summary(), request.descriptor(), input)
+                        .await;
                     match approval.decision {
-                        ApprovalDecision::Yes => approval_note = approval.comment,
+                        ApprovalDecision::Yes => {
+                            approval_note = approval.comment;
+                            applied_mode = approval.set_mode;
+                            approved_input = approval.approved_input;
+                        }
                         ApprovalDecision::YesAlways => {
-                            if !is_user_question {
-                                session.rules.allow.push(descriptor.clone());
+                            if request.allows_rule() {
+                                session.rules.allow.push(request.descriptor().to_string());
                             }
                             approval_note = approval.comment;
+                            applied_mode = approval.set_mode;
+                            approved_input = approval.approved_input;
                         }
                         ApprovalDecision::No => {
                             declined = true;
@@ -654,6 +668,19 @@ impl Agent {
                         }
                     }
                 }
+            }
+
+            // Keep the model-issued call for event/replay identity. The
+            // replacement below is only the reviewed artifact executed by the
+            // tool and seen by hooks.
+            let model_input = input;
+            let input = approved_input.as_ref().unwrap_or(model_input);
+
+            // A plan approval switches the permission mode before the tool
+            // runs, so the mode the tool executes under (and reports) is the
+            // approved one, and its note is already synced.
+            if let Some(mode) = applied_mode {
+                session.apply_approved_mode(mode);
             }
 
             // Pre-tool hooks may veto the call (exit code 2).
@@ -681,8 +708,8 @@ impl Agent {
                 events,
                 AgentEvent::ToolStart {
                     name: name.clone(),
-                    summary: summarize_call(name, input),
-                    input: input.clone(),
+                    summary: summarize_call(name, model_input),
+                    input: model_input.clone(),
                 },
             )
             .await?;
@@ -736,7 +763,15 @@ impl Agent {
             for note in post.notes {
                 output.content.push_str(&format!("\n[hook] {note}"));
             }
-            let output = self.gate(session, name, output);
+            let mut output = self.gate(session, name, output);
+            // Tell the model, in the same result, which mode execution now runs
+            // under. Only a plan approval sets `applied_mode`.
+            if let Some(mode) = applied_mode.filter(|_| !output.is_error) {
+                output.content.push_str(&format!(
+                    "\n\nPermission mode is now {}. Proceed with the plan.",
+                    mode.label()
+                ));
+            }
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
@@ -1552,6 +1587,24 @@ impl Agent {
         for note in notes {
             session.ledger.append(Entry::Note(note));
         }
+    }
+
+    /// Commit a staged permission-mode switch at a safe boundary and, if the
+    /// commit entered plan mode, append the plan-enter note. A net-zero cycle
+    /// commits nothing and injects nothing. This is the single place a staged
+    /// switch becomes live inside a running turn.
+    async fn commit_mode(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<(), AgentError> {
+        if let Some(mode) = session.commit_pending_mode() {
+            self.emit(events, AgentEvent::ModeChanged(mode)).await?;
+        }
+        if let Some(note) = session.take_mode_note() {
+            session.ledger.append(Entry::Note(note));
+        }
+        Ok(())
     }
 
     /// Hand the model whatever the user said while it was working.

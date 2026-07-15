@@ -2,6 +2,7 @@ mod fs_tools;
 mod grounding;
 mod interaction;
 mod mcp;
+mod plan;
 mod search;
 mod shell;
 mod skills;
@@ -42,6 +43,7 @@ pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
         Arc::new(web::WebFetchTool),
         Arc::new(web::WebSearchTool),
         Arc::new(shell::KillTaskTool),
+        Arc::new(plan::ExitPlanTool),
     ];
     if cfg!(windows) {
         tools.push(Arc::new(shell::ShellTool::new(ShellKind::PowerShell)));

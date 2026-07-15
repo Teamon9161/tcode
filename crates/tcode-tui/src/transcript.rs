@@ -732,8 +732,8 @@ fn row_slice(line: &Line<'_>, from: usize, to: usize) -> String {
 
 /// Pre-wrap lines at the target width instead of leaving soft wrapping to
 /// a Paragraph: only pre-wrapped lines can be sliced for the viewport and
-/// mapped back for selection.
-#[cfg(test)]
+/// mapped back for selection. Also used by the plan-review pane, which slices
+/// its own viewport out of the wrapped plan.
 pub fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     wrap_lines_flagged(lines, width)
         .into_iter()

@@ -115,6 +115,9 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                 println!("{DIM}── earlier conversation compacted ──{RESET}");
                 println!("{DIM}{summary}{RESET}");
             }
+            AgentEvent::ModeChanged(mode) => {
+                println!("{DIM}[permission mode → {}]{RESET}", mode.label());
+            }
             AgentEvent::AutoModePaused(notice) => {
                 println!("{YELLOW}[{notice}]{RESET}");
             }

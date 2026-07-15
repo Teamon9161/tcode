@@ -8,9 +8,11 @@
 //! as a paged form (←→ to switch questions, ↑↓ to choose, space to toggle
 //! multi-select). All answers aggregate into a single note comment.
 
+use std::cell::Cell;
+
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use tcode_core::{Approval, ApprovalDecision};
+use tcode_core::{Approval, ApprovalDecision, PermissionMode};
 
 use crate::editor::Editor;
 use crate::theme;
@@ -27,7 +29,156 @@ pub struct Dialog {
     note_focused: bool,
     /// Present iff this is an `ask_user` question form (else a consent prompt).
     questions: Option<Questions>,
+    /// Present iff this is a plan-review prompt: approving picks the mode
+    /// execution runs under, declining returns feedback to keep planning. The
+    /// plan body itself is baked into the transcript, not shown here.
+    plan: Option<PlanReview>,
 }
+
+/// The plan-review surface: the plan itself rendered inside the panel,
+/// navigable block by block, plus the four decisions. A comment can anchor to
+/// the focused block; a decline sends the comments (or free feedback) back so
+/// the model keeps planning. The plan the model relies on lives in the ledger;
+/// this pane is the human's review of it.
+struct PlanReview {
+    /// The verbatim `exit_plan` tool input (ledger truth). Kept so the pane can
+    /// bake the plan through the same renderer replay uses, and so `$EDITOR`
+    /// round-trips the exact plan source.
+    input: Value,
+    blocks: Vec<PlanBlock>,
+    /// The block the keyboard is on (comment / navigation target).
+    focus: usize,
+    /// First visible wrapped plan row; follows the focus, so it is derived at
+    /// render time (interior mutability) rather than driven by key handling
+    /// which has no display width.
+    scroll: Cell<usize>,
+    /// Selected decision option.
+    cursor: usize,
+    /// Whether ↑/↓ currently move through the decision options rather than plan
+    /// blocks. Saving a comment lands here so its next action is explicit.
+    options_focused: bool,
+    /// Some while composing a comment on the focused block.
+    compose: Option<PlanCommentDraft>,
+    /// Mouse anchor and current head in visible plan-row coordinates while the
+    /// user drags a passage to quote. Keeping both makes the selected passage
+    /// visible before the comment composer opens.
+    mouse_anchor: Option<PlanMousePosition>,
+    mouse_head: Option<PlanMousePosition>,
+    /// Free-form feedback for keep-planning when no per-block comments were left.
+    feedback: Editor,
+    feedback_focused: bool,
+    /// A `$EDITOR` revision of the plan, when it differs from the original. On
+    /// approval it becomes the actual `exit_plan` input and is mirrored to disk;
+    /// on keep-planning it is sent back as a diff.
+    revised: Option<String>,
+}
+
+/// A comment authored during plan review. `quote` is `None` for a keyboard
+/// comment on the focused block and `Some` for a mouse-selected passage.
+struct PlanComment {
+    quote: Option<String>,
+    text: String,
+}
+
+/// The active comment composer retains an optional selected-passage quote until
+/// the user saves or cancels it.
+struct PlanCommentDraft {
+    quote: Option<String>,
+    editor: Editor,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PlanMousePosition {
+    row: usize,
+    col: usize,
+}
+
+/// One plan block (a heading, paragraph, code block, table, or list item) with
+/// its pre-rendered markdown and any review comments anchored to it.
+struct PlanBlock {
+    /// Verbatim markdown source, for quoting into feedback.
+    source: String,
+    /// Rendered markdown, unwrapped; wrapped to display width at render time.
+    lines: Vec<Line<'static>>,
+    comments: Vec<PlanComment>,
+}
+
+impl PlanReview {
+    /// The plan the model submitted (ledger truth).
+    fn original(&self) -> &str {
+        self.input["plan"].as_str().unwrap_or("")
+    }
+
+    /// The plan currently under review: the `$EDITOR` revision if any, else the
+    /// original.
+    fn source(&self) -> &str {
+        self.revised.as_deref().unwrap_or_else(|| self.original())
+    }
+
+    /// A replacement input for an approved revised plan. The original tool use
+    /// remains ledger history; the accompanying user note tells the model why
+    /// the tool executed this final artifact instead.
+    fn approved_input(&self) -> Option<Value> {
+        self.revised.as_ref().map(|revised| {
+            let mut input = self.input.clone();
+            input["plan"] = Value::String(revised.clone());
+            input
+        })
+    }
+
+    fn has_revision(&self) -> bool {
+        self.revised.is_some()
+    }
+
+    /// A unified diff from the original plan to the `$EDITOR` revision, for
+    /// sending back as feedback. `None` when the plan was not revised.
+    fn revision_diff(&self) -> Option<String> {
+        let revised = self.revised.as_deref()?;
+        let diff = similar::TextDiff::from_lines(self.original().trim(), revised.trim());
+        Some(
+            diff.unified_diff()
+                .context_radius(3)
+                .header("plan", "revised")
+                .to_string(),
+        )
+    }
+}
+
+/// One plan-review option. Approving carries a permission-mode transition; the
+/// keep-planning option carries none and requires feedback text.
+struct PlanOption {
+    label: &'static str,
+    decision: ApprovalDecision,
+    set_mode: Option<PermissionMode>,
+    requires_feedback: bool,
+}
+
+const PLAN_OPTIONS: [PlanOption; 4] = [
+    PlanOption {
+        label: "Yes, and approve edits manually",
+        decision: ApprovalDecision::Yes,
+        set_mode: Some(PermissionMode::Default),
+        requires_feedback: false,
+    },
+    PlanOption {
+        label: "Yes, and auto-accept edits",
+        decision: ApprovalDecision::Yes,
+        set_mode: Some(PermissionMode::AcceptEdits),
+        requires_feedback: false,
+    },
+    PlanOption {
+        label: "Yes, and use auto mode",
+        decision: ApprovalDecision::Yes,
+        set_mode: Some(PermissionMode::Auto),
+        requires_feedback: false,
+    },
+    PlanOption {
+        label: "No, keep planning",
+        decision: ApprovalDecision::No,
+        set_mode: None,
+        requires_feedback: true,
+    },
+];
 
 /// A paged set of `ask_user` questions plus the currently shown page.
 struct Questions {
@@ -113,9 +264,20 @@ const OPTION_COLUMN_MIN: usize = 16;
 
 const OTHER_LABEL: &str = "Other";
 
+/// Blocks the plan pane jumps on PageUp/PageDown.
+const PLAN_PAGE: usize = 5;
+/// Rows the plan pane reserves for its comment/feedback editor when budgeting
+/// the scrollable body (an editor row can wrap once).
+const PLAN_EDITOR_ROWS: usize = 2;
+/// The plan body never shrinks below this many rows, even on a short terminal.
+const PLAN_MIN_VIEWPORT: usize = 3;
+
 pub enum DialogResult {
     Pending,
     Done(Approval),
+    /// The plan pane asked to open the plan in `$EDITOR`. The frontend owns the
+    /// terminal suspend/resume, so it handles this rather than the dialog.
+    EditPlan,
 }
 
 impl QuestionPage {
@@ -213,7 +375,85 @@ impl Dialog {
             note: Editor::new(),
             note_focused: false,
             questions: None,
+            plan: None,
         }
+    }
+
+    /// A plan-review prompt. The plan itself is the review surface: it renders
+    /// inside this pane, navigable block by block. `title` names the plan;
+    /// `input` is the verbatim `exit_plan` tool input; `blocks` pairs each
+    /// block's verbatim source with its pre-rendered markdown lines.
+    pub fn plan(title: String, input: Value, blocks: Vec<(String, Vec<Line<'static>>)>) -> Self {
+        let blocks: Vec<PlanBlock> = blocks
+            .into_iter()
+            .map(|(source, lines)| PlanBlock {
+                source,
+                lines,
+                comments: Vec::new(),
+            })
+            .collect();
+        Self {
+            summary: title,
+            descriptor: "exit_plan".into(),
+            call_summary: String::new(),
+            selected: 0,
+            note: Editor::new(),
+            note_focused: false,
+            questions: None,
+            plan: Some(PlanReview {
+                input,
+                blocks,
+                focus: 0,
+                scroll: Cell::new(0),
+                cursor: 0,
+                options_focused: false,
+                compose: None,
+                mouse_anchor: None,
+                mouse_head: None,
+                feedback: Editor::new(),
+                feedback_focused: false,
+                revised: None,
+            }),
+        }
+    }
+
+    /// The verbatim `exit_plan` input, for baking the plan into the transcript
+    /// on decline through the same renderer replay uses.
+    pub fn plan_input(&self) -> Option<Value> {
+        self.plan.as_ref().map(|p| p.input.clone())
+    }
+
+    /// The current plan source (the `$EDITOR` revision if one was made, else the
+    /// original), for writing to the review temp file.
+    pub fn plan_source(&self) -> Option<String> {
+        self.plan.as_ref().map(|p| p.source().to_string())
+    }
+
+    /// Adopt a `$EDITOR` revision: the pane now shows the revised plan (blocks
+    /// pre-rendered by the frontend, which owns the markdown renderer), and
+    /// earlier per-block comments are dropped because their anchors may be stale.
+    /// Reopening the editor and restoring the original clears a prior revision.
+    pub fn revise_plan(&mut self, revised: String, blocks: Vec<(String, Vec<Line<'static>>)>) {
+        let Some(plan) = self.plan.as_mut() else {
+            return;
+        };
+        // An editor save that did not alter what is currently on screen is a
+        // true no-op; it must not discard comments.
+        if revised.trim() == plan.source().trim() {
+            return;
+        }
+        let restores_original = revised.trim() == plan.original().trim();
+        plan.blocks = blocks
+            .into_iter()
+            .map(|(source, lines)| PlanBlock {
+                source,
+                lines,
+                comments: Vec::new(),
+            })
+            .collect();
+        plan.focus = 0;
+        plan.scroll.set(0);
+        plan.revised = (!restores_original).then_some(revised);
     }
 
     /// Build the `ask_user` form from the tool input. Accepts the `questions`
@@ -239,11 +479,16 @@ impl Dialog {
             note: Editor::new(),
             note_focused: false,
             questions: Some(Questions { pages, page: 0 }),
+            plan: None,
         }
     }
 
     pub fn is_question(&self) -> bool {
         self.questions.is_some()
+    }
+
+    pub fn is_plan(&self) -> bool {
+        self.plan.is_some()
     }
 
     fn note_text(&self) -> String {
@@ -269,6 +514,11 @@ impl Dialog {
         if text.is_empty() {
             return;
         }
+        if let Some(plan) = self.plan.as_mut() {
+            plan.feedback_focused = true;
+            plan.feedback.insert_str(&text);
+            return;
+        }
         self.note_focused = true;
         if self.questions.is_some() {
             self.cur_page().note.insert_str(&text);
@@ -278,6 +528,9 @@ impl Dialog {
     }
 
     pub fn handle_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
+        if self.plan.is_some() {
+            return self.handle_plan_key(key);
+        }
         if self.questions.is_some() {
             return self.handle_question_key(key);
         }
@@ -287,19 +540,16 @@ impl Dialog {
             K::Enter => {
                 let note = self.note_text();
                 let decision = OPTIONS[self.selected].1;
-                return DialogResult::Done(Approval {
+                return DialogResult::Done(Approval::simple(
                     decision,
-                    comment: Some(note).filter(|s| !s.is_empty()),
-                });
+                    Some(note).filter(|s| !s.is_empty()),
+                ));
             }
             K::Esc => {
                 if self.note_focused {
                     self.note_focused = false;
                 } else {
-                    return DialogResult::Done(Approval {
-                        decision: ApprovalDecision::No,
-                        comment: None,
-                    });
+                    return DialogResult::Done(Approval::simple(ApprovalDecision::No, None));
                 }
             }
             K::Left if self.note_focused => self.note.left(),
@@ -345,10 +595,7 @@ impl Dialog {
                 if self.note_focused {
                     self.note_focused = false;
                 } else {
-                    return DialogResult::Done(Approval {
-                        decision: ApprovalDecision::No,
-                        comment: None,
-                    });
+                    return DialogResult::Done(Approval::simple(ApprovalDecision::No, None));
                 }
             }
             K::Left if focused => self.cur_page().note.left(),
@@ -448,10 +695,7 @@ impl Dialog {
                 .collect::<Vec<_>>()
                 .join("\n")
         };
-        DialogResult::Done(Approval {
-            decision: ApprovalDecision::Yes,
-            comment: Some(comment),
-        })
+        DialogResult::Done(Approval::simple(ApprovalDecision::Yes, Some(comment)))
     }
 
     /// The note as display rows: cursor bar inserted when focused, then
@@ -488,7 +732,10 @@ impl Dialog {
         }
     }
 
-    pub fn render(&self, width: u16) -> Vec<Line<'static>> {
+    pub fn render(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+        if self.plan.is_some() {
+            return self.render_plan(width, height);
+        }
         if self.questions.is_some() {
             return self.render_questions(width);
         }
@@ -549,6 +796,538 @@ impl Dialog {
             theme::dim(),
         ));
         out
+    }
+
+    /// Convert a panel-relative mouse coordinate to a wrapped plan-body row.
+    /// The title occupies content row zero; everything below the viewport is an
+    /// option or editor rather than selectable plan text.
+    fn plan_mouse_position(
+        &self,
+        row: usize,
+        col: usize,
+        width: u16,
+        height: u16,
+    ) -> Option<(PlanMousePosition, Vec<(usize, usize)>)> {
+        let (rows, spans) = self.plan_rows(width);
+        let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
+        let viewport = (height as usize)
+            .saturating_sub(overhead)
+            .max(PLAN_MIN_VIEWPORT)
+            .min(rows.len());
+        let scroll = self.plan_scroll(&spans, viewport, rows.len());
+        let body_row = row.checked_sub(1)?;
+        let absolute_row = scroll + body_row;
+        (body_row < viewport && absolute_row < rows.len()).then_some((
+            PlanMousePosition {
+                row: absolute_row,
+                col,
+            },
+            spans,
+        ))
+    }
+
+    /// Start a mouse selection inside the visible plan viewport. `row` and
+    /// `col` are content coordinates inside the approval panel (after its
+    /// border), supplied by the frontend that owns terminal geometry.
+    pub fn plan_mouse_down(&mut self, row: usize, col: usize, width: u16, height: u16) {
+        let Some(plan) = self.plan.as_ref() else {
+            return;
+        };
+        if plan.compose.is_some() || plan.feedback_focused || row == 0 {
+            return;
+        }
+        let Some((position, spans)) = self.plan_mouse_position(row, col, width, height) else {
+            return;
+        };
+        let plan = self.plan.as_mut().expect("plan dialog");
+        if let Some((block, _)) = spans
+            .iter()
+            .enumerate()
+            .find(|(_, (start, len))| position.row >= *start && position.row < *start + *len)
+        {
+            plan.focus = block;
+        }
+        plan.mouse_anchor = Some(position);
+        plan.mouse_head = Some(position);
+    }
+
+    /// Update the visible selection while a mouse drag stays inside the plan
+    /// viewport. The final selection is still extracted on mouse-up.
+    pub fn plan_mouse_drag(&mut self, row: usize, col: usize, width: u16, height: u16) {
+        if !matches!(self.plan.as_ref(), Some(plan) if plan.mouse_anchor.is_some()) {
+            return;
+        }
+        if let Some((position, _)) = self.plan_mouse_position(row, col, width, height) {
+            self.plan.as_mut().expect("plan dialog").mouse_head = Some(position);
+        }
+    }
+
+    /// Complete a mouse selection. A non-empty drag opens the comment composer
+    /// with the selected display text quoted; a click simply moves block focus.
+    pub fn plan_mouse_up(&mut self, row: usize, col: usize, width: u16, height: u16) {
+        self.plan_mouse_drag(row, col, width, height);
+        let Some((anchor, head)) = self
+            .plan
+            .as_mut()
+            .and_then(|plan| Some((plan.mouse_anchor.take()?, plan.mouse_head.take()?)))
+        else {
+            return;
+        };
+        if head == anchor {
+            return;
+        }
+        let (rows, spans) = self.plan_rows(width);
+        let quote = selected_plan_text(&rows, anchor, head);
+        if quote.is_empty() {
+            return;
+        }
+        let plan = self.plan.as_mut().expect("plan dialog");
+        if let Some((block, _)) = spans
+            .iter()
+            .enumerate()
+            .find(|(_, (start, len))| anchor.row >= *start && anchor.row < *start + *len)
+        {
+            plan.focus = block;
+        }
+        plan.compose = Some(PlanCommentDraft {
+            quote: Some(quote),
+            editor: Editor::new(),
+        });
+        plan.options_focused = false;
+    }
+
+    /// Plan review. The plan renders inside the pane, block-navigable; a
+    /// comment anchors to the focused block, a decision (approve → a mode, or
+    /// keep-planning → feedback) resolves the pane. Three input sub-modes:
+    /// composing a comment, editing free feedback, or browsing blocks/options.
+    fn handle_plan_key(&mut self, key: crossterm::event::KeyEvent) -> DialogResult {
+        use crossterm::event::KeyCode as K;
+        let plan = self.plan.as_ref().expect("plan dialog");
+
+        if plan.compose.is_some() {
+            let plan = self.plan.as_mut().expect("plan dialog");
+            let draft = plan.compose.as_mut().expect("compose");
+            match key.code {
+                K::Enter => {
+                    let text = draft.editor.text().trim().to_string();
+                    let quote = draft.quote.clone();
+                    plan.compose = None;
+                    if !text.is_empty() {
+                        plan.blocks[plan.focus]
+                            .comments
+                            .push(PlanComment { quote, text });
+                        // Saving an annotation is not consent. Park the focus on
+                        // the decisions so the user can deliberately choose the
+                        // next destination with arrows or Enter.
+                        plan.options_focused = true;
+                    }
+                }
+                K::Esc => plan.compose = None,
+                K::Left => draft.editor.left(),
+                K::Right => draft.editor.right(),
+                K::Home => draft.editor.home(),
+                K::End => draft.editor.end(),
+                K::Delete => draft.editor.delete(),
+                K::Backspace => draft.editor.backspace(),
+                K::Char(c) => draft.editor.insert_char(c),
+                _ => {}
+            }
+            return DialogResult::Pending;
+        }
+
+        if plan.feedback_focused {
+            if matches!(key.code, K::Enter) {
+                return self.submit_plan();
+            }
+            let plan = self.plan.as_mut().expect("plan dialog");
+            match key.code {
+                K::Tab | K::Esc => plan.feedback_focused = false,
+                K::Left => plan.feedback.left(),
+                K::Right => plan.feedback.right(),
+                K::Home => plan.feedback.home(),
+                K::End => plan.feedback.end(),
+                K::Delete => plan.feedback.delete(),
+                K::Backspace => plan.feedback.backspace(),
+                K::Char(c) => plan.feedback.insert_char(c),
+                _ => {}
+            }
+            return DialogResult::Pending;
+        }
+
+        let plan = self.plan.as_mut().expect("plan dialog");
+        if plan.options_focused {
+            match key.code {
+                K::Enter => return self.submit_plan(),
+                // Leave the choices and resume reviewing the plan. A second Esc
+                // from plan browsing is the explicit keep-planning action.
+                K::Esc | K::Tab | K::Right => plan.options_focused = false,
+                K::Up | K::Char('k') => plan.cursor = plan.cursor.saturating_sub(1),
+                K::Down | K::Char('j') => {
+                    plan.cursor = (plan.cursor + 1).min(PLAN_OPTIONS.len() - 1)
+                }
+                K::Char(c) if c.is_ascii_digit() => {
+                    let index = (c as usize).wrapping_sub('1' as usize);
+                    if index < PLAN_OPTIONS.len() {
+                        plan.cursor = index;
+                    }
+                }
+                _ => {}
+            }
+            return DialogResult::Pending;
+        }
+
+        match key.code {
+            K::Enter => return self.submit_plan(),
+            K::Esc => return self.decline_plan(),
+            K::Tab => plan.feedback_focused = true,
+            K::Up | K::Char('k') => plan.focus = plan.focus.saturating_sub(1),
+            K::Down | K::Char('j') => {
+                plan.focus = (plan.focus + 1).min(plan.blocks.len().saturating_sub(1))
+            }
+            K::Home | K::Char('g') => plan.focus = 0,
+            K::End | K::Char('G') => plan.focus = plan.blocks.len().saturating_sub(1),
+            K::PageUp => plan.focus = plan.focus.saturating_sub(PLAN_PAGE),
+            K::PageDown => {
+                plan.focus = (plan.focus + PLAN_PAGE).min(plan.blocks.len().saturating_sub(1))
+            }
+            K::Left => plan.options_focused = true,
+            K::Char('c') => {
+                plan.compose = Some(PlanCommentDraft {
+                    quote: None,
+                    editor: Editor::new(),
+                })
+            }
+            K::Char('e') => return DialogResult::EditPlan,
+            K::Char(c) if c.is_ascii_digit() => {
+                let index = (c as usize).wrapping_sub('1' as usize);
+                if index < PLAN_OPTIONS.len() {
+                    plan.cursor = index;
+                    plan.options_focused = true;
+                }
+            }
+            _ => {}
+        }
+        DialogResult::Pending
+    }
+
+    /// Keep planning: decline carrying the assembled comments (or free
+    /// feedback) as the reason. Walking away with nothing is still a decline.
+    fn decline_plan(&mut self) -> DialogResult {
+        DialogResult::Done(Approval {
+            decision: ApprovalDecision::No,
+            comment: self.assemble_feedback(),
+            set_mode: None,
+            approved_input: None,
+        })
+    }
+
+    fn submit_plan(&mut self) -> DialogResult {
+        let (decision, set_mode, requires, revised, approved_input) = {
+            let plan = self.plan.as_ref().expect("plan dialog");
+            let opt = &PLAN_OPTIONS[plan.cursor];
+            (
+                opt.decision,
+                opt.set_mode,
+                opt.requires_feedback,
+                plan.revised.clone(),
+                plan.approved_input(),
+            )
+        };
+        if requires {
+            // Keep-planning must say what to change; hold with feedback focused
+            // if neither an edit, a comment, nor free feedback was given.
+            let comment = self.assemble_feedback();
+            if comment.is_none() {
+                self.plan.as_mut().expect("plan dialog").feedback_focused = true;
+                return DialogResult::Pending;
+            }
+            return DialogResult::Done(Approval {
+                decision,
+                comment,
+                set_mode,
+                approved_input: None,
+            });
+        }
+        // Approval notes use the same append-only UserNote path as ordinary
+        // approval annotations, so comments remain visible to the next turn and
+        // after session replay.
+        let mut parts = Vec::new();
+        if let Some(revised) = revised {
+            parts.push(format!(
+                "The user edited the plan before approving. Use this revised plan as the source of truth for execution, not the earlier draft:\n\n{revised}"
+            ));
+        }
+        if let Some(feedback) = self.comments_feedback() {
+            parts.push(feedback);
+        }
+        DialogResult::Done(Approval {
+            decision,
+            comment: (!parts.is_empty()).then(|| parts.join("\n\n")),
+            set_mode,
+            approved_input,
+        })
+    }
+
+    /// The feedback the model receives on keep-planning: each anchored comment
+    /// as a `>`-quoted block plus the comment, then any free feedback. Anchoring
+    /// to the quoted source is what makes a TUI review approach the desktop
+    /// "comment on a passage" experience.
+    fn assemble_feedback(&self) -> Option<String> {
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let mut parts: Vec<String> = Vec::new();
+        // A `$EDITOR` edit sent back for more planning travels as a diff so the
+        // model sees exactly what changed.
+        if let Some(diff) = plan.revision_diff() {
+            parts.push(format!("The user edited the plan:\n\n{diff}"));
+        }
+        if let Some(comments) = self.comments_feedback() {
+            parts.push(comments);
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    fn comments_feedback(&self) -> Option<String> {
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let mut parts: Vec<String> = Vec::new();
+        for block in &plan.blocks {
+            for comment in &block.comments {
+                let quote = comment.quote.as_deref().unwrap_or(&block.source);
+                parts.push(format!("{}\n\n{}", quote_source(quote), comment.text));
+            }
+        }
+        let free = plan.feedback.text().trim().to_string();
+        if !free.is_empty() {
+            parts.push(free);
+        }
+        (!parts.is_empty()).then(|| parts.join("\n\n"))
+    }
+
+    /// The wrapped plan body as display rows plus, for each block, the
+    /// `(start, len)` span of rows it occupies (comments and the trailing
+    /// blank included) so the viewport can be scrolled to keep the focus in
+    /// view.
+    fn plan_rows(&self, width: u16) -> (Vec<Line<'static>>, Vec<(usize, usize)>) {
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let text_w = (width as usize).saturating_sub(2).max(10);
+        let mut rows: Vec<Line<'static>> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        for (i, block) in plan.blocks.iter().enumerate() {
+            let start = rows.len();
+            let focused = i == plan.focus;
+            let gutter = if focused {
+                Span::styled("▎ ", theme::accent())
+            } else {
+                Span::raw("  ")
+            };
+            let mut wrapped = crate::transcript::wrap_lines(block.lines.clone(), text_w);
+            if wrapped.is_empty() {
+                wrapped.push(Line::default());
+            }
+            for (j, wl) in wrapped.into_iter().enumerate() {
+                let mut line_spans = vec![gutter.clone()];
+                line_spans.extend(wl.spans);
+                // A commented block wears its markers on its first row.
+                if j == 0 && !block.comments.is_empty() {
+                    line_spans.push(Span::styled(
+                        format!(" {}", superscripts(block.comments.len())),
+                        theme::accent(),
+                    ));
+                }
+                rows.push(Line::from(line_spans));
+            }
+            for (n, comment) in block.comments.iter().enumerate() {
+                for (j, row) in wrap_cells(&comment.text, text_w.saturating_sub(4))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let prefix = if j == 0 {
+                        format!("  {} ", superscript(n + 1))
+                    } else {
+                        "    ".to_string()
+                    };
+                    rows.push(Line::from(vec![
+                        Span::styled(prefix, theme::accent()),
+                        Span::raw(row),
+                    ]));
+                }
+            }
+            rows.push(Line::default());
+            spans.push((start, rows.len() - start));
+        }
+        if let Some((anchor, head)) = plan.mouse_anchor.zip(plan.mouse_head) {
+            highlight_plan_selection(&mut rows, anchor, head);
+        }
+        (rows, spans)
+    }
+
+    /// Scroll offset that keeps the focused block's first row visible, showing
+    /// as much of its body as the viewport `k` holds; a block taller than the
+    /// viewport is pinned to its start.
+    fn plan_scroll(&self, spans: &[(usize, usize)], k: usize, total: usize) -> usize {
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let mut scroll = plan.scroll.get();
+        let (fs, fl) = spans.get(plan.focus).copied().unwrap_or((0, 0));
+        if fs < scroll {
+            scroll = fs;
+        } else if fs + fl > scroll + k {
+            scroll = (fs + fl).saturating_sub(k);
+        }
+        scroll = scroll.min(fs);
+        scroll.min(total.saturating_sub(k))
+    }
+
+    fn render_plan(&self, width: u16, height: u16) -> Vec<Line<'static>> {
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let mut out: Vec<Line<'static>> = Vec::new();
+
+        // Title with the focus position.
+        let mut title = vec![
+            Span::styled("▤ Review plan: ", theme::accent()),
+            Span::styled(self.summary.clone(), theme::bold()),
+        ];
+        if plan.blocks.len() > 1 {
+            title.push(Span::styled(
+                format!("  · block {}/{}", plan.focus + 1, plan.blocks.len()),
+                theme::dim(),
+            ));
+        }
+        out.push(Line::from(title));
+
+        // Plan body, scrolled to keep the focus visible. Reserve the rest of
+        // the panel for the options, the editor row, and the hint.
+        let (rows, spans) = self.plan_rows(width);
+        let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
+        let k = (height as usize)
+            .saturating_sub(overhead)
+            .max(PLAN_MIN_VIEWPORT)
+            .min(rows.len());
+        let scroll = self.plan_scroll(&spans, k, rows.len());
+        plan.scroll.set(scroll);
+        out.extend(rows.into_iter().skip(scroll).take(k));
+
+        // Decision options. After an external edit these are deliberately
+        // phrased as the two available destinations: options 1–3 approve the
+        // revised artifact under a chosen permission mode; option 4 sends its
+        // diff back for another planning pass.
+        for (i, opt) in PLAN_OPTIONS.iter().enumerate() {
+            let label = if plan.has_revision() {
+                match i {
+                    0 => "Approve revised plan, approve edits manually",
+                    1 => "Approve revised plan, auto-accept edits",
+                    2 => "Approve revised plan, use auto mode",
+                    _ => "Send revision back as feedback",
+                }
+            } else {
+                opt.label
+            };
+            let selected = i == plan.cursor
+                && plan.options_focused
+                && !plan.feedback_focused
+                && plan.compose.is_none();
+            let marker = if selected {
+                "▸ "
+            } else if i == plan.cursor && !plan.feedback_focused && plan.compose.is_none() {
+                "· "
+            } else {
+                "  "
+            };
+            let color = if opt.requires_feedback {
+                theme::ERROR
+            } else {
+                theme::OK
+            };
+            let style = if selected {
+                ratatui::style::Style::default()
+                    .fg(color)
+                    .add_modifier(ratatui::style::Modifier::BOLD)
+            } else {
+                theme::dim()
+            };
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{marker}{}. {label}", i + 1), style),
+            ]));
+        }
+
+        // Composing a comment takes the editor row; otherwise it shows the
+        // free-feedback line.
+        if let Some(draft) = plan.compose.as_ref() {
+            if let Some(quote) = &draft.quote {
+                let quote = wrap_cells(quote, (width as usize).saturating_sub(16).max(10))
+                    .into_iter()
+                    .next()
+                    .unwrap_or_default();
+                out.push(Line::from(vec![
+                    Span::styled("  quote: ", theme::dim()),
+                    Span::styled(quote, theme::dim()),
+                ]));
+            }
+            self.render_line_editor("comment:", &draft.editor, true, width, &mut out);
+        } else {
+            self.render_line_editor(
+                "note:",
+                &plan.feedback,
+                plan.feedback_focused,
+                width,
+                &mut out,
+            );
+        }
+
+        let hint = if plan.compose.is_some() {
+            "  type comment · enter save · esc discard comment"
+        } else if plan.feedback_focused {
+            "  type feedback · enter send · esc return to plan"
+        } else if plan.options_focused {
+            "  ↑↓/1-4 choose · enter confirm · →/esc return to plan"
+        } else if plan.has_revision() {
+            "  ↑↓ blocks · c comment · e edit · ←/1-4 choose · esc = keep planning"
+        } else {
+            "  ↑↓ blocks · c comment · drag text to quote · ←/1-4 choose · tab feedback · esc = keep planning"
+        };
+        out.push(Line::styled(hint, theme::dim()));
+        out
+    }
+
+    /// A single-line editor row (comment or feedback), styled like the consent
+    /// note with a labelled prefix and a cursor bar when focused.
+    fn render_line_editor(
+        &self,
+        label: &str,
+        editor: &Editor,
+        focused: bool,
+        width: u16,
+        out: &mut Vec<Line<'static>>,
+    ) {
+        let text = editor.text();
+        let display = if focused {
+            let (_, col) = editor.cursor();
+            let byte = text
+                .char_indices()
+                .nth(col)
+                .map(|(b, _)| b)
+                .unwrap_or(text.len());
+            format!("{}▏{}", &text[..byte], &text[byte..])
+        } else {
+            text
+        };
+        let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
+        let style = if focused {
+            theme::accent()
+        } else {
+            theme::dim()
+        };
+        let indent = " ".repeat(NOTE_INDENT);
+        for (i, row) in wrap_cells(&display, avail).iter().enumerate() {
+            let prefix = if i == 0 {
+                format!("  {label} ")
+            } else {
+                indent.clone()
+            };
+            out.push(Line::from(vec![
+                Span::styled(prefix, style),
+                Span::raw(row.clone()),
+            ]));
+        }
     }
 
     fn render_questions(&self, width: u16) -> Vec<Line<'static>> {
@@ -728,6 +1507,136 @@ fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
     out
 }
 
+/// Prefix every line of a block's source with `> ` so a comment quotes the
+/// exact passage it refers to.
+fn quote_source(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A single superscript digit for a comment index (1-based); falls back to a
+/// bracketed number past nine.
+fn superscript(n: usize) -> String {
+    const SUP: [char; 10] = ['⁰', '¹', '²', '³', '⁴', '⁵', '⁶', '⁷', '⁸', '⁹'];
+    if (1..=9).contains(&n) {
+        SUP[n].to_string()
+    } else {
+        format!("[{n}]")
+    }
+}
+
+/// The run of superscript markers a block wears when it carries `count`
+/// comments (¹²³ …).
+fn superscripts(count: usize) -> String {
+    (1..=count).map(superscript).collect()
+}
+
+/// Apply the normal terminal selection treatment to the part of each wrapped
+/// row covered by a plan drag. The original Markdown styles survive; only the
+/// selected cells gain the reversed modifier.
+fn highlight_plan_selection(
+    rows: &mut [Line<'static>],
+    a: PlanMousePosition,
+    b: PlanMousePosition,
+) {
+    use ratatui::style::Modifier;
+    use unicode_width::UnicodeWidthChar;
+
+    let (start, end) = if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    for (row_index, line) in rows
+        .iter_mut()
+        .enumerate()
+        .skip(start.row)
+        .take(end.row.saturating_sub(start.row) + 1)
+    {
+        let from = if row_index == start.row {
+            start.col.max(2)
+        } else {
+            2
+        };
+        let to = if row_index == end.row {
+            end.col.max(2)
+        } else {
+            usize::MAX
+        };
+        let mut cell = 0usize;
+        let mut spans = Vec::new();
+        for span in std::mem::take(&mut line.spans) {
+            for c in span.content.chars() {
+                let width = c.width().unwrap_or(0);
+                let selected = cell + width > from && cell < to;
+                let style = if selected {
+                    span.style.add_modifier(Modifier::REVERSED)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(c.to_string(), style));
+                cell += width;
+            }
+        }
+        line.spans = spans;
+    }
+}
+
+/// Extract the text under a plan-pane mouse drag. Plan rows carry a two-cell
+/// gutter; selection columns are panel-relative, so remove that furniture before
+/// slicing and never include comments/options outside the visible plan rows.
+fn selected_plan_text(rows: &[Line<'_>], a: PlanMousePosition, b: PlanMousePosition) -> String {
+    use unicode_width::UnicodeWidthChar;
+
+    let (start, end) = if (a.row, a.col) <= (b.row, b.col) {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let mut selected = Vec::new();
+    for row in start.row..=end.row {
+        let text = rows
+            .get(row)
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        let from = if row == start.row {
+            start.col.max(2)
+        } else {
+            2
+        };
+        let to = if row == end.row {
+            end.col.max(2)
+        } else {
+            usize::MAX
+        };
+        let mut cell = 0usize;
+        let mut part = String::new();
+        for c in text.chars() {
+            let width = c.width().unwrap_or(0);
+            if cell + width > from && cell < to {
+                part.push(c);
+            }
+            cell += width;
+            if cell >= to {
+                break;
+            }
+        }
+        let part = part.trim();
+        if !part.is_empty() {
+            selected.push(part.to_string());
+        }
+    }
+    selected.join("\n")
+}
+
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut rows = vec![String::new()];
@@ -769,7 +1678,7 @@ mod tests {
     }
 
     fn screen(d: &Dialog, width: u16) -> String {
-        d.render(width)
+        d.render(width, 40)
             .iter()
             .map(|line| {
                 line.spans
@@ -989,7 +1898,7 @@ mod tests {
         type_str(&mut d, &"x".repeat(60));
         // 40 cells wide leaves ~30 for the note: expect several rows.
         let rows = d
-            .render(40)
+            .render(40, 40)
             .iter()
             .filter(|l| {
                 let text: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
@@ -997,7 +1906,7 @@ mod tests {
             })
             .count();
         assert!(rows >= 2, "60-char note must wrap at width 40");
-        assert!(d.render(40).len() > d.render(200).len());
+        assert!(d.render(40, 40).len() > d.render(200, 40).len());
     }
 
     #[test]
@@ -1120,5 +2029,307 @@ mod tests {
         };
         assert_eq!(a.decision, ApprovalDecision::No);
         assert_eq!(a.comment, None);
+    }
+
+    /// Blocks where each renders to a single line of its own source (enough to
+    /// exercise navigation, scrolling, quoting, and revision).
+    fn blocks_for(src: &str) -> Vec<(String, Vec<Line<'static>>)> {
+        crate::markdown::split_blocks(src)
+            .into_iter()
+            .map(|b| {
+                let line = Line::from(b.clone());
+                (b, vec![line])
+            })
+            .collect()
+    }
+
+    /// Build a plan dialog whose blocks each render to one line of their source.
+    fn plan_dialog(src: &str) -> Dialog {
+        Dialog::plan(
+            "Test plan".into(),
+            json!({ "plan": src, "title": "Test plan" }),
+            blocks_for(src),
+        )
+    }
+
+    fn render_text(d: &Dialog, width: u16, height: u16) -> String {
+        d.render(width, height)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn plan_esc_with_nothing_left_just_keeps_planning() {
+        let mut d = plan_dialog("# Title\n\nBody paragraph.");
+        assert!(d.is_plan());
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
+            panic!("esc keeps planning");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.comment, None);
+        assert_eq!(a.set_mode, None);
+    }
+
+    #[test]
+    fn plan_default_approval_requires_manual_edit_approval() {
+        let mut d = plan_dialog("# T\n\nBody.");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves");
+        };
+        assert_eq!(a.decision, ApprovalDecision::Yes);
+        assert_eq!(a.set_mode, Some(PermissionMode::Default));
+        assert_eq!(a.comment, None);
+    }
+
+    #[test]
+    fn plan_left_enters_approval_and_right_returns_to_the_body() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Left));
+        assert!(
+            d.plan.as_ref().expect("plan dialog").options_focused,
+            "left exits the plan body into approval choices"
+        );
+        d.handle_key(key(KeyCode::Right));
+        assert!(
+            !d.plan.as_ref().expect("plan dialog").options_focused,
+            "right returns from approval choices to the plan body"
+        );
+    }
+
+    #[test]
+    fn plan_digit_picks_the_auto_mode_option() {
+        let mut d = plan_dialog("# T\n\nBody.");
+        d.handle_key(key(KeyCode::Char('3'))); // "use auto mode"
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves");
+        };
+        assert_eq!(a.set_mode, Some(PermissionMode::Auto));
+    }
+
+    #[test]
+    fn plan_comment_anchors_to_the_focused_block() {
+        let mut d = plan_dialog("First block.\n\nSecond block.");
+        d.handle_key(key(KeyCode::Down)); // focus the second block
+        d.handle_key(key(KeyCode::Char('c')));
+        type_str(&mut d, "reword this");
+        d.handle_key(key(KeyCode::Enter)); // save the comment, focus decisions
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Esc)),
+            DialogResult::Pending
+        ));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
+            panic!("second esc keeps planning with the comment");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        let comment = a.comment.expect("assembled feedback");
+        assert!(
+            comment.contains("> Second block."),
+            "quotes the anchored block: {comment}"
+        );
+        assert!(comment.contains("reword this"));
+        assert!(
+            !comment.contains("First block"),
+            "an uncommented block is not quoted: {comment}"
+        );
+    }
+
+    #[test]
+    fn saved_comment_moves_to_options_and_can_select_auto_accept() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('c')));
+        type_str(&mut d, "looks good");
+        d.handle_key(key(KeyCode::Enter));
+        d.handle_key(key(KeyCode::Down)); // manual approval → auto-accept
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter confirms the selected option");
+        };
+        assert_eq!(a.set_mode, Some(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn mouse_selected_passage_is_highlighted_and_comment_is_not_duplicated() {
+        use ratatui::style::Modifier;
+
+        let mut d = plan_dialog("First block.\n\nSecond block.");
+        // Title is content row 0; the second block is visual plan-body row 2.
+        d.plan_mouse_down(3, 2, 80, 20);
+        d.plan_mouse_drag(3, 8, 80, 20);
+        assert!(
+            d.render(80, 20)
+                .iter()
+                .flat_map(|line| &line.spans)
+                .any(|span| span.style.add_modifier.contains(Modifier::REVERSED)),
+            "a drag visibly marks the selected passage"
+        );
+        d.plan_mouse_up(3, 8, 80, 20);
+        type_str(&mut d, "make this concrete");
+        d.handle_key(key(KeyCode::Enter));
+        let rendered = render_text(&d, 80, 20);
+        assert!(
+            rendered.contains("Second block. ¹"),
+            "block wears the comment marker: {rendered}"
+        );
+        assert!(
+            rendered.contains("make this concrete"),
+            "comment is visible: {rendered}"
+        );
+        assert!(
+            !rendered.contains("› Second"),
+            "the selected text is not repeated: {rendered}"
+        );
+        assert_eq!(
+            rendered.matches("Second block.").count(),
+            1,
+            "only the plan body shows the source"
+        );
+    }
+
+    #[test]
+    fn approving_a_plan_preserves_its_comments_as_a_user_note() {
+        let mut d = plan_dialog("First block.\n\nSecond block.");
+        d.plan_mouse_down(3, 2, 80, 20);
+        d.plan_mouse_up(3, 8, 80, 20);
+        type_str(&mut d, "make this concrete");
+        d.handle_key(key(KeyCode::Enter));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("approval should complete");
+        };
+        assert_eq!(a.decision, ApprovalDecision::Yes);
+        let feedback = a.comment.expect("approved comment becomes a user note");
+        assert!(
+            feedback.contains("> Second"),
+            "exact selected passage: {feedback}"
+        );
+        assert!(feedback.contains("make this concrete"));
+        assert!(
+            !feedback.contains("First block"),
+            "only the selection is quoted: {feedback}"
+        );
+    }
+
+    #[test]
+    fn plan_keep_planning_requires_a_reason() {
+        let mut d = plan_dialog("# T\n\nBody.");
+        d.handle_key(key(KeyCode::Char('4'))); // "keep planning"
+                                               // Enter with nothing to say holds the dialog, focusing the note.
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Enter)),
+            DialogResult::Pending
+        ));
+        type_str(&mut d, "add error handling");
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter submits once a reason exists");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.comment.as_deref(), Some("add error handling"));
+        assert_eq!(a.set_mode, None);
+    }
+
+    #[test]
+    fn plan_editor_revision_is_approved_as_the_new_source_of_truth() {
+        let mut d = plan_dialog("Original body.");
+        d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves");
+        };
+        assert_eq!(a.decision, ApprovalDecision::Yes);
+        assert_eq!(a.set_mode, Some(PermissionMode::Default));
+        let comment = a.comment.expect("the revision travels with the approval");
+        assert!(comment.contains("Revised body."), "{comment}");
+        assert!(comment.contains("revised plan"), "{comment}");
+        assert_eq!(
+            a.approved_input
+                .as_ref()
+                .and_then(|input| input["plan"].as_str()),
+            Some("Revised body."),
+            "the mirror receives the reviewed plan, not the original tool input"
+        );
+    }
+
+    #[test]
+    fn plan_editor_revision_can_be_sent_back_as_a_diff() {
+        let mut d = plan_dialog("Original body.");
+        d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
+        d.handle_key(key(KeyCode::Char('4'))); // keep planning
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter submits the edit as feedback");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        let comment = a.comment.expect("the edit is the feedback");
+        assert!(comment.contains("The user edited the plan"), "{comment}");
+        assert!(
+            comment.contains("-Original body."),
+            "a diff line: {comment}"
+        );
+        assert!(comment.contains("+Revised body."), "a diff line: {comment}");
+    }
+
+    #[test]
+    fn plan_editor_revision_surfaces_approve_or_feedback_destinations() {
+        let mut d = plan_dialog("Original body.");
+        d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
+        let text = render_text(&d, 80, 20);
+        assert!(
+            text.contains("Approve revised plan, auto-accept edits"),
+            "{text}"
+        );
+        assert!(text.contains("Send revision back as feedback"), "{text}");
+    }
+
+    #[test]
+    fn restoring_the_original_plan_clears_a_prior_revision() {
+        let mut d = plan_dialog("Original body.");
+        d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
+        d.revise_plan("Original body.".into(), blocks_for("Original body."));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves");
+        };
+        assert_eq!(a.comment, None);
+        assert_eq!(a.approved_input, None);
+    }
+
+    #[test]
+    fn plan_editor_no_change_adds_nothing() {
+        let mut d = plan_dialog("Same body.");
+        d.revise_plan("Same body.".into(), blocks_for("Same body."));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter approves");
+        };
+        assert_eq!(a.comment, None, "an unchanged edit is a no-op");
+    }
+
+    #[test]
+    fn plan_e_key_requests_an_external_edit() {
+        let mut d = plan_dialog("Body.");
+        assert!(matches!(
+            d.handle_key(key(KeyCode::Char('e'))),
+            DialogResult::EditPlan
+        ));
+    }
+
+    #[test]
+    fn plan_scrolls_to_keep_the_focused_block_visible() {
+        let src = (1..=20)
+            .map(|i| format!("Block number {i}."))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let mut d = plan_dialog(&src);
+        d.handle_key(key(KeyCode::End)); // jump to the last block
+        let text = render_text(&d, 60, 14);
+        assert!(
+            text.contains("Block number 20"),
+            "the focus is in view: {text}"
+        );
+        assert!(
+            !text.contains("Block number 1."),
+            "an out-of-view block is not rendered: {text}"
+        );
     }
 }

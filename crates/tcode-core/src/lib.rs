@@ -21,7 +21,7 @@ pub mod tool;
 pub mod types;
 
 pub use agent::{
-    Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, Session,
+    Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, PendingMode, Session,
     DEFAULT_MAX_STEPS,
 };
 pub use auto_mode::{

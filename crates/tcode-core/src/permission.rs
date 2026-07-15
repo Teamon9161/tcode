@@ -71,6 +71,18 @@ impl PermissionRules {
         if matches!(request, PermissionRequest::UserInput { .. }) {
             return Decision::Ask;
         }
+        // Plan review is the one gate that turns plan mode *off*: it must reach
+        // the human in plan mode (never auto-approved), and outside plan mode
+        // it is a no-op the model is nudged to correct rather than a prompt.
+        if matches!(request, PermissionRequest::PlanReview { .. }) {
+            return if mode == PermissionMode::Plan {
+                Decision::Ask
+            } else {
+                Decision::Deny(
+                    "not in plan mode; nothing to exit. If you want to record a plan, just write it in your reply.".into(),
+                )
+            };
+        }
         let PermissionRequest::Ask {
             descriptor,
             is_edit,
@@ -134,6 +146,29 @@ pub fn pattern_match(pattern: &str, text: &str) -> bool {
 pub struct Approval {
     pub decision: ApprovalDecision,
     pub comment: Option<String>,
+    /// A permission-mode transition the approval carries. Set only by the plan
+    /// review dialog (approving a plan chooses the mode execution runs under);
+    /// the agent loop applies it generically. `None` for every ordinary
+    /// approval, which never changes the mode.
+    pub set_mode: Option<PermissionMode>,
+    /// Replacement input to execute after an approval. This preserves the
+    /// assistant's append-only tool-use entry while allowing a review surface
+    /// to turn an approved artifact (such as an edited plan) into the actual
+    /// tool input and on-disk result.
+    pub approved_input: Option<Value>,
+}
+
+impl Approval {
+    /// A plain yes/no/always answer with no mode transition — the shape of
+    /// every ordinary approval.
+    pub fn simple(decision: ApprovalDecision, comment: Option<String>) -> Self {
+        Self {
+            decision,
+            comment,
+            set_mode: None,
+            approved_input: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

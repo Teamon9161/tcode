@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::io::Write as _;
 
 use serde_json::Value;
-use tcode_core::{Approval, ApprovalDecision, Approver};
+use tcode_core::{Approval, ApprovalDecision, Approver, PermissionMode};
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -32,17 +32,20 @@ impl Approver for LineApprover {
         if !self.interactive {
             println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
             println!("{DIM}  denied — a one-shot run (-p) has nobody to approve it{RESET}");
-            return Approval {
-                decision: ApprovalDecision::No,
-                comment: Some(format!(
+            return Approval::simple(
+                ApprovalDecision::No,
+                Some(format!(
                     "Denied: this action needs approval, and a one-shot run has no one to give it. \
                      Re-run interactively, start with a permission mode that covers it \
                      (--mode auto or --mode accept-edits), or add an allow rule for {descriptor}."
                 )),
-            };
+            );
         }
         if tool == "ask_user" {
             return ask_user_plain(summary, input).await;
+        }
+        if tool == "exit_plan" {
+            return review_plan_plain(input).await;
         }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
@@ -62,10 +65,7 @@ impl Approver for LineApprover {
             // approve blindly — a blank Enter (n >= 1) still defaults to Yes.
             if n == 0 {
                 println!("{DIM}  no input (EOF) — denied{RESET}");
-                return Approval {
-                    decision: ApprovalDecision::No,
-                    comment: None,
-                };
+                return Approval::simple(ApprovalDecision::No, None);
             }
             let line = line.trim();
             let (head, rest) = match line.split_once(char::is_whitespace) {
@@ -82,10 +82,7 @@ impl Approver for LineApprover {
                     continue;
                 }
             };
-            return Approval {
-                decision,
-                comment: rest,
-            };
+            return Approval::simple(decision, rest);
         }
     }
 }
@@ -120,10 +117,7 @@ async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
             let (n, line) = read_line_blocking().await;
             if n == 0 {
                 println!("{DIM}  no input (EOF) — cancelled{RESET}");
-                return Approval {
-                    decision: ApprovalDecision::No,
-                    comment: None,
-                };
+                return Approval::simple(ApprovalDecision::No, None);
             }
             let raw = line.trim();
             if raw.is_empty() {
@@ -144,9 +138,67 @@ async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
             .collect::<Vec<_>>()
             .join("\n")
     };
-    Approval {
-        decision: ApprovalDecision::Yes,
-        comment: Some(comment),
+    Approval::simple(ApprovalDecision::Yes, Some(comment))
+}
+
+/// Line-mode plan review: print the plan, offer the four decisions, and read
+/// one. Keep-planning collects feedback. Mirrors the TUI plan dialog.
+async fn review_plan_plain(input: &Value) -> Approval {
+    let plan = input["plan"].as_str().unwrap_or("").trim();
+    println!("\n{YELLOW}▤{RESET} {BOLD}Review plan{RESET}");
+    for line in plan.lines() {
+        println!("{DIM}  {line}{RESET}");
+    }
+    let options: [(&str, ApprovalDecision, Option<PermissionMode>); 4] = [
+        (
+            "Yes, and approve edits manually",
+            ApprovalDecision::Yes,
+            Some(PermissionMode::Default),
+        ),
+        (
+            "Yes, and auto-accept edits",
+            ApprovalDecision::Yes,
+            Some(PermissionMode::AcceptEdits),
+        ),
+        (
+            "Yes, and use auto mode",
+            ApprovalDecision::Yes,
+            Some(PermissionMode::Auto),
+        ),
+        ("No, keep planning", ApprovalDecision::No, None),
+    ];
+    for (i, (label, _, _)) in options.iter().enumerate() {
+        println!("{DIM}  {}) {label}{RESET}", i + 1);
+    }
+    loop {
+        print!("{DIM}  choose 1-4 (append feedback, required for 4) > {RESET}");
+        let _ = std::io::stdout().flush();
+        let (n, line) = read_line_blocking().await;
+        if n == 0 {
+            println!("{DIM}  no input (EOF) — kept planning{RESET}");
+            return Approval::simple(ApprovalDecision::No, None);
+        }
+        let line = line.trim();
+        let (head, rest) = match line.split_once(char::is_whitespace) {
+            Some((h, r)) => (h, Some(r.trim().to_string()).filter(|s| !s.is_empty())),
+            None => (line, None),
+        };
+        let Some(index) = head.parse::<usize>().ok().filter(|i| (1..=4).contains(i)) else {
+            print!("{DIM}  enter 1, 2, 3 or 4 > {RESET}");
+            let _ = std::io::stdout().flush();
+            continue;
+        };
+        let (_, decision, set_mode) = options[index - 1];
+        if decision == ApprovalDecision::No && rest.is_none() {
+            println!("{DIM}  keep-planning needs feedback: 4 <what to change>{RESET}");
+            continue;
+        }
+        return Approval {
+            decision,
+            comment: rest,
+            set_mode,
+            approved_input: None,
+        };
     }
 }
 

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -110,15 +110,10 @@ impl Approver for ChannelApprover {
             reply,
         };
         if self.tx.send(msg).await.is_err() {
-            return Approval {
-                decision: ApprovalDecision::No,
-                comment: Some("UI unavailable".into()),
-            };
+            return Approval::simple(ApprovalDecision::No, Some("UI unavailable".into()));
         }
-        rx.await.unwrap_or(Approval {
-            decision: ApprovalDecision::No,
-            comment: None,
-        })
+        rx.await
+            .unwrap_or_else(|_| Approval::simple(ApprovalDecision::No, None))
     }
 }
 
@@ -296,6 +291,16 @@ pub struct App {
     /// Prompts submitted while a turn was running. The agent loop takes them at
     /// its next safe boundary; until then they show, dimmed, above the input.
     pending: tcode_core::PendingInput,
+    /// A permission-mode switch staged while a turn runs (the running turn owns
+    /// the `Session`). The agent loop commits it at the next batch boundary and
+    /// reports back with `ModeChanged`; until then the status line shows the
+    /// staged target with a pending marker.
+    pending_mode: tcode_core::PendingMode,
+    /// The mode currently in effect, as the frontend knows it. Kept in step
+    /// with `Session::mode`: updated directly when idle, and on `ModeChanged`
+    /// when a running turn commits a staged switch. Cycling reads
+    /// staged-else-committed so repeated presses collapse to the final target.
+    committed_mode: tcode_core::PermissionMode,
     /// The idle guess at the next instruction: ghost text in an empty input,
     /// accepted with →. It belongs to the turn that produced it and survives
     /// typing — the ghost hides while the input has text and comes back when it
@@ -410,6 +415,8 @@ impl App {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
         let mode_label = session.mode.label().to_string();
+        let committed_mode = session.mode;
+        let pending_mode = session.pending_mode.clone();
         let session_dogfood = session.dogfood();
         let cwd = session.tool_ctx.cwd.clone();
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
@@ -433,6 +440,8 @@ impl App {
             registry: CommandRegistry::builtin(),
             session: Some(session),
             pending,
+            pending_mode,
+            committed_mode,
             cwd,
             renderers,
             terminal,
@@ -530,6 +539,26 @@ impl App {
                     }
                     let dialog = if ask.tool == "ask_user" {
                         Dialog::questions(ask.summary, &ask.input)
+                    } else if ask.tool == "exit_plan" {
+                        // The plan is the review surface, but it lives inside the
+                        // pane now (block-navigable, commentable) rather than in
+                        // the transcript. Split it into blocks and pre-render each
+                        // so the hot key path never re-parses markdown. On
+                        // approval the tool runs and its ToolStart bakes the plan
+                        // into the transcript; on decline `bake_approval_record`
+                        // bakes it — either way the transcript record matches
+                        // replay's ExitPlanRenderer output.
+                        self.bake_live_text();
+                        self.finish_thinking();
+                        let source = ask.input["plan"].as_str().unwrap_or("").trim();
+                        let blocks = markdown::split_blocks(source)
+                            .into_iter()
+                            .map(|block| {
+                                let lines = self.md.render(&block);
+                                (block, lines)
+                            })
+                            .collect();
+                        Dialog::plan(ask.summary, ask.input.clone(), blocks)
                     } else {
                         // A change proposal (edit/write) is baked into the
                         // transcript now — in full, scrollable as part of the
@@ -1094,6 +1123,18 @@ impl App {
         self.phase = Phase::Idle;
         self.events_rx = None;
         self.state_label.clear();
+        // A switch staged during the closing (non-tool) output never reached a
+        // batch boundary. Now that the turn is over and we are idle again,
+        // commit it here. If a queued prompt starts the next turn instead, its
+        // own turn-start commit and note injection cover it.
+        if let Some(mode) = self.session.as_mut().and_then(|s| s.commit_pending_mode()) {
+            self.committed_mode = mode;
+            self.mode_label = mode.label().to_string();
+            self.bake(vec![Line::styled(
+                format!("permission mode → {}", mode.label()),
+                theme::dim(),
+            )]);
+        }
         let landed = result.is_ok();
         if let Err(e) = result {
             self.bake(vec![Line::styled(
@@ -1380,6 +1421,17 @@ impl App {
                 self.prev_cache_ratio = None;
             }
             AgentEvent::Compacted(summary) => self.bake_compacted(&summary),
+            AgentEvent::ModeChanged(mode) => {
+                // A staged switch just committed at a batch boundary. Promote
+                // the pending marker to the real mode and record where in the
+                // transcript it took effect.
+                self.committed_mode = mode;
+                self.mode_label = mode.label().to_string();
+                self.bake(vec![Line::styled(
+                    format!("permission mode → {}", mode.label()),
+                    theme::dim(),
+                )]);
+            }
             AgentEvent::AutoModePaused(notice) => {
                 self.bake(vec![Line::styled(
                     format!("⊙ {notice}"),
@@ -1434,6 +1486,32 @@ impl App {
         // Flush streamed text so the record keeps chronological order.
         self.bake_live_text();
         self.finish_thinking();
+        if dialog.is_plan() {
+            match approval.decision {
+                // Approved: the tool runs, so its ToolStart bakes the plan and
+                // its ToolEnd result + the ModeChanged event carry the record.
+                // Nothing to add here.
+                ApprovalDecision::Yes | ApprovalDecision::YesAlways => {}
+                ApprovalDecision::No => {
+                    // Keep-planning: no ToolStart/ToolEnd will fire, so bake the
+                    // plan here (through the same ExitPlanRenderer path replay
+                    // uses) followed by the decision + feedback.
+                    if let Some(input) = dialog.plan_input() {
+                        self.bake_call_start("exit_plan", &input);
+                    }
+                    let reason = approval
+                        .comment
+                        .as_deref()
+                        .map(|c| format!(" — {c}"))
+                        .unwrap_or_default();
+                    self.bake(vec![Line::styled(
+                        format!("  ⎿ keep planning{reason}"),
+                        ratatui::style::Style::default().fg(theme::WARN),
+                    )]);
+                }
+            }
+            return;
+        }
         if dialog.is_question() {
             let answer = approval.comment.clone().unwrap_or_default();
             let mut lines = vec![Line::default()];
@@ -1479,6 +1557,91 @@ impl App {
                     ),
                 ]);
             }
+        }
+    }
+
+    /// Open the plan under review in `$EDITOR`, then feed any change back into
+    /// the pane. The TUI owns the terminal, so it is suspended (leave the
+    /// alternate screen, drop raw mode and the input hooks) around the child
+    /// process, then restored and fully redrawn. A revision equal to the
+    /// original is a no-op inside `revise_plan`.
+    fn edit_plan_externally(&mut self) {
+        let Some(source) = self.dialog.as_ref().and_then(|(d, _)| d.plan_source()) else {
+            return;
+        };
+
+        // Stage the plan in a unique project-scratchpad file. A fixed name
+        // would let simultaneous tcode sessions overwrite each other's review.
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let path = tcode_core::store::scratchpad_dir(&self.cwd)
+            .join(format!("plan-review-{}-{nonce}.md", std::process::id()));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if std::fs::write(&path, &source).is_err() {
+            self.notice = Some((
+                "could not stage the plan for editing".into(),
+                Instant::now(),
+            ));
+            return;
+        }
+
+        // Suspend the TUI around the editor, then restore it and force a full
+        // repaint (the child scribbled over the alternate screen).
+        use crossterm::event::{
+            DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        };
+        use crossterm::terminal::{
+            disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+        };
+        let mut out = std::io::stdout();
+        let _ = crossterm::execute!(
+            out,
+            DisableMouseCapture,
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = disable_raw_mode();
+
+        let launched = editor_command(&path).status();
+
+        let _ = enable_raw_mode();
+        let _ = crossterm::execute!(
+            out,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            EnableMouseCapture
+        );
+        let _ = self.terminal.clear();
+
+        if launched.is_err() {
+            let _ = std::fs::remove_file(&path);
+            self.notice = Some(("could not launch $EDITOR".into(), Instant::now()));
+            return;
+        }
+
+        let edited = std::fs::read_to_string(&path);
+        // This is review-only staging, never a durable plan artifact. The
+        // approved tool writes the permanent copy under `plans/`.
+        let _ = std::fs::remove_file(&path);
+        let Ok(edited) = edited else {
+            self.notice = Some(("could not read the edited plan".into(), Instant::now()));
+            return;
+        };
+        // Re-split and pre-render the revised plan for the pane (which has no
+        // markdown renderer of its own).
+        let blocks = markdown::split_blocks(edited.trim())
+            .into_iter()
+            .map(|block| {
+                let lines = self.md.render(&block);
+                (block, lines)
+            })
+            .collect();
+        if let Some((dialog, _)) = self.dialog.as_mut() {
+            dialog.revise_plan(edited, blocks);
         }
     }
 
@@ -1814,6 +1977,41 @@ impl App {
 
     // ------------------------------------------------------------ keys
 
+    fn on_dialog_mouse(&mut self, mouse: MouseEvent) {
+        let width = area_width(&self.terminal);
+        let height = area_height(&self.terminal);
+        let budget = height.saturating_sub(6);
+        let Some((dialog, _)) = self.dialog.as_mut() else {
+            return;
+        };
+        if !dialog.is_plan() {
+            return;
+        }
+        // Match `redraw`'s panel geometry so a screen coordinate is translated
+        // to the plan pane's border-free content row, not the transcript behind
+        // the modal.
+        let lines = dialog.render(width, budget);
+        let panel_h = (lines.len() as u16 + 2)
+            .min(height.saturating_sub(4))
+            .max(1);
+        let panel_top = height.saturating_sub(panel_h);
+        if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
+            return;
+        }
+        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        let col = mouse.column.saturating_sub(1) as usize;
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                dialog.plan_mouse_down(row, col, width, budget)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                dialog.plan_mouse_drag(row, col, width, budget)
+            }
+            MouseEventKind::Up(MouseButton::Left) => dialog.plan_mouse_up(row, col, width, budget),
+            _ => {}
+        }
+    }
+
     fn on_term_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
@@ -1833,53 +2031,62 @@ impl App {
                     self.on_paste_text(text);
                 }
             }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
-                    let up = mouse.kind == MouseEventKind::ScrollUp;
-                    // Over the input box the wheel scrolls the prompt itself:
-                    // a long multi-line paste only shows six rows at a time, so
-                    // the wheel walks the visual cursor through it without
-                    // clicking or reaching for the arrow keys. The viewport is
-                    // cursor-derived, so moving the cursor scrolls the window.
-                    // Everywhere else — including while an approval dialog is
-                    // open (input hitbox is None then) — the wheel scrolls the
-                    // transcript so the reviewer can scroll the pre-baked diff.
-                    // Over the input the wheel nudges the prompt one line per
-                    // notch (not a page); a short prompt or one already at its
-                    // edge can't consume it, so the transcript scrolls instead.
-                    let moved_input = self.wheel_over_input(mouse.row)
-                        && if up {
-                            self.editor_visual_up()
+            Event::Mouse(mouse) => {
+                // A modal approval owns mouse input too. Without this guard a
+                // plan drag selects and copies the hidden transcript instead of
+                // producing a plan comment.
+                if self.dialog.is_some() {
+                    self.on_dialog_mouse(mouse);
+                    return;
+                }
+                match mouse.kind {
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = mouse.kind == MouseEventKind::ScrollUp;
+                        // Over the input box the wheel scrolls the prompt itself:
+                        // a long multi-line paste only shows six rows at a time, so
+                        // the wheel walks the visual cursor through it without
+                        // clicking or reaching for the arrow keys. The viewport is
+                        // cursor-derived, so moving the cursor scrolls the window.
+                        // Everywhere else — including while an approval dialog is
+                        // open (input hitbox is None then) — the wheel scrolls the
+                        // transcript so the reviewer can scroll the pre-baked diff.
+                        // Over the input the wheel nudges the prompt one line per
+                        // notch (not a page); a short prompt or one already at its
+                        // edge can't consume it, so the transcript scrolls instead.
+                        let moved_input = self.wheel_over_input(mouse.row)
+                            && if up {
+                                self.editor_visual_up()
+                            } else {
+                                self.editor_visual_down()
+                            };
+                        if !moved_input {
+                            self.transcript
+                                .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
+                        if !taken_by_input {
+                            self.transcript.mouse_down(mouse.column, mouse.row);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if self.input_mouse_active {
+                            self.input_mouse_drag(mouse.column, mouse.row);
                         } else {
-                            self.editor_visual_down()
-                        };
-                    if !moved_input {
-                        self.transcript
-                            .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                            self.transcript.mouse_drag(mouse.column, mouse.row);
+                        }
                     }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
-                    if !taken_by_input {
-                        self.transcript.mouse_down(mouse.column, mouse.row);
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        if self.input_mouse_active {
+                            self.input_mouse_up(mouse.column, mouse.row);
+                        } else if let Some(text) = self.transcript.mouse_up() {
+                            self.copy_selection(text);
+                        }
                     }
+                    _ => {}
                 }
-                MouseEventKind::Drag(MouseButton::Left) => {
-                    if self.input_mouse_active {
-                        self.input_mouse_drag(mouse.column, mouse.row);
-                    } else {
-                        self.transcript.mouse_drag(mouse.column, mouse.row);
-                    }
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    if self.input_mouse_active {
-                        self.input_mouse_up(mouse.column, mouse.row);
-                    } else if let Some(text) = self.transcript.mouse_up() {
-                        self.copy_selection(text);
-                    }
-                }
-                _ => {}
-            },
+            }
             // ratatui's autoresize adapts on the next draw; the transcript
             // rewraps lazily from the new area width.
             Event::Resize(..) => {}
@@ -1969,12 +2176,26 @@ impl App {
 
         // Approval dialog captures everything while open.
         if let Some((dialog, _)) = self.dialog.as_mut() {
-            if let DialogResult::Done(approval) = dialog.handle_key(key) {
-                let (dialog, reply) = self.dialog.take().expect("dialog present");
-                self.bake_approval_record(&dialog, &approval);
-                let _ = reply.send(approval);
-                if let Some(wait_started) = self.user_wait_started.take() {
-                    self.user_wait_total += wait_started.elapsed();
+            match dialog.handle_key(key) {
+                DialogResult::Pending => {}
+                // Open the plan in `$EDITOR`, then feed any revision back into
+                // the pane. Handled out here because it suspends the terminal.
+                DialogResult::EditPlan => self.edit_plan_externally(),
+                DialogResult::Done(approval) => {
+                    let (dialog, reply) = self.dialog.take().expect("dialog present");
+                    // A plan approval chose the mode execution runs under. The
+                    // agent loop applies it to the Session; mirror it into the
+                    // frontend's own view so the status line updates at once.
+                    if let Some(mode) = approval.set_mode {
+                        self.committed_mode = mode;
+                        self.mode_label = mode.label().to_string();
+                        self.pending_mode.clear();
+                    }
+                    self.bake_approval_record(&dialog, &approval);
+                    let _ = reply.send(approval);
+                    if let Some(wait_started) = self.user_wait_started.take() {
+                        self.user_wait_total += wait_started.elapsed();
+                    }
                 }
             }
             return;
@@ -2046,24 +2267,7 @@ impl App {
             KeyCode::Char('j') if ctrl => self.editor.newline(),
             KeyCode::Enter if alt || shift || ctrl => self.editor.newline(),
             KeyCode::Enter => self.submit(running),
-            KeyCode::BackTab => {
-                if let Some(session) = self.session.as_mut() {
-                    session.mode = session.mode.cycle();
-                    self.mode_label = session.mode.label().to_string();
-                    // Remembered across restarts, except Unsafe: a one-off flip
-                    // to it must not silently arm every future session, so
-                    // landing there clears the stored choice instead.
-                    let mode = session.mode;
-                    tcode_core::config::ModelState::update(|state| {
-                        state.mode = (mode != tcode_core::PermissionMode::Unsafe).then_some(mode);
-                    });
-                } else {
-                    self.bake(vec![Line::styled(
-                        "mode can be changed when idle",
-                        theme::dim(),
-                    )]);
-                }
-            }
+            KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Tab => {
                 if let Some(cmd) = self.popup_selection() {
                     self.editor.clear();
@@ -2149,6 +2353,41 @@ impl App {
         self.transcript.scroll_to_bottom();
         let message = self.compose_draft(input);
         self.start_turn(message);
+    }
+
+    /// shift+tab cycles the permission mode. Idle, it takes effect at once;
+    /// while a turn runs, the running turn owns the `Session`, so the switch is
+    /// staged and the agent loop commits it at the next batch boundary. Either
+    /// way the cycle steps from staged-else-committed, so repeated presses
+    /// collapse to the final target rather than restacking.
+    fn cycle_mode(&mut self) {
+        let base = self.pending_mode.get().unwrap_or(self.committed_mode);
+        let next = base.cycle();
+        self.persist_mode(next);
+        match self.session.as_mut() {
+            Some(session) => {
+                session.mode = next;
+                self.committed_mode = next;
+                self.pending_mode.clear();
+                self.mode_label = next.label().to_string();
+            }
+            None => {
+                self.pending_mode.set(next);
+                // A staged target shows with an arrow so the user is never
+                // misled into thinking the plan gate is already active while
+                // the current batch still runs under the old mode.
+                self.mode_label = format!("→ {}", next.label());
+            }
+        }
+    }
+
+    /// Persist the chosen mode as the default for new sessions — except Unsafe:
+    /// a one-off flip to it must not silently arm every future session, so
+    /// landing there clears the stored choice instead.
+    fn persist_mode(&self, mode: tcode_core::PermissionMode) {
+        tcode_core::config::ModelState::update(|state| {
+            state.mode = (mode != tcode_core::PermissionMode::Unsafe).then_some(mode);
+        });
     }
 
     // ---------------------------------------------------------- rewind
@@ -2484,6 +2723,8 @@ impl App {
         if let Some(session) = self.session.as_ref() {
             self.cwd = session.tool_ctx.cwd.clone();
             self.mode_label = session.mode.label().to_string();
+            self.committed_mode = session.mode;
+            self.pending_mode.clear();
             self.dogfood = session.dogfood();
         }
     }
@@ -3105,9 +3346,13 @@ impl App {
                     .map(|p| p.render(&self.menu, &self.agents))
             })
             .or_else(|| {
-                self.dialog
-                    .as_ref()
-                    .map(|(d, _)| d.render(area_width(&self.terminal)))
+                self.dialog.as_ref().map(|(d, _)| {
+                    // The plan pane scrolls its own body: cap it to the space the
+                    // panel can occupy (the transcript keeps a few rows) so a long
+                    // plan does not push the options and hint off screen.
+                    let budget = area_height(&self.terminal).saturating_sub(6);
+                    d.render(area_width(&self.terminal), budget)
+                })
             });
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
         // Ghost text only ever occupies the empty first row of the input.
@@ -3794,6 +4039,33 @@ fn estimate_context_tokens(agent: &Agent, session: &Session) -> u64 {
 
 fn area_width(terminal: &Term) -> u16 {
     terminal.size().map(|s| s.width).unwrap_or(80)
+}
+
+fn area_height(terminal: &Term) -> u16 {
+    terminal.size().map(|s| s.height).unwrap_or(24)
+}
+
+/// Build the editor invocation from `$VISUAL`/`$EDITOR` (falling back to `vi`),
+/// splitting the spec so a wrapper like `code --wait` keeps its flags, then
+/// appending the file to open.
+fn editor_command(path: &std::path::Path) -> std::process::Command {
+    let spec = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string());
+    let mut parts = spec.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let mut cmd = std::process::Command::new(program);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    cmd.arg(path);
+    cmd
 }
 
 /// Wrap logical editor lines ourselves instead of leaving it to the terminal.
