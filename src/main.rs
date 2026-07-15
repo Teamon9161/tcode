@@ -1,11 +1,12 @@
 mod approver;
 mod printer;
+mod update;
 
 use std::io::{IsTerminal, Write as _};
 use std::sync::Arc;
 
 use anyhow::Context;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
@@ -338,6 +339,9 @@ fn run_agents_command(args: &str, menu: &tcode_tui::ModelMenu, agents: &mut tcod
 #[derive(Parser)]
 #[command(name = "tcode", version, about = "tcode — a terminal agent harness")]
 struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
     /// Config profile to use (from ~/.tcode/config.toml)
     #[arg(long)]
     profile: Option<String>,
@@ -358,9 +362,18 @@ struct Cli {
     resume: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum Command {
+    /// Download and install the latest GitHub Release for this platform
+    Update,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    if matches!(cli.command, Some(Command::Update)) {
+        return update::run().await;
+    }
     let cwd = std::env::current_dir().context("cannot determine working directory")?;
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 

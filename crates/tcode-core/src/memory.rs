@@ -582,7 +582,7 @@ fn target_directory(path: &Path) -> PathBuf {
     }
 }
 
-fn canonical_target(path: &Path) -> PathBuf {
+pub(crate) fn canonical_target(path: &Path) -> PathBuf {
     if path.exists() {
         return canonical_or_normal(path);
     }

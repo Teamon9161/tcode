@@ -621,7 +621,11 @@ async fn first_external_write_is_blocked_then_retry_executes() {
     run(&agent, &mut session, &approver, "write external file").await;
 
     let results = tool_results(&session);
-    assert!(results[0].1);
+    assert!(
+        results[0].1,
+        "first write must be blocked by newly discovered instructions: {}",
+        results[0].0
+    );
     assert!(results[0]
         .0
         .contains("newly discovered directory-scoped instructions"));

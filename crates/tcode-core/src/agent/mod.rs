@@ -1843,10 +1843,14 @@ impl Agent {
         calls: &[(String, String, Value)],
         update: &MemoryUpdate,
     ) -> HashSet<usize> {
+        // Use the same canonical form as MemoryManager. A mutation may name a
+        // file that does not exist yet, so canonicalize its deepest existing
+        // ancestor and retain the missing tail rather than comparing a regular
+        // path to a Windows `\\?\\` instruction root.
         let roots: Vec<PathBuf> = update
             .affected_roots
             .iter()
-            .map(|root| normalize_path(root.clone()))
+            .map(|root| crate::memory::canonical_target(root))
             .collect();
         calls
             .iter()
@@ -1858,7 +1862,7 @@ impl Agent {
                 }
                 tool.context_paths(input)
                     .into_iter()
-                    .map(|path| normalize_path(session.tool_ctx.resolve(&path)))
+                    .map(|path| crate::memory::canonical_target(&session.tool_ctx.resolve(&path)))
                     .any(|path| roots.iter().any(|root| path.starts_with(root)))
                     .then_some(index)
             })

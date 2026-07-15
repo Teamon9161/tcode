@@ -70,6 +70,13 @@ pub fn selection() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
 }
 
+/// A low-contrast background for the actionable header of a hovered tool
+/// record. It is intentionally not reverse-video: diffs retain their own
+/// polarity, and detail rows stay visually untouched.
+pub fn hover_highlight() -> Style {
+    Style::default().bg(Color::Rgb(46, 56, 68))
+}
+
 /// Amber-tinted row background marking the rewind-navigation target.
 pub fn rewind_highlight_bg() -> Color {
     Color::Rgb(82, 62, 24)

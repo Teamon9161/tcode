@@ -49,8 +49,9 @@ pub struct Transcript {
     selection: Option<Selection>,
     /// Block emphasized by rewind navigation.
     highlight: Option<usize>,
-    /// Collapsible block currently under the pointer. The only visual change is
-    /// its fold affordance and a light underline, so diff polarity remains intact.
+    /// Collapsible block currently under the pointer. Its header receives a
+    /// compact background highlight so it reads as actionable without
+    /// underlining expanded output or trailing empty cells.
     hovered: Option<usize>,
 }
 
@@ -551,7 +552,10 @@ impl Transcript {
                 if y >= area.bottom() {
                     break 'blocks;
                 }
-                block.row(i).0.render(
+                let (line, _) = block.row(i);
+                let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
+                let content_width = line_display_width(&line).min(area.width as usize);
+                line.render(
                     Rect {
                         x: area.x,
                         y,
@@ -560,9 +564,9 @@ impl Transcript {
                     },
                     buf,
                 );
-                if self.hovered == Some(index) {
-                    for x in area.left()..area.right() {
-                        buf[(x, y)].modifier.insert(Modifier::UNDERLINED);
+                if is_hovered_head {
+                    for x in 0..content_width {
+                        buf[(area.x + x as u16, y)].set_style(crate::theme::hover_highlight());
                     }
                 }
                 if self.highlight == Some(index) {
@@ -798,6 +802,17 @@ fn row_slice(line: &Line<'_>, from: usize, to: usize) -> String {
         }
     }
     out
+}
+
+fn line_display_width(line: &Line<'_>) -> usize {
+    use unicode_width::UnicodeWidthStr;
+
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    text.trim_end().width()
 }
 
 /// Pre-wrap lines at the target width instead of leaving soft wrapping to
@@ -1201,6 +1216,32 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert_eq!(t.total(), 1);
+    }
+
+    #[test]
+    fn hovered_tool_header_uses_background_without_touching_detail_or_padding() {
+        let mut t = Transcript::new(40);
+        t.push_with_detail(
+            vec![Line::raw("preview")],
+            vec![Line::raw("expanded output")],
+            false,
+            5,
+        );
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        t.mouse_moved(0, 0);
+        t.render(&mut buf, area);
+        assert_eq!(buf[(0, 0)].bg, crate::theme::hover_highlight().bg.unwrap());
+        assert_eq!(buf[(30, 0)].bg, ratatui::style::Color::Reset);
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+
+        t.mouse_down(0, 0);
+        assert_eq!(t.mouse_up(), None);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Reset);
+        assert!(!buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]
