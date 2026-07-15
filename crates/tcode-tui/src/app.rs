@@ -218,8 +218,22 @@ enum ResultRender {
     /// A head row carrying the fold affordance plus the collapsed body.
     Foldable {
         head: Vec<Line<'static>>,
-        detail: Vec<Line<'static>>,
+        detail: ResultDetail,
     },
+}
+
+enum ResultDetail {
+    Lines(Vec<Line<'static>>),
+    Markdown(markdown::Document),
+}
+
+impl ResultDetail {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Lines(lines) => lines.is_empty(),
+            Self::Markdown(document) => document.is_empty(),
+        }
+    }
 }
 
 struct ProgressPhase {
@@ -707,8 +721,9 @@ impl App {
                                 self.bake_thinking(&title, thinking);
                             }
                             ContentBlock::Text { text } => {
-                                lines.extend(self.md.render(text));
-                                lines.push(Line::default());
+                                self.transcript.push(std::mem::take(&mut lines));
+                                self.transcript
+                                    .push_markdown(self.md.parse(text).with_trailing_blank());
                             }
                             ContentBlock::ToolUse { id, name, input } => {
                                 // Defer the header to the matching ToolResults
@@ -740,7 +755,9 @@ impl App {
                     }
                 }
                 tcode_core::Entry::IncompleteAssistant { text, error } => {
-                    lines.extend(self.md.render(text));
+                    self.transcript.push(std::mem::take(&mut lines));
+                    self.transcript
+                        .push_markdown(self.md.parse(text).with_trailing_blank());
                     lines.push(Line::styled(
                         format!(
                             "↻ stream failed: {error} — incomplete response retained; not sent back to model"
@@ -789,7 +806,9 @@ impl App {
                             Span::styled(summary, theme::bold()),
                         ]));
                         if !content.is_empty() {
-                            lines.extend(self.md.render(content));
+                            self.transcript.push(std::mem::take(&mut lines));
+                            self.transcript
+                                .push_markdown(self.md.parse(content).with_trailing_blank());
                         }
                     }
                     lines.push(Line::default());
@@ -1483,9 +1502,13 @@ impl App {
     /// the same foldable record.
     fn bake_thinking(&mut self, title: &str, text: &str) {
         let head = vec![Line::styled(format!("✻ {title}"), theme::thinking())];
-        let detail = self.md.render(text);
-        self.transcript
-            .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+        self.transcript.push_with_markdown_detail(
+            head,
+            self.md.parse(text),
+            Vec::new(),
+            false,
+            OUTPUT_VIEW_ROWS,
+        );
     }
 
     /// The `── earlier conversation compacted ──` divider, folding open to the
@@ -1500,9 +1523,13 @@ impl App {
             Line::default(),
             Line::styled("── earlier conversation compacted ──", theme::dim()),
         ];
-        let detail = self.md.render(summary);
-        self.transcript
-            .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+        self.transcript.push_with_markdown_detail(
+            head,
+            self.md.parse(summary),
+            Vec::new(),
+            false,
+            OUTPUT_VIEW_ROWS,
+        );
         self.bake(vec![Line::default()]);
     }
 
@@ -1510,15 +1537,15 @@ impl App {
         if self.live_text.trim().is_empty() {
             return;
         }
-        let lines = self.md.render(&self.live_text);
-        if lines.is_empty() {
+        let document = self.md.parse(&self.live_text);
+        if document.is_empty() {
             return;
         }
         if let Some(index) = self.live_block {
-            self.transcript.replace_block(index, lines);
+            self.transcript.replace_markdown_block(index, document);
         } else {
             let index = self.transcript.block_count();
-            self.transcript.push(lines);
+            self.transcript.push_markdown(document);
             self.live_block = Some(index);
         }
     }
@@ -1536,12 +1563,11 @@ impl App {
             return;
         }
         let text = std::mem::take(&mut self.live_text);
-        let mut lines = self.md.render(&text);
-        lines.push(Line::default());
+        let document = self.md.parse(&text).with_trailing_blank();
         if let Some(index) = self.live_block.take() {
-            self.transcript.replace_block(index, lines);
+            self.transcript.replace_markdown_block(index, document);
         } else {
-            self.bake(lines);
+            self.transcript.push_markdown(document);
         }
     }
 
@@ -1664,8 +1690,7 @@ impl App {
             }
             ResultRender::Foldable { head, detail } => {
                 if batch_header.is_empty() {
-                    self.transcript
-                        .push_with_detail(head, detail, false, OUTPUT_VIEW_ROWS);
+                    self.push_result_detail(head, detail);
                 } else {
                     // Batch items already have a compact `├ summary` row. Hang
                     // the fold affordance off that row instead of adding a
@@ -1673,10 +1698,25 @@ impl App {
                     if is_error || !self.renderers.get(name).quiet_output() {
                         append_result_preview(&mut batch_header, preview, style);
                     }
-                    self.transcript
-                        .push_with_detail(batch_header, detail, false, OUTPUT_VIEW_ROWS);
+                    self.push_result_detail(batch_header, detail);
                 }
             }
+        }
+    }
+
+    fn push_result_detail(&mut self, head: Vec<Line<'static>>, detail: ResultDetail) {
+        match detail {
+            ResultDetail::Lines(lines) => {
+                self.transcript
+                    .push_with_detail(head, lines, false, OUTPUT_VIEW_ROWS)
+            }
+            ResultDetail::Markdown(document) => self.transcript.push_with_markdown_detail(
+                head,
+                document,
+                vec![Span::styled("  │ ", theme::dim())],
+                false,
+                OUTPUT_VIEW_ROWS,
+            ),
         }
     }
 
@@ -1732,24 +1772,15 @@ impl App {
         preview: &str,
         content: &str,
         is_error: bool,
-    ) -> Vec<Line<'static>> {
+    ) -> ResultDetail {
         let renderer = self.renderers.get(name);
         let quiet = renderer.quiet_output();
         if content.trim() == preview.trim() && (is_error || !quiet) {
-            return Vec::new(); // nothing beyond the preview
+            return ResultDetail::Lines(Vec::new()); // nothing beyond the preview
         }
         let gutter = || Span::styled("  │ ", theme::dim());
         if !is_error && renderer.markdown_detail(input) {
-            return self
-                .md
-                .render(content)
-                .into_iter()
-                .map(|line| {
-                    let mut spans = vec![gutter()];
-                    spans.extend(line.spans);
-                    Line::from(spans)
-                })
-                .collect();
+            return ResultDetail::Markdown(self.md.parse(content));
         }
         let text_style = if is_error {
             ratatui::style::Style::default().fg(theme::ERROR)
@@ -1762,11 +1793,13 @@ impl App {
         let first = content.lines().next().unwrap_or("");
         let skip =
             usize::from(!quiet && first.chars().count() <= 120 && content.lines().count() > 1);
-        content
-            .lines()
-            .skip(skip)
-            .map(|line| Line::from(vec![gutter(), Span::styled(line.to_string(), text_style)]))
-            .collect()
+        ResultDetail::Lines(
+            content
+                .lines()
+                .skip(skip)
+                .map(|line| Line::from(vec![gutter(), Span::styled(line.to_string(), text_style)]))
+                .collect(),
+        )
     }
 
     fn editor_visual_up(&mut self) -> bool {

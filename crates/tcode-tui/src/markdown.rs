@@ -17,6 +17,38 @@ pub struct Renderer {
     theme: syntect::highlighting::Theme,
 }
 
+/// Parsed Markdown that keeps table cells structured until the transcript
+/// knows how much terminal width is available.
+pub struct Document {
+    parts: Vec<Part>,
+}
+
+enum Part {
+    Lines(Vec<Line<'static>>),
+    Table(Table),
+}
+
+impl Document {
+    pub fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    pub fn with_trailing_blank(mut self) -> Self {
+        self.parts.push(Part::Lines(vec![Line::default()]));
+        self
+    }
+
+    pub fn lines_at(&self, width: usize) -> Vec<Line<'static>> {
+        self.parts
+            .iter()
+            .flat_map(|part| match part {
+                Part::Lines(lines) => lines.clone(),
+                Part::Table(table) => table.render_at(width),
+            })
+            .collect()
+    }
+}
+
 struct Table {
     alignments: Vec<Alignment>,
     header: Vec<Vec<Span<'static>>>,
@@ -46,8 +78,16 @@ impl Default for Renderer {
 }
 
 impl Renderer {
+    /// Compatibility path for callers that have no layout context. The
+    /// transcript uses `parse` so tables can reflow on resize.
+    #[cfg(test)]
     pub fn render(&self, text: &str) -> Vec<Line<'static>> {
+        self.parse(text).lines_at(usize::MAX)
+    }
+
+    pub fn parse(&self, text: &str) -> Document {
         let mut out: Vec<Line<'static>> = Vec::new();
+        let mut parts = Vec::new();
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut style_stack: Vec<Style> = vec![Style::default()];
         let mut list_depth: usize = 0;
@@ -82,6 +122,9 @@ impl Renderer {
                     Tag::Table(alignments) => {
                         if !spans.is_empty() {
                             flush(&mut spans, &mut out, quote_depth);
+                        }
+                        if !out.is_empty() {
+                            parts.push(Part::Lines(std::mem::take(&mut out)));
                         }
                         table = Some(Table::new(alignments));
                     }
@@ -181,7 +224,7 @@ impl Renderer {
                     }
                     TagEnd::Table => {
                         if let Some(table) = table.take() {
-                            out.extend(self.render_table(table));
+                            parts.push(Part::Table(table));
                             out.push(Line::default());
                         }
                     }
@@ -287,76 +330,10 @@ impl Renderer {
         while out.last().is_some_and(|l| l.spans.is_empty()) {
             out.pop();
         }
-        out
-    }
-
-    fn render_table(&self, table: Table) -> Vec<Line<'static>> {
-        let columns = table
-            .alignments
-            .len()
-            .max(table.header.len())
-            .max(table.rows.iter().map(Vec::len).max().unwrap_or(0));
-        if columns == 0 {
-            return Vec::new();
+        if !out.is_empty() {
+            parts.push(Part::Lines(out));
         }
-
-        let mut widths = vec![1; columns];
-        for row in std::iter::once(&table.header).chain(table.rows.iter()) {
-            for (index, cell) in row.iter().enumerate() {
-                widths[index] = widths[index].max(cell_width(cell));
-            }
-        }
-
-        let border = |left, join, right| {
-            let mut text = String::from(left);
-            for (index, width) in widths.iter().enumerate() {
-                if index > 0 {
-                    text.push_str(join);
-                }
-                text.push_str(&"─".repeat(width + 2));
-            }
-            text.push_str(right);
-            Line::styled(text, theme::border())
-        };
-        let row_line = |cells: &[Vec<Span<'static>>], header: bool| {
-            let mut spans = vec![Span::styled("│", theme::border())];
-            for index in 0..columns {
-                let cell = cells.get(index).map(Vec::as_slice).unwrap_or(&[]);
-                let cell_width = cell_width(cell);
-                let padding = widths[index].saturating_sub(cell_width);
-                let (left, right) = match table
-                    .alignments
-                    .get(index)
-                    .copied()
-                    .unwrap_or(Alignment::None)
-                {
-                    Alignment::Right => (padding, 0),
-                    Alignment::Center => (padding / 2, padding - padding / 2),
-                    Alignment::None | Alignment::Left => (0, padding),
-                };
-                spans.push(Span::raw(format!(" {}", " ".repeat(left))));
-                spans.extend(cell.iter().map(|span| {
-                    let style = if header {
-                        span.style.add_modifier(Modifier::BOLD)
-                    } else {
-                        span.style
-                    };
-                    Span::styled(span.content.to_string(), style)
-                }));
-                spans.push(Span::raw(format!("{} ", " ".repeat(right))));
-                spans.push(Span::styled("│", theme::border()));
-            }
-            Line::from(spans)
-        };
-
-        let mut out = vec![border("┌", "┬", "┐")];
-        if !table.header.is_empty() {
-            out.push(row_line(&table.header, true));
-            out.push(border("├", "┼", "┤"));
-        }
-        out.extend(table.rows.iter().map(|row| row_line(row, false)));
-        out.push(border("└", "┴", "┘"));
-        out
+        Document { parts }
     }
 
     fn highlight(&self, lang: &str, code: &str) -> Vec<Line<'static>> {
@@ -384,6 +361,133 @@ impl Renderer {
         }
         out
     }
+}
+
+impl Table {
+    fn columns(&self) -> usize {
+        self.alignments
+            .len()
+            .max(self.header.len())
+            .max(self.rows.iter().map(Vec::len).max().unwrap_or(0))
+    }
+
+    fn widths(&self, columns: usize) -> Vec<usize> {
+        let mut widths = vec![1; columns];
+        for row in std::iter::once(&self.header).chain(self.rows.iter()) {
+            for (index, cell) in row.iter().enumerate() {
+                widths[index] = widths[index].max(cell_width(cell));
+            }
+        }
+        widths
+    }
+
+    fn render_at(&self, width: usize) -> Vec<Line<'static>> {
+        let columns = self.columns();
+        if columns == 0 {
+            return Vec::new();
+        }
+        let widths = self.widths(columns);
+        let grid_width = widths.iter().sum::<usize>() + columns * 3 + 1;
+        if grid_width <= width {
+            self.render_grid(&widths)
+        } else {
+            self.render_cards(columns)
+        }
+    }
+
+    fn render_grid(&self, widths: &[usize]) -> Vec<Line<'static>> {
+        let border = |left, join, right| {
+            let mut text = String::from(left);
+            for (index, width) in widths.iter().enumerate() {
+                if index > 0 {
+                    text.push_str(join);
+                }
+                text.push_str(&"─".repeat(width + 2));
+            }
+            text.push_str(right);
+            Line::styled(text, theme::border())
+        };
+        let row_line = |cells: &[Vec<Span<'static>>], header: bool| {
+            let mut spans = vec![Span::styled("│", theme::border())];
+            for (index, width) in widths.iter().enumerate() {
+                let cell = cells.get(index).map(Vec::as_slice).unwrap_or(&[]);
+                let padding = width.saturating_sub(cell_width(cell));
+                let (left, right) = match self
+                    .alignments
+                    .get(index)
+                    .copied()
+                    .unwrap_or(Alignment::None)
+                {
+                    Alignment::Right => (padding, 0),
+                    Alignment::Center => (padding / 2, padding - padding / 2),
+                    Alignment::None | Alignment::Left => (0, padding),
+                };
+                spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+                spans.extend(styled_cell(cell, header));
+                spans.push(Span::raw(format!("{} ", " ".repeat(right))));
+                spans.push(Span::styled("│", theme::border()));
+            }
+            Line::from(spans)
+        };
+
+        let mut out = vec![border("┌", "┬", "┐")];
+        if !self.header.is_empty() {
+            out.push(row_line(&self.header, true));
+            out.push(border("├", "┼", "┤"));
+        }
+        out.extend(self.rows.iter().map(|row| row_line(row, false)));
+        out.push(border("└", "┴", "┘"));
+        out
+    }
+
+    fn render_cards(&self, columns: usize) -> Vec<Line<'static>> {
+        let mut out = Vec::new();
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if row_index > 0 {
+                out.push(Line::default());
+            }
+            let titled = self.header.first().is_some_and(|cell| !cell.is_empty());
+            let first_field = if titled { 1 } else { 0 };
+            if titled {
+                let title = row.first().map(Vec::as_slice).unwrap_or(&[]);
+                out.push(Line::from(styled_cell(title, true)));
+            }
+            for column in first_field..columns {
+                let label = self.header.get(column).map(Vec::as_slice).unwrap_or(&[]);
+                let value = row.get(column).map(Vec::as_slice).unwrap_or(&[]);
+                let mut spans = vec![Span::styled("  ", theme::dim())];
+                if label.is_empty() {
+                    spans.push(Span::styled(
+                        format!("Column {}", column + 1),
+                        theme::bold(),
+                    ));
+                } else {
+                    spans.extend(styled_cell(label, true));
+                }
+                spans.push(Span::raw(": "));
+                if value.is_empty() {
+                    spans.push(Span::styled("—", theme::dim()));
+                } else {
+                    spans.extend(styled_cell(value, false));
+                }
+                out.push(Line::from(spans));
+            }
+        }
+        out
+    }
+}
+
+fn styled_cell(cell: &[Span<'_>], bold: bool) -> Vec<Span<'static>> {
+    cell.iter()
+        .map(|span| {
+            let style = if bold {
+                span.style.add_modifier(Modifier::BOLD)
+            } else {
+                span.style
+            };
+            Span::styled(span.content.to_string(), style)
+        })
+        .collect()
 }
 
 fn cell_width(cell: &[Span<'_>]) -> usize {
@@ -431,6 +535,39 @@ mod tests {
             .any(|line| line.contains("│ fincta_soft_short_nogold")));
         assert!(text.iter().any(|line| line.starts_with("├")));
         assert!(!text.iter().any(|line| line.contains("组合Sharpe")));
+    }
+
+    #[test]
+    fn responsive_table_uses_cards_when_grid_exceeds_width() {
+        let document = Renderer::default().parse(
+            "| 组合 | Sharpe | 年化收益 | 最大回撤 |\n| --- | ---: | ---: | ---: |\n| baseline_swcta | 2.106 | 2.54% | -1.71% |",
+        );
+        let wide: Vec<String> = document
+            .lines_at(80)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        let narrow: Vec<String> = document
+            .lines_at(20)
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert!(wide.iter().any(|line| line.starts_with("┌")));
+        assert!(wide.iter().any(|line| line.contains("│ baseline_swcta")));
+        assert!(!narrow.iter().any(|line| line.starts_with("┌")));
+        assert!(narrow.iter().any(|line| line == "baseline_swcta"));
+        assert!(narrow.iter().any(|line| line.contains("Sharpe: 2.106")));
     }
 
     #[test]

@@ -106,6 +106,14 @@ impl Approver for ScriptedApprover {
     }
 }
 
+fn platform_shell_tool() -> &'static str {
+    if cfg!(windows) {
+        "shell"
+    } else {
+        "bash"
+    }
+}
+
 fn tool_use(id: &str, name: &str, json: &str) -> Vec<StreamEvent> {
     vec![
         StreamEvent::Started,
@@ -1634,7 +1642,7 @@ async fn auto_mode_bypasses_classifier_for_normal_project_edits() {
 async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
     let root = tempfile::tempdir().unwrap();
     let main = MockProvider::new(vec![
-        tool_use("t1", "shell", r#"{"command":"echo auto-ok"}"#),
+        tool_use("t1", platform_shell_tool(), r#"{"command":"echo auto-ok"}"#),
         text_done("done"),
     ]);
     let classifier = MockProvider::new(vec![text_done("ALLOW")]);
@@ -1659,11 +1667,11 @@ async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
 async fn auto_mode_classifier_outages_pause_and_notify_the_frontend() {
     let root = tempfile::tempdir().unwrap();
     let main = MockProvider::new(vec![
-        tool_use("t1", "shell", r#"{"command":"Write-Output first"}"#),
+        tool_use("t1", platform_shell_tool(), r#"{"command":"echo first"}"#),
         text_done("first done"),
-        tool_use("t2", "shell", r#"{"command":"Write-Output second"}"#),
+        tool_use("t2", platform_shell_tool(), r#"{"command":"echo second"}"#),
         text_done("second done"),
-        tool_use("t3", "shell", r#"{"command":"Write-Output third"}"#),
+        tool_use("t3", platform_shell_tool(), r#"{"command":"echo third"}"#),
         text_done("third done"),
     ]);
     let classifier = MockProvider::new(vec![
@@ -1691,11 +1699,15 @@ async fn auto_mode_classifier_outages_pause_and_notify_the_frontend() {
 async fn auto_mode_stage_two_block_prevents_shell_execution() {
     let root = tempfile::tempdir().unwrap();
     let target = root.path().join("blocked.txt");
-    let command = format!("Set-Content -Path '{}' -Value blocked", target.display());
+    let command = if cfg!(windows) {
+        format!("Set-Content -Path '{}' -Value blocked", target.display())
+    } else {
+        format!("printf blocked > '{}'", target.display())
+    };
     let main = MockProvider::new(vec![
         tool_use(
             "t1",
-            "shell",
+            platform_shell_tool(),
             &serde_json::json!({"command": command}).to_string(),
         ),
         text_done("found a safer route"),

@@ -78,6 +78,9 @@ impl Wrapped {
 /// diff (starts open). When open it occupies a fixed number of rows and
 /// scrolls internally under the mouse wheel; a click on the block toggles.
 struct Detail {
+    content: Content,
+    /// Materialized source lines at the current transcript width. The wrapped
+    /// cache remains the only per-width cache used during frame rendering.
     lines: Vec<Line<'static>>,
     wrapped: Wrapped,
     open: bool,
@@ -85,7 +88,56 @@ struct Detail {
     view_rows: usize,
 }
 
+enum Content {
+    Lines(Vec<Line<'static>>),
+    Markdown {
+        document: crate::markdown::Document,
+        prefix: Vec<Span<'static>>,
+    },
+}
+
+impl Content {
+    fn lines_at(&self, width: u16) -> Vec<Line<'static>> {
+        match self {
+            Self::Lines(lines) => lines.clone(),
+            Self::Markdown { document, prefix } => {
+                use unicode_width::UnicodeWidthStr;
+
+                // `wrap_lines_flagged` reserves one terminal cell, so the
+                // table chooser must make the same reservation before it
+                // decides whether a grid fits.
+                let available = (width as usize)
+                    .saturating_sub(1)
+                    .max(1)
+                    .saturating_sub(prefix.iter().map(|span| span.content.width()).sum());
+                document
+                    .lines_at(available)
+                    .into_iter()
+                    .map(|line| {
+                        let mut spans = prefix.clone();
+                        spans.extend(line.spans);
+                        Line::from(spans)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Lines(lines) => lines.is_empty(),
+            Self::Markdown { document, .. } => document.is_empty(),
+        }
+    }
+}
+
 impl Detail {
+    fn rewrap(&mut self, width: u16) {
+        self.lines = self.content.lines_at(width);
+        self.wrapped = Wrapped::of(&self.lines, width);
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
     fn overflows(&self) -> bool {
         self.wrapped.len() > self.view_rows
     }
@@ -118,7 +170,7 @@ impl Detail {
 }
 
 struct Block {
-    head: Vec<Line<'static>>,
+    head: Content,
     head_wrapped: Wrapped,
     detail: Option<Detail>,
     /// Ledger entry this block echoes (user inputs). Rewind uses it to
@@ -128,15 +180,14 @@ struct Block {
 
 impl Block {
     fn rewrap(&mut self, width: u16) {
-        self.head_wrapped = Wrapped::of(&self.display_head(), width);
         if let Some(detail) = &mut self.detail {
-            detail.wrapped = Wrapped::of(&detail.lines, width);
-            detail.scroll = detail.scroll.min(detail.max_scroll());
+            detail.rewrap(width);
         }
+        self.head_wrapped = Wrapped::of(&self.display_head(width), width);
     }
 
-    fn display_head(&self) -> Vec<Line<'static>> {
-        let mut head = self.head.clone();
+    fn display_head(&self, width: u16) -> Vec<Line<'static>> {
+        let mut head = self.head.lines_at(width);
         if let (Some(last), Some(detail)) = (head.last_mut(), &self.detail) {
             // Keep the fold affordance in the same logical line as the preview,
             // so wrapping is computed once for the combined row. Appending it
@@ -194,11 +245,22 @@ impl Transcript {
     }
 
     pub fn push(&mut self, lines: Vec<Line<'static>>) {
-        if lines.is_empty() {
+        self.push_content(Content::Lines(lines));
+    }
+
+    pub fn push_markdown(&mut self, document: crate::markdown::Document) {
+        self.push_content(Content::Markdown {
+            document,
+            prefix: Vec::new(),
+        });
+    }
+
+    fn push_content(&mut self, head: Content) {
+        if head.is_empty() {
             return;
         }
         self.push_block(Block {
-            head: lines,
+            head,
             head_wrapped: Wrapped::default(),
             detail: None,
             entry: None,
@@ -211,7 +273,7 @@ impl Transcript {
             return;
         }
         self.push_block(Block {
-            head: lines,
+            head: Content::Lines(lines),
             head_wrapped: Wrapped::default(),
             detail: None,
             entry: Some(entry),
@@ -228,14 +290,41 @@ impl Transcript {
         open: bool,
         view_rows: usize,
     ) {
+        self.push_with_detail_content(head, Content::Lines(detail), open, view_rows);
+    }
+
+    pub fn push_with_markdown_detail(
+        &mut self,
+        head: Vec<Line<'static>>,
+        document: crate::markdown::Document,
+        prefix: Vec<Span<'static>>,
+        open: bool,
+        view_rows: usize,
+    ) {
+        self.push_with_detail_content(
+            head,
+            Content::Markdown { document, prefix },
+            open,
+            view_rows,
+        );
+    }
+
+    fn push_with_detail_content(
+        &mut self,
+        head: Vec<Line<'static>>,
+        detail: Content,
+        open: bool,
+        view_rows: usize,
+    ) {
         if detail.is_empty() {
             return self.push(head);
         }
         self.push_block(Block {
-            head,
+            head: Content::Lines(head),
             head_wrapped: Wrapped::default(),
             detail: Some(Detail {
-                lines: detail,
+                content: detail,
+                lines: Vec::new(),
                 wrapped: Wrapped::default(),
                 open,
                 scroll: 0,
@@ -245,16 +334,29 @@ impl Transcript {
         });
     }
 
-    /// Replace a finalized-looking head block in place. Used by the TUI's
-    /// still-streaming assistant message: each delta re-renders the Markdown
-    /// for the whole message and swaps the block without creating duplicates.
+    /// Test helper for replacing an ordinary fixed-line block in place.
+    #[cfg(test)]
     pub fn replace_block(&mut self, index: usize, lines: Vec<Line<'static>>) {
-        if lines.is_empty() || index >= self.blocks.len() {
+        self.replace_content(index, Content::Lines(lines));
+    }
+
+    pub fn replace_markdown_block(&mut self, index: usize, document: crate::markdown::Document) {
+        self.replace_content(
+            index,
+            Content::Markdown {
+                document,
+                prefix: Vec::new(),
+            },
+        );
+    }
+
+    fn replace_content(&mut self, index: usize, head: Content) {
+        if head.is_empty() || index >= self.blocks.len() {
             return;
         }
         let old_height = self.blocks[index].height();
         let block = &mut self.blocks[index];
-        block.head = lines;
+        block.head = head;
         block.detail = None;
         block.entry = None;
         block.rewrap(self.width);
@@ -1090,6 +1192,32 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert!(buffer_text(&buf, area).contains("early input"));
+    }
+
+    #[test]
+    fn responsive_markdown_table_reflows_between_grid_and_cards_on_resize() {
+        let document = crate::markdown::Renderer::default().parse(
+            "| 组合 | Sharpe | 年化收益 | 最大回撤 |\n| --- | ---: | ---: | ---: |\n| baseline_swcta | 2.106 | 2.54% | -1.71% |",
+        );
+        let mut transcript = Transcript::new(80);
+        transcript.push_markdown(document);
+
+        let wide = Rect::new(0, 0, 80, 12);
+        let mut wide_buffer = Buffer::empty(wide);
+        transcript.render(&mut wide_buffer, wide);
+        assert!(buffer_text(&wide_buffer, wide).contains("┌"));
+
+        let narrow = Rect::new(0, 0, 20, 12);
+        let mut narrow_buffer = Buffer::empty(narrow);
+        transcript.render(&mut narrow_buffer, narrow);
+        let narrow_text = buffer_text(&narrow_buffer, narrow);
+        assert!(!narrow_text.contains("┌"));
+        assert!(narrow_text.contains("baseline_swcta"));
+        assert!(narrow_text.contains("Sharpe: 2.106"));
+
+        let mut restored_buffer = Buffer::empty(wide);
+        transcript.render(&mut restored_buffer, wide);
+        assert!(buffer_text(&restored_buffer, wide).contains("┌"));
     }
 
     #[test]
