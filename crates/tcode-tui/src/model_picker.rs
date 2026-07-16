@@ -200,6 +200,31 @@ impl Picker {
         PickResult::Pending
     }
 
+    /// `row` is the border-free rendered content row. The title occupies row
+    /// zero; following rows are the visible model window. Clicking a row both
+    /// selects and applies it, preserving the keyboard Enter behaviour.
+    pub fn handle_mouse_row(&mut self, row: usize) -> PickResult {
+        const WINDOW: usize = 8;
+        let start = self
+            .selected
+            .saturating_sub(WINDOW / 2)
+            .min(self.rows.len().saturating_sub(WINDOW));
+        let Some(index) = row
+            .checked_sub(1)
+            .map(|offset| start + offset)
+            .filter(|index| *index < (start + WINDOW).min(self.rows.len()))
+        else {
+            return PickResult::Pending;
+        };
+        self.selected = index;
+        let row = &self.rows[index];
+        let effort = (row.option.is_some() && row.slot > 0).then(|| row.slots[row.slot].clone());
+        PickResult::Picked {
+            option: row.option,
+            effort,
+        }
+    }
+
     pub fn render(&self, menu: &ModelMenu) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(vec![Span::styled(
             self.title.clone(),
@@ -402,6 +427,17 @@ mod tests {
         let PickResult::Picked { option, effort } = p.handle_key(KeyEvent::from(KeyCode::Enter))
         else {
             panic!("expected pick");
+        };
+        assert_eq!(option, Some(1));
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn mouse_row_applies_the_visible_model() {
+        let m = menu();
+        let mut p = Picker::new(&m, None).unwrap();
+        let PickResult::Picked { option, effort } = p.handle_mouse_row(2) else {
+            panic!("expected a model pick");
         };
         assert_eq!(option, Some(1));
         assert_eq!(effort, None);

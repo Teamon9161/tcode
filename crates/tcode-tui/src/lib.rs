@@ -10,6 +10,7 @@ mod diff;
 mod editor;
 mod markdown;
 mod mathfmt;
+mod mode_picker;
 mod model_picker;
 mod render;
 mod resume;
@@ -114,6 +115,7 @@ fn restore_terminal_output(output: &mut impl Write) {
 mod tests {
     use super::restore_terminal_output;
 
+    #[cfg(not(windows))]
     #[test]
     fn terminal_teardown_disables_mouse_after_leaving_alternate_screen() {
         let mut output = Vec::new();
@@ -125,5 +127,23 @@ mod tests {
         let paste_end = output.find("\x1b[?2004l").unwrap();
         assert!(alternate_end < mouse_end);
         assert!(mouse_end < paste_end);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn terminal_teardown_uses_winapi_for_mouse_cleanup() {
+        let mut output = Vec::new();
+        restore_terminal_output(&mut output);
+
+        // Crossterm uses WinAPI for mouse cleanup, so `?1006l` is deliberately
+        // absent. The remaining ANSI commands still prove the teardown order:
+        // leave the alternate screen, then disable paste, then reveal cursor.
+        let output = String::from_utf8(output).unwrap();
+        let alternate_end = output.find("\x1b[?1049l").unwrap();
+        let paste_end = output.find("\x1b[?2004l").unwrap();
+        let cursor_show = output.find("\x1b[?25h").unwrap();
+        assert!(alternate_end < paste_end);
+        assert!(paste_end < cursor_show);
+        assert!(!output.contains("\x1b[?1006l"));
     }
 }

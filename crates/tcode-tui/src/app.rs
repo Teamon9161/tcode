@@ -17,6 +17,7 @@ use ratatui::Terminal;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthStr;
 
 use tcode_core::blobs::approx_tokens;
 use tcode_core::commands::{
@@ -222,6 +223,18 @@ struct InputHitbox {
     editor_start: usize,
 }
 
+#[derive(Clone, Copy)]
+struct StatusHitboxes {
+    mode: Rect,
+    model: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusHover {
+    Mode,
+    Model,
+}
+
 struct PendingCall {
     detail: String,
     /// Batch items defer their indented summary row (plus any diff) so
@@ -395,6 +408,11 @@ pub struct App {
     /// (headless/SSH) — copy then falls back to OSC 52.
     clipboard: Option<arboard::Clipboard>,
     input_hitbox: Option<InputHitbox>,
+    /// Clickable regions for the mode and model values in the idle status row.
+    /// They are computed from the final rendered layout every frame.
+    status_hitboxes: Option<StatusHitboxes>,
+    /// Which clickable status value the pointer currently rests over.
+    status_hover: Option<StatusHover>,
     input_mouse_active: bool,
     /// Whether the current prompt press has actually dragged. A plain click
     /// (no Drag event) must not copy, even if the release cell differs slightly.
@@ -415,6 +433,7 @@ pub struct App {
     resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
     model_picker: Option<model_picker::Picker>,
+    mode_picker: Option<crate::mode_picker::Picker>,
     agents: AgentMenu,
     agent_picker: Option<model_picker::AgentPicker>,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
@@ -552,6 +571,8 @@ impl App {
             next_attachment_id: 1,
             clipboard: arboard::Clipboard::new().ok(),
             input_hitbox: None,
+            status_hitboxes: None,
+            status_hover: None,
             input_mouse_active: false,
             input_dragged: false,
             drag_scroll: None,
@@ -561,6 +582,7 @@ impl App {
             resume_picker: None,
             menu,
             model_picker: None,
+            mode_picker: None,
             agents,
             agent_picker: None,
             dogfood: session_dogfood,
@@ -2295,6 +2317,101 @@ impl App {
         }
     }
 
+    fn on_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.model_picker.is_none() && self.mode_picker.is_none() && self.agent_picker.is_none()
+        {
+            return false;
+        }
+        // Pickers are modal even where they have no mouse actions yet: do not
+        // let a click select transcript text behind the panel.
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return true;
+        }
+        let height = area_height(&self.terminal);
+        let lines = self
+            .model_picker
+            .as_ref()
+            .map(|picker| picker.render(&self.menu))
+            .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
+            .or_else(|| {
+                self.agent_picker
+                    .as_ref()
+                    .map(|picker| picker.render(&self.menu, &self.agents))
+            })
+            .expect("picker present");
+        let panel_h = (lines.len() as u16 + 2)
+            .min(height.saturating_sub(4))
+            .max(1);
+        let panel_top = height.saturating_sub(panel_h);
+        if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
+            self.model_picker = None;
+            self.mode_picker = None;
+            self.agent_picker = None;
+            return true;
+        }
+        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        if let Some(picker) = self.model_picker.as_mut() {
+            match picker.handle_mouse_row(row) {
+                model_picker::PickResult::Picked {
+                    option: Some(index),
+                    effort,
+                } => {
+                    self.model_picker = None;
+                    self.apply_model(index, effort);
+                }
+                model_picker::PickResult::Cancelled
+                | model_picker::PickResult::Pending
+                | model_picker::PickResult::Picked { option: None, .. } => {}
+            }
+        } else if let Some(picker) = self.mode_picker.as_mut() {
+            match picker.handle_mouse_row(row) {
+                crate::mode_picker::PickResult::Picked(mode) => {
+                    self.mode_picker = None;
+                    self.set_mode(mode);
+                }
+                crate::mode_picker::PickResult::Cancelled
+                | crate::mode_picker::PickResult::Pending => {}
+            }
+        }
+        true
+    }
+
+    fn on_status_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let hover = self
+            .status_hitboxes
+            .and_then(|hitboxes| status_hover_at(hitboxes, mouse.column, mouse.row));
+        if hover == self.status_hover {
+            return hover.is_some();
+        }
+        self.status_hover = hover;
+        if hover.is_some() {
+            // A status value is an interactive control, not transcript content:
+            // clear a prior tool-row highlight before painting its replacement.
+            self.transcript.clear_hover();
+        }
+        hover.is_some()
+    }
+
+    fn on_status_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let Some(hitboxes) = self.status_hitboxes else {
+            return false;
+        };
+        if rect_contains(hitboxes.mode, mouse.column, mouse.row) {
+            self.status_hover = None;
+            self.open_mode_picker();
+            return true;
+        }
+        if rect_contains(hitboxes.model, mouse.column, mouse.row) {
+            self.status_hover = None;
+            self.open_model_picker();
+            return true;
+        }
+        false
+    }
+
     fn on_term_event(&mut self, ev: Event) {
         match ev {
             Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
@@ -2308,6 +2425,7 @@ impl App {
                     dialog.paste_text(text);
                 } else if self.resume_picker.is_none()
                     && self.model_picker.is_none()
+                    && self.mode_picker.is_none()
                     && self.agent_picker.is_none()
                     && self.rewind_nav.is_none()
                 {
@@ -2320,6 +2438,16 @@ impl App {
                 // producing a plan comment.
                 if self.dialog.is_some() {
                     self.on_dialog_mouse(mouse);
+                    return;
+                }
+                if self.on_picker_mouse(mouse) {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved) && self.on_status_mouse_moved(mouse)
+                {
+                    return;
+                }
+                if self.on_status_mouse_down(mouse) {
                     return;
                 }
                 match mouse.kind {
@@ -2376,7 +2504,10 @@ impl App {
             }
             // ratatui's autoresize adapts on the next draw; the transcript
             // rewraps lazily from the new area width.
-            Event::Resize(..) => self.transcript.clear_hover(),
+            Event::Resize(..) => {
+                self.status_hover = None;
+                self.transcript.clear_hover();
+            }
             _ => {}
         }
     }
@@ -2411,6 +2542,18 @@ impl App {
                     if let Some(index) = option {
                         self.apply_model(index, effort);
                     }
+                }
+            }
+            return;
+        }
+
+        if let Some(picker) = self.mode_picker.as_mut() {
+            match picker.handle_key(key) {
+                crate::mode_picker::PickResult::Pending => {}
+                crate::mode_picker::PickResult::Cancelled => self.mode_picker = None,
+                crate::mode_picker::PickResult::Picked(mode) => {
+                    self.mode_picker = None;
+                    self.set_mode(mode);
                 }
             }
             return;
@@ -2664,14 +2807,10 @@ impl App {
         self.start_turn(message);
     }
 
-    /// shift+tab cycles the permission mode. Idle, it takes effect at once;
-    /// while a turn runs, the running turn owns the `Session`, so the switch is
-    /// staged and the agent loop commits it at the next batch boundary. Either
-    /// way the cycle steps from staged-else-committed, so repeated presses
-    /// collapse to the final target rather than restacking.
-    fn cycle_mode(&mut self) {
-        let base = self.pending_mode.get().unwrap_or(self.committed_mode);
-        let next = base.cycle();
+    /// Apply a direct permission-mode choice. The running agent owns the
+    /// Session, so a live turn receives only a staged target and commits it at
+    /// the next tool-batch boundary.
+    fn set_mode(&mut self, next: tcode_core::PermissionMode) {
         self.persist_mode(next);
         match self.session.as_mut() {
             Some(session) => {
@@ -2688,6 +2827,13 @@ impl App {
                 self.mode_label = format!("→ {}", next.label());
             }
         }
+    }
+
+    /// shift+tab cycles the permission mode; status-bar selection calls the
+    /// same setter so persistence and running-turn staging cannot drift.
+    fn cycle_mode(&mut self) {
+        let base = self.pending_mode.get().unwrap_or(self.committed_mode);
+        self.set_mode(base.cycle());
     }
 
     /// Persist the chosen mode as the default for new sessions — except Unsafe:
@@ -2836,6 +2982,22 @@ impl App {
         }
     }
 
+    fn open_mode_picker(&mut self) {
+        let current = self.pending_mode.get().unwrap_or(self.committed_mode);
+        self.mode_picker = Some(crate::mode_picker::Picker::new(current));
+    }
+
+    fn open_model_picker(&mut self) {
+        let effort = self.agent.model.snapshot().effort;
+        self.model_picker = model_picker::Picker::new(&self.menu, effort.as_deref());
+        if self.model_picker.is_none() {
+            self.bake(vec![Line::styled(
+                "no models configured — edit ~/.tcode/config.toml",
+                theme::dim(),
+            )]);
+        }
+    }
+
     /// Hot-swap the shared ModelCell; a running turn finishes on its
     /// snapshot, the next request uses the new model.
     fn apply_model(&mut self, index: usize, effort: Option<String>) {
@@ -2908,14 +3070,7 @@ impl App {
                 return;
             }
             "/model" => {
-                let effort = self.agent.model.snapshot().effort;
-                self.model_picker = model_picker::Picker::new(&self.menu, effort.as_deref());
-                if self.model_picker.is_none() {
-                    self.bake(vec![Line::styled(
-                        "no models configured — edit ~/.tcode/config.toml",
-                        theme::dim(),
-                    )]);
-                }
+                self.open_model_picker();
                 return;
             }
             "/agents" => {
@@ -2979,7 +3134,10 @@ impl App {
             ),
             ("ctrl+a", "select prompt · ctrl+c copy selection"),
             ("alt+c / alt+x", "copy / cut prompt"),
-            ("mouse", "click prompt to move cursor · drag to copy"),
+            (
+                "mouse",
+                "click mode/model to switch · click prompt to move cursor · drag to copy",
+            ),
             ("backspace", "delete · after an [attachment] token drops it"),
             (
                 "ctrl+c",
@@ -3819,11 +3977,13 @@ impl App {
         };
         let status = self.status_line(running, started);
         let hint = self.idle_hint();
+        let status_model_label = self.agent.model.snapshot().describe();
         let dialog_lines = self
             .resume_picker
             .as_ref()
             .map(|p| p.render())
             .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
+            .or_else(|| self.mode_picker.as_ref().map(|p| p.render()))
             .or_else(|| {
                 self.agent_picker
                     .as_ref()
@@ -3845,6 +4005,7 @@ impl App {
         let dialog_owns_panel = dialog_lines.is_some()
             && self.resume_picker.is_none()
             && self.model_picker.is_none()
+            && self.mode_picker.is_none()
             && self.agent_picker.is_none();
         let dialog_cursor = dialog_owns_panel
             .then(|| self.dialog.as_ref().and_then(|(d, _)| d.cursor_cell()))
@@ -3880,6 +4041,7 @@ impl App {
         // coordinates back to editor positions. None when a dialog/picker
         // replaces the input box.
         let mut captured_input: Option<InputHitbox> = None;
+        let mut captured_status: Option<StatusHitboxes> = None;
         let transcript = &mut self.transcript;
         self.terminal.draw(|frame| {
             let area = frame.area();
@@ -4076,9 +4238,17 @@ impl App {
                 y += 1;
             }
 
+            if self.rewind_nav.is_none() {
+                captured_status = Some(status_hitboxes(
+                    row(y, 1),
+                    &self.mode_label,
+                    &status_model_label,
+                ));
+            }
             frame.render_widget(Paragraph::new(hint), row(y, 1));
         })?;
         self.input_hitbox = captured_input;
+        self.status_hitboxes = captured_status;
         Ok(())
     }
 
@@ -4157,13 +4327,25 @@ impl App {
         } else {
             " · ↑ viewing history"
         };
+        let mode_style = if self.status_hover == Some(StatusHover::Mode) {
+            theme::hover_highlight()
+                .fg(theme::ACCENT)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            theme::accent()
+        };
+        let model_style = if self.status_hover == Some(StatusHover::Model) {
+            theme::hover_highlight()
+                .fg(theme::ACCENT)
+                .add_modifier(ratatui::style::Modifier::BOLD)
+        } else {
+            theme::dim()
+        };
         let mut spans = vec![
             Span::styled("  mode ".to_string(), theme::dim()),
-            Span::styled(self.mode_label.clone(), theme::accent()),
-            Span::styled(
-                format!(" · {}", self.agent.model.snapshot().describe()),
-                theme::dim(),
-            ),
+            Span::styled(self.mode_label.clone(), mode_style),
+            Span::styled(" · ".to_string(), theme::dim()),
+            Span::styled(self.agent.model.snapshot().describe(), model_style),
         ];
         // A mode that silently changes what the model does must be visible
         // while it is on, not only in the line that switched it on.
@@ -4181,6 +4363,53 @@ impl App {
         }
         spans.push(Span::styled(" · /help".to_string(), theme::dim()));
         Line::from(spans)
+    }
+}
+
+fn status_hitboxes(row: Rect, mode: &str, model: &str) -> StatusHitboxes {
+    // The hint begins with `  mode `, then `mode`, ` · `, then the model
+    // description. Compute terminal-cell widths rather than byte offsets: both
+    // labels may contain Unicode glyphs.
+    let mode_start = "  mode ".width();
+    let model_start = mode_start + mode.width() + " · ".width();
+    StatusHitboxes {
+        mode: clipped_hitbox(row, mode_start, mode.width()),
+        model: clipped_hitbox(row, model_start, model.width()),
+    }
+}
+
+fn clipped_hitbox(row: Rect, offset: usize, width: usize) -> Rect {
+    let right = row.right();
+    let x = row
+        .x
+        .saturating_add(offset.min(u16::MAX as usize) as u16)
+        .min(right);
+    Rect {
+        x,
+        y: row.y,
+        width: right
+            .saturating_sub(x)
+            .min(width.min(u16::MAX as usize) as u16),
+        height: row.height,
+    }
+}
+
+fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
+    rect.width > 0
+        && rect.height > 0
+        && x >= rect.x
+        && x < rect.right()
+        && y >= rect.y
+        && y < rect.bottom()
+}
+
+fn status_hover_at(hitboxes: StatusHitboxes, x: u16, y: u16) -> Option<StatusHover> {
+    if rect_contains(hitboxes.mode, x, y) {
+        Some(StatusHover::Mode)
+    } else if rect_contains(hitboxes.model, x, y) {
+        Some(StatusHover::Model)
+    } else {
+        None
     }
 }
 
@@ -4924,6 +5153,34 @@ async fn join_external_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_hitboxes_follow_display_width_and_clip_to_terminal() {
+        let hits = status_hitboxes(Rect::new(0, 7, 24, 1), "→ default", "模型 model");
+        assert!(rect_contains(hits.mode, 7, 7));
+        assert!(!rect_contains(hits.model, 7, 7));
+        assert!(rect_contains(hits.model, hits.model.x, 7));
+        assert!(hits.model.right() <= 24);
+
+        let clipped = status_hitboxes(Rect::new(0, 0, 8, 1), "accept-edits", "model");
+        assert_eq!(clipped.mode.right(), 8);
+        assert_eq!(clipped.model.width, 0);
+    }
+
+    #[test]
+    fn status_hover_targets_only_the_clickable_values() {
+        let hits = status_hitboxes(Rect::new(0, 7, 40, 1), "default", "model");
+        assert_eq!(status_hover_at(hits, 2, 7), None, "the mode label is inert");
+        assert_eq!(
+            status_hover_at(hits, hits.mode.x, 7),
+            Some(StatusHover::Mode)
+        );
+        assert_eq!(
+            status_hover_at(hits, hits.model.x, 7),
+            Some(StatusHover::Model)
+        );
+        assert_eq!(status_hover_at(hits, 39, 7), None);
+    }
 
     #[test]
     fn long_or_multiline_pastes_fold_into_attachments() {
