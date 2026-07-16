@@ -26,7 +26,9 @@ jobs:
             binary: tcode
             asset: tcode-aarch64-linux
             zig: true
-          - runner: macos-13
+          # Cross-compiled from the Apple Silicon runner: the Intel macos-13
+          # runners have scarce capacity and long queues, and are being retired.
+          - runner: macos-14
             target: x86_64-apple-darwin
             binary: tcode
             asset: tcode-x86_64-macos
