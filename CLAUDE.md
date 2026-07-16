@@ -32,7 +32,7 @@ tcode 是一个类 Claude Code / Codex 的 Rust agent harness CLI。**`plan.md` 
 - transcript 是唯一事实源、屏幕只是视图；alternate screen 为唯一路径（inline 已删，非 TTY 走 plain）。
 - wrap 只算一次：每块缓存当前宽度的 wrap，resize 才失效；流式追加只重排最后一块。
 - 只渲染可见切片：前缀和二分定位视口起点，每帧 O(视口高度)，与转录总长无关。
-- ratatui 双缓冲 diff 最小化终端写入，帧外包 crossterm synchronized update 防撕裂；重绘按事件驱动 + 250ms tick 合并。
+- ratatui 双缓冲 diff 最小化终端写入，帧外包 crossterm synchronized update 防撕裂；重绘按事件驱动 + 250ms tick 合并。唯一例外是 shimmer 的 100ms 动画 tick（select arm 以 `shimmer_active` 门控，只在有 in-flight 调用或运行中 task 时醒来），且它是 paint-only：`set_task_activity_frame`/`set_live_head` 不改内容不重排，每帧仍 O(视口)。
 - wrap 必须展开 tab：工具输出 `行号\t内容` 的 tab 宽度测 0 却占 buffer cell，滚动残留浮字；`transcript.rs::wrap_lines_flagged` 按 8 列制表位展开成空格，勿改回裸 tab。
 - 折叠输出默认：read/grep/glob 转录里默认只显示折叠摘要，不铺开首行。
 - 批量渲染 item 紧跟自己的 result：批次 header 后每个 call 的 `├ 摘要`(+diff) 推迟到自己的 `ToolEnd` 再 bake（`PendingCall.header`），live 与 replay 一致。

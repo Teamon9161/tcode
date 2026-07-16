@@ -145,40 +145,35 @@ impl UiTaskRun {
 
 /// The tree lines plus, per line, its action target. `None` means an inert
 /// phase/detail/filler row. Empty only when there is neither progress nor a
-/// task run to show.
+/// task run to show. `current` is the view the user is looking at; its row
+/// carries a `▸` gutter marker so the tree always shows where you are.
 pub fn lines(
     progress: &[ProgressPhase],
     runs: &[&UiTaskRun],
     main: MainAgent<'_>,
     width: u16,
     hovered: Option<&PanelTarget>,
+    current: &PanelTarget,
 ) -> (Vec<Line<'static>>, Vec<Option<PanelTarget>>) {
     let mut lines = Vec::new();
     let mut targets = Vec::new();
 
     if !runs.is_empty() {
         let main_hovered = hovered == Some(&PanelTarget::Main);
-        let (marker, activity) = if main.running {
-            ("●", format!(" · {}", main.activity))
-        } else {
-            ("●", String::new())
-        };
         let mut main_spans = vec![
-            Span::styled(
-                format!("  {marker} "),
-                row_style(theme::accent(), main_hovered),
-            ),
+            gutter(current == &PanelTarget::Main),
+            Span::styled("● ", row_style(theme::accent(), main_hovered)),
             Span::styled("main", row_style(theme::bold(), main_hovered)),
         ];
         if main.running {
             main_spans.push(Span::styled(
-                activity,
+                format!(" · {}", main.activity),
                 row_style(Style::default(), main_hovered),
             ));
             main_spans.push(Span::styled(
                 format!(
-                    " · {}s · ↓ {} tok",
-                    main.elapsed_secs,
+                    " · {} · ↓ {} tok",
+                    fmt_elapsed(main.elapsed_secs),
                     token_count(main.output_tokens as u64)
                 ),
                 row_style(theme::dim(), main_hovered),
@@ -187,10 +182,11 @@ pub fn lines(
         lines.push(Line::from(main_spans));
         targets.push(Some(PanelTarget::Main));
 
-        for run in runs {
+        for (i, run) in runs.iter().enumerate() {
             let target = PanelTarget::Task(run.id.clone());
             let highlighted = hovered == Some(&target);
-            let task_lines = task_lines(run, width, highlighted);
+            let connector = if i + 1 == runs.len() { "└ " } else { "├ " };
+            let task_lines = task_lines(run, width, highlighted, connector, current == &target);
             targets.extend(std::iter::repeat_n(Some(target), task_lines.len()));
             lines.extend(task_lines);
         }
@@ -206,7 +202,13 @@ pub fn lines(
     (lines, targets)
 }
 
-fn task_lines(run: &UiTaskRun, width: u16, highlighted: bool) -> Vec<Line<'static>> {
+fn task_lines(
+    run: &UiTaskRun,
+    width: u16,
+    highlighted: bool,
+    connector: &str,
+    current: bool,
+) -> Vec<Line<'static>> {
     let marker = match run.status {
         TaskRunStatus::Running => "●",
         TaskRunStatus::Done => "✓",
@@ -214,10 +216,11 @@ fn task_lines(run: &UiTaskRun, width: u16, highlighted: bool) -> Vec<Line<'stati
         TaskRunStatus::Cancelled => "⨯",
         TaskRunStatus::Interrupted => "⊘",
     };
-    let elapsed = run.started.elapsed().as_secs();
     let spans = vec![
+        gutter(current),
+        Span::styled(connector.to_string(), row_style(theme::dim(), highlighted)),
         Span::styled(
-            format!("  {marker} "),
+            format!("{marker} "),
             row_style(status_style(run.status), highlighted),
         ),
         Span::styled(
@@ -231,8 +234,9 @@ fn task_lines(run: &UiTaskRun, width: u16, highlighted: bool) -> Vec<Line<'stati
         ),
         Span::styled(
             format!(
-                " · {elapsed}s · ↓ {} tok",
-                token_count(run.usage.total_input())
+                " · {} · ↓ {} tok",
+                fmt_elapsed(run.started.elapsed().as_secs()),
+                token_count(run.usage.output_tokens)
             ),
             row_style(theme::dim(), highlighted),
         ),
@@ -241,6 +245,16 @@ fn task_lines(run: &UiTaskRun, width: u16, highlighted: bool) -> Vec<Line<'stati
         vec![Line::from(spans)],
         usize::from(width.saturating_sub(2).max(1)),
     )
+}
+
+/// Two-column gutter: `▸` on the row whose view is on screen, blank elsewhere.
+/// The same glyph the view picker uses, so "where am I" reads identically.
+fn gutter(current: bool) -> Span<'static> {
+    if current {
+        Span::styled("▸ ", theme::accent())
+    } else {
+        Span::raw("  ")
+    }
 }
 
 fn status_style(status: TaskRunStatus) -> Style {
@@ -344,6 +358,14 @@ fn cap_activity(summary: &str) -> String {
     format!("{capped}…")
 }
 
+fn fmt_elapsed(secs: u64) -> String {
+    if secs < 100 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
 fn token_count(tokens: u64) -> String {
     if tokens >= 1_000 {
         format!("{:.1}k", tokens as f64 / 1_000.0)
@@ -420,7 +442,7 @@ mod tests {
 
     #[test]
     fn tree_is_absent_when_no_sub_agent_is_running() {
-        let (lines, targets) = lines(&[], &[], main(), 80, None);
+        let (lines, targets) = lines(&[], &[], main(), 80, None, &PanelTarget::Main);
         assert!(lines.is_empty());
         assert!(targets.is_empty());
     }
@@ -438,7 +460,14 @@ mod tests {
             &RenderRegistry::from_tools(&tcode_tools::builtin_tools(Path::new("."))),
             Path::new("."),
         );
-        let (lines, targets) = lines(&phases(&["in_progress"]), &[&active], main(), 80, None);
+        let (lines, targets) = lines(
+            &phases(&["in_progress"]),
+            &[&active],
+            main(),
+            80,
+            None,
+            &PanelTarget::Main,
+        );
         assert_eq!(
             lines.len(),
             5,
@@ -456,7 +485,7 @@ mod tests {
     fn long_summary_wraps_without_losing_its_task_target() {
         let mut active = run("t1");
         active.summary = "用中文完整概括这个足够长的委派任务，不能被树裁掉".into();
-        let (lines, targets) = lines(&[], &[&active], main(), 20, None);
+        let (lines, targets) = lines(&[], &[&active], main(), 20, None, &PanelTarget::Main);
         assert!(lines.len() > 2, "the task summary wraps on a narrow panel");
         let summary = lines
             .iter()
@@ -473,13 +502,42 @@ mod tests {
     #[test]
     fn task_tree_keeps_navigation_static_and_places_summary_before_stats() {
         let active = run("t1");
-        let (lines, _) = lines(&[], &[&active], main(), 120, None);
+        let (lines, _) = lines(&[], &[&active], main(), 120, None, &PanelTarget::Main);
         let row = text(&lines[1]);
-        assert!(row.starts_with("  ● Explore · inspect the implementation"));
+        assert!(row.starts_with("  └ ● Explore · inspect the implementation"));
         assert!(
             row.find("inspect the implementation").unwrap() < row.find(" · 0s").unwrap(),
             "the summary matches main's activity-before-stats order"
         );
+    }
+
+    #[test]
+    fn current_view_row_carries_the_gutter_marker() {
+        let first = run("t1");
+        let second = run("t2");
+        let current = PanelTarget::Task("t1".into());
+        let (in_task, _) = lines(&[], &[&first, &second], main(), 120, None, &current);
+        assert!(text(&in_task[0]).starts_with("  ● main"));
+        assert!(text(&in_task[1]).starts_with("▸ ├ ● Explore"));
+        assert!(text(&in_task[2]).starts_with("  └ ● Explore"));
+
+        let (in_main, _) = lines(
+            &[],
+            &[&first, &second],
+            main(),
+            120,
+            None,
+            &PanelTarget::Main,
+        );
+        assert!(text(&in_main[0]).starts_with("▸ ● main"));
+        assert!(text(&in_main[1]).starts_with("  ├ ● Explore"));
+    }
+
+    #[test]
+    fn elapsed_switches_to_minutes_past_the_readable_seconds_range() {
+        assert_eq!(fmt_elapsed(99), "99s");
+        assert_eq!(fmt_elapsed(100), "1m40s");
+        assert_eq!(fmt_elapsed(134), "2m14s");
     }
 
     #[test]

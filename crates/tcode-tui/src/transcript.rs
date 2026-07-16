@@ -56,6 +56,9 @@ pub struct Transcript {
     /// Tick frame used only when painting a live task status. Keeping it out of
     /// the wrapped block data preserves the transcript's resize-only reflow.
     task_activity_frame: usize,
+    /// Block whose head rows shimmer because its call (or batch) is still in
+    /// flight. Paint-only, like the frame: content and wrapping never change.
+    live_head: Option<usize>,
 }
 
 /// Lines wrapped at a width. `starts` is aligned with `lines`: true where
@@ -277,6 +280,7 @@ impl Transcript {
             highlight: None,
             hovered: None,
             task_activity_frame: 0,
+            live_head: None,
         }
     }
 
@@ -587,6 +591,7 @@ impl Transcript {
         self.selection = None;
         self.highlight = None;
         self.hovered = None;
+        self.live_head = None;
     }
 
     /// Number of blocks — a stable mark to `truncate_blocks` back to.
@@ -718,6 +723,12 @@ impl Transcript {
         self.task_activity_frame = frame;
     }
 
+    /// Mark (or clear) the block whose head rows shimmer while its tool call
+    /// or batch is in flight. Paint-only; see `set_task_activity_frame`.
+    pub fn set_live_head(&mut self, block: Option<usize>) {
+        self.live_head = block;
+    }
+
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -752,6 +763,7 @@ impl Transcript {
                 let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
                 let is_live_task_status = i >= block.head_wrapped.len()
                     && i < block.head_wrapped.len() + block.status_wrapped.len();
+                let is_live_head = self.live_head == Some(index) && i < block.head_wrapped.len();
                 let content_width = line_display_width(&line).min(area.width as usize);
                 line.render(
                     Rect {
@@ -762,12 +774,13 @@ impl Transcript {
                     },
                     buf,
                 );
-                if is_live_task_status {
+                if is_live_task_status || is_live_head {
                     for x in 0..content_width {
                         buf[(area.x + x as u16, y)].set_fg(
                             crate::theme::task_activity_animation_color(
                                 self.task_activity_frame,
                                 x,
+                                content_width,
                             ),
                         );
                     }

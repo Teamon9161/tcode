@@ -173,14 +173,20 @@ pub fn task_activity_gradient(text: &str) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Colour for one cell in the active task-card status. The bright band travels
-/// across the text on every frame, so activity remains visible without a
-/// spinner or animation in the navigation tree.
-pub fn task_activity_animation_color(frame: usize, column: usize) -> Color {
+/// Colour for one cell in the active task-card status: a single soft highlight
+/// band sweeps left to right over dim text, dwells briefly past the end, then
+/// restarts. `frame` must be monotonic (100ms animation ticks); `width` is the
+/// painted content width so the dwell scales with the line, not the terminal.
+pub fn task_activity_animation_color(frame: usize, column: usize, width: usize) -> Color {
     const DIM: (u8, u8, u8) = (124, 132, 144);
     const BRIGHT: (u8, u8, u8) = (218, 224, 230);
-    let phase = (frame as f32 / 10.0 + column as f32 / 18.0) * std::f32::consts::TAU;
-    let t = (phase.sin() + 1.0) / 2.0;
+    const SPEED: f32 = 1.5; // columns per frame
+    const SIGMA: f32 = 4.0; // band half-width
+    const DWELL: f32 = 12.0; // off-end travel ≈ a beat of rest between sweeps
+    let span = width as f32 + DWELL + 2.0 * SIGMA;
+    let center = (frame as f32 * SPEED) % span - SIGMA;
+    let d = column as f32 - center;
+    let t = (-d * d / (2.0 * SIGMA * SIGMA)).exp();
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
     Color::Rgb(
         lerp(DIM.0, BRIGHT.0),
@@ -218,4 +224,39 @@ pub fn logo_gradient(text: &str) -> Vec<Span<'static>> {
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brightness(color: Color) -> u16 {
+        match color {
+            Color::Rgb(r, g, b) => u16::from(r) + u16::from(g) + u16::from(b),
+            _ => 0,
+        }
+    }
+
+    /// The live-status animation is one highlight band travelling rightward,
+    /// with a rest where every column sits at the dim base — not a full-field
+    /// wave. This is the visual contract the shimmer rework established.
+    #[test]
+    fn shimmer_band_sweeps_right_and_rests_between_passes() {
+        let width = 40;
+        let peak = |frame: usize| {
+            (0..width)
+                .max_by_key(|&col| brightness(task_activity_animation_color(frame, col, width)))
+                .unwrap()
+        };
+        assert!(peak(10) < peak(20), "the band travels left to right");
+        let dim_base = 124 + 132 + 144;
+        let resting = (0..width)
+            .map(|col| brightness(task_activity_animation_color(37, col, width)))
+            .max()
+            .unwrap();
+        assert!(
+            resting <= dim_base + 10,
+            "between passes the whole line rests near the dim base, got {resting}"
+        );
+    }
 }

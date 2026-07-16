@@ -518,6 +518,9 @@ pub struct App {
     turn_usage: Usage,
     mode_label: String,
     spinner: usize,
+    /// Monotonic 100ms shimmer frame for live task statuses. Unlike `spinner`
+    /// it never wraps, so the sweep's phase stays continuous.
+    anim_frame: usize,
     /// Cache-read share of the previous turn; the regression sentinel
     /// compares against it so cache decay is visible immediately.
     prev_cache_ratio: Option<f64>,
@@ -653,6 +656,7 @@ impl App {
             turn_usage: Usage::default(),
             mode_label,
             spinner: 0,
+            anim_frame: 0,
             prev_cache_ratio: None,
             should_exit: false,
             provider_setup_requested: false,
@@ -673,6 +677,11 @@ impl App {
         // while a drag is actually parked at an edge — never when idle.
         let mut drag_tick = tokio::time::interval(Duration::from_millis(50));
         drag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drives the shimmer on live task statuses and in-flight call headers.
+        // Its select arm is gated on `shimmer_active`, so the finer cadence
+        // only runs while something is actually animating.
+        let mut anim_tick = tokio::time::interval(Duration::from_millis(100));
+        anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !self.should_exit {
             self.redraw()?;
@@ -776,9 +785,22 @@ impl App {
                 _ = drag_tick.tick(), if self.drag_scroll.is_some() => {
                     self.drag_autoscroll_step();
                 }
+                _ = anim_tick.tick(), if self.shimmer_active() => {
+                    self.anim_frame = self.anim_frame.wrapping_add(1);
+                }
             }
         }
         Ok(())
+    }
+
+    /// True while any shimmer target exists: a running task run's status line
+    /// or an in-flight tool call's header. Gates the 100ms animation tick.
+    fn shimmer_active(&self) -> bool {
+        self.task_runs
+            .iter()
+            .any(|run| run.status == tcode_core::TaskRunStatus::Running)
+            || self.pending_tool.is_some()
+            || !self.pending_batch.is_empty()
     }
 
     pub fn provider_setup_requested(&self) -> bool {
@@ -1320,6 +1342,11 @@ impl App {
         self.drain_agent_events();
         self.bake_live_text();
         self.finish_thinking();
+        // An interrupted turn can leave a call in flight; its header must not
+        // keep shimmering over a turn that is over.
+        self.transcript.set_live_head(None);
+        self.pending_tool = None;
+        self.pending_batch.clear();
 
         let (mut session, result) = done;
         let elapsed = match &self.phase {
@@ -1466,7 +1493,10 @@ impl App {
                 self.bake_live_text();
                 self.finish_thinking();
                 let header = self.batch_header_lines(&label);
+                let header_block = self.transcript.block_count();
                 self.bake(header);
+                // The batch header shimmers until its last result lands.
+                self.transcript.set_live_head(Some(header_block));
                 self.pending_batch.clear();
                 // A batch spanning several tools tags each item with its tool
                 // name so the reader can tell the calls apart; a single-tool
@@ -1528,6 +1558,9 @@ impl App {
                 } else {
                     None
                 };
+                // A bare call's header shimmers while the tool runs; calls
+                // whose record is a baked body (diff/preview) stay static.
+                self.transcript.set_live_head(header_index);
                 self.pending_tool = Some(PendingCall {
                     call_id,
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
@@ -1581,6 +1614,10 @@ impl App {
                             .position(|entry| entry.call_id == call_id)?;
                         self.pending_batch.remove(position)
                     });
+                // Last in-flight call finished: stop the header shimmer.
+                if self.pending_tool.is_none() && self.pending_batch.is_empty() {
+                    self.transcript.set_live_head(None);
+                }
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
                 let (input, record) = match entry {
@@ -4312,6 +4349,10 @@ impl App {
             Phase::Running { started, .. } => Some(*started),
             Phase::Idle => None,
         };
+        let current = match &self.active_view {
+            ViewId::Main => PanelTarget::Main,
+            ViewId::TaskRun(id) => PanelTarget::Task(id.clone()),
+        };
         live_panel::lines(
             &self.progress,
             &running,
@@ -4329,6 +4370,7 @@ impl App {
             },
             area_width(&self.terminal),
             self.live_panel_hover.as_ref(),
+            &current,
         )
     }
 
@@ -4526,7 +4568,7 @@ impl App {
         let mut captured_input: Option<InputHitbox> = None;
         let mut captured_status: Option<StatusHitboxes> = None;
         let mut captured_panel: Option<Rect> = None;
-        let task_activity_frame = self.spinner;
+        let task_activity_frame = self.anim_frame;
         let transcript = match &self.active_view {
             ViewId::Main => &mut self.transcript,
             ViewId::TaskRun(_) => {
@@ -5039,11 +5081,10 @@ fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
     lines
 }
 
+/// The activity is already self-describing ("thinking…", a tool header), and
+/// the shimmer marks it as live — no fixed "working" prefix needed.
 fn task_live_status(activity: &str) -> Vec<Line<'static>> {
-    vec![Line::styled(
-        format!("  working · {activity}"),
-        theme::dim(),
-    )]
+    vec![Line::styled(format!("  {activity}"), theme::dim())]
 }
 
 /// Remove task-run accounting from the user-facing report. The complete,
@@ -5757,14 +5798,14 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains("Trace session persistence and resume flow"));
-        assert!(!text.contains("working · Search task traces"));
+        assert!(!text.contains("Search task traces"));
         assert_eq!(
             status
                 .iter()
                 .flat_map(|line| line.spans.iter())
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "  working · Search task traces"
+            "  Search task traces"
         );
         assert!(text.contains("└ Read task_trace.rs"));
         assert!(text.contains("└ Grep task runs"));
