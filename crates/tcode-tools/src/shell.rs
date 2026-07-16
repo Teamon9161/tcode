@@ -96,11 +96,15 @@ impl ShellTool {
             Ok(c) => c,
             Err(e) => return ToolOutput::err(format!("failed to start background task: {e}")),
         };
-        let (id, shared) = ctx
+        let (id, shared) = match ctx
             .background
             .lock()
             .expect("background lock")
-            .register(script);
+            .register(script)
+        {
+            Ok(task) => task,
+            Err(error) => return ToolOutput::err(error),
+        };
 
         let stdout = child.stdout.take().expect("piped stdout");
         let stderr = child.stderr.take().expect("piped stderr");

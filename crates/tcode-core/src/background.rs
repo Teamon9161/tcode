@@ -34,8 +34,9 @@ impl TaskStatus {
 pub struct TaskShared {
     /// Live output streams here; the model tails it with `read`.
     pub log_path: PathBuf,
-    /// Append handle, opened lazily on first output.
-    file: Mutex<Option<std::fs::File>>,
+    /// Append handle created when the task is registered, so the advertised
+    /// log path exists even before the child writes its first output line.
+    file: Mutex<std::fs::File>,
     /// Line count kept in memory so completion notes don't re-scan the file.
     lines: Mutex<usize>,
     pub status: Mutex<TaskStatus>,
@@ -44,31 +45,42 @@ pub struct TaskShared {
 }
 
 impl TaskShared {
-    fn new(log_path: PathBuf) -> Self {
-        Self {
+    fn new(log_path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "cannot create background task log directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        std::fs::File::create(&log_path).map_err(|e| {
+            format!(
+                "cannot create background task log {}: {e}",
+                log_path.display()
+            )
+        })?;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .map_err(|e| {
+                format!(
+                    "cannot open background task log {} for append: {e}",
+                    log_path.display()
+                )
+            })?;
+        Ok(Self {
             log_path,
-            file: Mutex::new(None),
+            file: Mutex::new(file),
             lines: Mutex::new(0),
             status: Mutex::new(TaskStatus::Running),
             kill: CancellationToken::new(),
-        }
+        })
     }
 
     pub fn append_output(&self, chunk: &str) {
-        let mut guard = self.file.lock().expect("task file lock");
-        if guard.is_none() {
-            if let Some(parent) = self.log_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            *guard = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.log_path)
-                .ok();
-        }
-        if let Some(file) = guard.as_mut() {
-            let _ = file.write_all(chunk.as_bytes());
-        }
+        let mut file = self.file.lock().expect("task file lock");
+        let _ = file.write_all(chunk.as_bytes());
         *self.lines.lock().expect("task lines lock") += chunk.matches('\n').count();
     }
 
@@ -112,9 +124,9 @@ impl BackgroundTasks {
 
     /// Register a new task and return its id plus the shared state the
     /// process-owning task writes into.
-    pub fn register(&mut self, command: &str) -> (String, Arc<TaskShared>) {
+    pub fn register(&mut self, command: &str) -> Result<(String, Arc<TaskShared>), String> {
         let id = format!("b{}", self.tasks.len() + 1);
-        let shared = Arc::new(TaskShared::new(self.dir.join(format!("{id}.log"))));
+        let shared = Arc::new(TaskShared::new(self.dir.join(format!("{id}.log")))?);
         self.tasks.push(Task {
             id: id.clone(),
             command: command.to_string(),
@@ -122,7 +134,7 @@ impl BackgroundTasks {
             shared: shared.clone(),
             notified: false,
         });
-        (id, shared)
+        Ok((id, shared))
     }
 
     fn find(&self, id: &str) -> Result<&Task, String> {
@@ -169,9 +181,13 @@ impl BackgroundTasks {
             }
             task.notified = true;
             let lines = task.shared.line_count();
+            let output_hint = if lines == 0 {
+                " No output was captured by tcode; command-level redirection may have sent output elsewhere."
+            } else {
+                " Read that file (with offset) if relevant."
+            };
             notes.push(format!(
-                "Background task {} ({}) {} after {}s; {lines} output lines in {}. \
-                 Read that file (with offset) if relevant.",
+                "Background task {} ({}) {} after {}s; {lines} output lines in {}.{output_hint}",
                 task.id,
                 task.command,
                 status.label(),
@@ -207,7 +223,7 @@ mod tests {
     #[test]
     fn lifecycle_notes_once() {
         let mut reg = reg();
-        let (id, shared) = reg.register("cargo watch");
+        let (id, shared) = reg.register("cargo watch").unwrap();
         assert_eq!(id, "b1");
         assert!(reg.take_completion_notes().is_empty());
         assert_eq!(reg.running(), vec!["b1"]);
@@ -229,7 +245,7 @@ mod tests {
     #[test]
     fn output_streams_to_the_log_file() {
         let mut reg = reg();
-        let (_id, shared) = reg.register("server");
+        let (_id, shared) = reg.register("server").unwrap();
         shared.append_output("a\nb\nc\n");
         assert_eq!(shared.line_count(), 3);
         let logged = std::fs::read_to_string(&shared.log_path).unwrap();
@@ -238,9 +254,24 @@ mod tests {
     }
 
     #[test]
+    fn registered_log_exists_before_the_task_emits_output() {
+        let mut reg = reg();
+        let (_id, shared) = reg.register("quiet command").unwrap();
+        assert_eq!(std::fs::read_to_string(&shared.log_path).unwrap(), "");
+
+        shared.set_status(TaskStatus::Exited(1));
+        let notes = reg.take_completion_notes();
+        assert_eq!(notes.len(), 1);
+        assert!(notes[0].contains("0 output lines"));
+        assert!(notes[0].contains("No output was captured by tcode"));
+        assert!(notes[0].contains("redirection may have sent output elsewhere"));
+        let _ = std::fs::remove_file(&shared.log_path);
+    }
+
+    #[test]
     fn unknown_id_lists_tasks() {
         let mut reg = reg();
-        reg.register("x");
+        reg.register("x").unwrap();
         let err = reg.kill("b9").unwrap_err();
         assert!(err.contains("b1"));
         assert!(err.contains("x"));
@@ -249,7 +280,7 @@ mod tests {
     #[test]
     fn kill_semantics() {
         let mut reg = reg();
-        let (id, shared) = reg.register("server");
+        let (id, shared) = reg.register("server").unwrap();
         assert!(reg.kill(&id).unwrap().contains("kill signal sent"));
         assert!(shared.kill.is_cancelled());
         shared.set_status(TaskStatus::Killed);
