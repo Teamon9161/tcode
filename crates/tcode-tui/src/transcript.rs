@@ -776,13 +776,14 @@ impl Transcript {
                 );
                 if is_live_task_status || is_live_head {
                     for x in 0..content_width {
-                        buf[(area.x + x as u16, y)].set_fg(
-                            crate::theme::task_activity_animation_color(
-                                self.task_activity_frame,
-                                x,
-                                content_width,
-                            ),
-                        );
+                        let cell = &mut buf[(area.x + x as u16, y)];
+                        let base = cell.style().fg.unwrap_or(ratatui::style::Color::Reset);
+                        cell.set_fg(crate::theme::shimmer_color(
+                            self.task_activity_frame,
+                            x,
+                            content_width,
+                            base,
+                        ));
                     }
                 }
                 if is_hovered_head {

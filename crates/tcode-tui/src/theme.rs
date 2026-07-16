@@ -173,12 +173,18 @@ pub fn task_activity_gradient(text: &str) -> Vec<Span<'static>> {
         .collect()
 }
 
-/// Colour for one cell in the active task-card status: a single soft highlight
-/// band sweeps left to right over dim text, dwells briefly past the end, then
-/// restarts. `frame` must be monotonic (100ms animation ticks); `width` is the
-/// painted content width so the dwell scales with the line, not the terminal.
-pub fn task_activity_animation_color(frame: usize, column: usize, width: usize) -> Color {
-    const DIM: (u8, u8, u8) = (124, 132, 144);
+/// Colour for one cell of a live (shimmering) line: a single soft highlight
+/// band sweeps left to right, dwells briefly past the end, then restarts.
+/// `frame` must be monotonic (100ms animation ticks); `width` is the painted
+/// content width so the dwell scales with the line, not the terminal.
+///
+/// The band lifts the cell's own colour toward the highlight instead of
+/// overwriting it, so styled lines (green tool names, dim arguments) keep
+/// their identity while running. Cells without a concrete RGB colour (the
+/// terminal default) only join the band once it is clearly over them,
+/// starting from a neutral tone close to a typical default foreground.
+pub fn shimmer_color(frame: usize, column: usize, width: usize, base: Color) -> Color {
+    const NEUTRAL: (u8, u8, u8) = (190, 197, 205);
     const BRIGHT: (u8, u8, u8) = (218, 224, 230);
     const SPEED: f32 = 1.5; // columns per frame
     const SIGMA: f32 = 4.0; // band half-width
@@ -187,11 +193,16 @@ pub fn task_activity_animation_color(frame: usize, column: usize, width: usize) 
     let center = (frame as f32 * SPEED) % span - SIGMA;
     let d = column as f32 - center;
     let t = (-d * d / (2.0 * SIGMA * SIGMA)).exp();
+    let from = match base {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ if t > 0.2 => NEUTRAL,
+        _ => return base,
+    };
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
     Color::Rgb(
-        lerp(DIM.0, BRIGHT.0),
-        lerp(DIM.1, BRIGHT.1),
-        lerp(DIM.2, BRIGHT.2),
+        lerp(from.0, BRIGHT.0),
+        lerp(from.1, BRIGHT.1),
+        lerp(from.2, BRIGHT.2),
     )
 }
 
@@ -237,26 +248,47 @@ mod tests {
         }
     }
 
-    /// The live-status animation is one highlight band travelling rightward,
-    /// with a rest where every column sits at the dim base — not a full-field
-    /// wave. This is the visual contract the shimmer rework established.
+    /// The live-line animation is one highlight band travelling rightward,
+    /// with a rest where every column sits at its own base colour — not a
+    /// full-field wave. This is the visual contract the shimmer established.
     #[test]
     fn shimmer_band_sweeps_right_and_rests_between_passes() {
         let width = 40;
+        let base = Color::Rgb(124, 132, 144);
         let peak = |frame: usize| {
             (0..width)
-                .max_by_key(|&col| brightness(task_activity_animation_color(frame, col, width)))
+                .max_by_key(|&col| brightness(shimmer_color(frame, col, width, base)))
                 .unwrap()
         };
         assert!(peak(10) < peak(20), "the band travels left to right");
         let dim_base = 124 + 132 + 144;
         let resting = (0..width)
-            .map(|col| brightness(task_activity_animation_color(37, col, width)))
+            .map(|col| brightness(shimmer_color(37, col, width, base)))
             .max()
             .unwrap();
         assert!(
             resting <= dim_base + 10,
             "between passes the whole line rests near the dim base, got {resting}"
         );
+    }
+
+    /// Styled cells keep their own hue at rest and only lighten under the
+    /// band; default-coloured cells are left alone until the band covers them.
+    #[test]
+    fn shimmer_lifts_the_base_color_instead_of_overwriting_it() {
+        let width = 40;
+        let green = Color::Rgb(80, 180, 100);
+        // Frame 37 parks the band off the right end: everything is at rest.
+        assert_eq!(shimmer_color(37, 5, width, green), green);
+        assert_eq!(shimmer_color(37, 5, width, Color::Reset), Color::Reset);
+        // Under the band's centre the green cell is visibly lighter.
+        let center_col = (0..width)
+            .max_by_key(|&col| brightness(shimmer_color(10, col, width, green)))
+            .unwrap();
+        assert!(brightness(shimmer_color(10, center_col, width, green)) > brightness(green));
+        assert!(matches!(
+            shimmer_color(10, center_col, width, Color::Reset),
+            Color::Rgb(..)
+        ));
     }
 }

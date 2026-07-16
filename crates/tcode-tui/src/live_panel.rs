@@ -48,6 +48,13 @@ pub struct MainAgent<'a> {
     pub output_tokens: usize,
 }
 
+/// One in-flight tool call inside a task run, with the same renderer
+/// one-liner the main transcript would show for it.
+pub struct RunningCall {
+    pub id: String,
+    pub summary: String,
+}
+
 /// One `task` sub-agent run as the UI tracks it, fed by `TaskRun*` events.
 pub struct UiTaskRun {
     pub id: String,
@@ -62,8 +69,14 @@ pub struct UiTaskRun {
     pub tools: usize,
     pub usage: Usage,
     pub started: Instant,
-    /// What the run is doing right now, one short line.
+    /// Last non-tool state, one short line ("thinking…", "retrying (1/3)").
+    /// While tools run, `calls` is the precise in-flight set and wins.
     pub activity: String,
+    /// Calls currently executing, in start order. The task card's live status
+    /// shows one of them, rotating through a parallel batch over time.
+    pub calls: Vec<RunningCall>,
+    /// Which of `calls` the status line shows; advanced by the animation tick.
+    pub rotation: usize,
     /// Latest meaningful tool headers, rendered on the parent task card rather
     /// than expanded in the tree.
     pub steps: Vec<String>,
@@ -98,10 +111,17 @@ impl UiTaskRun {
             usage: Usage::default(),
             started: Instant::now(),
             activity: "starting…".into(),
+            calls: Vec::new(),
+            rotation: 0,
             steps: Vec::new(),
             events: Vec::new(),
             block,
         }
+    }
+
+    /// The in-flight call the status line should show right now, if any.
+    pub fn current_call(&self) -> Option<&RunningCall> {
+        (!self.calls.is_empty()).then(|| &self.calls[self.rotation % self.calls.len()])
     }
 
     /// Advance the activity line from one forwarded sub-agent event. Tool
@@ -113,12 +133,32 @@ impl UiTaskRun {
                 self.tools += calls.len();
                 self.activity = cap_activity(label);
                 self.note_step(self.activity.clone());
+                // Parallel batches emit no per-call ToolStart; the batch event
+                // carries every call, so the live status can rotate over them.
+                for (id, name, input) in calls {
+                    self.calls.push(RunningCall {
+                        id: id.clone(),
+                        summary: renderers.get(name).header(name, input, Some(cwd)),
+                    });
+                }
             }
-            AgentEvent::ToolStart { name, input, .. } => {
+            AgentEvent::ToolStart {
+                call_id,
+                name,
+                input,
+                ..
+            } => {
                 self.tools += 1;
                 let summary = renderers.get(name).header(name, input, Some(cwd));
                 self.activity = cap_activity(&summary);
                 self.note_step(self.activity.clone());
+                self.calls.push(RunningCall {
+                    id: call_id.clone(),
+                    summary,
+                });
+            }
+            AgentEvent::ToolEnd { call_id, .. } => {
+                self.calls.retain(|call| call.id != *call_id);
             }
             AgentEvent::TextDelta(_) => self.activity = "writing…".into(),
             AgentEvent::ThinkingDelta(_) => self.activity = "thinking…".into(),
@@ -212,9 +252,14 @@ fn task_lines(
     let marker = match run.status {
         TaskRunStatus::Running => "●",
         TaskRunStatus::Done => "✓",
-        TaskRunStatus::Failed => "!",
+        TaskRunStatus::Failed => "✗",
         TaskRunStatus::Cancelled => "⨯",
         TaskRunStatus::Interrupted => "⊘",
+    };
+    let model = if run.model.is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", run.model)
     };
     let spans = vec![
         gutter(current),
@@ -234,7 +279,7 @@ fn task_lines(
         ),
         Span::styled(
             format!(
-                " · {} · ↓ {} tok",
+                " · {} · ↓ {} tok{model}",
                 fmt_elapsed(run.started.elapsed().as_secs()),
                 token_count(run.usage.output_tokens)
             ),
@@ -259,9 +304,12 @@ fn gutter(current: bool) -> Span<'static> {
 
 fn status_style(status: TaskRunStatus) -> Style {
     match status {
-        TaskRunStatus::Running => theme::dim(),
+        // A live sub-agent gets the same "alive" accent as the root's dot; a
+        // dim marker would read as inactive.
+        TaskRunStatus::Running => theme::accent(),
         TaskRunStatus::Done => theme::ok(),
-        TaskRunStatus::Failed | TaskRunStatus::Cancelled => theme::warn(),
+        TaskRunStatus::Failed => Style::default().fg(theme::ERROR),
+        TaskRunStatus::Cancelled => theme::warn(),
         TaskRunStatus::Interrupted => theme::dim(),
     }
 }
@@ -531,6 +579,62 @@ mod tests {
         );
         assert!(text(&in_main[0]).starts_with("▸ ● main"));
         assert!(text(&in_main[1]).starts_with("  ├ ● Explore"));
+    }
+
+    #[test]
+    fn batch_calls_rotate_and_clear_on_tool_end() {
+        let registry = RenderRegistry::from_tools(&tcode_tools::builtin_tools(Path::new(".")));
+        let mut task = run("t1");
+        task.note_event(
+            &AgentEvent::ToolBatchStart {
+                label: "Read 2 files".into(),
+                calls: vec![
+                    (
+                        "c1".into(),
+                        "read".into(),
+                        serde_json::json!({"file_path": "a.rs"}),
+                    ),
+                    (
+                        "c2".into(),
+                        "read".into(),
+                        serde_json::json!({"file_path": "b.rs"}),
+                    ),
+                ],
+            },
+            &registry,
+            Path::new("."),
+        );
+        assert_eq!(task.calls.len(), 2);
+        assert!(task.current_call().unwrap().summary.contains("a.rs"));
+        task.rotation += 1;
+        assert!(task.current_call().unwrap().summary.contains("b.rs"));
+        task.note_event(
+            &AgentEvent::ToolEnd {
+                call_id: "c2".into(),
+                name: "read".into(),
+                preview: String::new(),
+                content: String::new(),
+                is_error: false,
+            },
+            &registry,
+            Path::new("."),
+        );
+        assert!(
+            task.current_call().unwrap().summary.contains("a.rs"),
+            "a finished call leaves the rotation"
+        );
+        task.note_event(
+            &AgentEvent::ToolEnd {
+                call_id: "c1".into(),
+                name: "read".into(),
+                preview: String::new(),
+                content: String::new(),
+                is_error: false,
+            },
+            &registry,
+            Path::new("."),
+        );
+        assert!(task.current_call().is_none(), "no calls, plain activity");
     }
 
     #[test]

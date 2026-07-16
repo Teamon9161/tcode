@@ -787,6 +787,10 @@ impl App {
                 }
                 _ = anim_tick.tick(), if self.shimmer_active() => {
                     self.anim_frame = self.anim_frame.wrapping_add(1);
+                    // Every ~1.5s, parallel batches show their next call.
+                    if self.anim_frame.is_multiple_of(15) {
+                        self.rotate_task_calls();
+                    }
                 }
             }
         }
@@ -1763,23 +1767,21 @@ impl App {
                     self.turn_usage = add_usage(self.turn_usage, *u);
                     self.out_tokens = self.out_tokens.saturating_add(u.output_tokens as usize);
                 }
-                let live_detail =
-                    self.task_runs
-                        .iter_mut()
-                        .find(|entry| entry.id == run)
-                        .map(|entry| {
-                            entry.note_event(&event, &self.renderers, &self.cwd);
-                            entry.events.push(trace_event);
-                            (
-                                entry.block,
-                                task_live_detail(&entry.summary, &entry.steps),
-                                task_live_status(&entry.activity),
-                            )
-                        });
-                if let Some((Some(block), detail, status)) = live_detail {
-                    self.transcript
-                        .replace_detail_preserving_open(block, detail, OUTPUT_VIEW_ROWS);
-                    self.transcript.set_live_status(block, Some(status));
+                if let Some(position) = self.task_runs.iter().position(|entry| entry.id == run) {
+                    let entry = &mut self.task_runs[position];
+                    entry.note_event(&event, &self.renderers, &self.cwd);
+                    entry.events.push(trace_event);
+                    let entry = &self.task_runs[position];
+                    if let Some(block) = entry.block {
+                        let detail = task_live_detail(&entry.summary, &entry.steps);
+                        let status = self.task_status_lines(entry);
+                        self.transcript.replace_detail_preserving_open(
+                            block,
+                            detail,
+                            OUTPUT_VIEW_ROWS,
+                        );
+                        self.transcript.set_live_status(block, Some(status));
+                    }
                 }
                 self.refresh_open_trace(&run);
             }
@@ -1807,7 +1809,7 @@ impl App {
                         OUTPUT_VIEW_ROWS,
                     );
                     self.transcript
-                        .set_live_status(index, Some(task_live_status("starting…")));
+                        .set_live_status(index, Some(task_plain_status("starting…")));
                 } else if let Some(position) = self
                     .pending_batch
                     .iter()
@@ -1832,7 +1834,7 @@ impl App {
                         OUTPUT_VIEW_ROWS,
                     );
                     self.transcript
-                        .set_live_status(index, Some(task_live_status("starting…")));
+                        .set_live_status(index, Some(task_plain_status("starting…")));
                 }
                 self.task_runs.push(UiTaskRun::new(
                     run,
@@ -4336,6 +4338,47 @@ impl App {
             .collect();
     }
 
+    /// The task card's live status: the in-flight call rendered exactly like a
+    /// main-window tool line (green name, dim arguments), or the run's plain
+    /// activity when no tool is running. A parallel batch shows one call at a
+    /// time with its position, rotated by the animation tick.
+    fn task_status_lines(&self, run: &UiTaskRun) -> Vec<Line<'static>> {
+        let Some(call) = run.current_call() else {
+            return task_plain_status(&run.activity);
+        };
+        let summary = self.display_summary(&call.summary);
+        let mut spans = vec![Span::raw("  ")];
+        spans.extend(self.colored_tool_summary(&summary));
+        if run.calls.len() > 1 {
+            spans.push(Span::styled(
+                format!(
+                    " · {}/{}",
+                    run.rotation % run.calls.len() + 1,
+                    run.calls.len()
+                ),
+                theme::dim(),
+            ));
+        }
+        vec![Line::from(spans)]
+    }
+
+    /// Advance which call of a parallel batch each running task's status line
+    /// shows. Driven by the animation tick at a slow multiple of its cadence.
+    fn rotate_task_calls(&mut self) {
+        for index in 0..self.task_runs.len() {
+            let run = &self.task_runs[index];
+            if run.status != tcode_core::TaskRunStatus::Running || run.calls.len() < 2 {
+                continue;
+            }
+            self.task_runs[index].rotation = self.task_runs[index].rotation.wrapping_add(1);
+            let Some(block) = self.task_runs[index].block else {
+                continue;
+            };
+            let status = self.task_status_lines(&self.task_runs[index]);
+            self.transcript.set_live_status(block, Some(status));
+        }
+    }
+
     /// The persistent agent tree: progress phases plus the root conversation
     /// and only currently working task runs. Completed traces remain reachable
     /// from their parent task headers, not as stale tree children.
@@ -4353,15 +4396,21 @@ impl App {
             ViewId::Main => PanelTarget::Main,
             ViewId::TaskRun(id) => PanelTarget::Task(id.clone()),
         };
+        // The bottom status line keeps the "running:" prefix; inside the tree
+        // the dot already says the row is live, so the label alone reads better.
+        let activity = self
+            .state_label
+            .strip_prefix("running: ")
+            .unwrap_or(&self.state_label);
         live_panel::lines(
             &self.progress,
             &running,
             MainAgent {
                 running: started.is_some(),
-                activity: if self.state_label.is_empty() {
+                activity: if activity.is_empty() {
                     "working…"
                 } else {
-                    &self.state_label
+                    activity
                 },
                 elapsed_secs: started
                     .map(|started| started.elapsed().as_secs())
@@ -5081,9 +5130,9 @@ fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
     lines
 }
 
-/// The activity is already self-describing ("thinking…", a tool header), and
+/// The activity is already self-describing ("thinking…", "starting…"), and
 /// the shimmer marks it as live — no fixed "working" prefix needed.
-fn task_live_status(activity: &str) -> Vec<Line<'static>> {
+fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
     vec![Line::styled(format!("  {activity}"), theme::dim())]
 }
 
@@ -5791,7 +5840,7 @@ mod tests {
             "Trace session persistence and resume flow",
             &["Read task_trace.rs".into(), "Grep task runs".into()],
         );
-        let status = task_live_status("Search task traces");
+        let status = task_plain_status("Search task traces");
         let text = lines
             .iter()
             .flat_map(|line| line.spans.iter())
