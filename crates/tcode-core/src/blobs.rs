@@ -27,18 +27,26 @@ impl BlobStore {
     }
 
     /// Pass small outputs through; spill large ones to a file and return a
-    /// head+tail preview with the saved path.
-    pub fn gate(&mut self, tool: &str, full: String) -> String {
+    /// head+tail preview with the saved path. Errors preserve much more of the
+    /// tail, where compilers and test runners normally print diagnostics and
+    /// their final summary.
+    pub fn gate(&mut self, tool: &str, full: String, is_error: bool) -> String {
         if approx_tokens(&full) <= self.budget_tokens {
             return full;
         }
         let lines: Vec<&str> = full.lines().collect();
         let total_lines = lines.len();
-        // Head shows the beginning, tail shows the end (build failures
-        // usually live at the end).
         let budget_chars = self.budget_tokens * 3;
-        let head = take_chars(lines.iter().copied(), budget_chars * 3 / 5);
-        let tail_count = take_chars(lines.iter().rev().copied(), budget_chars / 5).len();
+        // Build/test failures usually put the useful diagnostics and final
+        // summary at the end. Keep enough of the beginning to identify early
+        // startup errors, but spend the rest of the preview budget on the tail.
+        let (head_budget, tail_budget) = if is_error {
+            (budget_chars / 4, budget_chars * 13 / 20)
+        } else {
+            (budget_chars * 3 / 5, budget_chars / 5)
+        };
+        let head = take_chars(lines.iter().copied(), head_budget);
+        let tail_count = take_chars(lines.iter().rev().copied(), tail_budget).len();
         let tail_start = total_lines - tail_count;
 
         self.counter += 1;
@@ -256,14 +264,14 @@ mod tests {
     fn small_output_passes_through() {
         let mut store = store(100);
         let s = "hello\nworld".to_string();
-        assert_eq!(store.gate("shell", s.clone()), s);
+        assert_eq!(store.gate("shell", s.clone(), false), s);
     }
 
     #[test]
     fn large_output_spills_to_a_file() {
         let mut store = store(50); // ~150 chars
         let full: String = (1..=100).map(|i| format!("line number {i}\n")).collect();
-        let gated = store.gate("shell", full.clone());
+        let gated = store.gate("shell", full.clone(), false);
 
         assert!(gated.len() < 1000);
         assert!(gated.contains("line number 1")); // head kept
@@ -348,7 +356,7 @@ index 4444444..0000000
     fn truncated_diff_leads_with_the_file_list() {
         let mut store = store(60); // ~180 chars; the diff below is far bigger
         let padding: String = (1..=80).map(|i| format!(" context line {i}\n")).collect();
-        let gated = store.gate("shell", format!("{GIT_DIFF}{padding}"));
+        let gated = store.gate("shell", format!("{GIT_DIFF}{padding}"), false);
 
         assert!(gated.starts_with("[truncated diff — 3 files changed"));
         assert!(gated.contains("src/two.rs"));
@@ -356,9 +364,37 @@ index 4444444..0000000
     }
 
     #[test]
+    fn error_output_keeps_a_larger_diagnostic_tail() {
+        let full = (1..=120)
+            .map(|line| {
+                if line == 116 {
+                    "assertion failed: expected success\n".to_string()
+                } else if line == 120 {
+                    "(exit code 101)\n".to_string()
+                } else {
+                    format!("log {line:03}\n")
+                }
+            })
+            .collect::<String>();
+
+        let mut normal_store = store(40);
+        let normal_dir = normal_store.dir.clone();
+        let normal = normal_store.gate("shell", full.clone(), false);
+        let mut error_store = store(40);
+        let error_dir = error_store.dir.clone();
+        let error = error_store.gate("shell", full, true);
+
+        assert!(!normal.contains("assertion failed"), "{normal}");
+        assert!(error.contains("assertion failed"), "{error}");
+        assert!(error.contains("(exit code 101)"), "{error}");
+        let _ = std::fs::remove_dir_all(normal_dir);
+        let _ = std::fs::remove_dir_all(error_dir);
+    }
+
+    #[test]
     fn untruncated_output_gets_no_preamble() {
         let mut store = store(10_000);
-        let gated = store.gate("shell", GIT_DIFF.to_string());
+        let gated = store.gate("shell", GIT_DIFF.to_string(), false);
         assert_eq!(gated, GIT_DIFF);
     }
 }

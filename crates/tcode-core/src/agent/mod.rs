@@ -1892,7 +1892,7 @@ impl Agent {
         let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
         // Only text is budget-gated; images never go to the blob store.
         ToolOutput {
-            content: blobs.gate(tool, content),
+            content: blobs.gate(tool, content, is_error),
             is_error,
             images,
         }

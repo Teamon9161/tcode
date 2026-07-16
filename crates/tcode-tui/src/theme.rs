@@ -1,10 +1,28 @@
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::Span;
 
-pub const ACCENT: Color = Color::Cyan;
-pub const DIM: Color = Color::DarkGray;
-pub const ERROR: Color = Color::Red;
-pub const WARN: Color = Color::Yellow;
-pub const OK: Color = Color::Green;
+// A pinned dark palette. Named ANSI colours resolve against whatever
+// palette the emulator ships — warm themes render "DarkGray" as pale
+// brown and "White" as cream, which used to tint the whole transcript.
+// Fixed RGB values keep the UI identical in every terminal, matching
+// the diff backgrounds and syntect output that were always RGB.
+// Dark-first by design; a light variant can arrive as `[ui] theme`.
+//
+// Hue semantics: cyan = interactive, green = tool, dim = aside.
+pub const ACCENT: Color = Color::Rgb(79, 195, 217);
+pub const DIM: Color = Color::Rgb(124, 132, 144);
+pub const ERROR: Color = Color::Rgb(224, 108, 117);
+pub const WARN: Color = Color::Rgb(217, 163, 87);
+pub const OK: Color = Color::Rgb(87, 199, 135);
+/// A lighter accent for the user rail and inline code: same hue as
+/// ACCENT, lifted for small glyphs that need to read at a glance.
+const ACCENT_LIGHT: Color = Color::Rgb(122, 220, 232);
+/// One notch above the terminal's default foreground, for the user's
+/// own words and error text on filled backgrounds.
+const FG_BRIGHT: Color = Color::Rgb(232, 236, 240);
+/// Math is rare enough to afford its own hue, distinct from the
+/// cyan/green working colours.
+const MATH: Color = Color::Rgb(199, 146, 234);
 
 pub fn dim() -> Style {
     Style::default().fg(DIM)
@@ -42,7 +60,7 @@ pub fn user_prompt() -> Style {
 pub const USER_GUTTER: &str = "▌ ";
 
 pub fn user_gutter() -> Style {
-    Style::default().fg(Color::LightCyan)
+    Style::default().fg(ACCENT_LIGHT)
 }
 
 /// A note is not a turn: an aside the human slipped to the model mid-turn
@@ -61,7 +79,7 @@ pub fn note_label() -> Style {
 /// meaning here (cyan = interactive, green = tool, dim = aside) — and a filled
 /// background would compete with the diff blocks.
 pub fn user_message() -> Style {
-    Style::default().fg(Color::White)
+    Style::default().fg(FG_BRIGHT)
 }
 
 /// Text selection in the input box — matches the transcript's reversed
@@ -86,7 +104,7 @@ pub fn rewind_highlight_bg() -> Color {
 /// scrollback — a bold light foreground on a deep-red background.
 pub fn error_highlight() -> Style {
     Style::default()
-        .fg(Color::White)
+        .fg(FG_BRIGHT)
         .bg(Color::Rgb(90, 24, 28))
         .add_modifier(Modifier::BOLD)
 }
@@ -111,17 +129,46 @@ pub fn diff_del_emph_bg() -> Color {
 }
 
 pub fn inline_code() -> Style {
-    Style::default().fg(Color::LightCyan)
+    Style::default().fg(ACCENT_LIGHT)
 }
 
-/// TeX source is more reliable than attempting terminal typesetting, but it
-/// must remain visibly distinct from prose and code.
+/// Math renders as a best-effort Unicode linearization (`mathfmt`), so the
+/// colour alone must keep it visibly distinct from prose and code.
 pub fn math_inline() -> Style {
-    Style::default()
-        .fg(Color::LightMagenta)
-        .add_modifier(Modifier::ITALIC)
+    Style::default().fg(MATH).add_modifier(Modifier::ITALIC)
 }
 
 pub fn math_block() -> Style {
-    Style::default().fg(Color::LightMagenta)
+    Style::default().fg(MATH)
+}
+
+/// Anchor colours for the startup logo: the tool green sliding into the
+/// interactive cyan — the wordmark spans the palette's two working hues
+/// instead of introducing a third. Anchors sit slightly outside OK and
+/// ACCENT so the sweep stays visible across only twenty columns.
+const LOGO_FROM: (u8, u8, u8) = (98, 205, 125);
+const LOGO_TO: (u8, u8, u8) = (72, 188, 228);
+
+/// One span per character, horizontally interpolated between the logo
+/// anchors. Rows of equal length share column colours, so a multi-row
+/// logo reads as a single gradient surface.
+pub fn logo_gradient(text: &str) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let last = chars.len().saturating_sub(1).max(1) as f32;
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let t = i as f32 / last;
+            let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(Color::Rgb(
+                    lerp(LOGO_FROM.0, LOGO_TO.0),
+                    lerp(LOGO_FROM.1, LOGO_TO.1),
+                    lerp(LOGO_FROM.2, LOGO_TO.2),
+                )),
+            )
+        })
+        .collect()
 }

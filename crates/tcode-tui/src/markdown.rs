@@ -140,12 +140,18 @@ impl Renderer {
                         if !spans.is_empty() {
                             flush(&mut spans, &mut out, quote_depth);
                         }
-                        let style = theme::bold().fg(theme::ACCENT);
+                        // No literal `#` marks: weight and colour carry the
+                        // hierarchy — accent for the top levels (underlined
+                        // for h1), default foreground for h3, dim below.
+                        let style = match level as usize {
+                            1 => theme::bold()
+                                .fg(theme::ACCENT)
+                                .add_modifier(Modifier::UNDERLINED),
+                            2 => theme::bold().fg(theme::ACCENT),
+                            3 => theme::bold(),
+                            _ => theme::bold().fg(theme::DIM),
+                        };
                         style_stack.push(style);
-                        spans.push(Span::styled(
-                            format!("{} ", "#".repeat(level as usize)),
-                            style,
-                        ));
                     }
                     Tag::Emphasis => {
                         let s = style_stack.last().copied().unwrap_or_default();
@@ -291,7 +297,10 @@ impl Renderer {
                     spans.push(Span::styled(t.to_string(), theme::inline_code()));
                 }
                 Event::InlineMath(t) => {
-                    spans.push(Span::styled(format!("${t}$"), theme::math_inline()));
+                    spans.push(Span::styled(
+                        crate::mathfmt::prettify(&t),
+                        theme::math_inline(),
+                    ));
                 }
                 Event::DisplayMath(t) => {
                     if !spans.is_empty() {
@@ -302,7 +311,10 @@ impl Renderer {
                         math.push(Span::styled("▎ ".repeat(quote_depth), theme::dim()));
                     }
                     math.push(Span::styled("∑ ", theme::accent()));
-                    math.push(Span::styled(format!("$${t}$$"), theme::math_block()));
+                    math.push(Span::styled(
+                        crate::mathfmt::prettify(&t),
+                        theme::math_block(),
+                    ));
                     out.push(Line::from(math));
                     display_math = true;
                 }
@@ -387,12 +399,18 @@ impl Table {
         if columns == 0 {
             return Vec::new();
         }
-        let widths = self.widths(columns);
-        let grid_width = widths.iter().sum::<usize>() + columns * 3 + 1;
-        if grid_width <= width {
-            self.render_grid(&widths)
-        } else {
-            self.render_cards(columns)
+        let natural = self.widths(columns);
+        let available = width.saturating_sub(columns * 3 + 1);
+        if natural.iter().sum::<usize>() <= available {
+            return self.render_grid(&natural);
+        }
+        // Too wide at natural widths: squeeze the widest columns and wrap
+        // cell content inside them, browser-style, so the grid survives.
+        // Only when even the per-column floor cannot fit does the table
+        // give up its shape and fall back to one record per row.
+        match squeeze_widths(&natural, available) {
+            Some(widths) => self.render_grid(&widths),
+            None => self.render_cards(columns),
         }
     }
 
@@ -408,35 +426,56 @@ impl Table {
             text.push_str(right);
             Line::styled(text, theme::border())
         };
-        let row_line = |cells: &[Vec<Span<'static>>], header: bool| {
-            let mut spans = vec![Span::styled("│", theme::border())];
-            for (index, width) in widths.iter().enumerate() {
-                let cell = cells.get(index).map(Vec::as_slice).unwrap_or(&[]);
-                let padding = width.saturating_sub(cell_width(cell));
-                let (left, right) = match self
-                    .alignments
-                    .get(index)
-                    .copied()
-                    .unwrap_or(Alignment::None)
-                {
-                    Alignment::Right => (padding, 0),
-                    Alignment::Center => (padding / 2, padding - padding / 2),
-                    Alignment::None | Alignment::Left => (0, padding),
-                };
-                spans.push(Span::raw(format!(" {}", " ".repeat(left))));
-                spans.extend(styled_cell(cell, header));
-                spans.push(Span::raw(format!("{} ", " ".repeat(right))));
-                spans.push(Span::styled("│", theme::border()));
-            }
-            Line::from(spans)
+        // One logical row can occupy several visual rows: every cell wraps
+        // within its column and short cells pad with empty rows. A fitting
+        // table wraps nothing and renders exactly as it always did.
+        let row_lines = |cells: &[Vec<Span<'static>>], header: bool| -> Vec<Line<'static>> {
+            let wrapped: Vec<Vec<Line<'static>>> = widths
+                .iter()
+                .enumerate()
+                .map(|(index, width)| {
+                    let cell = cells.get(index).map(Vec::as_slice).unwrap_or(&[]);
+                    // `wrap_lines` fits content into `width - 1` columns.
+                    crate::transcript::wrap_lines(
+                        vec![Line::from(styled_cell(cell, header))],
+                        width + 1,
+                    )
+                })
+                .collect();
+            let height = wrapped.iter().map(Vec::len).max().unwrap_or(1).max(1);
+            (0..height)
+                .map(|visual| {
+                    let mut spans = vec![Span::styled("│", theme::border())];
+                    for (index, width) in widths.iter().enumerate() {
+                        let cell_line = wrapped[index].get(visual);
+                        let content = cell_line.map(|line| line.spans.as_slice()).unwrap_or(&[]);
+                        let padding = width.saturating_sub(cell_width(content));
+                        let (left, right) = match self
+                            .alignments
+                            .get(index)
+                            .copied()
+                            .unwrap_or(Alignment::None)
+                        {
+                            Alignment::Right => (padding, 0),
+                            Alignment::Center => (padding / 2, padding - padding / 2),
+                            Alignment::None | Alignment::Left => (0, padding),
+                        };
+                        spans.push(Span::raw(format!(" {}", " ".repeat(left))));
+                        spans.extend(content.iter().cloned());
+                        spans.push(Span::raw(format!("{} ", " ".repeat(right))));
+                        spans.push(Span::styled("│", theme::border()));
+                    }
+                    Line::from(spans)
+                })
+                .collect()
         };
 
         let mut out = vec![border("┌", "┬", "┐")];
         if !self.header.is_empty() {
-            out.push(row_line(&self.header, true));
+            out.extend(row_lines(&self.header, true));
             out.push(border("├", "┼", "┤"));
         }
-        out.extend(self.rows.iter().map(|row| row_line(row, false)));
+        out.extend(self.rows.iter().flat_map(|row| row_lines(row, false)));
         out.push(border("└", "┴", "┘"));
         out
     }
@@ -476,6 +515,28 @@ impl Table {
         }
         out
     }
+}
+
+/// Below this a column is unreadable; columns already narrower keep
+/// their natural width.
+const MIN_COLUMN: usize = 6;
+
+/// Shrink the widest columns first — one cell at a time, so only the
+/// columns responsible for the overflow pay for it — until the grid fits
+/// `available`. None when even the floors do not fit.
+fn squeeze_widths(natural: &[usize], available: usize) -> Option<Vec<usize>> {
+    let floor: usize = natural.iter().map(|&w| w.min(MIN_COLUMN)).sum();
+    if floor > available {
+        return None;
+    }
+    let mut widths = natural.to_vec();
+    let mut total: usize = widths.iter().sum();
+    while total > available {
+        let widest = (0..widths.len()).max_by_key(|&i| widths[i])?;
+        widths[widest] -= 1;
+        total -= 1;
+    }
+    Some(widths)
 }
 
 fn styled_cell(cell: &[Span<'_>], bold: bool) -> Vec<Span<'static>> {
@@ -709,6 +770,48 @@ mod tests {
     }
 
     #[test]
+    fn headings_drop_the_hash_marks_and_carry_style() {
+        let lines = Renderer::default().render("## Section title\n\nbody");
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert!(text.iter().any(|l| l == "Section title"));
+        assert!(!text.iter().any(|l| l.contains('#')));
+        let heading = lines
+            .iter()
+            .find(|l| {
+                l.spans
+                    .iter()
+                    .any(|s| s.content.as_ref().contains("Section"))
+            })
+            .unwrap();
+        let style = heading.spans[0].style;
+        assert_eq!(style.fg, Some(theme::ACCENT));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn wide_table_squeezes_columns_and_wraps_cells_before_giving_up_the_grid() {
+        let document = Renderer::default().parse(
+            "| name | description |\n| --- | --- |\n| alpha | a very long description that cannot fit on one single line at this width |",
+        );
+        let lines = document.lines_at(44);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        // The grid survives: borders intact, nothing wider than the pane,
+        // and the long cell continues across several visual rows.
+        assert!(text.iter().any(|l| l.starts_with('┌')));
+        use unicode_width::UnicodeWidthStr;
+        assert!(text.iter().all(|l| l.width() <= 44), "no row overflows");
+        let alpha_rows = text.iter().filter(|l| l.starts_with('│')).count();
+        assert!(alpha_rows > 2, "long cell wraps into extra rows");
+        assert!(text.iter().any(|l| l.contains("description that")));
+    }
+
+    #[test]
     fn responsive_table_uses_cards_when_grid_exceeds_width() {
         let document = Renderer::default().parse(
             "| 组合 | Sharpe | 年化收益 | 最大回撤 |\n| --- | ---: | ---: | ---: |\n| baseline_swcta | 2.106 | 2.54% | -1.71% |",
@@ -771,10 +874,8 @@ mod tests {
             })
             .collect();
 
-        assert!(text
-            .iter()
-            .any(|line| line.contains("Energy is $E = mc^2$.")));
-        assert!(text.iter().any(|line| line == "∑ $$\\frac{a}{b} = c$$"));
+        assert!(text.iter().any(|line| line.contains("Energy is E = mc².")));
+        assert!(text.iter().any(|line| line == "∑ a/b = c"));
     }
 
     #[test]

@@ -9,6 +9,7 @@ mod approval;
 mod diff;
 mod editor;
 mod markdown;
+mod mathfmt;
 mod model_picker;
 mod render;
 mod resume;

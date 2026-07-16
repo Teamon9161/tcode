@@ -678,11 +678,12 @@ impl Tool for EditTool {
                 }
                 return ToolOutput::err(msg);
             }
-            Err(()) => {
-                return ToolOutput::err(
+            Err(candidates) => {
+                return ToolOutput::err(format!(
                     "old_string has multiple whitespace/punctuation-normalized matches; \
-                     add enough exact surrounding context to identify one occurrence.",
-                );
+                     add enough exact surrounding context to identify one occurrence.\nCandidates:\n{}",
+                    candidate_help(&text, &candidates).join("\n\n")
+                ));
             }
         };
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
@@ -747,10 +748,16 @@ struct ReplacementPlan {
 /// A non-exact recovery match is safe only when it identifies one location.
 /// It must never silently pick the first of several whitespace-equivalent
 /// blocks: that would violate edit's public uniqueness contract.
+#[derive(Debug)]
+struct MatchCandidate {
+    at: usize,
+    len: usize,
+}
+
 enum NormalizedMatch {
     NotFound,
     Unique(String),
-    Ambiguous,
+    Ambiguous(Vec<MatchCandidate>),
 }
 
 impl ReplacementPlan {
@@ -767,7 +774,11 @@ impl ReplacementPlan {
     }
 }
 
-fn replacement_plan(text: &str, old: &str, new: &str) -> Result<Option<ReplacementPlan>, ()> {
+fn replacement_plan(
+    text: &str,
+    old: &str,
+    new: &str,
+) -> Result<Option<ReplacementPlan>, Vec<MatchCandidate>> {
     let eol = dominant_line_ending(text);
     let mut candidates = Vec::new();
     candidates.push((old.to_string(), normalize_newlines(new, eol)));
@@ -813,7 +824,7 @@ fn replacement_plan(text: &str, old: &str, new: &str) -> Result<Option<Replaceme
             orig,
             normalize_newlines(new, eol),
         )),
-        NormalizedMatch::Ambiguous => Err(()),
+        NormalizedMatch::Ambiguous(candidates) => Err(candidates),
     }
 }
 
@@ -837,23 +848,38 @@ fn find_punct_normalized(text: &str, old: &str) -> NormalizedMatch {
     if pat.iter().copied().eq(old.chars()) {
         return NormalizedMatch::NotFound; // exact pass already tried this
     }
-    let tchars: Vec<char> = text.chars().collect();
+    let tchars: Vec<(usize, char)> = text.char_indices().collect();
     if pat.is_empty() || pat.len() > tchars.len() {
         return NormalizedMatch::NotFound;
     }
-    let mut matches = (0..=tchars.len() - pat.len()).filter_map(|i| {
-        let window = &tchars[i..i + pat.len()];
-        window
-            .iter()
-            .copied()
-            .map(normalize_punct)
-            .eq(pat.iter().copied())
-            .then(|| window.iter().collect::<String>())
-    });
-    match (matches.next(), matches.next()) {
-        (None, _) => NormalizedMatch::NotFound,
-        (Some(found), None) => NormalizedMatch::Unique(found),
-        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    let matches: Vec<(usize, String)> = (0..=tchars.len() - pat.len())
+        .filter_map(|i| {
+            let window = &tchars[i..i + pat.len()];
+            window
+                .iter()
+                .map(|(_, c)| normalize_punct(*c))
+                .eq(pat.iter().copied())
+                .then(|| {
+                    (
+                        window[0].0,
+                        window.iter().map(|(_, c)| c).collect::<String>(),
+                    )
+                })
+        })
+        .take(6)
+        .collect();
+    match matches.as_slice() {
+        [] => NormalizedMatch::NotFound,
+        [(_, found)] => NormalizedMatch::Unique(found.clone()),
+        _ => NormalizedMatch::Ambiguous(
+            matches
+                .into_iter()
+                .map(|(at, found)| MatchCandidate {
+                    at,
+                    len: found.len(),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -900,24 +926,35 @@ fn find_ws_normalized(text: &str, old: &str) -> NormalizedMatch {
         return NormalizedMatch::NotFound;
     }
     let include_trailing = old.ends_with('\n');
-    let mut matches = (0..=lines.len() - m).filter_map(|w| {
-        let matched = (0..m).all(|k| lines[w + k].3 == old_keys[k]);
-        if !matched {
-            return None;
-        }
-        let start = lines[w].0;
-        let (last_off, last_content, last_len, _) = lines[w + m - 1];
-        let end = if include_trailing {
-            last_off + last_len
-        } else {
-            last_off + last_content.len()
-        };
-        Some(text[start..end].to_string())
-    });
-    match (matches.next(), matches.next()) {
-        (None, _) => NormalizedMatch::NotFound,
-        (Some(found), None) => NormalizedMatch::Unique(found),
-        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    let matches: Vec<(usize, String)> = (0..=lines.len() - m)
+        .filter_map(|w| {
+            let matched = (0..m).all(|k| lines[w + k].3 == old_keys[k]);
+            if !matched {
+                return None;
+            }
+            let start = lines[w].0;
+            let (last_off, last_content, last_len, _) = lines[w + m - 1];
+            let end = if include_trailing {
+                last_off + last_len
+            } else {
+                last_off + last_content.len()
+            };
+            Some((start, text[start..end].to_string()))
+        })
+        .take(6)
+        .collect();
+    match matches.as_slice() {
+        [] => NormalizedMatch::NotFound,
+        [(_, found)] => NormalizedMatch::Unique(found.clone()),
+        _ => NormalizedMatch::Ambiguous(
+            matches
+                .into_iter()
+                .map(|(at, found)| MatchCandidate {
+                    at,
+                    len: found.len(),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -954,18 +991,29 @@ fn find_reflow_normalized(text: &str, old: &str) -> NormalizedMatch {
     }
     // Slide char-by-char, comparing without allocating; only a hit materializes
     // the original substring (same shape as `find_punct_normalized`).
-    let mut matches = (0..=haystack.len() - m).filter_map(|i| {
-        if !(0..m).all(|k| haystack[i + k].0 == needle[k]) {
-            return None;
-        }
-        let start = haystack[i].1;
-        let (_, last_start, last_len) = haystack[i + m - 1];
-        Some(text[start..last_start + last_len].to_string())
-    });
-    match (matches.next(), matches.next()) {
-        (None, _) => NormalizedMatch::NotFound,
-        (Some(found), None) => NormalizedMatch::Unique(found),
-        (Some(_), Some(_)) => NormalizedMatch::Ambiguous,
+    let matches: Vec<(usize, String)> = (0..=haystack.len() - m)
+        .filter_map(|i| {
+            if !(0..m).all(|k| haystack[i + k].0 == needle[k]) {
+                return None;
+            }
+            let start = haystack[i].1;
+            let (_, last_start, last_len) = haystack[i + m - 1];
+            Some((start, text[start..last_start + last_len].to_string()))
+        })
+        .take(6)
+        .collect();
+    match matches.as_slice() {
+        [] => NormalizedMatch::NotFound,
+        [(_, found)] => NormalizedMatch::Unique(found.clone()),
+        _ => NormalizedMatch::Ambiguous(
+            matches
+                .into_iter()
+                .map(|(at, found)| MatchCandidate {
+                    at,
+                    len: found.len(),
+                })
+                .collect(),
+        ),
     }
 }
 
@@ -988,22 +1036,74 @@ fn dominant_line_ending(text: &str) -> &'static str {
     }
 }
 
+const MAX_EDIT_CANDIDATES: usize = 5;
+const CANDIDATE_CONTEXT_LINES: usize = 2;
+const MAX_CANDIDATE_LINE_CHARS: usize = 120;
+
+/// Show a small, line-numbered window around each rejected exact occurrence.
+/// The model still has to submit a unique `old_string`; line numbers are
+/// evidence for disambiguation, never an alternate edit addressing scheme.
 fn occurrence_help(text: &str, needle: &str, limit: usize) -> Vec<String> {
-    text.match_indices(needle)
+    let candidates = text
+        .match_indices(needle)
         .take(limit)
-        .map(|(byte, _)| {
-            let line = text[..byte].bytes().filter(|b| *b == b'\n').count() + 1;
-            let body = text[byte..]
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .chars()
-                .take(160)
-                .collect::<String>();
-            format!("  line {line}: {body}")
+        .map(|(at, _)| MatchCandidate {
+            at,
+            len: needle.len(),
         })
-        .collect()
+        .collect::<Vec<_>>();
+    candidate_help(text, &candidates)
+}
+
+fn candidate_help(text: &str, candidates: &[MatchCandidate]) -> Vec<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut rendered: Vec<String> = candidates
+        .iter()
+        .take(MAX_EDIT_CANDIDATES)
+        .enumerate()
+        .map(|(index, candidate)| {
+            let start_line = text[..candidate.at].bytes().filter(|b| *b == b'\n').count() + 1;
+            let matched_lines = text[candidate.at..candidate.at + candidate.len]
+                .lines()
+                .count()
+                .max(1);
+            let end_line = start_line + matched_lines - 1;
+            let first = start_line.saturating_sub(CANDIDATE_CONTEXT_LINES + 1);
+            let last = (end_line + CANDIDATE_CONTEXT_LINES).min(lines.len());
+            let window = lines[first..last]
+                .iter()
+                .enumerate()
+                .map(|(offset, line)| {
+                    format!("{:>6}\t{}", first + offset + 1, candidate_line(line))
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            let range = if start_line == end_line {
+                format!("line {start_line}")
+            } else {
+                format!("lines {start_line}–{end_line}")
+            };
+            format!("  candidate {} ({range}):\n{window}", index + 1)
+        })
+        .collect();
+    if candidates.len() > MAX_EDIT_CANDIDATES {
+        rendered.push(format!(
+            "  … {} additional candidate matches omitted",
+            candidates.len() - MAX_EDIT_CANDIDATES
+        ));
+    }
+    rendered
+}
+
+fn candidate_line(line: &str) -> String {
+    let mut clipped = line
+        .chars()
+        .take(MAX_CANDIDATE_LINE_CHARS)
+        .collect::<String>();
+    if line.chars().nth(MAX_CANDIDATE_LINE_CHARS).is_some() {
+        clipped.push('…');
+    }
+    clipped
 }
 
 /// Self-healing "old_string not found": locate the closest region so the
@@ -1179,7 +1279,12 @@ fn rate_limits_from() {
     fn edit_fallback_rejects_ambiguous_whitespace_matches() {
         let text = "fn f() {\n\treturn 1;\n}\n\nfn f() {\n    return 1;\n}\n";
         let old = "fn f() {\n  return 1;\n}\n";
-        assert!(matches!(replacement_plan(text, old, "x"), Err(())));
+        let Err(candidates) = replacement_plan(text, old, "x") else {
+            panic!("expected ambiguous match");
+        };
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].at, text.find("fn f").unwrap());
+        assert!(candidate_help(text, &candidates)[0].contains("candidate 1"));
     }
 
     #[test]
@@ -1238,7 +1343,7 @@ fn c() {
 }
 ";
         let old = "assert_eq!(a, b);";
-        assert!(matches!(replacement_plan(text, old, "x"), Err(())));
+        assert!(matches!(replacement_plan(text, old, "x"), Err(_)));
     }
 
     #[test]
@@ -1315,13 +1420,27 @@ assert_eq!(
     }
 
     #[test]
-    fn edit_occurrences_use_actual_match_line_not_first_probe_line() {
-        let text = "header\nalpha\nbeta\nalpha\nbeta\n";
-        let needle = "alpha\nbeta\n";
-        assert_eq!(
-            occurrence_help(text, needle, 8),
-            vec!["  line 2: alpha", "  line 4: alpha"]
-        );
+    fn edit_occurrences_show_bounded_line_numbered_context() {
+        let text = "header\nfirst section\nalpha\nbeta\nsecond section\nalpha\nbeta\nfooter\n";
+        let candidates = occurrence_help(text, "alpha\nbeta\n", 8);
+
+        assert_eq!(candidates.len(), 2);
+        assert!(candidates[0].contains("candidate 1 (lines 3–4):"));
+        assert!(candidates[0].contains("     2\tfirst section"));
+        assert!(candidates[1].contains("candidate 2 (lines 6–7):"));
+        assert!(candidates[1].contains("     5\tsecond section"));
+    }
+
+    #[test]
+    fn edit_occurrence_help_marks_additional_candidates_as_omitted() {
+        let text = "match\n".repeat(MAX_EDIT_CANDIDATES + 1);
+        let candidates = occurrence_help(&text, "match\n", MAX_EDIT_CANDIDATES + 1);
+
+        assert_eq!(candidates.len(), MAX_EDIT_CANDIDATES + 1);
+        assert!(candidates
+            .last()
+            .unwrap()
+            .contains("1 additional candidate matches omitted"));
     }
 
     #[tokio::test]

@@ -366,7 +366,64 @@ impl Transcript {
         block.head = head;
         block.detail = None;
         block.entry = None;
-        block.rewrap(self.width, self.hovered == Some(index));
+        self.remeasure(index, old_height);
+    }
+
+    /// Extend the last head line of an existing block — a tool-result
+    /// preview landing on the call's own header row at `ToolEnd`.
+    pub fn extend_head(&mut self, index: usize, spans: Vec<Span<'static>>) {
+        if spans.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        if let Content::Lines(lines) = &mut self.blocks[index].head {
+            if let Some(last) = lines.last_mut() {
+                last.spans.extend(spans);
+            }
+        }
+        self.remeasure(index, old_height);
+    }
+
+    /// Retro-fit a collapsed body onto an existing block: a live tool
+    /// record pushes its header at `ToolStart` and only learns its output
+    /// at `ToolEnd`. The hover and fold affordances land on the header
+    /// row itself — no separate result row.
+    pub fn attach_detail(&mut self, index: usize, detail: Vec<Line<'static>>, view_rows: usize) {
+        self.attach_detail_content(index, Content::Lines(detail), view_rows);
+    }
+
+    pub fn attach_markdown_detail(
+        &mut self,
+        index: usize,
+        document: crate::markdown::Document,
+        prefix: Vec<Span<'static>>,
+        view_rows: usize,
+    ) {
+        self.attach_detail_content(index, Content::Markdown { document, prefix }, view_rows);
+    }
+
+    fn attach_detail_content(&mut self, index: usize, detail: Content, view_rows: usize) {
+        if detail.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        self.blocks[index].detail = Some(Detail {
+            content: detail,
+            lines: Vec::new(),
+            wrapped: Wrapped::default(),
+            open: false,
+            scroll: 0,
+            view_rows: view_rows.max(1),
+        });
+        self.remeasure(index, old_height);
+    }
+
+    /// Recompute layout after a block mutated in place, preserving a
+    /// scrolled-up reader's position exactly like `push_block` does.
+    fn remeasure(&mut self, index: usize, old_height: usize) {
+        let hovered = self.hovered == Some(index);
+        let block = &mut self.blocks[index];
+        block.rewrap(self.width, hovered);
         let new_height = block.height();
         if self.scroll > 0 {
             if new_height >= old_height {
@@ -1242,6 +1299,37 @@ mod tests {
         t.render(&mut buf, area);
         assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn results_attach_to_the_already_baked_call_row() {
+        let mut t = Transcript::new(40);
+        t.push(vec![Line::raw("● Read app.rs")]);
+        // ToolEnd lands: preview rides on the header row, output folds
+        // under it — no separate `⎿` row appears.
+        t.extend_head(0, vec![Span::raw(" — 3 lines")]);
+        t.attach_detail(
+            0,
+            (0..3).map(|i| Line::raw(format!("out {i}"))).collect(),
+            5,
+        );
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        assert_eq!(t.total(), 1, "closed detail keeps the record one row");
+        assert!(buffer_text(&buf, area).contains("● Read app.rs — 3 lines"));
+
+        // Hover advertises the fold on the call row itself; click opens it.
+        t.mouse_moved(0, 0);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        assert!(buffer_text(&buf, area).contains("▸ 3 lines"));
+        t.mouse_down(0, 0);
+        t.mouse_up();
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        let text = buffer_text(&buf, area);
+        assert!(text.contains("out 0") && text.contains("out 2"));
     }
 
     #[test]

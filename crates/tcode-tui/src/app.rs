@@ -58,12 +58,28 @@ const PASTE_FOLD_LINES: usize = 15;
 /// Long one-line pastes should not make the editor visibly type character by
 /// character. They are sent as a text attachment instead.
 const PASTE_FOLD_CHARS: usize = 1_000;
-/// A calm, low-contrast alternative to the legacy sparkle animation.
-const CALM_SPINNER: [(&str, ratatui::style::Color); 4] = [
-    (".", theme::DIM),
-    ("o", theme::DIM),
-    ("O", theme::DIM),
-    ("o", theme::DIM),
+/// Braille spinner drawn in the accent colour: visibly alive without the
+/// bulk or flicker of the legacy sparkle animation.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Half-block wordmark for the welcome banner. Both rows must stay the
+/// same character length: the gradient is per-column and the version tag
+/// hangs off the second row.
+const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " █  █▄▄ █▄█ █▄▀ ██▄"];
+
+/// One of these shows per launch, picked at random: a discovery channel
+/// for features nobody reads /help for. Every entry must describe real,
+/// current behaviour — stale tips are worse than none.
+const TIPS: [&str; 9] = [
+    "shift+tab cycles permission modes",
+    "esc esc rewinds the conversation · ctrl+r also restores files",
+    "ctrl+c stops the turn and sends queued prompts right away — it never exits",
+    "type while a turn runs: the prompt queues and esc takes it back",
+    "→ accepts the dim suggestion in the input box",
+    "/model switches model mid-session · /agents pins sub-agent models",
+    "/resume picks up an earlier session · /export saves the transcript",
+    "/compact squeezes a long conversation back into budget",
+    "/note slips the model an aside without starting a turn",
 ];
 
 /// Commands whose substance drives frontend-owned objects (key table, model
@@ -204,6 +220,10 @@ struct PendingCall {
     /// baking every item first and every result after. Empty for single calls
     /// (their header is baked at `ToolStart`).
     header: Vec<Line<'static>>,
+    /// A single bare call's already-baked `●` header block: its result
+    /// attaches to that very row at `ToolEnd` instead of opening a
+    /// separate `⎿` row. None for batch items and body-carrying calls.
+    header_index: Option<usize>,
 }
 
 /// A tool call recovered from the ledger during replay, with the batch it
@@ -219,13 +239,32 @@ struct ReplayBatch {
     header: Option<String>,
     /// Several tools in one batch: tag each item with its tool name.
     mixed: bool,
+    /// The batch's final call closes the tree with `└` instead of `├`.
+    last: bool,
+}
+
+/// Tree glyphs opening each batch item row; the final row closes the tree.
+const BATCH_ITEM_GLYPH: &str = "  ├ ";
+const BATCH_TAIL_GLYPH: &str = "  └ ";
+
+/// Where a result's call record lives, shared by live `ToolEnd` and
+/// replay. The three cases are mutually exclusive by construction.
+enum CallRecord {
+    /// A batch item: its deferred `├ summary` lines bake with the result.
+    Batch(Vec<Line<'static>>),
+    /// A bare single call: its `●` header block is already in the
+    /// transcript and the result attaches to that very row.
+    HeaderBlock(usize),
+    /// Header (plus diff/command body) fully baked; the result stands alone.
+    Baked,
 }
 
 /// One tool result's rendering, shared by live `ToolEnd` and replay.
 enum ResultRender {
     /// The call site already told the story (successful edit/write diff).
     Nothing,
-    /// A single `⎿ preview` row.
+    /// A one-line preview and nothing more: it rides on the call's own
+    /// row when there is one, or renders as a `⎿ preview` row.
     Inline(Line<'static>),
     /// A head row carrying the fold affordance plus the collapsed body.
     Foldable {
@@ -658,7 +697,7 @@ impl App {
                 }
                 _ = tick.tick() => {
                     if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
-                        self.spinner = (self.spinner + 1) % CALM_SPINNER.len();
+                        self.spinner = (self.spinner + 1) % SPINNER.len();
                     }
                 }
                 _ = drag_tick.tick(), if self.drag_scroll.is_some() => {
@@ -679,33 +718,36 @@ impl App {
         self.session.take()
     }
 
-    /// Welcome box, Claude Code style: identity, model, cwd.
+    /// Welcome block: gradient logo, model, cwd, one rotating tip.
+    /// Frameless on purpose — whitespace does the framing, and there is
+    /// no box-width arithmetic to break on narrow terminals.
     fn banner(&self) -> Vec<Line<'static>> {
         use unicode_width::UnicodeWidthStr;
         let model = self.agent.model.snapshot();
-        let title = format!("✻ tcode v{}", env!("CARGO_PKG_VERSION"));
-        let rows = [
-            format!("model  {} · {}", model.provider.name(), model.describe()),
-            {
-                let cwd = self
-                    .session
-                    .as_ref()
-                    .map(|s| s.tool_ctx.cwd.display().to_string())
-                    .unwrap_or_default();
-                let home = std::env::var("HOME")
-                    .or_else(|_| std::env::var("USERPROFILE"))
-                    .unwrap_or_default();
-                let cwd = match (home.is_empty(), cwd.strip_prefix(&home)) {
-                    (false, Some(rest)) => format!("~{rest}"),
-                    _ => cwd,
-                };
-                format!("cwd    {cwd}")
-            },
-        ];
-        // Fit inside the terminal; overly long rows (deep cwd) keep
-        // their tail, which is the informative end of a path.
+        let version = format!("v{}", env!("CARGO_PKG_VERSION"));
         let term_w = self.terminal.size().map(|s| s.width).unwrap_or(80) as usize;
-        let max_content = term_w.saturating_sub(6).max(20);
+
+        let mut out = vec![Line::default()];
+        // Half-block wordmark, two rows of equal length so the gradient
+        // columns line up. Too-narrow terminals fall back to plain text
+        // rather than letting the blocks soft-wrap into noise.
+        if term_w > LOGO[0].width() + 4 {
+            out.push(Line::from(theme::logo_gradient(&format!(" {}", LOGO[0]))));
+            let mut bottom = theme::logo_gradient(&format!(" {}", LOGO[1]));
+            bottom.push(Span::styled(format!("  {version}"), theme::dim()));
+            out.push(Line::from(bottom));
+        } else {
+            out.push(Line::from(vec![
+                Span::styled(" ✻ ".to_string(), theme::accent()),
+                Span::styled("tcode".to_string(), theme::user_prompt()),
+                Span::styled(format!(" {version}"), theme::dim()),
+            ]));
+        }
+        out.push(Line::default());
+
+        // Overly long values (deep cwd) keep their tail, which is the
+        // informative end of a path.
+        let max_content = term_w.saturating_sub(11).max(20);
         let clip = |s: &str| -> String {
             if s.width() <= max_content {
                 return s.to_string();
@@ -723,40 +765,43 @@ impl App {
                 .collect();
             format!("…{tail}")
         };
-        let title = clip(&title);
-        let rows: Vec<String> = rows.iter().map(|r| clip(r)).collect();
-        let width = rows
-            .iter()
-            .map(|r| r.width())
-            .chain([title.width()])
-            .max()
-            .unwrap_or(0);
-        let pad = |s: &str| " ".repeat(width.saturating_sub(s.width()));
-        let mut out = vec![Line::from(vec![Span::styled(
-            format!("╭{}╮", "─".repeat(width + 2)),
-            theme::border(),
-        )])];
-        out.push(Line::from(vec![
-            Span::styled("│ ".to_string(), theme::border()),
-            Span::styled(title.clone(), theme::user_prompt()),
-            Span::raw(format!("{} ", pad(&title))),
-            Span::styled("│".to_string(), theme::border()),
-        ]));
-        for row in &rows {
+        let cwd = {
+            let cwd = self
+                .session
+                .as_ref()
+                .map(|s| s.tool_ctx.cwd.display().to_string())
+                .unwrap_or_default();
+            let home = std::env::var("HOME")
+                .or_else(|_| std::env::var("USERPROFILE"))
+                .unwrap_or_default();
+            match (home.is_empty(), cwd.strip_prefix(&home)) {
+                (false, Some(rest)) => format!("~{rest}"),
+                _ => cwd,
+            }
+        };
+        let rows = [
+            (
+                "model",
+                format!("{} · {}", model.provider.name(), model.describe()),
+            ),
+            ("cwd", cwd),
+        ];
+        for (label, value) in rows {
             out.push(Line::from(vec![
-                Span::styled("│ ".to_string(), theme::border()),
-                Span::styled(format!("{row}{} ", pad(row)), theme::dim()),
-                Span::styled("│".to_string(), theme::border()),
+                Span::styled(format!("  {label:<6} "), theme::dim()),
+                Span::raw(clip(&value)),
             ]));
         }
-        out.push(Line::styled(
-            format!("╰{}╯", "─".repeat(width + 2)),
-            theme::border(),
-        ));
-        out.push(Line::styled(
-            "  /help commands · /model switch model · shift+tab permission mode",
-            theme::dim(),
-        ));
+        out.push(Line::default());
+
+        let tip = TIPS[std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.subsec_nanos() as usize)
+            % TIPS.len()];
+        out.push(Line::from(vec![
+            Span::styled("  ✻ ".to_string(), theme::accent()),
+            Span::styled(clip(&format!("tip: {tip}")), theme::dim()),
+        ]));
         out.push(Line::default());
         out
     }
@@ -841,10 +886,12 @@ impl App {
                         .collect::<HashSet<_>>()
                         .len()
                         > 1;
+                    let group_len = group.len();
                     for (index, (id, name, input)) in group.into_iter().enumerate() {
                         let batch = label.as_ref().map(|label| ReplayBatch {
                             header: (index == 0).then(|| label.clone()),
                             mixed,
+                            last: index + 1 == group_len,
                         });
                         calls.insert(id, ReplayCall { name, input, batch });
                     }
@@ -931,20 +978,27 @@ impl App {
                         self.transcript.push(std::mem::take(&mut lines));
                         // Bake this call's header (+ diff / command block)
                         // right above its own result.
-                        let mut batch_header = Vec::new();
-                        if let Some(call) = call {
-                            match &call.batch {
+                        let record = match call {
+                            Some(call) => match &call.batch {
                                 Some(batch) => {
                                     if let Some(label) = &batch.header {
                                         let header = self.batch_header_lines(label);
                                         self.bake(header);
                                     }
-                                    batch_header =
-                                        self.batch_item_lines(name, &call.input, batch.mixed);
+                                    CallRecord::Batch(self.batch_item_lines(
+                                        name,
+                                        &call.input,
+                                        batch.mixed,
+                                        batch.last,
+                                    ))
                                 }
-                                None => self.bake_call_start(name, &call.input),
-                            }
-                        }
+                                None => match self.bake_call_start(name, &call.input) {
+                                    Some(index) => CallRecord::HeaderBlock(index),
+                                    None => CallRecord::Baked,
+                                },
+                            },
+                            None => CallRecord::Baked,
+                        };
                         let preview = result_preview(content);
                         self.bake_call_result(
                             name,
@@ -952,7 +1006,7 @@ impl App {
                             &preview,
                             content,
                             *is_error,
-                            batch_header,
+                            record,
                         );
                     }
                 }
@@ -1317,7 +1371,8 @@ impl App {
                 for (name, input) in calls {
                     self.pending_batch.push_back(PendingCall {
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                        header: self.batch_item_lines(&name, &input, mixed),
+                        header: self.batch_item_lines(&name, &input, mixed, false),
+                        header_index: None,
                     });
                 }
                 self.state_label = format!("running: {label}");
@@ -1353,16 +1408,19 @@ impl App {
                     self.state_label = format!("running: {summary}");
                     return;
                 }
-                self.pending_tool = Some(PendingCall {
-                    detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                    header: Vec::new(),
-                });
                 // If this call's diff was already baked in full while its
                 // approval dialog was open, keep that block — don't render a
                 // second, capped copy.
-                if self.change_prebake.take().is_none() {
-                    self.bake_call_start(&name, &input);
-                }
+                let header_index = if self.change_prebake.take().is_none() {
+                    self.bake_call_start(&name, &input)
+                } else {
+                    None
+                };
+                self.pending_tool = Some(PendingCall {
+                    detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
+                    header: Vec::new(),
+                    header_index,
+                });
                 self.state_label = format!("running: {summary}");
             }
             AgentEvent::ToolEnd {
@@ -1385,31 +1443,42 @@ impl App {
                     self.state_label = "responding".into();
                     return;
                 }
-                let entry = self
-                    .pending_tool
-                    .take()
-                    .or_else(|| self.pending_batch.pop_front());
+                let (entry, closes_batch) = match self.pending_tool.take() {
+                    Some(entry) => (Some(entry), false),
+                    None => {
+                        let entry = self.pending_batch.pop_front();
+                        let closes = entry.is_some() && self.pending_batch.is_empty();
+                        (entry, closes)
+                    }
+                };
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
-                let (input, batch_header): (Option<serde_json::Value>, Vec<Line<'static>>) =
-                    if let Some(entry) = entry {
-                        (serde_json::from_str(&entry.detail).ok(), entry.header)
-                    } else {
-                        (None, Vec::new())
-                    };
+                let (input, record) = match entry {
+                    Some(entry) => {
+                        let record = match entry.header_index {
+                            Some(index) => CallRecord::HeaderBlock(index),
+                            None if !entry.header.is_empty() => {
+                                let mut header = entry.header;
+                                if closes_batch {
+                                    mark_batch_tail(&mut header);
+                                }
+                                CallRecord::Batch(header)
+                            }
+                            None => CallRecord::Baked,
+                        };
+                        (
+                            serde_json::from_str::<serde_json::Value>(&entry.detail).ok(),
+                            record,
+                        )
+                    }
+                    None => (None, CallRecord::Baked),
+                };
                 // The gated result is exactly what is appended to the next
                 // model request, so it belongs in the in-between estimate.
                 self.context_tokens = self
                     .context_tokens
                     .saturating_add(approx_tokens(&content) as u64);
-                self.bake_call_result(
-                    &name,
-                    input.as_ref(),
-                    &preview,
-                    &content,
-                    is_error,
-                    batch_header,
-                );
+                self.bake_call_result(&name, input.as_ref(), &preview, &content, is_error, record);
                 self.state_label = "responding".into();
             }
             AgentEvent::ReferencesExpanded {
@@ -1862,13 +1931,22 @@ impl App {
     /// Bake a single call's `●` block. The blank row above (and, when the
     /// call carries a diff or command block, the one below) is what keeps
     /// consecutive calls from running together — live and replayed alike.
-    fn bake_call_start(&mut self, name: &str, input: &serde_json::Value) {
-        let mut lines = vec![Line::default()];
-        lines.extend(self.call_lines(name, input));
-        if lines.len() > 2 {
-            lines.push(Line::default());
+    ///
+    /// A bare header (no diff, no command block) becomes its own transcript
+    /// block and its index is returned: the result attaches to that very
+    /// row at `ToolEnd`, so hover and fold live on the tool line itself
+    /// instead of a separate `⎿` row beneath it.
+    fn bake_call_start(&mut self, name: &str, input: &serde_json::Value) -> Option<usize> {
+        let mut lines = self.call_lines(name, input);
+        self.bake(vec![Line::default()]);
+        if lines.len() == 1 {
+            let index = self.transcript.block_count();
+            self.bake(lines);
+            return Some(index);
         }
+        lines.push(Line::default());
         self.bake(lines);
+        None
     }
 
     /// The `● label` row opening a batch, with its separating blank above.
@@ -1881,15 +1959,24 @@ impl App {
     /// One batch item's `├ summary` row (plus any diff). Baked not here but
     /// at the item's own result, so each call sits above its own output. A
     /// change body gets a trailing separator, otherwise adjacent file diffs
-    /// would visually merge into one block.
+    /// would visually merge into one block. `last` closes the tree with `└`;
+    /// the live path passes false and patches the final row when it bakes
+    /// (items land in completion order, so the last baked row is always the
+    /// bottom one).
     fn batch_item_lines(
         &self,
         name: &str,
         input: &serde_json::Value,
         mixed: bool,
+        last: bool,
     ) -> Vec<Line<'static>> {
         let renderer = self.renderers.get(name);
-        let mut row = vec![Span::raw("  ├ ")];
+        let glyph = if last {
+            BATCH_TAIL_GLYPH
+        } else {
+            BATCH_ITEM_GLYPH
+        };
+        let mut row = vec![Span::styled(glyph, theme::dim())];
         if mixed {
             // Keep per-item tool tags subdued: the batch header is where
             // display names get title-cased and highlighted.
@@ -1908,11 +1995,11 @@ impl App {
         lines
     }
 
-    /// Bake one call's result, shared by live `ToolEnd` and replay.
-    /// `batch_header` is the item's deferred `├ summary` block when the call
-    /// belongs to a batch, empty for a single call (whose header is already
-    /// baked). The head row carries the fold affordance: for a batch item
-    /// that is the `├` row, for a single call the `⎿ preview` row.
+    /// Bake one call's result, shared by live `ToolEnd` and replay. The
+    /// result lands on the call's own row whenever there is one — preview
+    /// appended, fold affordance on hover — so no record spends an extra
+    /// line on a lone connector glyph. Only `Baked` records (a diff or
+    /// command block between header and output) keep the `⎿ preview` row.
     fn bake_call_result(
         &mut self,
         name: &str,
@@ -1920,7 +2007,7 @@ impl App {
         preview: &str,
         content: &str,
         is_error: bool,
-        mut batch_header: Vec<Line<'static>>,
+        record: CallRecord,
     ) {
         let style = if is_error {
             ratatui::style::Style::default().fg(theme::ERROR)
@@ -1929,31 +2016,56 @@ impl App {
         };
         match self.result_render(name, input, preview, content, is_error) {
             ResultRender::Nothing => {
-                if !batch_header.is_empty() {
-                    self.bake(batch_header);
+                if let CallRecord::Batch(header) = record {
+                    self.bake(header);
                 }
             }
-            ResultRender::Inline(line) => {
-                if batch_header.is_empty() {
-                    self.bake(vec![line]);
-                } else {
-                    append_result_preview(&mut batch_header, preview, style);
-                    self.bake(batch_header);
+            ResultRender::Inline(line) => match record {
+                CallRecord::HeaderBlock(index) => self
+                    .transcript
+                    .extend_head(index, preview_tail(preview, style)),
+                CallRecord::Batch(mut header) => {
+                    append_result_preview(&mut header, preview, style);
+                    self.bake(header);
                 }
-            }
+                CallRecord::Baked => self.bake(vec![line]),
+            },
             ResultRender::Foldable { head, detail } => {
-                if batch_header.is_empty() {
-                    self.push_result_detail(head, detail);
-                } else {
-                    // Batch items already have a compact `├ summary` row. Hang
-                    // the fold affordance off that row instead of adding a
-                    // separate `⎿  ▸ N lines` line beneath every item.
-                    if is_error || !self.renderers.get(name).quiet_output() {
-                        append_result_preview(&mut batch_header, preview, style);
+                // Quiet tools (read/grep/glob) skip the preview: the fold
+                // affordance already states the line count on hover.
+                let quiet = !is_error && self.renderers.get(name).quiet_output();
+                match record {
+                    CallRecord::HeaderBlock(index) => {
+                        if !quiet {
+                            self.transcript
+                                .extend_head(index, preview_tail(preview, style));
+                        }
+                        self.attach_result_detail(index, detail);
                     }
-                    self.push_result_detail(batch_header, detail);
+                    CallRecord::Batch(mut header) => {
+                        if !quiet {
+                            append_result_preview(&mut header, preview, style);
+                        }
+                        self.push_result_detail(header, detail);
+                    }
+                    CallRecord::Baked => self.push_result_detail(head, detail),
                 }
             }
+        }
+    }
+
+    fn attach_result_detail(&mut self, index: usize, detail: ResultDetail) {
+        match detail {
+            ResultDetail::Lines(lines) => {
+                self.transcript
+                    .attach_detail(index, lines, OUTPUT_VIEW_ROWS)
+            }
+            ResultDetail::Markdown(document) => self.transcript.attach_markdown_detail(
+                index,
+                document,
+                vec![Span::styled("  │ ", theme::dim())],
+                OUTPUT_VIEW_ROWS,
+            ),
         }
     }
 
@@ -3882,7 +3994,7 @@ impl App {
                 y += 1;
             }
 
-            frame.render_widget(Paragraph::new(Line::styled(hint, theme::dim())), row(y, 1));
+            frame.render_widget(Paragraph::new(hint), row(y, 1));
         })?;
         self.input_hitbox = captured_input;
         Ok(())
@@ -3916,12 +4028,9 @@ impl App {
             ]);
         }
         let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
-        let (frame, color) = CALM_SPINNER[self.spinner % CALM_SPINNER.len()];
+        let frame = SPINNER[self.spinner % SPINNER.len()];
         Line::from(vec![
-            Span::styled(
-                format!("{frame} "),
-                ratatui::style::Style::default().fg(color),
-            ),
+            Span::styled(format!("{frame} "), theme::accent()),
             Span::styled(self.state_label.clone(), theme::accent()),
             Span::styled(
                 format!(
@@ -3933,15 +4042,24 @@ impl App {
         ])
     }
 
-    /// Dim one-liner under the input box: mode, model, cache health.
-    fn idle_hint(&self) -> String {
+    /// One-liner under the input box: mode, model, cache health. Mostly
+    /// dim; the mode value carries the accent because it decides what the
+    /// agent may do without asking, and a transient notice keeps the
+    /// default foreground so it reads as news rather than furniture.
+    fn idle_hint(&self) -> Line<'static> {
         if let Some(nav) = &self.rewind_nav {
             let files = if nav.candidates[nav.pos].dirty {
                 " · ctrl+r rewind + restore files"
             } else {
                 ""
             };
-            return format!("  ↺ rewind: enter confirm{files} · esc/↑ older · ↓ newer/exit");
+            return Line::from(vec![
+                Span::styled("  ↺ rewind:".to_string(), theme::accent()),
+                Span::styled(
+                    format!(" enter confirm{files} · esc/↑ older · ↓ newer/exit"),
+                    theme::dim(),
+                ),
+            ]);
         }
         let u = self.turn_usage;
         let cache = if u.total_input() > 0 {
@@ -3957,24 +4075,33 @@ impl App {
         } else {
             " · ↑ viewing history"
         };
-        let notice = self
+        let mut spans = vec![
+            Span::styled("  mode ".to_string(), theme::dim()),
+            Span::styled(self.mode_label.clone(), theme::accent()),
+            Span::styled(
+                format!(" · {}", self.agent.model.snapshot().describe()),
+                theme::dim(),
+            ),
+        ];
+        // A mode that silently changes what the model does must be visible
+        // while it is on, not only in the line that switched it on.
+        if self.dogfood {
+            spans.push(Span::styled(
+                " · dogfood".to_string(),
+                ratatui::style::Style::default().fg(theme::WARN),
+            ));
+        }
+        spans.push(Span::styled(format!("{cache}{scrolled}"), theme::dim()));
+        if let Some((text, _)) = self
             .notice
             .as_ref()
             .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
-            .map(|(text, _)| format!(" · {text}"))
-            .unwrap_or_default();
-        // A mode that silently changes what the model does must be visible
-        // while it is on, not only in the line that switched it on.
-        let dogfood = if self.dogfood { " · dogfood" } else { "" };
-        format!(
-            "  mode {} · {}{}{}{}{} · /help",
-            self.mode_label,
-            self.agent.model.snapshot().describe(),
-            dogfood,
-            cache,
-            scrolled,
-            notice
-        )
+        {
+            spans.push(Span::styled(" · ".to_string(), theme::dim()));
+            spans.push(Span::raw(text.clone()));
+        }
+        spans.push(Span::styled(" · /help".to_string(), theme::dim()));
+        Line::from(spans)
     }
 }
 
@@ -3992,19 +4119,37 @@ fn visible_phase_range(phases: &[ProgressPhase], max_visible: usize) -> (usize, 
     (start, start + max_visible)
 }
 
+/// The final item baked for a batch closes the tree: swap its `├` for a
+/// `└`. Items bake in completion order, so the last one popped is always
+/// the bottom row however the batch was listed.
+fn mark_batch_tail(header: &mut [Line<'static>]) {
+    if let Some(span) = header.first_mut().and_then(|line| line.spans.first_mut()) {
+        if span.content == BATCH_ITEM_GLYPH {
+            span.content = BATCH_TAIL_GLYPH.into();
+        }
+    }
+}
+
+/// A result preview riding on its call's own row: ` — preview`, dim on
+/// success, red on failure. One format for batch rows and single calls.
+fn preview_tail(preview: &str, style: ratatui::style::Style) -> Vec<Span<'static>> {
+    if preview.is_empty() {
+        return Vec::new();
+    }
+    vec![Span::styled(format!(" — {preview}"), style)]
+}
+
 fn append_result_preview(
     lines: &mut Vec<Line<'static>>,
     preview: &str,
     style: ratatui::style::Style,
 ) {
-    if preview.is_empty() {
-        return;
-    }
-    let span = Span::styled(format!("  ⎿ {preview}"), style);
-    if let Some(last) = lines.last_mut() {
-        last.spans.push(span);
-    } else {
-        lines.push(Line::from(vec![span]));
+    for span in preview_tail(preview, style) {
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(span);
+        } else {
+            lines.push(Line::from(vec![span]));
+        }
     }
 }
 
@@ -4051,23 +4196,6 @@ fn context_progress_line(
     let window = window.max(1);
     let pct = used.saturating_mul(100).saturating_div(window).min(100);
     let estimate_mark = if estimated { "≈" } else { "" };
-    let label = if terminal_width < 42 {
-        format!("  ctx {estimate_mark}{pct}% ")
-    } else {
-        format!(
-            "  context {estimate_mark}{pct}% · {}/{} ",
-            token_count(used),
-            token_count(window)
-        )
-    };
-    let bar_width = (terminal_width as usize)
-        .saturating_sub(label.len() + 2)
-        .clamp(6, 22);
-    let filled = if used == 0 {
-        0
-    } else {
-        ((bar_width as u64 * pct).div_ceil(100) as usize).min(bar_width)
-    };
     let color = if pct >= 95 {
         theme::ERROR
     } else if pct >= 85 {
@@ -4075,16 +4203,41 @@ fn context_progress_line(
     } else {
         theme::ACCENT
     };
-    Line::from(vec![
-        Span::styled(label, theme::dim()),
-        Span::styled("▕", ratatui::style::Style::default().fg(color)),
+    let (label, bar_width) = if terminal_width < 42 {
+        ("  ctx ", 8usize)
+    } else {
+        ("  context ", 12usize)
+    };
+    let filled = if used == 0 {
+        0
+    } else {
+        ((bar_width as u64 * pct).div_ceil(100) as usize).min(bar_width)
+    };
+    let mut spans = vec![Span::styled(label, theme::dim())];
+    spans.extend(slim_bar(filled, bar_width, color));
+    spans.push(Span::styled(
+        format!(" {estimate_mark}{pct}%"),
+        ratatui::style::Style::default().fg(color),
+    ));
+    if terminal_width >= 42 {
+        spans.push(Span::styled(
+            format!(" · {}/{}", token_count(used), token_count(window)),
+            theme::dim(),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The slim gauge shared by the context meter and the rate-limit row:
+/// a heavy coloured run over a dim dashed track.
+fn slim_bar(filled: usize, width: usize, color: ratatui::style::Color) -> [Span<'static>; 2] {
+    [
         Span::styled(
-            "▰".repeat(filled),
+            "━".repeat(filled),
             ratatui::style::Style::default().fg(color),
         ),
-        Span::styled("▱".repeat(bar_width - filled), theme::dim()),
-        Span::styled("▏", ratatui::style::Style::default().fg(color)),
-    ])
+        Span::styled("╌".repeat(width.saturating_sub(filled)), theme::dim()),
+    ]
 }
 
 fn token_count(tokens: u64) -> String {
@@ -4108,37 +4261,22 @@ fn rate_limit_line_at(limits: tcode_core::RateLimits, now: u64) -> Line<'static>
     let primary_used = limits.primary.used_percent.clamp(0.0, 100.0);
     let filled = ((primary_used / 100.0) * 12.0).round() as usize;
     let color = usage_color(primary_used);
-    let mut spans = vec![
-        Span::styled("  Codex 5h used ", theme::dim()),
-        Span::styled("▕", ratatui::style::Style::default().fg(color)),
-        Span::styled(
-            "▰".repeat(filled),
-            ratatui::style::Style::default().fg(color),
-        ),
-        Span::styled("▱".repeat(12 - filled), theme::dim()),
-        Span::styled(
-            format!("▏ {primary_used:.0}%"),
-            ratatui::style::Style::default().fg(color),
-        ),
-    ];
+    let mut spans = vec![Span::styled("  Codex 5h ", theme::dim())];
+    spans.extend(slim_bar(filled, 12, color));
+    spans.push(Span::styled(
+        format!(" {primary_used:.0}%"),
+        ratatui::style::Style::default().fg(color),
+    ));
     append_reset_countdown(&mut spans, limits.primary.resets_at, now);
 
     if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 65.0) {
         let weekly_used = weekly.used_percent.clamp(0.0, 100.0);
         let weekly_filled = ((weekly_used / 100.0) * 12.0).round() as usize;
         let weekly_color = usage_color(weekly_used);
-        spans.push(Span::styled(" · week used ", theme::dim()));
+        spans.push(Span::styled(" · week ", theme::dim()));
+        spans.extend(slim_bar(weekly_filled, 12, weekly_color));
         spans.push(Span::styled(
-            "▕",
-            ratatui::style::Style::default().fg(weekly_color),
-        ));
-        spans.push(Span::styled(
-            "▰".repeat(weekly_filled),
-            ratatui::style::Style::default().fg(weekly_color),
-        ));
-        spans.push(Span::styled("▱".repeat(12 - weekly_filled), theme::dim()));
-        spans.push(Span::styled(
-            format!("▏ {weekly_used:.0}%"),
+            format!(" {weekly_used:.0}%"),
             ratatui::style::Style::default().fg(weekly_color),
         ));
         append_reset_countdown(&mut spans, weekly.resets_at, now);
@@ -4899,7 +5037,8 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert!(text.contains("context 85% · 170k/200k"));
+        assert!(text.contains("context"));
+        assert!(text.contains("85% · 170k/200k"));
         assert!(line
             .spans
             .iter()
@@ -4926,10 +5065,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(text.contains("Codex 5h used"));
-        assert!(text.contains("▏ 30% ↻ 1h20m"));
-        assert!(text.contains("week used ▕"));
-        assert!(text.contains("▏ 65% ↻ 3d"));
+        assert!(text.contains("Codex 5h"));
+        assert!(text.contains(" 30% ↻ 1h20m"));
+        assert!(text.contains("week "));
+        assert!(text.contains(" 65% ↻ 3d"));
     }
 
     #[test]
@@ -4960,7 +5099,7 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(!text.contains("week used"));
+        assert!(!text.contains("week"));
     }
 
     #[test]
