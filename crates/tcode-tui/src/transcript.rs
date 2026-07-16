@@ -835,21 +835,34 @@ impl Transcript {
 
 /// Characters of a wrapped row whose display cells intersect [from, to].
 fn row_slice(line: &Line<'_>, from: usize, to: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
+    use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     let mut cell = 0usize;
     let mut out = String::new();
+    // Wrapping materializes one span per character, so the rail is no longer
+    // one `USER_GUTTER` span here. Its marker and dedicated style still identify
+    // it; skip its fixed display width while retaining cells for hit testing.
+    let gutter_width = line
+        .spans
+        .first()
+        .filter(|span| {
+            span.content
+                .starts_with(crate::theme::USER_GUTTER.trim_end())
+                && span.style == crate::theme::user_gutter()
+        })
+        .map(|_| crate::theme::USER_GUTTER.width())
+        .unwrap_or(0);
     for span in &line.spans {
         for c in span.content.chars() {
             let width = c.width().unwrap_or(0);
             if width == 0 {
                 // Zero-width marks travel with the preceding character.
-                if cell > from && cell <= to.saturating_add(1) {
+                if cell >= gutter_width && cell > from && cell <= to.saturating_add(1) {
                     out.push(c);
                 }
                 continue;
             }
-            if cell + width > from && cell <= to {
+            if cell >= gutter_width && cell + width > from && cell <= to {
                 out.push(c);
             }
             cell += width;
@@ -1183,6 +1196,35 @@ mod tests {
         t.mouse_drag(3, 2);
         // Soft-wrapped rows join without a newline; block boundary keeps one.
         assert_eq!(t.mouse_up().as_deref(), Some("abcdefghi\nnext"));
+    }
+
+    #[test]
+    fn selection_omits_the_user_rail_from_wrapped_prompts() {
+        let mut t = Transcript::new(10); // usable width 9, including the rail
+        t.push(vec![Line::from(vec![
+            Span::styled(crate::theme::USER_GUTTER, crate::theme::user_gutter()),
+            Span::raw("abcdefghi"),
+        ])]);
+        let area = Rect::new(0, 0, 10, 2);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        t.mouse_down(0, 0);
+        t.mouse_drag(9, 1);
+
+        assert_eq!(t.mouse_up().as_deref(), Some("abcdefghi"));
+    }
+
+    #[test]
+    fn selection_preserves_ordinary_text_that_starts_with_the_rail_marker() {
+        let mut t = Transcript::new(20);
+        t.push(vec![Line::raw("▌ literal text")]);
+        let area = Rect::new(0, 0, 20, 1);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        t.mouse_down(0, 0);
+        t.mouse_drag(19, 0);
+
+        assert_eq!(t.mouse_up().as_deref(), Some("▌ literal text"));
     }
 
     #[test]
