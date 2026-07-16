@@ -864,6 +864,38 @@ async fn shell_tool_runs_and_reports_exit_code() {
 }
 
 #[tokio::test]
+async fn shell_tool_preserves_each_successful_test_target_in_a_chain() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = if cfg!(windows) {
+        "Write-Output 'running 2 tests'; Write-Output 'test result: ok. 2 passed; 0 failed'; Write-Output 'running 3 tests'; Write-Output 'test result: ok. 3 passed; 0 failed'"
+    } else {
+        "printf '%s\\n' 'running 2 tests' 'test result: ok. 2 passed; 0 failed' && printf '%s\\n' 'running 3 tests' 'test result: ok. 3 passed; 0 failed'"
+    };
+    let tool_name = platform_shell_tool();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            tool_name,
+            &serde_json::json!({ "command": command }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "run both test targets").await;
+
+    let result = &tool_results(&session)[0];
+    assert!(!result.1, "{}", result.0);
+    assert!(result.0.contains("running 2 tests"), "{}", result.0);
+    assert!(result.0.contains("running 3 tests"), "{}", result.0);
+    assert!(result.0.contains("2 passed"), "{}", result.0);
+    assert!(result.0.contains("3 passed"), "{}", result.0);
+    assert!(result.0.contains("(exit code 0)"), "{}", result.0);
+}
+
+#[tokio::test]
 async fn oversized_tool_output_spills_to_a_readable_file() {
     // A command tool's output is unbounded, so it stays gated (unlike the
     // self-paginating `read`/`grep`, which opt out). Produce ~5000 lines.
@@ -1763,6 +1795,24 @@ async fn lone_and_unbatchable_calls_have_no_batch_label() {
     assert_eq!(agent.batch_display_label(&session, &mixed), None);
 }
 
+#[tokio::test]
+async fn main_system_prompt_expands_session_runtime_variables() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![text_done("done")]);
+    let mut agent = agent(provider.clone());
+    agent.system = "scratch=${TCODE_SCRATCH_DIR}".into();
+    let mut session = session(root.path(), PermissionMode::Default);
+    let scratch = session.tool_ctx.scratch_dir.display().to_string();
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "check runtime expansion").await;
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].system.contains(&format!("scratch={scratch}")));
+    assert!(!requests[0].system.contains("${TCODE_SCRATCH_DIR}"));
+}
+
 /// `/dogfood` is a hidden command, so nothing but the system prompt tells the
 /// model to critique the tools. Pin that it lands there — and only when on.
 #[tokio::test]
@@ -1908,6 +1958,59 @@ async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
 }
 
 #[tokio::test]
+async fn auto_mode_classification_receives_expanded_session_scratch_policy() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let scratch = session.tool_ctx.scratch_dir.clone();
+    let expected_scope = session.classifier_cache_scope();
+    let target = scratch.join("probe.csv");
+    let command = if cfg!(windows) {
+        format!(
+            "Set-Content -Path '{}' -Value scratch; Remove-Item -Path '{}'",
+            target.display(),
+            target.display()
+        )
+    } else {
+        format!(
+            "printf scratch > '{}' && rm '{}'",
+            target.display(),
+            target.display()
+        )
+    };
+    let main = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": command }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW")]);
+    let mut agent = auto_agent(main, classifier.clone());
+    agent.auto_policy = "The session scratch root is ${TCODE_SCRATCH_DIR}.".into();
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(
+        &agent,
+        &mut session,
+        &approver,
+        "clean up the temporary CSV",
+    )
+    .await;
+
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert!(!target.exists());
+    let requests = classifier.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert!(requests[0].system.contains(&scratch.display().to_string()));
+    assert!(!requests[0].system.contains("${TCODE_SCRATCH_DIR}"));
+    assert_eq!(
+        requests[0].cache_scope.as_deref(),
+        Some(expected_scope.as_str())
+    );
+}
+
+#[tokio::test]
 async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
     let root = tempfile::tempdir().unwrap();
     let main = MockProvider::new(vec![
@@ -1929,7 +2032,10 @@ async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
     // A cap that only fits the verdict truncates models that think first.
     assert_eq!(requests[0].max_tokens, 1_024);
     // The classifier runs on the agent's provider but not its prefix.
-    assert_eq!(requests[0].cache_scope.as_deref(), Some("auto-classifier"));
+    assert!(requests[0]
+        .cache_scope
+        .as_deref()
+        .is_some_and(|scope| scope.starts_with("auto-classifier:")));
 }
 
 #[tokio::test]

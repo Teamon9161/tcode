@@ -15,9 +15,10 @@ use crate::types::{ContentBlock, Message, Role};
 /// short because its prompt says so, not because it is capped.
 const VERDICT_MAX_TOKENS: u32 = 1_024;
 /// The classifier runs on the agent's provider but never on the agent's
-/// prefix, so it must not share the agent's provider-side cache id.
-const CLASSIFIER_SCOPE: &str = "auto-classifier";
-
+/// prefix. Each `ClassifierRequest` carries a session-specific cache scope so
+/// dynamically-expanded policy never shares a provider cache ID with another
+/// session.
+///
 /// Provider-backed two-stage classifier. It deliberately uses the ordinary
 /// provider interface: classifier requests have no tools and never enter the
 /// main ledger, so the safety model stays isolated from the agent's context.
@@ -69,7 +70,7 @@ impl ProviderSafetyClassifier {
             // prefix at a provider cache boundary.
             system: request.policy.clone(),
             system_suffix: Some(suffix.to_string()),
-            cache_scope: Some(CLASSIFIER_SCOPE.to_string()),
+            cache_scope: Some(request.cache_scope.clone()),
             messages,
             tools: vec![],
             // Providers without an output cap (Codex 400s on `max_output_tokens`)

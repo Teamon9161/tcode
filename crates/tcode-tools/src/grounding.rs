@@ -1,16 +1,16 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Build the opening context using a caller-supplied session-private scratch
-/// root. `project_map` remains a convenience for tests and standalone callers.
-pub fn project_map_with_scratch(cwd: &Path, scratch: &Path) -> String {
+/// Build the opening context. The scratch parameter remains in the signature
+/// so existing frontends can call it, while the exact path now comes from the
+/// stable `${TCODE_SCRATCH_DIR}` system-prompt substitution.
+pub fn project_map_with_scratch(cwd: &Path, _scratch: &Path) -> String {
     let mut out = String::new();
     out.push_str(&format!(
-        "# Environment\nplatform: {}\ncwd: {}\ndate: {}\nscratch: {}\n",
+        "# Environment\nplatform: {}\ncwd: {}\ndate: {}\n",
         std::env::consts::OS,
         cwd.display(),
         chrono_date(),
-        scratch.display(),
     ));
 
     match git_summary(cwd) {

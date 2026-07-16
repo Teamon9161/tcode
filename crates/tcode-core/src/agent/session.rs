@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::ledger::{Entry, Ledger};
 use crate::permission::{PermissionMode, PermissionRules};
+use crate::template::PromptVariables;
 use crate::tool::ToolCtx;
 use crate::types::{ContentBlock, Usage};
 
@@ -158,10 +159,15 @@ pub struct Session {
     /// A sub-agent shares its parent's provider but not its prefix, so it must
     /// not share its cache id.
     cache_scope: Option<String>,
+    /// Runtime values are captured from trusted harness state before prompt
+    /// construction. They only change as part of a full conversation
+    /// replacement, which also changes the provider cache scope.
+    prompt_variables: PromptVariables,
 }
 
 impl Session {
     pub fn new(tool_ctx: ToolCtx, mode: PermissionMode, rules: PermissionRules) -> Self {
+        let prompt_variables = PromptVariables::new(&tool_ctx.cwd, &tool_ctx.scratch_dir);
         Self {
             ledger: Ledger::new(),
             opening_context: String::new(),
@@ -188,6 +194,7 @@ impl Session {
             auto_total_denials: 0,
             auto_consecutive_unavailable: 0,
             cache_scope: None,
+            prompt_variables,
         }
     }
 
@@ -201,6 +208,19 @@ impl Session {
 
     pub fn cache_scope(&self) -> Option<String> {
         self.cache_scope.clone()
+    }
+
+    /// Runtime values for one-pass expansion in harness-owned prompt templates.
+    pub fn prompt_variables(&self) -> &PromptVariables {
+        &self.prompt_variables
+    }
+
+    pub fn classifier_cache_scope(&self) -> String {
+        let session_scope = self
+            .cache_scope
+            .as_deref()
+            .unwrap_or_else(|| self.prompt_variables.session_id());
+        format!("auto-classifier:{session_scope}")
     }
 
     /// Cwd-specific portion of the system prompt used for request construction.
@@ -326,11 +346,15 @@ impl Session {
         self.opening_context = context;
     }
 
-    /// Bind ephemeral tool state to the persistent conversation currently held
-    /// in the ledger. `/resume` calls this before another tool can run.
+    /// Bind ephemeral tool state to a persistent conversation. This is a full
+    /// conversation replacement (`/resume` or startup), so it first changes the
+    /// provider cache scope and only then captures the replacement variables.
     pub fn bind_scratch_session(&mut self, session_id: &str) {
         let scratch = crate::store::session_scratchpad_dir(&self.tool_ctx.cwd, session_id);
         self.tool_ctx.rebind_scratch_dir(scratch);
+        self.cache_scope = Some(format!("main:{session_id}"));
+        self.prompt_variables =
+            PromptVariables::new(&self.tool_ctx.cwd, &self.tool_ctx.scratch_dir);
     }
 
     /// Change the conversation working directory. Before any model-visible
@@ -360,6 +384,7 @@ impl Session {
         self.tool_ctx.cwd = new.clone();
         if refresh_opening_context {
             self.tool_ctx.memory = std::sync::Mutex::new(crate::MemoryManager::new(&new));
+            self.prompt_variables = PromptVariables::new(&new, &self.tool_ctx.scratch_dir);
             return Ok(CwdChange {
                 old,
                 new,
@@ -588,6 +613,30 @@ mod tests {
     }
 
     #[test]
+    fn session_replacement_changes_cache_scope_before_refreshing_variables() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::new(root, 1_000),
+            PermissionMode::Auto,
+            PermissionRules::default(),
+        );
+        let initial_scratch = session.prompt_variables().expand("${TCODE_SCRATCH_DIR}");
+        let initial_scope = session.classifier_cache_scope();
+
+        session.bind_scratch_session("resumed-session");
+
+        assert_ne!(
+            session.prompt_variables().expand("${TCODE_SCRATCH_DIR}"),
+            initial_scratch
+        );
+        assert_ne!(session.classifier_cache_scope(), initial_scope);
+        assert_eq!(
+            session.classifier_cache_scope(),
+            "auto-classifier:main:resumed-session"
+        );
+    }
+
+    #[test]
     fn change_cwd_refreshes_fresh_context_or_appends_a_history_note() {
         let root = std::env::temp_dir().join(format!(
             "tcode-cd-test-{}-{}",
@@ -604,6 +653,7 @@ mod tests {
             PermissionMode::Default,
             PermissionRules::default(),
         );
+        let initial_project = session.prompt_variables().expand("${TCODE_PROJECT_DIR}");
         let change = session.change_cwd("child").unwrap();
 
         assert!(change.changed);
@@ -611,13 +661,26 @@ mod tests {
         assert_eq!(change.old, root);
         assert_eq!(change.new, child);
         assert_eq!(session.tool_ctx.cwd, child);
+        assert_eq!(
+            session.prompt_variables().expand("${TCODE_PROJECT_DIR}"),
+            child.display().to_string()
+        );
+        assert_ne!(
+            session.prompt_variables().expand("${TCODE_PROJECT_DIR}"),
+            initial_project
+        );
         assert!(session.ledger.is_empty());
 
         session.ledger.append(Entry::Note("history".into()));
+        let frozen_project = session.prompt_variables().expand("${TCODE_PROJECT_DIR}");
         let change = session.change_cwd("..").unwrap();
         assert!(change.changed);
         assert!(!change.refresh_opening_context);
         assert_eq!(session.tool_ctx.cwd, root);
+        assert_eq!(
+            session.prompt_variables().expand("${TCODE_PROJECT_DIR}"),
+            frozen_project
+        );
         assert!(matches!(
             session.ledger.entries().last(),
             Some(Entry::Note(text))

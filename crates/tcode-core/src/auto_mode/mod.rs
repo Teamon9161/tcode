@@ -207,9 +207,12 @@ fn append_tag(out: &mut String, tag: &str, attr: &str, text: &str) {
 
 #[derive(Debug, Clone)]
 pub struct ClassifierRequest {
-    /// Fixed policy prompt plus only human-maintained instructions. This is a
-    /// stable prefix shared by both stages and suitable for provider caching.
+    /// Policy after trusted runtime placeholders are expanded for this session.
+    /// It remains byte-stable within the request's dedicated cache scope.
     pub policy: String,
+    /// Dedicated provider cache scope for this session's dynamic classifier
+    /// prefix. It must not share a cache id with another session.
+    pub cache_scope: String,
     pub transcript: ClassifierTranscript,
     pub tool_name: String,
     pub input: Value,

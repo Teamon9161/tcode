@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{PermissionRequest, PromptVariables, Tool, ToolCtx, ToolOutput};
 
 /// One listed line per skill; longer descriptions are clipped, not dropped.
 const DESCRIPTION_CAP: usize = 200;
@@ -68,7 +68,10 @@ impl Tool for SkillTool {
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "properties": { "name": { "type": "string", "description": "Skill name from the list" } },
+            "properties": {
+                "name": { "type": "string", "description": "Skill name from the list" },
+                "arguments": { "type": "string", "description": "Optional raw arguments for $ARGUMENTS, $0, $1, and $ARGUMENTS[N] substitutions" }
+            },
             "required": ["name"]
         })
     }
@@ -77,8 +80,9 @@ impl Tool for SkillTool {
         PermissionRequest::None
     }
 
-    async fn run(&self, input: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: &ToolCtx, _: &CancellationToken) -> ToolOutput {
         let name = input["name"].as_str().unwrap_or("");
+        let arguments = input["arguments"].as_str().unwrap_or("");
         let Some(skill) = self.skills.iter().find(|skill| skill.name == name) else {
             // Self-healing error: the model fixes the call without a
             // discovery turn.
@@ -92,13 +96,17 @@ impl Tool for SkillTool {
             ));
         };
         // Read at call time: skill files may change while tcode runs.
-        match std::fs::read_to_string(skill.dir.join("SKILL.md")) {
-            Ok(body) => ToolOutput::ok(format!(
-                "# Skill: {} (files in {})\n\n{}",
-                skill.name,
-                skill.dir.display(),
-                strip_front_matter(&body),
-            )),
+        match tokio::fs::read_to_string(skill.dir.join("SKILL.md")).await {
+            Ok(body) => {
+                let rendered = PromptVariables::new(&ctx.cwd, &ctx.scratch_dir)
+                    .with_skill(&skill.dir, arguments)
+                    .expand(strip_front_matter(&body));
+                ToolOutput::ok(format!(
+                    "# Skill: {} (files in {})\n\n{rendered}",
+                    skill.name,
+                    skill.dir.display(),
+                ))
+            }
             Err(e) => ToolOutput::err(format!(
                 "cannot read {}: {e}",
                 skill.dir.join("SKILL.md").display()
@@ -309,6 +317,42 @@ mod tests {
         let skills = discover_skills(tmp.path());
         assert_eq!(skills[0].name, "deploy");
         assert_eq!(skills[0].description, "ship it");
+    }
+
+    #[tokio::test]
+    async fn loaded_skill_expands_runtime_and_argument_placeholders_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("inspect");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: inspect\n---\n${CLAUDE_SKILL_DIR}|${TCODE_PROJECT_DIR}|${TCODE_SCRATCH_DIR}|${CLAUDE_SESSION_ID}|$0|$1|$ARGUMENTS[2]|$ARGUMENTS",
+        )
+        .unwrap();
+        let tool = SkillTool::from_skills(vec![Skill {
+            name: "inspect".into(),
+            description: String::new(),
+            dir: dir.clone(),
+        }]);
+        let project = tmp.path().join("project");
+        let scratch = tmp.path().join("scratch/runs/session-a");
+        let ctx = ToolCtx::with_scratch_dir(project.clone(), 4_000, scratch.clone());
+
+        let out = tool
+            .run(
+                json!({"name": "inspect", "arguments": "first 'two words' ${TCODE_SCRATCH_DIR}"}),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains(&dir.display().to_string()));
+        assert!(out.content.contains(&project.display().to_string()));
+        assert!(out.content.contains(&scratch.display().to_string()));
+        assert!(out.content.contains(
+            "session-a|first|two words|${TCODE_SCRATCH_DIR}|first 'two words' ${TCODE_SCRATCH_DIR}"
+        ));
     }
 
     #[test]

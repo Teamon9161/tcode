@@ -332,6 +332,13 @@ pub trait Tool: Send + Sync {
     fn gates_output(&self) -> bool {
         true
     }
+    /// Optionally reduce a successful result before the central output gate.
+    /// Tools whose output has a stable, domain-specific success format can
+    /// preserve its useful evidence without spending context on repetition.
+    /// Failures always bypass this hook unchanged for diagnosis.
+    fn compact_success_output(&self, output: String) -> String {
+        output
+    }
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput;
 }
 

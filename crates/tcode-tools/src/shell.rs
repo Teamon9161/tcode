@@ -193,6 +193,57 @@ fn spawn_line_reader(
     })
 }
 
+/// Successful test runs often contain several nearly-identical target blocks
+/// (especially doctests and crates with zero tests). Keep one result for every
+/// target that actually ran tests, plus the shell's final status, while avoiding
+/// needless context use. Any error-like marker leaves the original output
+/// untouched for diagnosis.
+fn compact_successful_test_output(output: String) -> String {
+    if !(output.contains("test result: ok.")
+        && output.contains("running ")
+        && !output.contains("test result: FAILED")
+        && !output.contains("error:")
+        && !output.contains("failures:"))
+    {
+        return output;
+    }
+
+    let lines: Vec<&str> = output.lines().collect();
+    let mut passed = Vec::new();
+    for (index, result) in lines.iter().enumerate() {
+        if !result.trim_start().starts_with("test result: ok.") || result.contains("0 passed") {
+            continue;
+        }
+        let running = lines[..index]
+            .iter()
+            .rev()
+            .find(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with("running ")
+                    && trimmed.contains(" tests")
+                    && !trimmed.contains("running 0 tests")
+            })
+            .copied();
+        if let Some(running) = running {
+            passed.push(format!("{running}\n{result}"));
+        }
+    }
+    if passed.is_empty() {
+        return output;
+    }
+
+    let status = lines
+        .iter()
+        .rev()
+        .find(|line| line.starts_with("(exit code "))
+        .copied()
+        .unwrap_or("test result: ok.");
+    format!(
+        "{}\n… successful test output folded …\n{status}",
+        passed.join("\n")
+    )
+}
+
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -282,6 +333,10 @@ impl Tool for ShellTool {
         BatchPolicy::SequentialBatch
     }
 
+    fn compact_success_output(&self, output: String) -> String {
+        compact_successful_test_output(output)
+    }
+
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
         let Some(script) = input["command"].as_str() else {
             return ToolOutput::err("missing required parameter: command");
@@ -352,6 +407,7 @@ impl Tool for ShellTool {
                     out.push_str(&format!("\n(exit code {code})"));
                     ToolOutput::err(out)
                 } else {
+                    out.push_str("\n(exit code 0)");
                     ToolOutput::ok(out)
                 }
             }

@@ -37,38 +37,6 @@ pub(super) fn preview(s: &str) -> String {
     line
 }
 
-/// Successful test runs often contain several nearly-identical target blocks
-/// (especially doctests and crates with zero tests).  Keep the evidence that
-/// matters to both the human and model while avoiding needless context use.
-/// Any error-like marker leaves the original output untouched for diagnosis.
-pub(super) fn compact_successful_test_output(output: String) -> String {
-    if !(output.contains("test result: ok.")
-        && output.contains("running ")
-        && !output.contains("test result: FAILED")
-        && !output.contains("error:")
-        && !output.contains("failures:"))
-    {
-        return output;
-    }
-    let running: Vec<&str> = output
-        .lines()
-        .filter(|line| line.trim_start().starts_with("running ") && line.contains(" tests"))
-        .collect();
-    let Some(first) = running
-        .iter()
-        .copied()
-        .find(|line| !line.contains("running 0 tests"))
-    else {
-        return output;
-    };
-    let passed = output
-        .lines()
-        .filter(|line| line.trim_start().starts_with("test result: ok."))
-        .find(|line| !line.contains("0 passed"))
-        .unwrap_or("test result: ok.");
-    format!("{first}\n… successful test output folded …\n{passed}")
-}
-
 /// An interrupted stream can leave a tool_use whose input JSON never
 /// finished; the accumulator falls back to a raw string for those.
 /// They must not be replayed to the API.
@@ -88,24 +56,4 @@ pub(super) fn split_malformed(blocks: Vec<ContentBlock>) -> (Vec<ContentBlock>, 
         })
         .collect();
     (kept, dropped)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::compact_successful_test_output;
-
-    #[test]
-    fn folds_repeated_successful_test_blocks() {
-        let output = "running 24 tests\n........................\ntest result: ok. 24 passed; 0 failed\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed";
-        let folded = compact_successful_test_output(output.into());
-        assert!(folded.contains("running 24 tests"));
-        assert!(folded.contains("folded"));
-        assert!(!folded.contains("running 0 tests"));
-    }
-
-    #[test]
-    fn retains_failed_test_output() {
-        let output = "running 2 tests\ntest result: FAILED. 1 passed; 1 failed";
-        assert_eq!(compact_successful_test_output(output.into()), output);
-    }
 }

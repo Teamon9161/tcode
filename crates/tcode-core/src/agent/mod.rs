@@ -6,7 +6,7 @@ mod summarize;
 pub use session::{CwdChange, PendingInput, PendingMessage, PendingMode, Session};
 pub use suggest::SuggestRequest;
 pub use summarize::summarize_call;
-use summarize::{compact_successful_test_output, preview, split_malformed};
+use summarize::{preview, split_malformed};
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
@@ -312,8 +312,10 @@ impl Agent {
                         self.auto_policy, instructions
                     )
                 };
+                let policy = session.prompt_variables().expand(&policy);
                 let request = ClassifierRequest {
                     policy,
+                    cache_scope: session.classifier_cache_scope(),
                     transcript: ClassifierTranscript::from_ledger(&session.ledger),
                     tool_name: check.name.to_string(),
                     input: check.input.clone(),
@@ -344,7 +346,7 @@ impl Agent {
     }
 
     pub(super) fn system_prompt(&self, session: &Session) -> String {
-        let mut prompt = self.system.clone();
+        let mut prompt = session.prompt_variables().expand(&self.system);
         if !session.opening_context().is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(session.opening_context());
@@ -1876,12 +1878,16 @@ impl Agent {
     fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
         let is_error = output.is_error;
         let images = output.images;
+        let tool_impl = self.tool(tool);
         let content = if is_error {
             output.content
         } else {
-            compact_successful_test_output(output.content)
+            match tool_impl {
+                Some(tool) => tool.compact_success_output(output.content),
+                None => output.content,
+            }
         };
-        let gates = self.tool(tool).is_none_or(|t| t.gates_output());
+        let gates = tool_impl.is_none_or(|tool| tool.gates_output());
         if !gates {
             return ToolOutput {
                 content,
