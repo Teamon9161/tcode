@@ -786,7 +786,10 @@ impl Transcript {
         {
             return None;
         }
-        let row = (self.view_top + (y - area.y) as usize).min(self.total() - 1);
+        let row = self.view_top + (y - area.y) as usize;
+        if row >= self.total() {
+            return None;
+        }
         Some((row, (x - area.x) as usize))
     }
 
@@ -1373,6 +1376,29 @@ mod tests {
         t.render(&mut buf, area);
         assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn moving_into_blank_tail_clears_final_tool_hover() {
+        let mut t = Transcript::new(40);
+        t.push_with_detail(
+            vec![Line::raw("preview")],
+            (0..3).map(|i| Line::raw(format!("out {i}"))).collect(),
+            false,
+            5,
+        );
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+
+        t.mouse_moved(0, 0);
+        assert_eq!(t.hovered, Some(0));
+
+        t.mouse_moved(0, 1);
+        assert_eq!(t.hovered, None);
+        t.render(&mut buf, area);
+        assert!(!buffer_text(&buf, area).contains("▸ 3 lines"));
+        assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
     }
 
     #[test]
