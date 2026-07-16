@@ -27,7 +27,7 @@ use crate::ledger::Entry;
 use crate::memory::MemoryUpdate;
 use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode};
 use crate::provider::{ProviderError, Request, StreamEvent};
-use crate::tool::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
+use crate::tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolCtx, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 
 /// Default ceiling on model round-trips per user turn; a runaway loop should
@@ -67,6 +67,9 @@ pub enum AgentEvent {
         delay_ms: u64,
     },
     ToolStart {
+        /// Provider-issued tool_use id, the stable key tying this call to its
+        /// ledger entry and to any sub-agent run it spawns.
+        call_id: String,
         name: String,
         summary: String,
         /// Raw call input, e.g. for rendering edit diffs in the UI.
@@ -76,9 +79,11 @@ pub enum AgentEvent {
     /// `ToolEnd` in call order, but UIs can avoid five identical headers.
     ToolBatchStart {
         label: String,
-        calls: Vec<(String, Value)>,
+        /// (call_id, name, input) per call, in model order.
+        calls: Vec<(String, String, Value)>,
     },
     ToolEnd {
+        call_id: String,
         name: String,
         preview: String,
         /// Complete gated output for UI detail views. The regular transcript
@@ -120,6 +125,31 @@ pub enum AgentEvent {
     /// Usage spent inside a delegated `task` sub-agent. It contributes to
     /// cost/turn statistics, but not to the parent's context-window meter.
     DelegatedUsage(Usage),
+    /// A `task` sub-agent run began. Trace/display only — nothing here enters
+    /// the parent's provider ledger.
+    TaskRunStarted {
+        run: String,
+        /// tool_use id of the spawning `task` call.
+        parent_call: String,
+        kind: String,
+        model: String,
+        prompt: String,
+        /// One-line parent-authored description for task lists.
+        summary: String,
+    },
+    /// One event from inside a running sub-agent, tagged with its run id.
+    /// Streaming deltas arrive coalesced; `Usage`/`DelegatedUsage` inside
+    /// carry the delegated-usage semantics (cost, not context).
+    TaskRunEvent {
+        run: String,
+        event: Box<AgentEvent>,
+    },
+    TaskRunFinished {
+        run: String,
+        status: crate::task_trace::TaskRunStatus,
+        tool_calls: usize,
+        usage: Usage,
+    },
     /// Context grew past the auto-compact threshold; a summary request
     /// is running before the actual turn.
     Compacting,
@@ -818,6 +848,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolStart {
+                    call_id: id.clone(),
                     name: name.clone(),
                     summary: summarize_call(name, model_input),
                     input: model_input.clone(),
@@ -832,22 +863,13 @@ impl Agent {
                     session.ledger.record_aux(&ev);
                 }
             }
-            let mut output = {
-                let (usage_tx, mut usage_rx) = mpsc::unbounded_channel();
-                session.tool_ctx.set_usage_reporter(usage_tx);
-                let run = tool.run(input.clone(), &session.tool_ctx, cancel);
-                tokio::pin!(run);
-                let output = loop {
-                    tokio::select! {
-                        Some(usage) = usage_rx.recv() => {
-                            self.emit(events, AgentEvent::DelegatedUsage(usage)).await?;
-                        }
-                        output = &mut run => break output,
-                    }
-                };
-                session.tool_ctx.clear_usage_reporter();
-                output
-            };
+            let mut output = self
+                .forward_delegates(
+                    &session.tool_ctx,
+                    events,
+                    tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel),
+                )
+                .await?;
             if !output.is_error {
                 if let Some(raw) = tool.touches(input) {
                     let path = session.tool_ctx.resolve(&raw);
@@ -886,6 +908,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
+                    call_id: id.clone(),
                     name: name.clone(),
                     preview: preview(&output.content),
                     content: output.content.clone(),
@@ -975,24 +998,29 @@ impl Agent {
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
         }
 
+        let label = batch_label(&prepared);
+        session.ledger.record_batch_label(&label);
         self.emit(
             events,
             AgentEvent::ToolBatchStart {
-                label: batch_label(&prepared),
+                label,
                 calls: prepared
                     .iter()
-                    .map(|(_, name, input, _)| (name.clone(), input.clone()))
+                    .map(|(id, name, input, _)| (id.clone(), name.clone(), input.clone()))
                     .collect(),
             },
         )
         .await?;
 
-        let outputs = join_all(
-            prepared
-                .iter()
-                .map(|(_, _, input, tool)| tool.run(input.clone(), &session.tool_ctx, cancel)),
-        )
-        .await;
+        let outputs = self
+            .forward_delegates(
+                &session.tool_ctx,
+                events,
+                join_all(prepared.iter().map(|(id, _, input, tool)| {
+                    tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel)
+                })),
+            )
+            .await?;
         for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
             let post = self
                 .hooks
@@ -1011,6 +1039,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
+                    call_id: id.clone(),
                     name,
                     preview: preview(&output.content),
                     content: output.content.clone(),
@@ -1269,13 +1298,15 @@ impl Agent {
                 }
             }
         }
+        let label = batch_label(&prepared);
+        session.ledger.record_batch_label(&label);
         self.emit(
             events,
             AgentEvent::ToolBatchStart {
-                label: batch_label(&prepared),
+                label,
                 calls: prepared
                     .iter()
-                    .map(|(_, name, input, _)| (name.clone(), input.clone()))
+                    .map(|(id, name, input, _)| (id.clone(), name.clone(), input.clone()))
                     .collect(),
             },
         )
@@ -1307,27 +1338,36 @@ impl Agent {
         // would discard work that was never in danger (one no-op edit used to
         // cost the seven independent edits queued behind it). Calls on one
         // file still run in the model's order; only cancellation halts a lane.
-        let lane_outputs = join_all(lanes.iter().map(|lane| {
-            let prepared = &prepared;
-            let tool_ctx = &session.tool_ctx;
-            async move {
-                let mut outputs = Vec::with_capacity(lane.len());
-                for &index in lane {
-                    let (_, _, input, tool) = &prepared[index];
-                    let (output, ran) = if cancel.is_cancelled() {
-                        (
-                            ToolOutput::err("Cancelled by user before execution."),
-                            false,
-                        )
-                    } else {
-                        (tool.run(input.clone(), tool_ctx, cancel).await, true)
-                    };
-                    outputs.push((index, output, ran));
-                }
-                outputs
-            }
-        }))
-        .await;
+        let lane_outputs = self
+            .forward_delegates(
+                &session.tool_ctx,
+                events,
+                join_all(lanes.iter().map(|lane| {
+                    let prepared = &prepared;
+                    let tool_ctx = &session.tool_ctx;
+                    async move {
+                        let mut outputs = Vec::with_capacity(lane.len());
+                        for &index in lane {
+                            let (id, _, input, tool) = &prepared[index];
+                            let (output, ran) = if cancel.is_cancelled() {
+                                (
+                                    ToolOutput::err("Cancelled by user before execution."),
+                                    false,
+                                )
+                            } else {
+                                (
+                                    tool.run_with_call(id, input.clone(), tool_ctx, cancel)
+                                        .await,
+                                    true,
+                                )
+                            };
+                            outputs.push((index, output, ran));
+                        }
+                        outputs
+                    }
+                })),
+            )
+            .await?;
         let mut outputs: Vec<(usize, ToolOutput, bool)> =
             lane_outputs.into_iter().flatten().collect();
         outputs.sort_by_key(|(index, _, _)| *index);
@@ -1377,6 +1417,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
+                    call_id: id.clone(),
                     name,
                     preview: preview(&output.content),
                     content: output.content.clone(),
@@ -1587,10 +1628,11 @@ impl Agent {
         }
 
         // Emit batch start for display.
-        let batch_calls: Vec<(String, Value)> = prepared
+        let batch_calls: Vec<(String, String, Value)> = prepared
             .iter()
-            .map(|(_, name, input, _)| (name.clone(), input.clone()))
+            .map(|(id, name, input, _)| (id.clone(), name.clone(), input.clone()))
             .collect();
+        session.ledger.record_batch_label(&batch_label);
         self.emit(
             events,
             AgentEvent::ToolBatchStart {
@@ -1618,6 +1660,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolStart {
+                    call_id: id.clone(),
                     name: name.clone(),
                     summary: summarize_call(name, input),
                     input: input.clone(),
@@ -1625,7 +1668,13 @@ impl Agent {
             )
             .await?;
 
-            let mut output = tool.run(input.clone(), &session.tool_ctx, cancel).await;
+            let mut output = self
+                .forward_delegates(
+                    &session.tool_ctx,
+                    events,
+                    tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel),
+                )
+                .await?;
 
             let post = self
                 .hooks
@@ -1645,6 +1694,7 @@ impl Agent {
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
+                    call_id: id.clone(),
                     name: name.clone(),
                     preview: preview(&output.content),
                     content: output.content.clone(),
@@ -1965,6 +2015,72 @@ impl Agent {
         ev: AgentEvent,
     ) -> Result<(), AgentError> {
         events.send(ev).await.map_err(|_| AgentError::ChannelClosed)
+    }
+
+    /// Run one tool call (or a whole concurrent batch) while forwarding
+    /// everything delegated work reports through the `ToolCtx` channel —
+    /// sub-agent trace events and delegated usage alike. This wraps every
+    /// execution path, so a `task` in a parallel batch is as visible as an
+    /// isolated one. Remaining queued events are drained after completion:
+    /// a run's finish line must never be lost to select timing.
+    async fn forward_delegates<T>(
+        &self,
+        tool_ctx: &ToolCtx,
+        events: &mpsc::Sender<AgentEvent>,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T, AgentError> {
+        let (delegate_tx, mut delegate_rx) = mpsc::unbounded_channel();
+        tool_ctx.set_delegate_reporter(delegate_tx);
+        tokio::pin!(fut);
+        let output = loop {
+            tokio::select! {
+                Some(ev) = delegate_rx.recv() => self.emit_delegate(events, ev).await?,
+                output = &mut fut => break output,
+            }
+        };
+        tool_ctx.clear_delegate_reporter();
+        while let Ok(ev) = delegate_rx.try_recv() {
+            self.emit_delegate(events, ev).await?;
+        }
+        Ok(output)
+    }
+
+    async fn emit_delegate(
+        &self,
+        events: &mpsc::Sender<AgentEvent>,
+        ev: DelegateEvent,
+    ) -> Result<(), AgentError> {
+        let ev = match ev {
+            DelegateEvent::Usage(usage) => AgentEvent::DelegatedUsage(usage),
+            DelegateEvent::TaskStarted {
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+            } => AgentEvent::TaskRunStarted {
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+            },
+            DelegateEvent::TaskEvent { run, event } => AgentEvent::TaskRunEvent { run, event },
+            DelegateEvent::TaskFinished {
+                run,
+                status,
+                tool_calls,
+                usage,
+            } => AgentEvent::TaskRunFinished {
+                run,
+                status,
+                tool_calls,
+                usage,
+            },
+        };
+        self.emit(events, ev).await
     }
 }
 

@@ -53,6 +53,9 @@ pub struct Transcript {
     /// compact background highlight so it reads as actionable without
     /// underlining expanded output or trailing empty cells.
     hovered: Option<usize>,
+    /// Tick frame used only when painting a live task status. Keeping it out of
+    /// the wrapped block data preserves the transcript's resize-only reflow.
+    task_activity_frame: usize,
 }
 
 /// Lines wrapped at a width. `starts` is aligned with `lines`: true where
@@ -177,9 +180,16 @@ struct Block {
     head: Content,
     head_wrapped: Wrapped,
     detail: Option<Detail>,
+    /// A short mutable status rendered immediately below the header. Task
+    /// cards use it for live activity without forcing the summary foldout open.
+    status: Option<Vec<Line<'static>>>,
+    status_wrapped: Wrapped,
     /// Ledger entry this block echoes (user inputs). Rewind uses it to
     /// jump-highlight and to truncate the view together with the ledger.
     entry: Option<usize>,
+    /// A task trace this record opens. This is view-only metadata: it never
+    /// reaches the provider ledger and coexists with ordinary detail folding.
+    task_run: Option<String>,
 }
 
 impl Block {
@@ -187,32 +197,42 @@ impl Block {
         if let Some(detail) = &mut self.detail {
             detail.rewrap(width);
         }
+        self.status_wrapped = self
+            .status
+            .as_ref()
+            .map_or_else(Wrapped::default, |lines| Wrapped::of(lines, width));
         self.head_wrapped = Wrapped::of(&self.display_head(width, hovered), width);
     }
 
     fn display_head(&self, width: u16, hovered: bool) -> Vec<Line<'static>> {
         let mut head = self.head.lines_at(width);
-        if let (Some(last), Some(detail)) = (head.last_mut(), &self.detail) {
-            // Keep the fold affordance in the same logical line as the preview,
-            // so wrapping is computed once for the combined row. Appending it
-            // after wrapping lets the terminal/ratatui push it onto a stray
-            // extra row on narrow panes.
-            last.spans.push(if detail.open {
-                Span::styled("  ▾", crate::theme::accent())
-            } else if hovered {
-                Span::styled(
-                    format!("  ▸ {} lines", detail.lines.len()),
-                    crate::theme::accent(),
-                )
-            } else {
-                Span::raw("")
-            });
+        if let Some(last) = head.last_mut() {
+            if let Some(detail) = &self.detail {
+                // Keep the fold affordance in the same logical line as the preview,
+                // so wrapping is computed once for the combined row. Appending it
+                // after wrapping lets the terminal/ratatui push it onto a stray
+                // extra row on narrow panes. A task trace link coexists with this
+                // ordinary foldout: click folds its summary/report, double-click
+                // opens the isolated sub-agent trace.
+                last.spans.push(if detail.open {
+                    Span::styled("  ▾", crate::theme::accent())
+                } else if hovered {
+                    Span::styled(
+                        format!("  ▸ {} lines", detail.lines.len()),
+                        crate::theme::accent(),
+                    )
+                } else {
+                    Span::raw("")
+                });
+            }
         }
         head
     }
 
     fn height(&self) -> usize {
-        self.head_wrapped.len() + self.detail.as_ref().map_or(0, Detail::visible)
+        self.head_wrapped.len()
+            + self.status_wrapped.len()
+            + self.detail.as_ref().map_or(0, Detail::visible)
     }
 
     /// The i-th visible row of this block.
@@ -223,10 +243,18 @@ impl Block {
                 self.head_wrapped.starts[i],
             );
         }
+        let status_start = self.head_wrapped.len();
+        let status_end = status_start + self.status_wrapped.len();
+        if i < status_end {
+            return (
+                self.status_wrapped.lines[i - status_start].clone(),
+                self.status_wrapped.starts[i - status_start],
+            );
+        }
         let Some(detail) = &self.detail else {
             return (Line::default(), true);
         };
-        let j = i - self.head_wrapped.len();
+        let j = i - status_end;
         if detail.overflows() && j == detail.view_rows {
             return (detail.footer(), true);
         }
@@ -248,6 +276,7 @@ impl Transcript {
             selection: None,
             highlight: None,
             hovered: None,
+            task_activity_frame: 0,
         }
     }
 
@@ -270,7 +299,10 @@ impl Transcript {
             head,
             head_wrapped: Wrapped::default(),
             detail: None,
+            status: None,
+            status_wrapped: Wrapped::default(),
             entry: None,
+            task_run: None,
         });
     }
 
@@ -283,7 +315,10 @@ impl Transcript {
             head: Content::Lines(lines),
             head_wrapped: Wrapped::default(),
             detail: None,
+            status: None,
+            status_wrapped: Wrapped::default(),
             entry: Some(entry),
+            task_run: None,
         });
     }
 
@@ -337,14 +372,11 @@ impl Transcript {
                 scroll: 0,
                 view_rows: view_rows.max(1),
             }),
+            status: None,
+            status_wrapped: Wrapped::default(),
             entry: None,
+            task_run: None,
         });
-    }
-
-    /// Test helper for replacing an ordinary fixed-line block in place.
-    #[cfg(test)]
-    pub fn replace_block(&mut self, index: usize, lines: Vec<Line<'static>>) {
-        self.replace_content(index, Content::Lines(lines));
     }
 
     pub fn replace_markdown_block(&mut self, index: usize, document: crate::markdown::Document) {
@@ -365,8 +397,37 @@ impl Transcript {
         let block = &mut self.blocks[index];
         block.head = head;
         block.detail = None;
+        block.status = None;
+        block.status_wrapped = Wrapped::default();
         block.entry = None;
+        block.task_run = None;
         self.remeasure(index, old_height);
+    }
+
+    /// Index of the most recently appended block, useful for attaching
+    /// view-only metadata immediately after a batch item bakes.
+    pub fn last_block_index(&self) -> Option<usize> {
+        self.blocks.len().checked_sub(1)
+    }
+
+    /// Associate an existing transcript block with a task trace. Calling this
+    /// after the header was baked lets `TaskRunStarted` arrive naturally after
+    /// its parent `ToolStart`, without special event ordering.
+    pub fn link_task_run(&mut self, index: usize, run: impl Into<String>) {
+        if let Some(block) = self.blocks.get_mut(index) {
+            block.task_run = Some(run.into());
+        }
+    }
+
+    /// The task trace link under a pending click, if any. The caller uses it
+    /// after `mouse_up()` has performed the ordinary foldout toggle, so one
+    /// click expands the task card and a second quick click can open its trace.
+    pub fn selected_task_run(&self) -> Option<String> {
+        let selection = self.selection?;
+        (selection.anchor == selection.head)
+            .then_some(selection.anchor.0)
+            .and_then(|row| self.block_at(row).map(|(index, _)| index))
+            .and_then(|index| self.blocks[index].task_run.clone())
     }
 
     /// Extend the last head line of an existing block — a tool-result
@@ -381,6 +442,18 @@ impl Transcript {
                 last.spans.extend(spans);
             }
         }
+        self.remeasure(index, old_height);
+    }
+
+    /// Replace or clear a live status line below an existing block's header.
+    /// It is transient UI state, intended for a running task's current action.
+    pub fn set_live_status(&mut self, index: usize, status: Option<Vec<Line<'static>>>) {
+        if index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        self.blocks[index].status = status.filter(|lines| !lines.is_empty());
+        self.blocks[index].status_wrapped = Wrapped::default();
         self.remeasure(index, old_height);
     }
 
@@ -400,6 +473,34 @@ impl Transcript {
         view_rows: usize,
     ) {
         self.attach_detail_content(index, Content::Markdown { document, prefix }, view_rows);
+    }
+
+    /// Replace a live detail while preserving the reader's fold choice. Task
+    /// cards use this for their evolving summary/tool activity; ordinary tool
+    /// results deliberately continue to attach as closed details.
+    pub fn replace_detail_preserving_open(
+        &mut self,
+        index: usize,
+        detail: Vec<Line<'static>>,
+        view_rows: usize,
+    ) {
+        if detail.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        let open = self.blocks[index]
+            .detail
+            .as_ref()
+            .is_some_and(|detail| detail.open);
+        self.blocks[index].detail = Some(Detail {
+            content: Content::Lines(detail),
+            lines: Vec::new(),
+            wrapped: Wrapped::default(),
+            open,
+            scroll: 0,
+            view_rows: view_rows.max(1),
+        });
+        self.remeasure(index, old_height);
     }
 
     fn attach_detail_content(&mut self, index: usize, detail: Content, view_rows: usize) {
@@ -611,6 +712,12 @@ impl Transcript {
         self.scroll == 0
     }
 
+    /// Advance the paint-only animation for a live task status. This does not
+    /// change line content or wrapping, so a tick remains O(viewport height).
+    pub fn set_task_activity_frame(&mut self, frame: usize) {
+        self.task_activity_frame = frame;
+    }
+
     pub fn render(&mut self, buf: &mut Buffer, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -643,6 +750,8 @@ impl Transcript {
                 }
                 let (line, _) = block.row(i);
                 let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
+                let is_live_task_status = i >= block.head_wrapped.len()
+                    && i < block.head_wrapped.len() + block.status_wrapped.len();
                 let content_width = line_display_width(&line).min(area.width as usize);
                 line.render(
                     Rect {
@@ -653,6 +762,16 @@ impl Transcript {
                     },
                     buf,
                 );
+                if is_live_task_status {
+                    for x in 0..content_width {
+                        buf[(area.x + x as u16, y)].set_fg(
+                            crate::theme::task_activity_animation_color(
+                                self.task_activity_frame,
+                                x,
+                            ),
+                        );
+                    }
+                }
                 if is_hovered_head {
                     for x in 0..content_width {
                         buf[(area.x + x as u16, y)].set_style(crate::theme::hover_highlight());
@@ -719,7 +838,9 @@ impl Transcript {
             .pos_at(x, y)
             .and_then(|(row, _)| self.block_at(row))
             .map(|(index, _)| index)
-            .filter(|&index| self.blocks[index].detail.is_some());
+            .filter(|&index| {
+                self.blocks[index].detail.is_some() || self.blocks[index].task_run.is_some()
+            });
         if hovered == self.hovered {
             return;
         }
@@ -1399,6 +1520,35 @@ mod tests {
         t.render(&mut buf, area);
         assert!(!buffer_text(&buf, area).contains("▸ 3 lines"));
         assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
+    }
+
+    #[test]
+    fn live_status_stays_visible_when_the_detail_is_folded_and_clears_cleanly() {
+        let mut t = Transcript::new(40);
+        t.push(vec![Line::raw("● Task")]);
+        t.attach_detail(0, vec![Line::raw("summary")], 5);
+        t.set_live_status(0, Some(vec![Line::raw("  ⠋ working · Search")]));
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+        t.set_task_activity_frame(0);
+        t.render(&mut buf, area);
+        assert_eq!(t.total(), 2, "status is visible outside the closed detail");
+        assert!(buffer_text(&buf, area).contains("working · Search"));
+        let first_frame = buf[(3, 1)].fg;
+
+        t.set_task_activity_frame(5);
+        t.render(&mut buf, area);
+        assert_ne!(
+            buf[(3, 1)].fg,
+            first_frame,
+            "the live status colour animates"
+        );
+
+        t.set_live_status(0, None);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        assert_eq!(t.total(), 1);
+        assert!(!buffer_text(&buf, area).contains("working · Search"));
     }
 
     #[test]

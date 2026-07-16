@@ -108,6 +108,10 @@ impl ToolRenderer for DefaultRenderer {
 struct TaskRenderer;
 
 impl ToolRenderer for TaskRenderer {
+    fn folds_result(&self, _input: &Value) -> bool {
+        true
+    }
+
     fn markdown_detail(&self, _input: Option<&Value>) -> bool {
         true
     }

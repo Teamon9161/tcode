@@ -99,6 +99,12 @@ impl Entry {
 /// inside the Ledger, it cannot be bypassed by a forgetful call site.
 pub trait LedgerSink: Send + Sync {
     fn record(&mut self, ev: &LogEvent);
+    /// Whether this sink wants `LogEvent::Batch` display labels. Task traces
+    /// opt in so replay can restore the loop's batch grouping; the main
+    /// session log keeps its format unchanged.
+    fn wants_batch_labels(&self) -> bool {
+        false
+    }
 }
 
 /// Append-only conversation ledger. The only legal mutations are
@@ -140,6 +146,21 @@ impl Ledger {
     pub fn record_aux(&mut self, ev: &LogEvent) {
         if let Some(sink) = &mut self.sink {
             sink.record(ev);
+        }
+    }
+
+    /// Record the display label the agent loop chose for a concurrent tool
+    /// batch. Only sinks that opt in receive it (see
+    /// [`LedgerSink::wants_batch_labels`]); replay then reads the recorded
+    /// value instead of re-deriving the grouping rule.
+    pub fn record_batch_label(&mut self, label: &str) {
+        if let Some(sink) = &mut self.sink {
+            if sink.wants_batch_labels() {
+                sink.record(&LogEvent::Batch {
+                    label: label.to_string(),
+                    after: self.entries.len(),
+                });
+            }
         }
     }
 

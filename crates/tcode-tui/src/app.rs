@@ -30,10 +30,13 @@ use tcode_core::{
 
 use crate::approval::{Dialog, DialogResult};
 use crate::editor::{Editor, Position};
+use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
 use crate::model_picker::{self, AgentMenu, ModelMenu};
 use crate::render::{shorten_summary_path, CallRoute, RenderRegistry};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
+use crate::view::{BakeCtx, SessionView};
+use crate::view_picker::{self, ViewId};
 use crate::{diff, markdown, theme, OpeningContextFn};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
@@ -42,9 +45,6 @@ type Term = Terminal<CrosstermBackend<Stdout>>;
 const WHEEL_STEP: usize = 3;
 /// Visible rows of an expanded tool-output region.
 const OUTPUT_VIEW_ROWS: usize = 12;
-/// Progress panel rows should stay small and predictable; long phase lists
-/// render as a focused window around the active phase instead of stealing scroll focus.
-const PROGRESS_VISIBLE_PHASES: usize = 5;
 
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
@@ -63,15 +63,16 @@ const PASTE_FOLD_CHARS: usize = 1_000;
 /// bulk or flicker of the legacy sparkle animation.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Half-block wordmark for the welcome banner. Both rows must stay the
-/// same character length: the gradient is per-column and the version tag
-/// hangs off the second row.
+/// The time window that turns two clicks on a parent task card into opening
+/// its isolated sub-agent trace.
+const TASK_CARD_DOUBLE_CLICK: Duration = Duration::from_millis(450);
+
 const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " █  █▄▄ █▄█ █▄▀ ██▄"];
 
 /// One of these shows per launch, picked at random: a discovery channel
 /// for features nobody reads /help for. Every entry must describe real,
 /// current behaviour — stale tips are worse than none.
-const TIPS: [&str; 9] = [
+const TIPS: [&str; 10] = [
     "shift+tab cycles permission modes",
     "esc esc rewinds the conversation · ctrl+r also restores files",
     "ctrl+c stops the turn and sends queued prompts right away — it never exits",
@@ -80,6 +81,7 @@ const TIPS: [&str; 9] = [
     "/model switches model mid-session · /agents pins sub-agent models",
     "/resume picks up an earlier session · /export saves the transcript",
     "/compact squeezes a long conversation back into budget",
+    "click the agent tree to expand a task; double-click it to open its trace",
     "/note slips the model an aside without starting a turn",
 ];
 
@@ -95,8 +97,9 @@ fn tip_line(tip: &str) -> Line<'static> {
 /// Commands whose substance drives frontend-owned objects (key table, model
 /// picker, provider wizard). Everything else lives in the shared
 /// `CommandRegistry` in tcode-core.
-const UI_COMMANDS: [(&str, &str); 4] = [
+const UI_COMMANDS: [(&str, &str); 5] = [
     ("/help", "show keys and commands"),
+    ("/views", "switch concurrent sessions"),
     ("/model", "switch model · adjust reasoning effort"),
     (
         "/agents",
@@ -186,6 +189,15 @@ enum Phase {
     },
 }
 
+/// Lazily materialized task transcript. It is rebuilt from the durable trace
+/// or from retained live events each time it is opened, keeping only one extra
+/// transcript resident while the main conversation continues in the background.
+struct TraceView {
+    run: String,
+    view: SessionView,
+    consumed: usize,
+}
+
 /// The input's visual layout. The editor deliberately stores logical lines
 /// only; this is the terminal-width-aware projection used for rendering.
 struct EditorLayout {
@@ -223,6 +235,13 @@ struct InputHitbox {
     editor_start: usize,
 }
 
+/// The agent tree's rendered area plus the action target each inner row owns
+/// (border rows excluded, indexes parallel the panel's content lines).
+struct PanelHitbox {
+    rect: Rect,
+    targets: Vec<Option<PanelTarget>>,
+}
+
 #[derive(Clone, Copy)]
 struct StatusHitboxes {
     mode: Rect,
@@ -236,6 +255,9 @@ enum StatusHover {
 }
 
 struct PendingCall {
+    /// Provider-issued id retained until the matching result arrives. Task
+    /// trace metadata uses this as the parent-call key.
+    call_id: String,
     detail: String,
     /// Batch items defer their indented summary row (plus any diff) so
     /// `ToolEnd` can bake it directly above this call's own result instead of
@@ -251,6 +273,7 @@ struct PendingCall {
 /// A tool call recovered from the ledger during replay, with the batch it
 /// was executed in (asked of core, never re-derived here).
 struct ReplayCall {
+    id: String,
     name: String,
     input: serde_json::Value,
     batch: Option<ReplayBatch>,
@@ -303,17 +326,6 @@ impl ResultDetail {
             Self::Lines(lines) => lines.is_empty(),
             Self::Markdown(document) => document.is_empty(),
         }
-    }
-}
-
-struct ProgressPhase {
-    phase: String,
-    status: String,
-}
-
-impl ProgressPhase {
-    fn is_completed(&self) -> bool {
-        self.status == "completed"
     }
 }
 
@@ -411,6 +423,14 @@ pub struct App {
     /// Clickable regions for the mode and model values in the idle status row.
     /// They are computed from the final rendered layout every frame.
     status_hitboxes: Option<StatusHitboxes>,
+    /// Where the persistent agent tree rendered this frame and which action
+    /// target each row owns.
+    live_panel_hitbox: Option<PanelHitbox>,
+    /// Tree row currently under the pointer; rendered with the shared hover
+    /// background so its click behavior is discoverable.
+    live_panel_hover: Option<PanelTarget>,
+    /// Previous parent-task-card press for double-click-to-open-trace behavior.
+    last_task_card_click: Option<(String, Instant)>,
     /// Which clickable status value the pointer currently rests over.
     status_hover: Option<StatusHover>,
     input_mouse_active: bool,
@@ -444,6 +464,17 @@ pub struct App {
     /// order. Keeping them queued lets each result retain its own input.
     pending_batch: VecDeque<PendingCall>,
     progress: Vec<ProgressPhase>,
+    /// `task` sub-agent runs of this conversation, fed by `TaskRun*` events.
+    /// Running ones show live in the panel above the input; finished ones
+    /// stay as the registry the trace viewer will list.
+    task_runs: Vec<UiTaskRun>,
+    /// Root containing `tN.jsonl` trace files for this selected session. It is
+    /// retained while a turn owns `Session`, so task cards can open their
+    /// trace during live work.
+    task_trace_root: Option<PathBuf>,
+    active_view: ViewId,
+    trace_view: Option<TraceView>,
+    view_picker: Option<view_picker::Picker>,
     last_esc: Option<Instant>,
     popup_index: usize,
     /// Tab accepted this exact `@` marker. Keep its completion closed until the
@@ -524,6 +555,8 @@ impl App {
         let session_dogfood = session.dogfood();
         let cwd = session.tool_ctx.cwd.clone();
         let scratch_dir = session.tool_ctx.scratch_dir.clone();
+        let task_trace_root = task_trace_root(&session);
+        let task_runs = discover_task_runs(task_trace_root.as_deref());
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
             agent.estimate_context_tokens(&session)
@@ -572,6 +605,9 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             input_hitbox: None,
             status_hitboxes: None,
+            live_panel_hitbox: None,
+            live_panel_hover: None,
+            last_task_card_click: None,
             status_hover: None,
             input_mouse_active: false,
             input_dragged: false,
@@ -589,6 +625,11 @@ impl App {
             pending_tool: None,
             pending_batch: VecDeque::new(),
             progress: Vec::new(),
+            task_runs,
+            task_trace_root,
+            active_view: ViewId::Main,
+            trace_view: None,
+            view_picker: None,
             last_esc: None,
             popup_index: 0,
             dismissed_reference: None,
@@ -927,7 +968,15 @@ impl App {
                             header: (index == 0).then(|| label.clone()),
                             mixed,
                         });
-                        calls.insert(id, ReplayCall { name, input, batch });
+                        calls.insert(
+                            id.clone(),
+                            ReplayCall {
+                                id,
+                                name,
+                                input,
+                                batch,
+                            },
+                        );
                     }
                 }
                 tcode_core::Entry::IncompleteAssistant { text, error } => {
@@ -1012,6 +1061,13 @@ impl App {
                         self.transcript.push(std::mem::take(&mut lines));
                         // Bake this call's header (+ diff / command block)
                         // right above its own result.
+                        let run_id = call.and_then(|call| {
+                            self.task_runs
+                                .iter()
+                                .find(|run| run.parent_call == call.id)
+                                .map(|run| run.id.clone())
+                        });
+                        let blocks_before = self.transcript.block_count();
                         let record = match call {
                             Some(call) => match &call.batch {
                                 Some(batch) => {
@@ -1033,14 +1089,27 @@ impl App {
                             None => CallRecord::Baked,
                         };
                         let preview = result_preview(content);
+                        let report = run_id.as_ref().map(|_| task_result_text(content));
                         self.bake_call_result(
                             name,
                             call.map(|c| &c.input),
                             &preview,
-                            content,
+                            report.as_deref().unwrap_or(content),
                             *is_error,
                             record,
                         );
+                        if let Some(run) =
+                            run_id.filter(|_| self.transcript.block_count() > blocks_before)
+                        {
+                            if let Some(index) = self.transcript.last_block_index() {
+                                self.transcript.link_task_run(index, run.clone());
+                                if let Some(entry) =
+                                    self.task_runs.iter_mut().find(|entry| entry.id == run)
+                                {
+                                    entry.block = Some(index);
+                                }
+                            }
+                        }
                         space_before_assistant_text = true;
                     }
                 }
@@ -1404,12 +1473,13 @@ impl App {
                 // batch (e.g. "Read 5 files") needs no per-item prefix.
                 let mixed = calls
                     .iter()
-                    .map(|(n, _)| n.as_str())
+                    .map(|(_, n, _)| n.as_str())
                     .collect::<HashSet<_>>()
                     .len()
                     > 1;
-                for (name, input) in calls {
+                for (call_id, name, input) in calls {
                     self.pending_batch.push_back(PendingCall {
+                        call_id,
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
                         header: self.batch_item_lines(&name, &input, mixed),
                         header_index: None,
@@ -1418,6 +1488,7 @@ impl App {
                 self.state_label = format!("running: {label}");
             }
             AgentEvent::ToolStart {
+                call_id,
                 name,
                 summary,
                 input,
@@ -1458,6 +1529,7 @@ impl App {
                     None
                 };
                 self.pending_tool = Some(PendingCall {
+                    call_id,
                     detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
                     header: Vec::new(),
                     header_index,
@@ -1465,11 +1537,11 @@ impl App {
                 self.state_label = format!("running: {summary}");
             }
             AgentEvent::ToolEnd {
+                call_id,
                 name,
                 preview,
                 content,
                 is_error,
-                ..
             } => {
                 if !is_error
                     && self
@@ -1484,10 +1556,31 @@ impl App {
                     self.state_label = "responding".into();
                     return;
                 }
+                let task_run = self
+                    .task_runs
+                    .iter()
+                    .find(|run| run.parent_call == call_id)
+                    .map(|run| run.id.clone());
+                let linked_run = task_run
+                    .as_ref()
+                    .and_then(|run| {
+                        self.task_runs
+                            .iter()
+                            .find(|entry| entry.id == *run && entry.block.is_none())
+                    })
+                    .map(|run| run.id.clone());
+                let blocks_before = self.transcript.block_count();
                 let entry = self
                     .pending_tool
                     .take()
-                    .or_else(|| self.pending_batch.pop_front());
+                    .filter(|entry| entry.call_id == call_id)
+                    .or_else(|| {
+                        let position = self
+                            .pending_batch
+                            .iter()
+                            .position(|entry| entry.call_id == call_id)?;
+                        self.pending_batch.remove(position)
+                    });
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
                 let (input, record) = match entry {
@@ -1512,7 +1605,26 @@ impl App {
                 self.context_tokens = self
                     .context_tokens
                     .saturating_add(approx_tokens(&content) as u64);
-                self.bake_call_result(&name, input.as_ref(), &preview, &content, is_error, record);
+                let report = task_run.as_ref().map(|_| task_result_text(&content));
+                self.bake_call_result(
+                    &name,
+                    input.as_ref(),
+                    &preview,
+                    report.as_deref().unwrap_or(&content),
+                    is_error,
+                    record,
+                );
+                if let Some(run) =
+                    linked_run.filter(|_| self.transcript.block_count() > blocks_before)
+                {
+                    if let Some(index) = self.transcript.last_block_index() {
+                        self.transcript.link_task_run(index, run.clone());
+                        if let Some(entry) = self.task_runs.iter_mut().find(|entry| entry.id == run)
+                        {
+                            entry.block = Some(index);
+                        }
+                    }
+                }
                 self.space_before_response = true;
                 self.state_label = "responding".into();
             }
@@ -1523,9 +1635,11 @@ impl App {
                 self.context_tokens = self.context_tokens.saturating_add(added_tokens as u64);
                 let count = labels.len();
                 let summary = labels.into_iter().take(2).collect::<Vec<_>>().join(", ");
-                let more = (count > 2)
-                    .then(|| format!(" +{}", count - 2))
-                    .unwrap_or_default();
+                let more = if count > 2 {
+                    format!(" +{}", count - 2)
+                } else {
+                    String::new()
+                };
                 self.notice = Some((format!("referenced {summary}{more}"), Instant::now()));
             }
             AgentEvent::QueuedInput {
@@ -1602,6 +1716,117 @@ impl App {
                 self.turn_usage = add_usage(self.turn_usage, u);
                 self.out_tokens = self.out_tokens.saturating_add(u.output_tokens as usize);
                 self.state_label = "sub-agent working".into();
+            }
+            AgentEvent::TaskRunEvent { run, event } => {
+                let trace_event = (*event).clone();
+                // Usage inside a run carries delegated semantics: billable,
+                // animates the counter, never the parent's context meter.
+                if let AgentEvent::Usage(u) | AgentEvent::DelegatedUsage(u) = event.as_ref() {
+                    self.delegated_usage = add_usage(self.delegated_usage, *u);
+                    self.turn_usage = add_usage(self.turn_usage, *u);
+                    self.out_tokens = self.out_tokens.saturating_add(u.output_tokens as usize);
+                }
+                let live_detail =
+                    self.task_runs
+                        .iter_mut()
+                        .find(|entry| entry.id == run)
+                        .map(|entry| {
+                            entry.note_event(&event, &self.renderers, &self.cwd);
+                            entry.events.push(trace_event);
+                            (
+                                entry.block,
+                                task_live_detail(&entry.summary, &entry.steps),
+                                task_live_status(&entry.activity),
+                            )
+                        });
+                if let Some((Some(block), detail, status)) = live_detail {
+                    self.transcript
+                        .replace_detail_preserving_open(block, detail, OUTPUT_VIEW_ROWS);
+                    self.transcript.set_live_status(block, Some(status));
+                }
+                self.refresh_open_trace(&run);
+            }
+            AgentEvent::TaskRunStarted {
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+            } => {
+                // ToolStart always precedes a task's delegated start. Single
+                // calls already have a header block; batch calls receive their
+                // link when their item bakes at ToolEnd.
+                let mut block = self
+                    .pending_tool
+                    .as_ref()
+                    .filter(|call| call.call_id == parent_call)
+                    .and_then(|call| call.header_index);
+                if let Some(index) = block {
+                    self.transcript.link_task_run(index, run.clone());
+                    self.transcript.attach_detail(
+                        index,
+                        task_summary_detail(&summary),
+                        OUTPUT_VIEW_ROWS,
+                    );
+                    self.transcript
+                        .set_live_status(index, Some(task_live_status("starting…")));
+                } else if let Some(position) = self
+                    .pending_batch
+                    .iter()
+                    .position(|call| call.call_id == parent_call)
+                {
+                    // A parallel task's batch item normally waits for its
+                    // result. It is a live trace card, though, so bake it now
+                    // and retain the header index for the eventual report.
+                    let mut call = self
+                        .pending_batch
+                        .remove(position)
+                        .expect("position checked");
+                    let index = self.transcript.block_count();
+                    self.bake(std::mem::take(&mut call.header));
+                    call.header_index = Some(index);
+                    self.pending_batch.insert(position, call);
+                    block = Some(index);
+                    self.transcript.link_task_run(index, run.clone());
+                    self.transcript.attach_detail(
+                        index,
+                        task_summary_detail(&summary),
+                        OUTPUT_VIEW_ROWS,
+                    );
+                    self.transcript
+                        .set_live_status(index, Some(task_live_status("starting…")));
+                }
+                self.task_runs.push(UiTaskRun::new(
+                    run,
+                    parent_call,
+                    kind,
+                    model,
+                    prompt,
+                    summary,
+                    block,
+                ));
+            }
+            AgentEvent::TaskRunFinished {
+                run,
+                status,
+                tool_calls,
+                usage,
+            } => {
+                let block = self
+                    .task_runs
+                    .iter_mut()
+                    .find(|r| r.id == run)
+                    .map(|entry| {
+                        entry.status = status;
+                        entry.tools = tool_calls;
+                        entry.usage = usage;
+                        entry.block
+                    });
+                if let Some(Some(block)) = block {
+                    self.transcript.set_live_status(block, None);
+                }
+                self.finish_open_trace(&run);
             }
             AgentEvent::Compacting => {
                 self.bake(vec![Line::styled(
@@ -2318,7 +2543,10 @@ impl App {
     }
 
     fn on_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.model_picker.is_none() && self.mode_picker.is_none() && self.agent_picker.is_none()
+        if self.view_picker.is_none()
+            && self.model_picker.is_none()
+            && self.mode_picker.is_none()
+            && self.agent_picker.is_none()
         {
             return false;
         }
@@ -2329,9 +2557,14 @@ impl App {
         }
         let height = area_height(&self.terminal);
         let lines = self
-            .model_picker
+            .view_picker
             .as_ref()
-            .map(|picker| picker.render(&self.menu))
+            .map(|picker| picker.render())
+            .or_else(|| {
+                self.model_picker
+                    .as_ref()
+                    .map(|picker| picker.render(&self.menu))
+            })
             .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
             .or_else(|| {
                 self.agent_picker
@@ -2344,13 +2577,22 @@ impl App {
             .max(1);
         let panel_top = height.saturating_sub(panel_h);
         if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
+            self.view_picker = None;
             self.model_picker = None;
             self.mode_picker = None;
             self.agent_picker = None;
             return true;
         }
         let row = mouse.row.saturating_sub(panel_top + 1) as usize;
-        if let Some(picker) = self.model_picker.as_mut() {
+        if let Some(picker) = self.view_picker.as_mut() {
+            match picker.handle_mouse_row(row) {
+                view_picker::PickResult::Picked(id) => {
+                    self.view_picker = None;
+                    self.open_view(id);
+                }
+                view_picker::PickResult::Cancelled | view_picker::PickResult::Pending => {}
+            }
+        } else if let Some(picker) = self.model_picker.as_mut() {
             match picker.handle_mouse_row(row) {
                 model_picker::PickResult::Picked {
                     option: Some(index),
@@ -2387,7 +2629,7 @@ impl App {
         if hover.is_some() {
             // A status value is an interactive control, not transcript content:
             // clear a prior tool-row highlight before painting its replacement.
-            self.transcript.clear_hover();
+            self.active_transcript_mut().clear_hover();
         }
         hover.is_some()
     }
@@ -2410,6 +2652,50 @@ impl App {
             return true;
         }
         false
+    }
+
+    fn panel_target_at(&self, x: u16, y: u16) -> Option<PanelTarget> {
+        let hitbox = self.live_panel_hitbox.as_ref()?;
+        if y <= hitbox.rect.y || y >= hitbox.rect.bottom().saturating_sub(1) || x < hitbox.rect.x {
+            return None;
+        }
+        let row = y.saturating_sub(hitbox.rect.y + 1) as usize;
+        hitbox.targets.get(row).and_then(Clone::clone)
+    }
+
+    fn on_live_panel_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let target = self.panel_target_at(mouse.column, mouse.row);
+        let inside = self.live_panel_hitbox.as_ref().is_some_and(|hitbox| {
+            mouse.column >= hitbox.rect.x
+                && mouse.column < hitbox.rect.right()
+                && mouse.row >= hitbox.rect.y
+                && mouse.row < hitbox.rect.bottom()
+        });
+        if target != self.live_panel_hover {
+            self.live_panel_hover = target;
+        }
+        if inside {
+            self.status_hover = None;
+            self.active_transcript_mut().clear_hover();
+        }
+        inside
+    }
+
+    fn on_live_panel_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let Some(target) = self.panel_target_at(mouse.column, mouse.row) else {
+            return false;
+        };
+        match target {
+            PanelTarget::Main => self.open_view(ViewId::Main),
+            // The bottom tree is navigation only. Detail belongs to the parent
+            // conversation's task card, which has the normal fold/double-click
+            // interaction.
+            PanelTarget::Task(run) => self.open_view(ViewId::TaskRun(run)),
+        }
+        true
     }
 
     fn on_term_event(&mut self, ev: Event) {
@@ -2443,6 +2729,14 @@ impl App {
                 if self.on_picker_mouse(mouse) {
                     return;
                 }
+                if matches!(mouse.kind, MouseEventKind::Moved)
+                    && self.on_live_panel_mouse_moved(mouse)
+                {
+                    return;
+                }
+                if self.on_live_panel_mouse_down(mouse) {
+                    return;
+                }
                 if matches!(mouse.kind, MouseEventKind::Moved) && self.on_status_mouse_moved(mouse)
                 {
                     return;
@@ -2451,7 +2745,9 @@ impl App {
                     return;
                 }
                 match mouse.kind {
-                    MouseEventKind::Moved => self.transcript.mouse_moved(mouse.column, mouse.row),
+                    MouseEventKind::Moved => self
+                        .active_transcript_mut()
+                        .mouse_moved(mouse.column, mouse.row),
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = mouse.kind == MouseEventKind::ScrollUp;
                         // Over the input box the wheel scrolls the prompt itself:
@@ -2472,28 +2768,34 @@ impl App {
                                 self.editor_visual_down()
                             };
                         if !moved_input {
-                            self.transcript
-                                .wheel(mouse.column, mouse.row, up, WHEEL_STEP);
+                            self.active_transcript_mut().wheel(
+                                mouse.column,
+                                mouse.row,
+                                up,
+                                WHEEL_STEP,
+                            );
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.drag_scroll = None;
                         let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
                         if !taken_by_input {
-                            self.transcript.mouse_down(mouse.column, mouse.row);
+                            self.active_transcript_mut()
+                                .mouse_down(mouse.column, mouse.row);
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left) => {
                         if self.input_mouse_active {
                             self.input_mouse_drag(mouse.column, mouse.row);
                         } else {
-                            self.transcript.mouse_drag(mouse.column, mouse.row);
+                            let drag_edge = {
+                                let transcript = self.active_transcript_mut();
+                                transcript.mouse_drag(mouse.column, mouse.row);
+                                transcript.drag_edge(mouse.row)
+                            };
                             // Arm edge auto-scroll when the drag reaches a view
                             // edge; disarm the moment it returns inside.
-                            self.drag_scroll = self
-                                .transcript
-                                .drag_edge(mouse.row)
-                                .map(|up| (up, mouse.column, mouse.row));
+                            self.drag_scroll = drag_edge.map(|up| (up, mouse.column, mouse.row));
                         }
                     }
                     // Any button release ends the drag (defensive: some terminals
@@ -2506,13 +2808,25 @@ impl App {
             // rewraps lazily from the new area width.
             Event::Resize(..) => {
                 self.status_hover = None;
-                self.transcript.clear_hover();
+                self.live_panel_hover = None;
+                self.active_transcript_mut().clear_hover();
             }
             _ => {}
         }
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        if let Some(picker) = self.view_picker.as_mut() {
+            match picker.handle_key(key) {
+                view_picker::PickResult::Pending => {}
+                view_picker::PickResult::Cancelled => self.view_picker = None,
+                view_picker::PickResult::Picked(id) => {
+                    self.view_picker = None;
+                    self.open_view(id);
+                }
+            }
+            return;
+        }
         // Model picker captures everything while open.
         if let Some(picker) = self.resume_picker.as_mut() {
             match picker.handle_key(key) {
@@ -2571,6 +2885,18 @@ impl App {
                     self.agent_picker = None;
                     self.apply_agent_model(&kind, option, effort);
                 }
+            }
+            return;
+        }
+
+        if !matches!(self.active_view, ViewId::Main) {
+            match key.code {
+                KeyCode::Esc => self.open_view(ViewId::Main),
+                KeyCode::PageUp => self.active_transcript_mut().page_up(),
+                KeyCode::PageDown => self.active_transcript_mut().page_down(),
+                KeyCode::Up => self.active_transcript_mut().scroll_up(1),
+                KeyCode::Down => self.active_transcript_mut().scroll_down(1),
+                _ => {}
             }
             return;
         }
@@ -3064,6 +3390,10 @@ impl App {
                 self.show_help();
                 return;
             }
+            "/views" => {
+                self.open_view_picker();
+                return;
+            }
             "/provider" => {
                 self.provider_setup_requested = true;
                 self.should_exit = true;
@@ -3255,8 +3585,25 @@ impl App {
         self.drag_scroll = None;
         if self.input_mouse_active {
             self.input_mouse_up(x, y);
-        } else if let Some(text) = self.transcript.mouse_up() {
-            self.copy_selection(text);
+        } else {
+            let linked = self.active_transcript().selected_task_run();
+            let copied = self.active_transcript_mut().mouse_up();
+            if let Some(run) = linked {
+                let double = self
+                    .last_task_card_click
+                    .as_ref()
+                    .is_some_and(|(previous, at)| {
+                        previous == &run && at.elapsed() <= TASK_CARD_DOUBLE_CLICK
+                    });
+                if double {
+                    self.last_task_card_click = None;
+                    self.open_view(ViewId::TaskRun(run));
+                } else {
+                    self.last_task_card_click = Some((run, Instant::now()));
+                }
+            } else if let Some(text) = copied {
+                self.copy_selection(text);
+            }
         }
     }
 
@@ -3274,22 +3621,22 @@ impl App {
             self.drag_scroll = None;
             return;
         }
-        let before = self.transcript.scroll_offset();
+        let before = self.active_transcript().scroll_offset();
         if toward_older {
-            self.transcript.scroll_up(1);
+            self.active_transcript_mut().scroll_up(1);
         } else {
-            self.transcript.scroll_down(1);
+            self.active_transcript_mut().scroll_down(1);
         }
-        if self.transcript.scroll_offset() == before {
+        if self.active_transcript().scroll_offset() == before {
             // Hit the content edge: stop and copy what is now selected, so the
             // gesture completes even if its release was lost outside the window.
             self.drag_scroll = None;
-            if let Some(text) = self.transcript.mouse_up() {
+            if let Some(text) = self.active_transcript_mut().mouse_up() {
                 self.copy_selection(text);
             }
             return;
         }
-        self.transcript.mouse_drag(x, y);
+        self.active_transcript_mut().mouse_drag(x, y);
     }
 
     fn input_mouse_up(&mut self, x: u16, y: u16) {
@@ -3648,6 +3995,11 @@ impl App {
         self.context_step_start = self.context_tokens;
         self.prev_cache_ratio = None;
         self.progress.clear();
+        self.task_trace_root = self.session.as_ref().and_then(task_trace_root);
+        self.task_runs = discover_task_runs(self.task_trace_root.as_deref());
+        self.active_view = ViewId::Main;
+        self.trace_view = None;
+        self.view_picker = None;
         self.pending_tool = None;
         self.pending_batch.clear();
         self.thinking_text.clear();
@@ -3770,6 +4122,157 @@ impl App {
         }
     }
 
+    fn active_transcript(&self) -> &Transcript {
+        match (&self.active_view, &self.trace_view) {
+            (ViewId::TaskRun(id), Some(trace)) if trace.run == *id => &trace.view.transcript,
+            _ => &self.transcript,
+        }
+    }
+
+    fn active_transcript_mut(&mut self) -> &mut Transcript {
+        match (&self.active_view, &mut self.trace_view) {
+            (ViewId::TaskRun(id), Some(trace)) if trace.run == *id => &mut trace.view.transcript,
+            _ => &mut self.transcript,
+        }
+    }
+
+    fn view_entries(&self) -> Vec<view_picker::ViewEntry> {
+        // Task traces are navigated from their task header or the live agent
+        // tree. `/views` deliberately reserves this picker for concurrent
+        // top-level sessions, whose registry has not been introduced yet.
+        vec![view_picker::ViewEntry {
+            id: ViewId::Main,
+            title: "current session".into(),
+            detail: if matches!(self.phase, Phase::Running { .. }) {
+                "running".into()
+            } else {
+                "idle".into()
+            },
+            active: self.active_view == ViewId::Main,
+        }]
+    }
+
+    fn open_view_picker(&mut self) {
+        let entries = self.view_entries();
+        if entries.len() < 2 {
+            self.notice = Some(("no other active sessions".into(), Instant::now()));
+            return;
+        }
+        self.view_picker = view_picker::Picker::new(entries, &self.active_view);
+    }
+
+    fn open_view(&mut self, id: ViewId) {
+        if id == ViewId::Main {
+            self.active_view = ViewId::Main;
+            self.trace_view = None;
+            self.drag_scroll = None;
+            return;
+        }
+        let run_id = match &id {
+            ViewId::TaskRun(run_id) => run_id.clone(),
+            ViewId::Main => return,
+        };
+        let Some(run) = self.task_runs.iter().find(|run| run.id == run_id) else {
+            self.notice = Some(("task trace is no longer available".into(), Instant::now()));
+            return;
+        };
+        let width = area_width(&self.terminal);
+        let mut view = SessionView::new(width);
+        let status = run.status;
+        let header = vec![Line::from(vec![
+            Span::styled(
+                format!("{} {} {}", status_icon(status), run.id, run.kind),
+                theme::bold(),
+            ),
+            Span::styled(
+                format!(" · {} · {} tools", run.model, run.tools),
+                theme::dim(),
+            ),
+            Span::styled(format!(" · {}", status.label()), theme::dim()),
+        ])];
+        let prompt = run.prompt.clone();
+        let events = run.events.clone();
+        let path = self
+            .task_trace_root
+            .as_ref()
+            .map(|root| root.join(format!("{}.jsonl", run.id)));
+        let mut ctx = BakeCtx {
+            renderers: &self.renderers,
+            markdown: &mut self.md,
+            cwd: &self.cwd,
+            show_reasoning: self.show_reasoning,
+        };
+        view.bake(header);
+        view.transcript.push(prompt_echo(&prompt, &[]));
+        let mut consumed = 0;
+        if status != tcode_core::TaskRunStatus::Running {
+            if let Some(path) = path.filter(|path| path.exists()) {
+                match tcode_core::TaskTraces::load(&path) {
+                    Ok(load) => {
+                        view.replay_task_ledger(load.ledger.entries(), &load.batch_labels, &mut ctx)
+                    }
+                    Err(error) => view.bake(vec![Line::styled(
+                        format!("could not load trace: {error}"),
+                        theme::error_highlight(),
+                    )]),
+                }
+            } else {
+                for event in &events {
+                    view.feed_event(event, &mut ctx);
+                }
+                consumed = events.len();
+            }
+        } else {
+            for event in &events {
+                view.feed_event(event, &mut ctx);
+            }
+            consumed = events.len();
+        }
+        self.active_view = id;
+        self.trace_view = Some(TraceView {
+            run: run_id.clone(),
+            view,
+            consumed,
+        });
+        self.drag_scroll = None;
+    }
+
+    fn refresh_open_trace(&mut self, run: &str) {
+        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == run) else {
+            return;
+        };
+        let Some(task) = self.task_runs.iter().find(|task| task.id == run) else {
+            return;
+        };
+        let events: Vec<AgentEvent> = task.events.iter().skip(trace.consumed).cloned().collect();
+        if events.is_empty() {
+            return;
+        }
+        let mut ctx = BakeCtx {
+            renderers: &self.renderers,
+            markdown: &mut self.md,
+            cwd: &self.cwd,
+            show_reasoning: self.show_reasoning,
+        };
+        for event in &events {
+            trace.view.feed_event(event, &mut ctx);
+        }
+        trace.consumed += events.len();
+    }
+
+    fn finish_open_trace(&mut self, run: &str) {
+        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == run) else {
+            return;
+        };
+        let mut ctx = BakeCtx {
+            renderers: &self.renderers,
+            markdown: &mut self.md,
+            cwd: &self.cwd,
+            show_reasoning: self.show_reasoning,
+        };
+        trace.view.finish(&mut ctx);
+    }
+
     fn update_progress(&mut self, input: &serde_json::Value) {
         // `plan` / `step` keep resumed sessions created before the rename
         // readable; live calls use `phases` / `phase` exclusively.
@@ -3796,65 +4299,37 @@ impl App {
             .collect();
     }
 
-    fn progress_lines(&self) -> Vec<Line<'static>> {
-        if self.progress.is_empty() {
-            return Vec::new();
-        }
-        let complete = self
-            .progress
+    /// The persistent agent tree: progress phases plus the root conversation
+    /// and only currently working task runs. Completed traces remain reachable
+    /// from their parent task headers, not as stale tree children.
+    fn live_panel_lines(&self) -> (Vec<Line<'static>>, Vec<Option<PanelTarget>>) {
+        let running: Vec<&UiTaskRun> = self
+            .task_runs
             .iter()
-            .filter(|item| item.is_completed())
-            .count();
-        let (start, end) = visible_phase_range(&self.progress, PROGRESS_VISIBLE_PHASES);
-        let hidden_before = start;
-        let hidden_after = self.progress.len().saturating_sub(end);
-        let mut lines = vec![Line::from(vec![
-            Span::styled("  progress ", theme::bold().fg(theme::ACCENT)),
-            Span::styled(
-                format!("{complete}/{} phases complete", self.progress.len()),
-                theme::dim(),
-            ),
-            if hidden_before + hidden_after > 0 {
-                Span::styled(format!(" · showing {}-{}", start + 1, end), theme::dim())
-            } else {
-                Span::raw("")
+            .filter(|run| run.status == tcode_core::TaskRunStatus::Running)
+            .collect();
+        let started = match &self.phase {
+            Phase::Running { started, .. } => Some(*started),
+            Phase::Idle => None,
+        };
+        live_panel::lines(
+            &self.progress,
+            &running,
+            MainAgent {
+                running: started.is_some(),
+                activity: if self.state_label.is_empty() {
+                    "working…"
+                } else {
+                    &self.state_label
+                },
+                elapsed_secs: started
+                    .map(|started| started.elapsed().as_secs())
+                    .unwrap_or(0),
+                output_tokens: self.out_tokens,
             },
-        ])];
-        if hidden_before > 0 {
-            lines.push(Line::styled(
-                format!("    … {hidden_before} earlier"),
-                theme::dim(),
-            ));
-        }
-        lines.extend(self.progress[start..end].iter().map(|item| {
-            let (marker, style) = match item.status.as_str() {
-                "completed" => ("✓ ", ratatui::style::Style::default().fg(theme::OK)),
-                "in_progress" => ("● ", theme::accent()),
-                _ => ("○ ", theme::dim()),
-            };
-            Line::from(vec![
-                Span::styled(format!("    {marker}"), style),
-                Span::styled(
-                    item.phase.clone(),
-                    if item.status == "completed" {
-                        ratatui::style::Style::default()
-                            .fg(theme::OK)
-                            .add_modifier(ratatui::style::Modifier::CROSSED_OUT)
-                    } else if item.status == "pending" {
-                        theme::dim()
-                    } else {
-                        ratatui::style::Style::default()
-                    },
-                ),
-            ])
-        }));
-        if hidden_after > 0 {
-            lines.push(Line::styled(
-                format!("    … {hidden_after} later"),
-                theme::dim(),
-            ));
-        }
-        lines
+            area_width(&self.terminal),
+            self.live_panel_hover.as_ref(),
+        )
     }
 
     /// Ask, off-thread, what the user probably wants next. It runs on its own
@@ -3978,24 +4453,27 @@ impl App {
         let status = self.status_line(running, started);
         let hint = self.idle_hint();
         let status_model_label = self.agent.model.snapshot().describe();
+        let viewing_trace = !matches!(self.active_view, ViewId::Main);
         let dialog_lines = self
-            .resume_picker
+            .view_picker
             .as_ref()
-            .map(|p| p.render())
-            .or_else(|| self.model_picker.as_ref().map(|p| p.render(&self.menu)))
-            .or_else(|| self.mode_picker.as_ref().map(|p| p.render()))
+            .map(|picker| picker.render())
+            .or_else(|| self.resume_picker.as_ref().map(|picker| picker.render()))
+            .or_else(|| {
+                self.model_picker
+                    .as_ref()
+                    .map(|picker| picker.render(&self.menu))
+            })
+            .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
             .or_else(|| {
                 self.agent_picker
                     .as_ref()
-                    .map(|p| p.render(&self.menu, &self.agents))
+                    .map(|picker| picker.render(&self.menu, &self.agents))
             })
             .or_else(|| {
-                self.dialog.as_ref().map(|(d, _)| {
-                    // The plan pane scrolls its own body: cap it to the space the
-                    // panel can occupy (the transcript keeps a few rows) so a long
-                    // plan does not push the options and hint off screen.
+                self.dialog.as_ref().map(|(dialog, _)| {
                     let budget = area_height(&self.terminal).saturating_sub(6);
-                    d.render(area_width(&self.terminal), budget)
+                    dialog.render(area_width(&self.terminal), budget)
                 })
             });
         // A focused note in the approval dialog exposes its caret cell (set by
@@ -4003,6 +4481,7 @@ impl App {
         // keeps the OS IME composition window tracking the caret. Only valid
         // when the dialog — not a picker — produced the lines this frame.
         let dialog_owns_panel = dialog_lines.is_some()
+            && self.view_picker.is_none()
             && self.resume_picker.is_none()
             && self.model_picker.is_none()
             && self.mode_picker.is_none()
@@ -4031,8 +4510,12 @@ impl App {
             Vec::new()
         };
         let popup_index = self.popup_index.min(popup.len().saturating_sub(1));
-        let progress_lines = self.progress_lines();
-        let queued_lines = self.queued_lines(area_width(&self.terminal));
+        let (panel_lines, panel_targets) = self.live_panel_lines();
+        let queued_lines = if viewing_trace {
+            Vec::new()
+        } else {
+            self.queued_lines(area_width(&self.terminal))
+        };
 
         use ratatui::widgets::{Block, BorderType, Clear};
 
@@ -4042,7 +4525,20 @@ impl App {
         // replaces the input box.
         let mut captured_input: Option<InputHitbox> = None;
         let mut captured_status: Option<StatusHitboxes> = None;
-        let transcript = &mut self.transcript;
+        let mut captured_panel: Option<Rect> = None;
+        let task_activity_frame = self.spinner;
+        let transcript = match &self.active_view {
+            ViewId::Main => &mut self.transcript,
+            ViewId::TaskRun(_) => {
+                &mut self
+                    .trace_view
+                    .as_mut()
+                    .expect("active task view has trace")
+                    .view
+                    .transcript
+            }
+        };
+        transcript.set_task_activity_frame(task_activity_frame);
         self.terminal.draw(|frame| {
             let area = frame.area();
             // The lower panel changes height when a dialog opens, a paste is
@@ -4060,6 +4556,8 @@ impl App {
                 .clamp(1, 6) as u16;
             let panel_h = if let Some(lines) = &dialog_lines {
                 lines.len() as u16 + 2
+            } else if viewing_trace {
+                (!panel_lines.is_empty() as u16) * (panel_lines.len() as u16 + 2)
             } else {
                 let mut h = editor_h + 2 + 2; // input box + context meter + hint
                 if running {
@@ -4069,8 +4567,8 @@ impl App {
                     h += 2; // separator + spinner/status line above the input box
                 }
                 h += queued_lines.len() as u16;
-                if !progress_lines.is_empty() {
-                    h += progress_lines.len() as u16 + 2;
+                if !panel_lines.is_empty() {
+                    h += panel_lines.len() as u16 + 2;
                 }
                 if self.rate_limits.is_some() {
                     h += 1;
@@ -4117,16 +4615,35 @@ impl App {
                 return;
             }
 
-            if !progress_lines.is_empty() {
-                let h = progress_lines.len() as u16 + 2;
+            if viewing_trace {
+                if !panel_lines.is_empty() {
+                    let h = panel_lines.len() as u16 + 2;
+                    let rect = row(y, h);
+                    frame.render_widget(
+                        Paragraph::new(Text::from(panel_lines)).block(
+                            Block::bordered()
+                                .border_type(BorderType::Rounded)
+                                .border_style(theme::border()),
+                        ),
+                        rect,
+                    );
+                    captured_panel = Some(rect);
+                }
+                return;
+            }
+
+            if !panel_lines.is_empty() {
+                let h = panel_lines.len() as u16 + 2;
+                let rect = row(y, h);
                 frame.render_widget(
-                    Paragraph::new(Text::from(progress_lines)).block(
+                    Paragraph::new(Text::from(panel_lines)).block(
                         Block::bordered()
                             .border_type(BorderType::Rounded)
                             .border_style(theme::border()),
                     ),
-                    row(y, h),
+                    rect,
                 );
+                captured_panel = Some(rect);
                 y += h;
             }
 
@@ -4249,6 +4766,10 @@ impl App {
         })?;
         self.input_hitbox = captured_input;
         self.status_hitboxes = captured_status;
+        self.live_panel_hitbox = captured_panel.map(|rect| PanelHitbox {
+            rect,
+            targets: panel_targets,
+        });
         Ok(())
     }
 
@@ -4366,6 +4887,47 @@ impl App {
     }
 }
 
+fn task_trace_root(session: &Session) -> Option<PathBuf> {
+    tcode_core::store::project_data_dir(&session.tool_ctx.cwd).map(|root| {
+        root.join("tasks")
+            .join(session.prompt_variables().session_id())
+    })
+}
+
+fn discover_task_runs(root: Option<&std::path::Path>) -> Vec<UiTaskRun> {
+    let metas = root
+        .map(tcode_core::TaskTraces::discover)
+        .unwrap_or_default();
+    metas
+        .into_iter()
+        .map(|meta| {
+            let mut run = UiTaskRun::new(
+                meta.id,
+                meta.parent_call,
+                meta.kind,
+                meta.model,
+                meta.prompt,
+                meta.summary,
+                None,
+            );
+            run.status = meta.status;
+            run.tools = meta.tool_calls;
+            run.usage = meta.usage;
+            run
+        })
+        .collect()
+}
+
+fn status_icon(status: tcode_core::TaskRunStatus) -> &'static str {
+    match status {
+        tcode_core::TaskRunStatus::Running => "●",
+        tcode_core::TaskRunStatus::Done => "✓",
+        tcode_core::TaskRunStatus::Failed => "!",
+        tcode_core::TaskRunStatus::Cancelled => "⨯",
+        tcode_core::TaskRunStatus::Interrupted => "⊘",
+    }
+}
+
 fn status_hitboxes(row: Rect, mode: &str, model: &str) -> StatusHitboxes {
     // The hint begins with `  mode `, then `mode`, ` · `, then the model
     // description. Compute terminal-cell widths rather than byte offsets: both
@@ -4413,20 +4975,6 @@ fn status_hover_at(hitboxes: StatusHitboxes, x: u16, y: u16) -> Option<StatusHov
     }
 }
 
-fn visible_phase_range(phases: &[ProgressPhase], max_visible: usize) -> (usize, usize) {
-    if phases.len() <= max_visible || max_visible == 0 {
-        return (0, phases.len());
-    }
-    let focus = phases
-        .iter()
-        .position(|item| item.status == "in_progress")
-        .or_else(|| phases.iter().position(|item| item.status == "pending"))
-        .unwrap_or(phases.len() - 1);
-    let mut start = focus.saturating_sub(max_visible / 2);
-    start = start.min(phases.len().saturating_sub(max_visible));
-    (start, start + max_visible)
-}
-
 /// A result preview riding on its call's own row: ` — preview`, dim on
 /// success, red on failure. One format for batch rows and single calls.
 fn preview_tail(preview: &str, style: ratatui::style::Style) -> Vec<Span<'static>> {
@@ -4467,6 +5015,48 @@ fn colored_batch_label(label: &str) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+fn task_summary_detail(summary: &str) -> Vec<Line<'static>> {
+    summary
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let mut spans = vec![Span::styled("  │ ", theme::dim())];
+            spans.extend(theme::task_activity_gradient(line));
+            Line::from(spans)
+        })
+        .collect()
+}
+
+fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
+    let mut lines = task_summary_detail(summary);
+    lines.extend(
+        steps
+            .iter()
+            .map(|step| Line::styled(format!("  │ └ {step}"), theme::dim())),
+    );
+    lines
+}
+
+fn task_live_status(activity: &str) -> Vec<Line<'static>> {
+    vec![Line::styled(
+        format!("  working · {activity}"),
+        theme::dim(),
+    )]
+}
+
+/// Remove task-run accounting from the user-facing report. The complete,
+/// unmodified tool result remains in the ledger for the parent agent.
+fn task_result_text(content: &str) -> String {
+    let mut lines = content.lines();
+    let first = lines.next().unwrap_or_default();
+    let body = if first.starts_with('[') && first.contains("sub-agent on") {
+        lines.collect::<Vec<_>>().join("\n")
+    } else {
+        content.to_string()
+    };
+    body.trim().to_string()
 }
 
 fn result_preview(s: &str) -> String {
@@ -5155,6 +5745,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_task_detail_keeps_summary_activity_and_recent_steps() {
+        let lines = task_live_detail(
+            "Trace session persistence and resume flow",
+            &["Read task_trace.rs".into(), "Grep task runs".into()],
+        );
+        let status = task_live_status("Search task traces");
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Trace session persistence and resume flow"));
+        assert!(!text.contains("working · Search task traces"));
+        assert_eq!(
+            status
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "  working · Search task traces"
+        );
+        assert!(text.contains("└ Read task_trace.rs"));
+        assert!(text.contains("└ Grep task runs"));
+    }
+
+    #[test]
     fn status_hitboxes_follow_display_width_and_clip_to_terminal() {
         let hits = status_hitboxes(Rect::new(0, 7, 24, 1), "→ default", "模型 model");
         assert!(rect_contains(hits.mode, 7, 7));
@@ -5333,28 +5949,6 @@ mod tests {
     }
 
     #[test]
-    fn visible_phase_range_focuses_in_progress_item() {
-        let phases = (0..8)
-            .map(|i| ProgressPhase {
-                phase: format!("Phase {i}"),
-                status: if i == 5 { "in_progress" } else { "pending" }.to_string(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(visible_phase_range(&phases, 5), (3, 8));
-    }
-
-    #[test]
-    fn visible_phase_range_falls_back_to_first_pending() {
-        let phases = (0..8)
-            .map(|i| ProgressPhase {
-                phase: format!("Phase {i}"),
-                status: if i < 4 { "completed" } else { "pending" }.to_string(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(visible_phase_range(&phases, 5), (2, 7));
-    }
-
-    #[test]
     fn input_tokens_accent_only_known_references_and_attachment_placeholders() {
         let references = [ReferenceCandidate {
             path: "src/app.rs".into(),
@@ -5435,17 +6029,6 @@ mod tests {
         assert!(!reference_boundary(&email, 2));
         let mention: Vec<char> = "read @src".chars().collect();
         assert!(reference_boundary(&mention, 5));
-    }
-
-    #[test]
-    fn visible_phase_range_shows_tail_when_all_complete() {
-        let phases = (0..8)
-            .map(|i| ProgressPhase {
-                phase: format!("Phase {i}"),
-                status: "completed".to_string(),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(visible_phase_range(&phases, 5), (3, 8));
     }
 
     #[test]

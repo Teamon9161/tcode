@@ -2313,3 +2313,199 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
         "second edit must be blocked by plan mode"
     );
 }
+
+/// A parent agent with a `task` tool whose `explore` kind is pinned to `sub`.
+fn task_agent(parent: Arc<MockProvider>, sub: Arc<MockProvider>) -> Agent {
+    let task = tcode_tools::TaskTool::new(
+        cell(parent.clone()),
+        WatchdogConfig::default(),
+        2000,
+        std::env::temp_dir(),
+    )
+    .with_agent_models({
+        let pins = AgentModels::default();
+        pins.pin("explore", cell(sub).snapshot());
+        pins
+    });
+    Agent {
+        tools: vec![Arc::new(task)],
+        ..agent(parent)
+    }
+}
+
+/// One `task` run must stream its inner events out, tagged with a stable run
+/// id, and persist its whole sub-agent ledger — including the batch label the
+/// loop chose — as a trace file tied to the spawning call's tool_use id.
+#[tokio::test]
+async fn a_task_run_streams_tagged_events_and_persists_a_trace() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(root.path().join("b.rs"), "fn b() {}\n").unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "call-7",
+            "task",
+            r#"{"agent":"explore","prompt":"survey","summary":"survey the repository"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let sub = MockProvider::named(
+        "scout-1",
+        vec![
+            tool_uses(&[
+                ("s1", "read", r#"{"file_path":"a.rs"}"#),
+                ("s2", "read", r#"{"file_path":"b.rs"}"#),
+            ]),
+            text_done("the report"),
+        ],
+    );
+    let agent = task_agent(parent, sub);
+    let mut session = session(root.path(), PermissionMode::Default);
+    let traces_root = root.path().join("tasks");
+    session
+        .tool_ctx
+        .bind_task_trace_root(Some(traces_root.clone()));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "explore this").await;
+
+    // The run announced itself, tied to the spawning call.
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunStarted { run, parent_call, kind, model, summary, .. }
+            if run == "t1" && parent_call == "call-7" && kind == "explore"
+                && model == "scout-1" && summary == "survey the repository"
+    )));
+    // Inner activity crossed the boundary: the sub-agent's read batch...
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunEvent { run, event }
+            if run == "t1" && matches!(event.as_ref(), AgentEvent::ToolBatchStart { .. })
+    )));
+    // ...and its usage, carrying delegated semantics.
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunEvent { run, event }
+            if run == "t1" && matches!(event.as_ref(), AgentEvent::Usage(_))
+    )));
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunFinished { run, status, tool_calls, .. }
+            if run == "t1" && *status == tcode_core::TaskRunStatus::Done && *tool_calls == 2
+    )));
+
+    // The trace replays to the sub-agent's exact ledger, with the executed
+    // batch label recorded rather than re-derived.
+    let load = tcode_core::TaskTraces::load(&traces_root.join("t1.jsonl")).unwrap();
+    assert_eq!(load.meta.parent_call, "call-7");
+    assert_eq!(load.meta.prompt, "survey");
+    assert_eq!(load.meta.summary, "survey the repository");
+    assert_eq!(load.meta.status, tcode_core::TaskRunStatus::Done);
+    assert_eq!(load.meta.tool_calls, 2);
+    // User prompt, assistant tool_use pair, results, final report.
+    assert_eq!(load.ledger.len(), 4);
+    assert!(matches!(
+        load.ledger.entries().last().unwrap(),
+        Entry::Assistant(blocks)
+            if matches!(&blocks[0], ContentBlock::Text { text } if text == "the report")
+    ));
+    assert_eq!(load.batch_labels.len(), 1);
+    assert_eq!(
+        load.batch_labels[0].0, 2,
+        "label keyed to the batch position"
+    );
+    assert!(
+        load.batch_labels[0].1.contains('2'),
+        "{}",
+        load.batch_labels[0].1
+    );
+
+    // The trace stays out of the parent's provider ledger: only the task call
+    // and its single gated report entered.
+    assert!(!session.ledger.entries().iter().any(|e| matches!(
+        e,
+        Entry::ToolResults(blocks)
+            if matches!(&blocks[0], ContentBlock::ToolResult { content, .. } if content.contains("fn a()"))
+    )));
+}
+
+/// Two explore calls in one assistant message run through the parallel batch
+/// path, which previously dropped every delegated event. Each run must arrive
+/// distinctly tagged, and each must leave its own trace file.
+#[tokio::test]
+async fn a_parallel_explore_batch_forwards_each_run_distinctly() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_uses(&[
+            ("c1", "task", r#"{"agent":"explore","prompt":"look left"}"#),
+            ("c2", "task", r#"{"agent":"explore","prompt":"look right"}"#),
+        ]),
+        text_done("combined"),
+    ]);
+    let sub = MockProvider::named(
+        "scout-1",
+        vec![text_done("left report"), text_done("right report")],
+    );
+    let agent = task_agent(parent, sub);
+    let mut session = session(root.path(), PermissionMode::Default);
+    let traces_root = root.path().join("tasks");
+    session
+        .tool_ctx
+        .bind_task_trace_root(Some(traces_root.clone()));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "explore both").await;
+
+    // The batch header carries each call's id.
+    let batch_ids = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolBatchStart { calls, .. } => Some(
+                calls
+                    .iter()
+                    .map(|(id, _, _)| id.clone())
+                    .collect::<Vec<_>>(),
+            ),
+            _ => None,
+        })
+        .expect("batch start");
+    assert_eq!(batch_ids, vec!["c1", "c2"]);
+
+    // Two runs, distinct ids, each tied to its own spawning call.
+    let started: Vec<(String, String)> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::TaskRunStarted {
+                run, parent_call, ..
+            } => Some((run.clone(), parent_call.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(started.len(), 2);
+    let runs: std::collections::HashSet<_> = started.iter().map(|(run, _)| run.clone()).collect();
+    let parents: std::collections::HashSet<_> =
+        started.iter().map(|(_, call)| call.clone()).collect();
+    assert_eq!(runs.len(), 2, "{started:?}");
+    assert_eq!(
+        parents,
+        ["c1".to_string(), "c2".to_string()].into_iter().collect()
+    );
+
+    // Both finished, and their usage crossed the parallel path that used to
+    // drop it.
+    let finished = events
+        .iter()
+        .filter(|e| {
+            matches!(e,
+                AgentEvent::TaskRunFinished { status, .. }
+                    if *status == tcode_core::TaskRunStatus::Done)
+        })
+        .count();
+    assert_eq!(finished, 2);
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunEvent { event, .. }
+            if matches!(event.as_ref(), AgentEvent::Usage(_)))));
+
+    // One trace per run.
+    let metas = tcode_core::TaskTraces::discover(&traces_root);
+    assert_eq!(metas.len(), 2);
+    assert!(metas
+        .iter()
+        .all(|meta| meta.status == tcode_core::TaskRunStatus::Done));
+}

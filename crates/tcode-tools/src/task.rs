@@ -13,9 +13,10 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentModels, Approval, ApprovalDecision, Approver, ContentBlock, Entry,
-    ModelCell, PermissionMode, PermissionRequest, PermissionRules, ProviderSafetyClassifier,
-    SafetyClassifier, Session, Tool, ToolCtx, ToolOutput,
+    ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
+    ContentBlock, DelegateEvent, Entry, ModelCell, PermissionMode, PermissionRequest,
+    PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, TaskRunStatus, Tool,
+    ToolCtx, ToolOutput,
 };
 
 const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
@@ -123,6 +124,22 @@ fn keeps_sub_tool(agent_kind: &str, tool: &dyn Tool) -> bool {
         || (!tool.is_mutating() && (agent_kind != "plan" || tool.name() != "exit_plan"))
 }
 
+/// Keep legacy/direct task calls useful while the tool schema nudges models to
+/// supply an intentional one-line summary.
+fn prompt_summary(prompt: &str) -> String {
+    const MAX_CHARS: usize = 88;
+    let first = prompt
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or("")
+        .trim();
+    if first.chars().count() <= MAX_CHARS {
+        return first.to_string();
+    }
+    let capped: String = first.chars().take(MAX_CHARS - 1).collect();
+    format!("{capped}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{keeps_sub_tool, TASK_AGENT_KINDS};
@@ -170,8 +187,8 @@ impl Tool for TaskTool {
          context). Use agent='plan' for a read-only implementation-plan \
          draft that the parent must still review and submit. Use \
          agent='general' for independent multi-step work. Give a complete, \
-         self-contained prompt; the sub-agent sees nothing of this \
-         conversation and cannot ask questions."
+         self-contained prompt and a very short task summary in the same language as that prompt; \
+         the sub-agent sees nothing of this conversation and cannot ask questions."
     }
 
     fn input_schema(&self) -> Value {
@@ -179,7 +196,11 @@ impl Tool for TaskTool {
             "type": "object",
             "properties": {
                 "agent": { "type": "string", "enum": ["explore", "plan", "general"] },
-                "prompt": { "type": "string" }
+                "prompt": { "type": "string" },
+                "summary": {
+                    "type": "string",
+                    "description": "A very short summary of the delegated objective. Use the same language as prompt; it appears in the live agent tree."
+                }
             },
             "required": ["agent", "prompt"]
         })
@@ -210,9 +231,27 @@ impl Tool for TaskTool {
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
+        // Only reachable through a caller that bypassed `run_with_call`; the
+        // run still works, its trace just cannot be tied to a ledger entry.
+        self.run_with_call("", input, ctx, cancel).await
+    }
+
+    async fn run_with_call(
+        &self,
+        call_id: &str,
+        input: Value,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
         let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str()) else {
             return ToolOutput::err("missing required parameters: agent, prompt");
         };
+        let summary = input["summary"]
+            .as_str()
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| prompt_summary(prompt));
         let system = match kind {
             "explore" => EXPLORE_SYSTEM,
             "plan" => PLAN_SYSTEM,
@@ -257,26 +296,94 @@ impl Tool for TaskTool {
         )
         .with_cache_scope(format!("task-{kind}-{run}"));
 
-        // Drain sub-agent events; count tool calls for the stats line.
+        // Trace: the run gets a stable per-session id, and (when the parent
+        // session persists) its own JSONL ledger log for the trace viewer.
+        // Nothing here enters the parent's provider ledger.
+        let (run_id, trace) = ctx.task_traces.lock().expect("task traces lock").begin(
+            call_id,
+            kind,
+            &model_name,
+            prompt,
+            &summary,
+        );
+        if let Some(trace) = &trace {
+            session.ledger.attach_sink(Box::new(trace.clone()));
+        }
+        let delegate = ctx.delegate_reporter();
+        if let Some(delegate) = &delegate {
+            // Best-effort visual/trace updates; losing them must never
+            // interrupt the sub-agent.
+            let _ = delegate.send(DelegateEvent::TaskStarted {
+                run: run_id.clone(),
+                parent_call: call_id.to_string(),
+                kind: kind.to_string(),
+                model: model_name.clone(),
+                prompt: prompt.to_string(),
+                summary,
+            });
+        }
+
+        // Drain sub-agent events: count tool calls for the stats line and
+        // forward everything, tagged with the run id, so the parent UI can
+        // show live activity and a full trace. Streaming deltas coalesce so a
+        // chatty sub-agent does not cross the channel one token at a time.
         let (tx, mut rx) = mpsc::channel(64);
-        let usage_reporter = ctx.usage_reporter();
-        let counter = tokio::spawn(async move {
-            let mut tools = 0usize;
-            while let Some(ev) = rx.recv().await {
-                match ev {
-                    tcode_core::AgentEvent::ToolStart { .. } => tools += 1,
-                    tcode_core::AgentEvent::Usage(usage) => {
-                        if let Some(reporter) = &usage_reporter {
-                            // It is a best-effort visual/statistical update;
-                            // losing it must never interrupt the sub-agent.
-                            let _ = reporter.send(usage);
+        let tagger = {
+            let delegate = delegate.clone();
+            let run = run_id.clone();
+            tokio::spawn(async move {
+                let send = |ev: AgentEvent| {
+                    if let Some(delegate) = &delegate {
+                        let _ = delegate.send(DelegateEvent::TaskEvent {
+                            run: run.clone(),
+                            event: Box::new(ev),
+                        });
+                    }
+                };
+                let mut tools = 0usize;
+                // At most one buffered delta run (text or thinking).
+                let mut pending: Option<AgentEvent> = None;
+                while let Some(ev) = rx.recv().await {
+                    match &ev {
+                        AgentEvent::ToolStart { .. } => tools += 1,
+                        // Parallel batches emit no per-call ToolStart.
+                        AgentEvent::ToolBatchStart { calls, .. } => tools += calls.len(),
+                        _ => {}
+                    }
+                    match (&mut pending, ev) {
+                        (Some(AgentEvent::TextDelta(buf)), AgentEvent::TextDelta(t)) => {
+                            buf.push_str(&t)
+                        }
+                        (Some(AgentEvent::ThinkingDelta(buf)), AgentEvent::ThinkingDelta(t)) => {
+                            buf.push_str(&t)
+                        }
+                        (slot, ev @ (AgentEvent::TextDelta(_) | AgentEvent::ThinkingDelta(_))) => {
+                            if let Some(prev) = slot.take() {
+                                send(prev);
+                            }
+                            *slot = Some(ev);
+                        }
+                        (slot, ev) => {
+                            if let Some(prev) = slot.take() {
+                                send(prev);
+                            }
+                            send(ev);
                         }
                     }
-                    _ => {}
+                    let full = pending.as_ref().is_some_and(|ev| match ev {
+                        AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => t.len() >= 64,
+                        _ => false,
+                    });
+                    if full {
+                        send(pending.take().expect("checked above"));
+                    }
                 }
-            }
-            tools
-        });
+                if let Some(prev) = pending.take() {
+                    send(prev);
+                }
+                tools
+            })
+        };
 
         let result = agent
             .user_turn(
@@ -290,7 +397,27 @@ impl Tool for TaskTool {
             )
             .await;
         drop(tx);
-        let tool_calls = counter.await.unwrap_or(0);
+        let tool_calls = tagger.await.unwrap_or(0);
+
+        let status = if result.is_err() {
+            TaskRunStatus::Failed
+        } else if cancel.is_cancelled() {
+            TaskRunStatus::Cancelled
+        } else {
+            TaskRunStatus::Done
+        };
+        let usage = session.turn_usage;
+        if let Some(trace) = &trace {
+            trace.finish(status, tool_calls, usage);
+        }
+        if let Some(delegate) = &delegate {
+            let _ = delegate.send(DelegateEvent::TaskFinished {
+                run: run_id,
+                status,
+                tool_calls,
+                usage,
+            });
+        }
 
         if let Err(e) = result {
             return ToolOutput::err(format!("sub-agent failed: {e}"));

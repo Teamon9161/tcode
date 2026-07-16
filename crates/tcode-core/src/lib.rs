@@ -18,6 +18,7 @@ pub mod permission;
 pub mod provider;
 pub mod references;
 pub mod store;
+pub mod task_trace;
 pub mod template;
 pub mod tool;
 pub mod types;
@@ -46,6 +47,7 @@ pub use provider::{
 };
 pub use references::{expand_references, index_project, ReferenceCandidate, ReferenceKind};
 pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
+pub use task_trace::{TaskRunLoad, TaskRunMeta, TaskRunStatus, TaskTraces, TraceStore};
 pub use template::PromptVariables;
-pub use tool::{BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
+pub use tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolCtx, ToolOutput};
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

@@ -86,7 +86,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
                     in_thinking = false;
                 }
                 println!("{CYAN}●{RESET} {label}");
-                for (name, input) in calls {
+                for (_, name, input) in calls {
                     println!(
                         "  ├ {}",
                         color_tool_summary(&tcode_core::agent::summarize_call(&name, &input))
@@ -109,6 +109,11 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             } => println!("{CYAN}Note:{RESET} {text}"),
             AgentEvent::UserNote { answer: true, .. } => {}
             AgentEvent::Usage(_) | AgentEvent::DelegatedUsage(_) | AgentEvent::RateLimits(_) => {}
+            // Sub-agent trace/progress stream: plain mode already prints the
+            // final report through ToolEnd.
+            AgentEvent::TaskRunStarted { .. }
+            | AgentEvent::TaskRunEvent { .. }
+            | AgentEvent::TaskRunFinished { .. } => {}
             AgentEvent::Compacting => {
                 println!("{YELLOW}[context near limit — compacting]{RESET}");
             }

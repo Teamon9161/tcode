@@ -352,6 +352,13 @@ impl Session {
     pub fn bind_scratch_session(&mut self, session_id: &str) {
         let scratch = crate::store::session_scratchpad_dir(&self.tool_ctx.cwd, session_id);
         self.tool_ctx.rebind_scratch_dir(scratch);
+        // Task traces live and die with the session (like checkpoints), so
+        // they bind here too — every persistent binding point flows through
+        // this method.
+        self.tool_ctx.bind_task_trace_root(
+            crate::store::project_data_dir(&self.tool_ctx.cwd)
+                .map(|dir| dir.join("tasks").join(session_id)),
+        );
         self.cache_scope = Some(format!("main:{session_id}"));
         self.prompt_variables =
             PromptVariables::new(&self.tool_ctx.cwd, &self.tool_ctx.scratch_dir);

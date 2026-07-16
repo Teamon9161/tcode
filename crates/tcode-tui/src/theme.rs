@@ -147,6 +147,48 @@ pub fn math_block() -> Style {
     Style::default().fg(MATH)
 }
 
+/// A subtle bright-to-dim sweep for static task summary details. Terminal
+/// styles have no alpha channel, so fading the foreground is the closest
+/// portable equivalent to transparency.
+pub fn task_activity_gradient(text: &str) -> Vec<Span<'static>> {
+    const FROM: (u8, u8, u8) = (218, 224, 230);
+    const TO: (u8, u8, u8) = (124, 132, 144);
+    let chars: Vec<char> = text.chars().collect();
+    let last = chars.len().saturating_sub(1).max(1) as f32;
+    chars
+        .iter()
+        .enumerate()
+        .map(|(i, &c)| {
+            let t = i as f32 / last;
+            let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(Color::Rgb(
+                    lerp(FROM.0, TO.0),
+                    lerp(FROM.1, TO.1),
+                    lerp(FROM.2, TO.2),
+                )),
+            )
+        })
+        .collect()
+}
+
+/// Colour for one cell in the active task-card status. The bright band travels
+/// across the text on every frame, so activity remains visible without a
+/// spinner or animation in the navigation tree.
+pub fn task_activity_animation_color(frame: usize, column: usize) -> Color {
+    const DIM: (u8, u8, u8) = (124, 132, 144);
+    const BRIGHT: (u8, u8, u8) = (218, 224, 230);
+    let phase = (frame as f32 / 10.0 + column as f32 / 18.0) * std::f32::consts::TAU;
+    let t = (phase.sin() + 1.0) / 2.0;
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
+    Color::Rgb(
+        lerp(DIM.0, BRIGHT.0),
+        lerp(DIM.1, BRIGHT.1),
+        lerp(DIM.2, BRIGHT.2),
+    )
+}
+
 /// Anchor colours for the startup logo: the tool green sliding into the
 /// interactive cyan — the wordmark spans the palette's two working hues
 /// instead of introducing a third. Anchors sit slightly outside OK and

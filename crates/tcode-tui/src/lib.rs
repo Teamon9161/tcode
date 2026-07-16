@@ -8,6 +8,7 @@ mod app;
 mod approval;
 mod diff;
 mod editor;
+mod live_panel;
 mod markdown;
 mod mathfmt;
 mod mode_picker;
@@ -16,6 +17,8 @@ mod render;
 mod resume;
 mod theme;
 mod transcript;
+mod view;
+mod view_picker;
 pub mod wizard;
 
 use std::io::{stdout, Write};

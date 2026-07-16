@@ -155,8 +155,8 @@ impl Tool for ViewImageTool {
             match event {
                 Ok(StreamEvent::TextDelta(text)) => answer.push_str(&text),
                 Ok(StreamEvent::Usage(usage)) => {
-                    if let Some(reporter) = ctx.usage_reporter() {
-                        let _ = reporter.send(usage);
+                    if let Some(reporter) = ctx.delegate_reporter() {
+                        let _ = reporter.send(tcode_core::DelegateEvent::Usage(usage));
                     }
                 }
                 Err(error) => return ToolOutput::err(format!("vision request failed: {error}")),

@@ -12,6 +12,7 @@ use crate::background::BackgroundTasks;
 use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
 use crate::provider::ModelCell;
+use crate::task_trace::{TaskRunStatus, TaskTraces};
 use crate::types::Usage;
 
 use crate::auto_mode::AutoSafety;
@@ -159,6 +160,39 @@ impl PermissionRequest {
     }
 }
 
+/// What delegated work (a `task` sub-agent, a `view_image` request) reports
+/// back to the agent loop while it runs. The loop translates each variant
+/// into the matching `AgentEvent`, so every frontend sees delegated progress
+/// through its ordinary event stream.
+#[derive(Debug, Clone)]
+pub enum DelegateEvent {
+    /// Billable usage spent by a delegated helper with no run identity of its
+    /// own (e.g. `view_image`). Surfaces as `AgentEvent::DelegatedUsage`.
+    Usage(Usage),
+    /// A `task` sub-agent run began. `parent_call` is the tool_use id of the
+    /// spawning `task` call, tying the run to its ledger entry.
+    TaskStarted {
+        run: String,
+        parent_call: String,
+        kind: String,
+        model: String,
+        prompt: String,
+        /// A one-line parent-authored description for task lists.
+        summary: String,
+    },
+    /// One event from inside a running sub-agent, tagged with its run id.
+    TaskEvent {
+        run: String,
+        event: Box<crate::agent::AgentEvent>,
+    },
+    TaskFinished {
+        run: String,
+        status: TaskRunStatus,
+        tool_calls: usize,
+        usage: Usage,
+    },
+}
+
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx {
     pub cwd: PathBuf,
@@ -172,10 +206,13 @@ pub struct ToolCtx {
     /// The model active for this invocation. Tools may use its capabilities
     /// without owning model selection or provider construction.
     pub model: Option<ModelCell>,
+    /// Per-session task-run id allocator and trace persistence. Runs persist
+    /// only after `bind_task_trace_root`; ids are issued regardless.
+    pub task_traces: Mutex<TaskTraces>,
     /// Budget reused when a resume/import binds this context to another
     /// session's scratch root.
     output_budget_tokens: usize,
-    usage_reporter: Mutex<Option<mpsc::UnboundedSender<Usage>>>,
+    delegate: Mutex<Option<mpsc::UnboundedSender<DelegateEvent>>>,
 }
 
 static EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(0);
@@ -213,8 +250,9 @@ impl ToolCtx {
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
             model: None,
+            task_traces: Mutex::new(TaskTraces::default()),
             output_budget_tokens,
-            usage_reporter: Mutex::new(None),
+            delegate: Mutex::new(None),
             cwd,
             scratch_dir,
         }
@@ -248,21 +286,30 @@ impl ToolCtx {
         }
     }
 
-    pub fn set_usage_reporter(&self, reporter: mpsc::UnboundedSender<Usage>) {
-        *self.usage_reporter.lock().expect("usage reporter lock") = Some(reporter);
+    pub fn set_delegate_reporter(&self, reporter: mpsc::UnboundedSender<DelegateEvent>) {
+        *self.delegate.lock().expect("delegate reporter lock") = Some(reporter);
     }
 
-    pub fn clear_usage_reporter(&self) {
-        *self.usage_reporter.lock().expect("usage reporter lock") = None;
+    pub fn clear_delegate_reporter(&self) {
+        *self.delegate.lock().expect("delegate reporter lock") = None;
     }
 
-    /// Returns a clone so a nested task can forward usage from its own event
-    /// drain without holding this mutex across awaits.
-    pub fn usage_reporter(&self) -> Option<mpsc::UnboundedSender<Usage>> {
-        self.usage_reporter
+    /// Returns a clone so a nested task can forward events from its own drain
+    /// without holding this mutex across awaits.
+    pub fn delegate_reporter(&self) -> Option<mpsc::UnboundedSender<DelegateEvent>> {
+        self.delegate
             .lock()
-            .expect("usage reporter lock")
+            .expect("delegate reporter lock")
             .clone()
+    }
+
+    /// Bind (or unbind) where task traces persist. Called whenever the
+    /// context is bound to a persistent session (startup, resume, import).
+    pub fn bind_task_trace_root(&self, root: Option<PathBuf>) {
+        self.task_traces
+            .lock()
+            .expect("task traces lock")
+            .bind_root(root);
     }
 }
 
@@ -340,6 +387,18 @@ pub trait Tool: Send + Sync {
         output
     }
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput;
+    /// Entry point the agent loop uses, carrying the provider-issued tool_use
+    /// id. Most tools ignore it; `task` records it so a sub-agent run can be
+    /// tied back to the exact call that spawned it.
+    async fn run_with_call(
+        &self,
+        _call_id: &str,
+        input: Value,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        self.run(input, ctx, cancel).await
+    }
 }
 
 /// Capitalize the first character; used for default tool labels.

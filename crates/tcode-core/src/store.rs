@@ -39,6 +39,33 @@ pub enum LogEvent {
         path: String,
         saved: Option<String>,
     },
+    /// First line of a task trace file (see `task_trace.rs`). Never appears
+    /// in a session log.
+    TaskMeta {
+        id: String,
+        parent_call: String,
+        kind: String,
+        model: String,
+        prompt: String,
+        /// One-line parent-authored description for task lists. Older trace
+        /// files omit this; their loader derives a prompt-based fallback.
+        #[serde(default)]
+        summary: String,
+        created_unix: u64,
+    },
+    /// Last line of a completed task trace file.
+    TaskFinished {
+        status: crate::task_trace::TaskRunStatus,
+        tool_calls: usize,
+        usage: crate::types::Usage,
+    },
+    /// Display label of a concurrent tool batch, recorded at execution time.
+    /// `after` is the ledger length when the batch started (its assistant
+    /// entry sits at `after - 1`). Only opt-in sinks receive it.
+    Batch {
+        label: String,
+        after: usize,
+    },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -155,12 +182,13 @@ const KEEP_FOR: Duration = Duration::from_secs(30 * 24 * 3600);
 /// now in this project and has simply not been spoken to yet.
 const EMPTY_GRACE: Duration = Duration::from_secs(3600);
 
-/// Best-effort startup GC of `sessions/` and `checkpoints/`.
+/// Best-effort startup GC of `sessions/`, `checkpoints/` and `tasks/`.
 ///
-/// The two expire *together*: a conversation you can still resume must still be
-/// rewindable, and a checkpoint without the log that indexes it is just a file
-/// nobody can name. So the rule is one rule — a checkpoint directory exists iff
-/// its session is kept — which also collects orphans left by earlier crashes.
+/// They expire *together*: a conversation you can still resume must still be
+/// rewindable and its task traces still viewable, and a checkpoint or trace
+/// without the log that indexes it is just a file nobody can name. So the rule
+/// is one rule — a per-session directory exists iff its session is kept —
+/// which also collects orphans left by earlier crashes.
 ///
 /// Logs nobody spoke into (starting tcode and typing nothing leaves one) are
 /// not conversations: they are deleted outright and never occupy a slot, so a
@@ -204,13 +232,15 @@ pub fn sweep_old_sessions(data_dir: &Path) {
             let _ = fs::remove_file(&path);
         }
     }
-    let Ok(dirs) = fs::read_dir(&checkpoints_dir) else {
-        return;
-    };
-    for dir in dirs.flatten() {
-        let id = dir.file_name().to_string_lossy().into_owned();
-        if !kept.contains(&id) {
-            let _ = fs::remove_dir_all(dir.path());
+    for per_session in [&checkpoints_dir, &data_dir.join("tasks")] {
+        let Ok(dirs) = fs::read_dir(per_session) else {
+            continue;
+        };
+        for dir in dirs.flatten() {
+            let id = dir.file_name().to_string_lossy().into_owned();
+            if !kept.contains(&id) {
+                let _ = fs::remove_dir_all(dir.path());
+            }
         }
     }
 }
@@ -424,6 +454,10 @@ impl SessionStore {
                     path,
                     saved,
                 } => checkpoints.push((ledger_len, path, saved)),
+                // Trace-file lines; a session log never contains them.
+                LogEvent::TaskMeta { .. }
+                | LogEvent::TaskFinished { .. }
+                | LogEvent::Batch { .. } => {}
             }
         }
         let file = OpenOptions::new().append(true).open(&path)?;
@@ -530,15 +564,16 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A session's log and its checkpoints live and die together, empty logs
-    /// are not conversations and never occupy a slot, and a checkpoint
-    /// directory with no session left is garbage.
+    /// A session's log, its checkpoints and its task traces live and die
+    /// together, empty logs are not conversations and never occupy a slot,
+    /// and a per-session directory with no session left is garbage.
     #[test]
     fn the_sweep_keeps_conversations_and_their_checkpoints_together() {
         let dir = std::env::temp_dir().join(format!("tcode-sweep-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let sessions = dir.join("sessions");
         let checkpoints = dir.join("checkpoints");
+        let tasks = dir.join("tasks");
         fs::create_dir_all(&sessions).unwrap();
 
         // A real conversation, an abandoned launch, and an orphan checkpoint
@@ -564,15 +599,20 @@ mod tests {
         for id in [&real_id, &empty_id, &"deadbeef".to_string()] {
             fs::create_dir_all(checkpoints.join(id)).unwrap();
             fs::write(checkpoints.join(id).join("aa.orig"), "x").unwrap();
+            fs::create_dir_all(tasks.join(id)).unwrap();
+            fs::write(tasks.join(id).join("t1.jsonl"), "x").unwrap();
         }
 
         sweep_old_sessions(&dir);
 
         assert!(sessions.join(format!("{real_id}.jsonl")).exists());
         assert!(checkpoints.join(&real_id).exists(), "kept with its session");
+        assert!(tasks.join(&real_id).exists(), "traces kept with it too");
         assert!(!empty_log.exists(), "a launch nobody spoke into");
         assert!(!checkpoints.join(&empty_id).exists());
+        assert!(!tasks.join(&empty_id).exists());
         assert!(!checkpoints.join("deadbeef").exists(), "orphan collected");
+        assert!(!tasks.join("deadbeef").exists(), "orphan trace collected");
 
         let _ = fs::remove_dir_all(&dir);
     }
