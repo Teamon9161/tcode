@@ -190,7 +190,7 @@ fn inline_emphasis(change: &similar::InlineChange<'_, str>) -> (String, Vec<Rang
         range.start < range.end
     });
     if inline_emphasis_is_local(&text, &ranges) {
-        ranges = non_whitespace_ranges(&text, ranges);
+        ranges = trimmed_emphasis_ranges(&text, ranges);
     } else {
         ranges.clear();
     }
@@ -221,28 +221,21 @@ fn inline_emphasis_is_local(text: &str, ranges: &[Range<usize>]) -> bool {
     changed > 0 && changed * MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR <= visible
 }
 
-/// Emphasis is a signal for changed text, not for the whitespace which carries
-/// its layout. Keeping only non-whitespace runs prevents a short changed prefix
-/// plus trailing spaces from painting the entire line more brightly.
-fn non_whitespace_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
-    let mut result = Vec::new();
-    for range in ranges {
-        let mut run_start = None;
-        for (offset, ch) in text[range.clone()].char_indices() {
-            let index = range.start + offset;
-            if ch.is_whitespace() {
-                if let Some(start) = run_start.take() {
-                    result.push(start..index);
-                }
-            } else if run_start.is_none() {
-                run_start = Some(index);
-            }
-        }
-        if let Some(start) = run_start {
-            result.push(start..range.end);
-        }
-    }
-    result
+/// Preserve the whitespace inside a changed phrase so its bright background is
+/// continuous. Only its leading and trailing layout whitespace stays at the
+/// line's ordinary diff colour.
+fn trimmed_emphasis_ranges(text: &str, ranges: Vec<Range<usize>>) -> Vec<Range<usize>> {
+    ranges
+        .into_iter()
+        .filter_map(|range| {
+            let changed = &text[range.clone()];
+            let leading = changed.len() - changed.trim_start().len();
+            let trailing = changed.len() - changed.trim_end().len();
+            let start = range.start + leading;
+            let end = range.end - trailing;
+            (start < end).then_some(start..end)
+        })
+        .collect()
 }
 
 /// The parts of a changed line that differ, and the background that lifts them
@@ -405,7 +398,7 @@ mod tests {
         let lines = edit_diff(
             "notes.md",
             "the quick brown fox jumps over the lazy dog\n",
-            "the quick red fox jumps over the lazy dog\n",
+            "the quick red wolf fox jumps over the lazy dog\n",
         );
         let added = lines
             .iter()
@@ -417,7 +410,11 @@ mod tests {
             .filter(|span| span.style.bg == Some(theme::diff_add_emph_bg()))
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(emphasized.trim(), "red");
+        assert_eq!(emphasized.trim(), "red wolf");
+        assert!(
+            emphasized.contains(' '),
+            "the highlight must remain continuous across a changed phrase"
+        );
         let shared: String = added
             .spans
             .iter()
@@ -464,11 +461,13 @@ mod tests {
     }
 
     #[test]
-    fn whitespace_does_not_receive_inline_emphasis() {
-        let text = "prefix  suffix";
+    fn inline_emphasis_keeps_spaces_inside_a_changed_phrase() {
+        let text = "prefix  changed words  suffix";
+        let phrase = "  changed words  ";
+        let start = text.find(phrase).unwrap();
         assert_eq!(
-            non_whitespace_ranges(text, vec![0..text.len()]),
-            vec![0..6, 8..14]
+            trimmed_emphasis_ranges(text, vec![start..start + phrase.len()]),
+            vec![8..21]
         );
     }
 

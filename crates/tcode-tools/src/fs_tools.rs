@@ -576,7 +576,8 @@ impl Tool for EditTool {
         "Exact string replacement in a UTF-8 text file. `old_string` must match the \
          current content exactly (including whitespace; line endings may be \
          LF/CRLF and are normalized to the file's style) and be unique unless \
-         replace_all is set. \
+         replace_all is set. `target_line` selects one otherwise-ambiguous match \
+         by its 1-based starting line; it is mutually exclusive with replace_all. \
          Only edit text you have actually seen in this session (read or grep \
          output both count) and whose surroundings you understand; if you are \
          unsure of the exact content or the impact of the change, read the file \
@@ -591,7 +592,12 @@ impl Tool for EditTool {
                 "path": { "type": "string" },
                 "old_string": { "type": "string" },
                 "new_string": { "type": "string" },
-                "replace_all": { "type": "boolean", "default": false }
+                "replace_all": { "type": "boolean", "default": false },
+                "target_line": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "1-based start line of the one occurrence to replace; use a line reported by a prior ambiguous-match error. Cannot be combined with replace_all."
+                }
             },
             "required": ["path", "old_string", "new_string"]
         })
@@ -641,6 +647,17 @@ impl Tool for EditTool {
         if old == new {
             return ToolOutput::err("old_string and new_string are identical");
         }
+        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
+        let target_line = match input.get("target_line") {
+            None | Some(Value::Null) => None,
+            Some(value) => match value.as_u64().and_then(|line| usize::try_from(line).ok()) {
+                Some(line @ 1..) => Some(line),
+                _ => return ToolOutput::err("target_line must be a positive 1-based line number"),
+            },
+        };
+        if replace_all && target_line.is_some() {
+            return ToolOutput::err("target_line cannot be combined with replace_all=true");
+        }
         let path = ctx.resolve(path_str);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
@@ -667,7 +684,13 @@ impl Tool for EditTool {
         };
 
         let plan = match replacement_plan(&text, old, new) {
-            Ok(Some(plan)) => plan,
+            Ok(Some(plan)) => match target_line {
+                Some(line) => match select_exact_match_at_line(&text, plan, line) {
+                    Ok(plan) => plan,
+                    Err(error) => return ToolOutput::err(error),
+                },
+                None => plan,
+            },
             Ok(None) => {
                 let mut msg = near_miss_help(&text, old);
                 if !seen {
@@ -679,22 +702,38 @@ impl Tool for EditTool {
                 return ToolOutput::err(msg);
             }
             Err(candidates) => {
-                return ToolOutput::err(format!(
-                    "old_string has multiple whitespace/punctuation-normalized matches; \
-                     add enough exact surrounding context to identify one occurrence.\nCandidates:\n{}",
-                    candidate_help(&text, &candidates).join("\n\n")
-                ));
+                let Some(line) = target_line else {
+                    return ToolOutput::err(format!(
+                        "old_string has multiple whitespace/punctuation-normalized matches; \
+                         add enough exact surrounding context to identify one occurrence, or \
+                         pass target_line from one candidate below.\nCandidates:\n{}",
+                        candidate_help(&text, &candidates).join("\n\n")
+                    ));
+                };
+                let Some(candidate) = select_candidate_at_line(&text, &candidates, line) else {
+                    return ToolOutput::err(format!(
+                        "target_line {line} does not identify exactly one normalized match. \
+                         Re-read the candidate list and choose a unique starting line.\nCandidates:\n{}",
+                        candidate_help(&text, &candidates).join("\n\n")
+                    ));
+                };
+                ReplacementPlan {
+                    old: text[candidate.at..candidate.at + candidate.len].to_string(),
+                    new: normalize_newlines(new, dominant_line_ending(&text)),
+                    count: 1,
+                    at: candidate.at,
+                }
             }
         };
-        let replace_all = input["replace_all"].as_bool().unwrap_or(false);
         match plan.count {
             0 => unreachable!("replacement_plan only returns matching needles"),
             1 => {}
+            _ if target_line.is_some() => unreachable!("target_line selects one exact match"),
             n if !replace_all => {
                 let occurrences = occurrence_help(&text, &plan.old, 8);
                 return ToolOutput::err(format!(
                     "old_string appears {n} times; add surrounding context to make it \
-                     unique, or set replace_all=true.\nOccurrences:\n{}",
+                     unique, pass target_line from one occurrence below, or set replace_all=true.\nOccurrences:\n{}",
                     occurrences.join("\n")
                 ));
             }
@@ -704,7 +743,7 @@ impl Tool for EditTool {
         let new_text = if replace_all {
             text.replace(&plan.old, &plan.new)
         } else {
-            text.replacen(&plan.old, &plan.new, 1)
+            replace_once_at(&text, &plan)
         };
         if let Err(error) = write_with_windows_retry(&path, new_text.as_bytes()).await {
             return ToolOutput::err(write_error(&path, &error));
@@ -772,6 +811,56 @@ impl ReplacementPlan {
             at,
         })
     }
+}
+
+fn match_start_line(text: &str, at: usize) -> usize {
+    text[..at].bytes().filter(|byte| *byte == b'\n').count() + 1
+}
+
+fn select_exact_match_at_line(
+    text: &str,
+    mut plan: ReplacementPlan,
+    target_line: usize,
+) -> Result<ReplacementPlan, String> {
+    let mut matches = text
+        .match_indices(&plan.old)
+        .map(|(at, _)| at)
+        .filter(|at| match_start_line(text, *at) == target_line);
+    let Some(at) = matches.next() else {
+        return Err(format!(
+            "target_line {target_line} does not contain an exact old_string occurrence"
+        ));
+    };
+    if matches.next().is_some() {
+        return Err(format!(
+            "target_line {target_line} contains multiple old_string occurrences; add surrounding context"
+        ));
+    }
+    plan.at = at;
+    plan.count = 1;
+    Ok(plan)
+}
+
+fn select_candidate_at_line<'a>(
+    text: &str,
+    candidates: &'a [MatchCandidate],
+    target_line: usize,
+) -> Option<&'a MatchCandidate> {
+    let mut matches = candidates
+        .iter()
+        .filter(|candidate| match_start_line(text, candidate.at) == target_line);
+    let candidate = matches.next()?;
+    matches.next().is_none().then_some(candidate)
+}
+
+fn replace_once_at(text: &str, plan: &ReplacementPlan) -> String {
+    let end = plan.at + plan.old.len();
+    debug_assert_eq!(&text[plan.at..end], plan.old);
+    let mut result = String::with_capacity(text.len() - plan.old.len() + plan.new.len());
+    result.push_str(&text[..plan.at]);
+    result.push_str(&plan.new);
+    result.push_str(&text[end..]);
+    result
 }
 
 fn replacement_plan(
@@ -1441,6 +1530,136 @@ assert_eq!(
             .last()
             .unwrap()
             .contains("1 additional candidate matches omitted"));
+    }
+
+    #[tokio::test]
+    async fn edit_target_line_selects_one_exact_occurrence() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcode-edit-target-line-exact-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("text.txt");
+        std::fs::write(&file, "header\nneedle\nseparator\nneedle\n").unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "text.txt",
+                    "old_string": "needle",
+                    "new_string": "changed",
+                    "target_line": 4,
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "header\nneedle\nseparator\nchanged\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_target_line_selects_one_normalized_occurrence() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcode-edit-target-line-normalized-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("text.txt");
+        std::fs::write(&file, "call - x;\nseparator\ncall - x;\n").unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "text.txt",
+                    "old_string": "call – x;",
+                    "new_string": "changed();",
+                    "target_line": 3,
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "call - x;\nseparator\nchanged();\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_target_line_rejects_a_nonmatching_line_without_mutating() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcode-edit-target-line-miss-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("text.txt");
+        let original = "needle\nseparator\nneedle\n";
+        std::fs::write(&file, original).unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "text.txt",
+                    "old_string": "needle",
+                    "new_string": "changed",
+                    "target_line": 2,
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(out.is_error);
+        assert!(out.content.contains("does not contain an exact old_string"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn edit_target_line_rejects_replace_all_without_mutating() {
+        let dir = std::env::temp_dir().join(format!(
+            "tcode-edit-target-line-replace-all-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("text.txt");
+        let original = "needle\nneedle\n";
+        std::fs::write(&file, original).unwrap();
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = EditTool
+            .run(
+                json!({
+                    "path": "text.txt",
+                    "old_string": "needle",
+                    "new_string": "changed",
+                    "target_line": 1,
+                    "replace_all": true,
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+
+        assert!(out.is_error);
+        assert_eq!(
+            out.content,
+            "target_line cannot be combined with replace_all=true"
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

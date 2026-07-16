@@ -82,6 +82,15 @@ const TIPS: [&str; 9] = [
     "/note slips the model an aside without starting a turn",
 ];
 
+/// Keep the complete tip in the transcript source. `Transcript` owns wrapping
+/// and recomputes it whenever the terminal width changes.
+fn tip_line(tip: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled("  ✻ ".to_string(), theme::accent()),
+        Span::styled(format!("tip: {tip}"), theme::dim()),
+    ])
+}
+
 /// Commands whose substance drives frontend-owned objects (key table, model
 /// picker, provider wizard). Everything else lives in the shared
 /// `CommandRegistry` in tcode-core.
@@ -798,10 +807,7 @@ impl App {
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.subsec_nanos() as usize)
             % TIPS.len()];
-        out.push(Line::from(vec![
-            Span::styled("  ✻ ".to_string(), theme::accent()),
-            Span::styled(clip(&format!("tip: {tip}")), theme::dim()),
-        ]));
+        out.push(tip_line(tip));
         out.push(Line::default());
         out
     }
@@ -3800,11 +3806,17 @@ impl App {
             .then(|| self.dialog.as_ref().and_then(|(d, _)| d.cursor_cell()))
             .flatten();
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
-        // Ghost text only ever occupies the empty first row of the input.
+        // Ghost text only appears while the input is empty and idle. Its visual
+        // rows use the editor's own width calculation below.
         let ghost = self
             .suggestion
             .clone()
             .filter(|_| self.editor.is_empty() && !running);
+        // Ghost text uses the same width calculation as actual input. Its rows
+        // remain read-only, but a longer suggestion must not overrun the box.
+        let ghost_lines = ghost.as_deref().map(|text| {
+            ghost_visual_lines(&format!("{text}  → to accept"), area_width(&self.terminal))
+        });
         let popup: Vec<(String, String)> = if self.popup_active() {
             self.completion_matches()
                 .into_iter()
@@ -3835,13 +3847,20 @@ impl App {
 
             // ------- bottom panel height (transcript gets the rest) -------
             let editor_start = editor.cursor_row.saturating_sub(5);
-            let editor_h = ((editor.lines.len() - editor_start) as u16).clamp(1, 6);
+            let editor_h = ghost_lines
+                .as_ref()
+                .map(|lines| lines.len().min(6))
+                .unwrap_or_else(|| editor.lines.len() - editor_start)
+                .clamp(1, 6) as u16;
             let panel_h = if let Some(lines) = &dialog_lines {
                 lines.len() as u16 + 2
             } else {
                 let mut h = editor_h + 2 + 2; // input box + context meter + hint
                 if running {
-                    h += 1; // spinner/status line above the input box
+                    // Leave a breathing row after the transcript before the
+                    // live status line, rather than pinning "responding" to
+                    // the last rendered transcript row.
+                    h += 2; // separator + spinner/status line above the input box
                 }
                 h += queued_lines.len() as u16;
                 if !progress_lines.is_empty() {
@@ -3906,6 +3925,9 @@ impl App {
             }
 
             if running {
+                // The reserved row separates completed transcript content from
+                // the live turn indicator.
+                y += 1;
                 frame.render_widget(Paragraph::new(status), row(y, 1));
                 y += 1;
             }
@@ -3922,28 +3944,44 @@ impl App {
             // Input inside a rounded box, Claude Code style.
             // Show the cursor even when a long multi-line prompt exceeds
             // the six-row input box.
-            let mut inner: Vec<Line> = editor.lines[editor_start..]
-                .iter()
-                .take(6)
-                .map(|vl| {
-                    let mut spans = vec![Span::styled(
-                        if vl.first_logical_line { "› " } else { "  " },
-                        theme::user_prompt(),
-                    )];
-                    match vl.selection {
-                        Some(selection) => spans.extend(input_spans(&vl.text, Some(selection))),
-                        None => spans.extend(input_spans(&vl.text, None)),
-                    }
-                    Line::from(spans)
-                })
-                .collect();
-            if let Some(ghost) = &ghost {
-                inner[0] = Line::from(vec![
-                    Span::styled("› ", theme::user_prompt()),
-                    Span::styled(ghost.clone(), theme::dim()),
-                    Span::styled("  → to accept", theme::dim()),
-                ]);
-            }
+            let inner: Vec<Line> = if let Some(lines) = &ghost_lines {
+                lines
+                    .iter()
+                    .take(6)
+                    .enumerate()
+                    .map(|(index, line)| {
+                        Line::from(vec![
+                            Span::styled(
+                                if index == 0 { "› " } else { "  " },
+                                theme::user_prompt(),
+                            ),
+                            Span::styled(line.clone(), theme::dim()),
+                        ])
+                    })
+                    .collect()
+            } else {
+                editor.lines[editor_start..]
+                    .iter()
+                    .take(6)
+                    .map(|vl| {
+                        let mut spans = vec![Span::styled(
+                            if vl.first_logical_line { "› " } else { "  " },
+                            theme::user_prompt(),
+                        )];
+                        match vl.selection {
+                            Some(selection) => spans.extend(input_spans(
+                                &vl.text,
+                                Some(selection),
+                                &self.reference_index,
+                            )),
+                            None => {
+                                spans.extend(input_spans(&vl.text, None, &self.reference_index))
+                            }
+                        }
+                        Line::from(spans)
+                    })
+                    .collect()
+            };
             let box_y = y;
             let input_rect = row(y, editor_h + 2);
             captured_input = Some(InputHitbox {
@@ -4030,8 +4068,8 @@ impl App {
         let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let frame = SPINNER[self.spinner % SPINNER.len()];
         Line::from(vec![
-            Span::styled(format!("{frame} "), theme::accent()),
-            Span::styled(self.state_label.clone(), theme::accent()),
+            Span::styled(format!("{frame} "), theme::warn()),
+            Span::styled(self.state_label.clone(), theme::warn()),
             Span::styled(
                 format!(
                     " · {elapsed}s · ↓ ~{} tok · esc to cancel",
@@ -4086,10 +4124,7 @@ impl App {
         // A mode that silently changes what the model does must be visible
         // while it is on, not only in the line that switched it on.
         if self.dogfood {
-            spans.push(Span::styled(
-                " · dogfood".to_string(),
-                ratatui::style::Style::default().fg(theme::WARN),
-            ));
+            spans.push(Span::styled(" · dogfood".to_string(), theme::warn()));
         }
         spans.push(Span::styled(format!("{cache}{scrolled}"), theme::dim()));
         if let Some((text, _)) = self
@@ -4201,7 +4236,7 @@ fn context_progress_line(
     } else if pct >= 85 {
         theme::WARN
     } else {
-        theme::ACCENT
+        theme::OK
     };
     let (label, bar_width) = if terminal_width < 42 {
         ("  ctx ", 8usize)
@@ -4290,7 +4325,7 @@ fn usage_color(used_percent: f64) -> ratatui::style::Color {
     } else if used_percent >= 75.0 {
         theme::WARN
     } else {
-        theme::ACCENT
+        theme::OK
     }
 }
 
@@ -4579,6 +4614,19 @@ fn editor_layout(editor: &Editor, terminal_width: u16) -> EditorLayout {
     }
 }
 
+/// Build read-only ghost rows with the exact same wrapping rules as the editor.
+/// Keeping this route shared is what makes a two-line suggestion grow the input
+/// box instead of overflowing its first row.
+fn ghost_visual_lines(text: &str, terminal_width: u16) -> Vec<String> {
+    let mut ghost = Editor::new();
+    ghost.insert_str(text);
+    editor_layout(&ghost, terminal_width)
+        .lines
+        .into_iter()
+        .map(|line| line.text)
+        .collect()
+}
+
 /// Char range within a wrapped chunk `[char_start, char_end)` that falls
 /// inside the selection `[start, end]` (both in logical row/char coords).
 /// Returns offsets relative to the chunk, or `None` if disjoint.
@@ -4682,11 +4730,16 @@ enum InputSpanStyle {
     Selection,
 }
 
-/// Style references and attachment placeholders directly in the input, while
-/// preserving selection highlighting as the higher-priority interaction state.
-fn input_spans(text: &str, selection: Option<(usize, usize)>) -> Vec<Span<'static>> {
+/// Style exact project references and attachment placeholders directly in the
+/// input, while preserving selection highlighting as the higher-priority
+/// interaction state. An unrecognized `@token` remains ordinary prose.
+fn input_spans(
+    text: &str,
+    selection: Option<(usize, usize)>,
+    references: &[ReferenceCandidate],
+) -> Vec<Span<'static>> {
     let chars: Vec<char> = text.chars().collect();
-    let token_ranges = input_token_ranges(&chars);
+    let token_ranges = input_token_ranges(&chars, references);
     let style_at = |index| {
         if selection.is_some_and(|(from, to)| from <= index && index < to) {
             InputSpanStyle::Selection
@@ -4723,7 +4776,7 @@ fn input_spans(text: &str, selection: Option<(usize, usize)>) -> Vec<Span<'stati
     spans
 }
 
-fn input_token_ranges(chars: &[char]) -> Vec<(usize, usize)> {
+fn input_token_ranges(chars: &[char], references: &[ReferenceCandidate]) -> Vec<(usize, usize)> {
     let mut ranges = Vec::new();
     let mut index = 0;
     while index < chars.len() {
@@ -4742,7 +4795,9 @@ fn input_token_ranges(chars: &[char]) -> Vec<(usize, usize)> {
                     end += 1;
                 }
             }
-            ranges.push((index, end));
+            if known_reference_marker(chars, index, end, references) {
+                ranges.push((index, end));
+            }
             index = end;
             continue;
         }
@@ -4770,6 +4825,26 @@ fn input_token_ranges(chars: &[char]) -> Vec<(usize, usize)> {
         }
     }
     ranges
+}
+
+fn known_reference_marker(
+    chars: &[char],
+    start: usize,
+    end: usize,
+    references: &[ReferenceCandidate],
+) -> bool {
+    let marker: String = chars[start..end].iter().collect();
+    let Some(raw) = marker
+        .strip_prefix("@\"")
+        .and_then(|quoted| quoted.strip_suffix('"'))
+        .or_else(|| marker.strip_prefix('@'))
+    else {
+        return false;
+    };
+    references.iter().any(|candidate| match candidate.kind {
+        ReferenceKind::File => raw == candidate.path,
+        ReferenceKind::Directory => raw.trim_end_matches('/') == candidate.path,
+    })
 }
 
 fn key_char_eq(key: &KeyEvent, target: char) -> bool {
@@ -4829,6 +4904,34 @@ mod tests {
     }
 
     #[test]
+    fn tip_source_reflows_without_losing_text() {
+        let tip = "ctrl+c stops the turn and sends queued prompts right away — it never exits";
+        let expected = format!("  ✻ tip: {tip}");
+
+        let narrow = crate::transcript::wrap_lines(vec![tip_line(tip)], 20);
+        assert!(narrow.len() > 1, "the narrow terminal wraps the tip");
+        assert_eq!(
+            narrow
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            expected
+        );
+
+        let wide = crate::transcript::wrap_lines(vec![tip_line(tip)], 120);
+        assert_eq!(wide.len(), 1, "a wider terminal restores one row");
+        assert_eq!(
+            wide[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            expected
+        );
+    }
+
+    #[test]
     fn attachment_placeholder_is_stable_per_id() {
         let img = Attachment::Image {
             id: 2,
@@ -4861,6 +4964,12 @@ mod tests {
             e.backspace();
         }
         assert_eq!(e.text(), "你好 ");
+    }
+
+    #[test]
+    fn ghost_suggestion_uses_the_editor_wrap_width() {
+        // Width 10 leaves six input cells after the border and prompt gutter.
+        assert_eq!(ghost_visual_lines("abcdefghi", 10), ["abcdef", "ghi"]);
     }
 
     #[test]
@@ -4959,19 +5068,42 @@ mod tests {
     }
 
     #[test]
-    fn input_tokens_are_accented_without_styling_email_text() {
-        let spans = input_spans("see @src/app.rs [Image #2] and me@example.com", None);
+    fn input_tokens_accent_only_known_references_and_attachment_placeholders() {
+        let references = [ReferenceCandidate {
+            path: "src/app.rs".into(),
+            kind: ReferenceKind::File,
+            bytes: Some(1),
+        }];
+        let spans = input_spans(
+            "see @src/app.rs, but @not-a-file [Image #2] and me@example.com",
+            None,
+            &references,
+        );
         let accented: Vec<_> = spans
             .iter()
             .filter(|span| span.style.fg == Some(theme::ACCENT))
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(accented, ["@src/app.rs", "[Image #2]"]);
+        let plain: String = spans
+            .iter()
+            .filter(|span| span.style.fg.is_none())
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(
+            plain.contains("@not-a-file"),
+            "unmatched at-sign text is ordinary prose"
+        );
     }
 
     #[test]
     fn selection_overrides_input_token_accent() {
-        let spans = input_spans("@src/app.rs", Some((0, 11)));
+        let references = [ReferenceCandidate {
+            path: "src/app.rs".into(),
+            kind: ReferenceKind::File,
+            bytes: Some(1),
+        }];
+        let spans = input_spans("@src/app.rs", Some((0, 11)), &references);
         assert_eq!(spans.len(), 1);
         assert_ne!(spans[0].style.fg, Some(theme::ACCENT));
     }
@@ -5027,6 +5159,29 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(visible_phase_range(&phases, 5), (3, 8));
+    }
+
+    #[test]
+    fn normal_usage_meters_use_the_tool_green() {
+        let context = context_progress_line(20_000, 200_000, 80, false);
+        assert!(context
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme::OK)));
+
+        let limits = tcode_core::RateLimits {
+            primary: tcode_core::RateLimit {
+                used_percent: 30.0,
+                window_minutes: 300,
+                resets_at: 14_800,
+            },
+            secondary: None,
+        };
+        let rate_limit = rate_limit_line_at(limits, 10_000);
+        assert!(rate_limit
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(theme::OK)));
     }
 
     #[test]

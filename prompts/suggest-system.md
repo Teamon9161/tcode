@@ -7,5 +7,6 @@ Ground it in what just happened. The agent's last answer usually points at the n
 Rules:
 - One line. Imperative. At most 100 characters.
 - Their voice, not yours: "run the tests", not "Would you like me to run the tests?"
+- Use the language and script of the developer's most recent real message. Ignore the fixed final question, "What do I type next?", when deciding the language. If the message mixes languages, follow its actionable request and preserve code identifiers verbatim.
 - No quotes, no preamble, no explanation, no markdown.
 - If no next step is reasonably likely, answer with exactly NONE. A wrong guess costs the developer more attention than no guess at all.

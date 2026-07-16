@@ -50,6 +50,11 @@ pub fn ok() -> Style {
     Style::default().fg(OK)
 }
 
+/// Amber — used for warnings and explicit diagnostic modes such as dogfood.
+pub fn warn() -> Style {
+    Style::default().fg(WARN)
+}
+
 pub fn user_prompt() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }
