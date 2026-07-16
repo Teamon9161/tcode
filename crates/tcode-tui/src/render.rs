@@ -37,10 +37,23 @@ pub trait ToolRenderer: Send + Sync {
         tcode_core::agent::summarize_call(name, input)
     }
 
-    /// Block under a collapsed single-call header (shell command block).
-    /// Not rendered for batch items, which keep their compact `├` row.
-    fn header_block(&self, _input: &Value) -> Vec<Line<'static>> {
+    /// Detail available as soon as a single call starts. Long shell commands
+    /// use this so their full text stays folded until explicitly opened.
+    /// Batch items deliberately remain compact.
+    fn initial_detail(&self, _input: &Value) -> Vec<Line<'static>> {
         Vec::new()
+    }
+
+    /// Whether a single call's result belongs in its foldout without a visible
+    /// preview. This keeps a multi-line shell invocation to one summary row.
+    fn folds_result(&self, _input: &Value) -> bool {
+        false
+    }
+
+    /// A concise error label for a result whose complete diagnostic is kept in
+    /// the foldout. The call body remains visible as the attempted change.
+    fn error_label(&self) -> Option<&'static str> {
+        None
     }
 
     /// Change preview under the header (edit diff / write content). Rendered
@@ -49,7 +62,7 @@ pub trait ToolRenderer: Send + Sync {
         Vec::new()
     }
 
-    /// Compact text for a batch `├` row.
+    /// Compact text for an indented batch row.
     fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
         shorten_summary_path(&tcode_core::agent::summarize_call(name, input), cwd)
     }
@@ -133,8 +146,12 @@ impl ToolRenderer for ShellRenderer {
         }
     }
 
-    fn header_block(&self, input: &Value) -> Vec<Line<'static>> {
+    fn initial_detail(&self, input: &Value) -> Vec<Line<'static>> {
         diff::command_block(command_of(input))
+    }
+
+    fn folds_result(&self, input: &Value) -> bool {
+        diff::command_is_block(command_of(input))
     }
 
     fn batch_item(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
@@ -151,6 +168,10 @@ impl ToolRenderer for EditRenderer {
             input["old_string"].as_str().unwrap_or(""),
             input["new_string"].as_str().unwrap_or(""),
         )
+    }
+
+    fn error_label(&self) -> Option<&'static str> {
+        Some("Edit(error)")
     }
 
     fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
@@ -482,11 +503,13 @@ mod tests {
         let renderer = ShellRenderer;
         let short = json!({ "command": "git status" });
         assert_eq!(renderer.header("shell", &short, None), "shell(git status)");
-        assert!(renderer.header_block(&short).is_empty());
+        assert!(renderer.initial_detail(&short).is_empty());
+        assert!(!renderer.folds_result(&short));
 
         let multiline = json!({ "command": "a\nb" });
         assert_eq!(renderer.header("shell", &multiline, None), "shell");
-        assert!(!renderer.header_block(&multiline).is_empty());
+        assert!(!renderer.initial_detail(&multiline).is_empty());
+        assert!(renderer.folds_result(&multiline));
 
         let long = json!({ "command": format!("echo {}", "x".repeat(100)) });
         assert_eq!(renderer.header("bash", &long, None), "bash");
@@ -522,6 +545,7 @@ mod tests {
             "path": "src/main.rs", "old_string": "let x = 1;", "new_string": "let x = 2;"
         });
         assert!(!EditRenderer.body(&edit).is_empty());
+        assert_eq!(EditRenderer.error_label(), Some("Edit(error)"));
         assert!(EditRenderer.hide_success_result());
 
         let write = json!({ "path": "src/new.rs", "content": "fn main() {}\n" });

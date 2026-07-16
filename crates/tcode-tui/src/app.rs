@@ -224,7 +224,7 @@ struct InputHitbox {
 
 struct PendingCall {
     detail: String,
-    /// Batch items defer their `├ summary` line (plus any diff) to here, so
+    /// Batch items defer their indented summary row (plus any diff) so
     /// `ToolEnd` can bake it directly above this call's own result instead of
     /// baking every item first and every result after. Empty for single calls
     /// (their header is baked at `ToolStart`).
@@ -248,18 +248,15 @@ struct ReplayBatch {
     header: Option<String>,
     /// Several tools in one batch: tag each item with its tool name.
     mixed: bool,
-    /// The batch's final call closes the tree with `└` instead of `├`.
-    last: bool,
 }
 
-/// Tree glyphs opening each batch item row; the final row closes the tree.
-const BATCH_ITEM_GLYPH: &str = "  ├ ";
-const BATCH_TAIL_GLYPH: &str = "  └ ";
+/// Batch items are indented under their shared header without a tree glyph.
+const BATCH_ITEM_INDENT: &str = "    ";
 
 /// Where a result's call record lives, shared by live `ToolEnd` and
 /// replay. The three cases are mutually exclusive by construction.
 enum CallRecord {
-    /// A batch item: its deferred `├ summary` lines bake with the result.
+    /// A batch item: its deferred indented summary lines bake with the result.
     Batch(Vec<Line<'static>>),
     /// A bare single call: its `●` header block is already in the
     /// transcript and the result attaches to that very row.
@@ -892,12 +889,10 @@ impl App {
                         .collect::<HashSet<_>>()
                         .len()
                         > 1;
-                    let group_len = group.len();
                     for (index, (id, name, input)) in group.into_iter().enumerate() {
                         let batch = label.as_ref().map(|label| ReplayBatch {
                             header: (index == 0).then(|| label.clone()),
                             mixed,
-                            last: index + 1 == group_len,
                         });
                         calls.insert(id, ReplayCall { name, input, batch });
                     }
@@ -995,7 +990,6 @@ impl App {
                                         name,
                                         &call.input,
                                         batch.mixed,
-                                        batch.last,
                                     ))
                                 }
                                 None => match self.bake_call_start(name, &call.input) {
@@ -1377,7 +1371,7 @@ impl App {
                 for (name, input) in calls {
                     self.pending_batch.push_back(PendingCall {
                         detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                        header: self.batch_item_lines(&name, &input, mixed, false),
+                        header: self.batch_item_lines(&name, &input, mixed),
                         header_index: None,
                     });
                 }
@@ -1449,14 +1443,10 @@ impl App {
                     self.state_label = "responding".into();
                     return;
                 }
-                let (entry, closes_batch) = match self.pending_tool.take() {
-                    Some(entry) => (Some(entry), false),
-                    None => {
-                        let entry = self.pending_batch.pop_front();
-                        let closes = entry.is_some() && self.pending_batch.is_empty();
-                        (entry, closes)
-                    }
-                };
+                let entry = self
+                    .pending_tool
+                    .take()
+                    .or_else(|| self.pending_batch.pop_front());
                 // Recover the call's input (stashed as JSON) to decide whether
                 // the output is markdown before the result is appended to it.
                 let (input, record) = match entry {
@@ -1464,10 +1454,7 @@ impl App {
                         let record = match entry.header_index {
                             Some(index) => CallRecord::HeaderBlock(index),
                             None if !entry.header.is_empty() => {
-                                let mut header = entry.header;
-                                if closes_batch {
-                                    mark_batch_tail(&mut header);
-                                }
+                                let header = entry.header;
                                 CallRecord::Batch(header)
                             }
                             None => CallRecord::Baked,
@@ -1930,13 +1917,13 @@ impl App {
         spans.insert(0, Span::styled("● ", theme::accent()));
         let mut lines = vec![Line::from(spans)];
         lines.extend(renderer.body(input));
-        lines.extend(renderer.header_block(input));
         lines
     }
 
-    /// Bake a single call's `●` block. The blank row above (and, when the
-    /// call carries a diff or command block, the one below) is what keeps
+    /// Bake a single call's `●` block. The blank row above is what keeps
     /// consecutive calls from running together — live and replayed alike.
+    /// Long shell commands attach their command text as a closed detail here,
+    /// then append their result to that same detail at `ToolEnd`.
     ///
     /// A bare header (no diff, no command block) becomes its own transcript
     /// block and its index is returned: the result attaches to that very
@@ -1948,6 +1935,11 @@ impl App {
         if lines.len() == 1 {
             let index = self.transcript.block_count();
             self.bake(lines);
+            let detail = self.renderers.get(name).initial_detail(input);
+            if !detail.is_empty() {
+                self.transcript
+                    .attach_detail(index, detail, OUTPUT_VIEW_ROWS);
+            }
             return Some(index);
         }
         lines.push(Line::default());
@@ -1962,27 +1954,18 @@ impl App {
         vec![Line::default(), Line::from(spans)]
     }
 
-    /// One batch item's `├ summary` row (plus any diff). Baked not here but
-    /// at the item's own result, so each call sits above its own output. A
-    /// change body gets a trailing separator, otherwise adjacent file diffs
-    /// would visually merge into one block. `last` closes the tree with `└`;
-    /// the live path passes false and patches the final row when it bakes
-    /// (items land in completion order, so the last baked row is always the
-    /// bottom one).
+    /// One batch item's indented summary row (plus any diff). It is baked at
+    /// the item's own result so each call stays immediately above its output.
+    /// Change bodies retain their trailing separator so adjacent diffs never
+    /// visually merge.
     fn batch_item_lines(
         &self,
         name: &str,
         input: &serde_json::Value,
         mixed: bool,
-        last: bool,
     ) -> Vec<Line<'static>> {
         let renderer = self.renderers.get(name);
-        let glyph = if last {
-            BATCH_TAIL_GLYPH
-        } else {
-            BATCH_ITEM_GLYPH
-        };
-        let mut row = vec![Span::styled(glyph, theme::dim())];
+        let mut row = vec![Span::styled(BATCH_ITEM_INDENT, theme::dim())];
         if mixed {
             // Keep per-item tool tags subdued: the batch header is where
             // display names get title-cased and highlighted.
@@ -2004,7 +1987,7 @@ impl App {
     /// Bake one call's result, shared by live `ToolEnd` and replay. The
     /// result lands on the call's own row whenever there is one — preview
     /// appended, fold affordance on hover — so no record spends an extra
-    /// line on a lone connector glyph. Only `Baked` records (a diff or
+    /// line on a separate result marker. Only `Baked` records (a diff or
     /// command block between header and output) keep the `⎿ preview` row.
     fn bake_call_result(
         &mut self,
@@ -2038,19 +2021,33 @@ impl App {
             },
             ResultRender::Foldable { head, detail } => {
                 // Quiet tools (read/grep/glob) skip the preview: the fold
-                // affordance already states the line count on hover.
-                let quiet = !is_error && self.renderers.get(name).quiet_output();
+                // affordance already states the line count on hover. Long
+                // single shell calls likewise keep both their command and
+                // output inside the foldout.
+                let renderer = self.renderers.get(name);
+                let hide_preview = !is_error
+                    && (renderer.quiet_output()
+                        || input.is_some_and(|input| renderer.folds_result(input)));
+                let label = if is_error {
+                    renderer.error_label().unwrap_or(preview)
+                } else {
+                    preview
+                };
                 match record {
                     CallRecord::HeaderBlock(index) => {
-                        if !quiet {
+                        if !hide_preview {
                             self.transcript
-                                .extend_head(index, preview_tail(preview, style));
+                                .extend_head(index, preview_tail(label, style));
                         }
-                        self.attach_result_detail(index, detail);
+                        self.attach_result_detail(
+                            index,
+                            detail,
+                            input.is_some_and(|input| renderer.folds_result(input)),
+                        );
                     }
                     CallRecord::Batch(mut header) => {
-                        if !quiet {
-                            append_result_preview(&mut header, preview, style);
+                        if !hide_preview {
+                            append_result_preview(&mut header, label, style);
                         }
                         self.push_result_detail(header, detail);
                     }
@@ -2060,8 +2057,12 @@ impl App {
         }
     }
 
-    fn attach_result_detail(&mut self, index: usize, detail: ResultDetail) {
+    fn attach_result_detail(&mut self, index: usize, detail: ResultDetail, append: bool) {
         match detail {
+            ResultDetail::Lines(lines) if append => {
+                self.transcript
+                    .append_detail(index, lines, OUTPUT_VIEW_ROWS)
+            }
             ResultDetail::Lines(lines) => {
                 self.transcript
                     .attach_detail(index, lines, OUTPUT_VIEW_ROWS)
@@ -2112,14 +2113,28 @@ impl App {
         } else {
             theme::dim()
         };
-        let detail = self.output_detail(name, input, preview, content, is_error);
+        if is_error {
+            if let Some(label) = renderer.error_label() {
+                let diagnostic = if content.trim().is_empty() {
+                    preview
+                } else {
+                    content
+                };
+                return ResultRender::Foldable {
+                    head: vec![Line::styled(format!("  {label}"), style)],
+                    detail: self.output_detail(name, input, preview, diagnostic, true, false),
+                };
+            }
+        }
+        let folded_result = input.is_some_and(|input| renderer.folds_result(input));
+        let detail = self.output_detail(name, input, preview, content, is_error, !folded_result);
         if detail.is_empty() {
             ResultRender::Inline(Line::styled(format!("  ⎿ {preview}"), style))
         } else {
             let quiet = !is_error && renderer.quiet_output();
             // The fold affordance already carries the line count ("▸ N
             // lines"); a quiet tool's head only marks the result.
-            let head = if quiet {
+            let head = if quiet || folded_result {
                 Line::styled("  ⎿", style)
             } else {
                 Line::styled(format!("  ⎿ {preview}"), style)
@@ -2134,8 +2149,8 @@ impl App {
     /// The foldable body of a tool result. Markdown-shaped output (a
     /// `web_fetch`, or a `read` of a `.md` file) is rendered; everything
     /// else stays literal. Either way a left gutter bar delineates the
-    /// expanded region, and the first line — already shown untruncated in
-    /// the preview head — is dropped from plain output to avoid a duplicate.
+    /// expanded region, and the first line is dropped only when the head has
+    /// already shown it as a preview.
     fn output_detail(
         &self,
         name: &str,
@@ -2143,10 +2158,11 @@ impl App {
         preview: &str,
         content: &str,
         is_error: bool,
+        preview_visible: bool,
     ) -> ResultDetail {
         let renderer = self.renderers.get(name);
         let quiet = renderer.quiet_output();
-        if content.trim() == preview.trim() && (is_error || !quiet) {
+        if preview_visible && content.trim() == preview.trim() && (is_error || !quiet) {
             return ResultDetail::Lines(Vec::new()); // nothing beyond the preview
         }
         let gutter = || Span::styled("  │ ", theme::dim());
@@ -2162,8 +2178,12 @@ impl App {
         // foldout; quiet tools such as read/grep use a generic head, so the
         // expanded body must include line 1.
         let first = content.lines().next().unwrap_or("");
-        let skip =
-            usize::from(!quiet && first.chars().count() <= 120 && content.lines().count() > 1);
+        let skip = usize::from(
+            preview_visible
+                && !quiet
+                && first.chars().count() <= 120
+                && content.lines().count() > 1,
+        );
         ResultDetail::Lines(
             content
                 .lines()
@@ -4154,17 +4174,6 @@ fn visible_phase_range(phases: &[ProgressPhase], max_visible: usize) -> (usize, 
     (start, start + max_visible)
 }
 
-/// The final item baked for a batch closes the tree: swap its `├` for a
-/// `└`. Items bake in completion order, so the last one popped is always
-/// the bottom row however the batch was listed.
-fn mark_batch_tail(header: &mut [Line<'static>]) {
-    if let Some(span) = header.first_mut().and_then(|line| line.spans.first_mut()) {
-        if span.content == BATCH_ITEM_GLYPH {
-            span.content = BATCH_TAIL_GLYPH.into();
-        }
-    }
-}
-
 /// A result preview riding on its call's own row: ` — preview`, dim on
 /// success, red on failure. One format for batch rows and single calls.
 fn preview_tail(preview: &str, style: ratatui::style::Style) -> Vec<Span<'static>> {
@@ -4448,24 +4457,21 @@ fn turn_summary_line(elapsed: f32, usage: Usage) -> Line<'static> {
         theme::dim()
     };
     Line::from(vec![
-        Span::styled("  ╰─ ", theme::border()),
-        Span::styled("completed ", theme::dim()),
+        Span::styled("✓ completed ", theme::ok()),
         Span::styled(format!("{elapsed:.1}s"), theme::bold()),
-        Span::styled("  ·  ↑ ", theme::dim()),
+        Span::styled(" · ↑", theme::dim()),
         // Uncached input only: the tokens this turn actually paid full price
         // for. Summing total_input() across a multi-step turn would recount
         // the cached prefix on every request; the cache figure below shows
         // how much of the full prompt was reused. This is a turn receipt, not
         // the window-occupancy figure the context meter reports.
         Span::styled(token_count(usage.input_tokens), theme::accent()),
-        Span::styled(" new input", theme::dim()),
-        Span::styled("  ·  ↓ ", theme::dim()),
+        Span::styled(" · ↓", theme::dim()),
         Span::styled(
             token_count(usage.output_tokens),
             ratatui::style::Style::default().fg(theme::OK),
         ),
-        Span::styled(" output", theme::dim()),
-        Span::styled("  ·  cache ", theme::dim()),
+        Span::styled(" · cache ", theme::dim()),
         Span::styled(format!("{cache_pct:.0}%"), cache_style),
     ])
 }
@@ -5272,10 +5278,7 @@ mod tests {
             .iter()
             .map(|span| span.content.as_ref())
             .collect::<String>();
-        assert_eq!(
-            text,
-            "  ╰─ completed 2.5s  ·  ↑ 1.2k new input  ·  ↓ 23 output  ·  cache 0%"
-        );
+        assert_eq!(text, "✓ completed 2.5s · ↑1.2k · ↓23 · cache 0%");
     }
 
     #[test]

@@ -418,6 +418,38 @@ impl Transcript {
         self.remeasure(index, old_height);
     }
 
+    /// Extend a plain foldout without changing `attach_detail`'s replacement
+    /// semantics. A long shell command uses this when its result arrives.
+    pub fn append_detail(&mut self, index: usize, mut lines: Vec<Line<'static>>, view_rows: usize) {
+        if lines.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let appends_to_plain = self.blocks[index]
+            .detail
+            .as_ref()
+            .is_some_and(|detail| matches!(&detail.content, Content::Lines(_)));
+        if !appends_to_plain {
+            return self.attach_detail(index, lines, view_rows);
+        }
+        let old_height = self.blocks[index].height();
+        let detail = self.blocks[index]
+            .detail
+            .as_mut()
+            .expect("plain detail checked");
+        let Content::Lines(existing_lines) = &mut detail.content else {
+            unreachable!("plain detail checked");
+        };
+        if !existing_lines.is_empty() {
+            existing_lines.push(Line::default());
+        }
+        existing_lines.append(&mut lines);
+        detail.lines.clear();
+        detail.wrapped = Wrapped::default();
+        detail.scroll = 0;
+        detail.view_rows = detail.view_rows.max(view_rows.max(1));
+        self.remeasure(index, old_height);
+    }
+
     /// Recompute layout after a block mutated in place, preserving a
     /// scrolled-up reader's position exactly like `push_block` does.
     fn remeasure(&mut self, index: usize, old_height: usize) {
@@ -1437,6 +1469,42 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert_eq!(t.total(), 3);
+    }
+
+    #[test]
+    fn attaching_a_result_preserves_an_existing_plain_detail() {
+        let mut t = Transcript::new(30);
+        t.push(vec![Line::raw("run")]);
+        t.attach_detail(
+            0,
+            vec![Line::raw("command one"), Line::raw("command two")],
+            14,
+        );
+        t.append_detail(
+            0,
+            vec![Line::raw("result one"), Line::raw("result two")],
+            14,
+        );
+
+        let Some(detail) = &t.blocks[0].detail else {
+            panic!("detail attached");
+        };
+        let Content::Lines(lines) = &detail.content else {
+            panic!("plain detail retained");
+        };
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            text,
+            ["command one", "command two", "", "result one", "result two"]
+        );
     }
 
     #[test]
