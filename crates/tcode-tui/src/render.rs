@@ -31,8 +31,8 @@ pub trait ToolRenderer: Send + Sync {
     }
 
     /// One-line header text (uncolored; the App applies display-name
-    /// coloring). Long/multi-line shell commands collapse to the bare name
-    /// and render via `header_block` instead.
+    /// coloring). Long/multi-line shell commands use a capped first-line
+    /// preview while their full command remains folded below.
     fn header(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
         tcode_core::agent::summarize_call(name, input)
     }
@@ -44,10 +44,17 @@ pub trait ToolRenderer: Send + Sync {
         Vec::new()
     }
 
-    /// Whether a single call's result belongs in its foldout without a visible
-    /// preview. This keeps a multi-line shell invocation to one summary row.
+    /// Whether a call's result belongs in its foldout without a visible
+    /// preview. Shell commands use this so their output never competes with
+    /// the command summary, regardless of command length.
     fn folds_result(&self, _input: &Value) -> bool {
         false
+    }
+
+    /// Render a successful result body as syntax-highlighted source. The
+    /// caller keeps errors literal so diagnostics never masquerade as code.
+    fn syntax_detail(&self, _input: &Value, _content: &str) -> Option<Vec<Line<'static>>> {
+        None
     }
 
     /// A concise error label for a result whose complete diagnostic is kept in
@@ -135,12 +142,15 @@ impl ToolRenderer for ExitPlanRenderer {
 
 struct ShellRenderer;
 
+/// Header previews must leave room for the tool label, result affordance, and
+/// common terminal widths. The full command remains in the foldout.
+const SHELL_HEADER_PREVIEW_MAX: usize = 56;
+
 impl ToolRenderer for ShellRenderer {
     fn header(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
-        // A long or multi-line command would truncate or corrupt the one-line
-        // header; collapse to the bare name and let `header_block` show it.
-        if diff::command_is_block(command_of(input)) {
-            name.to_string()
+        let command = command_of(input);
+        if diff::command_is_block(command) {
+            format!("{name}({})", command_header_preview(command))
         } else {
             tcode_core::agent::summarize_call(name, input)
         }
@@ -150,8 +160,8 @@ impl ToolRenderer for ShellRenderer {
         diff::command_block(command_of(input))
     }
 
-    fn folds_result(&self, input: &Value) -> bool {
-        diff::command_is_block(command_of(input))
+    fn folds_result(&self, _input: &Value) -> bool {
+        true
     }
 
     fn batch_item(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
@@ -221,6 +231,10 @@ impl ToolRenderer for ReadRenderer {
 
     fn quiet_output(&self) -> bool {
         self.quiet
+    }
+
+    fn syntax_detail(&self, input: &Value, content: &str) -> Option<Vec<Line<'static>>> {
+        input_path(input).map(|path| diff::read_preview(path, content))
     }
 
     fn markdown_detail(&self, input: Option<&Value>) -> bool {
@@ -394,6 +408,20 @@ fn file_target_item(name: &str, input: &Value, cwd: Option<&Path>) -> String {
         .unwrap_or_else(|| name.to_string())
 }
 
+/// First physical line shown in a folded long command's header. An ellipsis
+/// marks both a clipped long line and the existence of later command lines.
+fn command_header_preview(command: &str) -> String {
+    let first = command.lines().next().unwrap_or("").trim();
+    if first.is_empty() {
+        return "…".to_string();
+    }
+    let mut preview: String = first.chars().take(SHELL_HEADER_PREVIEW_MAX).collect();
+    if first.chars().count() > SHELL_HEADER_PREVIEW_MAX || command.lines().nth(1).is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
 /// First line of a command, capped, with a note when more lines follow. Keeps
 /// a multi-line command from corrupting a compact one-line batch row.
 fn command_first_line(cmd: &str) -> String {
@@ -499,20 +527,24 @@ mod tests {
     }
 
     #[test]
-    fn shell_header_collapses_exactly_when_the_command_is_a_block() {
+    fn shell_headers_preview_only_long_commands_and_always_fold_results() {
         let renderer = ShellRenderer;
         let short = json!({ "command": "git status" });
         assert_eq!(renderer.header("shell", &short, None), "shell(git status)");
         assert!(renderer.initial_detail(&short).is_empty());
-        assert!(!renderer.folds_result(&short));
+        assert!(renderer.folds_result(&short));
 
         let multiline = json!({ "command": "a\nb" });
-        assert_eq!(renderer.header("shell", &multiline, None), "shell");
+        assert_eq!(renderer.header("shell", &multiline, None), "shell(a…)");
         assert!(!renderer.initial_detail(&multiline).is_empty());
         assert!(renderer.folds_result(&multiline));
 
         let long = json!({ "command": format!("echo {}", "x".repeat(100)) });
-        assert_eq!(renderer.header("bash", &long, None), "bash");
+        let long_header = renderer.header("bash", &long, None);
+        assert!(long_header.starts_with("bash(echo "));
+        assert!(long_header.ends_with("…)"));
+        assert!(long_header.chars().count() <= "bash(".len() + SHELL_HEADER_PREVIEW_MAX + 2);
+        assert!(renderer.folds_result(&long));
     }
 
     /// Real grep calls almost always carry a `path`, which outranks `pattern`
@@ -559,6 +591,14 @@ mod tests {
         let cwd = Path::new("/work");
         let plain = json!({ "path": "/work/a.rs" });
         assert_eq!(renderer.batch_item("read", &plain, Some(cwd)), "a.rs");
+        let syntax = renderer
+            .syntax_detail(&plain, "     1\tlet answer = 42;\n")
+            .expect("read source has syntax detail");
+        assert!(syntax[0]
+            .spans
+            .iter()
+            .skip(3)
+            .any(|span| span.style.fg.is_some()));
         let ranged = json!({ "path": "/work/a.rs", "offset": 10, "limit": 5 });
         assert_eq!(
             renderer.batch_item("read", &ranged, Some(cwd)),

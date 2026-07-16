@@ -17,7 +17,7 @@ mod theme;
 mod transcript;
 pub mod wizard;
 
-use std::io::stdout;
+use std::io::{stdout, Write};
 use std::sync::Arc;
 
 use crossterm::cursor::SetCursorStyle;
@@ -95,12 +95,35 @@ pub async fn run(
 }
 
 fn restore_terminal() {
-    let _ = execute!(
-        stdout(),
-        DisableMouseCapture,
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
+    let mut output = stdout();
+    restore_terminal_output(&mut output);
     let _ = disable_raw_mode();
-    let _ = execute!(stdout(), crossterm::cursor::Show);
+}
+
+fn restore_terminal_output(output: &mut impl Write) {
+    // Some terminal emulators keep mouse-reporting state across an alternate
+    // screen switch. Return to the shell's screen before disabling it, or
+    // pointer movement can be delivered to the shell as CSI mouse reports.
+    let _ = execute!(output, LeaveAlternateScreen);
+    let _ = execute!(output, DisableMouseCapture);
+    let _ = execute!(output, DisableBracketedPaste);
+    let _ = execute!(output, crossterm::cursor::Show);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::restore_terminal_output;
+
+    #[test]
+    fn terminal_teardown_disables_mouse_after_leaving_alternate_screen() {
+        let mut output = Vec::new();
+        restore_terminal_output(&mut output);
+
+        let output = String::from_utf8(output).unwrap();
+        let alternate_end = output.find("\x1b[?1049l").unwrap();
+        let mouse_end = output.find("\x1b[?1006l").unwrap();
+        let paste_end = output.find("\x1b[?2004l").unwrap();
+        assert!(alternate_end < mouse_end);
+        assert!(mouse_end < paste_end);
+    }
 }

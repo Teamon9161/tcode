@@ -434,6 +434,9 @@ pub struct App {
     // Live streaming state: kept as a replace-in-place transcript block until
     // the provider finishes this assistant message.
     live_text: String,
+    /// A visible tool result must not run into the model's next visible response.
+    /// A following tool header or user message clears this before it is rendered.
+    space_before_response: bool,
     /// Index of the still-streaming assistant block inside the transcript.
     /// While set, incoming deltas replace that block in place; finalization just
     /// drops the marker so the block becomes ordinary scrollback.
@@ -568,6 +571,7 @@ impl App {
             popup_index: 0,
             dismissed_reference: None,
             live_text: String::new(),
+            space_before_response: false,
             live_block: None,
             thinking_chars: 0,
             thinking_text: String::new(),
@@ -827,9 +831,11 @@ impl App {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_progress: Option<serde_json::Value> = None;
         let mut calls: HashMap<String, ReplayCall> = HashMap::new();
+        let mut space_before_assistant_text = false;
         for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
                 tcode_core::Entry::User(blocks) => {
+                    space_before_assistant_text = false;
                     // User echoes are their own entry-tagged blocks so
                     // rewind can jump to and truncate from them.
                     self.transcript.push(std::mem::take(&mut lines));
@@ -864,6 +870,11 @@ impl App {
                                 self.bake_thinking(&title, thinking);
                             }
                             ContentBlock::Text { text } => {
+                                if space_before_assistant_text {
+                                    self.transcript.push(std::mem::take(&mut lines));
+                                    self.bake(vec![Line::default()]);
+                                    space_before_assistant_text = false;
+                                }
                                 self.transcript.push(std::mem::take(&mut lines));
                                 self.transcript
                                     .push_markdown(self.md.parse(text).with_trailing_blank());
@@ -1008,6 +1019,7 @@ impl App {
                             *is_error,
                             record,
                         );
+                        space_before_assistant_text = true;
                     }
                 }
                 tcode_core::Entry::UserNote { text, .. } => {
@@ -1115,6 +1127,7 @@ impl App {
         // The user just answered the question the guess was asking.
         self.drop_suggestion();
         self.clear_live_text();
+        self.space_before_response = false;
         if !self.progress.is_empty() && self.progress.iter().all(ProgressPhase::is_completed) {
             self.progress.clear();
         }
@@ -1321,6 +1334,10 @@ impl App {
             }
             AgentEvent::TextDelta(t) => {
                 self.finish_thinking();
+                if self.space_before_response {
+                    self.bake(vec![Line::default()]);
+                    self.space_before_response = false;
+                }
                 let tokens = approx_tokens(&t);
                 self.out_tokens += tokens;
                 self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
@@ -1349,6 +1366,7 @@ impl App {
                 self.state_label = "calling tool".into();
             }
             AgentEvent::ToolBatchStart { label, calls } => {
+                self.space_before_response = false;
                 // A batch supersedes any single diff pre-baked for its
                 // (once) approval — retract it so the batch renders in full.
                 if let Some(mark) = self.change_prebake.take() {
@@ -1382,6 +1400,7 @@ impl App {
                 summary,
                 input,
             } => {
+                self.space_before_response = false;
                 match self.renderers.get(&name).route() {
                     CallRoute::Progress => {
                         self.update_progress(&input);
@@ -1394,7 +1413,7 @@ impl App {
                     CallRoute::Transcript => {}
                 }
                 // Recompute the header from name+input so a long/multi-line
-                // shell command collapses to `Shell` and renders as a block,
+                // shell command gets a capped preview and folded detail,
                 // instead of the raw command string core put in `summary`.
                 let _ = summary;
                 let summary = self.display_summary(&self.renderers.get(&name).header(
@@ -1472,6 +1491,7 @@ impl App {
                     .context_tokens
                     .saturating_add(approx_tokens(&content) as u64);
                 self.bake_call_result(&name, input.as_ref(), &preview, &content, is_error, record);
+                self.space_before_response = true;
                 self.state_label = "responding".into();
             }
             AgentEvent::ReferencesExpanded {
@@ -1497,6 +1517,7 @@ impl App {
                 // on its own — it was only ever a view of the queue.
                 self.bake_live_text();
                 self.finish_thinking();
+                self.space_before_response = false;
                 self.transcript
                     .push_tagged(prompt_echo(&text, &attachments), entry_index);
             }
@@ -1896,7 +1917,7 @@ impl App {
     /// tool's display name is green, the arguments are dim.
     fn colored_tool_summary(&self, summary: &str) -> Vec<Span<'static>> {
         // The tool name is always the accent-colored part, argument or not: a
-        // long shell command collapses to a bare `Run`, and an argument-less
+        // long shell command uses a capped preview, and an argument-less
         // summary (MCP tools) must not read as a different kind of record.
         match summary.find('(') {
             Some(paren) => vec![
@@ -2020,14 +2041,12 @@ impl App {
                 CallRecord::Baked => self.bake(vec![line]),
             },
             ResultRender::Foldable { head, detail } => {
-                // Quiet tools (read/grep/glob) skip the preview: the fold
-                // affordance already states the line count on hover. Long
-                // single shell calls likewise keep both their command and
-                // output inside the foldout.
+                // Quiet tools (read/grep/glob) and shell commands skip the
+                // preview: their fold affordance already exposes the complete
+                // result on demand, without competing with the call summary.
                 let renderer = self.renderers.get(name);
-                let hide_preview = !is_error
-                    && (renderer.quiet_output()
-                        || input.is_some_and(|input| renderer.folds_result(input)));
+                let hide_preview = renderer.quiet_output()
+                    || input.is_some_and(|input| renderer.folds_result(input));
                 let label = if is_error {
                     renderer.error_label().unwrap_or(preview)
                 } else {
@@ -2168,6 +2187,11 @@ impl App {
         let gutter = || Span::styled("  │ ", theme::dim());
         if !is_error && renderer.markdown_detail(input) {
             return ResultDetail::Markdown(self.md.parse(content));
+        }
+        if !is_error {
+            if let Some(lines) = input.and_then(|input| renderer.syntax_detail(input, content)) {
+                return ResultDetail::Lines(lines);
+            }
         }
         let text_style = if is_error {
             ratatui::style::Style::default().fg(theme::ERROR)

@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/Teamon9161/tcode/main/install.sh | 
 The default destination is `~/.local/bin`. To choose a version or install directory:
 
 ```sh
-TCODE_VERSION=0.1.3 TCODE_INSTALL_DIR=/usr/local/bin \
+TCODE_VERSION=0.1.4 TCODE_INSTALL_DIR=/usr/local/bin \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/Teamon9161/tcode/main/install.sh)"
 ```
 

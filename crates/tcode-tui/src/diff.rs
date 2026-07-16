@@ -68,6 +68,22 @@ pub fn command_block(cmd: &str) -> Vec<Line<'static>> {
     lines
 }
 
+/// Render a numbered `read` result with syntax foregrounds but no change
+/// background. Lines which are not part of the tool's numbered file payload
+/// remain subdued metadata, such as freshness and pagination notices.
+pub fn read_preview(path: &str, content: &str) -> Vec<Line<'static>> {
+    content
+        .lines()
+        .map(|line| match line.split_once('\t') {
+            Some((number, text)) => match number.trim().parse::<usize>() {
+                Ok(number) => code_line(path, "  ", Some(number), text, None),
+                Err(_) => Line::styled(format!("  {line}"), theme::dim()),
+            },
+            None => Line::styled(format!("  {line}"), theme::dim()),
+        })
+        .collect()
+}
+
 /// Full new-content preview for a `write` call: every line is an addition.
 pub fn write_preview(path: &str, content: &str) -> Vec<Line<'static>> {
     content
@@ -370,6 +386,27 @@ fn code_line_emphasized(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_preview_keeps_source_line_numbers_and_syntax_foregrounds() {
+        let lines = read_preview(
+            "src/main.rs",
+            "note: this file changed on disk since you last read it.\n     7\tlet answer = 42;\n",
+        );
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].style.fg, Some(theme::DIM));
+        let rendered: String = lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.contains("7 │ let answer = 42;"));
+        assert!(lines[1]
+            .spans
+            .iter()
+            .skip(3)
+            .any(|span| span.style.fg.is_some()));
+    }
 
     #[test]
     fn diff_uses_background_without_losing_syntax_foreground() {
