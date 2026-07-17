@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -12,8 +12,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::{
-    ActiveModel, ContentBlock, DelegateEvent, Message, PermissionRequest, Request, Role,
-    StreamEvent, Tool, ToolCtx, ToolOutput,
+    ActiveModel, AgentModels, AgentRole, AutoSafety, ContentBlock, DelegateEvent, Message,
+    ModelCell, PermissionRequest, Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
 };
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
@@ -632,7 +632,56 @@ async fn summarize_page(
 
 // ---------------------------------------------------------------- web_fetch
 
-pub struct WebFetchTool;
+/// Immutable, startup-configured exact host names that `web_fetch` may treat
+/// as direct-safe public metadata reads in Auto Mode.
+pub type TrustedReadHosts = Arc<BTreeSet<String>>;
+
+/// Normalize the global configuration once before it is shared by all main and
+/// sub-agent `WebFetchTool` instances.
+pub fn trusted_read_hosts(hosts: impl IntoIterator<Item = String>) -> TrustedReadHosts {
+    Arc::new(
+        hosts
+            .into_iter()
+            .map(|host| host.to_ascii_lowercase())
+            .collect(),
+    )
+}
+
+pub struct FetchSummarizer {
+    model: ModelCell,
+    pinned: AgentModels,
+}
+
+impl FetchSummarizer {
+    pub fn new(model: ModelCell, pinned: AgentModels) -> Self {
+        Self { model, pinned }
+    }
+
+    fn model(&self) -> Option<ActiveModel> {
+        self.pinned.resolve(AgentRole::Fetch, &self.model)
+    }
+}
+
+pub struct WebFetchTool {
+    trusted_read_hosts: TrustedReadHosts,
+    summarizer: Option<FetchSummarizer>,
+}
+
+impl WebFetchTool {
+    pub fn new(trusted_read_hosts: TrustedReadHosts) -> Self {
+        Self {
+            trusted_read_hosts,
+            summarizer: None,
+        }
+    }
+
+    /// Attach the live model role resolver used only for `prompt` summaries.
+    /// A toolset without this dependency deliberately keeps summaries off.
+    pub fn with_summarizer(mut self, summarizer: FetchSummarizer) -> Self {
+        self.summarizer = Some(summarizer);
+        self
+    }
+}
 
 #[async_trait]
 impl Tool for WebFetchTool {
@@ -678,6 +727,24 @@ impl Tool for WebFetchTool {
             aliases: Vec::new(),
             summary: format!("fetch {url}"),
             is_edit: false,
+        }
+    }
+
+    fn auto_safety(&self, input: &Value) -> AutoSafety {
+        let Some(url) = input["url"].as_str().and_then(|raw| parse_url(raw).ok()) else {
+            return AutoSafety::Classify;
+        };
+        if url.scheme() == "https"
+            && url.port_or_known_default() == Some(443)
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url
+                .host_str()
+                .is_some_and(|host| self.trusted_read_hosts.contains(&host.to_ascii_lowercase()))
+        {
+            AutoSafety::Allow
+        } else {
+            AutoSafety::Classify
         }
     }
 
@@ -778,12 +845,7 @@ impl Tool for WebFetchTool {
         // `prompt` costs a model call, so it is honored only when `web-fetch`
         // is on. Its inherited mode deliberately snapshots the main model;
         // unconfigured is still off and returns the page directly.
-        let model = ctx.agent_models.get("fetch").or_else(|| {
-            ctx.agent_models
-                .inherits("fetch")
-                .then(|| ctx.model.as_ref().map(|model| model.snapshot()))
-                .flatten()
-        });
+        let model = self.summarizer.as_ref().and_then(FetchSummarizer::model);
         let Some(model) = model else {
             let mut out = fetch_output(&final_url, &text, None, extracted);
             out.content = format!(
@@ -1171,6 +1233,31 @@ mod tests {
     }
 
     #[test]
+    fn auto_safety_requires_a_trusted_anonymous_default_port_https_host() {
+        let tool = WebFetchTool::new(trusted_read_hosts(vec!["api.github.com".into()]));
+        let safety = |url| tool.auto_safety(&json!({ "url": url }));
+        assert_eq!(
+            safety("https://API.GITHUB.COM/repos/actions/checkout/releases/latest"),
+            AutoSafety::Allow
+        );
+        for url in [
+            "https://raw.githubusercontent.com/actions/checkout/main/README.md",
+            "https://not-api.github.com/repos/actions/checkout",
+            "http://api.github.com/repos/actions/checkout",
+            "https://api.github.com:444/repos/actions/checkout",
+            "https://token@api.github.com/repos/actions/checkout",
+            "https://api.github.com:443@evil.example/",
+            "ftp://api.github.com/repos/actions/checkout",
+        ] {
+            assert_eq!(
+                safety(url),
+                AutoSafety::Classify,
+                "{url} must be classified"
+            );
+        }
+    }
+
+    #[test]
     fn render_body_by_content_type() {
         let md = render_body("text/html; charset=utf-8", "<h1>Hi</h1><p>there</p>").unwrap();
         assert!(md.contains("# Hi"));
@@ -1303,6 +1390,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn fetch_summarizer_requires_an_explicit_fetch_role() {
+        let provider = std::sync::Arc::new(MockFetchModel::default());
+        let primary = ModelCell::new(ActiveModel {
+            provider,
+            max_tokens: 4096,
+            context_window: 128_000,
+            effort: None,
+        });
+        let pins = AgentModels::default();
+        let summarizer = FetchSummarizer::new(primary.clone(), pins.clone());
+
+        assert!(summarizer.model().is_none(), "fetch defaults to off");
+        pins.pin_inherit(AgentRole::Fetch.key());
+        assert_eq!(
+            summarizer.model().unwrap().provider.model(),
+            primary.snapshot().provider.model(),
+            "an explicit inherit follows the live primary model"
+        );
+    }
+
     #[tokio::test]
     async fn summarize_page_isolates_the_request_and_returns_the_answer() {
         let provider = std::sync::Arc::new(MockFetchModel::default());
@@ -1346,7 +1454,7 @@ mod tests {
     async fn pattern_and_prompt_are_mutually_exclusive() {
         let directory = tempfile::tempdir().unwrap();
         let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
-        let out = WebFetchTool
+        let out = WebFetchTool::new(trusted_read_hosts(Vec::new()))
             .run(
                 serde_json::json!({
                     "url": "https://example.com/",

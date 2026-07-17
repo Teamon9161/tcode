@@ -10,9 +10,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use crate::ledger::Entry;
-use crate::store::{Resumed, SessionStore, StoreError};
-use crate::types::ContentBlock;
+use tcode_core::store::StoreError;
+use tcode_core::{import_entries, ContentBlock, Entry, Resumed};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalSource {
@@ -69,35 +68,8 @@ pub fn import_external_session(
     cwd: &Path,
     external: &ExternalSessionInfo,
 ) -> Result<Resumed, StoreError> {
-    let mut entries = parse_entries(external)?;
-    if entries.is_empty() {
-        return Err(StoreError::External("no importable text messages".into()));
-    }
-    // Zero-guessing: the model must not spend a turn discovering that this
-    // history is second-hand. Tool calls/outputs were dropped on import and
-    // the workspace may have moved on since the original conversation.
-    entries.push(Entry::Note(format!(
-        "This conversation was imported from a {} transcript. Tool calls and their outputs \
-         were omitted, and files may have changed since; re-read any file before relying on \
-         or editing it.",
-        external.source.label()
-    )));
-    let mut store = SessionStore::create(data_dir, cwd)?;
-    let mut ledger = crate::ledger::Ledger::new();
-    for entry in entries {
-        store.record(&crate::store::LogEvent::Append {
-            entry: entry.clone(),
-        });
-        ledger.append(entry);
-    }
-    Ok(Resumed {
-        store,
-        ledger,
-        checkpoints: Vec::new(),
-        startup: None,
-        environment: None,
-        delivered_environment: None,
-    })
+    let entries = parse_entries(external)?;
+    import_entries(data_dir, cwd, external.source.label(), entries)
 }
 
 fn external_info(cwd: &Path, source: ExternalSource, path: PathBuf) -> Option<ExternalSessionInfo> {

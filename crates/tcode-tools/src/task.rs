@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
+    ActiveModel, Agent, AgentEvent, AgentModels, AgentRole, Approval, ApprovalDecision, Approver,
     ContentBlock, DelegateEvent, Entry, ModelCell, PermissionMode, PermissionRequest,
     PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, TaskRunStatus, Tool,
     ToolCtx, ToolOutput,
@@ -44,21 +44,10 @@ impl Approver for NeverAsk {
     }
 }
 
-/// The sub-agent kinds `task` dispatches to. They are intentionally separate
-/// from configurable auxiliary model roles: `auto` configures a classifier and
-/// is never a value accepted by `task(agent=...)`.
-pub const TASK_AGENT_KINDS: [&str; 3] = ["explore", "plan", "general"];
-
-/// Roles surfaced by `/agents`: task kinds plus the auxiliary models the
-/// harness itself runs — the Auto Mode classifier, the next-prompt guess,
-/// image understanding, and the `web_fetch` summarizer. Most want something
-/// small and fast, which is the whole point of pinning. `fetch` is the one
-/// role where unpinned means *off* (web_fetch returns the page verbatim)
-/// rather than "follow the main model": the main model reading the raw page
-/// directly beats paying an extra full-page request for a lossy summary.
-pub const MODEL_ROLES: [&str; 7] = [
-    "explore", "plan", "general", "auto", "suggest", "vision", "fetch",
-];
+/// The sub-agent kinds `task` dispatches to. The shared role registry owns
+/// the complete `/agents` catalogue; this compatibility view names only task
+/// inputs.
+pub const TASK_AGENT_KINDS: [&str; 3] = AgentRole::TASK_KEYS;
 
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -71,6 +60,9 @@ pub struct TaskTool {
     watchdog: WatchdogConfig,
     output_budget: usize,
     auto_policy: String,
+    auto_compact: bool,
+    auto_compact_percent: u8,
+    trusted_read_hosts: crate::TrustedReadHosts,
 }
 
 impl TaskTool {
@@ -86,6 +78,9 @@ impl TaskTool {
             watchdog,
             output_budget,
             auto_policy: String::new(),
+            auto_compact: true,
+            auto_compact_percent: 85,
+            trusted_read_hosts: crate::trusted_read_hosts(Vec::new()),
         }
     }
 
@@ -102,18 +97,37 @@ impl TaskTool {
         self
     }
 
+    /// Apply the main session's automatic compaction policy to isolated runs.
+    pub fn with_auto_compact(mut self, enabled: bool, percent: u8) -> Self {
+        self.auto_compact = enabled;
+        self.auto_compact_percent = percent;
+        self
+    }
+
+    /// Carry the global, tool-scoped trusted read hosts into each isolated
+    /// sub-agent. Project configuration never reaches this field.
+    pub fn with_trusted_read_hosts(mut self, hosts: crate::TrustedReadHosts) -> Self {
+        self.trusted_read_hosts = hosts;
+        self
+    }
+
     /// The pinned model for `kind`, else a snapshot of the parent's.
     fn model_for(&self, kind: &str) -> ActiveModel {
-        self.pinned
-            .get(kind)
-            .unwrap_or_else(|| self.model.snapshot())
+        let role = AgentRole::from_key(kind).filter(|role| role.is_task_kind());
+        role.and_then(|role| self.pinned.resolve(role, &self.model))
+            .expect("validated task role always resolves a model")
     }
 
     /// Read-only sub-agents get only side-effect-free tools. `plan` has the
     /// same exploration surface as `explore`, except it cannot submit a plan:
     /// approval and the plan-mode transition remain exclusive to the parent.
     fn sub_tools(&self, agent_kind: &str, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
-        let mut tools = crate::builtin_tools(cwd);
+        let mut tools = crate::builtin_tools_with_web_fetch(
+            cwd,
+            crate::WebFetchTool::new(self.trusted_read_hosts.clone()).with_summarizer(
+                crate::FetchSummarizer::new(model.clone(), self.pinned.clone()),
+            ),
+        );
         tools.push(Arc::new(crate::ViewImageTool::new(
             model,
             self.pinned.clone(),
@@ -229,7 +243,7 @@ impl Tool for TaskTool {
         json!({
             "type": "object",
             "properties": {
-                "agent": { "type": "string", "enum": ["explore", "plan", "general"] },
+                "agent": { "type": "string", "enum": AgentRole::TASK_KINDS.map(AgentRole::key) },
                 "prompt": { "type": "string" },
                 "summary": {
                     "type": "string",
@@ -320,6 +334,8 @@ impl Tool for TaskTool {
             safety_classifier: Some(safety_classifier),
             auto_policy: self.auto_policy.clone(),
             max_steps: tcode_core::DEFAULT_MAX_STEPS,
+            auto_compact: self.auto_compact,
+            auto_compact_percent: self.auto_compact_percent,
         };
         // Every sub-agent run is its own conversation on (usually) the parent's
         // provider. Sharing the parent's cache id would interleave two
@@ -328,8 +344,7 @@ impl Tool for TaskTool {
         let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut session = Session::new(
             ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
-                .with_model(model.clone())
-                .with_agent_models(self.pinned.clone()),
+                .with_model(model.clone()),
             PermissionMode::Auto,
             PermissionRules::default(),
         )

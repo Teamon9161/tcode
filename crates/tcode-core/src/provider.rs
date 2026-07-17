@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
+use crate::agent_roles::{AgentRole, RoleDefault};
 use crate::types::{Message, RateLimits, StopReason, ToolDef, Usage};
 
 #[derive(Debug, Clone)]
@@ -170,6 +171,17 @@ impl AgentModels {
         match self.0.read().expect("agent models lock").get(kind) {
             Some(AgentPin::Model(model)) => Some(model.clone()),
             _ => None,
+        }
+    }
+
+    /// Resolve `role` using its registered default. An explicit pin always
+    /// wins; only an absent off-by-default role resolves to `None`.
+    pub fn resolve(&self, role: AgentRole, primary: &ModelCell) -> Option<ActiveModel> {
+        match self.pin_state(role.key()) {
+            Some(AgentPin::Model(model)) => Some(model),
+            Some(AgentPin::Inherit) => Some(primary.snapshot()),
+            None if matches!(role.default(), RoleDefault::InheritMain) => Some(primary.snapshot()),
+            None => None,
         }
     }
 

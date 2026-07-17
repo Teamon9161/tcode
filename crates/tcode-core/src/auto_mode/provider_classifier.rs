@@ -3,6 +3,7 @@ use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{ClassifierDecision, ClassifierRequest, SafetyClassifier};
+use crate::agent_roles::AgentRole;
 use crate::provider::{AgentModels, ModelCell, Request, StreamEvent};
 use crate::types::{ContentBlock, Message, Role};
 
@@ -40,8 +41,8 @@ impl ProviderSafetyClassifier {
 
     fn model(&self) -> crate::provider::ActiveModel {
         self.pinned
-            .get("auto")
-            .unwrap_or_else(|| self.parent_model.snapshot())
+            .resolve(AgentRole::Auto, &self.parent_model)
+            .expect("auto always inherits the main model")
     }
 
     async fn run_stage(

@@ -6,8 +6,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::{
-    ActiveModel, AgentModels, AutoSafety, ContentBlock, Message, ModelCell, PermissionRequest,
-    Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
+    ActiveModel, AgentModels, AgentRole, AutoSafety, ContentBlock, Message, ModelCell,
+    PermissionRequest, Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
 };
 
 const SYSTEM: &str = include_str!("../../../prompts/view-image-system.md");
@@ -27,8 +27,8 @@ impl ViewImageTool {
 
     fn model_for_vision(&self) -> ActiveModel {
         self.pinned
-            .get("vision")
-            .unwrap_or_else(|| self.model.snapshot())
+            .resolve(AgentRole::Vision, &self.model)
+            .expect("vision always inherits the main model")
     }
 }
 

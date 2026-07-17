@@ -20,7 +20,7 @@ use futures::StreamExt;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::codex;
+use crate::codex_cli;
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
     CacheStrategy, ContentBlock, EventStream, Message, Provider, ProviderError, RateLimit,
@@ -124,7 +124,7 @@ impl CodexProvider {
 
     async fn send(
         &self,
-        auth: &codex::CodexAuth,
+        auth: &codex_cli::CodexAuth,
         body: &Value,
         session_id: &str,
     ) -> Result<reqwest::Response, reqwest::Error> {
@@ -143,7 +143,10 @@ impl CodexProvider {
 
     /// Exchange the refresh token for fresh credentials and persist
     /// them back to auth.json (same as Codex itself does).
-    async fn refresh(&self, auth: &codex::CodexAuth) -> Result<codex::CodexAuth, ProviderError> {
+    async fn refresh(
+        &self,
+        auth: &codex_cli::CodexAuth,
+    ) -> Result<codex_cli::CodexAuth, ProviderError> {
         if auth.refresh_token.is_empty() {
             return Err(ProviderError::Config(
                 "ChatGPT token expired and no refresh token available; run `codex login`".into(),
@@ -178,8 +181,8 @@ impl CodexProvider {
             ));
         }
         let refresh = v["refresh_token"].as_str().unwrap_or_default().to_string();
-        codex::save_tokens(&access, &refresh, v["id_token"].as_str());
-        Ok(codex::CodexAuth {
+        codex_cli::save_tokens(&access, &refresh, v["id_token"].as_str());
+        Ok(codex_cli::CodexAuth {
             access_token: access,
             refresh_token: if refresh.is_empty() {
                 auth.refresh_token.clone()
@@ -198,7 +201,7 @@ impl CodexProvider {
         body: &Value,
         session_id: &str,
     ) -> Result<(reqwest::Response, Option<RateLimits>), ProviderError> {
-        let mut auth = codex::load_auth().ok_or_else(|| {
+        let mut auth = codex_cli::load_auth().ok_or_else(|| {
             ProviderError::Config(
                 "no ChatGPT credentials found (~/.codex/auth.json); run `codex login`".into(),
             )

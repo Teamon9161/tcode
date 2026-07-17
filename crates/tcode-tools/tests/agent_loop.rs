@@ -174,6 +174,8 @@ fn agent(provider: Arc<MockProvider>) -> Agent {
         safety_classifier: None,
         auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     }
 }
 
@@ -406,6 +408,8 @@ fn auto_agent(main: Arc<MockProvider>, classifier: Arc<MockProvider>) -> Agent {
         safety_classifier: Some(safety_classifier),
         auto_policy: "Classify dangerous actions conservatively.".into(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     }
 }
 
@@ -1846,6 +1850,8 @@ async fn retry_backoff_stops_immediately_when_cancelled() {
         safety_classifier: None,
         auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     };
     let mut session = session(dir.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
@@ -1911,6 +1917,8 @@ async fn connect_failure_is_retried_and_reported() {
         safety_classifier: None,
         auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     };
     let mut session = session(dir.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
@@ -2003,6 +2011,8 @@ async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
         safety_classifier: None,
         auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     };
     let mut session = session(dir.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
@@ -2236,6 +2246,8 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
         safety_classifier: None,
         auto_policy: String::new(),
         max_steps: tcode_core::DEFAULT_MAX_STEPS,
+        auto_compact: true,
+        auto_compact_percent: 85,
     };
     let mut session = session(root.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
@@ -2874,4 +2886,79 @@ async fn a_parallel_explore_batch_forwards_each_run_distinctly() {
     assert!(metas
         .iter()
         .all(|meta| meta.status == tcode_core::TaskRunStatus::Done));
+}
+
+#[tokio::test]
+async fn auto_compacts_after_a_tool_batch_before_the_next_model_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let large_note = "context ".repeat(30_000);
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "note",
+            "add_note",
+            &serde_json::json!({ "text": large_note.clone() }).to_string(),
+        ),
+        text_done("summary of the earlier work"),
+        text_done("finished after compaction"),
+    ]);
+    let mut agent = agent(provider.clone());
+    agent.model.swap(ActiveModel {
+        provider: provider.clone(),
+        max_tokens: 1024,
+        context_window: 100_000,
+        effort: None,
+    });
+    agent.auto_compact_percent = 50;
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "record the large note").await;
+
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Compacting)));
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Compacted(summary)
+        if summary == "summary of the earlier work")));
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3, "turn, compaction, then continuation");
+    let continuation = requests[2]
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(continuation.contains("summary of the earlier work"));
+    assert!(!continuation.contains(&large_note));
+}
+
+#[tokio::test]
+async fn auto_compaction_can_be_disabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![text_done("finished without compaction")]);
+    let mut agent = agent(provider);
+    agent.auto_compact = false;
+    agent.auto_compact_percent = 1;
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.last_prompt_tokens = 1_000_000;
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "existing history".into(),
+    }]));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "continue").await;
+
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::Compacting)));
+    assert!(session
+        .ledger
+        .entries()
+        .iter()
+        .all(|entry| !matches!(entry, Entry::Summary(_))));
 }

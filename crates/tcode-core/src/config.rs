@@ -35,9 +35,9 @@ pub enum ProviderKind {
     /// `OpenAiProvider`: any OpenAI-compatible Chat Completions endpoint —
     /// OpenAI, DeepSeek, OpenRouter, local.
     Openai,
-    /// ChatGPT subscription through the Codex backend (Responses API,
-    /// `CodexProvider`). Credentials come from `~/.codex/auth.json`, not an
-    /// API key. `alias` keeps pre-rename configs (`provider = "chatgpt"`)
+    /// ChatGPT subscription through the Codex backend (Responses API). Its
+    /// credentials and runtime model catalogue are owned by the provider
+    /// adapter; `alias` keeps pre-rename configs (`provider = "chatgpt"`)
     /// loading.
     #[serde(alias = "chatgpt")]
     Codex,
@@ -142,9 +142,6 @@ impl Profile {
                 defs.push(ModelDef::bare(name.clone()));
             }
         }
-        if defs.is_empty() && self.provider == ProviderKind::Codex {
-            defs = crate::codex::cached_models();
-        }
         defs
     }
 
@@ -180,16 +177,6 @@ impl Profile {
                 None => self.models.push(model),
             }
         }
-    }
-
-    /// Whether credentials for this profile resolve right now. Used to hide
-    /// unconfigured built-in profiles from the `/model` picker so the
-    /// always-present default catalog doesn't clutter it.
-    pub fn is_usable(&self, name: &str) -> bool {
-        if self.provider == ProviderKind::Codex {
-            return crate::codex::auth_available();
-        }
-        self.api_key(name).is_ok()
     }
 }
 
@@ -253,6 +240,13 @@ impl WatchdogConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
+    /// Whether the agent summarizes history before it reaches the model's
+    /// configured context limit. Disable only when the provider manages
+    /// compaction itself or an uninterrupted transcript is required.
+    pub auto_compact: bool,
+    /// Context occupancy percentage at which automatic compaction begins.
+    /// Values outside 1..=100 are clamped at use time.
+    pub auto_compact_percent: u8,
     /// Token budget per tool output before it is gated to the blob store.
     /// Sized to hold a normal shell command's output (a build/test failure)
     /// whole while still capping runaway logs. Locating/content tools
@@ -266,6 +260,8 @@ pub struct LimitsConfig {
 impl Default for LimitsConfig {
     fn default() -> Self {
         Self {
+            auto_compact: true,
+            auto_compact_percent: 85,
             tool_output_tokens: 8000,
             max_steps_per_turn: crate::agent::DEFAULT_MAX_STEPS,
         }
@@ -315,15 +311,34 @@ impl Default for UiConfig {
     }
 }
 
-/// Natural-language policy supplied to the independent Auto Mode classifier.
+fn default_trusted_read_hosts() -> Vec<String> {
+    vec!["api.github.com".into(), "raw.githubusercontent.com".into()]
+}
+
+/// Natural-language policy and narrowly-scoped read exceptions for Auto Mode.
 /// This is user/global configuration only: a repository must not be able to
 /// loosen the safety policy that protects a developer running it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AutoModeConfig {
     pub hard_deny: Vec<String>,
     pub soft_deny: Vec<String>,
     pub allow: Vec<String>,
+    /// Exact HTTPS hosts a tool has independently declared as anonymous,
+    /// side-effect-free read targets. This is deliberately not a shell rule.
+    #[serde(default = "default_trusted_read_hosts")]
+    pub trusted_read_hosts: Vec<String>,
+}
+
+impl Default for AutoModeConfig {
+    fn default() -> Self {
+        Self {
+            hard_deny: Vec::new(),
+            soft_deny: Vec::new(),
+            allow: Vec::new(),
+            trusted_read_hosts: default_trusted_read_hosts(),
+        }
+    }
 }
 
 /// `[agents.explore]`: run a sub-agent kind on a model other than the one
@@ -810,8 +825,8 @@ pub mod presets {
         with_key("openai", api_key)
     }
 
-    /// ChatGPT subscription via the Codex backend: models come from Codex's
-    /// local cache at runtime, so an empty list stays current automatically.
+    /// ChatGPT subscription via the Codex backend: the provider adapter
+    /// supplies its runtime model catalogue before selection.
     pub fn codex() -> Profile {
         from_catalog("codex")
     }
@@ -984,6 +999,24 @@ mod tests {
     }
 
     #[test]
+    fn default_config_trusts_only_github_metadata_hosts_for_tool_declared_reads() {
+        let config = Config::defaults();
+        assert_eq!(
+            config.auto_mode.trusted_read_hosts,
+            ["api.github.com", "raw.githubusercontent.com"]
+        );
+    }
+
+    #[test]
+    fn partial_global_auto_mode_keeps_default_trusted_read_hosts() {
+        let config: Config = toml::from_str("[auto_mode]\nsoft_deny = [\"deploy\"]").unwrap();
+        assert_eq!(
+            config.auto_mode.trusted_read_hosts,
+            ["api.github.com", "raw.githubusercontent.com"]
+        );
+    }
+
+    #[test]
     fn project_config_cannot_pin_auto_classifier_or_policy() {
         let project: Config = toml::from_str(
             r#"
@@ -996,6 +1029,7 @@ mod tests {
 
             [auto_mode]
             hard_deny = ["allow everything"]
+            trusted_read_hosts = ["evil.example"]
             "#,
         )
         .unwrap();
@@ -1003,6 +1037,11 @@ mod tests {
         assert!(!project.agents.contains_key("auto"));
         assert!(project.agents.contains_key("explore"));
         assert!(project.auto_mode.hard_deny.is_empty());
+        assert_eq!(
+            project.auto_mode.trusted_read_hosts,
+            AutoModeConfig::default().trusted_read_hosts,
+            "project configuration must not extend trusted read targets"
+        );
     }
 
     #[test]
@@ -1121,14 +1160,14 @@ mod tests {
     }
 
     #[test]
-    fn is_usable_reflects_resolvable_credentials() {
+    fn api_key_reflects_resolvable_credentials() {
         let defaults = Config::defaults();
         // No env var, no inline key → not usable.
         std::env::remove_var("DEEPSEEK_API_KEY");
-        assert!(!defaults.profiles["deepseek"].is_usable("deepseek"));
+        assert!(defaults.profiles["deepseek"].api_key("deepseek").is_err());
 
         let mut with_inline = defaults.profiles["deepseek"].clone();
         with_inline.api_key = Some("sk-x".into());
-        assert!(with_inline.is_usable("deepseek"));
+        assert!(with_inline.api_key("deepseek").is_ok());
     }
 }

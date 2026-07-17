@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use crate::background::BackgroundTasks;
 use crate::blobs::BlobStore;
 use crate::freshness::FreshnessTracker;
-use crate::provider::{AgentModels, ModelCell};
+use crate::provider::ModelCell;
 use crate::task_trace::{TaskRunStatus, TaskTraces};
 use crate::types::Usage;
 
@@ -213,10 +213,6 @@ pub struct ToolCtx {
     /// The model active for this invocation. Tools may use its capabilities
     /// without owning model selection or provider construction.
     pub model: Option<ModelCell>,
-    /// Pinned auxiliary-role models (`[agents.<kind>]` / `/agents`). Tools
-    /// that delegate work to a role (e.g. `web_fetch` summarizing with
-    /// `fetch`) look their model up here; an unpinned role is simply absent.
-    pub agent_models: AgentModels,
     /// Per-session task-run id allocator and trace persistence. Runs persist
     /// only after `bind_task_trace_root`; ids are issued regardless.
     pub task_traces: Mutex<TaskTraces>,
@@ -261,7 +257,6 @@ impl ToolCtx {
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
             model: None,
-            agent_models: AgentModels::default(),
             task_traces: Mutex::new(TaskTraces::default()),
             output_budget_tokens,
             delegate: Mutex::new(None),
@@ -285,12 +280,6 @@ impl ToolCtx {
 
     pub fn with_model(mut self, model: ModelCell) -> Self {
         self.model = Some(model);
-        self
-    }
-
-    /// Share the live auxiliary-role pin registry with tools.
-    pub fn with_agent_models(mut self, models: AgentModels) -> Self {
-        self.agent_models = models;
         self
     }
 

@@ -12,8 +12,8 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use tcode_core::codex;
 use tcode_core::config::{presets, Config, ModelDef, ModelState, Profile, ProviderKind};
+use tcode_providers::codex_auth_available;
 
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
@@ -57,7 +57,7 @@ fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Can
             (format!("{DIM}not configured{RESET}"), false)
         }
     };
-    let codex_ok = codex::auth_available();
+    let codex_ok = codex_auth_available();
     let (a_status, a_found) = env_or_inline("ANTHROPIC_API_KEY", "anthropic");
     let (o_status, o_found) = env_or_inline("OPENAI_API_KEY", "openai");
     let (d_status, d_found) = env_or_inline("DEEPSEEK_API_KEY", "deepseek");
@@ -182,11 +182,17 @@ fn run_with(
             .cloned(),
     );
 
+    // Dynamic provider catalogues are needed to choose a model, but they are
+    // runtime observations rather than user configuration and must not be
+    // serialized back into ~/.tcode/config.toml.
+    let mut model_config = config.clone();
+    tcode_providers::hydrate_codex_models(&mut model_config);
+
     // Default model across everything just configured.
     let mut options: Vec<(String, String, Option<String>)> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     for pname in &configured {
-        let Some(profile) = config.profiles.get(pname) else {
+        let Some(profile) = model_config.profiles.get(pname) else {
             continue;
         };
         for def in profile.model_defs() {
@@ -575,7 +581,7 @@ pub fn default_config() -> Config {
     config
         .profiles
         .insert("openai".into(), presets::openai(None));
-    if codex::auth_available() {
+    if codex_auth_available() {
         config.profiles.insert("codex".into(), presets::codex());
     }
     config.default_profile = Some("anthropic".into());

@@ -2,7 +2,8 @@
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Line;
-use tcode_core::{ExternalSessionInfo, ExternalSource, SessionInfo};
+use tcode_core::SessionInfo;
+use tcode_importers::{ExternalSessionInfo, ExternalSource};
 
 use crate::theme;
 

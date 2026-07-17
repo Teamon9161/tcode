@@ -6,6 +6,17 @@
 #
 # Model IDs, context windows, and pricing tiers verified 2026-07.
 
+# Anonymous, HTTPS GET-only reads that a tool has explicitly declared safe.
+# This does not apply to shell or bash, and project configuration cannot extend it.
+[limits]
+# Set `auto_compact = false` to manage summary timing manually with `/compact`.
+# `auto_compact_percent` is clamped to 1..=100 when the agent runs.
+auto_compact = true
+auto_compact_percent = 85
+
+[auto_mode]
+trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]
+
 [profiles.anthropic]
 provider = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
@@ -59,8 +70,8 @@ context_window = 1050000
 efforts = ["low", "medium", "high"]
 default_effort = "medium"
 
-# ChatGPT subscription through the Codex backend. Models come from Codex's
-# local cache at runtime, so an empty list stays current automatically.
+# ChatGPT subscription through the Codex backend. Its provider adapter fills
+# an empty model list from the local runtime catalogue before model selection.
 [profiles.codex]
 provider = "codex"
 # Codex Responses accepts input_image; keep pasted/read images inline.

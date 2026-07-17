@@ -23,6 +23,7 @@ hex = "0.4"
 [workspace]
 members = [
     "crates/tcode-core",
+    "crates/tcode-importers",
     "crates/tcode-providers",
     "crates/tcode-tools",
     "crates/tcode-tui",

@@ -24,8 +24,9 @@ pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,
 };
-pub use task::{TaskTool, MODEL_ROLES, TASK_AGENT_KINDS};
+pub use task::{TaskTool, TASK_AGENT_KINDS};
 pub use view_image::ViewImageTool;
+pub use web::{trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool};
 
 use std::path::Path;
 use std::sync::Arc;
@@ -40,7 +41,26 @@ use tcode_core::Tool;
 /// gets it from one place. Builtin skills (see `skills::builtin_skills`)
 /// mean this is never empty, so `skill` is now always present.
 pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
-    builtin_tools_with_skills(discover_skills(cwd))
+    builtin_tools_with_skills_and_web_fetch(
+        discover_skills(cwd),
+        WebFetchTool::new(trusted_read_hosts(Vec::new())),
+    )
+}
+
+/// Built-in toolset with a startup-configured, tool-scoped set of public read
+/// hosts. Empty keeps every web fetch on the ordinary Auto Mode path.
+pub fn builtin_tools_with_trusted_read_hosts(
+    cwd: &Path,
+    trusted_read_hosts: TrustedReadHosts,
+) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_skills_and_web_fetch(
+        discover_skills(cwd),
+        WebFetchTool::new(trusted_read_hosts),
+    )
+}
+
+pub fn builtin_tools_with_web_fetch(cwd: &Path, web_fetch: WebFetchTool) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_skills_and_web_fetch(discover_skills(cwd), web_fetch)
 }
 
 /// Same toolset, but with skill discovery already done by the caller. Lets a
@@ -48,6 +68,27 @@ pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
 /// completion (see `render_skill`) discover the filesystem once and hand the
 /// same result to both places, instead of scanning `.tcode/skills` twice.
 pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_skills_and_web_fetch(
+        skills,
+        WebFetchTool::new(trusted_read_hosts(Vec::new())),
+    )
+}
+
+/// Like [`builtin_tools_with_skills`], with a shared, startup-configured set of
+/// hosts that `web_fetch` may directly allow in Auto Mode.
+pub fn builtin_tools_with_skills_and_trusted_read_hosts(
+    skills: Vec<Skill>,
+    trusted_read_hosts: TrustedReadHosts,
+) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_skills_and_web_fetch(skills, WebFetchTool::new(trusted_read_hosts))
+}
+
+/// Build a toolset around a fully configured `web_fetch` instance. Its
+/// summarizer dependency stays owned by that tool rather than in `ToolCtx`.
+pub fn builtin_tools_with_skills_and_web_fetch(
+    skills: Vec<Skill>,
+    web_fetch: WebFetchTool,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs_tools::ReadTool),
         Arc::new(fs_tools::WriteTool),
@@ -55,7 +96,7 @@ pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
         Arc::new(fs_tools::EditTool),
         Arc::new(search::GrepTool),
         Arc::new(search::GlobTool),
-        Arc::new(web::WebFetchTool),
+        Arc::new(web_fetch),
         Arc::new(web::WebSearchTool),
         Arc::new(shell::KillTaskTool),
         Arc::new(plan::ExitPlanTool),

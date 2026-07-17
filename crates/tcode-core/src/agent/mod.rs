@@ -213,6 +213,10 @@ pub struct Agent {
     /// Runaway guard: model round-trips per user turn before the harness
     /// ends the turn gracefully.
     pub max_steps: usize,
+    /// Whether to summarize before context reaches the model limit.
+    pub auto_compact: bool,
+    /// Context occupancy percentage at which automatic compaction starts.
+    pub auto_compact_percent: u8,
 }
 
 struct PermissionCheck<'a> {
@@ -325,9 +329,10 @@ impl Agent {
             return decision;
         }
 
+        let safety = tool.auto_safety(check.input);
         let target = tool.safety_target(check.input);
         match AutoModePolicy::new(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir)
-            .route(tool.auto_safety(check.input), target.as_deref())
+            .route(safety, target.as_deref())
         {
             AutoRoute::Allow => Decision::Allow,
             AutoRoute::Prompt => Decision::Ask,
@@ -390,6 +395,26 @@ impl Agent {
         }
     }
 
+    fn should_auto_compact(&self, session: &Session, model: &crate::provider::ActiveModel) -> bool {
+        self.auto_compact
+            && session.last_prompt_tokens
+                >= model.context_window * u64::from(self.auto_compact_percent.clamp(1, 100)) / 100
+    }
+
+    async fn auto_compact_if_needed(
+        &self,
+        session: &mut Session,
+        model: &crate::provider::ActiveModel,
+        events: &mpsc::Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Result<(), AgentError> {
+        if self.should_auto_compact(session, model) {
+            self.emit(events, AgentEvent::Compacting).await?;
+            self.compact(session, events, cancel).await?;
+        }
+        Ok(())
+    }
+
     pub(super) fn system_prompt(&self, session: &Session) -> String {
         let mut prompt = session.prompt_variables().expand(&self.system);
         if !session.opening_context().is_empty() {
@@ -414,12 +439,9 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
         let model = self.model.snapshot();
-        // Auto-compact: pay the one-time cache invalidation before the
-        // context overflows, not after.
-        if session.last_prompt_tokens > model.context_window * 85 / 100 {
-            self.emit(events, AgentEvent::Compacting).await?;
-            self.compact(session, events, &cancel).await?;
-        }
+        // Auto-compact before the next user entry increases the request.
+        self.auto_compact_if_needed(session, &model, events, &cancel)
+            .await?;
         // Background/monitor notes that accumulated between turns: tell the
         // model before its new instruction (pure append, cache-safe).
         self.note_background(session, events).await?;
@@ -458,6 +480,12 @@ impl Agent {
             input.push(status);
         }
         session.ledger.append(Entry::User(input));
+        // A new prompt (especially an expanded @reference) can itself cross
+        // the threshold even when the preceding request did not. Compact at
+        // this legal boundary before the first request of the turn.
+        session.last_prompt_tokens = self.estimate_context_tokens(session);
+        self.auto_compact_if_needed(session, &model, events, &cancel)
+            .await?;
         session.turn_usage = Usage::default();
         self.run_steps(&model, session, events, approver, &cancel)
             .await
@@ -556,6 +584,12 @@ impl Agent {
             self.commit_mode(session, events).await?;
             self.deliver_pending_input(session, events).await?;
             self.deliver_deferred_context(session);
+            // A tool batch can add most of the context in one turn. Re-estimate
+            // the next complete request here rather than waiting for the user
+            // to submit another prompt after the window has already overflowed.
+            session.last_prompt_tokens = self.estimate_context_tokens(session);
+            self.auto_compact_if_needed(session, model, events, cancel)
+                .await?;
         }
         // Runaway guard tripped. The ledger is consistent (the last tool
         // batch committed its results), so end the turn instead of erroring:

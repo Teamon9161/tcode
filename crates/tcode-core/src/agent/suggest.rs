@@ -19,6 +19,8 @@
 use std::time::Duration;
 
 use futures::StreamExt;
+
+use crate::agent_roles::AgentRole;
 use tokio_util::sync::CancellationToken;
 
 use super::{Agent, Session};
@@ -91,8 +93,8 @@ impl Agent {
     pub async fn suggest(&self, req: SuggestRequest, cancel: CancellationToken) -> Option<String> {
         let model = self
             .models
-            .get("suggest")
-            .unwrap_or_else(|| self.model.snapshot());
+            .resolve(AgentRole::Suggest, &self.model)
+            .expect("suggest always inherits the main model");
         let request = Request {
             model: model.provider.model().to_string(),
             system: SUGGEST_SYSTEM.to_string(),

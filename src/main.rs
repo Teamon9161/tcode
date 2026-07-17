@@ -12,8 +12,8 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
 use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Selection};
 use tcode_core::{
-    ActiveModel, Agent, AgentError, AgentModels, ContentBlock, ModelCell, PermissionRules,
-    ProviderSafetyClassifier, SafetyClassifier, Session, ToolCtx,
+    ActiveModel, Agent, AgentError, AgentModels, AgentRole, ContentBlock, ModelCell,
+    PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, ToolCtx,
 };
 
 const CYAN: &str = "\x1b[36m";
@@ -94,7 +94,11 @@ fn agent_models(config: &Config, parent: &Selection) -> AgentModels {
         match build_agent_model(config, kind, parent) {
             Some(Ok(model)) => pinned.pin(kind, model),
             Some(Err(e)) => eprintln!("{DIM}warning: [agents.{kind}] ignored: {e}{RESET}"),
-            None if kind == "fetch" && assignment.enabled == Some(true) => pinned.pin_inherit(kind),
+            None if AgentRole::from_key(kind)
+                .is_some_and(|role| role.allows_off() && assignment.enabled == Some(true)) =>
+            {
+                pinned.pin_inherit(kind)
+            }
             None => {}
         }
     }
@@ -109,16 +113,12 @@ fn build_agent_menu(
     menu: &tcode_tui::ModelMenu,
     pinned: AgentModels,
 ) -> tcode_tui::AgentMenu {
-    let roles: Vec<tcode_tui::AgentRole> = tcode_tools::MODEL_ROLES
+    let roles: Vec<tcode_tui::AgentRole> = AgentRole::ALL
         .iter()
-        .map(|key| tcode_tui::AgentRole {
-            key: (*key).to_string(),
-            label: if *key == "fetch" {
-                "web-fetch".to_string()
-            } else {
-                (*key).to_string()
-            },
-            allows_off: *key == "fetch",
+        .map(|role| tcode_tui::AgentRole {
+            key: role.key().to_string(),
+            label: role.label().to_string(),
+            allows_off: role.allows_off(),
         })
         .collect();
     let watchdog = config.watchdog.clone();
@@ -153,35 +153,38 @@ fn build_agent_menu(
         })
         .collect();
 
-    let pin: tcode_tui::PinFn = Box::new(move |kind, choice| match choice {
-        tcode_tui::AgentModelChoice::Off => {
-            pinned.unpin(kind);
-            persist_agent_pin(kind, None, Some(false));
-            Ok("off".to_string())
-        }
-        tcode_tui::AgentModelChoice::Inherit => {
-            pinned.pin_inherit(kind);
-            persist_agent_pin(kind, None, (kind == "fetch").then_some(true));
-            Ok("inherit (main model)".to_string())
-        }
-        tcode_tui::AgentModelChoice::Model { option, effort } => {
-            let (profile_name, model) = options
-                .get(option)
-                .ok_or_else(|| "selected model disappeared".to_string())?;
-            let profile = profiles
-                .get(profile_name)
-                .ok_or_else(|| format!("unknown profile '{profile_name}'"))?;
-            let selection = Selection {
-                profile: profile_name.clone(),
-                model: model.clone(),
-                effort,
-            };
-            let active = tcode_providers::build_active(profile, &selection, &watchdog)
-                .map_err(|e| e.to_string())?;
-            let label = active.describe();
-            pinned.pin(kind, active);
-            persist_agent_pin(kind, Some(&selection), (kind == "fetch").then_some(true));
-            Ok(label)
+    let pin: tcode_tui::PinFn = Box::new(move |kind, choice| {
+        let role = AgentRole::from_key(kind).expect("menu only exposes registered roles");
+        match choice {
+            tcode_tui::AgentModelChoice::Off => {
+                pinned.unpin(kind);
+                persist_agent_pin(role, None, false);
+                Ok("off".to_string())
+            }
+            tcode_tui::AgentModelChoice::Inherit => {
+                pinned.pin_inherit(kind);
+                persist_agent_pin(role, None, true);
+                Ok("inherit (main model)".to_string())
+            }
+            tcode_tui::AgentModelChoice::Model { option, effort } => {
+                let (profile_name, model) = options
+                    .get(option)
+                    .ok_or_else(|| "selected model disappeared".to_string())?;
+                let profile = profiles
+                    .get(profile_name)
+                    .ok_or_else(|| format!("unknown profile '{profile_name}'"))?;
+                let selection = Selection {
+                    profile: profile_name.clone(),
+                    model: model.clone(),
+                    effort,
+                };
+                let active = tcode_providers::build_active(profile, &selection, &watchdog)
+                    .map_err(|e| e.to_string())?;
+                let label = active.describe();
+                pinned.pin(kind, active);
+                persist_agent_pin(role, Some(&selection), true);
+                Ok(label)
+            }
         }
     });
     tcode_tui::AgentMenu { roles, pins, pin }
@@ -189,10 +192,11 @@ fn build_agent_menu(
 
 /// State entries override `[agents.*]`: an explicit `enabled` lets opt-in
 /// roles preserve the distinction between "off" and "inherit main model".
-fn persist_agent_pin(kind: &str, selection: Option<&Selection>, enabled: Option<bool>) {
+fn persist_agent_pin(role: AgentRole, selection: Option<&Selection>, enabled: bool) {
+    let enabled = role.allows_off().then_some(enabled);
     ModelState::update(|state| {
         state.agents.insert(
-            kind.to_string(),
+            role.key().to_string(),
             match selection {
                 Some(s) => AgentConfig {
                     profile: Some(s.profile.clone()),
@@ -222,7 +226,7 @@ fn build_menu(
         // The built-in catalog always contributes every provider; hide the
         // ones the user has no credentials for so the picker stays short.
         // The active profile is always shown so `current` stays valid.
-        if !profile.is_usable(pname) && pname != &selection.profile {
+        if !tcode_providers::profile_is_usable(pname, profile) && pname != &selection.profile {
             continue;
         }
         for def in profile.model_defs() {
@@ -350,7 +354,7 @@ fn run_agents_command(args: &str, menu: &tcode_tui::ModelMenu, agents: &mut tcod
     let choice = match which {
         "off" if role.allows_off => tcode_tui::AgentModelChoice::Off,
         "off" => {
-            println!("{DIM}only web-fetch can be turned off{RESET}");
+            println!("{DIM}{} cannot be turned off{RESET}", role.label);
             return;
         }
         "inherit" => tcode_tui::AgentModelChoice::Inherit,
@@ -445,8 +449,9 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let (config, selection, active_model, state) = loop {
+    let (mut config, selection, active_model, state) = loop {
         let mut config = Config::load(&cwd)?;
+        tcode_providers::hydrate_codex_models(&mut config);
         let state = ModelState::load();
         // `/agents` picks live in state.toml and overlay the hand-written
         // `[agents.*]`, exactly as the saved model choice overlays the
@@ -488,11 +493,18 @@ async fn main() -> anyhow::Result<()> {
 
     let system = INTERACTIVE_AGENT_SYSTEM.to_string();
     let classifier_policy = auto_policy(&config);
+    let trusted_read_hosts =
+        tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
     // Discovered once and handed to both the tool and the frontends (TUI
     // completion/`/name` fallback, plain REPL fallback) so they never see a
     // different skill list than the `skill` tool the model calls.
     let skills = tcode_tools::discover_skills(&cwd);
-    let mut tools = tcode_tools::builtin_tools_with_skills(skills.clone());
+    let mut tools = tcode_tools::builtin_tools_with_skills_and_web_fetch(
+        skills.clone(),
+        tcode_tools::WebFetchTool::new(trusted_read_hosts.clone()).with_summarizer(
+            tcode_tools::FetchSummarizer::new(model_cell.clone(), pinned.clone()),
+        ),
+    );
     tools.push(Arc::new(tcode_tools::ViewImageTool::new(
         model_cell.clone(),
         pinned.clone(),
@@ -505,7 +517,12 @@ async fn main() -> anyhow::Result<()> {
             cwd.clone(),
         )
         .with_agent_models(pinned.clone())
-        .with_auto_policy(classifier_policy.clone()),
+        .with_auto_policy(classifier_policy.clone())
+        .with_auto_compact(
+            config.limits.auto_compact,
+            config.limits.auto_compact_percent,
+        )
+        .with_trusted_read_hosts(trusted_read_hosts.clone()),
     ));
     tools.push(Arc::new(tcode_tools::UpdateProgressTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
@@ -533,6 +550,8 @@ async fn main() -> anyhow::Result<()> {
         safety_classifier: Some(safety_classifier),
         auto_policy: classifier_policy,
         max_steps: config.limits.max_steps_per_turn,
+        auto_compact: config.limits.auto_compact,
+        auto_compact_percent: config.limits.auto_compact_percent,
     });
 
     let mode = match cli.mode.as_deref() {
@@ -552,9 +571,7 @@ async fn main() -> anyhow::Result<()> {
         deny: config.permissions.deny.clone(),
     };
     let mut session = Session::new(
-        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens)
-            .with_model(model_cell.clone())
-            .with_agent_models(pinned.clone()),
+        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens).with_model(model_cell.clone()),
         mode,
         rules,
     );
@@ -659,7 +676,8 @@ async fn main() -> anyhow::Result<()> {
 
                     // Rebuild the selected provider in the existing shared
                     // model cell, then reopen the same conversation.
-                    let runtime_config = Config::load(&cwd)?;
+                    let mut runtime_config = Config::load(&cwd)?;
+                    tcode_providers::hydrate_codex_models(&mut runtime_config);
                     let runtime_selection = runtime_config.select(None, None, &state)?;
                     let profile = runtime_config
                         .profiles

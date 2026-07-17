@@ -28,6 +28,10 @@ use tcode_core::{
     PendingMessage, ReferenceCandidate, ReferenceKind, Session, Usage,
 };
 
+use tcode_importers::{
+    import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
+};
+
 use crate::approval::{Dialog, DialogResult};
 use crate::editor::{Editor, Position};
 use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
@@ -381,7 +385,7 @@ pub struct App {
     events_rx: Option<mpsc::Receiver<AgentEvent>>,
     external_import: Option<
         JoinHandle<(
-            tcode_core::ExternalSource,
+            ExternalSource,
             Result<tcode_core::Resumed, tcode_core::store::StoreError>,
         )>,
     >,
@@ -4444,8 +4448,8 @@ impl App {
         }
     }
 
-    fn open_external_resume_picker(&mut self, source: tcode_core::ExternalSource) {
-        let sessions = tcode_core::list_external_sessions(&self.cwd, source);
+    fn open_external_resume_picker(&mut self, source: ExternalSource) {
+        let sessions = list_external_sessions(&self.cwd, source);
         match resume::Picker::external(source, sessions) {
             Some(picker) => self.resume_picker = Some(picker),
             None => {
@@ -4458,7 +4462,7 @@ impl App {
         }
     }
 
-    fn import_external_session(&mut self, external: tcode_core::ExternalSessionInfo) {
+    fn import_external_session(&mut self, external: ExternalSessionInfo) {
         if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
             self.bake(vec![Line::styled(
                 "wait for the current turn before importing",
@@ -4479,7 +4483,7 @@ impl App {
         let cwd = session.tool_ctx.cwd.clone();
         let source = external.source;
         self.external_import = Some(tokio::task::spawn_blocking(move || {
-            let result = tcode_core::import_external_session(&data_dir, &cwd, &external);
+            let result = import_external_session(&data_dir, &cwd, &external);
             (source, result)
         }));
         self.state_label = format!("importing {} conversation", source.label());
@@ -4488,7 +4492,7 @@ impl App {
     fn on_external_import_done(
         &mut self,
         (source, result): (
-            tcode_core::ExternalSource,
+            ExternalSource,
             Result<tcode_core::Resumed, tcode_core::store::StoreError>,
         ),
     ) {
@@ -4691,7 +4695,7 @@ impl App {
         else {
             return;
         };
-        self.progress = items
+        let parsed: Vec<ProgressPhase> = items
             .iter()
             .filter_map(|item| {
                 let phase = item["phase"]
@@ -4706,6 +4710,11 @@ impl App {
                     })
             })
             .collect();
+        // `[]` deliberately clears progress. A non-empty malformed payload is
+        // not a meaningful update and must not erase the existing snapshot.
+        if items.is_empty() || !parsed.is_empty() {
+            self.progress = parsed;
+        }
     }
 
     /// The task card's live status is intentionally muted: its parent-authored
@@ -6270,12 +6279,12 @@ async fn join_phase(phase: &mut Phase) -> (Session, Result<(), AgentError>) {
 async fn join_external_import(
     import: &mut Option<
         JoinHandle<(
-            tcode_core::ExternalSource,
+            ExternalSource,
             Result<tcode_core::Resumed, tcode_core::store::StoreError>,
         )>,
     >,
 ) -> (
-    tcode_core::ExternalSource,
+    ExternalSource,
     Result<tcode_core::Resumed, tcode_core::store::StoreError>,
 ) {
     match import {

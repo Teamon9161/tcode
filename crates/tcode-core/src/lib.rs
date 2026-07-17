@@ -1,18 +1,18 @@
 pub mod accumulate;
 pub mod agent;
+pub mod agent_roles;
 pub mod auto_mode;
 pub mod background;
 pub mod blobs;
 pub mod checkpoint;
-pub mod codex;
 pub mod commands;
 pub mod config;
 pub mod environment;
 pub mod export;
-pub mod external;
 pub mod freshness;
 pub mod hooks;
 pub mod images;
+pub mod import;
 pub mod ledger;
 pub mod memory;
 pub mod permission;
@@ -28,6 +28,7 @@ pub use agent::{
     Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, PendingMode, Session,
     DEFAULT_MAX_STEPS,
 };
+pub use agent_roles::{AgentRole, AgentRoleMeta, RoleDefault};
 pub use auto_mode::{
     AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision, ClassifierRequest,
     ClassifierTranscript, ProviderSafetyClassifier, SafetyClassifier,
@@ -37,10 +38,8 @@ pub use checkpoint::CheckpointStore;
 pub use config::FolderTrust;
 pub use environment::{EnvironmentSnapshot, GitSnapshot, StartupContext};
 pub use export::export_markdown;
-pub use external::{
-    import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
-};
 pub use hooks::{HookDef, HookEvent, Hooks};
+pub use import::import_entries;
 pub use ledger::{Entry, Ledger, LedgerSink};
 pub use memory::{MemoryManager, MemoryUpdate};
 pub use permission::{Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules};

@@ -1,5 +1,6 @@
 mod anthropic;
 mod codex;
+mod codex_cli;
 mod http;
 mod idle;
 mod openai;
@@ -7,12 +8,22 @@ mod retry;
 
 pub use anthropic::AnthropicProvider;
 pub use codex::CodexProvider;
+pub use codex_cli::{codex_auth_available, hydrate_codex_models};
 pub use openai::OpenAiProvider;
 
 use std::sync::Arc;
 
 use tcode_core::config::{ModelDef, Profile, ProviderKind, Selection, WatchdogConfig};
 use tcode_core::{ActiveModel, Provider};
+
+/// Whether this profile can be used now. Provider-local credential sources
+/// remain inside their adapter rather than leaking into core configuration.
+pub fn profile_is_usable(profile_name: &str, profile: &Profile) -> bool {
+    match profile.provider {
+        ProviderKind::Codex => codex_auth_available(),
+        ProviderKind::Anthropic | ProviderKind::Openai => profile.api_key(profile_name).is_ok(),
+    }
+}
 
 /// Assemble a provider for one model of a profile. `profile_name` is
 /// only used for error messages.
