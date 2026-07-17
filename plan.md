@@ -230,3 +230,4 @@ Auto-loaded
 280 tokens
 Working directory, platform, shell, OS version, and whether this is a git repo. Git branch, status, and recent commits load as a separate block at the very end of the system prompt.
 我们现在是不是少了这一块信息呢,只有个project_map?不过要注意比如resume后换cd路径了或者下次换shell了是不是得和原有的比较一下,有变化的增加一个Note, 因为不应该修改原始的记录,以免缓存未命中
+7. Edit(error)没有红色显示了
