@@ -49,8 +49,8 @@ pub struct Transcript {
     selection: Option<Selection>,
     /// Block emphasized by rewind navigation.
     highlight: Option<usize>,
-    /// Collapsible block currently under the pointer. Its header uses the
-    /// terminal's regular foreground while leaving expanded output alone.
+    /// Collapsible block currently under the pointer. Its header receives the
+    /// same static foreground lift used by the running shimmer.
     hovered: Option<usize>,
     /// Tick frame used only when painting an in-flight tool header. Keeping it
     /// out of the wrapped block data preserves the transcript's resize-only reflow.
@@ -202,7 +202,7 @@ struct Block {
 }
 
 impl Block {
-    fn rewrap(&mut self, width: u16, hovered: bool) {
+    fn rewrap(&mut self, width: u16) {
         if let Some(detail) = &mut self.detail {
             detail.rewrap(width);
         }
@@ -210,10 +210,10 @@ impl Block {
             .status
             .as_ref()
             .map_or_else(Wrapped::default, |lines| Wrapped::of(lines, width));
-        self.head_wrapped = Wrapped::of(&self.display_head(width, hovered), width);
+        self.head_wrapped = Wrapped::of(&self.display_head(width), width);
     }
 
-    fn display_head(&self, width: u16, _hovered: bool) -> Vec<Line<'static>> {
+    fn display_head(&self, width: u16) -> Vec<Line<'static>> {
         let mut head = self.head.lines_at(width);
         if let Some(last) = head.last_mut() {
             if let Some(detail) = &self.detail {
@@ -575,9 +575,8 @@ impl Transcript {
     /// Recompute layout after a block mutated in place, preserving a
     /// scrolled-up reader's position exactly like `push_block` does.
     fn remeasure(&mut self, index: usize, old_height: usize) {
-        let hovered = self.hovered == Some(index);
         let block = &mut self.blocks[index];
-        block.rewrap(self.width, hovered);
+        block.rewrap(self.width);
         let new_height = block.height();
         if self.scroll > 0 {
             if new_height >= old_height {
@@ -590,7 +589,7 @@ impl Transcript {
     }
 
     fn push_block(&mut self, mut block: Block) {
-        block.rewrap(self.width, false);
+        block.rewrap(self.width);
         let height = block.height();
         self.cum.push(self.total() + height);
         self.blocks.push(block);
@@ -681,7 +680,7 @@ impl Transcript {
         self.selection = None;
         self.hovered = None;
         for block in &mut self.blocks {
-            block.rewrap(width, false);
+            block.rewrap(width);
         }
         self.rebuild_cum();
     }
@@ -779,6 +778,7 @@ impl Transcript {
                 let (line, _) = block.row(i);
                 // A task card uses the same quiet, dim treatment as the live
                 // agent tree. Only ordinary in-flight tool headers shimmer.
+                let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
                 let is_live_head = self.live_head == Some(index)
                     && block.task_run.is_none()
                     && i < block.head_wrapped.len();
@@ -792,6 +792,13 @@ impl Transcript {
                     },
                     buf,
                 );
+                if is_hovered_head {
+                    for x in 0..content_width {
+                        let cell = &mut buf[(area.x + x as u16, y)];
+                        let base = cell.style().fg.unwrap_or(ratatui::style::Color::Reset);
+                        cell.set_fg(crate::theme::hover_color(base));
+                    }
+                }
                 if is_live_head {
                     for x in 0..content_width {
                         let cell = &mut buf[(area.x + x as u16, y)];
@@ -871,21 +878,11 @@ impl Transcript {
         if hovered == self.hovered {
             return;
         }
-        let previous = std::mem::replace(&mut self.hovered, hovered);
-        for index in [previous, hovered].into_iter().flatten() {
-            self.blocks[index].rewrap(self.width, self.hovered == Some(index));
-        }
-        self.rebuild_cum();
-        self.scroll = self.scroll.min(self.max_scroll());
+        self.hovered = hovered;
     }
 
     pub fn clear_hover(&mut self) {
-        let Some(index) = self.hovered.take() else {
-            return;
-        };
-        self.blocks[index].rewrap(self.width, false);
-        self.rebuild_cum();
-        self.scroll = self.scroll.min(self.max_scroll());
+        self.hovered = None;
     }
 
     /// Wheel input: an open, overflowing detail region under the cursor
@@ -916,13 +913,12 @@ impl Transcript {
         let Some((index, _)) = self.block_at(row) else {
             return;
         };
-        let hovered = self.hovered == Some(index);
         let block = &mut self.blocks[index];
         let Some(detail) = block.detail.as_mut() else {
             return;
         };
         detail.open = !detail.open;
-        block.rewrap(self.width, hovered);
+        block.rewrap(self.width);
         self.rebuild_cum();
         self.scroll = self.scroll.min(self.max_scroll());
     }
@@ -1524,10 +1520,13 @@ mod tests {
     }
 
     #[test]
-    fn hovered_tool_header_keeps_its_existing_colours() {
+    fn hovered_dim_tool_header_uses_the_static_running_highlight() {
         let mut t = Transcript::new(40);
         t.push_with_detail(
-            vec![Line::styled("preview", crate::theme::dim())],
+            vec![Line::from(vec![Span::styled(
+                "preview",
+                crate::theme::dim(),
+            )])],
             vec![Line::raw("expanded output")],
             false,
             5,
@@ -1539,7 +1538,8 @@ mod tests {
 
         t.mouse_moved(0, 0);
         t.render(&mut buf, area);
-        assert_eq!(buf[(0, 0)].style(), before_hover);
+        assert_ne!(buf[(0, 0)].style(), before_hover);
+        assert_eq!(buf[(0, 0)].fg, crate::theme::hover_color(crate::theme::DIM));
         assert_eq!(buf[(30, 0)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
 
@@ -1549,6 +1549,25 @@ mod tests {
         t.render(&mut buf, area);
         assert_eq!(buf[(0, 1)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 1)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn hovered_coloured_tool_header_preserves_its_hue_with_the_static_highlight() {
+        let mut t = Transcript::new(40);
+        t.push_with_detail(
+            vec![Line::from(vec![Span::styled("Task", crate::theme::ok())])],
+            vec![Line::raw("expanded output")],
+            false,
+            5,
+        );
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+
+        t.mouse_moved(0, 0);
+        t.render(&mut buf, area);
+        assert_eq!(buf[(0, 0)].fg, crate::theme::hover_color(crate::theme::OK));
+        assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
     }
 
     #[test]

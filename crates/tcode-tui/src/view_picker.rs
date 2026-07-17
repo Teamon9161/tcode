@@ -26,6 +26,7 @@ pub struct ViewEntry {
 pub struct Picker {
     entries: Vec<ViewEntry>,
     selected: usize,
+    hovered: Option<usize>,
 }
 
 pub enum PickResult {
@@ -42,6 +43,7 @@ impl Picker {
                 .position(|entry| &entry.id == active)
                 .unwrap_or(0),
             entries,
+            hovered: None,
         })
     }
 
@@ -74,6 +76,14 @@ impl Picker {
         PickResult::Picked(self.entries[index].id.clone())
     }
 
+    pub fn set_hovered_row(&mut self, row: Option<usize>) {
+        let start = self.window_start();
+        self.hovered = row
+            .and_then(|row| row.checked_sub(1))
+            .map(|offset| start + offset)
+            .filter(|&index| index < self.entries.len());
+    }
+
     pub fn render(&self) -> Vec<Line<'static>> {
         let mut lines = vec![Line::styled("◈ sessions", theme::bold().fg(theme::ACCENT))];
         let start = self.window_start();
@@ -86,10 +96,15 @@ impl Picker {
         {
             let marker = if index == self.selected { "▸ " } else { "  " };
             let current = if entry.active { " ✓" } else { "" };
-            let style = if index == self.selected {
+            let base_style = if index == self.selected {
                 theme::accent()
             } else {
                 theme::dim()
+            };
+            let style = if self.hovered == Some(index) {
+                theme::hover_style(base_style)
+            } else {
+                base_style
             };
             lines.push(Line::styled(
                 format!("  {marker}{} · {}{current}", entry.title, entry.detail),
@@ -118,6 +133,34 @@ impl Picker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hover_lifts_a_view_row_without_moving_keyboard_selection() {
+        let active = ViewId::Main;
+        let mut picker = Picker::new(
+            vec![
+                ViewEntry {
+                    id: ViewId::Main,
+                    title: "Main".into(),
+                    detail: "current".into(),
+                    active: true,
+                },
+                ViewEntry {
+                    id: ViewId::TaskRun("t1".into()),
+                    title: "Task".into(),
+                    detail: "done".into(),
+                    active: false,
+                },
+            ],
+            &active,
+        )
+        .unwrap();
+        picker.set_hovered_row(Some(2));
+
+        let lines = picker.render();
+        assert_eq!(picker.selected, 0);
+        assert_eq!(lines[2].style.fg, Some(theme::hover_color(theme::DIM)));
+    }
 
     #[test]
     fn picker_selects_task_trace_and_windows_rows() {

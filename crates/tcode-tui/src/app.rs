@@ -2596,6 +2596,18 @@ impl App {
         }
     }
 
+    fn set_picker_hover(&mut self, row: Option<usize>) {
+        if let Some(picker) = self.view_picker.as_mut() {
+            picker.set_hovered_row(row);
+        } else if let Some(picker) = self.model_picker.as_mut() {
+            picker.set_hovered_row(row);
+        } else if let Some(picker) = self.mode_picker.as_mut() {
+            picker.set_hovered_row(row);
+        } else if let Some(picker) = self.agent_picker.as_mut() {
+            picker.set_hovered_row(row, &self.agents);
+        }
+    }
+
     fn on_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
         if self.view_picker.is_none()
             && self.model_picker.is_none()
@@ -2603,11 +2615,6 @@ impl App {
             && self.agent_picker.is_none()
         {
             return false;
-        }
-        // Pickers are modal even where they have no mouse actions yet: do not
-        // let a click select transcript text behind the panel.
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return true;
         }
         let height = area_height(&self.terminal);
         let lines = self
@@ -2630,14 +2637,26 @@ impl App {
             .min(height.saturating_sub(4))
             .max(1);
         let panel_top = height.saturating_sub(panel_h);
-        if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
-            self.view_picker = None;
-            self.model_picker = None;
-            self.mode_picker = None;
-            self.agent_picker = None;
+        let inside = mouse.row > panel_top && mouse.row < panel_top + panel_h.saturating_sub(1);
+        if !inside {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                self.view_picker = None;
+                self.model_picker = None;
+                self.mode_picker = None;
+                self.agent_picker = None;
+            } else if matches!(mouse.kind, MouseEventKind::Moved) {
+                self.set_picker_hover(None);
+            }
             return true;
         }
         let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.set_picker_hover(Some(row));
+            return true;
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return true;
+        }
         if let Some(picker) = self.view_picker.as_mut() {
             match picker.handle_mouse_row(row) {
                 view_picker::PickResult::Picked(id) => {
@@ -5067,12 +5086,12 @@ impl App {
             " · ↑ viewing history"
         };
         let mode_style = if self.status_hover == Some(StatusHover::Mode) {
-            theme::bold().fg(theme::ACCENT)
+            theme::hover_style(theme::accent())
         } else {
             theme::accent()
         };
         let model_style = if self.status_hover == Some(StatusHover::Model) {
-            ratatui::style::Style::default()
+            theme::hover_style(theme::metadata())
         } else {
             theme::metadata()
         };

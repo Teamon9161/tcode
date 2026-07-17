@@ -19,6 +19,7 @@ const MODES: [PermissionMode; 5] = [
 pub struct Picker {
     selected: usize,
     current: usize,
+    hovered: Option<usize>,
 }
 
 pub enum PickResult {
@@ -33,6 +34,7 @@ impl Picker {
         Self {
             selected: current,
             current,
+            hovered: None,
         }
     }
 
@@ -62,6 +64,12 @@ impl Picker {
         PickResult::Picked(MODES[index])
     }
 
+    pub fn set_hovered_row(&mut self, row: Option<usize>) {
+        self.hovered = row
+            .and_then(|row| row.checked_sub(1))
+            .filter(|&index| index < MODES.len());
+    }
+
     pub fn render(&self) -> Vec<Line<'static>> {
         let mut lines = vec![Line::from(vec![Span::styled(
             "◈ permission mode",
@@ -79,7 +87,7 @@ impl Picker {
                 PermissionMode::Auto => "classifier reviews routine actions",
                 PermissionMode::Unsafe => "run without routine prompts",
             };
-            let style = if selected {
+            let base_style = if selected {
                 if *mode == PermissionMode::Unsafe {
                     theme::warn()
                 } else {
@@ -87,6 +95,11 @@ impl Picker {
                 }
             } else {
                 theme::dim()
+            };
+            let style = if self.hovered == Some(index) {
+                theme::hover_style(base_style)
+            } else {
+                base_style
             };
             lines.push(Line::styled(
                 format!("  {marker}{:<14} {description}{current}", mode.label()),
@@ -116,6 +129,16 @@ mod tests {
             picker.handle_key(KeyEvent::from(KeyCode::Enter)),
             PickResult::Picked(PermissionMode::Auto)
         ));
+    }
+
+    #[test]
+    fn hover_lifts_a_mode_row_without_moving_keyboard_selection() {
+        let mut picker = Picker::new(PermissionMode::Default);
+        picker.set_hovered_row(Some(1));
+
+        let lines = picker.render();
+        assert_eq!(picker.selected, 1);
+        assert_eq!(lines[1].style.fg, Some(theme::hover_color(theme::DIM)));
     }
 
     #[test]

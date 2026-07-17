@@ -286,7 +286,7 @@ fn gutter(current: bool) -> Span<'static> {
 
 fn row_style(base: Style, highlighted: bool) -> Style {
     if highlighted {
-        Style::default()
+        theme::hover_style(base)
     } else {
         base
     }
@@ -528,8 +528,11 @@ mod tests {
     }
 
     #[test]
-    fn hover_and_current_gutter_use_plain_foreground() {
-        assert_eq!(row_style(theme::dim(), true), Style::default());
+    fn hover_preserves_the_row_style_and_applies_the_shared_lift() {
+        assert_eq!(
+            row_style(theme::dim(), true),
+            theme::hover_style(theme::dim())
+        );
         assert_eq!(gutter(true).style, Style::default());
     }
 

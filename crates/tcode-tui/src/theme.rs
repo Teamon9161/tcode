@@ -147,6 +147,34 @@ pub fn math_block() -> Style {
     Style::default().fg(MATH)
 }
 
+/// The neutral base used when a terminal-default cell enters an interaction
+/// highlight, and the shared lift target for both hover and the running shimmer.
+const INTERACTION_NEUTRAL: (u8, u8, u8) = (190, 197, 205);
+const INTERACTION_BRIGHT: (u8, u8, u8) = (218, 224, 230);
+
+/// Apply the static form of the running-line highlight. The lift preserves an
+/// existing hue rather than assigning a separate hover colour, while terminal
+/// defaults start from a neutral foreground so they remain visible everywhere.
+pub fn hover_color(base: Color) -> Color {
+    const LIFT: f32 = 0.55;
+    let from = match base {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => INTERACTION_NEUTRAL,
+    };
+    let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * LIFT) as u8;
+    Color::Rgb(
+        lerp(from.0, INTERACTION_BRIGHT.0),
+        lerp(from.1, INTERACTION_BRIGHT.1),
+        lerp(from.2, INTERACTION_BRIGHT.2),
+    )
+}
+
+/// Preserve a text style's modifiers while applying the shared static hover
+/// lift to its effective foreground.
+pub fn hover_style(style: Style) -> Style {
+    style.fg(hover_color(style.fg.unwrap_or(Color::Reset)))
+}
+
 /// Colour for one cell of a live (shimmering) line: a single soft highlight
 /// band sweeps left to right, dwells briefly past the end, then restarts.
 /// `frame` must be monotonic (100ms animation ticks); `width` is the painted
@@ -158,8 +186,6 @@ pub fn math_block() -> Style {
 /// terminal default) only join the band once it is clearly over them,
 /// starting from a neutral tone close to a typical default foreground.
 pub fn shimmer_color(frame: usize, column: usize, width: usize, base: Color) -> Color {
-    const NEUTRAL: (u8, u8, u8) = (190, 197, 205);
-    const BRIGHT: (u8, u8, u8) = (218, 224, 230);
     const SPEED: f32 = 1.5; // columns per frame
     const SIGMA: f32 = 4.0; // band half-width
     const DWELL: f32 = 12.0; // off-end travel ≈ a beat of rest between sweeps
@@ -169,14 +195,14 @@ pub fn shimmer_color(frame: usize, column: usize, width: usize, base: Color) -> 
     let t = (-d * d / (2.0 * SIGMA * SIGMA)).exp();
     let from = match base {
         Color::Rgb(r, g, b) => (r, g, b),
-        _ if t > 0.2 => NEUTRAL,
+        _ if t > 0.2 => INTERACTION_NEUTRAL,
         _ => return base,
     };
     let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
     Color::Rgb(
-        lerp(from.0, BRIGHT.0),
-        lerp(from.1, BRIGHT.1),
-        lerp(from.2, BRIGHT.2),
+        lerp(from.0, INTERACTION_BRIGHT.0),
+        lerp(from.1, INTERACTION_BRIGHT.1),
+        lerp(from.2, INTERACTION_BRIGHT.2),
     )
 }
 

@@ -1432,41 +1432,65 @@ fn candidate_line(line: &str) -> String {
     clipped
 }
 
-/// Self-healing "old_string not found": locate the closest region so the
-/// model can fix the mismatch without a re-read turn.
+/// Self-healing "old_string not found": show every bounded diagnostic hint
+/// rather than biasing the model toward the first matching region in the file.
 fn near_miss_help(text: &str, old: &str) -> String {
     let mut msg = String::from("old_string not found in file.");
     let probe = old
         .lines()
         .map(str::trim)
-        .filter(|l| l.len() >= 8)
-        .max_by_key(|l| l.len());
-    if let Some(probe) = probe {
-        if let Some((idx, _)) = text
-            .lines()
-            .enumerate()
-            .find(|(_, l)| l.contains(probe) || l.trim() == probe)
-        {
-            let lines: Vec<&str> = text.lines().collect();
-            let start = idx.saturating_sub(3);
-            let end = (idx + 4).min(lines.len());
-            msg.push_str(&format!(
-                " The closest matching region (whitespace/indentation likely \
-                 differs from your old_string):\n{}",
-                numbered(&lines[start..end], start + 1)
-            ));
-            // Do not reconstruct old_string from the numbered view above (a
-            // single drifted space is the usual cause of the loop). Copy the
-            // exact bytes below verbatim, trimming to the lines you need.
-            msg.push_str(&format!(
-                "\nExact current text — copy verbatim as old_string:\n{}",
-                lines[start..end].join("\n")
-            ));
-            return msg;
-        }
+        .filter(|line| line.len() >= 8)
+        .max_by_key(|line| line.len());
+    let Some(probe) = probe else {
+        msg.push_str(
+            " No similar line found — the content may differ more than expected; re-read the relevant range.",
+        );
+        return msg;
+    };
+
+    let (candidates, omitted) = similar_line_candidates(text, probe);
+    if candidates.is_empty() {
+        msg.push_str(
+            " No similar line found — the content may differ more than expected; re-read the relevant range.",
+        );
+        return msg;
     }
-    msg.push_str(" No similar line found — the content may differ more than expected; re-read the relevant range.");
+
+    msg.push_str(
+        " Similar locations below are diagnostic hints, not replacement targets. \
+         Add unique exact surrounding context and retry:\n",
+    );
+    msg.push_str(&candidate_help(text, &candidates).join("\n\n"));
+    if omitted > 0 {
+        let suffix = if omitted == 1 { "" } else { "s" };
+        msg.push_str(&format!(
+            "\n  … {omitted} additional similar location{suffix} omitted"
+        ));
+    }
+    msg.push_str("\nRe-read the relevant range if none of these is the intended edit.");
     msg
+}
+
+fn similar_line_candidates(text: &str, probe: &str) -> (Vec<MatchCandidate>, usize) {
+    let mut candidates = Vec::with_capacity(MAX_EDIT_CANDIDATES);
+    let mut total: usize = 0;
+    let mut at = 0;
+    for piece in text.split_inclusive('\n') {
+        let line = piece.strip_suffix('\n').unwrap_or(piece);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if line.contains(probe) || line.trim() == probe {
+            total += 1;
+            if candidates.len() < MAX_EDIT_CANDIDATES {
+                candidates.push(MatchCandidate {
+                    at,
+                    len: line.len(),
+                });
+            }
+        }
+        at += piece.len();
+    }
+    let omitted = total.saturating_sub(candidates.len());
+    (candidates, omitted)
 }
 
 #[cfg(test)]
@@ -1767,6 +1791,51 @@ assert_eq!(
             .last()
             .unwrap()
             .contains("1 additional candidate matches omitted"));
+    }
+
+    #[test]
+    fn edit_not_found_shows_production_and_test_similar_locations() {
+        let text = "\
+pub fn helper() {
+    actual();
+}
+
+#[cfg(test)]
+mod tests {
+    fn helper() {
+        actual();
+    }
+}
+";
+        let help = near_miss_help(
+            text,
+            "fn helper() {
+    expected();
+}",
+        );
+
+        assert!(help.contains("diagnostic hints, not replacement targets"));
+        assert!(help.contains("candidate 1 (line 1):"));
+        assert!(help.contains("candidate 2 (line 7):"));
+        assert!(help.contains("#[cfg(test)]"));
+        assert!(!help.contains("Exact current text"));
+    }
+
+    #[test]
+    fn edit_not_found_bounds_similar_location_hints() {
+        let text = "target marker\n".repeat(MAX_EDIT_CANDIDATES + 1);
+        let help = near_miss_help(&text, "target marker\nmiss");
+
+        assert_eq!(help.matches("candidate ").count(), MAX_EDIT_CANDIDATES);
+        assert!(help.contains("1 additional similar location omitted"));
+    }
+
+    #[test]
+    fn edit_not_found_without_a_similar_line_keeps_reread_guidance() {
+        let help = near_miss_help("actual content\n", "expected content\n");
+
+        assert!(help.contains("No similar line found"));
+        assert!(help.contains("re-read the relevant range"));
     }
 
     #[tokio::test]

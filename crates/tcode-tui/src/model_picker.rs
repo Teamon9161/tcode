@@ -86,6 +86,7 @@ pub struct Picker {
     selected: usize,
     /// Row marked as the one in force (`✓`).
     current: usize,
+    hovered: Option<usize>,
 }
 
 pub enum PickResult {
@@ -140,6 +141,7 @@ impl Picker {
             rows,
             selected: menu.current,
             current: menu.current,
+            hovered: None,
         })
     }
 
@@ -169,6 +171,7 @@ impl Picker {
             rows,
             selected: current,
             current,
+            hovered: None,
         }
     }
 
@@ -225,6 +228,18 @@ impl Picker {
         }
     }
 
+    pub fn set_hovered_row(&mut self, row: Option<usize>) {
+        const WINDOW: usize = 8;
+        let start = self
+            .selected
+            .saturating_sub(WINDOW / 2)
+            .min(self.rows.len().saturating_sub(WINDOW));
+        self.hovered = row
+            .and_then(|row| row.checked_sub(1))
+            .map(|offset| start + offset)
+            .filter(|&index| index < (start + WINDOW).min(self.rows.len()));
+    }
+
     pub fn render(&self, menu: &ModelMenu) -> Vec<Line<'static>> {
         let mut out = vec![Line::from(vec![Span::styled(
             self.title.clone(),
@@ -241,10 +256,15 @@ impl Picker {
             let is_sel = i == self.selected;
             let marker = if is_sel { "▸ " } else { "  " };
             let current = if i == self.current { " ✓" } else { "" };
-            let style = if is_sel {
+            let base_style = if is_sel {
                 theme::bold().fg(theme::ACCENT)
             } else {
                 theme::dim()
+            };
+            let style = if self.hovered == Some(i) {
+                theme::hover_style(base_style)
+            } else {
+                base_style
             };
             let Some(option) = row.option else {
                 out.push(Line::styled(
@@ -287,6 +307,7 @@ impl Picker {
 pub struct AgentPicker {
     selected: usize,
     model: Option<Picker>,
+    hovered: Option<usize>,
 }
 
 pub enum AgentPick {
@@ -305,6 +326,7 @@ impl AgentPicker {
         (!agents.kinds.is_empty()).then_some(Self {
             selected: 0,
             model: None,
+            hovered: None,
         })
     }
 
@@ -370,6 +392,16 @@ impl AgentPicker {
         }
     }
 
+    pub fn set_hovered_row(&mut self, row: Option<usize>, agents: &AgentMenu) {
+        if let Some(picker) = self.model.as_mut() {
+            picker.set_hovered_row(row);
+        } else {
+            self.hovered = row
+                .and_then(|row| row.checked_sub(1))
+                .filter(|&index| index < agents.kinds.len());
+        }
+    }
+
     pub fn render(&self, menu: &ModelMenu, agents: &AgentMenu) -> Vec<Line<'static>> {
         if let Some(picker) = &self.model {
             return picker.render(menu);
@@ -380,10 +412,15 @@ impl AgentPicker {
         )])];
         for (i, kind) in agents.kinds.iter().enumerate() {
             let is_sel = i == self.selected;
-            let style = if is_sel {
+            let base_style = if is_sel {
                 theme::bold().fg(theme::ACCENT)
             } else {
                 theme::dim()
+            };
+            let style = if self.hovered == Some(i) {
+                theme::hover_style(base_style)
+            } else {
+                base_style
             };
             out.push(Line::styled(
                 format!(
@@ -461,6 +498,17 @@ mod tests {
     }
 
     #[test]
+    fn hover_lifts_a_model_row_without_moving_keyboard_selection() {
+        let m = menu();
+        let mut p = Picker::new(&m, None).unwrap();
+        p.set_hovered_row(Some(2));
+
+        let lines = p.render(&m);
+        assert_eq!(p.selected, 0);
+        assert_eq!(lines[2].style.fg, Some(theme::hover_color(theme::DIM)));
+    }
+
+    #[test]
     fn mouse_row_applies_the_visible_model() {
         let m = menu();
         let mut p = Picker::new(&m, None).unwrap();
@@ -469,6 +517,18 @@ mod tests {
         };
         assert_eq!(option, Some(1));
         assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn agent_kind_hover_lifts_without_changing_the_selected_kind() {
+        let m = menu();
+        let a = agents(vec![None, None]);
+        let mut p = AgentPicker::new(&a).unwrap();
+        p.set_hovered_row(Some(2), &a);
+
+        let lines = p.render(&m, &a);
+        assert_eq!(p.selected, 0);
+        assert_eq!(lines[2].style.fg, Some(theme::hover_color(theme::DIM)));
     }
 
     #[test]
