@@ -351,6 +351,11 @@ pub struct App {
     agent: Arc<Agent>,
     opening_context: OpeningContextFn,
     registry: CommandRegistry,
+    /// The same discovery the `skill` tool uses, handed in by the caller so a
+    /// `/name` line that misses both `UI_COMMANDS` and the registry can fall
+    /// back to loading a skill directly (see `run_slash`) without a second
+    /// filesystem scan.
+    skills: Vec<tcode_tools::Skill>,
     session: Option<Session>,
     /// The TUI retains this while a turn owns `session`, so live tool calls
     /// can still render in-project paths relatively.
@@ -518,8 +523,8 @@ pub struct App {
     turn_usage: Usage,
     mode_label: String,
     spinner: usize,
-    /// Monotonic 100ms shimmer frame for live task statuses. Unlike `spinner`
-    /// it never wraps, so the sweep's phase stays continuous.
+    /// Monotonic 100ms shimmer frame for the main running status and in-flight
+    /// tool headers. Unlike `spinner` it never wraps, so the sweep stays continuous.
     anim_frame: usize,
     /// Cache-read share of the previous turn; the regression sentinel
     /// compares against it so cache decay is visible immediately.
@@ -548,6 +553,7 @@ impl App {
         agents: AgentMenu,
         opening_context: OpeningContextFn,
         show_reasoning: bool,
+        skills: Vec<tcode_tools::Skill>,
     ) -> anyhow::Result<Self> {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
@@ -579,6 +585,7 @@ impl App {
             agent,
             opening_context,
             registry: CommandRegistry::builtin(),
+            skills,
             session: Some(session),
             pending,
             pending_mode,
@@ -677,9 +684,9 @@ impl App {
         // while a drag is actually parked at an edge — never when idle.
         let mut drag_tick = tokio::time::interval(Duration::from_millis(50));
         drag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Drives the shimmer on live task statuses and in-flight call headers.
-        // Its select arm is gated on `shimmer_active`, so the finer cadence
-        // only runs while something is actually animating.
+        // Drives the shimmer on the main running status and in-flight call
+        // headers. Its select arm is gated on `shimmer_active`, so the finer
+        // cadence only runs while a turn is actively executing.
         let mut anim_tick = tokio::time::interval(Duration::from_millis(100));
         anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -797,14 +804,11 @@ impl App {
         Ok(())
     }
 
-    /// True while any shimmer target exists: a running task run's status line
-    /// or an in-flight tool call's header. Gates the 100ms animation tick.
+    /// True while the main running status or an in-flight tool header needs a
+    /// shimmer frame. The 100ms animation tick stays asleep while idle and
+    /// during a retry countdown, whose red status is intentionally static.
     fn shimmer_active(&self) -> bool {
-        self.task_runs
-            .iter()
-            .any(|run| run.status == tcode_core::TaskRunStatus::Running)
-            || self.pending_tool.is_some()
-            || !self.pending_batch.is_empty()
+        matches!(self.phase, Phase::Running { .. }) && self.retry_wait.is_none()
     }
 
     pub fn provider_setup_requested(&self) -> bool {
@@ -3448,6 +3452,9 @@ impl App {
             }
             _ => {}
         }
+        if self.registry.find(cmd).is_none() && self.dispatch_skill(cmd) {
+            return;
+        }
         let Some(command) = self.registry.find(cmd) else {
             self.bake(vec![Line::styled(
                 format!("unknown command {cmd} — /help lists commands"),
@@ -3488,6 +3495,54 @@ impl App {
         self.apply_command_outcome(outcome);
     }
 
+    /// Slash lines that miss both `UI_COMMANDS` and the shared registry fall
+    /// back to the skill table — `/name` becomes shorthand for loading that
+    /// skill, matching Claude Code. Returns `false` for a genuinely unknown
+    /// command, so the caller still reports it.
+    ///
+    /// This runs even while a turn is in flight: unlike registry commands
+    /// (which need `&mut Session`, unavailable to the frontend mid-turn) a
+    /// skill invocation is just a prompt, submitted through the same queue a
+    /// typed message would use.
+    fn dispatch_skill(&mut self, cmd: &str) -> bool {
+        let rest = cmd.trim_start_matches('/');
+        let (name, args) = match rest.split_once(char::is_whitespace) {
+            Some((name, args)) => (name, args.trim()),
+            None => (rest, ""),
+        };
+        let Some(skill) = self.skills.iter().find(|skill| skill.name == name) else {
+            return false;
+        };
+        // Small, one-off, user-initiated read outside any tool batch: a
+        // blocking std::fs read here does not touch the parallel-batch path
+        // the async-IO rule guards (`tool.run` keeps using `tokio::fs`).
+        let body = match &skill.source {
+            tcode_tools::SkillSource::Dir(dir) => {
+                match std::fs::read_to_string(dir.join("SKILL.md")) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        self.bake(vec![Line::styled(
+                            format!("cannot read {}: {e}", dir.join("SKILL.md").display()),
+                            ratatui::style::Style::default().fg(theme::ERROR),
+                        )]);
+                        return true;
+                    }
+                }
+            }
+            tcode_tools::SkillSource::Builtin(body) => body.to_string(),
+        };
+        let rendered = tcode_tools::render_skill(skill, &body, args, &self.cwd, &self.scratch_dir);
+        let wrapped = tcode_tools::wrap_skill_echo(name, args, &rendered);
+        let message = self.compose_draft(wrapped);
+        if matches!(self.phase, Phase::Running { .. }) {
+            self.pending.push(message);
+        } else {
+            self.transcript.scroll_to_bottom();
+            self.start_turn(message);
+        }
+        true
+    }
+
     fn show_help(&mut self) {
         let mut lines: Vec<Line> = vec![Line::styled("keys:", theme::bold().fg(theme::ACCENT))];
         for (k, d) in [
@@ -3522,6 +3577,14 @@ impl App {
         }
         for (c, d) in self.registry.entries() {
             lines.push(Line::styled(format!("  {c:<16} {d}"), theme::dim()));
+        }
+        for skill in &self.skills {
+            let command = format!("/{}", skill.name);
+            let description = clip_description(&skill.description, 100);
+            lines.push(Line::styled(
+                format!("  {command:<16} {description}"),
+                theme::dim(),
+            ));
         }
         self.bake(lines);
     }
@@ -3883,7 +3946,7 @@ impl App {
         }
         if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {
             let prefix = self.editor.text();
-            return UI_COMMANDS
+            let mut matches: Vec<CompletionMatch> = UI_COMMANDS
                 .iter()
                 .copied()
                 .chain(self.registry.entries())
@@ -3895,6 +3958,16 @@ impl App {
                     kind: CompletionKind::Slash,
                 })
                 .collect();
+            matches.extend(self.skills.iter().filter_map(|skill| {
+                let command = format!("/{}", skill.name);
+                command.starts_with(&prefix).then(|| CompletionMatch {
+                    label: command.clone(),
+                    description: clip_description(&skill.description, 100),
+                    replacement: command,
+                    kind: CompletionKind::Slash,
+                })
+            }));
+            return matches;
         }
         let Some((start, end, query)) = self.active_reference() else {
             return Vec::new();
@@ -4617,7 +4690,7 @@ impl App {
         let mut captured_input: Option<InputHitbox> = None;
         let mut captured_status: Option<StatusHitboxes> = None;
         let mut captured_panel: Option<Rect> = None;
-        let task_activity_frame = self.anim_frame;
+        let animation_frame = self.anim_frame;
         let transcript = match &self.active_view {
             ViewId::Main => &mut self.transcript,
             ViewId::TaskRun(_) => {
@@ -4629,7 +4702,7 @@ impl App {
                     .transcript
             }
         };
-        transcript.set_task_activity_frame(task_activity_frame);
+        transcript.set_animation_frame(animation_frame);
         self.terminal.draw(|frame| {
             let area = frame.area();
             // The lower panel changes height when a dialog opens, a paste is
@@ -4893,17 +4966,16 @@ impl App {
         }
         let elapsed = started.map(|s| s.elapsed().as_secs()).unwrap_or(0);
         let frame = SPINNER[self.spinner % SPINNER.len()];
-        Line::from(vec![
-            Span::styled(format!("{frame} "), theme::warn()),
-            Span::styled(self.state_label.clone(), theme::warn()),
-            Span::styled(
-                format!(
-                    " · {elapsed}s · ↓ ~{} tok · esc to cancel",
-                    token_count(self.out_tokens as u64)
-                ),
-                theme::dim(),
+        let activity = format!("{frame} {}", self.state_label);
+        let mut spans = shimmer_text(&activity, self.anim_frame, theme::WARN);
+        spans.push(Span::styled(
+            format!(
+                " · {elapsed}s · ↓ ~{} tok · esc to cancel",
+                token_count(self.out_tokens as u64)
             ),
-        ])
+            theme::dim(),
+        ));
+        Line::from(spans)
     }
 
     /// One-liner under the input box: mode, model, cache health. Mostly
@@ -4975,6 +5047,26 @@ impl App {
         spans.push(Span::styled(" · /help".to_string(), theme::dim()));
         Line::from(spans)
     }
+}
+
+/// Build an amber activity label with the same soft sweep used by in-flight
+/// tool headers. Per-character spans keep the terminal's normal wrapping while
+/// allowing the sweep to preserve the status line's warning hue at rest.
+fn shimmer_text(text: &str, frame: usize, base: ratatui::style::Color) -> Vec<Span<'static>> {
+    let width = text.width().max(1);
+    let mut column = 0;
+    text.chars()
+        .map(|ch| {
+            let content = ch.to_string();
+            let span = Span::styled(
+                content.clone(),
+                ratatui::style::Style::default()
+                    .fg(theme::shimmer_color(frame, column, width, base)),
+            );
+            column += content.width();
+            span
+        })
+        .collect()
 }
 
 fn task_trace_root(session: &Session) -> Option<PathBuf> {
@@ -5111,11 +5203,7 @@ fn task_summary_detail(summary: &str) -> Vec<Line<'static>> {
     summary
         .lines()
         .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            let mut spans = vec![Span::styled("  │ ", theme::dim())];
-            spans.extend(theme::task_activity_gradient(line));
-            Line::from(spans)
-        })
+        .map(|line| Line::styled(format!("  │ {line}"), theme::dim()))
         .collect()
 }
 
@@ -5129,8 +5217,9 @@ fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
     lines
 }
 
-/// The activity is already self-describing ("thinking…", "starting…"), and
-/// the shimmer marks it as live — no fixed "working" prefix needed.
+/// The activity is already self-describing ("thinking…", "starting…"), so
+/// task cards keep it as a quiet indented status rather than competing with
+/// the main window's animated running indicator.
 fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
     vec![Line::styled(format!("  {activity}"), theme::dim())]
 }
@@ -5340,13 +5429,31 @@ fn merge(queued: Vec<PendingMessage>) -> Option<PendingMessage> {
 
 /// How a prompt appears in the transcript. The single renderer for both paths:
 /// a prompt sent immediately and one that waited in the queue must be
-/// indistinguishable once they land.
+/// indistinguishable once they land. A `/name` skill invocation is echoed
+/// folded, exactly as `SessionView`'s ledger replay folds the same sentinel
+/// text back down (`crate::view::skill_echo_lines`) — one shared detector so
+/// live and replay cannot draw it differently.
 fn prompt_echo(text: &str, attachments: &[String]) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = vec![Line::default()];
-    lines.extend(quote_lines(None, text));
+    match tcode_tools::parse_skill_echo(text) {
+        Some(skill_echo) => lines.extend(crate::view::skill_echo_lines(&skill_echo)),
+        None => lines.extend(quote_lines(None, text)),
+    }
     lines.extend(attachments.iter().map(|label| quote_attachment_line(label)));
     lines.push(Line::default());
     lines
+}
+
+/// Skill descriptions are free text from a SKILL.md front matter, unbounded
+/// unlike the `&'static str` help strings hand-written for registry commands.
+fn clip_description(text: &str, cap: usize) -> String {
+    let mut chars = text.chars();
+    let prefix: String = chars.by_ref().take(cap).collect();
+    if chars.next().is_some() {
+        format!("{prefix}…")
+    } else {
+        prefix
+    }
 }
 
 fn quote_lines(label: Option<&str>, text: &str) -> Vec<Line<'static>> {
@@ -5834,6 +5941,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shimmer_text_preserves_content_and_animates_the_amber_status() {
+        let first = shimmer_text("⠋ responding", 0, theme::WARN);
+        let later = shimmer_text("⠋ responding", 5, theme::WARN);
+        let text = first
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "⠋ responding");
+        assert!(
+            first
+                .iter()
+                .zip(later.iter())
+                .any(|(before, after)| before.style.fg != after.style.fg),
+            "the main running label has a moving highlight"
+        );
+    }
+
+    #[test]
     fn live_task_detail_keeps_summary_activity_and_recent_steps() {
         let lines = task_live_detail(
             "Trace session persistence and resume flow",
@@ -5857,6 +5982,12 @@ mod tests {
         );
         assert!(text.contains("└ Read task_trace.rs"));
         assert!(text.contains("└ Grep task runs"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.style.fg == Some(crate::theme::DIM)),
+            "task summary and recent activity stay uniformly dim"
+        );
     }
 
     #[test]

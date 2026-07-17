@@ -119,6 +119,13 @@ impl MemoryManager {
         }
     }
 
+    /// Session-private auto-memory root (`~/.tcode/projects/<id>/memory/`), if
+    /// a home directory could be resolved. Exposed so prompt templates (Auto
+    /// Mode's classifier policy) can name this location as legitimate to edit.
+    pub fn auto_dir(&self) -> Option<&Path> {
+        self.auto_dir.as_deref()
+    }
+
     pub fn startup_prompt(&self) -> String {
         let mut out = String::new();
         let instruction_sources: Vec<&PathBuf> = self

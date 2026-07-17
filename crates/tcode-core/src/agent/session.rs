@@ -166,8 +166,22 @@ pub struct Session {
 }
 
 impl Session {
+    /// Runtime placeholder values captured from this context's live state,
+    /// including the auto-memory root if one could be resolved (so prompts
+    /// like the Auto Mode classifier policy can reference `${TCODE_MEMORY_DIR}`).
+    fn capture_prompt_variables(tool_ctx: &ToolCtx) -> PromptVariables {
+        let memory_dir = tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .auto_dir()
+            .map(Path::to_path_buf);
+        PromptVariables::new(&tool_ctx.cwd, &tool_ctx.scratch_dir)
+            .with_memory_dir(memory_dir.as_deref())
+    }
+
     pub fn new(tool_ctx: ToolCtx, mode: PermissionMode, rules: PermissionRules) -> Self {
-        let prompt_variables = PromptVariables::new(&tool_ctx.cwd, &tool_ctx.scratch_dir);
+        let prompt_variables = Self::capture_prompt_variables(&tool_ctx);
         Self {
             ledger: Ledger::new(),
             opening_context: String::new(),
@@ -360,8 +374,7 @@ impl Session {
                 .map(|dir| dir.join("tasks").join(session_id)),
         );
         self.cache_scope = Some(format!("main:{session_id}"));
-        self.prompt_variables =
-            PromptVariables::new(&self.tool_ctx.cwd, &self.tool_ctx.scratch_dir);
+        self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
     }
 
     /// Change the conversation working directory. Before any model-visible
@@ -391,7 +404,7 @@ impl Session {
         self.tool_ctx.cwd = new.clone();
         if refresh_opening_context {
             self.tool_ctx.memory = std::sync::Mutex::new(crate::MemoryManager::new(&new));
-            self.prompt_variables = PromptVariables::new(&new, &self.tool_ctx.scratch_dir);
+            self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
             return Ok(CwdChange {
                 old,
                 new,

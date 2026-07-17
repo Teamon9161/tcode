@@ -437,7 +437,11 @@ async fn main() -> anyhow::Result<()> {
 
     let system = INTERACTIVE_AGENT_SYSTEM.to_string();
     let classifier_policy = auto_policy(&config);
-    let mut tools = tcode_tools::builtin_tools(&cwd);
+    // Discovered once and handed to both the tool and the frontends (TUI
+    // completion/`/name` fallback, plain REPL fallback) so they never see a
+    // different skill list than the `skill` tool the model calls.
+    let skills = tcode_tools::discover_skills(&cwd);
+    let mut tools = tcode_tools::builtin_tools_with_skills(skills.clone());
     tools.push(Arc::new(tcode_tools::ViewImageTool::new(
         model_cell.clone(),
         pinned.clone(),
@@ -561,6 +565,7 @@ async fn main() -> anyhow::Result<()> {
                 agent_menu,
                 opening_context.clone(),
                 config.ui.show_reasoning,
+                skills.clone(),
             )
             .await?
             {
@@ -653,6 +658,9 @@ async fn main() -> anyhow::Result<()> {
                 for (name, help) in registry.entries() {
                     println!("{DIM}  {name:<16} {help}{RESET}");
                 }
+                for skill in &skills {
+                    println!("{DIM}  /{:<15} {}{RESET}", skill.name, skill.description);
+                }
                 continue;
             }
             let turn_usage = session.turn_usage;
@@ -665,6 +673,44 @@ async fn main() -> anyhow::Result<()> {
                 &line,
             );
             let Some(outcome) = outcome else {
+                // Same fallback as the TUI's `dispatch_skill`: a `/name` that
+                // matches neither a UI command nor the registry loads that
+                // skill and starts a turn from its rendered body, instead of
+                // making the model spend a tool round-trip to fetch it.
+                let rest = line.trim_start_matches('/');
+                let (name, args) = match rest.split_once(char::is_whitespace) {
+                    Some((name, args)) => (name, args.trim()),
+                    None => (rest, ""),
+                };
+                if let Some(skill) = skills.iter().find(|skill| skill.name == name) {
+                    let body = match &skill.source {
+                        tcode_tools::SkillSource::Dir(dir) => {
+                            match std::fs::read_to_string(dir.join("SKILL.md")) {
+                                Ok(body) => body,
+                                Err(e) => {
+                                    eprintln!(
+                                        "{DIM}cannot read {}: {e}{RESET}",
+                                        dir.join("SKILL.md").display()
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        tcode_tools::SkillSource::Builtin(body) => body.to_string(),
+                    };
+                    let rendered = tcode_tools::render_skill(
+                        skill,
+                        &body,
+                        args,
+                        &cwd,
+                        &session.tool_ctx.scratch_dir,
+                    );
+                    let wrapped = tcode_tools::wrap_skill_echo(name, args, &rendered);
+                    if let Err(e) = run_turn(&agent, &mut session, wrapped, &line_approver).await {
+                        eprintln!("{DIM}error: {e}{RESET}");
+                    }
+                    continue;
+                }
                 println!("{DIM}unknown command {line} — /help lists commands{RESET}");
                 continue;
             };

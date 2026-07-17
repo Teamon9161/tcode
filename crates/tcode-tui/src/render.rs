@@ -343,6 +343,17 @@ impl ToolRenderer for ViewImageRenderer {
             .trim_end_matches(')')
             .to_string()
     }
+
+    /// The vision model's answer is prose, not a single-line value — fold it
+    /// under the header like `task`/`web_fetch` instead of gluing it onto the
+    /// call's own line.
+    fn folds_result(&self, _input: &Value) -> bool {
+        true
+    }
+
+    fn markdown_detail(&self, _input: Option<&Value>) -> bool {
+        true
+    }
 }
 
 struct ProgressRenderer;
@@ -576,6 +587,16 @@ mod tests {
             ),
             "Plan · draft a migration plan"
         );
+    }
+
+    #[test]
+    fn view_image_folds_its_result_instead_of_gluing_it_onto_the_header() {
+        let renderer = ViewImageRenderer;
+        let input = json!({ "paths": ["shot.png"], "prompt": "describe" });
+        // Regression: the vision model's answer used to have no opt-out from
+        // the default same-line preview, so it got appended to the header row.
+        assert!(renderer.folds_result(&input));
+        assert!(renderer.markdown_detail(Some(&input)));
     }
 
     #[test]

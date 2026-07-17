@@ -19,12 +19,33 @@ const DESCRIPTION_CAP: usize = 200;
 /// Skills beyond it stay invocable but appear as names only.
 const LISTING_CAP: usize = 6_000;
 
+/// Where a skill's SKILL.md body comes from. `Builtin` skills ship inside the
+/// binary (`include_str!`), so upgrading tcode upgrades them too; a
+/// filesystem skill of the same name overrides one, matching Claude Code.
+#[derive(Debug, Clone)]
+pub enum SkillSource {
+    Dir(PathBuf),
+    Builtin(&'static str),
+}
+
 #[derive(Debug, Clone)]
 pub struct Skill {
     pub name: String,
     pub description: String,
-    /// Directory containing SKILL.md, for resolving the skill's own files.
-    pub dir: PathBuf,
+    pub source: SkillSource,
+}
+
+/// Skills baked into the binary. Not materialized to disk: a user override
+/// lives at `.tcode/skills/<name>/SKILL.md` (or `~/.tcode/skills/<name>/`),
+/// found first by `discover_skills` and so preferred by its first-wins dedup.
+fn builtin_skills() -> Vec<Skill> {
+    let body = include_str!("../../../prompts/skills/init/SKILL.md");
+    let meta = front_matter(body);
+    vec![Skill {
+        name: meta.get("name").cloned().unwrap_or_else(|| "init".into()),
+        description: meta.get("description").cloned().unwrap_or_default(),
+        source: SkillSource::Builtin(body),
+    }]
 }
 
 pub struct SkillTool {
@@ -33,9 +54,7 @@ pub struct SkillTool {
 }
 
 impl SkillTool {
-    /// None when no skills exist — the tool then costs zero prompt tokens.
-    pub fn discover(cwd: &Path) -> Option<Self> {
-        let skills = discover_skills(cwd);
+    pub fn new(skills: Vec<Skill>) -> Option<Self> {
         (!skills.is_empty()).then(|| {
             let description = tool_description(&skills);
             Self {
@@ -45,13 +64,15 @@ impl SkillTool {
         })
     }
 
+    /// Builtin skills mean this is never `None` in practice; kept as `Option`
+    /// so a future all-filesystem-skills-removed state degrades safely.
+    pub fn discover(cwd: &Path) -> Option<Self> {
+        Self::new(discover_skills(cwd))
+    }
+
     #[cfg(test)]
     fn from_skills(skills: Vec<Skill>) -> Self {
-        let description = tool_description(&skills);
-        Self {
-            skills,
-            description,
-        }
+        Self::new(skills).expect("non-empty in tests")
     }
 }
 
@@ -95,29 +116,110 @@ impl Tool for SkillTool {
                     .join(", ")
             ));
         };
-        // Read at call time: skill files may change while tcode runs.
-        match tokio::fs::read_to_string(skill.dir.join("SKILL.md")).await {
-            Ok(body) => {
-                let rendered = PromptVariables::new(&ctx.cwd, &ctx.scratch_dir)
-                    .with_skill(&skill.dir, arguments)
-                    .expand(strip_front_matter(&body));
-                ToolOutput::ok(format!(
-                    "# Skill: {} (files in {})\n\n{rendered}",
-                    skill.name,
-                    skill.dir.display(),
-                ))
+        match &skill.source {
+            // Read at call time: skill files may change while tcode runs.
+            SkillSource::Dir(dir) => match tokio::fs::read_to_string(dir.join("SKILL.md")).await {
+                Ok(body) => {
+                    let rendered =
+                        render_skill(skill, &body, arguments, &ctx.cwd, &ctx.scratch_dir);
+                    ToolOutput::ok(format!(
+                        "# Skill: {} (files in {})\n\n{rendered}",
+                        skill.name,
+                        dir.display(),
+                    ))
+                }
+                Err(e) => ToolOutput::err(format!(
+                    "cannot read {}: {e}",
+                    dir.join("SKILL.md").display()
+                )),
+            },
+            SkillSource::Builtin(body) => {
+                let rendered = render_skill(skill, body, arguments, &ctx.cwd, &ctx.scratch_dir);
+                ToolOutput::ok(format!("# Skill: {}\n\n{rendered}", skill.name))
             }
-            Err(e) => ToolOutput::err(format!(
-                "cannot read {}: {e}",
-                skill.dir.join("SKILL.md").display()
-            )),
         }
     }
 }
 
+/// Pure rendering shared by the `skill` tool call and the user-triggered
+/// `/name` fallback (TUI and plain REPL): front-matter strip + variable
+/// expansion. Each caller reads the body its own way (async `tokio::fs` from
+/// the tool's async `run`, sync `std::fs` from the frontends' non-async
+/// command dispatch) so this stays IO-free and cannot drift between the two
+/// paths.
+pub fn render_skill(
+    skill: &Skill,
+    body: &str,
+    arguments: &str,
+    cwd: &Path,
+    scratch_dir: &Path,
+) -> String {
+    let vars = match &skill.source {
+        SkillSource::Dir(dir) => PromptVariables::new(cwd, scratch_dir).with_skill(dir, arguments),
+        SkillSource::Builtin(_) => PromptVariables::new(cwd, scratch_dir).with_arguments(arguments),
+    };
+    vars.expand(strip_front_matter(body))
+}
+
+/// Wraps a rendered skill body for injection as a normal `Entry::User`
+/// prompt (the user-triggered `/name` path, not the `skill` tool call): pure
+/// append, one turn cheaper than making the model call the tool itself. The
+/// sentinel lets a transcript recognize and fold this back down from the
+/// ledger text alone — live and replay both call `parse_skill_echo` on it, so
+/// there is exactly one place that knows the format.
+pub fn wrap_skill_echo(name: &str, args: &str, body: &str) -> String {
+    format!(
+        "<user-skill name=\"{}\" args=\"{}\">\n{body}\n</user-skill>",
+        escape_attr(name),
+        escape_attr(args),
+    )
+}
+
+/// The fields a transcript needs to fold a `wrap_skill_echo` block back down
+/// to a `/name args` line + a collapsed summary, without re-parsing the body.
+pub struct SkillEcho {
+    pub name: String,
+    pub args: String,
+    pub body_line_count: usize,
+}
+
+pub fn parse_skill_echo(text: &str) -> Option<SkillEcho> {
+    let rest = text.strip_prefix("<user-skill ")?;
+    let (tag, after_tag) = rest.split_once('>')?;
+    let name = attr(tag, "name")?;
+    let args = attr(tag, "args").unwrap_or_default();
+    let body = after_tag.strip_prefix('\n').unwrap_or(after_tag);
+    let body = body
+        .strip_suffix("\n</user-skill>")
+        .or_else(|| body.strip_suffix("</user-skill>"))
+        .unwrap_or(body);
+    Some(SkillEcho {
+        name,
+        args,
+        body_line_count: body.lines().count(),
+    })
+}
+
+fn attr(tag: &str, key: &str) -> Option<String> {
+    let needle = format!("{key}=\"");
+    let start = tag.find(&needle)? + needle.len();
+    let end = tag[start..].find('"')?;
+    Some(unescape_attr(&tag[start..start + end]))
+}
+
+fn escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+fn unescape_attr(s: &str) -> String {
+    s.replace("&quot;", "\"").replace("&amp;", "&")
+}
+
 /// Project skills override personal ones of the same name; `.tcode` wins
-/// over the `.claude` compatibility locations.
-fn discover_skills(cwd: &Path) -> Vec<Skill> {
+/// over the `.claude` compatibility locations; any of those override a
+/// builtin skill of the same name (checked last, so first-wins dedup keeps
+/// the filesystem version).
+pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut roots = vec![cwd.join(".tcode/skills"), cwd.join(".claude/skills")];
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".tcode/skills"));
@@ -150,8 +252,13 @@ fn discover_skills(cwd: &Path) -> Vec<Skill> {
             skills.push(Skill {
                 name,
                 description: meta.get("description").cloned().unwrap_or_default(),
-                dir,
+                source: SkillSource::Dir(dir),
             });
+        }
+    }
+    for skill in builtin_skills() {
+        if !skills.iter().any(|existing| existing.name == skill.name) {
+            skills.push(skill);
         }
     }
     skills
@@ -252,7 +359,7 @@ mod tests {
         Skill {
             name: name.into(),
             description: description.into(),
-            dir: PathBuf::from("unused"),
+            source: SkillSource::Dir(PathBuf::from("unused")),
         }
     }
 
@@ -332,7 +439,7 @@ mod tests {
         let tool = SkillTool::from_skills(vec![Skill {
             name: "inspect".into(),
             description: String::new(),
-            dir: dir.clone(),
+            source: SkillSource::Dir(dir.clone()),
         }]);
         let project = tmp.path().join("project");
         let scratch = tmp.path().join("scratch/runs/session-a");
@@ -361,5 +468,67 @@ mod tests {
             strip_front_matter("---\nname: x\n---\n\nDo the thing."),
             "Do the thing."
         );
+    }
+
+    #[test]
+    fn discover_skills_always_includes_builtin_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skills = discover_skills(tmp.path());
+        let init = skills
+            .iter()
+            .find(|skill| skill.name == "init")
+            .expect("builtin init skill present with no filesystem skills");
+        assert!(matches!(init.source, SkillSource::Builtin(_)));
+        assert!(!init.description.is_empty());
+    }
+
+    #[test]
+    fn filesystem_skill_overrides_builtin_of_the_same_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tcode/skills/init");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("SKILL.md"),
+            "---\nname: init\ndescription: custom override\n---\ncustom steps",
+        )
+        .unwrap();
+        let skills = discover_skills(tmp.path());
+        let matches: Vec<&Skill> = skills.iter().filter(|skill| skill.name == "init").collect();
+        assert_eq!(matches.len(), 1, "override must not duplicate the builtin");
+        assert_eq!(matches[0].description, "custom override");
+        assert!(matches!(matches[0].source, SkillSource::Dir(_)));
+    }
+
+    #[test]
+    fn render_skill_expands_builtin_without_a_skill_dir() {
+        let skill = Skill {
+            name: "probe".into(),
+            description: String::new(),
+            source: SkillSource::Builtin(""),
+        };
+        let rendered = render_skill(
+            &skill,
+            "---\nname: probe\n---\narg=$0 dir=${CLAUDE_SKILL_DIR} proj=${TCODE_PROJECT_DIR}",
+            "one two",
+            Path::new("/repo"),
+            Path::new("/scratch"),
+        );
+        // No skill directory to substitute: the placeholder stays literal
+        // rather than resolving to something misleading.
+        assert_eq!(rendered, "arg=one dir=${CLAUDE_SKILL_DIR} proj=/repo");
+    }
+
+    #[test]
+    fn wrap_and_parse_skill_echo_round_trips_through_special_characters() {
+        let wrapped = wrap_skill_echo("init", "say \"hi\" & bye", "line one\nline two\nline three");
+        let echo = parse_skill_echo(&wrapped).expect("sentinel recognized");
+        assert_eq!(echo.name, "init");
+        assert_eq!(echo.args, "say \"hi\" & bye");
+        assert_eq!(echo.body_line_count, 3);
+    }
+
+    #[test]
+    fn ordinary_user_text_is_not_mistaken_for_a_skill_echo() {
+        assert!(parse_skill_echo("just a normal message").is_none());
     }
 }

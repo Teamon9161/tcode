@@ -33,7 +33,9 @@
       "Bash(git ls-tree *)",
       "Bash(gh release *)",
       "Bash(sed -i 's/\"--mode\", \"default\"/\"--mode\", os.environ.get\\(\"TCODE_MODE\", \"default\"\\)/' drive_tui.py)",
-      "Bash(TCODE_MODE=unsafe python drive_tui.py \"run this exact shell command: echo hello-tcode && ls crates | head -2 . after it finishes just say done\" 60)"
+      "Bash(TCODE_MODE=unsafe python drive_tui.py \"run this exact shell command: echo hello-tcode && ls crates | head -2 . after it finishes just say done\" 60)",
+      "Bash(timeout 20 cargo run --quiet --)",
+      "Read(//home/teamon/.local/share/claude/versions/**)"
     ]
   }
 }

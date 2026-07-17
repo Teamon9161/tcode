@@ -11,7 +11,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
@@ -52,9 +52,9 @@ pub struct Transcript {
     /// Collapsible block currently under the pointer. Its header uses the
     /// terminal's regular foreground while leaving expanded output alone.
     hovered: Option<usize>,
-    /// Tick frame used only when painting a live task status. Keeping it out of
-    /// the wrapped block data preserves the transcript's resize-only reflow.
-    task_activity_frame: usize,
+    /// Tick frame used only when painting an in-flight tool header. Keeping it
+    /// out of the wrapped block data preserves the transcript's resize-only reflow.
+    animation_frame: usize,
     /// Block whose head rows shimmer because its call (or batch) is still in
     /// flight. Paint-only, like the frame: content and wrapping never change.
     live_head: Option<usize>,
@@ -221,7 +221,7 @@ impl Block {
                 } else if hovered {
                     Span::styled(
                         format!("  ▸ {} lines", detail.lines.len()),
-                        ratatui::style::Style::default().fg(Color::Reset),
+                        crate::theme::dim(),
                     )
                 } else {
                     Span::raw("")
@@ -278,7 +278,7 @@ impl Transcript {
             selection: None,
             highlight: None,
             hovered: None,
-            task_activity_frame: 0,
+            animation_frame: 0,
             live_head: None,
         }
     }
@@ -716,14 +716,14 @@ impl Transcript {
         self.scroll == 0
     }
 
-    /// Advance the paint-only animation for a live task status. This does not
-    /// change line content or wrapping, so a tick remains O(viewport height).
-    pub fn set_task_activity_frame(&mut self, frame: usize) {
-        self.task_activity_frame = frame;
+    /// Advance the paint-only animation for an in-flight tool header. This
+    /// does not change line content or wrapping, so a tick remains O(viewport height).
+    pub fn set_animation_frame(&mut self, frame: usize) {
+        self.animation_frame = frame;
     }
 
     /// Mark (or clear) the block whose head rows shimmer while its tool call
-    /// or batch is in flight. Paint-only; see `set_task_activity_frame`.
+    /// or batch is in flight. Paint-only; see `set_animation_frame`.
     pub fn set_live_head(&mut self, block: Option<usize>) {
         self.live_head = block;
     }
@@ -759,10 +759,11 @@ impl Transcript {
                     break 'blocks;
                 }
                 let (line, _) = block.row(i);
-                let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
-                let is_live_task_status = i >= block.head_wrapped.len()
-                    && i < block.head_wrapped.len() + block.status_wrapped.len();
-                let is_live_head = self.live_head == Some(index) && i < block.head_wrapped.len();
+                // A task card uses the same quiet, dim treatment as the live
+                // agent tree. Only ordinary in-flight tool headers shimmer.
+                let is_live_head = self.live_head == Some(index)
+                    && block.task_run.is_none()
+                    && i < block.head_wrapped.len();
                 let content_width = line_display_width(&line).min(area.width as usize);
                 line.render(
                     Rect {
@@ -773,22 +774,16 @@ impl Transcript {
                     },
                     buf,
                 );
-                if is_live_task_status || is_live_head {
+                if is_live_head {
                     for x in 0..content_width {
                         let cell = &mut buf[(area.x + x as u16, y)];
                         let base = cell.style().fg.unwrap_or(ratatui::style::Color::Reset);
                         cell.set_fg(crate::theme::shimmer_color(
-                            self.task_activity_frame,
+                            self.animation_frame,
                             x,
                             content_width,
                             base,
                         ));
-                    }
-                }
-                if is_hovered_head {
-                    for x in 0..content_width {
-                        buf[(area.x + x as u16, y)]
-                            .set_style(ratatui::style::Style::default().fg(Color::Reset));
                     }
                 }
                 if self.highlight == Some(index) {
@@ -1488,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn hovered_tool_header_uses_plain_foreground_without_touching_detail_or_padding() {
+    fn hovered_tool_header_keeps_its_existing_colours() {
         let mut t = Transcript::new(40);
         t.push_with_detail(
             vec![Line::styled("preview", crate::theme::dim())],
@@ -1499,10 +1494,11 @@ mod tests {
         let area = Rect::new(0, 0, 40, 4);
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
+        let before_hover = buf[(0, 0)].style();
+
         t.mouse_moved(0, 0);
         t.render(&mut buf, area);
-        assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
-        assert_eq!(buf[(0, 0)].fg, Color::Reset);
+        assert_eq!(buf[(0, 0)].style(), before_hover);
         assert_eq!(buf[(30, 0)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
 
@@ -1538,25 +1534,31 @@ mod tests {
     }
 
     #[test]
-    fn live_status_stays_visible_when_the_detail_is_folded_and_clears_cleanly() {
+    fn live_task_status_stays_dim_when_the_detail_is_folded_and_clears_cleanly() {
         let mut t = Transcript::new(40);
         t.push(vec![Line::raw("● Task")]);
         t.attach_detail(0, vec![Line::raw("summary")], 5);
-        t.set_live_status(0, Some(vec![Line::raw("  ⠋ working · Search")]));
+        t.set_live_status(
+            0,
+            Some(vec![Line::styled(
+                "  ⠋ working · Search",
+                crate::theme::dim(),
+            )]),
+        );
         let area = Rect::new(0, 0, 40, 5);
         let mut buf = Buffer::empty(area);
-        t.set_task_activity_frame(0);
+        t.set_animation_frame(0);
         t.render(&mut buf, area);
         assert_eq!(t.total(), 2, "status is visible outside the closed detail");
         assert!(buffer_text(&buf, area).contains("working · Search"));
         let first_frame = buf[(3, 1)].fg;
 
-        t.set_task_activity_frame(5);
+        t.set_animation_frame(5);
         t.render(&mut buf, area);
-        assert_ne!(
+        assert_eq!(
             buf[(3, 1)].fg,
             first_frame,
-            "the live status colour animates"
+            "the live task status stays at its dim base colour"
         );
 
         t.set_live_status(0, None);
@@ -1564,6 +1566,30 @@ mod tests {
         t.render(&mut buf, area);
         assert_eq!(t.total(), 1);
         assert!(!buffer_text(&buf, area).contains("working · Search"));
+    }
+
+    #[test]
+    fn linked_task_header_does_not_shimmer() {
+        let mut t = Transcript::new(40);
+        t.push(vec![Line::styled(
+            "● Explore · inspect renderer",
+            crate::theme::ok(),
+        )]);
+        t.link_task_run(0, "t1");
+        t.set_live_head(Some(0));
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buf = Buffer::empty(area);
+        t.set_animation_frame(0);
+        t.render(&mut buf, area);
+        let first_frame = buf[(3, 0)].fg;
+
+        t.set_animation_frame(5);
+        t.render(&mut buf, area);
+        assert_eq!(
+            buf[(3, 0)].fg,
+            first_frame,
+            "a linked task card must stay quiet in single and batch tool paths"
+        );
     }
 
     #[test]

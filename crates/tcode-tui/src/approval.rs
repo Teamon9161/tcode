@@ -891,7 +891,7 @@ impl Dialog {
             let marker = if i == self.selected { "▸ " } else { "  " };
             let label = match decision {
                 ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
-                    format!("{label} ({})", self.descriptor)
+                    format!("{label} ({})", approval_rule_label(&self.descriptor))
                 }
                 _ => (*label).to_string(),
             };
@@ -1370,9 +1370,13 @@ impl Dialog {
                 && plan.options_focused
                 && !plan.feedback_focused
                 && plan.compose.is_none();
+            // The cursor's own row keeps its "·" affordance even while the
+            // Tab-opened note editor has focus — otherwise every marker blanks
+            // out at once and there's no way to tell which option a note
+            // being typed applies to.
             let marker = if selected {
                 "▸ "
-            } else if i == plan.cursor && !plan.feedback_focused && plan.compose.is_none() {
+            } else if i == plan.cursor && plan.compose.is_none() {
                 "· "
             } else {
                 "  "
@@ -1833,6 +1837,21 @@ fn set_wrapped_note_cursor(editor: &mut Editor, row: usize, col: usize, width: u
     editor.set_cursor_by_display_col(0, base + col);
 }
 
+/// A persisted-rule option label lives on its own single `Line`, unlike the
+/// summary above it (which wraps). A long or multi-line command — the
+/// descriptor doubles as the raw rule pattern now that it's shown verbatim —
+/// must not corrupt that row, so collapse to the first line and cap width.
+fn approval_rule_label(descriptor: &str) -> String {
+    const MAX_CHARS: usize = 60;
+    let first_line = descriptor.lines().next().unwrap_or("");
+    let overflows = first_line.chars().count() > MAX_CHARS || descriptor.lines().count() > 1;
+    let mut label: String = first_line.chars().take(MAX_CHARS).collect();
+    if overflows {
+        label.push('…');
+    }
+    label
+}
+
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut rows = vec![String::new()];
@@ -1862,6 +1881,17 @@ mod tests {
             "edit(src/main.rs)".into(),
             false,
         )
+    }
+
+    #[test]
+    fn approval_rule_label_collapses_multiline_and_long_commands() {
+        assert_eq!(approval_rule_label("run(cargo build)"), "run(cargo build)");
+        let multiline = "run(cargo build\n&& cargo test)";
+        assert_eq!(approval_rule_label(multiline), "run(cargo build…");
+        let long = format!("run({})", "x".repeat(100));
+        let label = approval_rule_label(&long);
+        assert_eq!(label.chars().count(), 61); // 60 chars + ellipsis
+        assert!(label.ends_with('…'));
     }
 
     #[test]
@@ -2525,6 +2555,26 @@ mod tests {
         assert_eq!(
             a.comment.as_deref(),
             Some("run the focused tests afterwards")
+        );
+    }
+
+    #[test]
+    fn plan_tab_note_keeps_the_chosen_option_marked() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('2'))); // auto-accept edits
+                                               // Regression: opening the Tab note editor used to blank every
+                                               // option's marker, leaving no way to tell which one a note applies to.
+        let before = render_text(&d, 60, 20);
+        assert!(
+            before.contains("▸ 2."),
+            "option 2 should be fully selected before Tab"
+        );
+
+        d.handle_key(key(KeyCode::Tab));
+        let after = render_text(&d, 60, 20);
+        assert!(
+            after.contains("· 2."),
+            "option 2 must keep a visible marker while the note editor has focus:\n{after}"
         );
     }
 

@@ -135,28 +135,35 @@ impl PermissionRequest {
         }
     }
 
-    /// Human-facing name for the permission being granted. The saved rule still
-    /// uses `descriptor`, so shell variants persist as canonical `run(...)`.
+    /// Human-facing name for the permission being granted: the same string
+    /// that would be persisted as an allow rule, so the option label always
+    /// matches what approving it actually saves.
     pub fn approval_label(&self) -> String {
-        match self {
-            PermissionRequest::Ask { aliases, .. } => aliases
-                .first()
-                .and_then(|alias| alias.strip_prefix("shell(").map(|_| "Run (PowerShell)"))
-                .or_else(|| {
-                    aliases
-                        .first()
-                        .and_then(|alias| alias.strip_prefix("bash(").map(|_| "Run (Git Bash)"))
-                })
-                .unwrap_or_else(|| self.descriptor())
-                .to_string(),
-            _ => self.descriptor().to_string(),
-        }
+        self.descriptor().to_string()
     }
 
     /// Whether approving this may persist an allow rule. Questions and plan
     /// review never can.
     pub fn allows_rule(&self) -> bool {
         matches!(self, PermissionRequest::Ask { .. })
+    }
+}
+
+#[cfg(test)]
+mod permission_request_tests {
+    use super::PermissionRequest;
+
+    #[test]
+    fn approval_label_shows_the_actual_command_not_a_fixed_interpreter_name() {
+        let request = PermissionRequest::Ask {
+            descriptor: "run(cargo build --release)".into(),
+            aliases: vec!["shell(cargo build --release)".into()],
+            summary: "run: cargo build --release".into(),
+            is_edit: false,
+        };
+        // Regression: this used to collapse to a constant "Run (PowerShell)"
+        // for every shell call regardless of the command being approved.
+        assert_eq!(request.approval_label(), "run(cargo build --release)");
     }
 }
 

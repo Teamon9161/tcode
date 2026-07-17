@@ -147,32 +147,6 @@ pub fn math_block() -> Style {
     Style::default().fg(MATH)
 }
 
-/// A subtle bright-to-dim sweep for static task summary details. Terminal
-/// styles have no alpha channel, so fading the foreground is the closest
-/// portable equivalent to transparency.
-pub fn task_activity_gradient(text: &str) -> Vec<Span<'static>> {
-    const FROM: (u8, u8, u8) = (218, 224, 230);
-    const TO: (u8, u8, u8) = (124, 132, 144);
-    let chars: Vec<char> = text.chars().collect();
-    let last = chars.len().saturating_sub(1).max(1) as f32;
-    chars
-        .iter()
-        .enumerate()
-        .map(|(i, &c)| {
-            let t = i as f32 / last;
-            let lerp = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t) as u8;
-            Span::styled(
-                c.to_string(),
-                Style::default().fg(Color::Rgb(
-                    lerp(FROM.0, TO.0),
-                    lerp(FROM.1, TO.1),
-                    lerp(FROM.2, TO.2),
-                )),
-            )
-        })
-        .collect()
-}
-
 /// Colour for one cell of a live (shimmering) line: a single soft highlight
 /// band sweeps left to right, dwells briefly past the end, then restarts.
 /// `frame` must be monotonic (100ms animation ticks); `width` is the painted

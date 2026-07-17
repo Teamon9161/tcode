@@ -302,7 +302,10 @@ impl SessionView {
                     for block in blocks {
                         match block {
                             ContentBlock::Text { text } if !text.starts_with("<tcode-status>") => {
-                                echo.extend(quote_lines(text));
+                                match tcode_tools::parse_skill_echo(text) {
+                                    Some(skill_echo) => echo.extend(skill_echo_lines(&skill_echo)),
+                                    None => echo.extend(quote_lines(text)),
+                                }
                             }
                             ContentBlock::Image { .. } => echo.push(attachment_line("[image]")),
                             _ => {}
@@ -857,6 +860,29 @@ fn attachment_line(label: &str) -> Line<'static> {
     ])
 }
 
+/// `/name args` + a collapsed one-line summary, in place of quoting the whole
+/// rendered skill body — the same fold convention read/grep output uses. The
+/// single entry point for both the live prompt echo (`app.rs::prompt_echo`)
+/// and ledger replay (below), so a `/name` invocation looks identical
+/// whichever path baked it.
+pub(crate) fn skill_echo_lines(echo: &tcode_tools::SkillEcho) -> Vec<Line<'static>> {
+    let header = if echo.args.is_empty() {
+        format!("/{}", echo.name)
+    } else {
+        format!("/{} {}", echo.name, echo.args)
+    };
+    vec![
+        Line::from(vec![
+            Span::styled(theme::USER_GUTTER, theme::user_gutter()),
+            Span::styled(header, theme::user_message()),
+        ]),
+        Line::styled(
+            format!("  ⎿ skill loaded ({} lines)", echo.body_line_count),
+            theme::dim(),
+        ),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -941,5 +967,77 @@ mod tests {
             replay.transcript.block_count(),
             "live events and a persisted trace must use the same bake shape"
         );
+    }
+
+    #[test]
+    fn skill_echo_lines_fold_the_body_into_a_line_count_summary() {
+        let long_body: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wrapped = tcode_tools::wrap_skill_echo("init", "", &long_body);
+        let echo = tcode_tools::parse_skill_echo(&wrapped).expect("sentinel recognized");
+        let lines = skill_echo_lines(&echo);
+
+        // Header + one collapsed summary line, never the 20-line body.
+        assert_eq!(lines.len(), 2);
+        let header: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(header.ends_with("/init"), "header was {header:?}");
+        let summary: String = lines[1].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(summary.contains("20 lines"), "summary was {summary:?}");
+    }
+
+    /// Renders the whole transcript into a plain-text grid so a test can
+    /// check what a user would actually see, not just internal block counts.
+    fn rendered_text(view: &mut SessionView, width: u16, height: u16) -> String {
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.transcript.render(&mut buf, area);
+        let mut out = String::new();
+        for y in 0..height {
+            for x in 0..width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn replay_folds_a_skill_echo_but_quotes_a_plain_user_message() {
+        let registry = RenderRegistry::from_tools(&tcode_tools::builtin_tools(Path::new(".")));
+        let long_body: String = (0..20)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let wrapped = tcode_tools::wrap_skill_echo("init", "arg", &long_body);
+
+        let mut folded_markdown = markdown::Renderer::default();
+        let mut folded = SessionView::new(100);
+        let mut folded_ctx = ctx(&registry, &mut folded_markdown);
+        folded.replay_ledger(
+            &[Entry::User(vec![ContentBlock::Text { text: wrapped }])],
+            &[],
+            &mut folded_ctx,
+        );
+        let folded_text = rendered_text(&mut folded, 100, 40);
+        assert!(folded_text.contains("/init arg"), "{folded_text}");
+        assert!(folded_text.contains("20 lines"), "{folded_text}");
+        // The body itself never reaches the screen once folded.
+        assert!(!folded_text.contains("line 19"), "{folded_text}");
+
+        let mut plain_markdown = markdown::Renderer::default();
+        let mut plain = SessionView::new(100);
+        let mut plain_ctx = ctx(&registry, &mut plain_markdown);
+        plain.replay_ledger(
+            &[Entry::User(vec![ContentBlock::Text { text: long_body }])],
+            &[],
+            &mut plain_ctx,
+        );
+        let plain_text = rendered_text(&mut plain, 100, 40);
+        // An ordinary long user message is quoted in full, not folded.
+        assert!(plain_text.contains("line 19"), "{plain_text}");
     }
 }

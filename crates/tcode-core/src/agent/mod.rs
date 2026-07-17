@@ -1152,10 +1152,17 @@ impl Agent {
         })
     }
 
-    /// Execute an edit/write batch in per-file lanes. Approval, pre-hooks and
-    /// checkpoints are deliberately all complete before the first mutation;
-    /// after that, calls to one path preserve the model's order, while separate
-    /// paths run concurrently.
+    /// Execute an edit/write batch in per-file lanes. Permission checks still
+    /// run sequentially over the whole batch first — only one approval prompt
+    /// is ever on screen at a time — but a denial (or a pre-hook block) only
+    /// poisons its own lane: declining the edit to file B does not stop file
+    /// A's already-approved edit from running, and later calls still queued
+    /// for other files keep getting their own permission check. Only calls
+    /// after a denial *in the same lane* (same normalized path, since they
+    /// may depend on the change that didn't happen) are skipped without
+    /// asking. After preflight, hooks/checkpoints for every call that will
+    /// actually run are complete before the first mutation; calls to one path
+    /// preserve the model's order, while separate paths run concurrently.
     async fn run_file_mutation_lanes(
         &self,
         session: &mut Session,
@@ -1164,15 +1171,41 @@ impl Agent {
         approver: &dyn Approver,
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
+        enum Verdict {
+            Proceed,
+            /// Never reached `tool.run`: a denial, a hook block, or this
+            /// call's lane was already poisoned by an earlier one.
+            Declined(String),
+        }
+
         let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
+        let mut verdicts: Vec<Verdict> = Vec::new();
         let mut notes: Vec<Entry> = Vec::new();
+        let mut declined_paths: HashMap<PathBuf, String> = HashMap::new();
+        let mut awaiting_user_input = false;
 
         for (id, name, input) in calls {
             if cancel.is_cancelled() {
                 return self.cancel_unstarted_batch(session, calls, true);
             }
             let tool = self.tool(name).expect("preflighted tool").clone();
+            let path = normalize_path(
+                session
+                    .tool_ctx
+                    .resolve(&tool.touches(input).expect("preflighted path")),
+            );
+
+            if let Some(earlier_reason) = declined_paths.get(&path) {
+                let reason = format!(
+                    "Not executed: an earlier edit to this file in the same batch was declined ({earlier_reason})"
+                );
+                prepared.push((id.clone(), name.clone(), input.clone(), tool));
+                verdicts.push(Verdict::Declined(reason));
+                continue;
+            }
+
             let request = tool.permission(input);
+            let mut declined: Option<String> = None;
             match self
                 .permission_decision(
                     session,
@@ -1188,9 +1221,7 @@ impl Agent {
                 .await
             {
                 Decision::Allow => {}
-                Decision::Deny(reason) => {
-                    return self.abort_file_batch(session, calls, id, &reason, false);
-                }
+                Decision::Deny(reason) => declined = Some(reason),
                 Decision::Ask | Decision::Auto => {
                     let PermissionRequest::Ask {
                         descriptor: _,
@@ -1236,7 +1267,7 @@ impl Agent {
                             }
                         }
                         ApprovalDecision::No => {
-                            let (reason, awaiting_user_input) = match approval.comment {
+                            let (reason, awaits) = match approval.comment {
                                 Some(comment) => (
                                     format!("User declined this action. Reason: {comment}"),
                                     false,
@@ -1246,16 +1277,18 @@ impl Agent {
                                     true,
                                 ),
                             };
-                            return self.abort_file_batch(
-                                session,
-                                calls,
-                                id,
-                                &reason,
-                                awaiting_user_input,
-                            );
+                            awaiting_user_input |= awaits;
+                            declined = Some(reason);
                         }
                     }
                 }
+            }
+
+            if let Some(reason) = declined {
+                declined_paths.insert(path, reason.clone());
+                prepared.push((id.clone(), name.clone(), input.clone(), tool));
+                verdicts.push(Verdict::Declined(reason));
+                continue;
             }
 
             let pre = self
@@ -1269,23 +1302,26 @@ impl Agent {
                 )
                 .await;
             if let Some(reason) = pre.block {
-                return self.abort_file_batch(
-                    session,
-                    calls,
-                    id,
-                    &format!("Blocked by pre-tool hook: {reason}"),
-                    false,
-                );
+                let reason = format!("Blocked by pre-tool hook: {reason}");
+                declined_paths.insert(path, reason.clone());
+                prepared.push((id.clone(), name.clone(), input.clone(), tool));
+                verdicts.push(Verdict::Declined(reason));
+                continue;
             }
             notes.extend(pre.notes.into_iter().map(Entry::Note));
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
+            verdicts.push(Verdict::Proceed);
         }
 
-        // Save each original once before any lane starts. A checkpoint at this
+        // Save each original once before its lane starts. A checkpoint at this
         // ledger position restores the state before the entire batch, not an
-        // intermediate state after an earlier same-file call.
+        // intermediate state after an earlier same-file call. Declined calls
+        // never touch disk, so they need no checkpoint.
         let mut checkpointed = HashSet::new();
-        for (_, _, input, tool) in &prepared {
+        for ((_, _, input, tool), verdict) in prepared.iter().zip(&verdicts) {
+            if !matches!(verdict, Verdict::Proceed) {
+                continue;
+            }
             let path = normalize_path(
                 session
                     .tool_ctx
@@ -1314,7 +1350,10 @@ impl Agent {
 
         let mut lane_by_path: HashMap<PathBuf, usize> = HashMap::new();
         let mut lanes: Vec<Vec<usize>> = Vec::new();
-        for (index, (_, _, input, tool)) in prepared.iter().enumerate() {
+        for (index, ((_, _, input, tool), verdict)) in prepared.iter().zip(&verdicts).enumerate() {
+            if !matches!(verdict, Verdict::Proceed) {
+                continue;
+            }
             let path = normalize_path(
                 session
                     .tool_ctx
@@ -1332,12 +1371,13 @@ impl Agent {
             lanes[lane].push(index);
         }
 
-        // Every call runs and gets its own result. A lane does not stop at a
-        // failure: `edit` and `write` are atomic, so a failed one leaves the
-        // file byte-for-byte as the calls after it expect — skipping them
-        // would discard work that was never in danger (one no-op edit used to
-        // cost the seven independent edits queued behind it). Calls on one
-        // file still run in the model's order; only cancellation halts a lane.
+        // Every approved call runs and gets its own result. A lane does not
+        // stop at a failure: `edit` and `write` are atomic, so a failed one
+        // leaves the file byte-for-byte as the calls after it expect —
+        // skipping them would discard work that was never in danger (one
+        // no-op edit used to cost the seven independent edits queued behind
+        // it). Calls on one file still run in the model's order; only
+        // cancellation halts a lane.
         let lane_outputs = self
             .forward_delegates(
                 &session.tool_ctx,
@@ -1347,9 +1387,16 @@ impl Agent {
                     let tool_ctx = &session.tool_ctx;
                     async move {
                         let mut outputs = Vec::with_capacity(lane.len());
+                        // A call's `old_string` is authored blind to any
+                        // earlier call in this same batch/lane — they're all
+                        // generated in one assistant turn, before any tool
+                        // result comes back. A miss right after this lane's
+                        // own earlier edit is expected, not a sign the model
+                        // skipped reading the file.
+                        let mut edited_earlier_in_batch = false;
                         for &index in lane {
                             let (id, _, input, tool) = &prepared[index];
-                            let (output, ran) = if cancel.is_cancelled() {
+                            let (mut output, ran) = if cancel.is_cancelled() {
                                 (
                                     ToolOutput::err("Cancelled by user before execution."),
                                     false,
@@ -1361,6 +1408,12 @@ impl Agent {
                                     true,
                                 )
                             };
+                            if ran && output.is_error && edited_earlier_in_batch {
+                                note_same_batch_edit_conflict(&mut output.content);
+                            }
+                            if ran && !output.is_error {
+                                edited_earlier_in_batch = true;
+                            }
                             outputs.push((index, output, ran));
                         }
                         outputs
@@ -1368,16 +1421,24 @@ impl Agent {
                 })),
             )
             .await?;
-        let mut outputs: Vec<(usize, ToolOutput, bool)> =
-            lane_outputs.into_iter().flatten().collect();
-        outputs.sort_by_key(|(index, _, _)| *index);
+        let mut outputs_by_index: HashMap<usize, (ToolOutput, bool)> = lane_outputs
+            .into_iter()
+            .flatten()
+            .map(|(index, output, ran)| (index, (output, ran)))
+            .collect();
 
         let mut results = Vec::new();
         let mut status = Vec::new();
         let mut had_failure = false;
-        for ((index, (id, name, input, tool)), (_, mut output, ran)) in
-            prepared.into_iter().enumerate().zip(outputs)
+        for (index, ((id, name, input, tool), verdict)) in
+            prepared.into_iter().zip(verdicts).enumerate()
         {
+            let (mut output, ran) = match verdict {
+                Verdict::Proceed => outputs_by_index
+                    .remove(&index)
+                    .expect("every proceeding call produced a lane output"),
+                Verdict::Declined(reason) => (ToolOutput::err(reason), false),
+            };
             if ran && !output.is_error {
                 let path = session
                     .tool_ctx
@@ -1442,7 +1503,7 @@ impl Agent {
         self.append_notes(session, events, notes).await?;
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
-            awaiting_user_input: false,
+            awaiting_user_input,
         })
     }
 
@@ -1715,32 +1776,6 @@ impl Agent {
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
-        })
-    }
-
-    fn abort_file_batch(
-        &self,
-        session: &mut Session,
-        calls: &[(String, String, Value)],
-        declined_id: &str,
-        reason: &str,
-        awaiting_user_input: bool,
-    ) -> Result<ToolsOutcome, AgentError> {
-        let results = calls
-            .iter()
-            .map(|(id, _, _)| {
-                let message = if id == declined_id {
-                    reason.to_string()
-                } else {
-                    "Not executed: the independent edit batch was not fully approved.".to_string()
-                };
-                tool_result(id, &message, true)
-            })
-            .collect();
-        session.ledger.append(Entry::ToolResults(results));
-        Ok(ToolsOutcome {
-            interrupted: false,
-            awaiting_user_input,
         })
     }
 
@@ -2087,6 +2122,23 @@ impl Agent {
 struct ToolsOutcome {
     interrupted: bool,
     awaiting_user_input: bool,
+}
+
+/// `edit`'s own "you have not read the current version" hint assumes the
+/// model skipped reading the file. Inside a same-file batch lane that's
+/// usually wrong: this call's `old_string` was authored before any earlier
+/// call in the same batch had run, so a miss right after that earlier edit
+/// is expected. Point at the real cause instead of sending the model to
+/// re-read a file it already has the latest content for.
+fn note_same_batch_edit_conflict(content: &mut String) {
+    if content.contains("you have not read the current version") {
+        content.push_str(
+            "\nnote: an earlier edit to this file already ran in this same batch. Both \
+             calls were written before either result came back, so this one's old_string \
+             may no longer match. Edits to the same file within one turn must target \
+             independent, non-overlapping regions — split dependent edits across turns instead.",
+        );
+    }
 }
 
 /// Header for a parallel tool batch. Each tool describes its own fragment

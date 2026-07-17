@@ -1404,6 +1404,106 @@ async fn edit_lanes_continue_after_a_same_file_no_op_failure() {
 }
 
 #[tokio::test]
+async fn a_denied_edit_does_not_abort_an_independent_files_approved_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "beta").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"alpha","new_string":"ALPHA"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":"b.txt","old_string":"beta","new_string":"BETA"}"#,
+            ),
+        ]),
+        text_done("reported"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.rules.deny.push("edit(b.txt)".into());
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    // Regression: one denied file used to abort the whole batch, including
+    // calls to completely unrelated files that had nothing to do with it.
+    run(&agent, &mut session, &approver, "batch edits").await;
+
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "ALPHA",
+        "the independent, allowed edit must still execute"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "beta",
+        "the denied edit must not touch disk"
+    );
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[0].1,
+        "allowed file's edit must succeed: {}",
+        results[0].0
+    );
+    assert!(
+        results[1].1 && results[1].0.contains("edit(b.txt)"),
+        "denied file's edit must be an error naming the actual rule: {}",
+        results[1].0
+    );
+}
+
+#[tokio::test]
+async fn a_same_batch_edit_conflict_explains_itself_instead_of_blaming_a_missing_read() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "alpha beta").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"alpha","new_string":"ALPHA"}"#,
+            ),
+            // Written blind to t1's effect (same assistant turn): after t1
+            // runs, "beta" is still there, but "alpha" is gone, so this old
+            // string legitimately no longer matches.
+            (
+                "t2",
+                "edit",
+                r#"{"path":"a.txt","old_string":"alpha beta","new_string":"ALPHA BETA"}"#,
+            ),
+        ]),
+        text_done("reported"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "batch edits").await;
+
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 2);
+    assert!(
+        !results[0].1,
+        "the first edit must succeed: {}",
+        results[0].0
+    );
+    assert!(
+        results[1].1,
+        "the second edit must fail to match: {}",
+        results[1].0
+    );
+    assert!(
+        results[1].0.contains("already ran in this same batch"),
+        "must explain the batch conflict rather than just blaming a missing read: {}",
+        results[1].0
+    );
+}
+
+#[tokio::test]
 async fn edit_miss_without_read_suggests_reading() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha beta gamma").unwrap();

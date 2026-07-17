@@ -11,6 +11,7 @@ pub struct PromptVariables {
     project_dir: String,
     scratch_dir: String,
     session_id: String,
+    memory_dir: Option<String>,
     skill_dir: Option<String>,
     arguments: Option<String>,
 }
@@ -25,13 +26,28 @@ impl PromptVariables {
             project_dir: project_dir.display().to_string(),
             scratch_dir: scratch_dir.display().to_string(),
             session_id,
+            memory_dir: None,
             skill_dir: None,
             arguments: None,
         }
     }
 
+    /// The session's auto-memory root, if one could be resolved. Only the
+    /// Auto Mode classifier policy currently references `${TCODE_MEMORY_DIR}`.
+    pub fn with_memory_dir(mut self, memory_dir: Option<&Path>) -> Self {
+        self.memory_dir = memory_dir.map(|dir| dir.display().to_string());
+        self
+    }
+
     pub fn with_skill(mut self, skill_dir: &Path, arguments: impl Into<String>) -> Self {
         self.skill_dir = Some(skill_dir.display().to_string());
+        self.arguments = Some(arguments.into());
+        self
+    }
+
+    /// For skills with no directory of their own (builtin skills): arguments
+    /// expand, `${CLAUDE_SKILL_DIR}`/`${TCODE_SKILL_DIR}` stay literal.
+    pub fn with_arguments(mut self, arguments: impl Into<String>) -> Self {
         self.arguments = Some(arguments.into());
         self
     }
@@ -114,6 +130,7 @@ impl PromptVariables {
         match name {
             "TCODE_PROJECT_DIR" | "CLAUDE_PROJECT_DIR" => Some(&self.project_dir),
             "TCODE_SCRATCH_DIR" => Some(&self.scratch_dir),
+            "TCODE_MEMORY_DIR" => self.memory_dir.as_deref(),
             "TCODE_SESSION_ID" | "CLAUDE_SESSION_ID" => Some(&self.session_id),
             "TCODE_SKILL_DIR" | "CLAUDE_SKILL_DIR" => self.skill_dir.as_deref(),
             _ => None,
@@ -172,6 +189,17 @@ mod tests {
     }
 
     #[test]
+    fn with_arguments_expands_positionals_but_leaves_skill_dir_literal() {
+        let rendered = PromptVariables::new(Path::new("/repo"), Path::new("/scratch/runs/s1"))
+            .with_arguments("first second")
+            .expand("${CLAUDE_SKILL_DIR}|${TCODE_PROJECT_DIR}|$0|$1|$ARGUMENTS");
+        assert_eq!(
+            rendered,
+            "${CLAUDE_SKILL_DIR}|/repo|first|second|first second"
+        );
+    }
+
+    #[test]
     fn expands_runtime_and_claude_compatible_skill_variables_once() {
         let rendered = variables().expand(
             "${TCODE_PROJECT_DIR}|${TCODE_SCRATCH_DIR}|${CLAUDE_SESSION_ID}|${CLAUDE_SKILL_DIR}|$0|$1|$ARGUMENTS[2]|$ARGUMENTS",
@@ -187,6 +215,20 @@ mod tests {
         assert_eq!(
             variables().expand("${UNKNOWN} $HOME $1.00"),
             "${UNKNOWN} $HOME two words.00"
+        );
+    }
+
+    #[test]
+    fn memory_dir_expands_when_set_and_stays_literal_when_absent() {
+        let with_memory = PromptVariables::new(Path::new("/repo"), Path::new("/scratch/runs/s1"))
+            .with_memory_dir(Some(Path::new("/home/u/.tcode/projects/abc/memory")));
+        assert_eq!(
+            with_memory.expand("${TCODE_MEMORY_DIR}"),
+            "/home/u/.tcode/projects/abc/memory"
+        );
+        assert_eq!(
+            variables().expand("${TCODE_MEMORY_DIR}"),
+            "${TCODE_MEMORY_DIR}"
         );
     }
 }

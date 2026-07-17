@@ -1,10 +1,14 @@
 [package]
 name = "tcode-tui"
-version = "0.1.5"
+version = "0.1.6"
 edition = "2021"
 
 [dependencies]
 tcode-core = { path = "../tcode-core" }
+# `skill` (in tcode-tools) is the one tool whose `/name` shorthand the TUI
+# resolves itself (see app.rs `run_slash`'s skill fallback), so this needs to
+# be a real dependency, not the test-only one it used to be.
+tcode-tools = { path = "../tcode-tools" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -20,8 +24,3 @@ arboard = "3"
 image = { workspace = true }
 base64 = "0.22"
 unicode-width = "0.2"
-
-[dev-dependencies]
-# Test-only: render.rs asserts registry behaviour against the real builtin
-# tool set (quiet-output ↔ BatchPolicy alignment). No production dependency.
-tcode-tools = { path = "../tcode-tools" }

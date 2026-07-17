@@ -17,7 +17,10 @@ pub use grounding::{project_map, project_map_with_scratch};
 pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
-pub use skills::SkillTool;
+pub use skills::{
+    discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
+    SkillSource, SkillTool,
+};
 pub use task::{TaskTool, MODEL_ROLES, TASK_AGENT_KINDS};
 pub use view_image::ViewImageTool;
 
@@ -31,9 +34,17 @@ use tcode_core::Tool;
 ///
 /// `skill` is part of the registry rather than something the frontend bolts
 /// on, so everything that runs tools — the main agent and every sub-agent —
-/// gets it from one place. It appears only when the project actually has
-/// skills, so a skill-less project pays no prompt tokens for the feature.
+/// gets it from one place. Builtin skills (see `skills::builtin_skills`)
+/// mean this is never empty, so `skill` is now always present.
 pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_skills(discover_skills(cwd))
+}
+
+/// Same toolset, but with skill discovery already done by the caller. Lets a
+/// frontend that also needs the `Vec<Skill>` for its own `/name` fallback and
+/// completion (see `render_skill`) discover the filesystem once and hand the
+/// same result to both places, instead of scanning `.tcode/skills` twice.
+pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs_tools::ReadTool),
         Arc::new(fs_tools::WriteTool),
@@ -53,8 +64,8 @@ pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
     } else {
         tools.push(Arc::new(shell::ShellTool::new(ShellKind::Bash)));
     }
-    if let Some(skills) = SkillTool::discover(cwd) {
-        tools.push(Arc::new(skills));
+    if let Some(skill_tool) = SkillTool::new(skills) {
+        tools.push(Arc::new(skill_tool));
     }
     tools
 }

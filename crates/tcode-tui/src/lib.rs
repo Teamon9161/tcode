@@ -55,6 +55,7 @@ pub async fn run(
     agents: AgentMenu,
     opening_context: OpeningContextFn,
     show_reasoning: bool,
+    skills: Vec<tcode_tools::Skill>,
 ) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
     execute!(
@@ -79,6 +80,7 @@ pub async fn run(
         agents,
         opening_context,
         show_reasoning,
+        skills,
     ) {
         Ok(mut app) => match app.run().await {
             Ok(()) if app.provider_setup_requested() => app
