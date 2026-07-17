@@ -254,7 +254,10 @@ impl SessionView {
         }
     }
 
-    /// Replay an ordinary recorded conversation verbatim.
+    /// Replay an ordinary recorded conversation verbatim. This convenience
+    /// wrapper exists solely to assert parity with live rendering; runtime
+    /// task traces use `replay_task_ledger` below.
+    #[cfg(test)]
     pub fn replay_ledger(
         &mut self,
         entries: &[Entry],

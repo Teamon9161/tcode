@@ -108,6 +108,27 @@ impl ToolRenderer for DefaultRenderer {
 struct TaskRenderer;
 
 impl ToolRenderer for TaskRenderer {
+    fn header(&self, _name: &str, input: &Value, _cwd: Option<&Path>) -> String {
+        let kind = title_case_tool_name(input["agent"].as_str().unwrap_or("agent"));
+        let summary = input["summary"]
+            .as_str()
+            .or_else(|| {
+                input["prompt"]
+                    .as_str()
+                    .and_then(|prompt| prompt.lines().next())
+            })
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty());
+        match summary {
+            Some(summary) => format!("{kind} · {summary}"),
+            None => kind.to_string(),
+        }
+    }
+
+    fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        self.header(name, input, cwd)
+    }
+
     fn folds_result(&self, _input: &Value) -> bool {
         true
     }
@@ -528,6 +549,33 @@ mod tests {
         let registry = RenderRegistry::from_tools(&tools);
         assert_eq!(registry.get("update_progress").route(), CallRoute::Progress);
         assert_eq!(registry.get("update_plan").route(), CallRoute::Progress);
+    }
+
+    #[test]
+    fn task_header_shows_kind_and_parent_authored_summary() {
+        let renderer = TaskRenderer;
+        let explore = json!({
+            "agent": "explore",
+            "summary": "inspect TUI rendering",
+            "prompt": "longer fallback prompt"
+        });
+        assert_eq!(
+            renderer.header("task", &explore, None),
+            "Explore · inspect TUI rendering"
+        );
+        assert_eq!(
+            renderer.batch_item("task", &explore, None),
+            "Explore · inspect TUI rendering",
+            "parallel explore calls use the same title as a single call"
+        );
+        assert_eq!(
+            renderer.header(
+                "task",
+                &json!({"agent": "plan", "prompt": "draft a migration plan\nwith details"}),
+                None,
+            ),
+            "Plan · draft a migration plan"
+        );
     }
 
     #[test]

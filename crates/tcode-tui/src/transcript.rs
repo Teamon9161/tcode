@@ -11,7 +11,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Color, Modifier};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
@@ -49,9 +49,8 @@ pub struct Transcript {
     selection: Option<Selection>,
     /// Block emphasized by rewind navigation.
     highlight: Option<usize>,
-    /// Collapsible block currently under the pointer. Its header receives a
-    /// compact background highlight so it reads as actionable without
-    /// underlining expanded output or trailing empty cells.
+    /// Collapsible block currently under the pointer. Its header uses the
+    /// terminal's regular foreground while leaving expanded output alone.
     hovered: Option<usize>,
     /// Tick frame used only when painting a live task status. Keeping it out of
     /// the wrapped block data preserves the transcript's resize-only reflow.
@@ -218,11 +217,11 @@ impl Block {
                 // ordinary foldout: click folds its summary/report, double-click
                 // opens the isolated sub-agent trace.
                 last.spans.push(if detail.open {
-                    Span::styled("  ▾", crate::theme::accent())
+                    Span::styled("  ▾", crate::theme::dim())
                 } else if hovered {
                     Span::styled(
                         format!("  ▸ {} lines", detail.lines.len()),
-                        crate::theme::accent(),
+                        ratatui::style::Style::default().fg(Color::Reset),
                     )
                 } else {
                     Span::raw("")
@@ -788,7 +787,8 @@ impl Transcript {
                 }
                 if is_hovered_head {
                     for x in 0..content_width {
-                        buf[(area.x + x as u16, y)].set_style(crate::theme::hover_highlight());
+                        buf[(area.x + x as u16, y)]
+                            .set_style(ratatui::style::Style::default().fg(Color::Reset));
                     }
                 }
                 if self.highlight == Some(index) {
@@ -1488,10 +1488,10 @@ mod tests {
     }
 
     #[test]
-    fn hovered_tool_header_uses_background_without_touching_detail_or_padding() {
+    fn hovered_tool_header_uses_plain_foreground_without_touching_detail_or_padding() {
         let mut t = Transcript::new(40);
         t.push_with_detail(
-            vec![Line::raw("preview")],
+            vec![Line::styled("preview", crate::theme::dim())],
             vec![Line::raw("expanded output")],
             false,
             5,
@@ -1501,7 +1501,8 @@ mod tests {
         t.render(&mut buf, area);
         t.mouse_moved(0, 0);
         t.render(&mut buf, area);
-        assert_eq!(buf[(0, 0)].bg, crate::theme::hover_highlight().bg.unwrap());
+        assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
+        assert_eq!(buf[(0, 0)].fg, Color::Reset);
         assert_eq!(buf[(30, 0)].bg, ratatui::style::Color::Reset);
         assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
 

@@ -202,13 +202,12 @@ pub fn lines(
         let main_hovered = hovered == Some(&PanelTarget::Main);
         let mut main_spans = vec![
             gutter(current == &PanelTarget::Main),
-            Span::styled("● ", row_style(theme::accent(), main_hovered)),
-            Span::styled("main", row_style(theme::bold(), main_hovered)),
+            Span::styled("Main", row_style(theme::dim(), main_hovered)),
         ];
         if main.running {
             main_spans.push(Span::styled(
                 format!(" · {}", main.activity),
-                row_style(Style::default(), main_hovered),
+                row_style(theme::dim(), main_hovered),
             ));
             main_spans.push(Span::styled(
                 format!(
@@ -249,13 +248,6 @@ fn task_lines(
     connector: &str,
     current: bool,
 ) -> Vec<Line<'static>> {
-    let marker = match run.status {
-        TaskRunStatus::Running => "●",
-        TaskRunStatus::Done => "✓",
-        TaskRunStatus::Failed => "✗",
-        TaskRunStatus::Cancelled => "⨯",
-        TaskRunStatus::Interrupted => "⊘",
-    };
     let model = if run.model.is_empty() {
         String::new()
     } else {
@@ -264,19 +256,9 @@ fn task_lines(
     let spans = vec![
         gutter(current),
         Span::styled(connector.to_string(), row_style(theme::dim(), highlighted)),
-        Span::styled(
-            format!("{marker} "),
-            row_style(status_style(run.status), highlighted),
-        ),
-        Span::styled(
-            title_case(&run.kind),
-            row_style(Style::default(), highlighted),
-        ),
+        Span::styled(title_case(&run.kind), row_style(theme::dim(), highlighted)),
         Span::styled(" · ", row_style(theme::dim(), highlighted)),
-        Span::styled(
-            run.summary.clone(),
-            row_style(Style::default(), highlighted),
-        ),
+        Span::styled(run.summary.clone(), row_style(theme::dim(), highlighted)),
         Span::styled(
             format!(
                 " · {} · ↓ {} tok{model}",
@@ -296,29 +278,15 @@ fn task_lines(
 /// The same glyph the view picker uses, so "where am I" reads identically.
 fn gutter(current: bool) -> Span<'static> {
     if current {
-        Span::styled("▸ ", theme::accent())
+        Span::styled("▸ ", Style::default())
     } else {
         Span::raw("  ")
     }
 }
 
-fn status_style(status: TaskRunStatus) -> Style {
-    match status {
-        // A live sub-agent gets the same "alive" accent as the root's dot; a
-        // dim marker would read as inactive.
-        TaskRunStatus::Running => theme::accent(),
-        TaskRunStatus::Done => theme::ok(),
-        TaskRunStatus::Failed => Style::default().fg(theme::ERROR),
-        TaskRunStatus::Cancelled => theme::warn(),
-        TaskRunStatus::Interrupted => theme::dim(),
-    }
-}
-
 fn row_style(base: Style, highlighted: bool) -> Style {
     if highlighted {
-        theme::hover_highlight()
-            .fg(theme::ACCENT)
-            .add_modifier(ratatui::style::Modifier::BOLD)
+        Style::default()
     } else {
         base
     }
@@ -552,11 +520,17 @@ mod tests {
         let active = run("t1");
         let (lines, _) = lines(&[], &[&active], main(), 120, None, &PanelTarget::Main);
         let row = text(&lines[1]);
-        assert!(row.starts_with("  └ ● Explore · inspect the implementation"));
+        assert!(row.starts_with("  └ Explore · inspect the implementation"));
         assert!(
             row.find("inspect the implementation").unwrap() < row.find(" · 0s").unwrap(),
             "the summary matches main's activity-before-stats order"
         );
+    }
+
+    #[test]
+    fn hover_and_current_gutter_use_plain_foreground() {
+        assert_eq!(row_style(theme::dim(), true), Style::default());
+        assert_eq!(gutter(true).style, Style::default());
     }
 
     #[test]
@@ -565,9 +539,9 @@ mod tests {
         let second = run("t2");
         let current = PanelTarget::Task("t1".into());
         let (in_task, _) = lines(&[], &[&first, &second], main(), 120, None, &current);
-        assert!(text(&in_task[0]).starts_with("  ● main"));
-        assert!(text(&in_task[1]).starts_with("▸ ├ ● Explore"));
-        assert!(text(&in_task[2]).starts_with("  └ ● Explore"));
+        assert!(text(&in_task[0]).starts_with("  Main"));
+        assert!(text(&in_task[1]).starts_with("▸ ├ Explore"));
+        assert!(text(&in_task[2]).starts_with("  └ Explore"));
 
         let (in_main, _) = lines(
             &[],
@@ -577,8 +551,8 @@ mod tests {
             None,
             &PanelTarget::Main,
         );
-        assert!(text(&in_main[0]).starts_with("▸ ● main"));
-        assert!(text(&in_main[1]).starts_with("  ├ ● Explore"));
+        assert!(text(&in_main[0]).starts_with("▸ Main"));
+        assert!(text(&in_main[1]).starts_with("  ├ Explore"));
     }
 
     #[test]

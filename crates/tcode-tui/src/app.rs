@@ -4908,8 +4908,9 @@ impl App {
 
     /// One-liner under the input box: mode, model, cache health. Mostly
     /// dim; the mode value carries the accent because it decides what the
-    /// agent may do without asking, and a transient notice keeps the
-    /// default foreground so it reads as news rather than furniture.
+    /// agent may do without asking. The active model and cache hit rate use a
+    /// modest neutral lift, and a transient notice keeps the default foreground
+    /// so it reads as news rather than furniture.
     fn idle_hint(&self) -> Line<'static> {
         if let Some(nav) = &self.rewind_nav {
             let files = if nav.candidates[nav.pos].dirty {
@@ -4926,32 +4927,26 @@ impl App {
             ]);
         }
         let u = self.turn_usage;
-        let cache = if u.total_input() > 0 {
+        let cache = (u.total_input() > 0).then(|| {
             format!(
-                " · cache {}%",
+                "{}%",
                 (u.cache_read_tokens as f64 / u.total_input() as f64 * 100.0).round()
             )
-        } else {
-            String::new()
-        };
+        });
         let scrolled = if self.transcript.is_following() {
             ""
         } else {
             " · ↑ viewing history"
         };
         let mode_style = if self.status_hover == Some(StatusHover::Mode) {
-            theme::hover_highlight()
-                .fg(theme::ACCENT)
-                .add_modifier(ratatui::style::Modifier::BOLD)
+            theme::bold().fg(theme::ACCENT)
         } else {
             theme::accent()
         };
         let model_style = if self.status_hover == Some(StatusHover::Model) {
-            theme::hover_highlight()
-                .fg(theme::ACCENT)
-                .add_modifier(ratatui::style::Modifier::BOLD)
+            ratatui::style::Style::default()
         } else {
-            theme::dim()
+            theme::metadata()
         };
         let mut spans = vec![
             Span::styled("  mode ".to_string(), theme::dim()),
@@ -4964,7 +4959,11 @@ impl App {
         if self.dogfood {
             spans.push(Span::styled(" · dogfood".to_string(), theme::warn()));
         }
-        spans.push(Span::styled(format!("{cache}{scrolled}"), theme::dim()));
+        if let Some(cache) = cache {
+            spans.push(Span::styled(" · cache ", theme::dim()));
+            spans.push(Span::styled(cache, theme::metadata()));
+        }
+        spans.push(Span::styled(scrolled, theme::dim()));
         if let Some((text, _)) = self
             .notice
             .as_ref()
@@ -5198,7 +5197,7 @@ fn context_progress_line(
     ));
     if terminal_width >= 42 {
         spans.push(Span::styled(
-            format!(" · {}/{}", token_count(used), token_count(window)),
+            format!(" · {}", token_count(window)),
             theme::dim(),
         ));
     }
@@ -6153,7 +6152,8 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
         assert!(text.contains("context"));
-        assert!(text.contains("85% · 170k/200k"));
+        assert!(text.contains("85% · 200k"));
+        assert!(!text.contains("170k/200k"));
         assert!(line
             .spans
             .iter()

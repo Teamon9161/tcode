@@ -45,6 +45,13 @@ pub fn bold() -> Style {
     Style::default().add_modifier(Modifier::BOLD)
 }
 
+/// A restrained neutral lift for important machine metadata such as the active
+/// model and cache reuse. It remains distinct from cyan interactivity and green
+/// success without competing with either.
+pub fn metadata() -> Style {
+    Style::default().fg(Color::Rgb(184, 192, 201))
+}
+
 /// Green — used for tool names and successful status indicators.
 pub fn ok() -> Style {
     Style::default().fg(OK)
@@ -91,13 +98,6 @@ pub fn user_message() -> Style {
 /// selection so the two read as one selection model.
 pub fn selection() -> Style {
     Style::default().add_modifier(Modifier::REVERSED)
-}
-
-/// A low-contrast background for the actionable header of a hovered tool
-/// record. It is intentionally not reverse-video: diffs retain their own
-/// polarity, and detail rows stay visually untouched.
-pub fn hover_highlight() -> Style {
-    Style::default().bg(Color::Rgb(46, 56, 68))
 }
 
 /// Amber-tinted row background marking the rewind-navigation target.
