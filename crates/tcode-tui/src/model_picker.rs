@@ -342,6 +342,34 @@ impl AgentPicker {
         }
     }
 
+    pub fn handle_mouse_row(
+        &mut self,
+        row: usize,
+        menu: &ModelMenu,
+        agents: &AgentMenu,
+    ) -> AgentPick {
+        let Some(picker) = self.model.as_mut() else {
+            let Some(index) = row
+                .checked_sub(1)
+                .filter(|index| *index < agents.kinds.len())
+            else {
+                return AgentPick::Pending;
+            };
+            self.selected = index;
+            let kind = &agents.kinds[index];
+            self.model = Some(Picker::for_agent(menu, kind, agents.pins[index].as_ref()));
+            return AgentPick::Pending;
+        };
+        match picker.handle_mouse_row(row) {
+            PickResult::Pending | PickResult::Cancelled => AgentPick::Pending,
+            PickResult::Picked { option, effort } => AgentPick::Picked {
+                kind: agents.kinds[self.selected].clone(),
+                option,
+                effort,
+            },
+        }
+    }
+
     pub fn render(&self, menu: &ModelMenu, agents: &AgentMenu) -> Vec<Line<'static>> {
         if let Some(picker) = &self.model {
             return picker.render(menu);
@@ -440,6 +468,27 @@ mod tests {
             panic!("expected a model pick");
         };
         assert_eq!(option, Some(1));
+        assert_eq!(effort, None);
+    }
+
+    #[test]
+    fn agent_picker_mouse_walks_kind_then_model_and_inherit() {
+        let m = menu();
+        let a = agents(vec![None, None]);
+        let mut p = AgentPicker::new(&a).unwrap();
+
+        // Content row zero is the title; clicking row two selects `general`.
+        assert!(matches!(p.handle_mouse_row(2, &m, &a), AgentPick::Pending));
+        let AgentPick::Picked {
+            kind,
+            option,
+            effort,
+        } = p.handle_mouse_row(1, &m, &a)
+        else {
+            panic!("expected an inherit pick");
+        };
+        assert_eq!(kind, "general");
+        assert_eq!(option, None);
         assert_eq!(effort, None);
     }
 

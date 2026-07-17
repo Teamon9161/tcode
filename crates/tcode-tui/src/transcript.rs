@@ -138,6 +138,13 @@ impl Content {
             Self::Markdown { document, .. } => document.is_empty(),
         }
     }
+
+    fn link_at(&self, line: &Line<'_>, column: usize) -> Option<&str> {
+        match self {
+            Self::Lines(_) => None,
+            Self::Markdown { document, .. } => document.link_at(line, column),
+        }
+    }
 }
 
 impl Detail {
@@ -206,7 +213,7 @@ impl Block {
         self.head_wrapped = Wrapped::of(&self.display_head(width, hovered), width);
     }
 
-    fn display_head(&self, width: u16, hovered: bool) -> Vec<Line<'static>> {
+    fn display_head(&self, width: u16, _hovered: bool) -> Vec<Line<'static>> {
         let mut head = self.head.lines_at(width);
         if let Some(last) = head.last_mut() {
             if let Some(detail) = &self.detail {
@@ -216,16 +223,10 @@ impl Block {
                 // extra row on narrow panes. A task trace link coexists with this
                 // ordinary foldout: click folds its summary/report, double-click
                 // opens the isolated sub-agent trace.
-                last.spans.push(if detail.open {
-                    Span::styled("  ▾", crate::theme::dim())
-                } else if hovered {
-                    Span::styled(
-                        format!("  ▸ {} lines", detail.lines.len()),
-                        crate::theme::dim(),
-                    )
-                } else {
-                    Span::raw("")
-                });
+                last.spans.push(Span::styled(
+                    format!("  ({} lines)", detail.lines.len()),
+                    crate::theme::dim(),
+                ));
             }
         }
         head
@@ -235,6 +236,23 @@ impl Block {
         self.head_wrapped.len()
             + self.status_wrapped.len()
             + self.detail.as_ref().map_or(0, Detail::visible)
+    }
+
+    fn link_at(&self, row: usize, column: usize) -> Option<&str> {
+        if row < self.head_wrapped.len() {
+            return self.head.link_at(&self.head_wrapped.lines[row], column);
+        }
+        let status_end = self.head_wrapped.len() + self.status_wrapped.len();
+        let detail = self.detail.as_ref()?;
+        if row < status_end || (detail.overflows() && row == status_end + detail.view_rows) {
+            return None;
+        }
+        let detail_row = detail.scroll + row - status_end;
+        detail
+            .wrapped
+            .lines
+            .get(detail_row)
+            .and_then(|line| detail.content.link_at(line, column))
     }
 
     /// The i-th visible row of this block.
@@ -840,8 +858,8 @@ impl Transcript {
         ))
     }
 
-    /// Update hover state from a terminal mouse-move event. Closed details keep
-    /// their line count quiet until the pointer makes the block actionable.
+    /// Update hover state from a terminal mouse-move event. The fold affordance
+    /// is always visible; hover only marks the actionable block.
     pub fn mouse_moved(&mut self, x: u16, y: u16) {
         let hovered = self
             .pos_at(x, y)
@@ -921,6 +939,12 @@ impl Transcript {
             return None;
         }
         Some((row, (x - area.x) as usize))
+    }
+
+    pub fn link_at(&self, x: u16, y: u16) -> Option<String> {
+        let (row, column) = self.pos_at(x, y)?;
+        let (block, row) = self.block_at(row)?;
+        self.blocks[block].link_at(row, column).map(str::to_string)
     }
 
     pub fn mouse_down(&mut self, x: u16, y: u16) {
@@ -1228,6 +1252,23 @@ mod tests {
     }
 
     #[test]
+    fn markdown_link_hit_testing_uses_the_rendered_transcript_position() {
+        let mut transcript = Transcript::new(40);
+        transcript.push_markdown(
+            crate::markdown::Renderer::default()
+                .parse("Read [the docs](https://example.com/docs) now."),
+        );
+        let area = Rect::new(0, 0, 40, 3);
+        let mut buffer = Buffer::empty(area);
+        transcript.render(&mut buffer, area);
+        assert_eq!(
+            transcript.link_at("Read the ".len() as u16, 0).as_deref(),
+            Some("https://example.com/docs")
+        );
+        assert_eq!(transcript.link_at(0, 0), None);
+    }
+
+    #[test]
     fn render_shows_tail_and_scroll_reveals_history() {
         let mut t = Transcript::new(20);
         for i in 0..10 {
@@ -1529,7 +1570,7 @@ mod tests {
         t.mouse_moved(0, 1);
         assert_eq!(t.hovered, None);
         t.render(&mut buf, area);
-        assert!(!buffer_text(&buf, area).contains("▸ 3 lines"));
+        assert!(buffer_text(&buf, area).contains("(3 lines)"));
         assert_eq!(buf[(0, 0)].bg, ratatui::style::Color::Reset);
     }
 
@@ -1610,11 +1651,9 @@ mod tests {
         assert_eq!(t.total(), 1, "closed detail keeps the record one row");
         assert!(buffer_text(&buf, area).contains("● Read app.rs — 3 lines"));
 
-        // Hover advertises the fold on the call row itself; click opens it.
+        // The fold affordance is always visible on the call row; click opens it.
+        assert!(buffer_text(&buf, area).contains("(3 lines)"));
         t.mouse_moved(0, 0);
-        let mut buf = Buffer::empty(area);
-        t.render(&mut buf, area);
-        assert!(buffer_text(&buf, area).contains("▸ 3 lines"));
         t.mouse_down(0, 0);
         t.mouse_up();
         let mut buf = Buffer::empty(area);
@@ -1635,20 +1674,21 @@ mod tests {
         let area = Rect::new(0, 0, 40, 10);
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
-        // Closed details stay quiet until the block is actionable under the pointer.
-        assert!(!buffer_text(&buf, area).contains("▸ 3 lines"));
+        // Closed details always advertise their size, not only on hover.
+        assert!(buffer_text(&buf, area).contains("(3 lines)"));
         t.mouse_moved(0, 0);
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
-        assert!(buffer_text(&buf, area).contains("▸ 3 lines"));
+        assert!(buffer_text(&buf, area).contains("(3 lines)"));
 
         t.mouse_down(0, 0);
         t.mouse_up();
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         let text = buffer_text(&buf, area);
-        assert!(text.contains('▾'));
+        assert!(text.contains("(3 lines)"));
         assert!(!text.contains('▸'));
+        assert!(!text.contains('▾'));
     }
 
     #[test]

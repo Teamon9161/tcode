@@ -21,6 +21,13 @@ pub struct Renderer {
 /// knows how much terminal width is available.
 pub struct Document {
     parts: Vec<Part>,
+    links: Vec<Link>,
+}
+
+#[derive(Clone)]
+struct Link {
+    label: String,
+    target: String,
 }
 
 enum Part {
@@ -47,6 +54,49 @@ impl Document {
             })
             .collect()
     }
+
+    pub(crate) fn link_at(&self, line: &Line<'_>, column: usize) -> Option<&str> {
+        let text: String = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        self.links.iter().find_map(|link| {
+            let start = text.find(&link.label)?;
+            let end = start + link.label.len();
+            let mut start_col = 0usize;
+            let mut end_col = 0usize;
+            for (index, ch) in text.char_indices() {
+                let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if index < start {
+                    start_col += width;
+                }
+                if index < end {
+                    end_col += width;
+                }
+            }
+            (start_col <= column && column < end_col).then_some(link.target.as_str())
+        })
+    }
+}
+
+fn http_url(candidate: &str) -> Option<String> {
+    let parsed = url::Url::parse(candidate).ok()?;
+    matches!(parsed.scheme(), "http" | "https").then(|| parsed.into())
+}
+
+fn bare_links(text: &str) -> Vec<Link> {
+    text.split_whitespace()
+        .filter_map(|word| {
+            let candidate = word.trim_end_matches(|c: char| {
+                matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | ')' | ']' | '}')
+            });
+            http_url(candidate).map(|target| Link {
+                label: candidate.to_string(),
+                target,
+            })
+        })
+        .collect()
 }
 
 struct Table {
@@ -89,6 +139,8 @@ impl Renderer {
     pub fn parse(&self, text: &str) -> Document {
         let mut out: Vec<Line<'static>> = Vec::new();
         let mut parts = Vec::new();
+        let mut links = Vec::new();
+        let mut link_stack: Vec<Option<usize>> = Vec::new();
         let mut spans: Vec<Span<'static>> = Vec::new();
         let mut style_stack: Vec<Style> = vec![Style::default()];
         let mut list_depth: usize = 0;
@@ -201,9 +253,18 @@ impl Renderer {
                         };
                         spans.push(Span::styled(marker, theme::accent()));
                     }
-                    Tag::Link { .. } => {
+                    Tag::Link { dest_url, .. } => {
                         let s = style_stack.last().copied().unwrap_or_default();
                         style_stack.push(s.add_modifier(Modifier::UNDERLINED));
+                        let target = http_url(dest_url.as_ref());
+                        let index = target.map(|target| {
+                            links.push(Link {
+                                label: String::new(),
+                                target,
+                            });
+                            links.len() - 1
+                        });
+                        link_stack.push(index);
                     }
                     Tag::Paragraph => {}
                     _ => {}
@@ -247,8 +308,12 @@ impl Renderer {
                         out.push(Line::default());
                         display_math = false;
                     }
-                    TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
+                    TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
                         style_stack.pop();
+                    }
+                    TagEnd::Link => {
+                        style_stack.pop();
+                        link_stack.pop();
                     }
                     TagEnd::BlockQuote(_) => {
                         if !spans.is_empty() {
@@ -288,6 +353,11 @@ impl Renderer {
                             }
                             first = false;
                             if !part.is_empty() {
+                                if let Some(Some(index)) = link_stack.last() {
+                                    links[*index].label.push_str(part);
+                                } else {
+                                    links.extend(bare_links(part));
+                                }
                                 spans.push(Span::styled(part.to_string(), style));
                             }
                         }
@@ -346,7 +416,7 @@ impl Renderer {
         if !out.is_empty() {
             parts.push(Part::Lines(out));
         }
-        Document { parts }
+        Document { parts, links }
     }
 
     fn highlight(&self, lang: &str, code: &str) -> Vec<Line<'static>> {
@@ -876,6 +946,36 @@ mod tests {
 
         assert!(text.iter().any(|line| line.contains("Energy is E = mc².")));
         assert!(text.iter().any(|line| line == "∑ a/b = c"));
+    }
+
+    #[test]
+    fn markdown_and_bare_http_links_keep_click_targets() {
+        let document = Renderer::default()
+            .parse("[project](https://example.com/docs) and https://rust-lang.org/guide.");
+        let lines = document.lines_at(120);
+        let line = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("project"))
+            })
+            .unwrap();
+        assert_eq!(document.link_at(line, 1), Some("https://example.com/docs"));
+        assert_eq!(
+            document.link_at(line, "project and ".len()),
+            Some("https://rust-lang.org/guide")
+        );
+    }
+
+    #[test]
+    fn non_http_markdown_links_are_not_clickable() {
+        let document =
+            Renderer::default().parse("[local](file:///tmp/nope) [mail](mailto:a@b.test)");
+        let lines = document.lines_at(120);
+        let line = lines.first().unwrap();
+        assert_eq!(document.link_at(line, 1), None);
+        assert_eq!(document.link_at(line, 8), None);
     }
 
     #[test]

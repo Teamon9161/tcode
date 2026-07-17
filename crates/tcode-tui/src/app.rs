@@ -32,7 +32,9 @@ use crate::approval::{Dialog, DialogResult};
 use crate::editor::{Editor, Position};
 use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
 use crate::model_picker::{self, AgentMenu, ModelMenu};
-use crate::render::{shorten_summary_path, CallRoute, RenderRegistry};
+use crate::render::{
+    batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
+};
 use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
 use crate::view::{BakeCtx, SessionView};
@@ -288,6 +290,9 @@ struct ReplayBatch {
 
 /// Batch items are indented under their shared header without a tree glyph.
 const BATCH_ITEM_INDENT: &str = "    ";
+/// A sub-agent's live action belongs to its task item, never to the batch
+/// header, so it has one extra visible tree level.
+const TASK_STATUS_INDENT: &str = "      └ ";
 
 /// Where a result's call record lives, shared by live `ToolEnd` and
 /// replay. The three cases are mutually exclusive by construction.
@@ -2206,9 +2211,6 @@ impl App {
     /// Split a tool summary like `shell(cargo test)` into colored spans: the
     /// tool's display name is green, the arguments are dim.
     fn colored_tool_summary(&self, summary: &str) -> Vec<Span<'static>> {
-        // The tool name is always the accent-colored part, argument or not: a
-        // long shell command uses a capped preview, and an argument-less
-        // summary (MCP tools) must not read as a different kind of record.
         match summary.find('(') {
             Some(paren) => vec![
                 Span::styled(self.display_name(&summary[..paren]), theme::ok()),
@@ -2218,13 +2220,22 @@ impl App {
         }
     }
 
+    /// Task calls foreground the parent-authored objective, not the generic
+    /// delegation verb. Every other call keeps the usual verb/argument split.
+    fn colored_call_summary(&self, name: &str, summary: &str) -> Vec<Span<'static>> {
+        match self.renderers.get(name).header_tone() {
+            HeaderTone::Tool => self.colored_tool_summary(summary),
+            HeaderTone::Task => task_header_summary(summary),
+        }
+    }
+
     /// `●` header (+ change body + command block) for one tool call. Shared
     /// by the live `ToolStart` path and transcript replay so they can never
     /// drift apart.
     fn call_lines(&self, name: &str, input: &serde_json::Value) -> Vec<Line<'static>> {
         let renderer = self.renderers.get(name);
         let summary = self.display_summary(&renderer.header(name, input, Some(&self.cwd)));
-        let mut spans: Vec<Span> = self.colored_tool_summary(&summary);
+        let mut spans: Vec<Span> = self.colored_call_summary(name, &summary);
         spans.insert(0, Span::styled("● ", theme::accent()));
         let mut lines = vec![Line::from(spans)];
         lines.extend(renderer.body(input));
@@ -2284,7 +2295,7 @@ impl App {
         }
         row.push(Span::styled(
             renderer.batch_item(name, input, Some(&self.cwd)),
-            theme::dim(),
+            batch_item_style(renderer.header_tone()),
         ));
         let mut lines = vec![Line::from(row)];
         let body = renderer.body(input);
@@ -2657,6 +2668,19 @@ impl App {
                 crate::mode_picker::PickResult::Cancelled
                 | crate::mode_picker::PickResult::Pending => {}
             }
+        } else if let Some(picker) = self.agent_picker.as_mut() {
+            match picker.handle_mouse_row(row, &self.menu, &self.agents) {
+                model_picker::AgentPick::Pending => {}
+                model_picker::AgentPick::Cancelled => self.agent_picker = None,
+                model_picker::AgentPick::Picked {
+                    kind,
+                    option,
+                    effort,
+                } => {
+                    self.agent_picker = None;
+                    self.apply_agent_model(&kind, option, effort);
+                }
+            }
         }
         true
     }
@@ -2823,6 +2847,14 @@ impl App {
                         self.drag_scroll = None;
                         let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
                         if !taken_by_input {
+                            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                                if let Some(url) =
+                                    self.active_transcript().link_at(mouse.column, mouse.row)
+                                {
+                                    self.open_link(&url);
+                                    return;
+                                }
+                            }
                             self.active_transcript_mut()
                                 .mouse_down(mouse.column, mouse.row);
                         }
@@ -3066,23 +3098,12 @@ impl App {
             }
             KeyCode::Char('j') if ctrl => self.editor.newline(),
             KeyCode::Enter if alt || shift || ctrl => self.editor.newline(),
+            KeyCode::Enter if self.accept_reference_completion() => {}
             KeyCode::Enter => self.submit(running),
             KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Tab => {
                 if let Some(completion) = self.popup_selection() {
-                    match completion.kind {
-                        CompletionKind::Slash => {
-                            self.dismissed_reference = None;
-                            self.editor.clear();
-                            self.editor.insert_str(&completion.replacement);
-                        }
-                        CompletionKind::Reference { start, end } => {
-                            self.editor
-                                .replace_range(start, end, &completion.replacement);
-                            self.dismissed_reference = Some(start);
-                        }
-                    }
-                    self.popup_index = 0;
+                    self.accept_completion(completion);
                 }
             }
             KeyCode::Up => {
@@ -3348,6 +3369,15 @@ impl App {
         if let Phase::Running { cancel, .. } = &self.phase {
             cancel.cancel();
             self.state_label = "cancelling".into();
+        }
+    }
+
+    fn open_link(&mut self, url: &str) {
+        match open_http_url(url) {
+            Ok(()) => self.notice = Some(("opened link in browser".into(), Instant::now())),
+            Err(error) => {
+                self.notice = Some((format!("could not open link: {error}"), Instant::now()))
+            }
         }
     }
 
@@ -3983,9 +4013,7 @@ impl App {
             })
             .collect();
         matches.sort_by(|(left_score, left), (right_score, right)| {
-            left_score
-                .cmp(right_score)
-                .then_with(|| left.path.cmp(&right.path))
+            reference_match_order(*left_score, &left.path, *right_score, &right.path)
         });
         let mut basename_counts = HashMap::new();
         for (_, candidate) in &matches {
@@ -4070,6 +4098,33 @@ impl App {
         matches
             .get(self.popup_index.min(matches.len().saturating_sub(1)))
             .cloned()
+    }
+
+    fn accept_reference_completion(&mut self) -> bool {
+        let Some(completion) = self.popup_selection() else {
+            return false;
+        };
+        if !matches!(completion.kind, CompletionKind::Reference { .. }) {
+            return false;
+        }
+        self.accept_completion(completion);
+        true
+    }
+
+    fn accept_completion(&mut self, completion: CompletionMatch) {
+        match completion.kind {
+            CompletionKind::Slash => {
+                self.dismissed_reference = None;
+                self.editor.clear();
+                self.editor.insert_str(&completion.replacement);
+            }
+            CompletionKind::Reference { start, end } => {
+                self.editor
+                    .replace_range(start, end, &completion.replacement);
+                self.dismissed_reference = Some(start);
+            }
+        }
+        self.popup_index = 0;
     }
 
     /// Finalize content into the transcript. Name kept from the inline era;
@@ -4411,21 +4466,22 @@ impl App {
             .collect();
     }
 
-    /// The task card's live status: the in-flight call rendered exactly like a
-    /// main-window tool line (green name, dim arguments), or the run's plain
-    /// activity when no tool is running. A parallel batch shows one call at a
-    /// time with its position, rotated by the animation tick.
+    /// The task card's live status is intentionally muted: its parent-authored
+    /// objective is the primary label, while the changing sub-agent tool is
+    /// supporting progress. A parallel batch names its current task and count.
     fn task_status_lines(&self, run: &UiTaskRun) -> Vec<Line<'static>> {
         let Some(call) = run.current_call() else {
             return task_plain_status(&run.activity);
         };
         let summary = self.display_summary(&call.summary);
-        let mut spans = vec![Span::raw("  ")];
-        spans.extend(self.colored_tool_summary(&summary));
+        let mut spans = vec![Span::styled(
+            format!("{TASK_STATUS_INDENT}{summary}"),
+            theme::dim(),
+        )];
         if run.calls.len() > 1 {
             spans.push(Span::styled(
                 format!(
-                    " · {}/{}",
+                    " · task {}/{}",
                     run.rotation % run.calls.len() + 1,
                     run.calls.len()
                 ),
@@ -5221,7 +5277,21 @@ fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
 /// task cards keep it as a quiet indented status rather than competing with
 /// the main window's animated running indicator.
 fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
-    vec![Line::styled(format!("  {activity}"), theme::dim())]
+    vec![Line::from(vec![Span::styled(
+        format!("{TASK_STATUS_INDENT}{activity}"),
+        theme::dim(),
+    )])]
+}
+
+fn task_header_summary(summary: &str) -> Vec<Span<'static>> {
+    match summary.split_once(" · ") {
+        Some((kind, objective)) => vec![
+            Span::styled(kind.to_string(), theme::dim()),
+            Span::styled(" · ", theme::dim()),
+            Span::styled(objective.to_string(), ratatui::style::Style::default()),
+        ],
+        None => vec![Span::styled(summary.to_string(), theme::dim())],
+    }
 }
 
 /// Remove task-run accounting from the user-facing report. The complete,
@@ -5467,7 +5537,7 @@ fn quote_lines(label: Option<&str>, text: &str) -> Vec<Line<'static>> {
                 }
                 _ => {}
             }
-            spans.push(Span::styled(row.to_string(), theme::user_message()));
+            spans.extend(crate::reference_style::user_text_spans(row));
             Line::from(spans)
         })
         .collect()
@@ -5521,6 +5591,24 @@ fn area_width(terminal: &Term) -> u16 {
 
 fn area_height(terminal: &Term) -> u16 {
     terminal.size().map(|s| s.height).unwrap_or(24)
+}
+
+fn open_http_url(raw: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw).map_err(|_| "invalid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http(s) links can be opened".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer.exe").arg(raw).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(raw).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(raw).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::other(
+        "no browser launcher for this platform",
+    ));
+    result.map(|_| ()).map_err(|error| error.to_string())
 }
 
 /// Build the editor invocation from `$VISUAL`/`$EDITOR` (falling back to `vi`),
@@ -5706,6 +5794,21 @@ fn reference_token_char(c: char) -> bool {
             c,
             '@' | '`' | '"' | '\'' | ')' | '(' | '[' | ']' | '{' | '}' | ',' | ';' | ':'
         )
+}
+
+/// Root-level project files are the least surprising completion targets, so
+/// they outrank matching descendants before the usual relevance score applies.
+fn reference_match_order(
+    left_score: usize,
+    left_path: &str,
+    right_score: usize,
+    right_path: &str,
+) -> std::cmp::Ordering {
+    left_path
+        .contains('/')
+        .cmp(&right_path.contains('/'))
+        .then_with(|| left_score.cmp(&right_score))
+        .then_with(|| left_path.cmp(right_path))
 }
 
 fn reference_score(path: &str, query: &str) -> Option<usize> {
@@ -5978,8 +6081,9 @@ mod tests {
                 .flat_map(|line| line.spans.iter())
                 .map(|span| span.content.as_ref())
                 .collect::<String>(),
-            "  Search task traces"
+            "      └ Search task traces"
         );
+        assert_eq!(status[0].spans[0].style, theme::dim());
         assert!(text.contains("└ Read task_trace.rs"));
         assert!(text.contains("└ Grep task runs"));
         assert!(
@@ -6241,6 +6345,30 @@ mod tests {
         );
         assert!(reference_score("crates/tcode-tui/src/app.rs", "tuiapp").is_some());
         assert!(reference_score("crates/tcode-tui/src/app.rs", "xyz").is_none());
+    }
+
+    #[test]
+    fn reference_matching_prioritizes_root_files() {
+        let mut matches = vec![(0, "src/Cargo.toml"), (10, "Cargo.toml"), (0, "README.md")];
+        matches.sort_by(|(left_score, left), (right_score, right)| {
+            reference_match_order(*left_score, left, *right_score, right)
+        });
+        assert_eq!(
+            matches,
+            [(0, "README.md"), (10, "Cargo.toml"), (0, "src/Cargo.toml")]
+        );
+    }
+
+    #[test]
+    fn sent_prompt_echo_accents_reference_paths() {
+        let echo = prompt_echo("review @src/app.rs", &[]);
+        let accented: Vec<_> = echo[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(theme::ACCENT))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(accented, ["@src/app.rs"]);
     }
 
     #[test]

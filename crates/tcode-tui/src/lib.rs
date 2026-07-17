@@ -13,6 +13,7 @@ mod markdown;
 mod mathfmt;
 mod mode_picker;
 mod model_picker;
+mod reference_style;
 mod render;
 mod resume;
 mod theme;

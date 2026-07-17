@@ -140,9 +140,37 @@ fn prompt_summary(prompt: &str) -> String {
     format!("{capped}…")
 }
 
+fn task_batch_label(inputs: &[&Value]) -> String {
+    let count = inputs.len();
+    let kinds: Vec<&str> = inputs
+        .iter()
+        .filter_map(|input| input["agent"].as_str())
+        .collect();
+    let kind = match kinds.as_slice() {
+        ["explore", ..] if kinds.iter().all(|kind| *kind == "explore") => "Explore",
+        ["plan", ..] if kinds.iter().all(|kind| *kind == "plan") => "Plan",
+        ["general", ..] if kinds.iter().all(|kind| *kind == "general") => "Delegate",
+        _ => "Delegate",
+    };
+    format!(
+        "{kind} {count} {}",
+        if count == 1 { "task" } else { "tasks" }
+    )
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{keeps_sub_tool, TASK_AGENT_KINDS};
+    use super::{keeps_sub_tool, task_batch_label, TASK_AGENT_KINDS};
+    use serde_json::json;
+
+    #[test]
+    fn task_batch_labels_name_the_delegated_work() {
+        let explore = json!({"agent": "explore"});
+        let plan = json!({"agent": "plan"});
+        assert_eq!(task_batch_label(&[&explore]), "Explore 1 task");
+        assert_eq!(task_batch_label(&[&explore, &explore]), "Explore 2 tasks");
+        assert_eq!(task_batch_label(&[&plan, &explore]), "Delegate 2 tasks");
+    }
 
     #[test]
     fn plan_kind_is_registered_and_has_explore_tools_except_exit_plan() {
@@ -211,6 +239,10 @@ impl Tool for TaskTool {
             Some("explore" | "plan") => tcode_core::BatchPolicy::ParallelReadOnly,
             _ => tcode_core::BatchPolicy::Isolated,
         }
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        task_batch_label(inputs)
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {

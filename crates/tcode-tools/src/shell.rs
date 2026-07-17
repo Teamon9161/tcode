@@ -12,6 +12,42 @@ use tcode_core::{
 
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
+const FINAL_TAIL_LINES: usize = 80;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputMode {
+    Full,
+    Final,
+}
+
+impl OutputMode {
+    fn parse(input: &Value) -> Result<Self, ToolOutput> {
+        match input["output_mode"].as_str().unwrap_or("full") {
+            "full" => Ok(Self::Full),
+            "final" => Ok(Self::Final),
+            other => Err(ToolOutput::err(format!(
+                "invalid output_mode: {other:?}; use \"full\" (default) or \"final\""
+            ))),
+        }
+    }
+}
+
+fn final_output_summary(output: &str, log_path: &std::path::Path) -> String {
+    let lines: Vec<&str> = output.lines().collect();
+    let omitted = lines.len().saturating_sub(FINAL_TAIL_LINES);
+    let tail = lines
+        .iter()
+        .skip(omitted)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prefix = if omitted == 0 {
+        "Command output was captured in final mode".to_string()
+    } else {
+        format!("Command output was captured in final mode; {omitted} earlier lines omitted")
+    };
+    format!("{prefix}. Full output: {}\n\n{tail}", log_path.display())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -301,7 +337,8 @@ impl Tool for ShellTool {
                 "command": { "type": "string" },
                 "timeout_ms": { "type": "integer", "description": "Kill after this many ms (default 120000, max 600000); ignored for background tasks" },
                 "cwd": { "type": "string", "description": "Working directory (default: project cwd)" },
-                "run_in_background": { "type": "boolean", "description": "Run detached and return a task id immediately (default false)" }
+                "run_in_background": { "type": "boolean", "description": "Run detached and return a task id immediately (default false)" },
+                "output_mode": { "type": "string", "enum": ["full", "final"], "description": "full returns all output (default). final saves complete output in session scratch and returns only the final 80 lines; use for watch/polling commands such as gh run watch." }
             },
             "required": ["command"]
         })
@@ -344,6 +381,10 @@ impl Tool for ShellTool {
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
         let Some(script) = input["command"].as_str() else {
             return ToolOutput::err("missing required parameter: command");
+        };
+        let output_mode = match OutputMode::parse(&input) {
+            Ok(mode) => mode,
+            Err(error) => return error,
         };
         let cwd = input["cwd"]
             .as_str()
@@ -409,9 +450,31 @@ impl Tool for ShellTool {
                 }
                 if code != 0 {
                     out.push_str(&format!("\n(exit code {code})"));
-                    ToolOutput::err(out)
                 } else {
                     out.push_str("\n(exit code 0)");
+                }
+                if output_mode == OutputMode::Final {
+                    static NEXT_FINAL_LOG: std::sync::atomic::AtomicU64 =
+                        std::sync::atomic::AtomicU64::new(1);
+                    let dir = ctx.scratch_dir.join("tool-output");
+                    let id = NEXT_FINAL_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let log_path = dir.join(format!("shell-final-{id:04}.log"));
+                    let saved = async {
+                        tokio::fs::create_dir_all(&dir).await?;
+                        tokio::fs::write(&log_path, &out).await
+                    }
+                    .await;
+                    if let Err(error) = saved {
+                        return ToolOutput::err(format!(
+                            "final output mode could not save complete output: {error}\n\n{}",
+                            final_output_summary(&out, std::path::Path::new("(unavailable)"))
+                        ));
+                    }
+                    out = final_output_summary(&out, &log_path);
+                }
+                if code != 0 {
+                    ToolOutput::err(out)
+                } else {
                     ToolOutput::ok(out)
                 }
             }
@@ -429,5 +492,67 @@ impl Tool for ShellTool {
                 ToolOutput::err("command cancelled by user and killed".to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn final_mode_keeps_tail_and_points_to_complete_log() {
+        let output = (0..(FINAL_TAIL_LINES + 3))
+            .map(|index| format!("line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let summary = final_output_summary(&output, std::path::Path::new("/scratch/full.log"));
+        assert!(summary.contains("3 earlier lines omitted"));
+        assert!(summary.contains("/scratch/full.log"));
+        assert!(!summary.contains("line 0"));
+        assert!(summary.contains(&format!("line {}", FINAL_TAIL_LINES + 2)));
+    }
+
+    #[test]
+    fn output_mode_rejects_unknown_values() {
+        let error = OutputMode::parse(&json!({ "output_mode": "changes" })).unwrap_err();
+        assert!(error.is_error);
+        assert!(error.content.contains("full"));
+        assert!(error.content.contains("final"));
+    }
+
+    #[tokio::test]
+    async fn final_mode_saves_full_output_and_returns_a_tail() {
+        let root = std::env::temp_dir().join(format!("tcode-shell-final-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
+        let (kind, command) = if cfg!(windows) {
+            (
+                ShellKind::PowerShell,
+                "0..84 | ForEach-Object { \"line $_\" }",
+            )
+        } else {
+            (
+                ShellKind::Bash,
+                "for i in $(seq 0 84); do echo line $i; done",
+            )
+        };
+        let output = ShellTool::new(kind)
+            .run(
+                json!({ "command": command, "output_mode": "final" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("earlier lines omitted"));
+        assert!(!output.content.contains("line 0"));
+        assert!(output.content.contains("line 84"));
+        let logs = std::fs::read_dir(root.join("scratch/tool-output")).unwrap();
+        let path = logs.into_iter().next().unwrap().unwrap().path();
+        let raw = std::fs::read_to_string(path).unwrap();
+        assert!(raw.contains("line 0"));
+        assert!(raw.contains("line 84"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

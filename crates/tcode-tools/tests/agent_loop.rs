@@ -991,7 +991,7 @@ async fn explore_sub_agent_returns_only_the_report() {
 }
 
 #[tokio::test]
-async fn explore_tasks_share_the_parallel_read_only_batch_path() {
+async fn read_only_tasks_share_the_parallel_batch_path() {
     let dir = tempfile::tempdir().unwrap();
     let parent = MockProvider::new(vec![
         tool_uses(&[
@@ -1025,12 +1025,12 @@ async fn explore_tasks_share_the_parallel_read_only_batch_path() {
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolBatchStart { label, calls }
-            if label == "Task 2 calls" && calls.len() == 2
+            if label == "Delegate 2 tasks" && calls.len() == 2
     )));
     assert!(approver.asked.lock().unwrap().is_empty());
     assert_eq!(
         agent.batch_display_label(&session, &assistant_calls(&session)),
-        Some("Task 2 calls".into())
+        Some("Delegate 2 tasks".into())
     );
 }
 
@@ -1671,6 +1671,71 @@ impl Provider for FlakyProvider {
         }
         self.inner.stream(req, cancel).await
     }
+}
+
+#[tokio::test]
+async fn retry_backoff_stops_immediately_when_cancelled() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = Arc::new(FlakyProvider {
+        remaining_failures: Mutex::new(1),
+        inner: MockProvider::new(vec![]),
+    });
+    let agent = Agent {
+        models: AgentModels::default(),
+        model: ModelCell::new(ActiveModel {
+            provider,
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        }),
+        tools: tcode_tools::builtin_tools(&std::env::temp_dir()),
+        system: "test".into(),
+        watchdog: WatchdogConfig {
+            idle_timeout_secs: 5,
+            connect_timeout_secs: 20,
+            max_retries: 5,
+            initial_backoff_ms: 10_000,
+            max_backoff_ms: 10_000,
+        },
+        hooks: Default::default(),
+        safety_classifier: None,
+        auto_policy: String::new(),
+        max_steps: tcode_core::DEFAULT_MAX_STEPS,
+    };
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let cancel = CancellationToken::new();
+    let turn = agent.user_turn(
+        &mut session,
+        vec![ContentBlock::Text { text: "hi".into() }],
+        &tx,
+        &approver,
+        cancel.clone(),
+    );
+    tokio::pin!(turn);
+
+    let retry = tokio::select! {
+        event = rx.recv() => event,
+        result = &mut turn => panic!("turn ended before retry: {result:?}"),
+    };
+    assert!(matches!(retry, Some(AgentEvent::Retrying { .. })));
+    cancel.cancel();
+    tokio::time::timeout(std::time::Duration::from_millis(200), &mut turn)
+        .await
+        .expect("cancellation must not wait for retry backoff")
+        .expect("cancelled turn stays valid");
+    let interrupted = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, AgentEvent::Interrupted) {
+                return true;
+            }
+        }
+        false
+    })
+    .await
+    .expect("cancelled turn must emit an interrupt event promptly");
+    assert!(interrupted, "cancelled turn must emit Interrupted");
 }
 
 #[tokio::test]

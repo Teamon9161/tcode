@@ -2494,7 +2494,7 @@ dependencies = [
 
 [[package]]
 name = "tcode"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2515,7 +2515,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-core"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-providers"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2553,7 +2553,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tools"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "base64",
@@ -2575,7 +2575,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tui"
-version = "0.1.6"
+version = "0.1.7"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2594,6 +2594,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "unicode-width 0.2.0",
+ "url",
 ]
 
 [[package]]

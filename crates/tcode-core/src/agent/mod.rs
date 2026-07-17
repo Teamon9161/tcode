@@ -539,9 +539,13 @@ impl Agent {
                 Ok(stream) => stream,
                 Err(e) if e.retryable() && attempt < self.watchdog.max_retries => {
                     attempt += 1;
-                    self.emit_retry(events, attempt, &e.to_string(), false)
-                        .await?;
-                    continue 'retry;
+                    if self
+                        .emit_retry(events, attempt, &e.to_string(), false, cancel)
+                        .await?
+                    {
+                        continue 'retry;
+                    }
+                    return Ok((Vec::new(), Usage::default(), None));
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -573,9 +577,19 @@ impl Agent {
                         let partial_output_retained =
                             self.preserve_incomplete_assistant(session, acc, &e);
                         attempt += 1;
-                        self.emit_retry(events, attempt, &e.to_string(), partial_output_retained)
-                            .await?;
-                        continue 'retry;
+                        if self
+                            .emit_retry(
+                                events,
+                                attempt,
+                                &e.to_string(),
+                                partial_output_retained,
+                                cancel,
+                            )
+                            .await?
+                        {
+                            continue 'retry;
+                        }
+                        return Ok((Vec::new(), Usage::default(), None));
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -617,7 +631,8 @@ impl Agent {
         attempt: u32,
         error: &str,
         partial_output_retained: bool,
-    ) -> Result<(), AgentError> {
+        cancel: &CancellationToken,
+    ) -> Result<bool, AgentError> {
         let delay = self.watchdog.backoff(attempt);
         self.emit(
             events,
@@ -630,8 +645,10 @@ impl Agent {
             },
         )
         .await?;
-        tokio::time::sleep(delay).await;
-        Ok(())
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => Ok(true),
+            _ = cancel.cancelled() => Ok(false),
+        }
     }
 
     async fn run_tools(

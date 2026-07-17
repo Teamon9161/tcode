@@ -1,6 +1,6 @@
 [package]
 name = "tcode-tui"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
@@ -24,3 +24,4 @@ arboard = "3"
 image = { workspace = true }
 base64 = "0.22"
 unicode-width = "0.2"
+url = "2"

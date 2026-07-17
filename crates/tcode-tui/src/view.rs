@@ -14,7 +14,9 @@ use ratatui::text::{Line, Span};
 use tcode_core::{AgentEvent, ContentBlock, Entry};
 
 use crate::markdown;
-use crate::render::{shorten_summary_path, CallRoute, RenderRegistry};
+use crate::render::{
+    batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
+};
 use crate::theme;
 use crate::transcript::Transcript;
 
@@ -532,7 +534,7 @@ impl SessionView {
         let renderer = ctx.renderers.get(name);
         let summary =
             shorten_summary_path(&renderer.header(name, input, Some(ctx.cwd)), Some(ctx.cwd));
-        let mut spans = colored_tool_summary(ctx.renderers, &summary);
+        let mut spans = colored_call_summary(ctx.renderers, renderer.header_tone(), &summary);
         spans.insert(0, Span::styled("● ", theme::accent()));
         let mut lines = vec![Line::from(spans)];
         lines.extend(renderer.body(input));
@@ -583,7 +585,7 @@ impl SessionView {
         }
         row.push(Span::styled(
             renderer.batch_item(name, input, Some(ctx.cwd)),
-            theme::dim(),
+            batch_item_style(renderer.header_tone()),
         ));
         let mut lines = vec![Line::from(row)];
         let body = renderer.body(input);
@@ -711,7 +713,7 @@ impl SessionView {
                     result.content
                 };
                 return ResultRender::Foldable {
-                    head: vec![Line::styled(format!("  {label}"), style)],
+                    head: vec![Line::styled(format!("  ⎿ {label}"), style)],
                     detail: self.output_detail(result, diagnostic, false, ctx),
                 };
             }
@@ -786,6 +788,17 @@ impl SessionView {
     }
 }
 
+fn colored_call_summary(
+    renderers: &RenderRegistry,
+    tone: HeaderTone,
+    summary: &str,
+) -> Vec<Span<'static>> {
+    match tone {
+        HeaderTone::Tool => colored_tool_summary(renderers, summary),
+        HeaderTone::Task => task_header_summary(summary),
+    }
+}
+
 fn colored_tool_summary(renderers: &RenderRegistry, summary: &str) -> Vec<Span<'static>> {
     match summary.find('(') {
         Some(paren) => vec![
@@ -793,6 +806,17 @@ fn colored_tool_summary(renderers: &RenderRegistry, summary: &str) -> Vec<Span<'
             Span::styled(summary[paren..].to_string(), theme::dim()),
         ],
         None => vec![Span::styled(renderers.display_name(summary), theme::ok())],
+    }
+}
+
+fn task_header_summary(summary: &str) -> Vec<Span<'static>> {
+    match summary.split_once(" · ") {
+        Some((kind, objective)) => vec![
+            Span::styled(kind.to_string(), theme::ok()),
+            Span::styled(" · ", theme::dim()),
+            Span::styled(objective.to_string(), Style::default()),
+        ],
+        None => vec![Span::styled(summary.to_string(), theme::ok())],
     }
 }
 
@@ -845,10 +869,11 @@ fn result_preview(text: &str) -> String {
 fn quote_lines(text: &str) -> Vec<Line<'static>> {
     text.lines()
         .map(|row| {
-            Line::from(vec![
-                Span::styled(theme::USER_GUTTER, theme::user_gutter()),
-                Span::styled(row.to_string(), theme::user_message()),
-            ])
+            let mut spans = vec![Span::styled(theme::USER_GUTTER, theme::user_gutter())];
+            // Keep restored and sub-agent transcripts visually identical to a
+            // just-sent prompt, without requiring the completion index.
+            spans.extend(crate::reference_style::user_text_spans(row));
+            Line::from(spans)
         })
         .collect()
 }
@@ -895,6 +920,14 @@ mod tests {
             cwd: Path::new("."),
             show_reasoning: true,
         }
+    }
+
+    #[test]
+    fn outer_task_header_highlights_the_kind_and_keeps_the_objective_in_the_foreground() {
+        let spans = task_header_summary("Explore · inspect the implementation");
+        assert_eq!(spans[0].style.fg, Some(theme::OK));
+        assert_eq!(spans[2].style, Style::default());
+        assert_eq!(batch_item_style(HeaderTone::Task), Style::default());
     }
 
     #[test]

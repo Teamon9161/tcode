@@ -8,12 +8,14 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use ratatui::style::Style;
 use ratatui::text::Line;
 use serde_json::Value;
 
 use tcode_core::{BatchPolicy, Tool};
 
 use crate::diff;
+use crate::theme;
 
 /// Where a tool call's rendering goes. `Progress` feeds the execution-progress
 /// pane instead of the transcript (`update_progress`); `Silent` renders nothing
@@ -25,7 +27,28 @@ pub enum CallRoute {
     Silent,
 }
 
+/// Colour treatment for a call header. Most tools foreground their verb; a
+/// delegated task instead foregrounds its human-authored objective.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderTone {
+    Tool,
+    Task,
+}
+
+/// A batch row is normally quiet, but a delegated task's human-authored
+/// objective is its primary label. Its changing status remains dim below.
+pub fn batch_item_style(tone: HeaderTone) -> Style {
+    match tone {
+        HeaderTone::Tool => theme::dim(),
+        HeaderTone::Task => Style::default(),
+    }
+}
+
 pub trait ToolRenderer: Send + Sync {
+    fn header_tone(&self) -> HeaderTone {
+        HeaderTone::Tool
+    }
+
     fn route(&self) -> CallRoute {
         CallRoute::Transcript
     }
@@ -108,6 +131,10 @@ impl ToolRenderer for DefaultRenderer {
 struct TaskRenderer;
 
 impl ToolRenderer for TaskRenderer {
+    fn header_tone(&self) -> HeaderTone {
+        HeaderTone::Task
+    }
+
     fn header(&self, _name: &str, input: &Value, _cwd: Option<&Path>) -> String {
         let kind = title_case_tool_name(input["agent"].as_str().unwrap_or("agent"));
         let summary = input["summary"]
@@ -605,6 +632,8 @@ mod tests {
             renderer.header("task", &explore, None),
             "Explore · inspect TUI rendering"
         );
+        assert_eq!(renderer.header_tone(), HeaderTone::Task);
+        assert_eq!(batch_item_style(renderer.header_tone()), Style::default());
         assert_eq!(
             renderer.batch_item("task", &explore, None),
             "Explore · inspect TUI rendering",
