@@ -24,6 +24,22 @@ pub struct FileRecord {
     ranges: Vec<(usize, usize)>,
 }
 
+/// How much of the current on-disk version (identified by `hash`) is in the
+/// model's context. Powers `write`'s full-visibility overwrite gate and
+/// `append`'s any-visibility gate; `Partial` carries the seen ranges so
+/// gate errors can tell the model exactly what is missing.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Visibility {
+    /// No record for this path.
+    Unseen,
+    /// Recorded, but under a different hash — changed on disk since.
+    Stale,
+    /// Current version, but only these coalesced 1-based inclusive ranges.
+    Partial(Vec<(usize, usize)>),
+    /// The whole current version is in context.
+    Full,
+}
+
 /// Answer to "should this read actually return content?".
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReadStatus {
@@ -170,6 +186,50 @@ impl FreshnessTracker {
         self.files.get(path).is_some_and(|r| r.hash == hash)
     }
 
+    /// How much of the version identified by `hash` the model has seen.
+    pub fn visibility(&self, path: &Path, hash: u64) -> Visibility {
+        match self.files.get(path) {
+            None => Visibility::Unseen,
+            Some(r) if r.hash != hash => Visibility::Stale,
+            Some(r) if r.full => Visibility::Full,
+            Some(r) => Visibility::Partial(r.ranges.clone()),
+        }
+    }
+
+    /// After our own `append`: visibility of the prior version carries
+    /// forward — appended lines are model-authored and count as seen, but a
+    /// partial view of the old content must not become "fully seen".
+    /// `appended` is the 1-based inclusive line range of the NEW version now
+    /// visible from this append — the appendix plus any context lines the
+    /// tool echoed back — with `appended.1` equal to the new total line
+    /// count. (When the old content did not end in '\n' the first appended
+    /// chunk merges into the old last line; that line belongs in the range.)
+    pub fn record_append(&mut self, path: &Path, new_hash: u64, appended: (usize, usize)) {
+        let (mut full, mut ranges) = match self.files.get(path) {
+            Some(r) if r.full => (true, Vec::new()),
+            Some(r) => (false, r.ranges.clone()),
+            // The append gate requires prior sight; stay conservative if not.
+            None => (false, Vec::new()),
+        };
+        if !full {
+            insert_coalesced(&mut ranges, appended);
+            // Coalesced coverage of every line of the new version is full
+            // sight — a later whole-file read must stub correctly.
+            if ranges.as_slice() == [(1, appended.1)] {
+                full = true;
+                ranges.clear();
+            }
+        }
+        self.files.insert(
+            path.to_path_buf(),
+            FileRecord {
+                hash: new_hash,
+                full,
+                ranges,
+            },
+        );
+    }
+
     /// Context no longer contains old reads (compaction/rewind).
     pub fn clear(&mut self) {
         self.files.clear();
@@ -242,5 +302,64 @@ mod tests {
         t.record_write(p, 7);
         assert!(t.seen_current(p, 7));
         assert_eq!(t.check_read(p, 7, None), ReadStatus::Unchanged);
+    }
+
+    #[test]
+    fn visibility_reports_unseen_stale_partial_full() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        assert_eq!(t.visibility(p, 1), Visibility::Unseen);
+        t.record_read(p, 1, Some((10, 20)));
+        assert_eq!(t.visibility(p, 2), Visibility::Stale);
+        assert_eq!(t.visibility(p, 1), Visibility::Partial(vec![(10, 20)]));
+        t.record_read(p, 1, None);
+        assert_eq!(t.visibility(p, 1), Visibility::Full);
+    }
+
+    #[test]
+    fn record_append_after_full_sight_stays_full() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        t.record_write(p, 1);
+        t.record_append(p, 2, (11, 15));
+        assert_eq!(t.visibility(p, 2), Visibility::Full);
+        assert_eq!(t.check_read(p, 2, None), ReadStatus::Unchanged);
+    }
+
+    #[test]
+    fn record_append_after_partial_read_stays_partial() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        // Saw lines 1-10 of a 30-line file, then appended lines 31-35.
+        t.record_read(p, 1, Some((1, 10)));
+        t.record_append(p, 2, (31, 35));
+        assert_eq!(
+            t.visibility(p, 2),
+            Visibility::Partial(vec![(1, 10), (31, 35)])
+        );
+        assert_eq!(t.check_read(p, 2, None), ReadStatus::NewRange);
+        assert_eq!(t.check_read(p, 2, Some((15, 20))), ReadStatus::NewRange);
+        assert_eq!(t.check_read(p, 2, Some((32, 35))), ReadStatus::Unchanged);
+    }
+
+    #[test]
+    fn record_append_no_trailing_newline_covers_the_merged_line() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        // Saw lines 5-20; old last line 20 had no trailing newline, so the
+        // appended range starts at 20 and coalesces with the seen range.
+        t.record_read(p, 1, Some((5, 20)));
+        t.record_append(p, 2, (20, 24));
+        assert_eq!(t.visibility(p, 2), Visibility::Partial(vec![(5, 24)]));
+    }
+
+    #[test]
+    fn record_append_full_coverage_upgrades_to_full() {
+        let mut t = FreshnessTracker::default();
+        let p = Path::new("a.rs");
+        t.record_read(p, 1, Some((1, 30)));
+        t.record_append(p, 2, (31, 40));
+        assert_eq!(t.visibility(p, 2), Visibility::Full);
+        assert_eq!(t.check_read(p, 2, None), ReadStatus::Unchanged);
     }
 }

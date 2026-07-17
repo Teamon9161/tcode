@@ -101,6 +101,46 @@ pub fn write_preview(path: &str, content: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Preview for an `append` call: every appended line is an addition,
+/// numbered from where it lands in the file.
+pub fn append_preview(path: &str, content: &str) -> Vec<Line<'static>> {
+    let start = append_start_line(path, content);
+    content
+        .lines()
+        .enumerate()
+        .map(|(index, line)| {
+            code_line(
+                path,
+                "+ ",
+                Some(start + index),
+                line,
+                Some(theme::diff_add_bg()),
+            )
+        })
+        .collect()
+}
+
+/// Where the first appended line lands. Handles both bake timings the same
+/// way `edit_start_line` does: after the run the file already ends with the
+/// appendix (strip it to count the prefix); before the run (approval prompt)
+/// the append lands after the current content, merging into the last line
+/// when it has no trailing newline. Unreadable/missing file falls back to 1.
+fn append_start_line(path: &str, content: &str) -> usize {
+    let Ok(existing) = std::fs::read_to_string(path) else {
+        return 1;
+    };
+    if let Some(prefix) = existing.strip_suffix(content) {
+        return prefix.bytes().filter(|b| *b == b'\n').count() + 1;
+    }
+    if existing.is_empty() {
+        1
+    } else if existing.ends_with('\n') {
+        existing.lines().count() + 1
+    } else {
+        existing.lines().count()
+    }
+}
+
 /// Render a unified patch imported from another agent's transcript.  It uses
 /// the exact same syntax foreground and add/delete backgrounds as a live
 /// tcode edit, while treating patch headers as metadata rather than code.
@@ -406,6 +446,42 @@ mod tests {
             .iter()
             .skip(3)
             .any(|span| span.style.fg.is_some()));
+    }
+
+    #[test]
+    fn append_preview_numbers_lines_from_the_append_point() {
+        let dir = std::env::temp_dir().join(format!("tcode-append-preview-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rendered_number = |lines: &[Line<'static>]| -> String {
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        // Missing file: fall back to line 1.
+        let missing = dir.join("missing.txt");
+        let lines = append_preview(missing.to_str().unwrap(), "new\n");
+        assert!(rendered_number(&lines).contains("1 │"));
+
+        // Pre-run: content not yet on disk, lands after the last line.
+        let file = dir.join("pre.txt");
+        std::fs::write(&file, "a\nb\n").unwrap();
+        let lines = append_preview(file.to_str().unwrap(), "c\n");
+        assert!(rendered_number(&lines).contains("3 │"));
+
+        // Pre-run merge: no trailing newline, continues the last line.
+        std::fs::write(&file, "a\nb").unwrap();
+        let lines = append_preview(file.to_str().unwrap(), "c\n");
+        assert!(rendered_number(&lines).contains("2 │"));
+
+        // Post-run: the file already ends with the appendix.
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+        let lines = append_preview(file.to_str().unwrap(), "c\n");
+        assert!(rendered_number(&lines).contains("3 │"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

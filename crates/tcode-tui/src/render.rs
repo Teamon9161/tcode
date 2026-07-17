@@ -237,6 +237,29 @@ impl ToolRenderer for WriteRenderer {
     }
 }
 
+struct AppendRenderer;
+
+impl ToolRenderer for AppendRenderer {
+    fn body(&self, input: &Value) -> Vec<Line<'static>> {
+        diff::append_preview(
+            input["path"].as_str().unwrap_or(""),
+            input["content"].as_str().unwrap_or(""),
+        )
+    }
+
+    fn error_label(&self) -> Option<&'static str> {
+        Some("Append(error)")
+    }
+
+    fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        file_target_item(name, input, cwd)
+    }
+
+    fn hide_success_result(&self) -> bool {
+        true
+    }
+}
+
 struct ReadRenderer {
     quiet: bool,
 }
@@ -392,6 +415,7 @@ impl RenderRegistry {
                 "shell" | "bash" => Box::new(ShellRenderer),
                 "edit" => Box::new(EditRenderer),
                 "write" => Box::new(WriteRenderer),
+                "append" => Box::new(AppendRenderer),
                 "read" => Box::new(ReadRenderer { quiet }),
                 "grep" | "glob" => Box::new(PatternRenderer { quiet }),
                 "web_fetch" => Box::new(WebFetchRenderer),
@@ -541,7 +565,14 @@ mod tests {
         for name in ["read", "grep", "glob"] {
             assert!(registry.get(name).quiet_output(), "{name} should be quiet");
         }
-        for name in ["shell", "edit", "write", "web_fetch", "not-a-tool"] {
+        for name in [
+            "shell",
+            "edit",
+            "write",
+            "append",
+            "web_fetch",
+            "not-a-tool",
+        ] {
             assert!(
                 !registry.get(name).quiet_output(),
                 "{name} should not be quiet"

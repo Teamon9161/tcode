@@ -2124,14 +2124,18 @@ struct ToolsOutcome {
     awaiting_user_input: bool,
 }
 
-/// `edit`'s own "you have not read the current version" hint assumes the
-/// model skipped reading the file. Inside a same-file batch lane that's
-/// usually wrong: this call's `old_string` was authored before any earlier
-/// call in the same batch had run, so a miss right after that earlier edit
-/// is expected. Point at the real cause instead of sending the model to
-/// re-read a file it already has the latest content for.
+/// `edit`'s match-miss error tells the model to re-read the file. Inside a
+/// same-file batch lane that's usually wrong: this call's `old_string` was
+/// authored before any earlier call in the same batch had run, so a miss
+/// right after that earlier mutation is expected. Point at the real cause
+/// instead of sending the model to re-read a file it already has the latest
+/// content for. (Keyed on the match-miss marker, not the "have not read"
+/// hint: a successful earlier edit records the new hash, so that hint no
+/// longer appears within a lane.)
 fn note_same_batch_edit_conflict(content: &mut String) {
-    if content.contains("you have not read the current version") {
+    if content.starts_with("old_string not found in file.")
+        || content.contains("you have not read the current version")
+    {
         content.push_str(
             "\nnote: an earlier edit to this file already ran in this same batch. Both \
              calls were written before either result came back, so this one's old_string \

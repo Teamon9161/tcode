@@ -1321,6 +1321,59 @@ async fn edit_succeeds_without_prior_read() {
 }
 
 #[tokio::test]
+async fn same_file_append_batch_serializes_and_rewinds_as_one_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "original\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            ("t1", "write", r#"{"path":"a.txt","content":"rewritten\n"}"#),
+            ("t2", "append", r#"{"path":"a.txt","content":"tail\n"}"#),
+            ("t3", "append", r#"{"path":"b.txt","content":"created\n"}"#),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    session.checkpoints = tcode_core::CheckpointStore::new(dir.path().join(".ckpts"));
+    // The write tool demands full prior sight before overwriting.
+    session
+        .tool_ctx
+        .freshness
+        .lock()
+        .unwrap()
+        .record_write(&file, tcode_core::freshness::content_hash(b"original\n"));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "batch write and append").await;
+
+    // Same-file calls ran in model order: write first, then append.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "rewritten\ntail\n");
+    // Appending to a missing path creates the file.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "created\n"
+    );
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 3);
+    for (content, is_error) in &results {
+        assert!(!is_error, "{content}");
+    }
+    assert!(
+        results[2].0.contains("created new file"),
+        "{}",
+        results[2].0
+    );
+
+    // Rewind restores the pre-batch state: a.txt's original content is back
+    // and the file created by append is gone.
+    let restored = session.checkpoints.restore_to(0);
+    assert!(!restored.is_empty());
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+    assert!(!dir.path().join("b.txt").exists());
+}
+
+#[tokio::test]
 async fn edit_lanes_continue_after_a_same_file_no_op_failure() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "alpha").unwrap();

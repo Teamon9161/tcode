@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::freshness::{content_hash, ReadStatus};
+use tcode_core::freshness::{content_hash, ReadStatus, Visibility};
 use tcode_core::images::detect_image_mime;
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
@@ -445,7 +445,7 @@ impl Tool for WriteTool {
     fn description(&self) -> &str {
         "Create or overwrite a file. Prefer `edit` for modifying existing \
          files. Overwriting an existing file requires having read its \
-         current version."
+         current version in full."
     }
 
     fn input_schema(&self) -> Value {
@@ -505,16 +505,39 @@ impl Tool for WriteTool {
         // are guaranteed to target distinct paths, so nothing needs the lock
         // held across the read-modify-write.
         if let Ok(existing) = tokio::fs::read(&path).await {
-            let seen = {
+            let visibility = {
                 let freshness = ctx.freshness.lock().expect("freshness lock");
-                freshness.seen_current(&path, content_hash(&existing))
+                freshness.visibility(&path, content_hash(&existing))
             };
-            if !seen {
-                return ToolOutput::err(format!(
-                    "{} already exists and you have not read its current version; \
-                     read it first so no content is destroyed unknowingly.",
-                    rel(&path, &ctx.cwd).display()
-                ));
+            match visibility {
+                Visibility::Full => {}
+                Visibility::Partial(ranges) => {
+                    let seen: Vec<String> =
+                        ranges.iter().map(|(s, e)| format!("{s}-{e}")).collect();
+                    return ToolOutput::err(format!(
+                        "{} already exists and you have only seen lines {} of its \
+                         current version; `write` replaces the whole file. Read the \
+                         remaining lines first, or use `edit`/`append` for a \
+                         targeted change.",
+                        rel(&path, &ctx.cwd).display(),
+                        seen.join(", ")
+                    ));
+                }
+                Visibility::Stale => {
+                    return ToolOutput::err(format!(
+                        "{} changed on disk since you last read it; re-read it \
+                         before overwriting so the external changes are not \
+                         destroyed unknowingly.",
+                        rel(&path, &ctx.cwd).display()
+                    ));
+                }
+                Visibility::Unseen => {
+                    return ToolOutput::err(format!(
+                        "{} already exists and you have not read its current version; \
+                         read it first so no content is destroyed unknowingly.",
+                        rel(&path, &ctx.cwd).display()
+                    ));
+                }
             }
         }
         if let Some(parent) = path.parent() {
@@ -533,6 +556,203 @@ impl Tool for WriteTool {
             "wrote {} ({} lines)",
             rel(&path, &ctx.cwd).display(),
             content.lines().count()
+        ))
+    }
+}
+
+// -------------------------------------------------------------- append
+
+pub struct AppendTool;
+
+#[async_trait]
+impl Tool for AppendTool {
+    fn name(&self) -> &str {
+        "append"
+    }
+
+    fn batch_policy(&self) -> BatchPolicy {
+        BatchPolicy::ParallelPerFile
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let changes = inputs.len();
+        let files: HashSet<&str> = inputs
+            .iter()
+            .filter_map(|input| input["path"].as_str())
+            .collect();
+        if changes == files.len() {
+            format!(
+                "Append {changes} {}",
+                if changes == 1 { "file" } else { "files" }
+            )
+        } else {
+            format!(
+                "Append {changes} changes across {} {}",
+                files.len(),
+                if files.len() == 1 { "file" } else { "files" }
+            )
+        }
+    }
+
+    fn description(&self) -> &str {
+        "Append text to the end of a UTF-8 file, written exactly as given — \
+         no newline is added for you, so start with '\\n' if the file's last \
+         line must remain intact. Appending to an existing file requires \
+         having read its current version (a partial read counts); a missing \
+         file is created. For insertion in the middle of a file use `edit`."
+    }
+
+    fn input_schema(&self) -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "content": { "type": "string" }
+            },
+            "required": ["path", "content"]
+        })
+    }
+
+    fn permission(&self, input: &Value) -> PermissionRequest {
+        let path = input["path"].as_str().unwrap_or("?");
+        PermissionRequest::Ask {
+            descriptor: format!("append({path})"),
+            aliases: Vec::new(),
+            summary: format!(
+                "append {} bytes to {path}",
+                input["content"].as_str().map_or(0, |c| c.len())
+            ),
+            is_edit: true,
+        }
+    }
+
+    fn auto_safety(&self, _input: &Value) -> AutoSafety {
+        AutoSafety::AllowInProjectOrScratchEdit
+    }
+
+    fn touches(&self, input: &Value) -> Option<String> {
+        input["path"].as_str().map(String::from)
+    }
+
+    fn context_paths(&self, input: &Value) -> Vec<String> {
+        input["path"]
+            .as_str()
+            .map(String::from)
+            .into_iter()
+            .collect()
+    }
+
+    fn is_mutating(&self) -> bool {
+        true
+    }
+
+    async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
+        let (Some(path_str), Some(content)) = (input["path"].as_str(), input["content"].as_str())
+        else {
+            return ToolOutput::err("missing required parameters: path, content");
+        };
+        if content.is_empty() {
+            return ToolOutput::err("content must not be empty");
+        }
+        let path = ctx.resolve(path_str);
+        let old = match tokio::fs::read(&path).await {
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => text,
+                Err(_) => {
+                    return ToolOutput::err(format!(
+                        "{} is not valid UTF-8; append only supports text files \
+                         and will not extend bytes lossily",
+                        rel(&path, &ctx.cwd).display()
+                    ));
+                }
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Missing file: create it. Everything in it is model-authored,
+                // so the new version counts as fully seen.
+                if let Some(parent) = path.parent() {
+                    if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                        return ToolOutput::err(format!("cannot create {}: {e}", parent.display()));
+                    }
+                }
+                if let Err(error) = write_with_windows_retry(&path, content.as_bytes()).await {
+                    return ToolOutput::err(write_error(&path, &error));
+                }
+                ctx.freshness
+                    .lock()
+                    .expect("freshness lock")
+                    .record_write(&path, content_hash(content.as_bytes()));
+                let lines: Vec<&str> = content.lines().collect();
+                let count = lines.len();
+                let snippet = numbered(&lines, 1);
+                return ToolOutput::ok(format!(
+                    "created new file {} ({count} line{}). Result:\n{snippet}",
+                    rel(&path, &ctx.cwd).display(),
+                    if count == 1 { "" } else { "s" },
+                ));
+            }
+            Err(e) => return ToolOutput::err(format!("cannot read {}: {e}", path.display())),
+        };
+        // Gate: the model must have seen the current version (a partial read
+        // counts — append destroys nothing, it only needs to know what it is
+        // extending). Lock scope: see the note in `write`.
+        let visibility = {
+            let freshness = ctx.freshness.lock().expect("freshness lock");
+            freshness.visibility(&path, content_hash(old.as_bytes()))
+        };
+        match visibility {
+            Visibility::Full | Visibility::Partial(_) => {}
+            Visibility::Stale => {
+                return ToolOutput::err(format!(
+                    "{} changed on disk since you last read it; re-read it \
+                     before appending.",
+                    rel(&path, &ctx.cwd).display()
+                ));
+            }
+            Visibility::Unseen => {
+                return ToolOutput::err(format!(
+                    "{} already exists and you have not read its current version; \
+                     read it (even partially) before appending so you know what \
+                     you are extending.",
+                    rel(&path, &ctx.cwd).display()
+                ));
+            }
+        }
+        // Read-modify-write rather than OpenOptions::append: the old bytes are
+        // already in hand for the gate, and this reuses the Windows retry
+        // path. The gate-to-write race is the same accepted exposure as
+        // write/edit; same-file batch calls are lane-serialized.
+        let new_text = format!("{old}{content}");
+        if let Err(error) = write_with_windows_retry(&path, new_text.as_bytes()).await {
+            return ToolOutput::err(write_error(&path, &error));
+        }
+        let old_lines = old.lines().count();
+        let merged = !(old.is_empty() || old.ends_with('\n'));
+        let appended_start = if merged { old_lines } else { old_lines + 1 };
+        let new_total = new_text.lines().count().max(appended_start);
+        // Echo the tail so the model sees where its text landed: the appended
+        // lines plus up to 3 lines of prior context.
+        let start = appended_start.saturating_sub(3).max(1);
+        // Record what reaches the model: the appendix plus the echoed context
+        // lines, under the new hash. Prior visibility carries forward inside
+        // `record_append`; a partial view never silently becomes full.
+        ctx.freshness.lock().expect("freshness lock").record_append(
+            &path,
+            content_hash(new_text.as_bytes()),
+            (start, new_total),
+        );
+        let shown: Vec<&str> = new_text.lines().skip(start - 1).collect();
+        let snippet = numbered(&shown, start);
+        let count = content.lines().count();
+        let merge_note = if merged {
+            "\nnote: the file did not end with a newline; the appended text \
+             continues its last line."
+        } else {
+            ""
+        };
+        ToolOutput::ok(format!(
+            "appended {count} line{} to {} (now {new_total} lines).{merge_note} Result:\n{snippet}",
+            if count == 1 { "" } else { "s" },
+            rel(&path, &ctx.cwd).display(),
         ))
     }
 }
@@ -748,11 +968,6 @@ impl Tool for EditTool {
         if let Err(error) = write_with_windows_retry(&path, new_text.as_bytes()).await {
             return ToolOutput::err(write_error(&path, &error));
         }
-        // `edit` proves and changes one exact region, but it does not make the
-        // rest of the current file visible to the model. Do not call
-        // `record_write` here: that marks the whole file as seen and would let
-        // a later offset read incorrectly return an unchanged stub.
-
         // Show the edited region so the model sees the result without
         // re-reading the file. Everything before the first replacement is
         // untouched, so its offset in the new text is the one the plan already
@@ -762,6 +977,28 @@ impl Tool for EditTool {
         let window = plan.new.lines().count() + 5;
         let shown: Vec<&str> = new_text.lines().skip(start - 1).take(window).collect();
         let snippet = numbered(&shown, start);
+        // Record exactly what reached the model: the snippet above, under the
+        // new content hash (same principle as `read`). Not `record_write` —
+        // that would mark the whole file as seen and let a later offset read
+        // incorrectly return an unchanged stub. `record_read` clears the old
+        // version's ranges, which is the conservative truth: line numbers
+        // after the edit point may have shifted. Without this record the
+        // stored hash would stay stale and `append`/`write` gates would
+        // mistake our own edit for an external change.
+        if !shown.is_empty() {
+            let shown_end = start + shown.len() - 1;
+            let range = if start == 1 && shown_end >= new_text.lines().count() {
+                None
+            } else {
+                Some((start, shown_end))
+            };
+            // Lock scope: see the note in `write`.
+            ctx.freshness.lock().expect("freshness lock").record_read(
+                &path,
+                content_hash(new_text.as_bytes()),
+                range,
+            );
+        }
         ToolOutput::ok(format!(
             "edited {} ({} replacement{}). Result:\n{snippet}",
             rel(&path, &ctx.cwd).display(),
@@ -1894,5 +2131,306 @@ assert_eq!(
         assert!(again.content.contains("unchanged"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn append_test_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tcode-append-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    async fn run_append(ctx: &ToolCtx, path: &str, content: &str) -> ToolOutput {
+        AppendTool
+            .run(
+                json!({ "path": path, "content": content }),
+                ctx,
+                &CancellationToken::new(),
+            )
+            .await
+    }
+
+    async fn run_read(ctx: &ToolCtx, input: Value) -> ToolOutput {
+        ReadTool.run(input, ctx, &CancellationToken::new()).await
+    }
+
+    #[tokio::test]
+    async fn append_creates_missing_file_with_parents_and_notes_it() {
+        let dir = append_test_dir("create");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = run_append(&ctx, "sub/new.txt", "one\ntwo\n").await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("created new file"), "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("sub/new.txt")).unwrap(),
+            "one\ntwo\n"
+        );
+
+        // Fully model-authored: a follow-up read dedupes to a stub.
+        let read = run_read(&ctx, json!({ "path": "sub/new.txt" })).await;
+        assert!(read.content.starts_with("unchanged:"), "{}", read.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_adds_exact_bytes_without_auto_newline() {
+        let dir = append_test_dir("bytes");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let file = dir.join("log.txt");
+        std::fs::write(&file, "line\n").unwrap();
+        run_read(&ctx, json!({ "path": "log.txt" })).await;
+        let out = run_append(&ctx, "log.txt", "tail").await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line\ntail");
+        assert!(!out.content.contains("did not end with a newline"));
+
+        // No trailing newline: the appendix continues the last line.
+        let out = run_append(&ctx, "log.txt", "-more\n").await;
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "line\ntail-more\n");
+        assert!(
+            out.content.contains("did not end with a newline"),
+            "{}",
+            out.content
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_after_partial_read_succeeds_but_write_stays_gated() {
+        let dir = append_test_dir("partial");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("big.txt");
+        let body = (1..=300)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &body).unwrap();
+
+        let read = run_read(&ctx, json!({ "path": "big.txt", "offset": 1, "limit": 10 })).await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let out = run_append(&ctx, "big.txt", "line 301\n").await;
+        assert!(!out.is_error, "{}", out.content);
+        assert!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .ends_with("line 301\n"),
+            "appendix must land at the end"
+        );
+        assert!(out.content.contains("line 301"), "{}", out.content);
+
+        // The partial view must not let a whole-file overwrite through.
+        let write = WriteTool
+            .run(
+                json!({ "path": "big.txt", "content": "gone" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(write.is_error, "{}", write.content);
+        assert!(
+            write.content.contains("only seen lines"),
+            "{}",
+            write.content
+        );
+        assert!(std::fs::read_to_string(&file)
+            .unwrap()
+            .ends_with("line 301\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_refuses_without_prior_read() {
+        let dir = append_test_dir("unread");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("seen.txt");
+        std::fs::write(&file, "original\n").unwrap();
+
+        let out = run_append(&ctx, "seen.txt", "extra\n").await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(
+            out.content.contains("have not read its current version"),
+            "{}",
+            out.content
+        );
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "original\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_refuses_when_file_changed_on_disk() {
+        let dir = append_test_dir("stale");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("watched.txt");
+        std::fs::write(&file, "original\n").unwrap();
+        run_read(&ctx, json!({ "path": "watched.txt" })).await;
+
+        std::fs::write(&file, "external change\n").unwrap();
+        let out = run_append(&ctx, "watched.txt", "extra\n").await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("changed on disk"), "{}", out.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "external change\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_rejects_empty_content_and_non_utf8_files() {
+        let dir = append_test_dir("reject");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+        let out = run_append(&ctx, "any.txt", "").await;
+        assert!(out.is_error);
+        assert!(out.content.contains("content must not be empty"));
+
+        let bin = dir.join("data.bin");
+        let original = b"before\xffafter";
+        std::fs::write(&bin, original).unwrap();
+        let out = run_append(&ctx, "data.bin", "tail").await;
+        assert!(out.is_error, "{}", out.content);
+        assert!(out.content.contains("not valid UTF-8"), "{}", out.content);
+        assert_eq!(std::fs::read(&bin).unwrap(), original);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_after_full_read_lets_write_overwrite() {
+        let dir = append_test_dir("full");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("small.txt");
+        std::fs::write(&file, "a\nb\n").unwrap();
+        run_read(&ctx, json!({ "path": "small.txt" })).await;
+
+        let out = run_append(&ctx, "small.txt", "c\n").await;
+        assert!(!out.is_error, "{}", out.content);
+
+        // Full sight carried forward: overwrite is allowed.
+        let write = WriteTool
+            .run(
+                json!({ "path": "small.txt", "content": "rewritten\n" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!write.is_error, "{}", write.content);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "rewritten\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn read_then_edit_then_append_flow_works() {
+        let dir = append_test_dir("flow");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("flow.txt");
+        let body = (1..=100)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &body).unwrap();
+
+        let read = run_read(
+            &ctx,
+            json!({ "path": "flow.txt", "offset": 1, "limit": 20 }),
+        )
+        .await;
+        assert!(!read.is_error, "{}", read.content);
+
+        let edited = EditTool
+            .run(
+                json!({
+                    "path": "flow.txt",
+                    "old_string": "line 5\n",
+                    "new_string": "changed 5\n",
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!edited.is_error, "{}", edited.content);
+
+        // Our own edit must not read as an external change.
+        let out = run_append(&ctx, "flow.txt", "line 101\n").await;
+        assert!(!out.is_error, "{}", out.content);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("changed 5\n"));
+        assert!(text.ends_with("line 101\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_does_not_mark_unseen_middle_as_read() {
+        let dir = append_test_dir("middle");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("many.txt");
+        let body = (1..=300)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &body).unwrap();
+
+        run_read(
+            &ctx,
+            json!({ "path": "many.txt", "offset": 1, "limit": 10 }),
+        )
+        .await;
+        let out = run_append(&ctx, "many.txt", "line 301\n").await;
+        assert!(!out.is_error, "{}", out.content);
+
+        // The never-seen middle still returns content, not a stub.
+        let middle = run_read(
+            &ctx,
+            json!({ "path": "many.txt", "offset": 150, "limit": 10 }),
+        )
+        .await;
+        assert!(middle.content.contains("line 150"), "{}", middle.content);
+        assert!(
+            !middle.content.starts_with("unchanged:"),
+            "{}",
+            middle.content
+        );
+
+        // The appended tail was echoed already: re-reading it dedupes.
+        let tail = run_read(
+            &ctx,
+            json!({ "path": "many.txt", "offset": 299, "limit": 3 }),
+        )
+        .await;
+        assert!(tail.content.starts_with("unchanged:"), "{}", tail.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn append_snippet_is_anchored_at_the_append_point() {
+        let dir = append_test_dir("snippet");
+        let ctx = ToolCtx::new(dir.clone(), 10_000);
+        let file = dir.join("anchor.txt");
+        let body = (1..=50)
+            .map(|line| format!("line {line}\n"))
+            .collect::<String>();
+        std::fs::write(&file, &body).unwrap();
+        run_read(&ctx, json!({ "path": "anchor.txt" })).await;
+
+        let out = run_append(&ctx, "anchor.txt", "line 51\n").await;
+        assert!(!out.is_error, "{}", out.content);
+        // Snippet starts at most 3 lines before the appendix (line 48)...
+        assert!(out.content.contains("    48\tline 48"), "{}", out.content);
+        // ...and does not replay the whole file.
+        assert!(!out.content.contains("line 1\n"), "{}", out.content);
+        assert!(out.content.contains("    51\tline 51"), "{}", out.content);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_permission_is_an_edit() {
+        let request = AppendTool.permission(&json!({ "path": "a.txt", "content": "x" }));
+        let PermissionRequest::Ask {
+            descriptor,
+            is_edit,
+            ..
+        } = request
+        else {
+            panic!("append must ask for permission");
+        };
+        assert_eq!(descriptor, "append(a.txt)");
+        assert!(is_edit, "append must auto-allow in accept-edits mode");
     }
 }

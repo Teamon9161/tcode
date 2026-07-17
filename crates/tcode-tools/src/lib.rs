@@ -48,6 +48,7 @@ pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs_tools::ReadTool),
         Arc::new(fs_tools::WriteTool),
+        Arc::new(fs_tools::AppendTool),
         Arc::new(fs_tools::EditTool),
         Arc::new(search::GrepTool),
         Arc::new(search::GlobTool),
