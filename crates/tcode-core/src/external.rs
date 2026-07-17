@@ -94,6 +94,9 @@ pub fn import_external_session(
         store,
         ledger,
         checkpoints: Vec::new(),
+        startup: None,
+        environment: None,
+        delivered_environment: None,
     })
 }
 

@@ -8,6 +8,7 @@ mod app;
 mod approval;
 mod diff;
 mod editor;
+mod folder_trust_picker;
 mod live_panel;
 mod markdown;
 mod mathfmt;
@@ -36,8 +37,10 @@ use crossterm::terminal::{
 use tcode_core::{Agent, Session};
 
 pub use app::App;
-pub use model_picker::{AgentMenu, ModelMenu, ModelOption, PinFn, SwitchFn};
-pub use tcode_core::commands::OpeningContextFn;
+pub use model_picker::{
+    AgentMenu, AgentModelChoice, AgentRole, ModelMenu, ModelOption, PinFn, SwitchFn,
+};
+pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
 
 pub enum Exit {
     Quit,
@@ -55,6 +58,7 @@ pub async fn run(
     menu: ModelMenu,
     agents: AgentMenu,
     opening_context: OpeningContextFn,
+    environment: EnvironmentFn,
     show_reasoning: bool,
     skills: Vec<tcode_tools::Skill>,
 ) -> anyhow::Result<Exit> {
@@ -80,6 +84,7 @@ pub async fn run(
         menu,
         agents,
         opening_context,
+        environment,
         show_reasoning,
         skills,
     ) {

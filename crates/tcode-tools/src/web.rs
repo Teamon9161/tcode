@@ -1,17 +1,20 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::sinks::UTF8;
-use grep_searcher::SearcherBuilder;
 use reqwest::Url;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{
+    ActiveModel, ContentBlock, DelegateEvent, Message, PermissionRequest, Request, Role,
+    StreamEvent, Tool, ToolCtx, ToolOutput,
+};
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 const SEARCH_TIMEOUT: Duration = Duration::from_secs(25);
@@ -24,6 +27,13 @@ const CACHE_MAX_ENTRIES: usize = 32;
 /// find_in_page output caps.
 const FIND_MAX_BYTES: usize = 8 * 1024;
 const FIND_MAX_LINE_CHARS: usize = 300;
+/// Context lines shown around each `pattern` hit, grep -C style.
+const FIND_CONTEXT_LINES: usize = 2;
+/// Extraction that yields less text than this is judged a false positive
+/// (link hub, index page) and the full-page conversion is used instead.
+const EXTRACT_MIN_CHARS: usize = 500;
+/// Cap on the page text sent to the `fetch` summarizer model.
+const SUMMARY_INPUT_MAX_CHARS: usize = 96_000;
 /// Bound the LLM-optimized text Exa returns per search.
 const EXA_CONTEXT_CHARS: u64 = 8000;
 
@@ -181,7 +191,152 @@ fn html_to_markdown(html: &str) -> String {
             .skip_tags(vec!["script", "style", "head", "nav", "footer", "iframe"])
             .build()
     });
-    converter.convert(html).unwrap_or_else(|_| html.to_string())
+    slim_markdown(&converter.convert(html).unwrap_or_else(|_| html.to_string()))
+}
+
+/// Remove formatting bytes that help a terminal Markdown renderer but waste
+/// context: htmd pads table cells to a display width, and link titles repeat
+/// prose that is neither a destination nor visible link text.
+fn slim_markdown(markdown: &str) -> String {
+    strip_link_titles(markdown)
+        .split('\n')
+        .map(slim_table_row)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn slim_table_row(line: &str) -> String {
+    let (line, cr) = match line.strip_suffix('\r') {
+        Some(line) => (line, "\r"),
+        None => (line, ""),
+    };
+    let indent = &line[..line.len() - line.trim_start().len()];
+    let trimmed = line.trim();
+    if !trimmed.starts_with('|') || !trimmed.ends_with('|') || trimmed.len() < 2 {
+        return format!("{line}{cr}");
+    }
+
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for ch in trimmed[1..trimmed.len() - 1].chars() {
+        if ch == '|' && !escaped {
+            cells.push(cell.trim().to_string());
+            cell.clear();
+        } else {
+            cell.push(ch);
+        }
+        escaped = ch == '\\' && !escaped;
+        if ch != '\\' {
+            escaped = false;
+        }
+    }
+    cells.push(cell.trim().to_string());
+    format!("{indent}| {} |{cr}", cells.join(" | "))
+}
+
+fn strip_link_titles(markdown: &str) -> String {
+    let chars: Vec<char> = markdown.chars().collect();
+    let mut out = String::with_capacity(markdown.len());
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == ']' && chars.get(i + 1) == Some(&'(') {
+            out.push_str("](");
+            i += 2;
+            let start = i;
+            let mut depth = 0;
+            let mut escaped = false;
+            while i < chars.len() {
+                match chars[i] {
+                    '(' if !escaped => depth += 1,
+                    ')' if !escaped && depth == 0 => break,
+                    ')' if !escaped => depth -= 1,
+                    _ => {}
+                }
+                escaped = chars[i] == '\\' && !escaped;
+                if chars[i] != '\\' {
+                    escaped = false;
+                }
+                i += 1;
+            }
+            if i == chars.len() {
+                out.extend(chars[start..].iter());
+                break;
+            }
+            out.push_str(&strip_link_title(
+                &chars[start..i].iter().collect::<String>(),
+            ));
+            out.push(')');
+        } else {
+            out.push(chars[i]);
+        }
+        i += 1;
+    }
+    out
+}
+
+fn strip_link_title(destination: &str) -> String {
+    let mut in_angle_destination = false;
+    for (index, ch) in destination.char_indices() {
+        match ch {
+            '<' => in_angle_destination = true,
+            '>' => in_angle_destination = false,
+            _ if ch.is_whitespace() && !in_angle_destination => {
+                let title = destination[index..].trim_start();
+                if matches!(title.chars().next(), Some('"' | '\'' | '(')) {
+                    return destination[..index].trim_end().to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    destination.to_string()
+}
+
+/// Readability-style main-content extraction: most pages are mostly chrome
+/// (navigation, sidebars, cookie banners) that htmd's tag skip-list cannot
+/// catch because modern sites build it from divs. Returns None when the page
+/// does not look like an article or the extraction gutted it, in which case
+/// the caller falls back to full-page conversion.
+fn extract_main_content(html: &str, url: &str) -> Option<String> {
+    let mut readability = dom_smoothie::Readability::new(html, Some(url), None).ok()?;
+    if !readability.is_probably_readable() {
+        return None;
+    }
+    let article = readability.parse().ok()?;
+    if article.text_content.chars().count() < EXTRACT_MIN_CHARS {
+        return None;
+    }
+    let markdown = html_to_markdown(&article.content);
+    let title = article.title.trim();
+    if title.is_empty() || markdown.starts_with('#') {
+        Some(markdown)
+    } else {
+        Some(format!("# {title}\n\n{markdown}"))
+    }
+}
+
+/// Full page-processing pipeline: content-type rendering plus, for HTML,
+/// main-content extraction. Pure CPU — callers run it on a blocking thread.
+/// Returns the text and whether extraction (not full conversion) produced it.
+fn process_page(
+    content_type: &str,
+    body: &str,
+    url: &str,
+    want_raw: bool,
+) -> Result<(String, bool), String> {
+    let is_html = content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .contains("html");
+    if is_html && !want_raw {
+        if let Some(main) = extract_main_content(body, url) {
+            return Ok((main, true));
+        }
+    }
+    render_body(content_type, body).map(|text| (text, false))
 }
 
 /// Convert a response body to model-readable text based on content type.
@@ -214,6 +369,17 @@ struct Cached {
     at: Instant,
     final_url: String,
     text: String,
+    extracted: bool,
+}
+
+/// Raw and extracted views of the same URL are different texts, so the raw
+/// flag is part of the key.
+fn cache_key(url: &str, want_raw: bool) -> String {
+    if want_raw {
+        format!("raw\u{0}{url}")
+    } else {
+        url.to_string()
+    }
 }
 
 fn page_cache() -> &'static Mutex<HashMap<String, Cached>> {
@@ -221,84 +387,246 @@ fn page_cache() -> &'static Mutex<HashMap<String, Cached>> {
     C.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn cache_get(url: &str) -> Option<(String, String)> {
+fn cache_get(key: &str) -> Option<(String, String, bool)> {
     let mut c = page_cache().lock().expect("cache lock");
-    match c.get(url) {
-        Some(e) if e.at.elapsed() < CACHE_TTL => Some((e.final_url.clone(), e.text.clone())),
+    match c.get(key) {
+        Some(e) if e.at.elapsed() < CACHE_TTL => {
+            Some((e.final_url.clone(), e.text.clone(), e.extracted))
+        }
         Some(_) => {
-            c.remove(url);
+            c.remove(key);
             None
         }
         None => None,
     }
 }
 
-fn cache_put(url: &str, final_url: String, text: String) {
+fn cache_put(key: &str, final_url: String, text: String, extracted: bool) {
     let mut c = page_cache().lock().expect("cache lock");
-    if c.len() >= CACHE_MAX_ENTRIES && !c.contains_key(url) {
+    if c.len() >= CACHE_MAX_ENTRIES && !c.contains_key(key) {
         if let Some(oldest) = c.iter().min_by_key(|(_, e)| e.at).map(|(k, _)| k.clone()) {
             c.remove(&oldest);
         }
     }
     c.insert(
-        url.to_string(),
+        key.to_string(),
         Cached {
             at: Instant::now(),
             final_url,
             text,
+            extracted,
         },
     );
 }
 
 // ------------------------------------------------------------ find_in_page
 
-/// Return only the lines of `text` matching `pattern` (regex), each capped,
-/// with the whole result byte-bounded — the token-cheap alternative to
-/// dumping a whole page.
+/// Return the lines of `text` matching `pattern` (regex) with a little
+/// context around each hit, grep -C style: `N:` marks a match, `N-` marks a
+/// context line, `…` separates blocks. Every line is capped and the whole
+/// result byte-bounded — the token-cheap alternative to dumping a whole page.
 fn find_in_page(text: &str, pattern: &str) -> Result<String, String> {
     let matcher = RegexMatcherBuilder::new()
         .case_insensitive(true)
         .build(pattern)
         .map_err(|e| format!("invalid pattern regex: {e}"))?;
-    let mut searcher = SearcherBuilder::new().line_number(true).build();
-    let mut out = String::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut hit = vec![false; lines.len()];
     let mut hits = 0usize;
-    let _ = searcher.search_slice(
-        &matcher,
-        text.as_bytes(),
-        UTF8(|lnum, line| {
-            let trimmed = line.trim_end();
-            let clipped: String = if trimmed.chars().count() > FIND_MAX_LINE_CHARS {
-                trimmed
-                    .chars()
-                    .take(FIND_MAX_LINE_CHARS)
-                    .collect::<String>()
-                    + "…"
-            } else {
-                trimmed.to_string()
-            };
-            out.push_str(&format!("{lnum}: {clipped}\n"));
+    for (i, line) in lines.iter().enumerate() {
+        if matcher.is_match(line.as_bytes()).unwrap_or(false) {
+            hit[i] = true;
             hits += 1;
-            Ok(out.len() < FIND_MAX_BYTES)
-        }),
-    );
+        }
+    }
     if hits == 0 {
         return Err(format!(
             "pattern /{pattern}/ not found in page (fetch without pattern to see the full content)"
         ));
     }
+    let mut keep = vec![false; lines.len()];
+    for i in hit.iter().enumerate().filter(|(_, h)| **h).map(|(i, _)| i) {
+        let start = i.saturating_sub(FIND_CONTEXT_LINES);
+        let end = (i + FIND_CONTEXT_LINES).min(lines.len() - 1);
+        keep[start..=end].fill(true);
+    }
+    let mut out = String::new();
+    let mut in_block = false;
+    for (i, line) in lines.iter().enumerate() {
+        if !keep[i] {
+            in_block = false;
+            continue;
+        }
+        if !in_block && !out.is_empty() {
+            out.push_str("…\n");
+        }
+        in_block = true;
+        let trimmed = line.trim_end();
+        let clipped: String = if trimmed.chars().count() > FIND_MAX_LINE_CHARS {
+            trimmed
+                .chars()
+                .take(FIND_MAX_LINE_CHARS)
+                .collect::<String>()
+                + "…"
+        } else {
+            trimmed.to_string()
+        };
+        let sep = if hit[i] { ':' } else { '-' };
+        out.push_str(&format!("{}{sep} {clipped}\n", i + 1));
+        if out.len() >= FIND_MAX_BYTES {
+            out.push_str("… [more matches truncated]\n");
+            break;
+        }
+    }
     Ok(out)
 }
 
-fn fetch_output(final_url: &str, text: &str, pattern: Option<&str>) -> ToolOutput {
+fn fetch_output(final_url: &str, text: &str, pattern: Option<&str>, extracted: bool) -> ToolOutput {
+    // Extraction is lossy on purpose; the header always says so and names the
+    // way back (raw=true), so the model never has to guess why content is gone.
+    let mut notes: Vec<String> = Vec::new();
+    if extracted {
+        notes.push("main content; raw=true for the full page".into());
+    }
     match pattern {
-        Some(p) => match find_in_page(text, p) {
-            Ok(hits) => ToolOutput::ok(format!(
-                "URL: {final_url}  (lines matching /{p}/)\n\n{hits}"
-            )),
-            Err(e) => ToolOutput::err(format!("{final_url}: {e}")),
-        },
-        None => ToolOutput::ok(format!("URL: {final_url}\n\n{}", text.trim())),
+        Some(p) => {
+            notes.push(format!("lines matching /{p}/"));
+            match find_in_page(text, p) {
+                Ok(hits) => ToolOutput::ok(format!(
+                    "URL: {final_url}  ({})\n\n{hits}",
+                    notes.join("; ")
+                )),
+                Err(e) => ToolOutput::err(format!("{final_url}: {e}")),
+            }
+        }
+        None => {
+            let suffix = if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  ({})", notes.join("; "))
+            };
+            ToolOutput::ok(format!("URL: {final_url}{suffix}\n\n{}", text.trim()))
+        }
+    }
+}
+
+// ---------------------------------------------------------- fetch summarizer
+
+const SUMMARY_SYSTEM: &str = include_str!("../../../prompts/web-fetch-summary.md");
+static FETCH_RUN: AtomicU64 = AtomicU64::new(0);
+
+/// Save the full page text under the session scratchpad so a summarized fetch
+/// always leaves the unabridged original within `read`/`grep` reach.
+async fn save_page_text(ctx: &ToolCtx, run: u64, host: &str, text: &str) -> Option<String> {
+    let dir = ctx.scratch_dir.join("tool-output");
+    tokio::fs::create_dir_all(&dir).await.ok()?;
+    let safe: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("web-{run:03}-{safe}.md"));
+    tokio::fs::write(&path, text).await.ok()?;
+    Some(path.display().to_string())
+}
+
+/// Save a binary download under the session scratchpad when `web_fetch` cannot
+/// render it. The model gets an exact path rather than an opaque content-type
+/// failure, so it can choose an available local converter.
+async fn save_binary_download(
+    ctx: &ToolCtx,
+    run: u64,
+    host: &str,
+    extension: &str,
+    bytes: &[u8],
+) -> Result<String, String> {
+    let dir = ctx.scratch_dir.join("tool-output");
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        format!(
+            "could not create scratch output directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    let safe: String = host
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let path = dir.join(format!("web-{run:03}-{safe}.{extension}"));
+    tokio::fs::write(&path, bytes)
+        .await
+        .map_err(|e| format!("could not save download to {}: {e}", path.display()))?;
+    Ok(path.display().to_string())
+}
+
+/// One-shot delegation: the pinned `fetch` model reads the page and answers
+/// `prompt`; only that answer travels back to the caller. Same skeleton as
+/// `view_image` — own cache scope, usage reported through the delegate channel.
+async fn summarize_page(
+    model: &ActiveModel,
+    run: u64,
+    final_url: &str,
+    text: &str,
+    prompt: &str,
+    ctx: &ToolCtx,
+    cancel: &CancellationToken,
+) -> Result<String, String> {
+    let truncated = text.chars().count() > SUMMARY_INPUT_MAX_CHARS;
+    let body: String = if truncated {
+        let cut: String = text.chars().take(SUMMARY_INPUT_MAX_CHARS).collect();
+        format!("{cut}\n[page text truncated here]")
+    } else {
+        text.to_string()
+    };
+    let request = Request {
+        model: model.provider.model().to_string(),
+        system: SUMMARY_SYSTEM.to_string(),
+        system_suffix: None,
+        cache_scope: Some(format!("fetch-{run}")),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: format!("Page: {final_url}\n\n{body}\n\n---\nQuestion: {prompt}"),
+            }],
+        }],
+        tools: Vec::new(),
+        max_tokens: model.max_tokens.min(2048),
+        effort: model.effort.clone(),
+    };
+    let mut stream = model
+        .provider
+        .stream(request, cancel.clone())
+        .await
+        .map_err(|e| format!("fetch model request failed: {e}"))?;
+    let mut answer = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(delta)) => answer.push_str(&delta),
+            Ok(StreamEvent::Usage(usage)) => {
+                if let Some(reporter) = ctx.delegate_reporter() {
+                    let _ = reporter.send(DelegateEvent::Usage(usage));
+                }
+            }
+            Err(e) => return Err(format!("fetch model request failed: {e}")),
+            _ => {}
+        }
+    }
+    if cancel.is_cancelled() {
+        Err("fetch cancelled by user".into())
+    } else if answer.trim().is_empty() {
+        Err("fetch model returned no text".into())
+    } else {
+        Ok(answer)
     }
 }
 
@@ -313,14 +641,17 @@ impl Tool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch a URL over http(s) and return its content; HTML is converted \
-         to markdown. Pass `pattern` (a regex) to get back only the matching \
-         lines instead of the whole page — do this when you are looking for \
-         something specific, it is far cheaper. Large pages are truncated and \
-         the full copy saved to a file you can read or grep. A redirect to a \
-         different site is not \
-         followed automatically — you get the target URL and can fetch it \
-         explicitly. Responses are cached for 15 minutes."
+        "Fetch a URL over http(s); HTML is reduced to its main content as \
+         markdown (raw=true keeps the whole page). Pass `pattern` (a regex) \
+         to get back only matching lines with context — do this when you are \
+         looking for something specific, it is far cheaper. Pass `prompt` to \
+         have a separate fetch model answer it from the page, so only the \
+         answer enters your context and the full text lands in a file. Large \
+         pages are truncated and the full copy saved to a file you can read \
+         or grep. PDFs are saved as original bytes in scratch with a conversion \
+         suggestion. A redirect to a different site is not followed \
+         automatically — you get the target URL and can fetch it explicitly. \
+         Responses are cached for 15 minutes."
     }
 
     fn input_schema(&self) -> Value {
@@ -328,7 +659,9 @@ impl Tool for WebFetchTool {
             "type": "object",
             "properties": {
                 "url": { "type": "string", "description": "Full http(s) URL" },
-                "pattern": { "type": "string", "description": "Optional regex; return only matching lines" }
+                "pattern": { "type": "string", "description": "Optional regex; return only matching lines with context" },
+                "prompt": { "type": "string", "description": "Optional self-contained question or extraction instruction answered from the page by the configured fetch model; without one the full content is returned instead" },
+                "raw": { "type": "boolean", "description": "Skip main-content extraction (use when stripped parts like navigation or comments matter)" }
             },
             "required": ["url"]
         })
@@ -348,57 +681,149 @@ impl Tool for WebFetchTool {
         }
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
-        let Some(raw) = input["url"].as_str() else {
+    async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
+        let Some(raw_url) = input["url"].as_str() else {
             return ToolOutput::err("missing required parameter: url");
         };
         let pattern = input["pattern"].as_str().filter(|p| !p.is_empty());
-        let url = match parse_url(raw) {
+        let prompt = input["prompt"]
+            .as_str()
+            .map(str::trim)
+            .filter(|p| !p.is_empty());
+        let want_raw = input["raw"].as_bool().unwrap_or(false);
+        if pattern.is_some() && prompt.is_some() {
+            return ToolOutput::err(
+                "pass either `pattern` (free regex filter) or `prompt` (model summary), not both",
+            );
+        }
+        let url = match parse_url(raw_url) {
             Ok(u) => u,
             Err(e) => return ToolOutput::err(e),
         };
 
-        if let Some((final_url, text)) = cache_get(raw) {
-            return fetch_output(&final_url, &text, pattern);
-        }
+        let key = cache_key(raw_url, want_raw);
+        let (final_url, text, extracted) = match cache_get(&key) {
+            Some(hit) => hit,
+            None => {
+                let (final_url, resp) = match get_following(url, false, cancel).await {
+                    Ok(Fetched::Response(u, r)) => (u, r),
+                    Ok(Fetched::CrossHostRedirect { from, to }) => {
+                        return ToolOutput::ok(format!(
+                            "{from} redirects to a different site: {to}\nNot followed \
+                             automatically. Call web_fetch with that exact URL to fetch it."
+                        ));
+                    }
+                    Err(e) => return ToolOutput::err(e),
+                };
+                let status = resp.status();
+                let content_type = resp
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("")
+                    .to_string();
+                let bytes = match read_capped(resp, MAX_BODY_BYTES, cancel).await {
+                    Ok(b) => b,
+                    Err(e) => return ToolOutput::err(format!("{final_url}: {e}")),
+                };
+                if status.is_success()
+                    && content_type
+                        .split(';')
+                        .next()
+                        .is_some_and(|ct| ct.trim().eq_ignore_ascii_case("application/pdf"))
+                {
+                    let run = FETCH_RUN.fetch_add(1, Ordering::Relaxed);
+                    let host = final_url.host_str().unwrap_or("download");
+                    return match save_binary_download(ctx, run, host, "pdf", &bytes).await {
+                        Ok(path) => ToolOutput::err(format!(
+                            "{final_url} is a PDF, which web_fetch does not extract yet. Saved the original bytes to {path}. Use the shell tool to convert it to text (for example: pdftotext \"{path}\" -), then read the result."
+                        )),
+                        Err(e) => ToolOutput::err(format!(
+                            "{final_url} is a PDF, which web_fetch does not extract yet; {e}."
+                        )),
+                    };
+                }
+                let body = String::from_utf8_lossy(&bytes).into_owned();
+                if !status.is_success() {
+                    let mut msg = format!("{final_url} answered HTTP {status}");
+                    let text = render_body(&content_type, &body).unwrap_or_default();
+                    let trimmed: String = text.chars().take(500).collect();
+                    if !trimmed.trim().is_empty() {
+                        msg.push_str(&format!("\n{trimmed}"));
+                    }
+                    return ToolOutput::err(msg);
+                }
+                // Readability + markdown conversion are pure CPU and heavy on
+                // big pages; do not stall the runtime (or a parallel batch).
+                let final_url_str = final_url.to_string();
+                let processed = tokio::task::spawn_blocking(move || {
+                    process_page(&content_type, &body, &final_url_str, want_raw)
+                        .map(|(text, extracted)| (final_url_str, text, extracted))
+                })
+                .await;
+                match processed {
+                    Ok(Ok((final_url, text, extracted))) => {
+                        cache_put(&key, final_url.clone(), text.clone(), extracted);
+                        (final_url, text, extracted)
+                    }
+                    Ok(Err(e)) => return ToolOutput::err(format!("{final_url}: {e}")),
+                    Err(e) => return ToolOutput::err(format!("page processing failed: {e}")),
+                }
+            }
+        };
 
-        let (final_url, resp) = match get_following(url, false, cancel).await {
-            Ok(Fetched::Response(u, r)) => (u, r),
-            Ok(Fetched::CrossHostRedirect { from, to }) => {
-                return ToolOutput::ok(format!(
-                    "{from} redirects to a different site: {to}\nNot followed \
-                     automatically. Call web_fetch with that exact URL to fetch it."
-                ));
-            }
-            Err(e) => return ToolOutput::err(e),
+        let Some(prompt) = prompt else {
+            return fetch_output(&final_url, &text, pattern, extracted);
         };
-        let status = resp.status();
-        let content_type = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-        let bytes = match read_capped(resp, MAX_BODY_BYTES, cancel).await {
-            Ok(b) => b,
-            Err(e) => return ToolOutput::err(format!("{final_url}: {e}")),
+        // `prompt` costs a model call, so it is honored only when `web-fetch`
+        // is on. Its inherited mode deliberately snapshots the main model;
+        // unconfigured is still off and returns the page directly.
+        let model = ctx.agent_models.get("fetch").or_else(|| {
+            ctx.agent_models
+                .inherits("fetch")
+                .then(|| ctx.model.as_ref().map(|model| model.snapshot()))
+                .flatten()
+        });
+        let Some(model) = model else {
+            let mut out = fetch_output(&final_url, &text, None, extracted);
+            out.content = format!(
+                "note: prompt ignored — web-fetch summarizer is off (enable it with /agents); returning the page content.\n{}",
+                out.content
+            );
+            return out;
         };
-        let body = String::from_utf8_lossy(&bytes);
-        if !status.is_success() {
-            let mut msg = format!("{final_url} answered HTTP {status}");
-            let text = render_body(&content_type, &body).unwrap_or_default();
-            let trimmed: String = text.chars().take(500).collect();
-            if !trimmed.trim().is_empty() {
-                msg.push_str(&format!("\n{trimmed}"));
+        let run = FETCH_RUN.fetch_add(1, Ordering::Relaxed);
+        let host = Url::parse(&final_url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| "page".into());
+        let saved = save_page_text(ctx, run, &host, &text).await;
+        match summarize_page(&model, run, &final_url, &text, prompt, ctx, cancel).await {
+            Ok(answer) => {
+                let source = match &saved {
+                    Some(path) => format!("full page text: {path}"),
+                    None => "full page text could not be saved".to_string(),
+                };
+                // Say when the model read the extracted view: a "not on the
+                // page" answer then has an obvious next step (raw=true).
+                let scope = if extracted {
+                    "  (main content; retry with raw=true if something seems missing)"
+                } else {
+                    ""
+                };
+                ToolOutput::ok(format!(
+                    "URL: {final_url}{scope}\nAnswer from {} — {source}\n\n{answer}",
+                    model.provider.model()
+                ))
             }
-            return ToolOutput::err(msg);
+            // The page is already in hand; a broken summarizer must not turn
+            // the fetch itself into a failure.
+            Err(e) => {
+                let mut out = fetch_output(&final_url, &text, None, extracted);
+                out.content = format!("note: {e}; returning the page content.\n{}", out.content);
+                out
+            }
         }
-        let text = match render_body(&content_type, &body) {
-            Ok(t) => t,
-            Err(e) => return ToolOutput::err(format!("{final_url}: {e}")),
-        };
-        cache_put(raw, final_url.to_string(), text.clone());
-        fetch_output(final_url.as_str(), &text, pattern)
     }
 }
 
@@ -764,6 +1189,27 @@ mod tests {
     }
 
     #[test]
+    fn slim_markdown_removes_table_padding_and_link_titles() {
+        let input = "| Name       | Link                                      |\n| ---------- | ----------------------------------------- |\n| Rust       | [Homepage](https://www.rust-lang.org/ \"Rust language\") |\n\nKeep  internal prose spacing.";
+        let slim = slim_markdown(input);
+        assert_eq!(
+            slim,
+            "| Name | Link |\n| ---------- | ----------------------------------------- |\n| Rust | [Homepage](https://www.rust-lang.org/) |\n\nKeep  internal prose spacing."
+        );
+    }
+
+    #[tokio::test]
+    async fn binary_download_is_saved_verbatim() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+        let path = save_binary_download(&ctx, 3, "example.com", "pdf", b"%PDF-test")
+            .await
+            .unwrap();
+        assert!(path.ends_with("web-003-example.com.pdf"));
+        assert_eq!(tokio::fs::read(path).await.unwrap(), b"%PDF-test");
+    }
+
+    #[test]
     fn same_site_allows_www_toggle() {
         let a = Url::parse("https://example.com/a").unwrap();
         let b = Url::parse("https://www.example.com/b").unwrap();
@@ -776,13 +1222,143 @@ mod tests {
     }
 
     #[test]
-    fn find_in_page_returns_only_matches() {
-        let text = "alpha line\nbeta here\ngamma\nbeta again\n";
+    fn find_in_page_shows_matches_with_context() {
+        let text = "w01\nw02\nw03\nw04\nbeta here\nw06\nw07\nw08\nw09\nw10\nw11\nbeta again\nw13\n";
         let out = find_in_page(text, "beta").unwrap();
-        assert!(out.contains("beta here"));
-        assert!(out.contains("beta again"));
-        assert!(!out.contains("alpha"));
+        // Matches use `:`, context lines use `-`, blocks are separated.
+        assert!(out.contains("5: beta here"));
+        assert!(out.contains("12: beta again"));
+        assert!(out.contains("3- w03"));
+        assert!(out.contains("7- w07"));
+        assert!(out.contains("10- w10"));
+        assert!(out.contains("13- w13"));
+        assert!(out.contains("…\n"));
+        assert!(!out.contains("w01"));
+        assert!(!out.contains("w08"));
         assert!(find_in_page(text, "delta").is_err());
+    }
+
+    #[test]
+    fn non_article_html_falls_back_to_full_conversion() {
+        let (text, extracted) = process_page(
+            "text/html",
+            "<h1>Hi</h1><p>there</p>",
+            "https://x.com/",
+            false,
+        )
+        .unwrap();
+        assert!(!extracted);
+        assert!(text.contains("# Hi"));
+    }
+
+    #[test]
+    fn article_pages_reduce_to_main_content_unless_raw() {
+        let para = "Rust's ownership model guarantees memory safety without a garbage \
+                    collector, and the borrow checker enforces it at compile time. "
+            .repeat(30);
+        let nav = "<li><a href=\"/x\">NAVLINK</a></li>".repeat(40);
+        let html = format!(
+            "<html><head><title>Ownership</title></head><body>\
+             <div class=\"sidebar\"><ul>{nav}</ul></div>\
+             <article><h1>Ownership</h1><p>{para}</p><p>{para}</p></article>\
+             </body></html>"
+        );
+        let (text, extracted) =
+            process_page("text/html", &html, "https://example.com/post", false).unwrap();
+        assert!(extracted, "expected main-content extraction to trigger");
+        assert!(text.contains("ownership model"));
+        assert!(!text.contains("NAVLINK"));
+
+        let (raw_text, raw_extracted) =
+            process_page("text/html", &html, "https://example.com/post", true).unwrap();
+        assert!(!raw_extracted);
+        assert!(raw_text.contains("NAVLINK"));
+    }
+
+    #[derive(Default)]
+    struct MockFetchModel {
+        requests: std::sync::Mutex<Vec<Request>>,
+    }
+
+    #[async_trait]
+    impl tcode_core::Provider for MockFetchModel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+        fn model(&self) -> &str {
+            "mock-fetch"
+        }
+        fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+            tcode_core::CacheStrategy::ImplicitPrefix
+        }
+        async fn stream(
+            &self,
+            request: Request,
+            _cancel: CancellationToken,
+        ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+            self.requests.lock().unwrap().push(request);
+            Ok(Box::pin(futures::stream::iter(vec![Ok(
+                StreamEvent::TextDelta("the answer".into()),
+            )])))
+        }
+    }
+
+    #[tokio::test]
+    async fn summarize_page_isolates_the_request_and_returns_the_answer() {
+        let provider = std::sync::Arc::new(MockFetchModel::default());
+        let model = ActiveModel {
+            provider: provider.clone(),
+            max_tokens: 4096,
+            context_window: 128_000,
+            effort: None,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+
+        let answer = summarize_page(
+            &model,
+            7,
+            "https://example.com/doc",
+            "PAGE TEXT",
+            "What is documented?",
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(answer, "the answer");
+        let requests = provider.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        // Own cache scope — never rides the main conversation's prefix.
+        assert_eq!(request.cache_scope.as_deref(), Some("fetch-7"));
+        assert_eq!(request.system, SUMMARY_SYSTEM);
+        assert!(request.tools.is_empty());
+        let [Message { content, .. }] = requests[0].messages.as_slice() else {
+            panic!("expected one user message");
+        };
+        assert!(matches!(content.as_slice(), [ContentBlock::Text { text }]
+            if text.contains("PAGE TEXT") && text.contains("What is documented?")));
+    }
+
+    #[tokio::test]
+    async fn pattern_and_prompt_are_mutually_exclusive() {
+        let directory = tempfile::tempdir().unwrap();
+        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+        let out = WebFetchTool
+            .run(
+                serde_json::json!({
+                    "url": "https://example.com/",
+                    "pattern": "x",
+                    "prompt": "summarize"
+                }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(out.is_error);
+        assert!(out.content.contains("not both"));
     }
 
     #[test]

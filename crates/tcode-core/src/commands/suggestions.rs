@@ -53,10 +53,11 @@ mod tests {
 
     #[test]
     fn toggles_persistently_and_appears_in_help() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         assert!(ctx.session.suggestions(), "on by default");

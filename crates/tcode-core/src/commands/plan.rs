@@ -63,10 +63,11 @@ mod tests {
 
     #[test]
     fn bare_plan_enters_plan_mode_and_owes_the_enter_note() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
 
@@ -74,8 +75,8 @@ mod tests {
 
         assert_eq!(session.mode, PermissionMode::Plan);
         assert_eq!(outcome.messages[0].text, "permission mode → plan");
-        // The command itself does not write history; the next turn delivery
-        // point injects the guidance that makes the model plan-aware.
+        // The command itself does not write history; the next user-prompt
+        // delivery point injects the guidance that makes the model plan-aware.
         assert!(session.ledger.is_empty());
         assert!(session.take_mode_note().is_some());
     }

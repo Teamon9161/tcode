@@ -50,9 +50,15 @@ impl Approver for NeverAsk {
 pub const TASK_AGENT_KINDS: [&str; 3] = ["explore", "plan", "general"];
 
 /// Roles surfaced by `/agents`: task kinds plus the auxiliary models the
-/// harness itself runs — the Auto Mode classifier and the next-prompt guess.
-/// Both want something small and fast, which is the whole point of pinning.
-pub const MODEL_ROLES: [&str; 6] = ["explore", "plan", "general", "auto", "suggest", "vision"];
+/// harness itself runs — the Auto Mode classifier, the next-prompt guess,
+/// image understanding, and the `web_fetch` summarizer. Most want something
+/// small and fast, which is the whole point of pinning. `fetch` is the one
+/// role where unpinned means *off* (web_fetch returns the page verbatim)
+/// rather than "follow the main model": the main model reading the raw page
+/// directly beats paying an extra full-page request for a lossy summary.
+pub const MODEL_ROLES: [&str; 7] = [
+    "explore", "plan", "general", "auto", "suggest", "vision", "fetch",
+];
 
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -322,7 +328,8 @@ impl Tool for TaskTool {
         let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut session = Session::new(
             ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
-                .with_model(model.clone()),
+                .with_model(model.clone())
+                .with_agent_models(self.pinned.clone()),
             PermissionMode::Auto,
             PermissionRules::default(),
         )

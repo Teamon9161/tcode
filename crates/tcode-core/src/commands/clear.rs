@@ -35,12 +35,13 @@ mod tests {
 
     #[test]
     fn clear_empties_the_ledger_and_signals_the_frontend() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         session.ledger.append(Entry::Note("history".into()));
         session.last_prompt_tokens = 1234;
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = ClearCommand.run(&mut ctx, "");

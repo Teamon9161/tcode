@@ -256,7 +256,7 @@ fn task_lines(
     let spans = vec![
         gutter(current),
         Span::styled(connector.to_string(), row_style(theme::dim(), highlighted)),
-        Span::styled(title_case(&run.kind), row_style(theme::dim(), highlighted)),
+        Span::styled(title_case(&run.kind), row_style(theme::ok(), highlighted)),
         Span::styled(" · ", row_style(theme::dim(), highlighted)),
         Span::styled(run.summary.clone(), row_style(theme::dim(), highlighted)),
         Span::styled(
@@ -301,7 +301,7 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
     let hidden_before = start;
     let hidden_after = progress.len().saturating_sub(end);
     let mut lines = vec![Line::from(vec![
-        Span::styled("  progress ", theme::bold().fg(theme::ACCENT)),
+        Span::styled("  ┊ Progress ", theme::bold().fg(theme::ACCENT)),
         Span::styled(
             format!("{complete}/{} phases complete", progress.len()),
             theme::dim(),
@@ -457,6 +457,21 @@ mod tests {
     }
 
     #[test]
+    fn progress_header_is_a_quiet_structural_label() {
+        let (lines, _) = lines(
+            &phases(&["completed", "in_progress", "pending"]),
+            &[],
+            main(),
+            80,
+            None,
+            &PanelTarget::Main,
+        );
+        assert_eq!(text(&lines[0]), "  ┊ Progress 1/3 phases complete");
+        assert_eq!(lines[0].spans[0].style, theme::bold().fg(theme::ACCENT));
+        assert_eq!(lines[0].spans[1].style, theme::dim());
+    }
+
+    #[test]
     fn tree_is_absent_when_no_sub_agent_is_running() {
         let (lines, targets) = lines(&[], &[], main(), 80, None, &PanelTarget::Main);
         assert!(lines.is_empty());
@@ -524,6 +539,24 @@ mod tests {
         assert!(
             row.find("inspect the implementation").unwrap() < row.find(" · 0s").unwrap(),
             "the summary matches main's activity-before-stats order"
+        );
+    }
+
+    #[test]
+    fn task_tree_highlights_the_agent_kind_like_a_tool_name() {
+        let active = run("t1");
+        let (lines, _) = lines(&[], &[&active], main(), 120, None, &PanelTarget::Main);
+        let row = &lines[1];
+        let text = text(row);
+        let start = text.find("Explore").expect("task kind text");
+        let start = text[..start].chars().count();
+        assert!(
+            row.spans
+                .iter()
+                .skip(start)
+                .take("Explore".len())
+                .all(|span| span.style.fg == Some(theme::OK)),
+            "the task kind must retain the green tool-name tone"
         );
     }
 

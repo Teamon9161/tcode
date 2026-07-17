@@ -1,8 +1,11 @@
 use std::collections::VecDeque;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::ledger::{Entry, Ledger};
+use crate::config::FolderTrust;
+use crate::environment::{EnvironmentSnapshot, StartupContext};
+use crate::ledger::Ledger;
 use crate::permission::{PermissionMode, PermissionRules};
 use crate::template::PromptVariables;
 use crate::tool::ToolCtx;
@@ -114,6 +117,9 @@ pub struct CwdChange {
     /// The session has no model-visible history, so its opening system context
     /// must be regenerated for the new cwd instead of appending a note.
     pub refresh_opening_context: bool,
+    /// Memory discovered for the target directory. The command combines this
+    /// with the structured environment diff into one append-only Note.
+    pub memory_note: Option<String>,
 }
 
 /// Mutable per-conversation state.
@@ -131,11 +137,15 @@ pub struct Session {
     /// A permission-mode switch staged while the turn was running, committed
     /// at the next batch boundary. The frontend holds a clone of this handle.
     pub pending_mode: PendingMode,
-    /// The mode the model was last told about. Comparing it to `mode` at a
-    /// delivery point yields the plan-enter note without a per-keypress event
-    /// stream — flipping through modes and landing back where you started
-    /// produces no note at all.
+    /// The mode the model was last told about. A mode key press only changes
+    /// the permission gate; a user delivery point compares this with `mode` to
+    /// decide whether the model needs an enter/leave-plan explanation.
     last_notified_mode: PermissionMode,
+    /// A completed approval or queued user prompt authorizes the next safe
+    /// boundary to tell the model about the final selected mode. Bare mode-key
+    /// changes never set this, so they cannot leak transient plan guidance into
+    /// the append-only ledger.
+    mode_delivery_pending: bool,
     /// File snapshots for rewind; no-op unless persistence is set up.
     pub checkpoints: crate::checkpoint::CheckpointStore,
     /// Prompt size of the latest request (for the context status line).
@@ -159,6 +169,28 @@ pub struct Session {
     /// A sub-agent shares its parent's provider but not its prefix, so it must
     /// not share its cache id.
     cache_scope: Option<String>,
+    /// The user-selected local trust level of the current canonical cwd.
+    /// It is runtime state, not a ledger entry: the classifier receives it as
+    /// trusted harness context and a `/cd` can change it without rewriting the
+    /// conversation prefix.
+    folder_trust: FolderTrust,
+    /// Whether the current folder has been decided for this process. An
+    /// untrusted persisted choice is known and must not prompt again.
+    folder_trust_known: bool,
+    /// The latest actual harness environment, persisted even if the user has
+    /// not yet sent it to the model.
+    environment: Option<EnvironmentSnapshot>,
+    /// The last environment explicitly represented in the system prefix or a
+    /// model-facing environment Note.
+    delivered_environment: Option<EnvironmentSnapshot>,
+    /// One coalesced environment/instruction explanation awaiting a genuine
+    /// user delivery point. Repeated `/cd` replaces it rather than growing the
+    /// append-only model history with unobserved intermediate directories.
+    pending_environment_extra: Option<String>,
+    pending_environment_delivery: bool,
+    /// One coalesced `/memory on|off` explanation awaiting delivery. The local
+    /// setting changes immediately; only its final state reaches the model.
+    pending_memory_note: Option<String>,
     /// Runtime values are captured from trusted harness state before prompt
     /// construction. They only change as part of a full conversation
     /// replacement, which also changes the provider cache scope.
@@ -190,15 +222,15 @@ impl Session {
             tool_ctx,
             pending: PendingInput::default(),
             pending_mode: PendingMode::default(),
-            // Seed as "not yet in plan" so a session started in plan mode still
-            // injects the plan-enter note with its first prompt. Only entering
-            // plan ever injects, so any non-plan seed is equivalent for the
-            // other modes.
+            // Seed as "not yet explained" when starting in plan mode so the
+            // first user prompt receives plan guidance. The model never needs a
+            // note for a non-plan starting mode.
             last_notified_mode: if mode == PermissionMode::Plan {
                 PermissionMode::Default
             } else {
                 mode
             },
+            mode_delivery_pending: false,
             checkpoints: crate::checkpoint::CheckpointStore::default(),
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
@@ -208,6 +240,13 @@ impl Session {
             auto_total_denials: 0,
             auto_consecutive_unavailable: 0,
             cache_scope: None,
+            folder_trust: FolderTrust::Untrusted,
+            folder_trust_known: false,
+            environment: None,
+            delivered_environment: None,
+            pending_environment_extra: None,
+            pending_environment_delivery: false,
+            pending_memory_note: None,
             prompt_variables,
         }
     }
@@ -234,7 +273,31 @@ impl Session {
             .cache_scope
             .as_deref()
             .unwrap_or_else(|| self.prompt_variables.session_id());
-        format!("auto-classifier:{session_scope}")
+        // The classifier's prefix includes trusted cwd and folder trust. An
+        // opaque suffix prevents a /cd or trust choice from reusing a cache
+        // entry generated under a different safety boundary.
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.tool_ctx.cwd.hash(&mut hasher);
+        self.folder_trust.hash(&mut hasher);
+        format!("auto-classifier:{session_scope}:{:016x}", hasher.finish())
+    }
+
+    pub fn folder_trust(&self) -> FolderTrust {
+        self.folder_trust
+    }
+
+    pub fn folder_trust_known(&self) -> bool {
+        self.folder_trust_known
+    }
+
+    pub fn set_folder_trust(&mut self, trust: FolderTrust) {
+        self.folder_trust = trust;
+        self.folder_trust_known = true;
+    }
+
+    pub fn clear_folder_trust(&mut self) {
+        self.folder_trust = FolderTrust::Untrusted;
+        self.folder_trust_known = false;
     }
 
     /// Cwd-specific portion of the system prompt used for request construction.
@@ -306,9 +369,10 @@ impl Session {
         )
     }
 
-    /// Guidance injected into the ledger the first time the model is in plan
-    /// mode after a delivery point. Raw text; the ledger wraps it as a note.
+    /// Guidance injected when the model next receives a user interaction. Raw
+    /// text; the ledger wraps it as a note.
     const PLAN_ENTER_NOTE: &'static str = include_str!("../../../../prompts/plan-mode-enter.md");
+    const PLAN_EXIT_NOTE: &'static str = include_str!("../../../../prompts/plan-mode-exit.md");
 
     /// Commit a staged permission-mode switch, if one is pending. Returns the
     /// new mode only when it differs from the current one, so a net-zero cycle
@@ -324,39 +388,98 @@ impl Session {
     }
 
     /// Apply a mode transition an approval dialog chose (e.g. `exit_plan`
-    /// approved with "auto-accept edits"). Syncs `last_notified_mode` — the
-    /// tool result already states the new mode, so no note is owed — and drops
-    /// any staged switch so a stale earlier keypress cannot override it.
+    /// approved with "auto-accept edits"). The tool result itself states the
+    /// new mode, so no additional explanation is owed; drop any staged switch
+    /// so a stale earlier keypress cannot override it.
     pub fn apply_approved_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
         self.last_notified_mode = mode;
         self.pending_mode.clear();
     }
 
-    /// The note owed to the model at a delivery point, evaluated by comparing
-    /// the live mode with the one it was last told about. Only *entering* plan
-    /// mode injects guidance; every other transition is absorbed by the
-    /// permission gate and needs no model-visible note. Always resyncs the
-    /// last-notified mode, so back-and-forth switching never restacks notes.
+    /// Mark that the user interacted through an approval dialog or submitted a
+    /// prompt while the turn ran. The next safe boundary may then explain the
+    /// final mode to the model.
+    pub fn mark_mode_delivery(&mut self) {
+        self.mode_delivery_pending = true;
+    }
+
+    /// The mode explanation owed by a direct user prompt. This is deliberately
+    /// separate from committing a pending mode: mode-key presses are UI input,
+    /// not model context, and append-only history cannot retract a transient
+    /// plan instruction.
     pub fn take_mode_note(&mut self) -> Option<String> {
-        let note = (self.mode == PermissionMode::Plan
-            && self.last_notified_mode != PermissionMode::Plan)
-            .then(|| Self::PLAN_ENTER_NOTE.trim().to_string());
+        let note = match (self.last_notified_mode, self.mode) {
+            (PermissionMode::Plan, mode) if mode != PermissionMode::Plan => {
+                Some(Self::PLAN_EXIT_NOTE.trim().to_string())
+            }
+            (mode, PermissionMode::Plan) if mode != PermissionMode::Plan => {
+                Some(Self::PLAN_ENTER_NOTE.trim().to_string())
+            }
+            _ => None,
+        };
         self.last_notified_mode = self.mode;
         note
     }
 
-    /// Set the cwd-specific part of the system prompt before a first turn.
-    pub fn set_opening_context(&mut self, context: String) {
-        debug_assert!(self.ledger.is_empty());
-        self.opening_context = context;
+    /// The mode explanation owed by an interaction that occurred during a
+    /// running turn. A mode switch alone leaves this false and cannot append a
+    /// model-facing note.
+    pub fn take_pending_mode_note(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.mode_delivery_pending) {
+            return None;
+        }
+        self.take_mode_note()
     }
 
-    /// Replace the startup context when a whole conversation is restored or
-    /// imported before its next request. Ordinary cwd changes must use
-    /// `set_opening_context`'s empty-ledger guard instead, preserving the
-    /// append-only cached prefix invariant.
-    pub fn replace_opening_context_for_resume(&mut self, context: String) {
+    /// Set the complete persisted startup context before the first request.
+    /// A pre-turn `/cd` may replace it; the session log keeps the last version.
+    pub fn set_startup_context(&mut self, startup: StartupContext) {
+        debug_assert!(
+            self.opening_context.is_empty(),
+            "startup context may only be recorded before tcode sends a request"
+        );
+        self.opening_context = startup.text;
+        self.environment = Some(startup.environment.clone());
+        self.delivered_environment = Some(startup.environment);
+        self.ledger
+            .record_aux(&crate::store::LogEvent::StartupContext {
+                startup: StartupContext {
+                    text: self.opening_context.clone(),
+                    environment: self.environment.clone().expect("startup environment"),
+                },
+            });
+    }
+
+    /// Restore the already-sent startup prefix without changing its bytes.
+    pub fn restore_startup_context(
+        &mut self,
+        startup: StartupContext,
+        environment: Option<EnvironmentSnapshot>,
+        delivered_environment: Option<EnvironmentSnapshot>,
+    ) {
+        let StartupContext {
+            text,
+            environment: startup_environment,
+        } = startup;
+        self.opening_context = text;
+        self.environment = environment;
+        self.delivered_environment = delivered_environment.or_else(|| {
+            // Old JSONL recorded environment changes only when it also appended
+            // the Note, so its final stored snapshot is model-known.
+            self.environment
+                .clone()
+                .or_else(|| Some(startup_environment))
+        });
+        self.pending_environment_extra = None;
+        self.pending_environment_delivery = false;
+        self.pending_memory_note = None;
+    }
+
+    /// Set the cwd-specific part of the system prompt before a first turn.
+    /// Kept for focused tests and callers that do not persist a snapshot.
+    pub fn set_opening_context(&mut self, context: String) {
+        debug_assert!(self.ledger.is_empty());
         self.opening_context = context;
     }
 
@@ -377,6 +500,75 @@ impl Session {
         self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
     }
 
+    /// Record a fresh runtime environment immediately, but defer its
+    /// model-facing explanation until a user interaction actually reaches a
+    /// legal append boundary. The auxiliary snapshot survives a crash/resume;
+    /// repeated changes replace the explanation for unobserved intermediate
+    /// directories.
+    pub fn sync_environment(&mut self, current: EnvironmentSnapshot, extra_note: Option<String>) {
+        self.ledger
+            .record_aux(&crate::store::LogEvent::EnvironmentObserved {
+                environment: current.clone(),
+            });
+        self.environment = Some(current);
+        self.pending_environment_extra = extra_note;
+        self.pending_environment_delivery = true;
+    }
+
+    /// Defer the model-facing explanation of an immediately applied memory
+    /// setting. A second toggle replaces the first explanation before either
+    /// reaches append-only history.
+    pub fn stage_memory_note(&mut self, note: String) {
+        self.pending_memory_note = Some(note);
+    }
+
+    /// Consume all coalescible context whose final state has become meaningful
+    /// to the model at a user delivery point.
+    pub fn take_deferred_context_notes(&mut self) -> Vec<String> {
+        let mut notes = self.pending_memory_note.take().into_iter().collect();
+        if !std::mem::take(&mut self.pending_environment_delivery) {
+            return notes;
+        }
+        let Some(current) = self.environment.clone() else {
+            return notes;
+        };
+        let diff = self
+            .delivered_environment
+            .as_ref()
+            .map(|previous| previous.diff_lines(&current));
+        let mut note = match diff {
+            Some(lines) if !lines.is_empty() => format!(
+                "Runtime environment changed since the model last received an environment update:\n{}\n\nFuture relative tool paths, default shell cwd, grep/glob defaults, and cwd-relative operations resolve against {}. The startup project map is historical; inspect files or Git status when current detail matters.",
+                lines
+                    .iter()
+                    .map(|line| format!("- {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                current.cwd
+            ),
+            None if self.delivered_environment.is_none() => format!(
+                "This session predates a delivered environment snapshot. Current working directory is {}. The startup project map may be historical; inspect files or Git status when current detail matters.",
+                current.cwd
+            ),
+            _ => String::new(),
+        };
+        if let Some(extra) = self.pending_environment_extra.take() {
+            if !note.is_empty() {
+                note.push_str("\n\n");
+            }
+            note.push_str(&extra);
+        }
+        if !note.is_empty() {
+            self.delivered_environment = Some(current.clone());
+            self.ledger
+                .record_aux(&crate::store::LogEvent::EnvironmentDelivered {
+                    environment: current,
+                });
+            notes.push(note);
+        }
+        notes
+    }
+
     /// Change the conversation working directory. Before any model-visible
     /// history exists, the caller refreshes the opening context for the new
     /// directory. Later changes are append-only notes so cached history stays
@@ -389,6 +581,7 @@ impl Session {
                 new: old,
                 changed: false,
                 refresh_opening_context: false,
+                memory_note: None,
             });
         };
         if same_path(&old, &new) {
@@ -397,6 +590,7 @@ impl Session {
                 new,
                 changed: false,
                 refresh_opening_context: false,
+                memory_note: None,
             });
         }
 
@@ -410,6 +604,7 @@ impl Session {
                 new,
                 changed: true,
                 refresh_opening_context: true,
+                memory_note: None,
             });
         }
 
@@ -420,22 +615,12 @@ impl Session {
                 .discover_for_paths(std::slice::from_ref(&new))
                 .map(|update| update.note)
         };
-        let mut note = format!(
-            "Working directory changed by the user from {} to {}. Future relative tool paths, default shell cwd, grep/glob defaults, and cwd-relative operations now resolve against {}. Do not rely on the startup project map or earlier cwd-specific assumptions for the new directory; inspect as needed.",
-            old.display(),
-            new.display(),
-            new.display()
-        );
-        if let Some(memory_note) = memory_note {
-            note.push_str("\n\n");
-            note.push_str(&memory_note);
-        }
-        self.ledger.append(Entry::Note(note));
         Ok(CwdChange {
             old,
             new,
             changed: true,
             refresh_opening_context: false,
+            memory_note,
         })
     }
 
@@ -517,7 +702,7 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::Session;
-    use crate::{Entry, PermissionMode, PermissionRules, ToolCtx};
+    use crate::{Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx};
 
     #[test]
     fn three_auto_mode_classifier_failures_pause_to_default() {
@@ -585,7 +770,7 @@ mod tests {
     }
 
     #[test]
-    fn only_entering_plan_injects_a_note_and_only_once() {
+    fn mode_explanations_cover_plan_entry_and_exit_once() {
         let mut session = plan_session();
         // default → no note.
         assert!(session.take_mode_note().is_none());
@@ -594,9 +779,26 @@ mod tests {
         assert!(session.take_mode_note().is_some());
         // still plan, already notified → no restacking.
         assert!(session.take_mode_note().is_none());
-        // leaving plan → no note.
+        // Leaving plan must explicitly override the earlier plan instruction.
         session.mode = PermissionMode::AcceptEdits;
+        assert!(session
+            .take_mode_note()
+            .is_some_and(|note| note.contains("left plan mode")));
         assert!(session.take_mode_note().is_none());
+    }
+
+    #[test]
+    fn transient_plan_switch_waits_for_interaction_and_uses_final_mode() {
+        let mut session = plan_session();
+        // A running turn may commit plan at a batch boundary, but shift+tab
+        // itself is not model context. Before the next interaction the user
+        // switches on to auto, so no unretractable plan note is ever appended.
+        session.mode = PermissionMode::Plan;
+        assert!(session.take_pending_mode_note().is_none());
+        session.mode = PermissionMode::Auto;
+        session.mark_mode_delivery();
+        assert!(session.take_pending_mode_note().is_none());
+        assert_eq!(session.mode, PermissionMode::Auto);
     }
 
     #[test]
@@ -650,10 +852,9 @@ mod tests {
             initial_scratch
         );
         assert_ne!(session.classifier_cache_scope(), initial_scope);
-        assert_eq!(
-            session.classifier_cache_scope(),
-            "auto-classifier:main:resumed-session"
-        );
+        assert!(session
+            .classifier_cache_scope()
+            .starts_with("auto-classifier:main:resumed-session:"));
     }
 
     #[test]
@@ -693,6 +894,15 @@ mod tests {
 
         session.ledger.append(Entry::Note("history".into()));
         let frozen_project = session.prompt_variables().expand("${TCODE_PROJECT_DIR}");
+        session.environment = Some(EnvironmentSnapshot {
+            cwd: child.display().to_string(),
+            platform: "test".into(),
+            os_version: None,
+            command_shells: vec!["test shell".into()],
+            git: Default::default(),
+            date: "1970-01-01".into(),
+        });
+        session.delivered_environment = session.environment.clone();
         let change = session.change_cwd("..").unwrap();
         assert!(change.changed);
         assert!(!change.refresh_opening_context);
@@ -701,12 +911,46 @@ mod tests {
             session.prompt_variables().expand("${TCODE_PROJECT_DIR}"),
             frozen_project
         );
+        // `change_cwd` only changes state. Environment observations persist
+        // immediately, while their combined model note waits for delivery.
+        assert_eq!(session.ledger.len(), 1);
+        session.sync_environment(
+            EnvironmentSnapshot {
+                cwd: root.display().to_string(),
+                platform: "test".into(),
+                os_version: None,
+                command_shells: vec!["test shell".into()],
+                git: Default::default(),
+                date: "1970-01-01".into(),
+            },
+            change.memory_note,
+        );
+        assert_eq!(
+            session.ledger.len(),
+            1,
+            "environment is metadata until delivery"
+        );
+        let notes = session.take_deferred_context_notes();
         assert!(matches!(
-            session.ledger.entries().last(),
-            Some(Entry::Note(text))
-                if text.contains("Working directory changed by the user")
+            notes.as_slice(),
+            [text]
+                if text.contains("Runtime environment changed")
                     && text.contains("Future relative tool paths")
         ));
+        let entries_after_sync = session.ledger.len();
+        session.sync_environment(
+            EnvironmentSnapshot {
+                cwd: root.display().to_string(),
+                platform: "test".into(),
+                os_version: None,
+                command_shells: vec!["test shell".into()],
+                git: Default::default(),
+                date: "1970-01-01".into(),
+            },
+            None,
+        );
+        assert!(session.take_deferred_context_notes().is_empty());
+        assert_eq!(session.ledger.len(), entries_after_sync);
 
         let entries = session.ledger.len();
         let change = session.change_cwd(".").unwrap();

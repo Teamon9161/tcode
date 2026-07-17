@@ -103,6 +103,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             // mode deliberately does not duplicate its bounded context block.
             AgentEvent::ReferencesExpanded { .. } => {}
             AgentEvent::QueuedInput { text, .. } => println!("{CYAN}›{RESET} {text}"),
+            AgentEvent::Note(text) => println!("{DIM}Note: {text}{RESET}"),
             AgentEvent::UserNote {
                 text,
                 answer: false,

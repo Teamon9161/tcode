@@ -92,10 +92,13 @@ async fn sends_images_in_one_isolated_vision_request() {
         .is_some_and(|scope| scope.starts_with("vision-")));
     assert!(request.tools.is_empty());
     assert_eq!(request.messages.len(), 1);
+    // Each image is preceded by a file-name label so the answer can refer to
+    // images unambiguously; the prompt comes last.
     assert!(matches!(request.messages[0].content.as_slice(), [
+        tcode_core::ContentBlock::Text { text: label },
         tcode_core::ContentBlock::Image { .. },
         tcode_core::ContentBlock::Text { text },
-    ] if text == "What text is visible?"));
+    ] if label == "shot.png:" && text == "What text is visible?"));
 }
 
 #[tokio::test]

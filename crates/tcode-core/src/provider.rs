@@ -140,27 +140,64 @@ impl ModelCell {
     }
 }
 
+/// One `/agents` assignment for a role.
+#[derive(Clone)]
+pub enum AgentPin {
+    /// Explicitly follow the main model, resolved live at each use. For most
+    /// roles this is indistinguishable from being absent; roles that are off
+    /// by default (`web-fetch`) use it to switch the capability on without
+    /// pinning a model.
+    Inherit,
+    Model(ActiveModel),
+}
+
 /// Which auxiliary model role runs on a pinned model rather than following
 /// the main one. Roles cover sub-agents and the Auto Mode classifier. Shared
 /// between the consumers and the frontend that edits pins (`/agents`), and
 /// swappable for the same reason `ModelCell` is:
 /// a pick must apply to the next sub-agent, not the next process.
 ///
-/// Absent kind = inherit: that sub-agent uses the parent's `ModelCell` and so
-/// follows `/model`. A pinned kind deliberately does not.
+/// Absent kind = inherit for sub-agent roles (the parent's `ModelCell`, so it
+/// follows `/model`); off for off-by-default roles. A pinned kind
+/// deliberately does not follow `/model`.
 #[derive(Clone, Default)]
-pub struct AgentModels(std::sync::Arc<std::sync::RwLock<BTreeMap<String, ActiveModel>>>);
+pub struct AgentModels(std::sync::Arc<std::sync::RwLock<BTreeMap<String, AgentPin>>>);
 
 impl AgentModels {
+    /// The model `kind` is pinned to. `Inherit` and absent both yield None so
+    /// existing callers fall back to the parent's live handle.
     pub fn get(&self, kind: &str) -> Option<ActiveModel> {
+        match self.0.read().expect("agent models lock").get(kind) {
+            Some(AgentPin::Model(model)) => Some(model.clone()),
+            _ => None,
+        }
+    }
+
+    /// The raw assignment, for callers that must distinguish "inherit" from
+    /// "absent" (off-by-default roles).
+    pub fn pin_state(&self, kind: &str) -> Option<AgentPin> {
         self.0.read().expect("agent models lock").get(kind).cloned()
+    }
+
+    pub fn inherits(&self, kind: &str) -> bool {
+        matches!(
+            self.0.read().expect("agent models lock").get(kind),
+            Some(AgentPin::Inherit)
+        )
     }
 
     pub fn pin(&self, kind: &str, model: ActiveModel) {
         self.0
             .write()
             .expect("agent models lock")
-            .insert(kind.to_string(), model);
+            .insert(kind.to_string(), AgentPin::Model(model));
+    }
+
+    pub fn pin_inherit(&self, kind: &str) {
+        self.0
+            .write()
+            .expect("agent models lock")
+            .insert(kind.to_string(), AgentPin::Inherit);
     }
 
     pub fn unpin(&self, kind: &str) {
@@ -173,7 +210,13 @@ impl AgentModels {
             .read()
             .expect("agent models lock")
             .iter()
-            .map(|(kind, model)| (kind.clone(), model.describe()))
+            .map(|(kind, pin)| {
+                let label = match pin {
+                    AgentPin::Inherit => "inherit".to_string(),
+                    AgentPin::Model(model) => model.describe(),
+                };
+                (kind.clone(), label)
+            })
             .collect()
     }
 }

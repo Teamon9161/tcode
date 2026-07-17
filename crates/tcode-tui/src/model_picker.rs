@@ -1,8 +1,8 @@
 //! `/model` and `/agents` share one picker: ↑↓ chooses a model across all
 //! configured profiles, ←→ adjusts its reasoning effort, Enter applies, Esc
 //! cancels. `/agents` wraps it in a first step that picks *which* sub-agent
-//! the model is for, and adds an "inherit" row — a sub-agent may simply follow
-//! the main model instead of pinning its own.
+//! the model is for, and adds explicit `inherit` (use the main model) and,
+//! for opt-in capabilities such as `web-fetch`, `off` rows.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
@@ -36,28 +36,41 @@ pub struct ModelMenu {
     pub switch: SwitchFn,
 }
 
-/// Pin a sub-agent kind to a model (`Some`) or let it inherit (`None`),
-/// applying it live and persisting it. The binary owns this for the same
-/// reason it owns `SwitchFn`.
-pub type PinFn =
-    Box<dyn Fn(&str, Option<(&ModelOption, Option<&str>)>) -> Result<String, String> + Send + Sync>;
+/// Apply a role's model mode, live and in state.toml. `Off` is available only
+/// for opt-in capabilities such as the `web-fetch` summarizer.
+pub type PinFn = Box<dyn Fn(&str, AgentModelChoice) -> Result<String, String> + Send + Sync>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AgentModelChoice {
+    Off,
+    Inherit,
+    Model {
+        option: usize,
+        effort: Option<String>,
+    },
+}
+
+pub struct AgentRole {
+    pub key: String,
+    pub label: String,
+    pub allows_off: bool,
+}
 
 /// `/agents`: auxiliary model roles (sub-agents plus Auto Mode), what each
 /// currently runs on, and how to change it.
 pub struct AgentMenu {
-    pub kinds: Vec<String>,
-    /// Per kind: the menu option it is pinned to and that pin's effort.
-    /// Absent = inherit (follows `/model`).
-    pub pins: Vec<Option<(usize, Option<String>)>>,
+    pub roles: Vec<AgentRole>,
+    pub pins: Vec<AgentModelChoice>,
     pub pin: PinFn,
 }
 
 impl AgentMenu {
-    /// What a kind runs on right now, for the kind list and the status line.
-    fn describe(&self, index: usize, menu: &ModelMenu) -> String {
+    /// What a role runs on right now, for the kind list and the status line.
+    pub fn describe(&self, index: usize, menu: &ModelMenu) -> String {
         match &self.pins[index] {
-            None => "inherit".to_string(),
-            Some((option, effort)) => {
+            AgentModelChoice::Off => "off".to_string(),
+            AgentModelChoice::Inherit => "inherit (main model)".to_string(),
+            AgentModelChoice::Model { option, effort } => {
                 let name = menu
                     .options
                     .get(*option)
@@ -73,8 +86,9 @@ impl AgentMenu {
 }
 
 struct Row {
-    /// Menu option this row selects; `None` is the synthetic "inherit" row.
+    /// Menu option this row selects; `None` identifies a synthetic mode row.
     option: Option<usize>,
+    mode: Option<AgentModelChoice>,
     /// Effort slots: "auto" plus the model's declared levels.
     slots: Vec<String>,
     slot: usize,
@@ -131,6 +145,7 @@ impl Picker {
                 let (slots, slot) = slots_for(&opt.def, want);
                 Row {
                     option: Some(i),
+                    mode: None,
                     slots,
                     slot,
                 }
@@ -145,29 +160,50 @@ impl Picker {
         })
     }
 
-    /// `/agents` step 2: the same grid, with "inherit" on top, opened on
-    /// whatever the kind currently runs on.
-    pub fn for_agent(menu: &ModelMenu, kind: &str, pin: Option<&(usize, Option<String>)>) -> Self {
-        let mut rows = vec![Row {
+    /// `/agents` step 2: offers the role's non-model modes first, then the
+    /// shared model grid. `inherit` always means use the live main model;
+    /// opt-in roles additionally expose `off`.
+    pub fn for_agent(menu: &ModelMenu, role: &AgentRole, pin: &AgentModelChoice) -> Self {
+        let mut rows = Vec::new();
+        if role.allows_off {
+            rows.push(Row {
+                option: None,
+                mode: Some(AgentModelChoice::Off),
+                slots: vec![String::new()],
+                slot: 0,
+            });
+        }
+        rows.push(Row {
             option: None,
+            mode: Some(AgentModelChoice::Inherit),
             slots: vec![String::new()],
             slot: 0,
-        }];
+        });
         for (i, opt) in menu.options.iter().enumerate() {
             let want = match pin {
-                Some((pinned, effort)) if *pinned == i => effort.as_deref(),
+                AgentModelChoice::Model { option, effort } if *option == i => effort.as_deref(),
                 _ => opt.def.default_effort.as_deref(),
             };
             let (slots, slot) = slots_for(&opt.def, want);
             rows.push(Row {
                 option: Some(i),
+                mode: None,
                 slots,
                 slot,
             });
         }
-        let current = pin.map_or(0, |(option, _)| option + 1);
+        let current = rows
+            .iter()
+            .position(|row| match (&row.mode, &row.option, pin) {
+                (Some(mode), _, _) => mode == pin,
+                (None, Some(option), AgentModelChoice::Model { option: pinned, .. }) => {
+                    option == pinned
+                }
+                _ => false,
+            })
+            .unwrap_or(0);
         Self {
-            title: format!("◈ agent: {kind}"),
+            title: format!("◈ agent: {}", role.label),
             rows,
             selected: current,
             current,
@@ -206,6 +242,14 @@ impl Picker {
     /// `row` is the border-free rendered content row. The title occupies row
     /// zero; following rows are the visible model window. Clicking a row both
     /// selects and applies it, preserving the keyboard Enter behaviour.
+    fn agent_choice(&self) -> AgentModelChoice {
+        let row = &self.rows[self.selected];
+        row.mode.clone().unwrap_or_else(|| AgentModelChoice::Model {
+            option: row.option.expect("model row has an option"),
+            effort: (row.slot > 0).then(|| row.slots[row.slot].clone()),
+        })
+    }
+
     pub fn handle_mouse_row(&mut self, row: usize) -> PickResult {
         const WINDOW: usize = 8;
         let start = self
@@ -267,10 +311,12 @@ impl Picker {
                 base_style
             };
             let Some(option) = row.option else {
-                out.push(Line::styled(
-                    format!("  {marker}inherit — follow the main model{current}"),
-                    style,
-                ));
+                let label = match row.mode.as_ref() {
+                    Some(AgentModelChoice::Off) => "off — do not run this capability",
+                    Some(AgentModelChoice::Inherit) => "inherit — use the main model",
+                    _ => unreachable!("synthetic agent row has a mode"),
+                };
+                out.push(Line::styled(format!("  {marker}{label}{current}"), style));
                 continue;
             };
             let opt = &menu.options[option];
@@ -313,17 +359,15 @@ pub struct AgentPicker {
 pub enum AgentPick {
     Pending,
     Cancelled,
-    /// A kind was assigned: `option` is `None` for inherit.
     Picked {
         kind: String,
-        option: Option<usize>,
-        effort: Option<String>,
+        choice: AgentModelChoice,
     },
 }
 
 impl AgentPicker {
     pub fn new(agents: &AgentMenu) -> Option<Self> {
-        (!agents.kinds.is_empty()).then_some(Self {
+        (!agents.roles.is_empty()).then_some(Self {
             selected: 0,
             model: None,
             hovered: None,
@@ -335,14 +379,10 @@ impl AgentPicker {
             match key.code {
                 KeyCode::Esc => return AgentPick::Cancelled,
                 KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                KeyCode::Down => self.selected = (self.selected + 1).min(agents.kinds.len() - 1),
+                KeyCode::Down => self.selected = (self.selected + 1).min(agents.roles.len() - 1),
                 KeyCode::Enter => {
-                    let kind = &agents.kinds[self.selected];
-                    self.model = Some(Picker::for_agent(
-                        menu,
-                        kind,
-                        agents.pins[self.selected].as_ref(),
-                    ));
+                    let role = &agents.roles[self.selected];
+                    self.model = Some(Picker::for_agent(menu, role, &agents.pins[self.selected]));
                 }
                 _ => {}
             }
@@ -356,10 +396,9 @@ impl AgentPicker {
                 self.model = None;
                 AgentPick::Pending
             }
-            PickResult::Picked { option, effort } => AgentPick::Picked {
-                kind: agents.kinds[self.selected].clone(),
-                option,
-                effort,
+            PickResult::Picked { .. } => AgentPick::Picked {
+                kind: agents.roles[self.selected].key.clone(),
+                choice: picker.agent_choice(),
             },
         }
     }
@@ -373,21 +412,20 @@ impl AgentPicker {
         let Some(picker) = self.model.as_mut() else {
             let Some(index) = row
                 .checked_sub(1)
-                .filter(|index| *index < agents.kinds.len())
+                .filter(|index| *index < agents.roles.len())
             else {
                 return AgentPick::Pending;
             };
             self.selected = index;
-            let kind = &agents.kinds[index];
-            self.model = Some(Picker::for_agent(menu, kind, agents.pins[index].as_ref()));
+            let role = &agents.roles[index];
+            self.model = Some(Picker::for_agent(menu, role, &agents.pins[index]));
             return AgentPick::Pending;
         };
         match picker.handle_mouse_row(row) {
             PickResult::Pending | PickResult::Cancelled => AgentPick::Pending,
-            PickResult::Picked { option, effort } => AgentPick::Picked {
-                kind: agents.kinds[self.selected].clone(),
-                option,
-                effort,
+            PickResult::Picked { .. } => AgentPick::Picked {
+                kind: agents.roles[self.selected].key.clone(),
+                choice: picker.agent_choice(),
             },
         }
     }
@@ -398,7 +436,7 @@ impl AgentPicker {
         } else {
             self.hovered = row
                 .and_then(|row| row.checked_sub(1))
-                .filter(|&index| index < agents.kinds.len());
+                .filter(|&index| index < agents.roles.len());
         }
     }
 
@@ -410,7 +448,7 @@ impl AgentPicker {
             "◈ agents",
             theme::bold().fg(theme::ACCENT),
         )])];
-        for (i, kind) in agents.kinds.iter().enumerate() {
+        for (i, role) in agents.roles.iter().enumerate() {
             let is_sel = i == self.selected;
             let base_style = if is_sel {
                 theme::bold().fg(theme::ACCENT)
@@ -424,8 +462,9 @@ impl AgentPicker {
             };
             out.push(Line::styled(
                 format!(
-                    "  {}{kind}  →  {}",
+                    "  {}{}  →  {}",
                     if is_sel { "▸ " } else { "  " },
+                    role.label,
                     agents.describe(i, menu)
                 ),
                 style,
@@ -462,9 +501,20 @@ mod tests {
         }
     }
 
-    fn agents(pins: Vec<Option<(usize, Option<String>)>>) -> AgentMenu {
+    fn agents(pins: Vec<AgentModelChoice>) -> AgentMenu {
         AgentMenu {
-            kinds: vec!["explore".into(), "general".into()],
+            roles: vec![
+                AgentRole {
+                    key: "explore".into(),
+                    label: "explore".into(),
+                    allows_off: false,
+                },
+                AgentRole {
+                    key: "general".into(),
+                    label: "general".into(),
+                    allows_off: false,
+                },
+            ],
             pins,
             pin: Box::new(|_, _| Err("not applied in tests".into())),
         }
@@ -522,7 +572,7 @@ mod tests {
     #[test]
     fn agent_kind_hover_lifts_without_changing_the_selected_kind() {
         let m = menu();
-        let a = agents(vec![None, None]);
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
         let mut p = AgentPicker::new(&a).unwrap();
         p.set_hovered_row(Some(2), &a);
 
@@ -534,88 +584,106 @@ mod tests {
     #[test]
     fn agent_picker_mouse_walks_kind_then_model_and_inherit() {
         let m = menu();
-        let a = agents(vec![None, None]);
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
         let mut p = AgentPicker::new(&a).unwrap();
 
         // Content row zero is the title; clicking row two selects `general`.
         assert!(matches!(p.handle_mouse_row(2, &m, &a), AgentPick::Pending));
-        let AgentPick::Picked {
-            kind,
-            option,
-            effort,
-        } = p.handle_mouse_row(1, &m, &a)
-        else {
+        let AgentPick::Picked { kind, choice } = p.handle_mouse_row(1, &m, &a) else {
             panic!("expected an inherit pick");
         };
         assert_eq!(kind, "general");
-        assert_eq!(option, None);
-        assert_eq!(effort, None);
+        assert_eq!(choice, AgentModelChoice::Inherit);
     }
 
     #[test]
     fn agent_picker_walks_kind_then_model_and_pins() {
         let m = menu();
-        let a = agents(vec![None, None]);
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
         let mut p = AgentPicker::new(&a).unwrap();
 
-        // Step 1: "explore" is first; Enter opens the model grid.
         assert!(matches!(
             p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a),
             AgentPick::Pending
         ));
-        // Step 2: row 0 is "inherit", so Down lands on the first model.
+        // The inherit row is first, so Down lands on the first model.
         p.handle_key(KeyEvent::from(KeyCode::Down), &m, &a);
         p.handle_key(KeyEvent::from(KeyCode::Right), &m, &a); // auto → off
-        let AgentPick::Picked {
-            kind,
-            option,
-            effort,
-        } = p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a)
-        else {
-            panic!("expected a pick");
-        };
-        assert_eq!(kind, "explore");
-        assert_eq!(option, Some(0));
-        assert_eq!(effort.as_deref(), Some("off"));
-    }
-
-    #[test]
-    fn agent_picker_can_un_pin_and_esc_backs_out_one_step() {
-        let m = menu();
-        let a = agents(vec![Some((1, None)), None]);
-        let mut p = AgentPicker::new(&a).unwrap();
-        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
-
-        // Opens on the current pin (option 1 = row 2), not at the top.
-        // Esc returns to the kind list rather than closing the dialog...
-        assert!(matches!(
-            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
-            AgentPick::Pending
-        ));
-        // ...and a second Esc closes it.
-        assert!(matches!(
-            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
-            AgentPick::Cancelled
-        ));
-
-        // Re-enter and choose the "inherit" row: the pin is dropped.
-        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
-        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
-        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
-        let AgentPick::Picked { kind, option, .. } =
+        let AgentPick::Picked { kind, choice } =
             p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a)
         else {
             panic!("expected a pick");
         };
         assert_eq!(kind, "explore");
-        assert_eq!(option, None, "inherit un-pins the kind");
+        assert_eq!(
+            choice,
+            AgentModelChoice::Model {
+                option: 0,
+                effort: Some("off".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn agent_picker_can_inherit_and_esc_backs_out_one_step() {
+        let m = menu();
+        let a = agents(vec![
+            AgentModelChoice::Model {
+                option: 1,
+                effort: None,
+            },
+            AgentModelChoice::Inherit,
+        ]);
+        let mut p = AgentPicker::new(&a).unwrap();
+        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
+
+        assert!(matches!(
+            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
+            AgentPick::Pending
+        ));
+        assert!(matches!(
+            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
+            AgentPick::Cancelled
+        ));
+
+        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
+        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
+        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
+        let AgentPick::Picked { kind, choice } =
+            p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a)
+        else {
+            panic!("expected a pick");
+        };
+        assert_eq!(kind, "explore");
+        assert_eq!(choice, AgentModelChoice::Inherit);
+    }
+
+    #[test]
+    fn web_fetch_role_off_and_inherit_are_distinct() {
+        let m = menu();
+        let role = AgentRole {
+            key: "fetch".into(),
+            label: "web-fetch".into(),
+            allows_off: true,
+        };
+        let mut picker = Picker::for_agent(&m, &role, &AgentModelChoice::Off);
+        assert!(picker.render(&m)[1].to_string().contains("off"));
+        assert_eq!(picker.agent_choice(), AgentModelChoice::Off);
+        picker.handle_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(picker.agent_choice(), AgentModelChoice::Inherit);
     }
 
     #[test]
     fn kind_list_shows_what_each_agent_runs_on() {
         let m = menu();
-        let a = agents(vec![Some((0, Some("high".into()))), None]);
+        let a = agents(vec![
+            AgentModelChoice::Model {
+                option: 0,
+                effort: Some("high".into()),
+            },
+            AgentModelChoice::Inherit,
+        ]);
         assert_eq!(a.describe(0, &m), "deepseek-v4-flash[1m] (high)");
-        assert_eq!(a.describe(1, &m), "inherit");
+        assert_eq!(a.describe(1, &m), "inherit (main model)");
     }
 }

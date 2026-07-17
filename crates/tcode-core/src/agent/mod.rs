@@ -39,6 +39,9 @@ pub const DEFAULT_MAX_STEPS: usize = 500;
 /// Appended to the system prompt while `/dogfood` is on.
 const DOGFOOD_SYSTEM: &str = include_str!("../../../../prompts/dogfood.md");
 
+/// Appended to the Auto Mode classifier policy with machine-local folder trust.
+const FOLDER_TRUST_POLICY: &str = include_str!("../../../../prompts/folder-trust.md");
+
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
 #[derive(Debug, Clone)]
@@ -111,6 +114,10 @@ pub enum AgentEvent {
         /// like a normal prompt.
         entry_index: usize,
     },
+    /// A harness note just appended to the ledger at a safe boundary
+    /// (background task completion, monitor events). Carried so frontends
+    /// can show it live; replay bakes the same text from `Entry::Note`.
+    Note(String),
     /// The original text of a user's approval annotation. Sent only after its
     /// tool result has committed, matching the ledger order used by resume.
     UserNote {
@@ -342,6 +349,14 @@ impl Agent {
                         self.auto_policy, instructions
                     )
                 };
+                let folder_trust = match session.folder_trust() {
+                    crate::config::FolderTrust::Trusted => "trusted",
+                    crate::config::FolderTrust::Untrusted => "untrusted",
+                };
+                let policy = format!(
+                    "{policy}\n\n{}",
+                    FOLDER_TRUST_POLICY.replace("${TCODE_FOLDER_TRUST}", folder_trust)
+                );
                 let policy = session.prompt_variables().expand(&policy);
                 let request = ClassifierRequest {
                     policy,
@@ -405,12 +420,15 @@ impl Agent {
             self.emit(events, AgentEvent::Compacting).await?;
             self.compact(session, events, &cancel).await?;
         }
-        // Background tasks that finished between turns: tell the model
-        // before its new instruction (pure append, cache-safe).
-        self.note_finished_background_tasks(session);
-        // Commit a mode staged before this turn and, if it just entered plan
-        // mode, inject the plan-enter note ahead of the user's instruction.
+        // Background/monitor notes that accumulated between turns: tell the
+        // model before its new instruction (pure append, cache-safe).
+        self.note_background(session, events).await?;
+        // Commit a mode staged before this turn. The user prompt below is the
+        // delivery point that may append deferred environment, memory, and
+        // plan-mode context.
         self.commit_mode(session, events).await?;
+        session.mark_mode_delivery();
+        self.deliver_deferred_context(session);
         let expanded = crate::references::expand_references(
             session.tool_ctx.cwd.clone(),
             std::mem::take(&mut input),
@@ -441,10 +459,51 @@ impl Agent {
         }
         session.ledger.append(Entry::User(input));
         session.turn_usage = Usage::default();
+        self.run_steps(&model, session, events, approver, &cancel)
+            .await
+    }
 
+    /// A turn started by the harness because monitor events (or a monitor's
+    /// exit) arrived while the session was idle. There is no user input: the
+    /// injected notes are the whole prompt — legal because `Entry::Note`
+    /// renders as a user-role message. If another path already drained the
+    /// events, no request is made at all; returns whether a turn ran.
+    pub async fn monitor_turn(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+        approver: &dyn Approver,
+        cancel: CancellationToken,
+    ) -> Result<bool, AgentError> {
+        let model = self.model.snapshot();
+        if session.last_prompt_tokens > model.context_window * 85 / 100 {
+            self.emit(events, AgentEvent::Compacting).await?;
+            self.compact(session, events, &cancel).await?;
+        }
+        if self.note_background(session, events).await? == 0 {
+            return Ok(false);
+        }
+        self.commit_mode(session, events).await?;
+        session.turn_usage = Usage::default();
+        self.run_steps(&model, session, events, approver, &cancel)
+            .await?;
+        Ok(true)
+    }
+
+    /// The model-step loop shared by user turns and monitor wake turns:
+    /// stream → run tools → repeat until the model stops calling tools,
+    /// the user interrupts, or the runaway guard trips.
+    async fn run_steps(
+        &self,
+        model: &crate::provider::ActiveModel,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+        approver: &dyn Approver,
+        cancel: &CancellationToken,
+    ) -> Result<(), AgentError> {
         let max_steps = self.max_steps.max(1);
         for _ in 0..max_steps {
-            let (blocks, usage, stop) = self.stream_step(&model, session, events, &cancel).await?;
+            let (blocks, usage, stop) = self.stream_step(model, session, events, cancel).await?;
             session.last_prompt_tokens = usage.total_input() + usage.output_tokens;
             session.turn_usage.input_tokens += usage.input_tokens;
             session.turn_usage.output_tokens += usage.output_tokens;
@@ -477,7 +536,7 @@ impl Agent {
             }
 
             let outcome = self
-                .run_tools(session, &tool_calls, events, approver, &cancel)
+                .run_tools(session, &tool_calls, events, approver, cancel)
                 .await?;
             if outcome.interrupted {
                 self.emit(events, AgentEvent::Interrupted).await?;
@@ -490,12 +549,13 @@ impl Agent {
             }
             // End of a tool batch is a safe append boundary for background
             // task completion notes, a staged mode switch, and anything the
-            // user said meanwhile. The mode commits before pending input so a
-            // switch to plan takes effect for the next batch and its note lands
-            // ahead of whatever the user queued.
-            self.note_finished_background_tasks(session);
+            // user said meanwhile. A keypress commits the permission gate here
+            // but does not itself enter the model context: only an approval or
+            // queued prompt may deliver the final mode explanation.
+            self.note_background(session, events).await?;
             self.commit_mode(session, events).await?;
             self.deliver_pending_input(session, events).await?;
+            self.deliver_deferred_context(session);
         }
         // Runaway guard tripped. The ledger is consistent (the last tool
         // batch committed its results), so end the turn instead of erroring:
@@ -788,6 +848,7 @@ impl Agent {
                             input,
                         )
                         .await;
+                    session.mark_mode_delivery();
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             approval_note = approval.comment;
@@ -1257,6 +1318,7 @@ impl Agent {
                             input,
                         )
                         .await;
+                    session.mark_mode_delivery();
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1641,6 +1703,7 @@ impl Agent {
                             input,
                         )
                         .await;
+                    session.mark_mode_delivery();
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1849,25 +1912,33 @@ impl Agent {
         session.ledger.append(Entry::Note(msg));
     }
 
-    /// Append harness notes for background tasks that finished since the
-    /// last check. Only called at safe boundaries (turn start, after a
-    /// completed tool batch) so history stays append-only.
-    fn note_finished_background_tasks(&self, session: &mut Session) {
+    /// Append harness notes for background/monitor activity since the last
+    /// check and surface each one to the frontend. Only called at safe
+    /// boundaries (turn start, after a completed tool batch, an idle wake)
+    /// so history stays append-only. Returns how many notes landed.
+    async fn note_background(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+    ) -> Result<usize, AgentError> {
         let notes = session
             .tool_ctx
             .background
             .lock()
             .expect("background lock")
-            .take_completion_notes();
+            .take_notes();
+        let count = notes.len();
         for note in notes {
-            session.ledger.append(Entry::Note(note));
+            session.ledger.append(Entry::Note(note.clone()));
+            self.emit(events, AgentEvent::Note(note)).await?;
         }
+        Ok(count)
     }
 
-    /// Commit a staged permission-mode switch at a safe boundary and, if the
-    /// commit entered plan mode, append the plan-enter note. A net-zero cycle
-    /// commits nothing and injects nothing. This is the single place a staged
-    /// switch becomes live inside a running turn.
+    /// Commit a staged permission-mode switch at a safe boundary. The switch
+    /// changes the gate immediately for the next batch, but it is intentionally
+    /// not a model-facing event; `deliver_mode_note` handles that only after a
+    /// user interaction.
     async fn commit_mode(
         &self,
         session: &mut Session,
@@ -1876,10 +1947,20 @@ impl Agent {
         if let Some(mode) = session.commit_pending_mode() {
             self.emit(events, AgentEvent::ModeChanged(mode)).await?;
         }
-        if let Some(note) = session.take_mode_note() {
+        Ok(())
+    }
+
+    /// Append coalescible context only after a prompt or approval reaches a
+    /// legal ledger boundary. Bare UI setting changes never call this path.
+    fn deliver_deferred_context(&self, session: &mut Session) {
+        for note in session.take_deferred_context_notes() {
             session.ledger.append(Entry::Note(note));
         }
-        Ok(())
+        // Every caller marks a real prompt, queued prompt, or approval before
+        // reaching this boundary; bare UI setting changes never call this path.
+        if let Some(note) = session.take_pending_mode_note() {
+            session.ledger.append(Entry::Note(note));
+        }
     }
 
     /// Hand the model whatever the user said while it was working.
@@ -1894,6 +1975,7 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
         for message in session.pending.take() {
+            session.mark_mode_delivery();
             let expanded =
                 crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)
                     .await;

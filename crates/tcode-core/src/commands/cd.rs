@@ -15,9 +15,13 @@ impl SlashCommand for CdCommand {
         match ctx.session.change_cwd(args) {
             Ok(change) => {
                 if change.refresh_opening_context {
-                    let context =
+                    let startup =
                         (ctx.opening_context)(&change.new, &ctx.session.tool_ctx.scratch_dir);
-                    ctx.session.set_opening_context(context);
+                    ctx.session.set_startup_context(startup);
+                } else if change.changed {
+                    let environment = (ctx.environment)(&change.new);
+                    ctx.session
+                        .sync_environment(environment, change.memory_note);
                 }
                 if change.changed {
                     let _ = std::env::set_current_dir(&change.new);
@@ -33,9 +37,12 @@ impl SlashCommand for CdCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{test_ctx_parts, CommandCtx, MessageKind, OpeningContextFn, SlashCommand};
+    use super::super::{
+        test_ctx_parts, CommandCtx, EnvironmentFn, MessageKind, OpeningContextFn, SlashCommand,
+    };
     use super::CdCommand;
     use crate::types::Usage;
+    use crate::{EnvironmentSnapshot, StartupContext};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -45,17 +52,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("child")).unwrap();
 
-        let (mut session, _) = test_ctx_parts();
+        let (mut session, _, _) = test_ctx_parts();
         session.tool_ctx.cwd = root.canonicalize().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let opening: OpeningContextFn = Arc::new(move |_, _| {
+        let opening: OpeningContextFn = Arc::new(move |cwd, _| {
             calls2.fetch_add(1, Ordering::SeqCst);
-            "fresh map".into()
+            StartupContext {
+                text: "fresh map".into(),
+                environment: EnvironmentSnapshot {
+                    cwd: cwd.display().to_string(),
+                    platform: "test".into(),
+                    os_version: None,
+                    command_shells: vec!["test shell".into()],
+                    git: Default::default(),
+                    date: "1970-01-01".into(),
+                },
+            }
+        });
+        let environment: EnvironmentFn = Arc::new(|cwd| EnvironmentSnapshot {
+            cwd: cwd.display().to_string(),
+            platform: "test".into(),
+            os_version: None,
+            command_shells: vec!["test shell".into()],
+            git: Default::default(),
+            date: "1970-01-01".into(),
         });
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
 
@@ -71,10 +97,11 @@ mod tests {
 
     #[test]
     fn cd_to_a_bad_path_is_an_error_message() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = CdCommand.run(&mut ctx, "definitely-missing-dir-xyz");

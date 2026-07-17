@@ -598,11 +598,15 @@ fn build_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
         .compile_matcher())
 }
 
-/// Match against the path relative to the search base so `src/**/*.rs`
-/// works regardless of where the base directory lives.
+/// Match against slash-normalized paths relative to the search base so
+/// `src/**/*.rs` and bare names such as `app.rs` work on every platform.
 fn glob_matches(glob: &globset::GlobMatcher, path: &Path, base: &Path) -> bool {
     let rel = path.strip_prefix(base).unwrap_or(path);
-    glob.is_match(rel) || path.file_name().is_some_and(|n| glob.is_match(n))
+    let rel = rel.to_string_lossy().replace('\\', "/");
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().replace('\\', "/"));
+    glob.is_match(&rel) || name.is_some_and(|name| glob.is_match(name))
 }
 
 #[cfg(test)]
@@ -670,6 +674,22 @@ mod tests {
         )
         .await;
         assert_eq!(after, "a.rs:3: TARGET\na.rs:4- line4\na.rs:5- line5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_glob_matches_a_bare_filename_under_a_limited_directory() {
+        let dir = scratch("bare-glob", "outside\n");
+        let source = dir.join("src");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("app.rs"), "TARGET\n").unwrap();
+
+        let out = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "path": "src", "glob": "app.rs" }),
+        )
+        .await;
+        assert!(out.ends_with("app.rs:1: TARGET"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

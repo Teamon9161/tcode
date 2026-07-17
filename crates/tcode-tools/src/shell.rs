@@ -87,32 +87,42 @@ impl ShellTool {
     }
 
     fn command(&self, script: &str, cwd: &std::path::Path) -> tokio::process::Command {
-        match self.kind {
-            ShellKind::PowerShell => {
-                let mut cmd = tokio::process::Command::new("powershell.exe");
-                // Force UTF-8 so output survives non-English codepages.
-                let wrapped = format!(
-                    "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-                     $OutputEncoding=[System.Text.Encoding]::UTF8; {script}"
-                );
-                cmd.args([
-                    "-NoProfile",
-                    "-NonInteractive",
-                    "-ExecutionPolicy",
-                    "Bypass",
-                    "-Command",
-                    &wrapped,
-                ]);
-                cmd.current_dir(cwd);
-                cmd
-            }
-            ShellKind::Bash => {
-                let mut cmd =
-                    tokio::process::Command::new(which_bash().unwrap_or_else(|| "bash".into()));
-                cmd.args(["-c", script]);
-                cmd.current_dir(cwd);
-                cmd
-            }
+        shell_command(self.kind, script, cwd)
+    }
+}
+
+/// Build the interpreter invocation for a script. Shared with the `monitor`
+/// tool so both spawn commands identically.
+pub(crate) fn shell_command(
+    kind: ShellKind,
+    script: &str,
+    cwd: &std::path::Path,
+) -> tokio::process::Command {
+    match kind {
+        ShellKind::PowerShell => {
+            let mut cmd = tokio::process::Command::new("powershell.exe");
+            // Force UTF-8 so output survives non-English codepages.
+            let wrapped = format!(
+                "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
+                 $OutputEncoding=[System.Text.Encoding]::UTF8; {script}"
+            );
+            cmd.args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                &wrapped,
+            ]);
+            cmd.current_dir(cwd);
+            cmd
+        }
+        ShellKind::Bash => {
+            let mut cmd =
+                tokio::process::Command::new(which_bash().unwrap_or_else(|| "bash".into()));
+            cmd.args(["-c", script]);
+            cmd.current_dir(cwd);
+            cmd
         }
     }
 }
@@ -188,16 +198,16 @@ impl Tool for KillTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Stop a background task by id (e.g. b1). Killing an already-finished \
-         task is a no-op. Its captured output stays readable in the task's log \
-         file via read."
+        "Stop a background task or monitor by id (e.g. b1, m2). Killing an \
+         already-finished task is a no-op. Its captured output stays readable \
+         in the task's log file via read."
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
             "properties": {
-                "id": { "type": "string", "description": "Background task id, e.g. b1" }
+                "id": { "type": "string", "description": "Background task or monitor id, e.g. b1 or m2" }
             },
             "required": ["id"]
         })
@@ -219,16 +229,16 @@ impl Tool for KillTaskTool {
     }
 }
 
-/// Append a pipe's lines to the shared task output until EOF.
-fn spawn_line_reader(
+/// Append a pipe's lines to the shared task output until EOF. For monitor
+/// tasks each line also becomes an undelivered event (see `TaskShared`).
+pub(crate) fn spawn_line_reader(
     pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
     shared: std::sync::Arc<tcode_core::TaskShared>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut lines = BufReader::new(pipe).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            shared.append_output(&line);
-            shared.append_output("\n");
+            shared.push_line(&line);
         }
     })
 }

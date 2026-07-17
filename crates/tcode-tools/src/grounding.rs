@@ -1,37 +1,114 @@
 use std::path::Path;
 use std::process::Command;
 
-/// Build the opening context. The scratch parameter remains in the signature
-/// so existing frontends can call it, while the exact path now comes from the
-/// stable `${TCODE_SCRATCH_DIR}` system-prompt substitution.
-pub fn project_map_with_scratch(cwd: &Path, _scratch: &Path) -> String {
-    let mut out = String::new();
-    out.push_str(&format!(
-        "# Environment\nplatform: {}\ncwd: {}\ndate: {}\n",
-        std::env::consts::OS,
-        cwd.display(),
-        chrono_date(),
-    ));
+use tcode_core::{EnvironmentSnapshot, GitSnapshot, StartupContext};
 
-    match git_summary(cwd) {
-        Some(git) => out.push_str(&format!("\n# Git\n{git}\n")),
-        None => out.push_str("\nNot a git repository.\n"),
-    }
+use crate::shell;
+
+/// Build the byte-stable startup context for a new conversation. The scratch
+/// parameter remains in the signature so existing frontends can call it, while
+/// the exact path comes from the stable `${TCODE_SCRATCH_DIR}` substitution.
+pub fn startup_context_with_scratch(cwd: &Path, _scratch: &Path) -> StartupContext {
+    let environment = environment_snapshot(cwd);
+    let mut out = String::new();
 
     let tree = dir_tree(cwd);
     if !tree.is_empty() {
         out.push_str(&format!(
-            "\n# Project layout (2 levels, gitignore-aware)\n{tree}"
+            "# Project layout (2 levels, gitignore-aware)\n{tree}"
         ));
     }
 
     out.push_str(&tcode_core::MemoryManager::new(cwd).startup_prompt());
-    out
+    out.push_str(&render_environment(&environment));
+    out.push_str(&render_git(&environment.git));
+    StartupContext {
+        text: out,
+        environment,
+    }
+}
+
+/// The live runtime facts used to compare an inactive session with the current
+/// process. Keep this separate from the project tree: the tree is startup
+/// context, not a volatile fact to rescan and diff on every resume.
+pub fn environment_snapshot(cwd: &Path) -> EnvironmentSnapshot {
+    let info = os_info::get();
+    EnvironmentSnapshot {
+        cwd: cwd.display().to_string(),
+        platform: info.os_type().to_string(),
+        os_version: Some(info.version().to_string()).filter(|version| !version.is_empty()),
+        command_shells: command_shells(),
+        git: git_snapshot(cwd),
+        date: chrono_date(),
+    }
+}
+
+/// Compatibility wrapper for callers that only need the text portion.
+pub fn project_map_with_scratch(cwd: &Path, scratch: &Path) -> String {
+    startup_context_with_scratch(cwd, scratch).text
 }
 
 /// Convenience wrapper for callers that do not own a live `ToolCtx`.
 pub fn project_map(cwd: &Path) -> String {
     project_map_with_scratch(cwd, &tcode_core::store::scratchpad_dir(cwd))
+}
+
+fn command_shells() -> Vec<String> {
+    if cfg!(windows) {
+        let mut shells = vec!["PowerShell".into()];
+        if shell::bash_available() {
+            shells.push("Git Bash".into());
+        }
+        shells
+    } else {
+        vec!["bash".into()]
+    }
+}
+
+fn render_environment(environment: &EnvironmentSnapshot) -> String {
+    let version = environment
+        .os_version
+        .as_deref()
+        .filter(|version| !version.is_empty())
+        .map(|version| format!(" {version}"))
+        .unwrap_or_default();
+    format!(
+        "\n# Environment\nworking directory: {}\nplatform: {}{}\ncommand shells: {}\ndate: {}\n",
+        environment.cwd,
+        environment.platform,
+        version,
+        environment.command_shells.join(", "),
+        environment.date,
+    )
+}
+
+fn render_git(git: &GitSnapshot) -> String {
+    if !git.repository {
+        return "\n# Git\nNot a git repository.\n".into();
+    }
+    let mut out = format!(
+        "\n# Git\nbranch: {}\nlast commit: {}\n",
+        git.branch.as_deref().unwrap_or("(detached HEAD)"),
+        git.head.as_deref().unwrap_or("unknown")
+    );
+    if git.changed_files == 0 {
+        out.push_str("working tree: clean\n");
+    } else {
+        out.push_str(&format!(
+            "working tree: {} changed file(s)\n",
+            git.changed_files
+        ));
+        for line in &git.status_preview {
+            out.push_str(&format!("  {line}\n"));
+        }
+        if git.changed_files > git.status_preview.len() {
+            out.push_str(&format!(
+                "  … (+{} more)\n",
+                git.changed_files - git.status_preview.len()
+            ));
+        }
+    }
+    out
 }
 
 fn chrono_date() -> String {
@@ -71,24 +148,19 @@ fn git(cwd: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn git_summary(cwd: &Path) -> Option<String> {
-    let branch = git(cwd, &["branch", "--show-current"])?;
+fn git_snapshot(cwd: &Path) -> GitSnapshot {
+    let Some(branch) = git(cwd, &["branch", "--show-current"]) else {
+        return GitSnapshot::default();
+    };
     let status = git(cwd, &["status", "--porcelain"]).unwrap_or_default();
-    let last = git(cwd, &["log", "-1", "--format=%h %s"]).unwrap_or_default();
-    let dirty = status.lines().count();
-    let mut s = format!("branch: {branch}\nlast commit: {last}\n");
-    if dirty == 0 {
-        s.push_str("working tree: clean");
-    } else {
-        s.push_str(&format!("working tree: {dirty} changed file(s)\n"));
-        for line in status.lines().take(15) {
-            s.push_str(&format!("  {line}\n"));
-        }
-        if dirty > 15 {
-            s.push_str(&format!("  … (+{} more)\n", dirty - 15));
-        }
+    let changed_files = status.lines().count();
+    GitSnapshot {
+        repository: true,
+        branch: (!branch.is_empty()).then_some(branch),
+        head: git(cwd, &["log", "-1", "--format=%h %s"]).filter(|head| !head.is_empty()),
+        changed_files,
+        status_preview: status.lines().take(15).map(str::to_owned).collect(),
     }
-    Some(s)
 }
 
 /// Overall budget for the layout section of the system prompt.
@@ -161,4 +233,18 @@ fn dir_tree(cwd: &Path) -> String {
         return String::new();
     }
     entries.join("\n") + "\n"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_context_ends_with_environment_and_git_blocks() {
+        let context = startup_context_with_scratch(Path::new("."), Path::new("/scratch"));
+        let environment = context.text.rfind("# Environment").unwrap();
+        let git = context.text.rfind("# Git").unwrap();
+        assert!(environment < git);
+        assert!(context.text[environment..].contains("command shells:"));
+    }
 }

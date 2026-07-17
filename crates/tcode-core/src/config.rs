@@ -329,13 +329,16 @@ pub struct AutoModeConfig {
 /// `[agents.explore]`: run a sub-agent kind on a model other than the one
 /// driving the conversation. Reconnaissance is bulk reading and summarizing —
 /// a cheap, fast model does it well, and its context never enters the parent's
-/// window anyway. Unset fields inherit the parent's active selection.
+/// window anyway. Unset model fields inherit the parent's active selection.
+/// `enabled` applies to opt-in roles such as `fetch`: `true` selects the parent
+/// model, while absence leaves that role off by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AgentConfig {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -357,6 +360,13 @@ pub struct Config {
     /// command = "cargo fmt"`.
     pub hooks: Vec<crate::hooks::HookDef>,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FolderTrust {
+    Trusted,
+    Untrusted,
 }
 
 /// Everything the program itself decides and must remember: the active
@@ -386,16 +396,37 @@ pub struct ModelState {
     /// one-off flip to it must not silently arm every future session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<crate::permission::PermissionMode>,
+    /// Per-canonical-folder trust decisions. This is machine-local state, never
+    /// project configuration: checking out a repository cannot make it trusted.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub folder_trust: BTreeMap<String, FolderTrust>,
 }
 
 impl ModelState {
-    /// Read the file, apply `edit`, write it back. Callers that persist one
-    /// field must not clobber the others (the picker's model choice and the
-    /// dogfood switch are written from different places).
-    pub fn update(edit: impl FnOnce(&mut Self)) {
+    pub fn folder_trust_for(&self, folder: &Path) -> Option<FolderTrust> {
+        self.folder_trust
+            .get(&folder.display().to_string())
+            .copied()
+    }
+
+    pub fn set_folder_trust(&mut self, folder: &Path, trust: FolderTrust) {
+        self.folder_trust
+            .insert(folder.display().to_string(), trust);
+    }
+
+    /// Read the file, apply `edit`, write it back, reporting whether the local
+    /// state was actually made durable. New interactions that promise to
+    /// remember a security-relevant decision must use this rather than silently
+    /// claiming persistence succeeded.
+    pub fn update_checked(edit: impl FnOnce(&mut Self)) -> Result<(), ConfigError> {
         let mut state = Self::load();
         edit(&mut state);
-        state.save();
+        state.save_checked()
+    }
+
+    /// Legacy best-effort state updates retain their non-failing behavior.
+    pub fn update(edit: impl FnOnce(&mut Self)) {
+        let _ = Self::update_checked(edit);
     }
 }
 
@@ -413,13 +444,18 @@ impl ModelState {
     }
 
     pub fn save(&self) {
-        let Some(path) = Self::path() else { return };
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        if let Ok(text) = toml::to_string_pretty(self) {
-            let _ = std::fs::write(path, text);
-        }
+        let _ = self.save_checked();
+    }
+
+    pub fn save_checked(&self) -> Result<(), ConfigError> {
+        let path = Self::path().ok_or(ConfigError::NoHome)?;
+        let dir = path.parent().expect("state.toml has a parent");
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+            path: dir.to_path_buf(),
+            source,
+        })?;
+        let text = toml::to_string_pretty(self).expect("model state serializes");
+        std::fs::write(&path, text).map_err(|source| ConfigError::Io { path, source })
     }
 }
 
@@ -814,21 +850,22 @@ fn add_project_allow_blocking(project_dir: &Path, descriptor: &str) -> Result<bo
             path: path.clone(),
             message: format!("invalid TOML: {error}"),
         })?;
-    if document["permissions"].is_none() {
-        document["permissions"] = Item::Table(Table::new());
+    if document.get("permissions").is_none() {
+        document.insert("permissions", Item::Table(Table::new()));
     }
-    let permissions =
-        document["permissions"]
-            .as_table_mut()
-            .ok_or_else(|| ConfigError::Update {
-                path: path.clone(),
-                message: "`permissions` must be a TOML table".into(),
-            })?;
-    if permissions["allow"].is_none() {
-        permissions["allow"] = Item::Value(Value::Array(Array::new()));
+    let permissions = document
+        .get_mut("permissions")
+        .and_then(Item::as_table_mut)
+        .ok_or_else(|| ConfigError::Update {
+            path: path.clone(),
+            message: "`permissions` must be a TOML table".into(),
+        })?;
+    if permissions.get("allow").is_none() {
+        permissions.insert("allow", Item::Value(Value::Array(Array::new())));
     }
-    let allow = permissions["allow"]
-        .as_array_mut()
+    let allow = permissions
+        .get_mut("allow")
+        .and_then(Item::as_array_mut)
         .ok_or_else(|| ConfigError::Update {
             path: path.clone(),
             message: "`permissions.allow` must be a TOML array".into(),
@@ -892,6 +929,35 @@ mod tests {
         assert!(text.contains("edit(src/lib.rs)"));
         assert!(text.contains("run(cargo test)"));
         assert!(text.contains("[custom]"));
+    }
+
+    #[tokio::test]
+    async fn project_allow_update_creates_a_new_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(
+            Config::add_project_allow(dir.path().to_path_buf(), "web_search(*)".into())
+                .await
+                .unwrap()
+        );
+
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(".tcode/config.toml")).unwrap(),
+            "[permissions]\nallow = [\"web_search(*)\"]\n"
+        );
+    }
+
+    #[test]
+    fn folder_trust_is_machine_local_state_and_round_trips() {
+        let path = Path::new("C:/work/example");
+        let mut state = ModelState::default();
+        state.set_folder_trust(path, FolderTrust::Trusted);
+
+        let text = toml::to_string(&state).unwrap();
+        assert!(text.contains("[folder_trust]"));
+        assert!(!text.contains("permissions"));
+        let restored: ModelState = toml::from_str(&text).unwrap();
+        assert_eq!(restored.folder_trust_for(path), Some(FolderTrust::Trusted));
     }
 
     #[test]

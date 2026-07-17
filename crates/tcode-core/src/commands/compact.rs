@@ -29,10 +29,11 @@ mod tests {
 
     #[test]
     fn compact_needs_history_and_carries_the_focus() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = CompactCommand.run(&mut ctx, "");
@@ -43,6 +44,7 @@ mod tests {
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = CompactCommand.run(&mut ctx, "keep the api decisions");

@@ -41,10 +41,11 @@ mod tests {
 
     #[test]
     fn export_writes_a_markdown_file() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         assert_eq!(
@@ -59,6 +60,7 @@ mod tests {
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = ExportCommand.run(&mut ctx, target.to_str().unwrap());

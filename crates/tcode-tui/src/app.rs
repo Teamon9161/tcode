@@ -24,7 +24,7 @@ use tcode_core::commands::{
     CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
 };
 use tcode_core::{
-    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock,
+    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock, FolderTrust,
     PendingMessage, ReferenceCandidate, ReferenceKind, Session, Usage,
 };
 
@@ -39,7 +39,7 @@ use crate::resume::{self, PickResult as ResumePickResult};
 use crate::transcript::Transcript;
 use crate::view::{BakeCtx, SessionView};
 use crate::view_picker::{self, ViewId};
-use crate::{diff, markdown, theme, OpeningContextFn};
+use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
 
 type Term = Terminal<CrosstermBackend<Stdout>>;
 
@@ -355,6 +355,7 @@ struct RewindNav {
 pub struct App {
     agent: Arc<Agent>,
     opening_context: OpeningContextFn,
+    environment: EnvironmentFn,
     registry: CommandRegistry,
     /// The same discovery the `skill` tool uses, handed in by the caller so a
     /// `/name` line that misses both `UI_COMMANDS` and the registry can fall
@@ -397,6 +398,13 @@ pub struct App {
     /// Prompts submitted while a turn was running. The agent loop takes them at
     /// its next safe boundary; until then they show, dimmed, above the input.
     pending: tcode_core::PendingInput,
+    /// Fires when a monitor produces an event or exits; re-fetched from the
+    /// session each loop iteration so a rebound registry can't leave it stale.
+    monitor_signal: Arc<tokio::sync::Notify>,
+    /// When to wake an idle session for undelivered monitor events. `None`
+    /// while there is nothing to deliver; recomputed from the registry on
+    /// signal and at turn end.
+    monitor_deadline: Option<tokio::time::Instant>,
     /// A permission-mode switch staged while a turn runs (the running turn owns
     /// the `Session`). The agent loop commits it at the next batch boundary and
     /// reports back with `ModeChanged`; until then the status line shows the
@@ -464,6 +472,8 @@ pub struct App {
     menu: ModelMenu,
     model_picker: Option<model_picker::Picker>,
     mode_picker: Option<crate::mode_picker::Picker>,
+    /// First-entry confirmation for a folder with no local trust record.
+    folder_trust_picker: Option<crate::folder_trust_picker::Picker>,
     agents: AgentMenu,
     agent_picker: Option<model_picker::AgentPicker>,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
@@ -557,6 +567,7 @@ impl App {
         menu: ModelMenu,
         agents: AgentMenu,
         opening_context: OpeningContextFn,
+        environment: EnvironmentFn,
         show_reasoning: bool,
         skills: Vec<tcode_tools::Skill>,
     ) -> anyhow::Result<Self> {
@@ -570,6 +581,8 @@ impl App {
         let cwd = session.tool_ctx.cwd.clone();
         let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let task_trace_root = task_trace_root(&session);
+        let folder_trust_picker =
+            (!session.folder_trust_known()).then(|| crate::folder_trust_picker::Picker::new(&cwd));
         let task_runs = discover_task_runs(task_trace_root.as_deref());
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
@@ -581,18 +594,32 @@ impl App {
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
         let renderers = RenderRegistry::from_tools(&agent.tools);
-        let terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        // EnterAlternateScreen does not guarantee a blank physical buffer: on
+        // some terminals a prior tcode frame survives a leave/re-enter cycle.
+        // Ratatui's first diff sees a blank logical buffer and would otherwise
+        // never erase those untouched cells.
+        terminal.clear()?;
         let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
         // The running turn owns the Session; this handle is how input typed
         // meanwhile still reaches it.
         let pending = session.pending.clone();
+        let monitor_signal = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .monitor_signal();
         Ok(Self {
             agent,
             opening_context,
+            environment,
             registry: CommandRegistry::builtin(),
             skills,
             session: Some(session),
             pending,
+            monitor_signal,
+            monitor_deadline: None,
             pending_mode,
             committed_mode,
             cwd,
@@ -634,6 +661,7 @@ impl App {
             menu,
             model_picker: None,
             mode_picker: None,
+            folder_trust_picker,
             agents,
             agent_picker: None,
             dogfood: session_dogfood,
@@ -697,6 +725,23 @@ impl App {
 
         while !self.should_exit {
             self.redraw()?;
+            // Re-fetch when idle so a rebound registry (resume/import) can't
+            // leave a stale handle; while a turn owns the session, the cached
+            // clone stays valid because ToolCtx is never rebound mid-turn.
+            if let Some(session) = self.session.as_ref() {
+                self.monitor_signal = session
+                    .tool_ctx
+                    .background
+                    .lock()
+                    .expect("background lock")
+                    .monitor_signal();
+            }
+            let monitor_signal = self.monitor_signal.clone();
+            let monitor_armed =
+                self.monitor_deadline.is_some() && matches!(self.phase, Phase::Idle);
+            let monitor_deadline = self
+                .monitor_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 ev = term_events.next() => {
                     match ev {
@@ -785,6 +830,12 @@ impl App {
                 }
                 done = join_phase(&mut self.phase) => {
                     self.on_turn_done(done);
+                }
+                _ = monitor_signal.notified() => {
+                    self.refresh_monitor_deadline();
+                }
+                _ = tokio::time::sleep_until(monitor_deadline), if monitor_armed => {
+                    self.on_monitor_deadline();
                 }
                 done = join_external_import(&mut self.external_import) => {
                     self.on_external_import_done(done);
@@ -1306,6 +1357,81 @@ impl App {
         };
     }
 
+    /// Recompute when an idle session should wake for monitor activity.
+    /// While a turn is running the session is owned by the worker, so the
+    /// deadline stays unset; `on_turn_done` recomputes it.
+    fn refresh_monitor_deadline(&mut self) {
+        self.monitor_deadline = self
+            .session
+            .as_ref()
+            .and_then(|session| {
+                session
+                    .tool_ctx
+                    .background
+                    .lock()
+                    .expect("background lock")
+                    .monitor_wake_deadline()
+            })
+            .map(tokio::time::Instant::from_std);
+    }
+
+    fn on_monitor_deadline(&mut self) {
+        self.monitor_deadline = None;
+        // Don't start a turn underneath a modal (approval dialog, pickers,
+        // rewind navigation); retry shortly instead of losing the events.
+        let modal_open = self.dialog.is_some()
+            || self.rewind_nav.is_some()
+            || self.resume_picker.is_some()
+            || self.model_picker.is_some()
+            || self.mode_picker.is_some()
+            || self.agent_picker.is_some()
+            || self.view_picker.is_some();
+        if modal_open {
+            self.monitor_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
+            return;
+        }
+        self.start_monitor_wake();
+    }
+
+    /// A harness-started turn delivering monitor events that arrived while
+    /// idle. There is no user prompt to echo; the injected notes bake via
+    /// `AgentEvent::Note` and the model's reaction streams as usual.
+    fn start_monitor_wake(&mut self) {
+        let Some(mut session) = self.session.take() else {
+            return;
+        };
+        self.drop_suggestion();
+        self.clear_live_text();
+        self.space_before_response = false;
+
+        let (tx, rx) = mpsc::channel(64);
+        self.events_rx = Some(rx);
+        self.turn_usage = Usage::default();
+        self.delegated_usage = Usage::default();
+        self.user_wait_started = None;
+        self.user_wait_total = Duration::ZERO;
+        self.out_tokens = 0;
+        self.thinking_chars = 0;
+        self.state_label = "monitor event".into();
+
+        let cancel = CancellationToken::new();
+        let agent = self.agent.clone();
+        let approver = self.approver.clone();
+        let cancel2 = cancel.clone();
+        let handle = tokio::spawn(async move {
+            let result = agent
+                .monitor_turn(&mut session, &tx, &*approver, cancel2)
+                .await
+                .map(|_| ());
+            (session, result)
+        });
+        self.phase = Phase::Running {
+            handle,
+            cancel,
+            started: Instant::now(),
+        };
+    }
+
     /// `/compact [focus]` runs like a turn (spinner, cancel, usage report)
     /// but drives `Agent::compact` instead of the tool loop. The optional focus
     /// tells the summarizer which details deserve special attention.
@@ -1441,6 +1567,9 @@ impl App {
         if landed {
             self.start_suggestion();
         }
+        // Monitor events that arrived during the closing words never reached
+        // a boundary; now that the session is back, re-arm the idle wake.
+        self.refresh_monitor_deadline();
     }
 
     fn drain_agent_events(&mut self) {
@@ -1691,6 +1820,17 @@ impl App {
                     String::new()
                 };
                 self.notice = Some((format!("referenced {summary}{more}"), Instant::now()));
+            }
+            AgentEvent::Note(text) => {
+                // Same record replay bakes from `Entry::Note`, shown live so
+                // background completions and monitor events are visible the
+                // moment they land in the ledger.
+                self.bake_live_text();
+                self.finish_thinking();
+                let mut lines = vec![Line::default()];
+                lines.extend(quote_lines(Some(NOTE_LABEL), &text));
+                lines.push(Line::default());
+                self.bake(lines);
             }
             AgentEvent::QueuedInput {
                 text,
@@ -2603,6 +2743,8 @@ impl App {
             picker.set_hovered_row(row);
         } else if let Some(picker) = self.mode_picker.as_mut() {
             picker.set_hovered_row(row);
+        } else if let Some(picker) = self.folder_trust_picker.as_mut() {
+            picker.set_hovered_row(row);
         } else if let Some(picker) = self.agent_picker.as_mut() {
             picker.set_hovered_row(row, &self.agents);
         }
@@ -2612,6 +2754,7 @@ impl App {
         if self.view_picker.is_none()
             && self.model_picker.is_none()
             && self.mode_picker.is_none()
+            && self.folder_trust_picker.is_none()
             && self.agent_picker.is_none()
         {
             return false;
@@ -2627,6 +2770,11 @@ impl App {
                     .map(|picker| picker.render(&self.menu))
             })
             .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
+            .or_else(|| {
+                self.folder_trust_picker
+                    .as_ref()
+                    .map(|picker| picker.render())
+            })
             .or_else(|| {
                 self.agent_picker
                     .as_ref()
@@ -2687,17 +2835,22 @@ impl App {
                 crate::mode_picker::PickResult::Cancelled
                 | crate::mode_picker::PickResult::Pending => {}
             }
+        } else if let Some(picker) = self.folder_trust_picker.as_mut() {
+            match picker.handle_mouse_row(row) {
+                crate::folder_trust_picker::PickResult::Picked(choice) => {
+                    self.folder_trust_picker = None;
+                    self.apply_folder_trust_choice(choice);
+                }
+                crate::folder_trust_picker::PickResult::Cancelled
+                | crate::folder_trust_picker::PickResult::Pending => {}
+            }
         } else if let Some(picker) = self.agent_picker.as_mut() {
             match picker.handle_mouse_row(row, &self.menu, &self.agents) {
                 model_picker::AgentPick::Pending => {}
                 model_picker::AgentPick::Cancelled => self.agent_picker = None,
-                model_picker::AgentPick::Picked {
-                    kind,
-                    option,
-                    effort,
-                } => {
+                model_picker::AgentPick::Picked { kind, choice } => {
                     self.agent_picker = None;
-                    self.apply_agent_model(&kind, option, effort);
+                    self.apply_agent_model(&kind, choice);
                 }
             }
         }
@@ -2955,6 +3108,23 @@ impl App {
             return;
         }
 
+        if let Some(picker) = self.folder_trust_picker.as_mut() {
+            match picker.handle_key(key) {
+                crate::folder_trust_picker::PickResult::Pending => {}
+                crate::folder_trust_picker::PickResult::Cancelled => {
+                    self.folder_trust_picker = None;
+                    self.apply_folder_trust_choice(
+                        crate::folder_trust_picker::Choice::RejectSession,
+                    );
+                }
+                crate::folder_trust_picker::PickResult::Picked(choice) => {
+                    self.folder_trust_picker = None;
+                    self.apply_folder_trust_choice(choice);
+                }
+            }
+            return;
+        }
+
         if let Some(picker) = self.mode_picker.as_mut() {
             match picker.handle_key(key) {
                 crate::mode_picker::PickResult::Pending => {}
@@ -2971,13 +3141,9 @@ impl App {
             match picker.handle_key(key, &self.menu, &self.agents) {
                 model_picker::AgentPick::Pending => {}
                 model_picker::AgentPick::Cancelled => self.agent_picker = None,
-                model_picker::AgentPick::Picked {
-                    kind,
-                    option,
-                    effort,
-                } => {
+                model_picker::AgentPick::Picked { kind, choice } => {
                     self.agent_picker = None;
-                    self.apply_agent_model(&kind, option, effort);
+                    self.apply_agent_model(&kind, choice);
                 }
             }
             return;
@@ -3400,6 +3566,49 @@ impl App {
         }
     }
 
+    fn apply_folder_trust_choice(&mut self, choice: crate::folder_trust_picker::Choice) {
+        let (trust, remember) = crate::folder_trust_picker::outcome(choice);
+        let cwd = self.cwd.clone();
+        if let Some(session) = self.session.as_mut() {
+            session.set_folder_trust(trust);
+        }
+        let persistence = if remember {
+            match tcode_core::config::ModelState::update_checked(|state| {
+                state.set_folder_trust(&cwd, trust)
+            }) {
+                Ok(()) => " and remembered on this machine".to_string(),
+                Err(error) => format!(" for this session only (could not remember: {error})"),
+            }
+        } else {
+            " for this session only".to_string()
+        };
+        let label = match trust {
+            FolderTrust::Trusted => "trusted",
+            FolderTrust::Untrusted => "not trusted",
+        };
+        self.bake(vec![Line::styled(
+            format!("folder {label}{persistence}: {}", cwd.display()),
+            theme::dim(),
+        )]);
+    }
+
+    fn refresh_folder_trust(&mut self) {
+        let remembered = tcode_core::config::ModelState::load().folder_trust_for(&self.cwd);
+        let Some(session) = self.session.as_mut() else {
+            return;
+        };
+        match remembered {
+            Some(trust) => {
+                session.set_folder_trust(trust);
+                self.folder_trust_picker = None;
+            }
+            None => {
+                session.clear_folder_trust();
+                self.folder_trust_picker = Some(crate::folder_trust_picker::Picker::new(&self.cwd));
+            }
+        }
+    }
+
     fn open_mode_picker(&mut self) {
         let current = self.pending_mode.get().unwrap_or(self.committed_mode);
         self.mode_picker = Some(crate::mode_picker::Picker::new(current));
@@ -3440,26 +3649,19 @@ impl App {
         }
     }
 
-    /// `/agents`: pin a sub-agent kind to a model, or (option = None) let it
-    /// go back to following the main one. The binary applies and persists it;
-    /// we only mirror the result so the kind list stays truthful.
-    fn apply_agent_model(&mut self, kind: &str, option: Option<usize>, effort: Option<String>) {
-        let choice = option.and_then(|index| {
-            self.menu
-                .options
-                .get(index)
-                .map(|opt| (opt, effort.as_deref()))
-        });
-        match (self.agents.pin)(kind, choice) {
+    /// `/agents`: apply a role's explicit mode. The binary performs the live
+    /// registry update and persistence; the TUI only mirrors its result.
+    fn apply_agent_model(&mut self, kind: &str, choice: model_picker::AgentModelChoice) {
+        match (self.agents.pin)(kind, choice.clone()) {
             Ok(label) => {
                 if let Some(slot) = self
                     .agents
-                    .kinds
+                    .roles
                     .iter()
-                    .position(|k| k == kind)
+                    .position(|role| role.key == kind)
                     .map(|i| &mut self.agents.pins[i])
                 {
-                    *slot = option.map(|index| (index, effort.clone()));
+                    *slot = choice;
                 }
                 self.bake(vec![Line::styled(
                     format!("{kind} → {label}"),
@@ -3467,7 +3669,7 @@ impl App {
                 )]);
             }
             Err(e) => self.bake(vec![Line::styled(
-                format!("cannot pin {kind}: {e}"),
+                format!("cannot configure {kind}: {e}"),
                 ratatui::style::Style::default().fg(theme::ERROR),
             )]),
         }
@@ -3535,6 +3737,7 @@ impl App {
         let mut ctx = CommandCtx {
             session,
             opening_context: &self.opening_context,
+            environment: &self.environment,
             turn_usage: self.turn_usage,
         };
         let outcome = self
@@ -3680,6 +3883,7 @@ impl App {
         if self.cwd != old_cwd {
             self.reference_index.clear();
             self.refresh_reference_index();
+            self.refresh_folder_trust();
         }
     }
 
@@ -4130,6 +4334,19 @@ impl App {
         true
     }
 
+    fn apply_reference_completion(
+        editor: &mut Editor,
+        start: Position,
+        end: Position,
+        replacement: &str,
+    ) {
+        editor.replace_range(start, end, replacement);
+        // A completed reference is an atomic prompt token. Leave the cursor
+        // ready for prose rather than making the next character part of the
+        // path marker.
+        editor.insert_char(' ');
+    }
+
     fn accept_completion(&mut self, completion: CompletionMatch) {
         match completion.kind {
             CompletionKind::Slash => {
@@ -4138,8 +4355,12 @@ impl App {
                 self.editor.insert_str(&completion.replacement);
             }
             CompletionKind::Reference { start, end } => {
-                self.editor
-                    .replace_range(start, end, &completion.replacement);
+                Self::apply_reference_completion(
+                    &mut self.editor,
+                    start,
+                    end,
+                    &completion.replacement,
+                );
                 self.dismissed_reference = Some(start);
             }
         }
@@ -4274,6 +4495,7 @@ impl App {
         self.external_import = None;
         self.state_label.clear();
         let opening_context = self.opening_context.clone();
+        let environment = self.environment.clone();
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -4285,7 +4507,8 @@ impl App {
                 session.ledger.attach_sink(Box::new(resumed.store));
                 session.bind_scratch_session(&imported_id);
                 let opening = opening_context(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir);
-                session.replace_opening_context_for_resume(opening);
+                session.set_startup_context(opening);
+                session.sync_environment(environment(&session.tool_ctx.cwd), None);
                 self.scratch_dir = session.tool_ctx.scratch_dir.clone();
                 session.last_prompt_tokens = 0;
                 session
@@ -4705,6 +4928,11 @@ impl App {
             })
             .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
             .or_else(|| {
+                self.folder_trust_picker
+                    .as_ref()
+                    .map(|picker| picker.render())
+            })
+            .or_else(|| {
                 self.agent_picker
                     .as_ref()
                     .map(|picker| picker.render(&self.menu, &self.agents))
@@ -4724,6 +4952,7 @@ impl App {
             && self.resume_picker.is_none()
             && self.model_picker.is_none()
             && self.mode_picker.is_none()
+            && self.folder_trust_picker.is_none()
             && self.agent_picker.is_none();
         let dialog_cursor = dialog_owns_panel
             .then(|| self.dialog.as_ref().and_then(|(d, _)| d.cursor_cell()))
@@ -6350,6 +6579,19 @@ mod tests {
             reference_marker(&reference_candidate_path(&file)),
             "@crates/tcode-tui/src/app.rs"
         );
+    }
+
+    #[test]
+    fn accepted_reference_completion_inserts_a_separator() {
+        let mut editor = Editor::new();
+        editor.insert_str("review @app");
+        App::apply_reference_completion(
+            &mut editor,
+            Position { row: 0, col: 7 },
+            Position { row: 0, col: 11 },
+            "@src/app.rs",
+        );
+        assert_eq!(editor.text(), "review @src/app.rs ");
     }
 
     #[test]

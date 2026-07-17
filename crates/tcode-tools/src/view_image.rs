@@ -92,7 +92,7 @@ impl Tool for ViewImageTool {
             );
         }
 
-        let mut content = Vec::with_capacity(paths.len() + 1);
+        let mut content = Vec::with_capacity(paths.len() * 2 + 1);
         for raw_path in paths {
             if cancel.is_cancelled() {
                 return ToolOutput::err("view_image cancelled by user");
@@ -124,6 +124,11 @@ impl Tool for ViewImageTool {
                     return ToolOutput::err(format!("image normalization failed: {error}"))
                 }
             };
+            // Label each image with its path so the answer can reference
+            // images unambiguously (the system prompt tells the model to).
+            content.push(ContentBlock::Text {
+                text: format!("{path_str}:"),
+            });
             // Do not use freshness here: these blocks live only in this isolated
             // request, never in the parent ledger, so 'already in context' is false.
             content.push(normalized.into_block());

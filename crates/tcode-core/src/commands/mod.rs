@@ -24,13 +24,16 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::Session;
+use crate::environment::{EnvironmentSnapshot, StartupContext};
 use crate::types::Usage;
 
-/// Rebuilds the cwd-specific opening context (project map, instructions)
-/// when `/cd` runs before any model-visible history exists.
-/// Rebuild cwd-specific startup context. The second argument is the current
-/// session's private scratch root and remains stable across `/cd`.
-pub type OpeningContextFn = Arc<dyn Fn(&Path, &Path) -> String + Send + Sync>;
+/// Rebuild cwd-specific startup context when `/cd` runs before any
+/// model-visible history exists. The second argument is the current session's
+/// private scratch root and remains stable across `/cd`.
+pub type OpeningContextFn = Arc<dyn Fn(&Path, &Path) -> StartupContext + Send + Sync>;
+/// Capture live harness facts for a runtime environment diff. Core owns the
+/// comparison and ledger mutation; the frontend/tools own platform probing.
+pub type EnvironmentFn = Arc<dyn Fn(&Path) -> EnvironmentSnapshot + Send + Sync>;
 
 /// How a frontend should style a command's feedback. `Note` marks text the
 /// user addressed to the model (e.g. `/note`), not harness status output.
@@ -118,6 +121,7 @@ impl CommandOutcome {
 pub struct CommandCtx<'a> {
     pub session: &'a mut Session,
     pub opening_context: &'a OpeningContextFn,
+    pub environment: &'a EnvironmentFn,
     /// The frontend's display tally for `/cost` (the TUI includes delegated
     /// sub-agent usage; the plain REPL passes `session.turn_usage`).
     pub turn_usage: Usage,
@@ -212,15 +216,33 @@ fn split_line(line: &str) -> Option<(&str, &str)> {
 }
 
 #[cfg(test)]
-pub(crate) fn test_ctx_parts() -> (Session, OpeningContextFn) {
-    use crate::{PermissionMode, PermissionRules, ToolCtx};
+pub(crate) fn test_ctx_parts() -> (Session, OpeningContextFn, EnvironmentFn) {
+    use crate::{EnvironmentSnapshot, PermissionMode, PermissionRules, StartupContext, ToolCtx};
     let session = Session::new(
         ToolCtx::new(std::env::temp_dir(), 1_000),
         PermissionMode::Default,
         PermissionRules::default(),
     );
-    let opening: OpeningContextFn = Arc::new(|_, _| String::new());
-    (session, opening)
+    let opening: OpeningContextFn = Arc::new(|_, _| StartupContext {
+        text: String::new(),
+        environment: EnvironmentSnapshot {
+            cwd: String::new(),
+            platform: String::new(),
+            os_version: None,
+            command_shells: Vec::new(),
+            git: Default::default(),
+            date: String::new(),
+        },
+    });
+    let environment: EnvironmentFn = Arc::new(|cwd| EnvironmentSnapshot {
+        cwd: cwd.display().to_string(),
+        platform: "test".into(),
+        os_version: None,
+        command_shells: vec!["test shell".into()],
+        git: Default::default(),
+        date: "1970-01-01".into(),
+    });
+    (session, opening, environment)
 }
 
 #[cfg(test)]
@@ -241,10 +263,11 @@ mod tests {
     #[test]
     fn unknown_commands_return_none() {
         let registry = CommandRegistry::builtin();
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         assert!(registry

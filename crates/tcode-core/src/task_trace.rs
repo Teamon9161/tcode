@@ -205,7 +205,12 @@ impl TaskTraces {
                 LogEvent::Append { entry } => ledger.append(entry),
                 LogEvent::TruncateTail { len } => ledger.truncate_tail(len),
                 LogEvent::Compact { summary, upto } => ledger.compact(summary, upto),
-                LogEvent::Meta { .. } | LogEvent::Checkpoint { .. } => {}
+                LogEvent::Meta { .. }
+                | LogEvent::StartupContext { .. }
+                | LogEvent::EnvironmentChanged { .. }
+                | LogEvent::EnvironmentObserved { .. }
+                | LogEvent::EnvironmentDelivered { .. }
+                | LogEvent::Checkpoint { .. } => {}
             }
         }
         let meta = meta.ok_or_else(|| StoreError::External("trace has no meta line".into()))?;

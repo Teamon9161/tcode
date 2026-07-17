@@ -1,5 +1,4 @@
 use super::{CommandCtx, CommandOutcome, SlashCommand};
-use crate::ledger::Entry;
 
 pub struct MemoryCommand;
 
@@ -25,7 +24,7 @@ impl SlashCommand for MemoryCommand {
             (memory.status(), note)
         };
         if let Some(note) = toggle_note {
-            ctx.session.ledger.append(Entry::Note(note));
+            ctx.session.stage_memory_note(note);
         }
         let indented = status
             .lines()
@@ -41,26 +40,40 @@ mod tests {
     use super::super::{test_ctx_parts, CommandCtx, SlashCommand};
     use super::MemoryCommand;
     use crate::types::Usage;
-    use crate::Entry;
 
     #[test]
-    fn toggling_memory_appends_a_note_and_reports_status() {
-        let (mut session, opening) = test_ctx_parts();
+    fn toggling_memory_defers_and_coalesces_its_model_note() {
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = MemoryCommand.run(&mut ctx, "off");
         assert!(!outcome.messages.is_empty());
-        assert!(matches!(
-            session.ledger.entries().last(),
-            Some(Entry::Note(_))
-        ));
+        assert!(
+            session.ledger.is_empty(),
+            "a control toggle is not model context"
+        );
 
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
+            turn_usage: Usage::default(),
+        };
+        let outcome = MemoryCommand.run(&mut ctx, "on");
+        assert!(!outcome.messages.is_empty());
+        let notes = session.take_deferred_context_notes();
+        assert_eq!(notes.len(), 1, "the final toggle replaces the first");
+        assert!(notes[0].contains("enabled"));
+        assert!(!notes[0].contains("disabled"));
+
+        let mut ctx = CommandCtx {
+            session: &mut session,
+            opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = MemoryCommand.run(&mut ctx, "bogus");

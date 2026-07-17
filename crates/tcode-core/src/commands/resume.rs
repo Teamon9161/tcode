@@ -20,18 +20,35 @@ impl SlashCommand for ResumeCommand {
         };
         match crate::store::SessionStore::resume(&data_dir, Some(args)) {
             Ok(resumed) => {
-                let session_id = resumed.store.id.clone();
+                let crate::store::Resumed {
+                    store,
+                    ledger,
+                    checkpoints,
+                    startup,
+                    environment: previous_environment,
+                    delivered_environment,
+                } = resumed;
+                let session_id = store.id.clone();
                 let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
                 ctx.session.checkpoints =
-                    crate::checkpoint::CheckpointStore::load(ckpt_dir, resumed.checkpoints);
-                ctx.session.ledger = resumed.ledger;
-                ctx.session.ledger.attach_sink(Box::new(resumed.store));
+                    crate::checkpoint::CheckpointStore::load(ckpt_dir, checkpoints);
+                ctx.session.ledger = ledger;
+                ctx.session.ledger.attach_sink(Box::new(store));
                 ctx.session.bind_scratch_session(&session_id);
-                let opening = (ctx.opening_context)(
-                    &ctx.session.tool_ctx.cwd,
-                    &ctx.session.tool_ctx.scratch_dir,
+
+                let recovered_startup = startup.unwrap_or_else(|| {
+                    (ctx.opening_context)(
+                        &ctx.session.tool_ctx.cwd,
+                        &ctx.session.tool_ctx.scratch_dir,
+                    )
+                });
+                ctx.session.restore_startup_context(
+                    recovered_startup,
+                    previous_environment,
+                    delivered_environment,
                 );
-                ctx.session.replace_opening_context_for_resume(opening);
+                let current = (ctx.environment)(&ctx.session.tool_ctx.cwd);
+                ctx.session.sync_environment(current, None);
                 // Unknown until the next usage event; the TUI re-estimates in
                 // its ConversationReplaced handler.
                 ctx.session.last_prompt_tokens = 0;
@@ -56,10 +73,11 @@ mod tests {
 
     #[test]
     fn bare_resume_opens_the_picker_and_bad_ids_report_an_error() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = ResumeCommand.run(&mut ctx, "");
@@ -71,6 +89,7 @@ mod tests {
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = ResumeCommand.run(&mut ctx, "no-such-session-id");

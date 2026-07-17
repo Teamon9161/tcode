@@ -347,6 +347,41 @@ async fn a_prompt_queued_mid_turn_lands_after_the_tool_results() {
     )));
 }
 
+/// A deferred setting change becomes model context only when a real user turn
+/// starts; replacing it before that turn leaves no stale instruction behind.
+#[tokio::test]
+async fn user_turn_delivers_only_the_final_deferred_memory_note() {
+    let root = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![text_done("acknowledged")]);
+    let agent = agent(provider.clone());
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    session.stage_memory_note("memory setting: disabled".into());
+    session.stage_memory_note("memory setting: enabled".into());
+    assert!(session.ledger.is_empty());
+
+    run(&agent, &mut session, &approver, "continue").await;
+
+    let request = &provider.requests.lock().unwrap()[0];
+    let prompt = request
+        .messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(prompt.contains("memory setting: enabled"));
+    assert!(!prompt.contains("memory setting: disabled"));
+    assert!(matches!(
+        session.ledger.entries().first(),
+        Some(Entry::Note(text)) if text.contains("memory setting: enabled")
+    ));
+}
+
 fn auto_agent(main: Arc<MockProvider>, classifier: Arc<MockProvider>) -> Agent {
     let model = cell(main);
     let roles = AgentModels::default();
@@ -408,7 +443,7 @@ fn resumed_compacted_history_estimates_only_summary_and_tail() {
     let provider = MockProvider::new(Vec::new());
     let agent = agent(provider);
     let mut restored = session(dir.path(), PermissionMode::Default);
-    restored.replace_opening_context_for_resume("project map".into());
+    restored.set_opening_context("project map".into());
     restored.ledger = resumed.ledger;
 
     let mut expected = session(dir.path(), PermissionMode::Default);
@@ -1282,14 +1317,124 @@ async fn kill_task_stops_a_background_process() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let notes = session
-        .tool_ctx
-        .background
-        .lock()
-        .unwrap()
-        .take_completion_notes();
+    let notes = session.tool_ctx.background.lock().unwrap().take_notes();
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(notes[0].contains("killed"), "{}", notes[0]);
+}
+
+/// A monitor's output lines become events; when they arrive while the session
+/// is idle, `monitor_turn` delivers them as notes (legal because `Entry::Note`
+/// renders as a user-role message) and the model reacts. A second wake with
+/// nothing pending must not issue a request at all — the MockProvider would
+/// panic on an unscripted one.
+#[tokio::test]
+async fn monitor_events_wake_a_turn_and_deliver_as_notes() {
+    let dir = tempfile::tempdir().unwrap();
+    // The short sleep keeps the events out of turn 1's batch boundary, so the
+    // test deterministically exercises the idle path.
+    let command = if cfg!(windows) {
+        r#"{"command":"Start-Sleep -Milliseconds 300; Write-Output 'EVT one'; Write-Output 'EVT two'","description":"test watch","quiet_ms":100}"#
+    } else {
+        r#"{"command":"sleep 0.3; echo 'EVT one'; echo 'EVT two'","description":"test watch","quiet_ms":100}"#
+    };
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "monitor", command),
+        text_done("watching"),
+        text_done("noticed the events"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "watch for events").await;
+    // Same rule domain as shell: an allow saved for run(...) covers monitors.
+    let asked = approver.asked.lock().unwrap().clone();
+    assert!(asked[0].starts_with("run("), "{asked:?}");
+    let results = tool_results(&session);
+    assert!(
+        results[0].0.contains("Started monitor m1"),
+        "{}",
+        results[0].0
+    );
+
+    // The script prints its events and exits on its own.
+    for _ in 0..100 {
+        if session
+            .tool_ctx
+            .background
+            .lock()
+            .unwrap()
+            .running()
+            .is_empty()
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        session
+            .tool_ctx
+            .background
+            .lock()
+            .unwrap()
+            .monitor_wake_deadline()
+            .is_some(),
+        "undelivered monitor activity must arm the idle wake"
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let collector = tokio::spawn(async move {
+        let mut v = Vec::new();
+        while let Some(e) = rx.recv().await {
+            v.push(e);
+        }
+        v
+    });
+    let ran = agent
+        .monitor_turn(&mut session, &tx, &approver, CancellationToken::new())
+        .await
+        .unwrap();
+    drop(tx);
+    assert!(ran, "pending events must produce a wake turn");
+    let events = collector.await.unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Note(n) if n.contains("EVT one"))),
+        "the frontend must see the event note live"
+    );
+
+    let entries = session.ledger.entries();
+    let event_note = entries
+        .iter()
+        .position(|e| matches!(e, Entry::Note(n) if n.contains("Monitor m1") && n.contains("EVT one") && n.contains("EVT two")))
+        .expect("event note in the ledger");
+    let completion = entries
+        .iter()
+        .position(|e| matches!(e, Entry::Note(n) if n.contains("exited with code 0")))
+        .expect("completion note in the ledger");
+    let reply = entries
+        .iter()
+        .rposition(|e| matches!(e, Entry::Assistant(_)))
+        .expect("model reaction");
+    assert!(event_note < completion && completion < reply);
+
+    // Nothing pending: no request is made (the provider has no script left).
+    let ran = agent
+        .monitor_turn(
+            &mut session,
+            &tx2_noop(),
+            &approver,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(!ran);
+}
+
+/// A throwaway sender for a wake that must not produce events.
+fn tx2_noop() -> tokio::sync::mpsc::Sender<AgentEvent> {
+    tokio::sync::mpsc::channel(4).0
 }
 
 #[tokio::test]
@@ -2179,6 +2324,7 @@ async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
 async fn auto_mode_classification_receives_expanded_session_scratch_policy() {
     let root = tempfile::tempdir().unwrap();
     let mut session = session(root.path(), PermissionMode::Auto);
+    session.set_folder_trust(tcode_core::FolderTrust::Trusted);
     let scratch = session.tool_ctx.scratch_dir.clone();
     let expected_scope = session.classifier_cache_scope();
     let target = scratch.join("probe.csv");
@@ -2221,6 +2367,7 @@ async fn auto_mode_classification_receives_expanded_session_scratch_policy() {
     let requests = classifier.requests.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].system.contains(&scratch.display().to_string()));
+    assert!(requests[0].system.contains("`trusted` means"));
     assert!(!requests[0].system.contains("${TCODE_SCRATCH_DIR}"));
     assert_eq!(
         requests[0].cache_scope.as_deref(),
@@ -2523,7 +2670,8 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
     assert!(events
         .iter()
         .any(|e| matches!(e, AgentEvent::ModeChanged(PermissionMode::Plan))));
-    // Entering plan injects exactly one guidance note.
+    // Entering plan injects exactly one guidance note after the approval
+    // interaction reaches the batch boundary.
     assert_eq!(plan_enter_notes(&session), 1);
     let results = tool_results(&session);
     assert!(

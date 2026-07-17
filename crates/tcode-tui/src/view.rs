@@ -713,7 +713,7 @@ impl SessionView {
                     result.content
                 };
                 return ResultRender::Foldable {
-                    head: vec![Line::styled(format!("  ⎿ {label}"), style)],
+                    head: vec![Line::from(Span::styled(format!("  ⎿ {label}"), style))],
                     detail: self.output_detail(result, diagnostic, false, ctx),
                 };
             }
@@ -723,12 +723,15 @@ impl SessionView {
             .is_some_and(|input| renderer.folds_result(input));
         let detail = self.output_detail(result, result.content, !folded, ctx);
         if detail.is_empty() {
-            ResultRender::Inline(Line::styled(format!("  ⎿ {}", result.preview), style))
+            ResultRender::Inline(Line::from(Span::styled(
+                format!("  ⎿ {}", result.preview),
+                style,
+            )))
         } else {
             let head = if !result.is_error && (renderer.quiet_output() || folded) {
-                Line::styled("  ⎿", style)
+                Line::from(Span::styled("  ⎿", style))
             } else {
-                Line::styled(format!("  ⎿ {}", result.preview), style)
+                Line::from(Span::styled(format!("  ⎿ {}", result.preview), style))
             };
             ResultRender::Foldable {
                 head: vec![head],
@@ -928,6 +931,34 @@ mod tests {
         assert_eq!(spans[0].style.fg, Some(theme::OK));
         assert_eq!(spans[2].style, Style::default());
         assert_eq!(batch_item_style(HeaderTone::Task), Style::default());
+    }
+
+    #[test]
+    fn edit_errors_keep_their_red_text_through_transcript_wrapping() {
+        let registry = RenderRegistry::from_tools(&tcode_tools::builtin_tools(Path::new(".")));
+        let mut markdown = markdown::Renderer::default();
+        let view = SessionView::new(100);
+        let mut bake = ctx(&registry, &mut markdown);
+        let result = view.result_render(
+            &ToolResult {
+                name: "edit",
+                input: Some(&serde_json::json!({"path": "src/app.rs"})),
+                preview: "edit failed",
+                content: "old_string was not found",
+                is_error: true,
+            },
+            &mut bake,
+        );
+
+        let ResultRender::Foldable { head, detail } = result else {
+            panic!("an edit failure must remain visible with its diagnostic");
+        };
+        assert_eq!(head[0].style, Style::default());
+        assert_eq!(head[0].spans[0].style, Style::default().fg(theme::ERROR));
+        let ResultDetail::Lines(lines) = detail else {
+            panic!("tool diagnostics render as literal lines");
+        };
+        assert_eq!(lines[0].spans[1].style, Style::default().fg(theme::ERROR));
     }
 
     #[test]

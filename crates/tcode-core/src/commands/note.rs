@@ -30,10 +30,11 @@ mod tests {
 
     #[test]
     fn note_appends_a_ledger_note() {
-        let (mut session, opening) = test_ctx_parts();
+        let (mut session, opening, environment) = test_ctx_parts();
         let mut ctx = CommandCtx {
             session: &mut session,
             opening_context: &opening,
+            environment: &environment,
             turn_usage: Usage::default(),
         };
         let outcome = NoteCommand.run(&mut ctx, "remember the tests");

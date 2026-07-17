@@ -9,6 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::environment::{EnvironmentSnapshot, StartupContext};
 use crate::ledger::{Entry, Ledger, LedgerSink};
 
 /// One line in the session log. `Append`/`TruncateTail`/`Compact`
@@ -21,6 +22,28 @@ pub enum LogEvent {
         id: String,
         cwd: String,
         created_unix: u64,
+    },
+    /// Byte-stable system-prefix context captured before the first request.
+    /// Multiple records are possible only while no model-visible history
+    /// exists, e.g. an initial `/cd`; replay takes the last one.
+    StartupContext {
+        startup: StartupContext,
+    },
+    /// Historical record: prior versions wrote this together with an immediate
+    /// model-facing Note, so it is also treated as delivered during replay.
+    EnvironmentChanged {
+        environment: EnvironmentSnapshot,
+    },
+    /// Latest actual harness environment. It may be newer than the environment
+    /// the model has seen because a `/cd` can be coalesced before delivery.
+    EnvironmentObserved {
+        environment: EnvironmentSnapshot,
+    },
+    /// Latest runtime environment whose explanatory Note was actually appended
+    /// to the model-visible ledger. This distinguishes transient `/cd` state
+    /// from context the model can safely rely on after resume.
+    EnvironmentDelivered {
+        environment: EnvironmentSnapshot,
     },
     Append {
         entry: Entry,
@@ -298,6 +321,61 @@ fn upgrade_legacy_entry(entry: Entry) -> Entry {
     }
 }
 
+/// Background tasks and monitors whose process was still running when the
+/// session ended: started (per the tool's stable success prefix) but never
+/// terminated by a completion note. One note lists them all.
+fn lost_background_note(ledger: &Ledger) -> Option<String> {
+    let mut open: Vec<String> = Vec::new();
+    for entry in ledger.entries() {
+        match entry {
+            Entry::ToolResults(blocks) => {
+                for block in blocks {
+                    let crate::types::ContentBlock::ToolResult {
+                        content,
+                        is_error: false,
+                        ..
+                    } = block
+                    else {
+                        continue;
+                    };
+                    let started = content
+                        .strip_prefix("Started monitor ")
+                        .or_else(|| content.strip_prefix("Started background task "));
+                    if let Some(id) = started.and_then(|rest| rest.split_whitespace().next()) {
+                        open.push(id.trim_end_matches(':').to_string());
+                    }
+                }
+            }
+            Entry::Note(note) => {
+                // Completion notes name the task and a terminal status; event
+                // notes ("Monitor m1 (...): N new event lines") do neither.
+                let terminated = note.contains("exited with code")
+                    || note.contains("killed after")
+                    || note.contains("timeout");
+                if !terminated {
+                    continue;
+                }
+                let id = note
+                    .strip_prefix("Monitor ")
+                    .or_else(|| note.strip_prefix("Background task "))
+                    .and_then(|rest| rest.split_whitespace().next());
+                if let Some(id) = id {
+                    open.retain(|o| o != id);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!open.is_empty()).then(|| {
+        format!(
+            "Resumed session: background task(s) {} did not survive the restart \
+             — their processes are gone, though their log files remain readable. \
+             Restart any watch that is still needed.",
+            open.join(", ")
+        )
+    })
+}
+
 pub struct SessionStore {
     pub id: String,
     writer: BufWriter<File>,
@@ -308,6 +386,14 @@ pub struct Resumed {
     pub store: SessionStore,
     pub ledger: Ledger,
     pub checkpoints: Vec<(usize, String, Option<String>)>,
+    /// Missing for sessions created before startup contexts were persisted.
+    pub startup: Option<StartupContext>,
+    /// The last environment observed before tcode stopped.
+    pub environment: Option<EnvironmentSnapshot>,
+    /// The last runtime environment explicitly delivered into the model's
+    /// append-only context. Sessions with a startup snapshot always have this
+    /// baseline; older logs without one may omit it.
+    pub delivered_environment: Option<EnvironmentSnapshot>,
 }
 
 /// A resumable conversation in one project, suitable for a UI picker.
@@ -430,6 +516,9 @@ impl SessionStore {
 
         let mut ledger = Ledger::new();
         let mut checkpoints = Vec::new();
+        let mut startup = None;
+        let mut environment = None;
+        let mut delivered_environment = None;
         let mut id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -441,6 +530,29 @@ impl SessionStore {
             }
             match serde_json::from_str::<LogEvent>(&line)? {
                 LogEvent::Meta { id: meta_id, .. } => id = meta_id,
+                LogEvent::StartupContext { startup: context } => {
+                    environment = Some(context.environment.clone());
+                    delivered_environment = Some(context.environment.clone());
+                    startup = Some(context);
+                }
+                LogEvent::EnvironmentChanged {
+                    environment: snapshot,
+                } => {
+                    // Pre-delivery versions emitted this event with the
+                    // matching Note, so legacy snapshots are model-known.
+                    delivered_environment = Some(snapshot.clone());
+                    environment = Some(snapshot);
+                }
+                LogEvent::EnvironmentObserved {
+                    environment: snapshot,
+                } => {
+                    environment = Some(snapshot);
+                }
+                LogEvent::EnvironmentDelivered {
+                    environment: snapshot,
+                } => {
+                    delivered_environment = Some(snapshot);
+                }
                 // Before `Entry::UserNote` existed, approval annotations were
                 // persisted as a pre-formatted machine note. Upgrade that
                 // unambiguous legacy shape while replaying so resumed
@@ -460,6 +572,13 @@ impl SessionStore {
                 | LogEvent::Batch { .. } => {}
             }
         }
+        // Background processes don't survive a restart. Zero-guessing: tell
+        // the model which watches are gone instead of letting it discover a
+        // dead task id. Derived from the replayed ledger (not persisted), so
+        // repeating a resume repeats the same single note.
+        if let Some(note) = lost_background_note(&ledger) {
+            ledger.append(Entry::Note(note));
+        }
         let file = OpenOptions::new().append(true).open(&path)?;
         Ok(Resumed {
             store: Self {
@@ -468,6 +587,9 @@ impl SessionStore {
             },
             ledger,
             checkpoints,
+            startup,
+            environment,
+            delivered_environment,
         })
     }
 
@@ -500,6 +622,72 @@ mod tests {
 
     fn text(s: &str) -> Entry {
         Entry::User(vec![ContentBlock::Text { text: s.into() }])
+    }
+
+    fn environment(cwd: &str, changed_files: usize) -> EnvironmentSnapshot {
+        EnvironmentSnapshot {
+            cwd: cwd.into(),
+            platform: "test".into(),
+            os_version: Some("1".into()),
+            command_shells: vec!["test shell".into()],
+            git: crate::GitSnapshot {
+                repository: true,
+                branch: Some("main".into()),
+                head: Some("abc initial".into()),
+                changed_files,
+                status_preview: Vec::new(),
+            },
+            date: "2026-07-17".into(),
+        }
+    }
+
+    #[test]
+    fn resume_recovers_the_last_startup_context_and_environment_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        let startup = StartupContext {
+            text: "stable prefix\n# Environment\nworking directory: /old".into(),
+            environment: environment("/old", 0),
+        };
+        ledger.record_aux(&LogEvent::StartupContext {
+            startup: startup.clone(),
+        });
+        ledger.record_aux(&LogEvent::EnvironmentChanged {
+            environment: environment("/new", 2),
+        });
+        ledger.append(text("keep the prefix"));
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        assert_eq!(resumed.startup, Some(startup));
+        assert_eq!(resumed.environment, Some(environment("/new", 2)));
+        assert_eq!(resumed.delivered_environment, Some(environment("/new", 2)));
+        assert_eq!(resumed.ledger.entries().len(), 1);
+    }
+
+    #[test]
+    fn resume_keeps_unobserved_environment_separate_from_delivered_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        let startup = StartupContext {
+            text: "stable prefix".into(),
+            environment: environment("/old", 0),
+        };
+        ledger.record_aux(&LogEvent::StartupContext {
+            startup: startup.clone(),
+        });
+        ledger.record_aux(&LogEvent::EnvironmentObserved {
+            environment: environment("/temporary", 1),
+        });
+        ledger.append(text("continue later"));
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        assert_eq!(resumed.startup, Some(startup));
+        assert_eq!(resumed.environment, Some(environment("/temporary", 1)));
+        assert_eq!(resumed.delivered_environment, Some(environment("/old", 0)));
     }
 
     /// One clock for the whole scratchpad: the harness's overflow files and the
@@ -721,5 +909,47 @@ mod tests {
             SessionStore::resume(&dir, None),
             Err(StoreError::NoSession)
         ));
+    }
+
+    /// A monitor still running when the session ended is reported as lost on
+    /// resume; one that already completed is not.
+    #[test]
+    fn resume_notes_monitors_that_did_not_survive_the_restart() {
+        let tool_result = |content: &str| {
+            Entry::ToolResults(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: content.into(),
+                is_error: false,
+                images: vec![],
+            }])
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::new();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("watch things"));
+        ledger.append(tool_result(
+            "Started monitor m1 (ci status): every line the script prints…",
+        ));
+        ledger.append(tool_result(
+            "Started monitor m2 (log errors): every line the script prints…",
+        ));
+        ledger.append(tool_result(
+            "Started background task b3: cargo watch\nIt keeps running…",
+        ));
+        // m1 finished before the session ended; m2 and b3 did not.
+        ledger.append(Entry::Note(
+            "Monitor m1 (ci status) exited with code 0 after 9s; full log: m1.log.".into(),
+        ));
+        drop(ledger);
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        let last = resumed.ledger.entries().last().unwrap();
+        let Entry::Note(note) = last else {
+            panic!("expected a lost-background note, got {last:?}");
+        };
+        assert!(note.contains("m2, b3"), "{note}");
+        assert!(!note.contains("m1,"), "{note}");
+        assert!(note.contains("did not survive"), "{note}");
     }
 }

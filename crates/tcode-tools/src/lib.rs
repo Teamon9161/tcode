@@ -2,6 +2,7 @@ mod fs_tools;
 mod grounding;
 mod interaction;
 mod mcp;
+mod monitor;
 mod plan;
 mod search;
 mod shell;
@@ -13,7 +14,9 @@ mod web;
 #[cfg(test)]
 mod view_image_tests;
 
-pub use grounding::{project_map, project_map_with_scratch};
+pub use grounding::{
+    environment_snapshot, project_map, project_map_with_scratch, startup_context_with_scratch,
+};
 pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
@@ -57,14 +60,17 @@ pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
         Arc::new(shell::KillTaskTool),
         Arc::new(plan::ExitPlanTool),
     ];
-    if cfg!(windows) {
-        tools.push(Arc::new(shell::ShellTool::new(ShellKind::PowerShell)));
-        if shell::bash_available() {
-            tools.push(Arc::new(shell::ShellTool::new(ShellKind::Bash)));
-        }
+    let primary_shell = if cfg!(windows) {
+        ShellKind::PowerShell
     } else {
+        ShellKind::Bash
+    };
+    tools.push(Arc::new(shell::ShellTool::new(primary_shell)));
+    if cfg!(windows) && shell::bash_available() {
         tools.push(Arc::new(shell::ShellTool::new(ShellKind::Bash)));
     }
+    // The monitor speaks the platform's primary shell, like `shell`.
+    tools.push(Arc::new(monitor::MonitorTool::new(primary_shell)));
     if let Some(skill_tool) = SkillTool::new(skills) {
         tools.push(Arc::new(skill_tool));
     }
