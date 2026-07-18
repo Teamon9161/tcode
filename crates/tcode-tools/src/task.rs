@@ -3,8 +3,9 @@
 //! for the prompt and the final report — the sub-agent's exploration
 //! tokens never enter the parent's window.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
@@ -19,9 +20,7 @@ use tcode_core::{
     ToolCtx, ToolOutput,
 };
 
-const EXPLORE_SYSTEM: &str = include_str!("../../../prompts/task-explore-system.md");
-const PLAN_SYSTEM: &str = include_str!("../../../prompts/task-plan-system.md");
-const GENERAL_SYSTEM: &str = include_str!("../../../prompts/task-general-system.md");
+use crate::agent_defs::{keeps_tool, AgentDef, AgentRegistry};
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.
@@ -49,6 +48,23 @@ impl Approver for NeverAsk {
 /// inputs.
 pub const TASK_AGENT_KINDS: [&str; 3] = AgentRole::TASK_KEYS;
 
+/// Parked resumable runs per task-tool instance; oldest is evicted beyond
+/// this. Each parked run keeps its whole ledger in memory.
+const MAX_LIVE_TASKS: usize = 8;
+
+/// A finished delegated run kept alive for follow-up turns. Resuming appends
+/// to the same session under the same cache scope, so a follow-up costs only
+/// the increment on top of a full prefix cache hit.
+struct LiveTask {
+    agent: Agent,
+    session: Session,
+    exchanges_left: u32,
+    def_name: String,
+    model_name: String,
+    /// Park order for oldest-first eviction.
+    seq: u64,
+}
+
 pub struct TaskTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
     model: ModelCell,
@@ -63,6 +79,20 @@ pub struct TaskTool {
     auto_compact: bool,
     auto_compact_percent: u8,
     trusted_read_hosts: crate::TrustedReadHosts,
+    /// Builtin task kinds and discovered custom agents, one registry.
+    defs: Arc<AgentRegistry>,
+    /// Spawnable subset for a nested instance; `None` = the whole registry.
+    allowed: Option<Vec<String>>,
+    /// Nesting depth of the *owner* of this tool: the top-level agent holds a
+    /// depth-0 instance. At `MAX_TASK_DEPTH` sub-agents get no task tool.
+    depth: usize,
+    /// Built once at construction: the description enters the cached prompt
+    /// prefix and must not change within a session.
+    description: String,
+    /// Resumable runs, keyed by their task id. Entries are taken out for the
+    /// duration of a resumed turn, so concurrent resumes of one id fail with
+    /// a self-healing error instead of racing.
+    live: Arc<Mutex<HashMap<String, LiveTask>>>,
 }
 
 impl TaskTool {
@@ -72,6 +102,7 @@ impl TaskTool {
         output_budget: usize,
         _cwd: PathBuf,
     ) -> Self {
+        let defs = Arc::new(AgentRegistry::builtin());
         Self {
             model,
             pinned: AgentModels::default(),
@@ -81,12 +112,34 @@ impl TaskTool {
             auto_compact: true,
             auto_compact_percent: 85,
             trusted_read_hosts: crate::trusted_read_hosts(Vec::new()),
+            description: task_description(&defs, None),
+            defs,
+            allowed: None,
+            depth: 0,
+            live: Arc::default(),
         }
     }
 
     /// Share the live pin registry with the frontend that edits it.
     pub fn with_agent_models(mut self, pinned: AgentModels) -> Self {
         self.pinned = pinned;
+        self
+    }
+
+    /// Dispatch to this registry instead of the builtin-only default.
+    pub fn with_agent_defs(mut self, defs: Arc<AgentRegistry>) -> Self {
+        self.description = task_description(&defs, self.allowed.as_deref());
+        self.defs = defs;
+        self
+    }
+
+    /// Configure this instance for a top-level `--agent` run: the named
+    /// definition's spawn list becomes the whole schema, already one level
+    /// deep (the process itself is that agent). Call after `with_agent_defs`.
+    pub fn scoped_to(mut self, def: &AgentDef) -> Self {
+        self.description = task_description(&self.defs, Some(&def.agents));
+        self.allowed = Some(def.agents.clone());
+        self.depth = 1;
         self
     }
 
@@ -111,17 +164,19 @@ impl TaskTool {
         self
     }
 
-    /// The pinned model for `kind`, else a snapshot of the parent's.
+    /// The pinned model for `kind`, else a snapshot of the parent's. String
+    /// keyed so custom kinds resolve through `[agents.<name>]` for free.
     fn model_for(&self, kind: &str) -> ActiveModel {
-        let role = AgentRole::from_key(kind).filter(|role| role.is_task_kind());
-        role.and_then(|role| self.pinned.resolve(role, &self.model))
-            .expect("validated task role always resolves a model")
+        self.pinned
+            .get(kind)
+            .unwrap_or_else(|| self.model.snapshot())
     }
 
-    /// Read-only sub-agents get only side-effect-free tools. `plan` has the
-    /// same exploration surface as `explore`, except it cannot submit a plan:
-    /// approval and the plan-mode transition remain exclusive to the parent.
-    fn sub_tools(&self, agent_kind: &str, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
+    /// The definition-derived toolset. Read-only agents get only
+    /// side-effect-free tools; builtin `plan` additionally loses `exit_plan`
+    /// (approval and the plan-mode transition remain exclusive to the
+    /// parent); an allowlist restricts further.
+    fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
         let mut tools = crate::builtin_tools_with_web_fetch(
             cwd,
             crate::WebFetchTool::new(self.trusted_read_hosts.clone()).with_summarizer(
@@ -129,19 +184,125 @@ impl TaskTool {
             ),
         );
         tools.push(Arc::new(crate::ViewImageTool::new(
-            model,
+            model.clone(),
             self.pinned.clone(),
         )));
+        tools.retain(|tool| keeps_tool(def, tool.as_ref()));
+        // Delegation is granted by the `agents` field alone — deliberately
+        // outside the allowlist/read-only tiers — and bounded by depth, so
+        // definition cycles terminate without graph analysis.
+        if !def.agents.is_empty() && self.depth < crate::agent_defs::MAX_TASK_DEPTH {
+            tools.push(Arc::new(self.child(def, model)));
+        }
         tools
-            .into_iter()
-            .filter(|tool| keeps_sub_tool(agent_kind, tool.as_ref()))
-            .collect()
+    }
+
+    /// A task tool for a sub-agent that may itself delegate: same registry
+    /// and pins, spawn set restricted to the definition's list, one level
+    /// deeper. The child's parent handle is the sub-agent's own model cell,
+    /// so an unpinned grandchild inherits its spawner, not the top level.
+    fn child(&self, def: &AgentDef, model: ModelCell) -> TaskTool {
+        TaskTool {
+            model,
+            pinned: self.pinned.clone(),
+            watchdog: self.watchdog.clone(),
+            output_budget: self.output_budget,
+            auto_policy: self.auto_policy.clone(),
+            auto_compact: self.auto_compact,
+            auto_compact_percent: self.auto_compact_percent,
+            trusted_read_hosts: self.trusted_read_hosts.clone(),
+            description: task_description(&self.defs, Some(&def.agents)),
+            defs: self.defs.clone(),
+            allowed: Some(def.agents.clone()),
+            depth: self.depth + 1,
+            // Each instance parks its own runs: the child tool lives inside
+            // the spawning sub-agent's toolset, so a parked grandchild
+            // survives exactly as long as its parker can still resume it.
+            live: Arc::default(),
+        }
+    }
+
+    /// Park a finished run for follow-ups, evicting the oldest beyond cap.
+    fn park(&self, id: &str, task: LiveTask) {
+        let mut live = self.live.lock().expect("live tasks lock");
+        if live.len() >= MAX_LIVE_TASKS {
+            if let Some(oldest) = live
+                .iter()
+                .min_by_key(|(_, task)| task.seq)
+                .map(|(id, _)| id.clone())
+            {
+                live.remove(&oldest);
+            }
+        }
+        live.insert(id.to_string(), task);
+    }
+
+    /// The definition for `kind`, honoring this instance's spawn allowlist.
+    fn def_for(&self, kind: &str) -> Option<&AgentDef> {
+        let allowed = self
+            .allowed
+            .as_deref()
+            .is_none_or(|allow| allow.iter().any(|name| name == kind));
+        self.defs.get(kind).filter(|_| allowed)
     }
 }
 
-fn keeps_sub_tool(agent_kind: &str, tool: &dyn Tool) -> bool {
-    !matches!(agent_kind, "explore" | "plan")
-        || (!tool.is_mutating() && (agent_kind != "plan" || tool.name() != "exit_plan"))
+/// Tool description for a given registry view. The unrestricted text keeps
+/// the hand-written builtin paragraph verbatim (byte-identical prefix when no
+/// custom agents exist); a restricted (nested) view describes exactly the
+/// spawnable set instead.
+fn task_description(defs: &AgentRegistry, allow: Option<&[String]>) -> String {
+    let base = match allow {
+        None => {
+            "Delegate a bounded subtask to a sub-agent with its own fresh \
+             context. Use agent='explore' for read-only reconnaissance that \
+             returns a report (cheap: its exploration never enters your \
+             context). Use agent='plan' for a read-only implementation-plan \
+             draft that the parent must still review and submit. Use \
+             agent='general' for independent multi-step work. Give a complete, \
+             self-contained prompt and a very short task summary in the same language as that prompt; \
+             the sub-agent sees nothing of this conversation and cannot ask questions."
+                .to_string()
+        }
+        Some(allow) => {
+            let mut base = String::from(
+                "Delegate a bounded subtask to a sub-agent with its own fresh \
+                 context. Give a complete, self-contained prompt and a very \
+                 short task summary in the same language as that prompt; the \
+                 sub-agent sees nothing of this conversation and cannot ask \
+                 questions.\n\nAvailable agents:\n",
+            );
+            for name in defs.names_for(Some(allow)) {
+                if let Some(def) = defs.get(name) {
+                    if matches!(def.source, crate::AgentSource::Builtin) {
+                        base.push_str(&format!("- {}: {}\n", def.name, def.description));
+                    }
+                }
+            }
+            base
+        }
+    };
+    format!("{base}{}", defs.custom_listing(allow))
+}
+
+/// Input schema for a given registry view; the enum is the spawnable set.
+fn task_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "agent": { "type": "string", "enum": defs.names_for(allow) },
+            "prompt": { "type": "string" },
+            "resume": {
+                "type": "string",
+                "description": "Task id of a resumable previous run (given in its result line). The same sub-agent continues with its context intact — use for follow-up questions or feedback. `agent` must match the original kind."
+            },
+            "summary": {
+                "type": "string",
+                "description": "A very short summary of the delegated objective. Use the same language as prompt; it appears in the live agent tree."
+            }
+        },
+        "required": ["agent", "prompt"]
+    })
 }
 
 /// Keep legacy/direct task calls useful while the tool schema nudges models to
@@ -180,7 +341,8 @@ fn task_batch_label(inputs: &[&Value]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{keeps_sub_tool, task_batch_label, TASK_AGENT_KINDS};
+    use super::{task_batch_label, task_description, task_schema, TASK_AGENT_KINDS};
+    use crate::agent_defs::AgentRegistry;
     use serde_json::json;
 
     #[test]
@@ -192,33 +354,141 @@ mod tests {
         assert_eq!(task_batch_label(&[&plan, &explore]), "Delegate 2 tasks");
     }
 
-    #[test]
-    fn plan_kind_is_registered_and_has_explore_tools_except_exit_plan() {
-        assert!(TASK_AGENT_KINDS.contains(&"plan"));
-        let tools = crate::builtin_tools(&std::env::temp_dir());
-        let explore: Vec<&str> = tools
-            .iter()
-            .filter(|tool| keeps_sub_tool("explore", tool.as_ref()))
-            .map(|tool| tool.name())
-            .collect();
-        let plan: Vec<&str> = tools
-            .iter()
-            .filter(|tool| keeps_sub_tool("plan", tool.as_ref()))
-            .map(|tool| tool.name())
-            .collect();
+    fn registry_with(defs: &[(&str, &str)]) -> AgentRegistry {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tcode/agents");
+        std::fs::create_dir_all(&dir).unwrap();
+        for (name, front) in defs {
+            std::fs::write(
+                dir.join(format!("{name}.md")),
+                format!("---\ndescription: {name} agent\n{front}\n---\nSystem for {name}."),
+            )
+            .unwrap();
+        }
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        registry
+    }
 
-        assert!(plan.iter().all(|name| *name != "exit_plan"));
-        assert!(tools
+    #[test]
+    fn schema_enum_and_description_track_custom_agents() {
+        let registry = registry_with(&[("investor", "agents: quant-dev"), ("quant-dev", "")]);
+        let schema = task_schema(&registry, None);
+        let kinds: Vec<&str> = schema["properties"]["agent"]["enum"]
+            .as_array()
+            .unwrap()
             .iter()
-            .filter(|tool| keeps_sub_tool("plan", tool.as_ref()))
-            .all(|tool| !tool.is_mutating()));
+            .filter_map(|v| v.as_str())
+            .collect();
         assert_eq!(
-            plan,
-            explore
-                .into_iter()
-                .filter(|name| *name != "exit_plan")
-                .collect::<Vec<_>>()
+            kinds,
+            ["explore", "plan", "general", "investor", "quant-dev"]
         );
+        assert!(TASK_AGENT_KINDS.iter().all(|kind| kinds.contains(kind)));
+        let description = task_description(&registry, None);
+        assert!(description.contains("investor: investor agent"));
+    }
+
+    #[test]
+    fn a_spawn_allowlist_restricts_schema_and_description() {
+        let registry = registry_with(&[("investor", "agents: quant-dev"), ("quant-dev", "")]);
+        let allow = vec!["quant-dev".to_string()];
+        let schema = task_schema(&registry, Some(&allow));
+        assert_eq!(schema["properties"]["agent"]["enum"], json!(["quant-dev"]));
+        let description = task_description(&registry, Some(&allow));
+        assert!(description.contains("quant-dev:"));
+        assert!(!description.contains("investor:"));
+        assert!(!description.contains("agent='explore'"));
+    }
+
+    #[test]
+    fn without_custom_agents_the_description_is_the_static_paragraph() {
+        let registry = AgentRegistry::builtin();
+        let description = task_description(&registry, None);
+        assert!(description.ends_with("cannot ask questions."));
+        assert!(!description.contains("Custom agents"));
+    }
+
+    /// Never streams: toolset-shape tests construct models without talking.
+    struct NullProvider;
+
+    #[async_trait::async_trait]
+    impl tcode_core::Provider for NullProvider {
+        fn name(&self) -> &str {
+            "null"
+        }
+        fn model(&self) -> &str {
+            "null"
+        }
+        fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+            tcode_core::CacheStrategy::ImplicitPrefix
+        }
+        async fn stream(
+            &self,
+            _req: tcode_core::Request,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+            unreachable!("toolset tests never stream")
+        }
+    }
+
+    fn null_model() -> super::ModelCell {
+        super::ModelCell::new(tcode_core::ActiveModel {
+            provider: std::sync::Arc::new(NullProvider),
+            max_tokens: 1024,
+            context_window: 100_000,
+            effort: None,
+        })
+    }
+
+    #[test]
+    fn nesting_is_granted_by_the_agents_field_and_bounded_by_depth() {
+        use tcode_core::Tool as _;
+        let registry = std::sync::Arc::new(registry_with(&[
+            ("investor", "agents: quant-dev"),
+            ("quant-dev", ""),
+        ]));
+        let task = super::TaskTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_agent_defs(registry.clone());
+        let investor = registry.get("investor").unwrap();
+        let leaf = registry.get("quant-dev").unwrap();
+        let tmp = std::env::temp_dir();
+
+        // A spawner gets a task tool whose schema is exactly its spawn list.
+        let tools = task.sub_tools(investor, &tmp, null_model());
+        let child = tools
+            .iter()
+            .find(|tool| tool.name() == "task")
+            .expect("spawner receives a task tool");
+        assert_eq!(
+            child.input_schema()["properties"]["agent"]["enum"],
+            json!(["quant-dev"])
+        );
+
+        // A definition without `agents` is a leaf.
+        assert!(!task
+            .sub_tools(leaf, &tmp, null_model())
+            .iter()
+            .any(|tool| tool.name() == "task"));
+
+        // Depth bound: instances at MAX_TASK_DEPTH stop handing the tool out.
+        let d2 = task
+            .child(investor, null_model())
+            .child(investor, null_model());
+        let d3 = d2.child(investor, null_model());
+        assert!(d2
+            .sub_tools(investor, &tmp, null_model())
+            .iter()
+            .any(|tool| tool.name() == "task"));
+        assert!(!d3
+            .sub_tools(investor, &tmp, null_model())
+            .iter()
+            .any(|tool| tool.name() == "task"));
     }
 }
 
@@ -229,35 +499,24 @@ impl Tool for TaskTool {
     }
 
     fn description(&self) -> &str {
-        "Delegate a bounded subtask to a sub-agent with its own fresh \
-         context. Use agent='explore' for read-only reconnaissance that \
-         returns a report (cheap: its exploration never enters your \
-         context). Use agent='plan' for a read-only implementation-plan \
-         draft that the parent must still review and submit. Use \
-         agent='general' for independent multi-step work. Give a complete, \
-         self-contained prompt and a very short task summary in the same language as that prompt; \
-         the sub-agent sees nothing of this conversation and cannot ask questions."
+        &self.description
     }
 
     fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "agent": { "type": "string", "enum": AgentRole::TASK_KINDS.map(AgentRole::key) },
-                "prompt": { "type": "string" },
-                "summary": {
-                    "type": "string",
-                    "description": "A very short summary of the delegated objective. Use the same language as prompt; it appears in the live agent tree."
-                }
-            },
-            "required": ["agent", "prompt"]
-        })
+        task_schema(&self.defs, self.allowed.as_deref())
     }
 
     fn batch_policy_for(&self, input: &Value) -> tcode_core::BatchPolicy {
-        match input["agent"].as_str() {
-            Some("explore" | "plan") => tcode_core::BatchPolicy::ParallelReadOnly,
-            _ => tcode_core::BatchPolicy::Isolated,
+        // Resumed runs mutate parked session state; serialize them.
+        let read_only = input["resume"].as_str().is_none()
+            && input["agent"]
+                .as_str()
+                .and_then(|kind| self.def_for(kind))
+                .is_some_and(|def| def.read_only);
+        if read_only {
+            tcode_core::BatchPolicy::ParallelReadOnly
+        } else {
+            tcode_core::BatchPolicy::Isolated
         }
     }
 
@@ -266,19 +525,22 @@ impl Tool for TaskTool {
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {
-        match input["agent"].as_str() {
+        match input["agent"].as_str().and_then(|kind| self.def_for(kind)) {
             // Read-only: never prompts.
-            Some("explore" | "plan") => PermissionRequest::None,
-            _ => {
+            Some(def) if def.read_only => PermissionRequest::None,
+            Some(def) => {
                 let prompt = input["prompt"].as_str().unwrap_or("?");
                 let preview: String = prompt.chars().take(60).collect();
                 PermissionRequest::Ask {
-                    descriptor: "task(general)".into(),
+                    descriptor: format!("task({})", def.name),
                     aliases: Vec::new(),
                     summary: format!("delegate to sub-agent: {preview}"),
                     is_edit: false,
                 }
             }
+            // Unknown kind: run() fails immediately with a self-healing
+            // error before any side effect, so prompting would be noise.
+            None => PermissionRequest::None,
         }
     }
 
@@ -304,16 +566,22 @@ impl Tool for TaskTool {
             .filter(|summary| !summary.is_empty())
             .map(ToOwned::to_owned)
             .unwrap_or_else(|| prompt_summary(prompt));
-        let system = match kind {
-            "explore" => EXPLORE_SYSTEM,
-            "plan" => PLAN_SYSTEM,
-            "general" => GENERAL_SYSTEM,
-            other => {
-                return ToolOutput::err(format!(
-                    "unknown agent '{other}'; use 'explore', 'plan', or 'general'"
-                ))
-            }
+        let Some(def) = self.def_for(kind) else {
+            return ToolOutput::err(format!(
+                "unknown agent '{kind}'; available: {}",
+                self.defs.names_for(self.allowed.as_deref()).join(", ")
+            ));
         };
+        if let Some(id) = input["resume"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return self
+                .resume_run(id, def, prompt, &summary, call_id, ctx, cancel)
+                .await;
+        }
+        let system = def.system.clone();
 
         let model = self.model_for(kind);
         let model_name = model.provider.model().to_string();
@@ -327,13 +595,13 @@ impl Tool for TaskTool {
             // A sub-agent has no input box, so it never suggests; it still
             // carries the pins so its own classifier resolves the same way.
             models: self.pinned.clone(),
-            tools: self.sub_tools(kind, &ctx.cwd, model.clone()),
-            system: system.to_string(),
+            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
+            system,
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
             safety_classifier: Some(safety_classifier),
             auto_policy: self.auto_policy.clone(),
-            max_steps: tcode_core::DEFAULT_MAX_STEPS,
+            max_steps: def.max_steps.unwrap_or(tcode_core::DEFAULT_MAX_STEPS),
             auto_compact: self.auto_compact,
             auto_compact_percent: self.auto_compact_percent,
         };
@@ -350,16 +618,156 @@ impl Tool for TaskTool {
         )
         .with_cache_scope(format!("task-{kind}-{run}"));
 
+        let run = match self
+            .drive(
+                &agent,
+                &mut session,
+                kind,
+                &model_name,
+                prompt,
+                &summary,
+                call_id,
+                ctx,
+                cancel,
+            )
+            .await
+        {
+            Ok(run) => run,
+            Err(out) => return out,
+        };
+
+        if def.max_exchanges > 0 {
+            let id = run.run_id.clone();
+            let header = format!(
+                "[{kind} sub-agent {id} on {model_name}: {}; resumable — call task with \
+                 agent=\"{kind}\", resume=\"{id}\" for up to {} follow-up turns]",
+                run.stats, def.max_exchanges
+            );
+            static PARK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            self.park(
+                &id,
+                LiveTask {
+                    agent,
+                    session,
+                    exchanges_left: def.max_exchanges,
+                    def_name: def.name.clone(),
+                    model_name,
+                    seq: PARK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                },
+            );
+            return ToolOutput::ok(format!("{header}\n{}", run.report));
+        }
+        ToolOutput::ok(format!(
+            "[{kind} sub-agent on {model_name}: {}]\n{}",
+            run.stats, run.report
+        ))
+    }
+}
+
+/// What one delegated turn produced, shared by fresh and resumed runs.
+struct TaskRunOutcome {
+    run_id: String,
+    /// `"{tool_calls} tool calls, in X | out Y tokens"`.
+    stats: String,
+    report: String,
+}
+
+impl TaskTool {
+    /// Continue a parked run: same session, same cache scope, pure append —
+    /// a follow-up costs only the increment on a full prefix cache hit.
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_run(
+        &self,
+        id: &str,
+        def: &AgentDef,
+        prompt: &str,
+        summary: &str,
+        call_id: &str,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let taken = self.live.lock().expect("live tasks lock").remove(id);
+        let Some(mut task) = taken else {
+            let mut parked: Vec<String> = {
+                let live = self.live.lock().expect("live tasks lock");
+                live.keys().cloned().collect()
+            };
+            parked.sort();
+            return ToolOutput::err(format!(
+                "no resumable task '{id}' — it may have expired, hit its follow-up limit, \
+                 or be resuming concurrently. Resumable now: [{}]. Start a fresh task instead.",
+                parked.join(", ")
+            ));
+        };
+        if task.def_name != def.name {
+            let owner = task.def_name.clone();
+            self.live
+                .lock()
+                .expect("live tasks lock")
+                .insert(id.to_string(), task);
+            return ToolOutput::err(format!(
+                "task '{id}' belongs to agent '{owner}'; call it with agent=\"{owner}\""
+            ));
+        }
+        task.exchanges_left -= 1;
+        let outcome = self
+            .drive(
+                &task.agent,
+                &mut task.session,
+                &def.name,
+                &task.model_name,
+                prompt,
+                summary,
+                call_id,
+                ctx,
+                cancel,
+            )
+            .await;
+        match outcome {
+            // A failed or cancelled follow-up drops the parked run: its
+            // session state is no longer trustworthy.
+            Err(out) => out,
+            Ok(run) => {
+                let left = task.exchanges_left;
+                let model_name = task.model_name.clone();
+                let note = if left > 0 {
+                    self.park(id, task);
+                    format!("{left} follow-up turns left")
+                } else {
+                    "follow-up limit reached, task closed".to_string()
+                };
+                ToolOutput::ok(format!(
+                    "[{} sub-agent {id} resumed on {model_name}: {}; {note}]\n{}",
+                    def.name, run.stats, run.report
+                ))
+            }
+        }
+    }
+
+    /// Run one turn of a delegated agent — trace, live-event forwarding,
+    /// report extraction — shared by fresh runs and resumed follow-ups.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive(
+        &self,
+        agent: &Agent,
+        session: &mut Session,
+        kind: &str,
+        model_name: &str,
+        prompt: &str,
+        summary: &str,
+        call_id: &str,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> Result<TaskRunOutcome, ToolOutput> {
         // Trace: the run gets a stable per-session id, and (when the parent
         // session persists) its own JSONL ledger log for the trace viewer.
-        // Nothing here enters the parent's provider ledger.
-        let (run_id, trace) = ctx.task_traces.lock().expect("task traces lock").begin(
-            call_id,
-            kind,
-            &model_name,
-            prompt,
-            &summary,
-        );
+        // Nothing here enters the parent's provider ledger. A resumed run
+        // swaps in the new trace's sink, so each trace records its own turn.
+        let (run_id, trace) = ctx
+            .task_traces
+            .lock()
+            .expect("task traces lock")
+            .begin(call_id, kind, model_name, prompt, summary);
         if let Some(trace) = &trace {
             session.ledger.attach_sink(Box::new(trace.clone()));
         }
@@ -371,9 +779,9 @@ impl Tool for TaskTool {
                 run: run_id.clone(),
                 parent_call: call_id.to_string(),
                 kind: kind.to_string(),
-                model: model_name.clone(),
+                model: model_name.to_string(),
                 prompt: prompt.to_string(),
-                summary,
+                summary: summary.to_string(),
             });
         }
 
@@ -441,7 +849,7 @@ impl Tool for TaskTool {
 
         let result = agent
             .user_turn(
-                &mut session,
+                session,
                 vec![ContentBlock::Text {
                     text: prompt.to_string(),
                 }],
@@ -466,7 +874,7 @@ impl Tool for TaskTool {
         }
         if let Some(delegate) = &delegate {
             let _ = delegate.send(DelegateEvent::TaskFinished {
-                run: run_id,
+                run: run_id.clone(),
                 status,
                 tool_calls,
                 usage,
@@ -474,10 +882,10 @@ impl Tool for TaskTool {
         }
 
         if let Err(e) = result {
-            return ToolOutput::err(format!("sub-agent failed: {e}"));
+            return Err(ToolOutput::err(format!("sub-agent failed: {e}")));
         }
         if cancel.is_cancelled() {
-            return ToolOutput::err("sub-agent cancelled by user");
+            return Err(ToolOutput::err("sub-agent cancelled by user"));
         }
 
         // The report = text of the final assistant entry.
@@ -503,11 +911,14 @@ impl Tool for TaskTool {
             .unwrap_or_else(|| "(sub-agent produced no report)".into());
 
         let u = session.turn_usage;
-        ToolOutput::ok(format!(
-            "[{kind} sub-agent on {model_name}: {tool_calls} tool calls, \
-             in {} | out {} tokens]\n{report}",
-            u.total_input(),
-            u.output_tokens
-        ))
+        Ok(TaskRunOutcome {
+            run_id,
+            stats: format!(
+                "{tool_calls} tool calls, in {} | out {} tokens",
+                u.total_input(),
+                u.output_tokens
+            ),
+            report,
+        })
     }
 }

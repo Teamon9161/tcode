@@ -412,6 +412,10 @@ struct Cli {
     /// Resume a session by id (prefix is enough)
     #[arg(long)]
     resume: Option<String>,
+    /// Run as a named agent definition (`.tcode/agents/<name>.md`): its
+    /// system prompt, toolset, and model pin replace the interactive defaults
+    #[arg(long)]
+    agent: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -487,11 +491,64 @@ async fn main() -> anyhow::Result<()> {
 
     // Everything /model can switch to, with the swap logic attached.
     let mut menu = build_menu(&config, &selection, model_cell.clone());
+    // Builtin task kinds + user-defined agents (`.tcode/agents/*.md`), one
+    // registry shared by the task tool. Front-matter model hints become
+    // `[agents.<name>]` defaults, so hand-written config and `/agents` picks
+    // win through the ordinary resolution below.
+    let (agent_defs, agent_warnings) = tcode_tools::AgentRegistry::discover(&cwd);
+    for warning in &agent_warnings {
+        eprintln!("{DIM}warning: {warning}{RESET}");
+    }
+    for def in agent_defs.custom() {
+        if let Some(hint) = &def.model {
+            config
+                .agents
+                .entry(def.name.clone())
+                .or_insert_with(|| AgentConfig {
+                    profile: hint.profile.clone(),
+                    model: hint.model.clone(),
+                    effort: hint.effort.clone(),
+                    enabled: None,
+                });
+        }
+    }
+    let agent_defs = Arc::new(agent_defs);
+    // `--agent <name>`: this process runs *as* that definition. Resolved
+    // before anything enters the prompt prefix; everything it changes
+    // (system prompt, toolset, model, max_steps) is fixed at startup.
+    let cli_agent = match cli.agent.as_deref() {
+        Some(name) => {
+            if cli.r#continue || cli.resume.is_some() {
+                anyhow::bail!(
+                    "--agent cannot be combined with --continue/--resume: \
+                     a resumed session was recorded under a different system prompt"
+                );
+            }
+            let Some(def) = agent_defs.get(name) else {
+                anyhow::bail!(
+                    "unknown agent '{name}'; available: {}",
+                    agent_defs.names_for(None).join(", ")
+                );
+            };
+            Some(def.clone())
+        }
+        None => None,
+    };
     // Live sub-agent pins, shared by the `task` tool and `/agents`.
     let pinned = agent_models(&config, &selection);
+    if let Some(def) = &cli_agent {
+        // A pinned model for the named agent becomes the session model
+        // (process-local; never persisted to state.toml).
+        if let Some(model) = pinned.get(&def.name) {
+            model_cell.swap(model);
+        }
+    }
     let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone());
 
-    let system = INTERACTIVE_AGENT_SYSTEM.to_string();
+    let system = match &cli_agent {
+        Some(def) => def.system.clone(),
+        None => INTERACTIVE_AGENT_SYSTEM.to_string(),
+    };
     let classifier_policy = auto_policy(&config);
     let trusted_read_hosts =
         tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
@@ -509,21 +566,20 @@ async fn main() -> anyhow::Result<()> {
         model_cell.clone(),
         pinned.clone(),
     )));
-    tools.push(Arc::new(
-        tcode_tools::TaskTool::new(
-            model_cell.clone(),
-            config.watchdog.clone(),
-            config.limits.tool_output_tokens,
-            cwd.clone(),
-        )
-        .with_agent_models(pinned.clone())
-        .with_auto_policy(classifier_policy.clone())
-        .with_auto_compact(
-            config.limits.auto_compact,
-            config.limits.auto_compact_percent,
-        )
-        .with_trusted_read_hosts(trusted_read_hosts.clone()),
-    ));
+    let task_tool = tcode_tools::TaskTool::new(
+        model_cell.clone(),
+        config.watchdog.clone(),
+        config.limits.tool_output_tokens,
+        cwd.clone(),
+    )
+    .with_agent_models(pinned.clone())
+    .with_agent_defs(agent_defs.clone())
+    .with_auto_policy(classifier_policy.clone())
+    .with_auto_compact(
+        config.limits.auto_compact,
+        config.limits.auto_compact_percent,
+    )
+    .with_trusted_read_hosts(trusted_read_hosts.clone());
     tools.push(Arc::new(tcode_tools::UpdateProgressTool));
     tools.push(Arc::new(tcode_tools::AskUserTool));
     tools.push(Arc::new(tcode_tools::AddNoteTool));
@@ -535,6 +591,24 @@ async fn main() -> anyhow::Result<()> {
             eprintln!("{DIM}warning: {warning}{RESET}");
         }
         tools.extend(mcp_tools);
+    }
+    // Allowlists may only be checked against the fully assembled toolset
+    // (MCP included); definitions with unknown names stay usable elsewhere.
+    let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
+    for warning in agent_defs.validate_tools(&tool_names) {
+        eprintln!("{DIM}warning: {warning}{RESET}");
+    }
+    // A named-agent run shapes the toolset last: allowlist filtering over
+    // everything assembled above, then the task tool — which is granted by
+    // the definition's `agents` field alone, outside the allowlist tiers.
+    match &cli_agent {
+        Some(def) => {
+            tools.retain(|tool| tcode_tools::keeps_tool(def, tool.as_ref()));
+            if !def.agents.is_empty() {
+                tools.push(Arc::new(task_tool.scoped_to(def)));
+            }
+        }
+        None => tools.push(Arc::new(task_tool)),
     }
     let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
         model_cell.clone(),
@@ -549,7 +623,10 @@ async fn main() -> anyhow::Result<()> {
         hooks: tcode_core::Hooks::new(config.hooks.clone()),
         safety_classifier: Some(safety_classifier),
         auto_policy: classifier_policy,
-        max_steps: config.limits.max_steps_per_turn,
+        max_steps: cli_agent
+            .as_ref()
+            .and_then(|def| def.max_steps)
+            .unwrap_or(config.limits.max_steps_per_turn),
         auto_compact: config.limits.auto_compact,
         auto_compact_percent: config.limits.auto_compact_percent,
     });

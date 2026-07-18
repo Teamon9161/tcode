@@ -2962,3 +2962,263 @@ async fn auto_compaction_can_be_disabled() {
         .iter()
         .all(|entry| !matches!(entry, Entry::Summary(_))));
 }
+
+/// Build an `AgentRegistry` from inline definitions written to a temp dir, so
+/// integration tests can exercise custom kinds without a fixture tree.
+fn custom_registry(
+    dir: &std::path::Path,
+    defs: &[(&str, &str, &str)],
+) -> Arc<tcode_tools::AgentRegistry> {
+    let agents = dir.join(".tcode/agents");
+    std::fs::create_dir_all(&agents).unwrap();
+    for (name, front, body) in defs {
+        std::fs::write(
+            agents.join(format!("{name}.md")),
+            format!("---\ndescription: {name} agent\n{front}\n---\n{body}"),
+        )
+        .unwrap();
+    }
+    let (registry, warnings) = tcode_tools::AgentRegistry::discover(dir);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    Arc::new(registry)
+}
+
+fn task_texts(messages: &[tcode_core::Message]) -> Vec<String> {
+    messages
+        .iter()
+        .flat_map(|message| &message.content)
+        .filter_map(|block| match block {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A custom agent that itself delegates: the investor kind spawns quant-dev,
+/// three real agent loops on one scripted provider. Each level runs under its
+/// own system prompt and its own cache scope; the innermost report flows back
+/// out through the middle to the top.
+#[tokio::test]
+async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = custom_registry(
+        root.path(),
+        &[
+            (
+                "investor",
+                "agents: quant-dev",
+                "You are the investor. Delegate backtests.",
+            ),
+            (
+                "quant-dev",
+                "readonly: true",
+                "You are the quant developer. Report results.",
+            ),
+        ],
+    );
+    // One provider, one script queue, consumed in call order across all three
+    // levels: parent → investor → quant-dev → back up.
+    let provider = MockProvider::new(vec![
+        // Parent delegates to the investor.
+        tool_use(
+            "p1",
+            "task",
+            r#"{"agent":"investor","prompt":"grow the book","summary":"invest"}"#,
+        ),
+        // Investor delegates a backtest to quant-dev.
+        tool_use(
+            "i1",
+            "task",
+            r#"{"agent":"quant-dev","prompt":"backtest momentum","summary":"backtest"}"#,
+        ),
+        // quant-dev reports.
+        text_done("momentum Sharpe 1.4"),
+        // Investor summarizes for the parent.
+        text_done("allocated to momentum"),
+        // Parent's closing word.
+        text_done("done"),
+    ]);
+    let task = tcode_tools::TaskTool::new(
+        cell(provider.clone()),
+        WatchdogConfig::default(),
+        2_000,
+        root.path().to_path_buf(),
+    )
+    .with_agent_defs(registry);
+    let agent = Agent {
+        tools: vec![Arc::new(task)],
+        ..agent(provider.clone())
+    };
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "manage the portfolio").await;
+
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5, "parent x2, investor x2, quant-dev x1");
+    // Each level ran under its own definition's system prompt.
+    assert_eq!(requests[0].system, "test");
+    assert!(requests[1].system.contains("You are the investor"));
+    assert!(requests[2].system.contains("You are the quant developer"));
+    // Distinct cache scopes, one per delegated conversation.
+    let investor_scope = requests[1].cache_scope.clone();
+    let quant_scope = requests[2].cache_scope.clone();
+    assert!(investor_scope
+        .as_deref()
+        .is_some_and(|scope| scope.starts_with("task-investor-")));
+    assert!(quant_scope
+        .as_deref()
+        .is_some_and(|scope| scope.starts_with("task-quant-dev-")));
+    assert_ne!(investor_scope, quant_scope);
+    // The investor's second turn stays in its own append-only scope.
+    assert_eq!(requests[3].cache_scope, investor_scope);
+    assert_eq!(
+        task_texts(&requests[3].messages)[..1],
+        task_texts(&requests[1].messages)[..1],
+        "the investor's follow-up preserved its opening message byte-for-byte"
+    );
+
+    // The nested report reached the top: the parent's task tool returned the
+    // investor's summary, which itself carried the quant-dev result upward.
+    let report = events
+        .iter()
+        .find_map(|e| match e {
+            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("task returned a report");
+    assert!(report.contains("allocated to momentum"), "{report}");
+    // quant-dev's own tokens never entered the parent context.
+    assert!(!report.contains("momentum Sharpe"), "{report}");
+}
+
+/// A resumable custom agent can be re-driven with follow-up turns on the same
+/// session: the caller questions the sub-agent, the sub-agent answers with its
+/// context intact, and the follow-up is pure append under one cache scope.
+#[tokio::test]
+async fn a_resumable_sub_agent_continues_the_same_session() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = custom_registry(
+        root.path(),
+        &[(
+            "quant-dev",
+            "readonly: true\nmax_exchanges: 3",
+            "You are the quant developer.",
+        )],
+    );
+    let provider = MockProvider::new(vec![
+        // Parent delegates a backtest.
+        tool_use(
+            "p1",
+            "task",
+            r#"{"agent":"quant-dev","prompt":"backtest idea A","summary":"backtest"}"#,
+        ),
+        // quant-dev's first report.
+        text_done("Sharpe 1.2, max drawdown 15%"),
+        // Parent pushes back — resumes the SAME run (its id is t1).
+        tool_use(
+            "p2",
+            "task",
+            r#"{"agent":"quant-dev","prompt":"drawdown too high, add a stop","resume":"t1","summary":"refine"}"#,
+        ),
+        // quant-dev's refined answer.
+        text_done("with a 10% stop: Sharpe 1.1, max drawdown 9%"),
+        // Parent closes.
+        text_done("shipped"),
+    ]);
+    let task = tcode_tools::TaskTool::new(
+        cell(provider.clone()),
+        WatchdogConfig::default(),
+        2_000,
+        root.path().to_path_buf(),
+    )
+    .with_agent_defs(registry);
+    let agent = Agent {
+        tools: vec![Arc::new(task)],
+        ..agent(provider.clone())
+    };
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "research idea A").await;
+
+    let reports: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reports.len(), 2, "one fresh run, one resumed");
+    // The first report advertises the resumable id and the follow-up budget.
+    assert!(reports[0].contains("resumable"), "{}", reports[0]);
+    assert!(reports[0].contains("t1"), "{}", reports[0]);
+    assert!(reports[0].contains("Sharpe 1.2"), "{}", reports[0]);
+    // The resumed report continues the same run and counts a turn down.
+    assert!(reports[1].contains("resumed"), "{}", reports[1]);
+    assert!(
+        reports[1].contains("2 follow-up turns left"),
+        "{}",
+        reports[1]
+    );
+    assert!(reports[1].contains("max drawdown 9%"), "{}", reports[1]);
+
+    // Both quant-dev turns ran in one append-only session: same scope, and the
+    // resumed request carries the first turn's messages as its prefix.
+    let requests = provider.requests.lock().unwrap();
+    // requests: parent p1, quant fresh, parent p2, quant resumed, parent close.
+    assert_eq!(requests[1].cache_scope, requests[3].cache_scope);
+    let first = task_texts(&requests[1].messages);
+    let resumed = task_texts(&requests[3].messages);
+    assert_eq!(
+        resumed[..first.len()],
+        first[..],
+        "the resumed turn left the earlier exchange byte-identical (prefix cache hit)"
+    );
+    assert!(resumed.iter().any(|t| t.contains("add a stop")));
+}
+
+/// A resume that names an unknown id fails with a self-healing error that
+/// lists what is actually resumable, instead of silently starting fresh.
+#[tokio::test]
+async fn resuming_an_unknown_task_is_a_self_healing_error() {
+    use tcode_core::Tool as _;
+    let root = tempfile::tempdir().unwrap();
+    let registry = custom_registry(
+        root.path(),
+        &[(
+            "quant-dev",
+            "readonly: true\nmax_exchanges: 2",
+            "You are the quant developer.",
+        )],
+    );
+    let provider = MockProvider::new(vec![text_done("unused")]);
+    let task = tcode_tools::TaskTool::new(
+        cell(provider),
+        WatchdogConfig::default(),
+        2_000,
+        root.path().to_path_buf(),
+    )
+    .with_agent_defs(registry);
+    let ctx = ToolCtx::new(root.path().to_path_buf(), 2_000);
+
+    let out = task
+        .run(
+            serde_json::json!({"agent":"quant-dev","prompt":"continue","resume":"t99"}),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(out.is_error);
+    assert!(
+        out.content.contains("no resumable task 't99'"),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains("Start a fresh task"),
+        "{}",
+        out.content
+    );
+}

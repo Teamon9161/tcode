@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::frontmatter::{clip, front_matter, strip_front_matter};
 use tcode_core::{PermissionRequest, PromptVariables, Tool, ToolCtx, ToolOutput};
 
 /// One listed line per skill; longer descriptions are clipped, not dropped.
@@ -286,69 +287,6 @@ fn tool_description(skills: &[Skill]) -> String {
         ));
     }
     out
-}
-
-/// Minimal YAML front matter: top-level `key: value` pairs between `---`
-/// fences, including block scalars (`description: |` with indented lines) —
-/// the layout Claude Code skills use in practice. Everything else is ignored.
-fn front_matter(text: &str) -> std::collections::HashMap<String, String> {
-    let mut out = std::collections::HashMap::new();
-    let mut lines = text.lines().peekable();
-    if lines.next().map(str::trim) != Some("---") {
-        return out;
-    }
-    while let Some(line) = lines.next() {
-        if line.trim() == "---" {
-            break;
-        }
-        if line.starts_with([' ', '\t']) {
-            continue;
-        }
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        let value = if matches!(value, "|" | ">" | "|-" | ">-" | "|+" | ">+") {
-            // Block scalar: fold the following indented lines into one line;
-            // the listing shows a single line per skill anyway.
-            let mut parts: Vec<String> = Vec::new();
-            while let Some(next) = lines.peek() {
-                if next.trim().is_empty() || next.starts_with([' ', '\t']) {
-                    if !next.trim().is_empty() {
-                        parts.push(next.trim().to_owned());
-                    }
-                    lines.next();
-                } else {
-                    break;
-                }
-            }
-            parts.join(" ")
-        } else {
-            value.trim_matches(['"', '\'']).to_owned()
-        };
-        out.insert(key.trim().to_owned(), value);
-    }
-    out
-}
-
-fn strip_front_matter(text: &str) -> &str {
-    let Some(rest) = text.strip_prefix("---") else {
-        return text;
-    };
-    rest.split_once("\n---")
-        .map(|(_, body)| body.trim_start_matches('-').trim_start())
-        .unwrap_or(text)
-}
-
-fn clip(text: &str, cap: usize) -> String {
-    let text = text.lines().next().unwrap_or("").trim();
-    let mut chars = text.chars();
-    let prefix: String = chars.by_ref().take(cap).collect();
-    if chars.next().is_some() {
-        format!("{prefix}…")
-    } else {
-        prefix
-    }
 }
 
 #[cfg(test)]

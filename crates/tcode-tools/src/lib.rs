@@ -1,3 +1,5 @@
+mod agent_defs;
+mod frontmatter;
 mod fs_tools;
 mod grounding;
 mod interaction;
@@ -14,6 +16,9 @@ mod web;
 #[cfg(test)]
 mod view_image_tests;
 
+pub use agent_defs::{
+    keeps_tool, AgentDef, AgentModelHint, AgentRegistry, AgentSource, MAX_TASK_DEPTH,
+};
 pub use grounding::{
     environment_snapshot, project_map, project_map_with_scratch, startup_context_with_scratch,
 };
