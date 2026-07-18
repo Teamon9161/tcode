@@ -1,0 +1,1519 @@
+mod bake;
+mod commands;
+mod draw;
+mod input;
+mod replay;
+mod rewind;
+mod turn;
+mod views;
+
+use bake::*;
+use draw::*;
+use input::*;
+use rewind::*;
+use views::*;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Stdout;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use async_trait::async_trait;
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use futures::StreamExt;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Rect;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::Paragraph;
+use ratatui::Terminal;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
+use unicode_width::UnicodeWidthStr;
+
+use tcode_core::blobs::approx_tokens;
+use tcode_core::commands::{
+    CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
+};
+use tcode_core::{
+    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock, FolderTrust,
+    PendingMessage, ReferenceCandidate, Session, Usage,
+};
+
+use tcode_importers::{
+    import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
+};
+
+use crate::approval::Dialog;
+use crate::composer::{
+    editor_layout, format_bytes, ghost_visual_lines, input_spans, move_editor_visual,
+    paste_should_fold, reference_basename, reference_basename_path, reference_boundary,
+    reference_candidate_path, reference_marker, reference_match_order, reference_score,
+    reference_token_char, VisualMove,
+};
+use crate::editor::{Editor, Position};
+use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
+use crate::model_picker::{self, AgentMenu, ModelMenu};
+use crate::overlay::{Flow, Overlay, OverlayAction, OverlayCtx};
+use crate::render::{
+    batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
+};
+use crate::resume;
+use crate::transcript::Transcript;
+use crate::usage::{
+    context_progress_line, rate_limit_line, token_count, turn_summary_line, TurnMeter,
+};
+use crate::view::{BakeCtx, SessionView};
+use crate::view_picker::{self, ViewId};
+use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
+
+type Term = Terminal<CrosstermBackend<Stdout>>;
+
+/// Lines scrolled per mouse-wheel event.
+const WHEEL_STEP: usize = 3;
+/// Visible rows of an expanded tool-output region.
+const OUTPUT_VIEW_ROWS: usize = 12;
+
+/// Second Esc within this window (while idle) opens the rewind picker.
+const DOUBLE_ESC: Duration = Duration::from_millis(1200);
+
+/// Opens a note the human slipped to the model mid-turn (approval comment,
+/// `/note`), distinguishing it from a full user turn under the same rail.
+/// The note's own text already says what it is about — see
+/// `Agent`'s approval notes — so the label stays a bare marker.
+const NOTE_LABEL: &str = "Note: ";
+
+/// Braille spinner drawn in the accent colour: visibly alive without the
+/// bulk or flicker of the legacy sparkle animation.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// The time window that turns two clicks on a parent task card into opening
+/// its isolated sub-agent trace.
+const TASK_CARD_DOUBLE_CLICK: Duration = Duration::from_millis(450);
+
+const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " █  █▄▄ █▄█ █▄▀ ██▄"];
+
+/// One of these shows per launch, picked at random: a discovery channel
+/// for features nobody reads /help for. Every entry must describe real,
+/// current behaviour — stale tips are worse than none.
+const TIPS: [&str; 10] = [
+    "shift+tab cycles permission modes",
+    "esc esc rewinds the conversation · ctrl+r also restores files",
+    "ctrl+c stops the turn and sends queued prompts right away — it never exits",
+    "type while a turn runs: the prompt queues and esc takes it back",
+    "→ accepts the dim suggestion in the input box",
+    "/model switches model mid-session · /agents pins sub-agent models",
+    "/resume picks up an earlier session · /export saves the transcript",
+    "/compact squeezes a long conversation back into budget",
+    "click the agent tree to expand a task; double-click it to open its trace",
+    "/note slips the model an aside without starting a turn",
+];
+
+/// Commands whose substance drives frontend-owned objects (key table, model
+/// picker, provider wizard). Everything else lives in the shared
+/// `CommandRegistry` in tcode-core.
+const UI_COMMANDS: [(&str, &str); 5] = [
+    ("/help", "show keys and commands"),
+    ("/views", "switch concurrent sessions"),
+    ("/model", "switch model · adjust reasoning effort"),
+    (
+        "/agents",
+        "choose models for sub-agents and Auto Mode safety",
+    ),
+    ("/provider", "configure or switch provider"),
+];
+
+pub struct AskMsg {
+    pub tool: String,
+    pub summary: String,
+    pub descriptor: String,
+    pub is_edit: bool,
+    pub allows_project: bool,
+    pub input: serde_json::Value,
+    pub reply: oneshot::Sender<Approval>,
+}
+
+/// Approver that forwards prompts into the UI loop.
+pub struct ChannelApprover {
+    pub tx: mpsc::Sender<AskMsg>,
+}
+
+#[async_trait]
+impl Approver for ChannelApprover {
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        is_edit: bool,
+        allows_project: bool,
+        input: &serde_json::Value,
+    ) -> Approval {
+        let (reply, rx) = oneshot::channel();
+        let msg = AskMsg {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+            descriptor: descriptor.to_string(),
+            is_edit,
+            allows_project,
+            input: input.clone(),
+            reply,
+        };
+        if self.tx.send(msg).await.is_err() {
+            return Approval::simple(ApprovalDecision::No, Some("UI unavailable".into()));
+        }
+        rx.await
+            .unwrap_or_else(|_| Approval::simple(ApprovalDecision::No, None))
+    }
+}
+
+enum Phase {
+    Idle,
+    Running {
+        handle: JoinHandle<(Session, Result<(), AgentError>)>,
+        cancel: CancellationToken,
+        started: Instant,
+    },
+}
+
+/// Batch items are indented under their shared header without a tree glyph.
+const BATCH_ITEM_INDENT: &str = "    ";
+/// A sub-agent's live action belongs to its task item, never to the batch
+/// header, so it has one extra visible tree level.
+const TASK_STATUS_INDENT: &str = "      └ ";
+
+pub struct App {
+    agent: Arc<Agent>,
+    opening_context: OpeningContextFn,
+    environment: EnvironmentFn,
+    registry: CommandRegistry,
+    /// The same discovery the `skill` tool uses, handed in by the caller so a
+    /// `/name` line that misses both `UI_COMMANDS` and the registry can fall
+    /// back to loading a skill directly (see `run_slash`) without a second
+    /// filesystem scan.
+    skills: Vec<tcode_tools::Skill>,
+    session: Option<Session>,
+    /// The TUI retains this while a turn owns `session`, so live tool calls
+    /// can still render in-project paths relatively.
+    cwd: PathBuf,
+    /// Session-private scratch root mirrored for UI-owned temporary files while
+    /// a running turn owns the `Session`.
+    scratch_dir: PathBuf,
+    /// Per-tool renderers + display names, built from the agent's live tools
+    /// so rendering behaviour (quiet output, routes, diffs) can never drift
+    /// from core's tool contracts.
+    renderers: RenderRegistry,
+    terminal: Term,
+    transcript: Transcript,
+    md: markdown::Renderer,
+
+    phase: Phase,
+    events_rx: Option<mpsc::Receiver<AgentEvent>>,
+    external_import: Option<
+        JoinHandle<(
+            ExternalSource,
+            Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+        )>,
+    >,
+    ask_rx: mpsc::Receiver<AskMsg>,
+    approver: Arc<ChannelApprover>,
+
+    editor: Editor,
+    /// Ignored-aware project paths used only for local `@` completion. The
+    /// core agent resolves selected markers at send time, so an old index can
+    /// never read a stale or outside-project path.
+    reference_index: Vec<ReferenceCandidate>,
+    reference_tx: mpsc::Sender<(PathBuf, Vec<ReferenceCandidate>)>,
+    reference_rx: mpsc::Receiver<(PathBuf, Vec<ReferenceCandidate>)>,
+    /// Prompts submitted while a turn was running. The agent loop takes them at
+    /// its next safe boundary; until then they show, dimmed, above the input.
+    pending: tcode_core::PendingInput,
+    /// Fires when a monitor produces an event or exits; re-fetched from the
+    /// session each loop iteration so a rebound registry can't leave it stale.
+    monitor_signal: Arc<tokio::sync::Notify>,
+    /// When to wake an idle session for undelivered monitor events. `None`
+    /// while there is nothing to deliver; recomputed from the registry on
+    /// signal and at turn end.
+    monitor_deadline: Option<tokio::time::Instant>,
+    /// A permission-mode switch staged while a turn runs (the running turn owns
+    /// the `Session`). The agent loop commits it at the next batch boundary and
+    /// reports back with `ModeChanged`; until then the status line shows the
+    /// staged target with a pending marker.
+    pending_mode: tcode_core::PendingMode,
+    /// The mode currently in effect, as the frontend knows it. Kept in step
+    /// with `Session::mode`: updated directly when idle, and on `ModeChanged`
+    /// when a running turn commits a staged switch. Cycling reads
+    /// staged-else-committed so repeated presses collapse to the final target.
+    committed_mode: tcode_core::PermissionMode,
+    /// The idle guess at the next instruction: ghost text in an empty input,
+    /// accepted with →. It belongs to the turn that produced it and survives
+    /// typing — the ghost hides while the input has text and comes back when it
+    /// is empty again, without a second request. Whether to ask for one at all
+    /// is `Session::suggestions` (`/suggestions`).
+    suggestion: Option<String>,
+    suggest_cancel: Option<CancellationToken>,
+    /// Which guess is current. A reply carrying an older generation is a guess
+    /// about a conversation that no longer exists, and is dropped.
+    suggest_gen: u64,
+    suggest_tx: mpsc::Sender<(u64, Option<String>)>,
+    suggest_rx: mpsc::Receiver<(u64, Option<String>)>,
+    attachments: Vec<Attachment>,
+    /// Monotonic id for the next attachment; keeps inline tokens unique within
+    /// a draft. Reset to 1 once the draft is sent or cleared.
+    next_attachment_id: u32,
+    /// A long-lived system clipboard. Kept alive for the whole session: on
+    /// X11, arboard prints a warning to the terminal (corrupting the alternate
+    /// screen) if a `Clipboard` is dropped within 100ms of a write, so a fresh
+    /// one per copy is not an option. `None` when no local clipboard exists
+    /// (headless/SSH) — copy then falls back to OSC 52.
+    clipboard: Option<arboard::Clipboard>,
+    input_hitbox: Option<InputHitbox>,
+    /// Clickable regions for the mode and model values in the idle status row.
+    /// They are computed from the final rendered layout every frame.
+    status_hitboxes: Option<StatusHitboxes>,
+    /// Where the persistent agent tree rendered this frame and which action
+    /// target each row owns.
+    live_panel_hitbox: Option<PanelHitbox>,
+    /// Tree row currently under the pointer; rendered with the shared hover
+    /// background so its click behavior is discoverable.
+    live_panel_hover: Option<PanelTarget>,
+    /// Previous parent-task-card press for double-click-to-open-trace behavior.
+    last_task_card_click: Option<(String, Instant)>,
+    /// Which clickable status value the pointer currently rests over.
+    status_hover: Option<StatusHover>,
+    input_mouse_active: bool,
+    /// Whether the current prompt press has actually dragged. A plain click
+    /// (no Drag event) must not copy, even if the release cell differs slightly.
+    input_dragged: bool,
+    /// Armed while a transcript selection drag rests at a view edge: `(toward
+    /// older, x, y)`. A timer then scrolls and extends the selection, since a
+    /// pointer held still at the edge emits no further mouse events. Cleared on
+    /// release or when the drag returns inside the view.
+    drag_scroll: Option<(bool, u16, u16)>,
+    /// The single modal that can own the bottom panel: any picker, or the
+    /// approval dialog. They are mutually exclusive, so they share one slot —
+    /// see `overlay.rs` for why that matters.
+    overlay: Option<Overlay>,
+    /// A change diff baked into the transcript while its approval dialog is
+    /// open (so the full code is scrollable in the record, not cramped in
+    /// the dialog). Holds the block-count mark to retract to on decline or
+    /// when a batch supersedes it; on approval it tells the upcoming
+    /// `ToolStart` to skip re-baking the diff.
+    change_prebake: Option<usize>,
+    rewind_nav: Option<RewindNav>,
+    menu: ModelMenu,
+    agents: AgentMenu,
+    /// Mirror of `Session::dogfood` for the status line: a running turn owns
+    /// the session, so the hint cannot read it directly.
+    dogfood: bool,
+    pending_tool: Option<PendingCall>,
+    /// Entries belonging to a concurrent group, completed in model-call
+    /// order. Keeping them queued lets each result retain its own input.
+    pending_batch: VecDeque<PendingCall>,
+    progress: Vec<ProgressPhase>,
+    /// `task` sub-agent runs of this conversation, fed by `TaskRun*` events.
+    /// Running ones show live in the panel above the input; finished ones
+    /// stay as the registry the trace viewer will list.
+    task_runs: Vec<UiTaskRun>,
+    /// Root containing `tN.jsonl` trace files for this selected session. It is
+    /// retained while a turn owns `Session`, so task cards can open their
+    /// trace during live work.
+    task_trace_root: Option<PathBuf>,
+    active_view: ViewId,
+    trace_view: Option<TraceView>,
+    last_esc: Option<Instant>,
+    popup_index: usize,
+    /// Tab accepted this exact `@` marker. Keep its completion closed until the
+    /// user changes the draft, rather than immediately matching it again.
+    dismissed_reference: Option<Position>,
+
+    // Live streaming state: kept as a replace-in-place transcript block until
+    // the provider finishes this assistant message.
+    live_text: String,
+    /// A visible tool result must not run into the model's next visible response.
+    /// A following tool header or user message clears this before it is rendered.
+    space_before_response: bool,
+    /// Index of the still-streaming assistant block inside the transcript.
+    /// While set, incoming deltas replace that block in place; finalization just
+    /// drops the marker so the block becomes ordinary scrollback.
+    live_block: Option<usize>,
+    thinking_chars: usize,
+    thinking_text: String,
+    thinking_since: Option<Instant>,
+    show_reasoning: bool,
+    /// Token accounting for the status row and the turn receipt. These
+    /// figures move together, so they live behind one type — see `usage.rs`.
+    meter: TurnMeter,
+    state_label: String,
+    mode_label: String,
+    spinner: usize,
+    /// Monotonic 100ms shimmer frame for the main running status and in-flight
+    /// tool headers. Unlike `spinner` it never wraps, so the sweep stays continuous.
+    anim_frame: usize,
+    should_exit: bool,
+    provider_setup_requested: bool,
+    /// Transient feedback ("copied 3 lines") shown in the hint row.
+    notice: Option<(String, Instant)>,
+    /// Active retry backoff: countdown deadline plus attempt/max, rendered red
+    /// in the status line until the next attempt begins.
+    retry_wait: Option<RetryWait>,
+}
+
+#[derive(Clone)]
+struct RetryWait {
+    until: Instant,
+    attempt: u32,
+    max: u32,
+}
+
+impl App {
+    pub fn new(
+        agent: Arc<Agent>,
+        mut session: Session,
+        menu: ModelMenu,
+        agents: AgentMenu,
+        opening_context: OpeningContextFn,
+        environment: EnvironmentFn,
+        show_reasoning: bool,
+        skills: Vec<tcode_tools::Skill>,
+    ) -> anyhow::Result<Self> {
+        let (ask_tx, ask_rx) = mpsc::channel(4);
+        let (suggest_tx, suggest_rx) = mpsc::channel(1);
+        let (reference_tx, reference_rx) = mpsc::channel(1);
+        let mode_label = session.mode.label().to_string();
+        let committed_mode = session.mode;
+        let pending_mode = session.pending_mode.clone();
+        let session_dogfood = session.dogfood();
+        let cwd = session.tool_ctx.cwd.clone();
+        let scratch_dir = session.tool_ctx.scratch_dir.clone();
+        let task_trace_root = task_trace_root(&session);
+        let overlay = (!session.folder_trust_known())
+            .then(|| Overlay::FolderTrust(crate::folder_trust_picker::Picker::new(&cwd)));
+        let task_runs = discover_task_runs(task_trace_root.as_deref());
+        let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
+        let context_tokens = if context_estimated {
+            agent.estimate_context_tokens(&session)
+        } else {
+            session.last_prompt_tokens
+        };
+        // Keep the agent's automatic-compaction guard and status block in
+        // step with the UI even when tcode was launched with `--resume`.
+        session.last_prompt_tokens = context_tokens;
+        let renderers = RenderRegistry::from_tools(&agent.tools);
+        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        // EnterAlternateScreen does not guarantee a blank physical buffer: on
+        // some terminals a prior tcode frame survives a leave/re-enter cycle.
+        // Ratatui's first diff sees a blank logical buffer and would otherwise
+        // never erase those untouched cells.
+        terminal.clear()?;
+        let transcript = Transcript::new(terminal.size().map(|s| s.width).unwrap_or(80));
+        // The running turn owns the Session; this handle is how input typed
+        // meanwhile still reaches it.
+        let pending = session.pending.clone();
+        let monitor_signal = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .monitor_signal();
+        Ok(Self {
+            agent,
+            opening_context,
+            environment,
+            registry: CommandRegistry::builtin(),
+            skills,
+            session: Some(session),
+            pending,
+            monitor_signal,
+            monitor_deadline: None,
+            pending_mode,
+            committed_mode,
+            cwd,
+            scratch_dir,
+            renderers,
+            terminal,
+            transcript,
+            md: markdown::Renderer::default(),
+            phase: Phase::Idle,
+            events_rx: None,
+            external_import: None,
+            ask_rx,
+            approver: Arc::new(ChannelApprover { tx: ask_tx }),
+            editor: Editor::new(),
+            reference_index: Vec::new(),
+            reference_tx,
+            reference_rx,
+            suggestion: None,
+            suggest_cancel: None,
+            suggest_gen: 0,
+            suggest_tx,
+            suggest_rx,
+            attachments: Vec::new(),
+            next_attachment_id: 1,
+            clipboard: arboard::Clipboard::new().ok(),
+            input_hitbox: None,
+            status_hitboxes: None,
+            live_panel_hitbox: None,
+            live_panel_hover: None,
+            last_task_card_click: None,
+            status_hover: None,
+            input_mouse_active: false,
+            input_dragged: false,
+            drag_scroll: None,
+            overlay,
+            change_prebake: None,
+            rewind_nav: None,
+            menu,
+            agents,
+            dogfood: session_dogfood,
+            pending_tool: None,
+            pending_batch: VecDeque::new(),
+            progress: Vec::new(),
+            task_runs,
+            task_trace_root,
+            active_view: ViewId::Main,
+            trace_view: None,
+            last_esc: None,
+            popup_index: 0,
+            dismissed_reference: None,
+            live_text: String::new(),
+            space_before_response: false,
+            live_block: None,
+            thinking_chars: 0,
+            thinking_text: String::new(),
+            thinking_since: None,
+            show_reasoning,
+            meter: TurnMeter::new(context_tokens, context_estimated),
+            state_label: String::new(),
+            retry_wait: None,
+            mode_label,
+            spinner: 0,
+            anim_frame: 0,
+            should_exit: false,
+            provider_setup_requested: false,
+            notice: None,
+        })
+    }
+
+    pub async fn run(&mut self) -> anyhow::Result<()> {
+        let banner = self.banner();
+        self.bake(banner);
+        self.bake_transcript();
+        self.refresh_reference_index();
+        let mut term_events = EventStream::new();
+        let mut tick = tokio::time::interval(Duration::from_millis(250));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drives selection auto-scroll while the pointer is held at a view edge.
+        // Its select arm is gated on `drag_scroll`, so it only wakes the loop
+        // while a drag is actually parked at an edge — never when idle.
+        let mut drag_tick = tokio::time::interval(Duration::from_millis(50));
+        drag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Drives the shimmer on the main running status and in-flight call
+        // headers. Its select arm is gated on `shimmer_active`, so the finer
+        // cadence only runs while a turn is actively executing.
+        let mut anim_tick = tokio::time::interval(Duration::from_millis(100));
+        anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        while !self.should_exit {
+            self.redraw()?;
+            // Re-fetch when idle so a rebound registry (resume/import) can't
+            // leave a stale handle; while a turn owns the session, the cached
+            // clone stays valid because ToolCtx is never rebound mid-turn.
+            if let Some(session) = self.session.as_ref() {
+                self.monitor_signal = session
+                    .tool_ctx
+                    .background
+                    .lock()
+                    .expect("background lock")
+                    .monitor_signal();
+            }
+            let monitor_signal = self.monitor_signal.clone();
+            let monitor_armed =
+                self.monitor_deadline.is_some() && matches!(self.phase, Phase::Idle);
+            let monitor_deadline = self
+                .monitor_deadline
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            tokio::select! {
+                ev = term_events.next() => {
+                    match ev {
+                        Some(Ok(ev)) => self.on_term_event(ev),
+                        _ => break,
+                    }
+                }
+                Some(ev) = recv_opt(&mut self.events_rx) => {
+                    self.on_agent_event(ev);
+                    // Drain whatever is already queued to batch redraws.
+                    self.drain_agent_events();
+                }
+                Some((generation, suggestion)) = self.suggest_rx.recv() => {
+                    // Keep it even if the user is mid-word: the ghost simply
+                    // stays hidden until the input is empty again. Only a guess
+                    // about a conversation that has moved on is discarded.
+                    if generation == self.suggest_gen {
+                        self.suggestion = suggestion;
+                    }
+                }
+                Some((cwd, index)) = self.reference_rx.recv() => {
+                    if cwd == self.cwd {
+                        self.reference_index = index;
+                        self.popup_index = 0;
+                    }
+                }
+                Some(ask) = self.ask_rx.recv() => {
+                    self.meter.pause_for_user();
+                    let dialog = if ask.tool == "ask_user" {
+                        Dialog::questions(ask.summary, &ask.input)
+                    } else if ask.tool == "exit_plan" {
+                        // The plan is the review surface, but it lives inside the
+                        // pane now (block-navigable, commentable) rather than in
+                        // the transcript. Split it into blocks and pre-render each
+                        // so the hot key path never re-parses markdown. On
+                        // approval the tool runs and its ToolStart bakes the plan
+                        // into the transcript; on decline `bake_approval_record`
+                        // bakes it — either way the transcript record matches
+                        // replay's ExitPlanRenderer output.
+                        self.bake_live_text();
+                        self.finish_thinking();
+                        let source = ask.input["plan"].as_str().unwrap_or("").trim();
+                        let blocks = markdown::split_blocks(source)
+                            .into_iter()
+                            .map(|block| {
+                                let document = self.md.parse(&block);
+                                (block, document)
+                            })
+                            .collect();
+                        Dialog::plan(ask.summary, ask.input.clone(), blocks)
+                    } else {
+                        // A change proposal (edit/write) is baked into the
+                        // transcript now — in full, scrollable as part of the
+                        // record — so the reviewer reads the whole diff there
+                        // rather than in the cramped dialog. On decline it is
+                        // retracted; on approval the upcoming ToolStart skips
+                        // re-baking it (see `change_prebake`).
+                        let call_summary = self.display_summary(
+                            &tcode_core::agent::summarize_call(&ask.tool, &ask.input),
+                        );
+                        let change = self.renderers.get(&ask.tool).body(&ask.input);
+                        if !change.is_empty() {
+                            self.bake_live_text();
+                            self.finish_thinking();
+                            self.change_prebake = Some(self.transcript.block_count());
+                            let mut spans: Vec<Span> = self.colored_tool_summary(&call_summary);
+                            spans.insert(0, Span::styled("● ", theme::accent()));
+                            let mut lines = vec![Line::default(), Line::from(spans)];
+                            lines.extend(change);
+                            lines.push(Line::default());
+                            self.bake(lines);
+                        }
+                        // Diff lives in the transcript; the dialog carries only
+                        // the choices.
+                        Dialog::new(
+                            ask.summary,
+                            ask.descriptor,
+                            call_summary,
+                            ask.is_edit,
+                            ask.allows_project,
+                        )
+                    };
+                    self.transcript.clear_hover();
+                    self.overlay = Some(Overlay::approval(dialog, ask.reply));
+                }
+                done = join_phase(&mut self.phase) => {
+                    self.on_turn_done(done);
+                }
+                _ = monitor_signal.notified() => {
+                    self.refresh_monitor_deadline();
+                }
+                _ = tokio::time::sleep_until(monitor_deadline), if monitor_armed => {
+                    self.on_monitor_deadline();
+                }
+                done = join_external_import(&mut self.external_import) => {
+                    self.on_external_import_done(done);
+                }
+                _ = tick.tick() => {
+                    if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
+                        self.spinner = (self.spinner + 1) % SPINNER.len();
+                    }
+                }
+                _ = drag_tick.tick(), if self.drag_scroll.is_some() => {
+                    self.drag_autoscroll_step();
+                }
+                _ = anim_tick.tick(), if self.shimmer_active() => {
+                    self.anim_frame = self.anim_frame.wrapping_add(1);
+                    // Every ~1.5s, parallel batches show their next call.
+                    if self.anim_frame.is_multiple_of(15) {
+                        self.rotate_task_calls();
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn provider_setup_requested(&self) -> bool {
+        self.provider_setup_requested
+    }
+
+    /// Recover the active session when the app intentionally exits to launch
+    /// the provider wizard.
+    pub fn take_session(&mut self) -> Option<Session> {
+        self.session.take()
+    }
+
+    // ------------------------------------------------------------ turn
+
+    // ------------------------------------------------------------ keys
+
+    fn overlay_ctx(&self) -> OverlayCtx<'_> {
+        OverlayCtx {
+            menu: &self.menu,
+            agents: &self.agents,
+            width: area_width(&self.terminal),
+            height: area_height(&self.terminal),
+        }
+    }
+
+    /// Hands one event to the active overlay and applies what it asks for.
+    /// The overlay is moved out for the duration so it can be mutated while
+    /// `OverlayCtx` still borrows the rest of `App`.
+    fn drive_overlay(&mut self, event: impl FnOnce(&mut Overlay, &OverlayCtx) -> Flow) {
+        let Some(mut overlay) = self.overlay.take() else {
+            return;
+        };
+        let flow = {
+            let ctx = self.overlay_ctx();
+            event(&mut overlay, &ctx)
+        };
+        self.overlay = Some(overlay);
+        self.on_overlay_flow(flow);
+    }
+
+    fn on_overlay_flow(&mut self, flow: Flow) {
+        match flow {
+            Flow::Stay => {}
+            Flow::Close => self.overlay = None,
+            Flow::ActInPlace(action) => self.apply_overlay_action(action),
+            // The approval reply channel lives in the overlay itself, so
+            // finishing an approval consumes the overlay rather than routing
+            // through `apply_overlay_action`.
+            Flow::Act(OverlayAction::Approved(approval)) => {
+                if let Some(Overlay::Approval(dialog, reply)) = self.overlay.take() {
+                    self.finish_approval(*dialog, reply, approval);
+                }
+            }
+            Flow::Act(action) => {
+                self.overlay = None;
+                self.apply_overlay_action(action);
+            }
+        }
+    }
+
+    fn apply_overlay_action(&mut self, action: OverlayAction) {
+        match action {
+            OverlayAction::OpenView(id) => self.open_view(id),
+            OverlayAction::ResumeSession(id) => self.resume_session(&id),
+            OverlayAction::ShowImportSources => {
+                self.overlay = Some(Overlay::Resume(resume::Picker::sources()))
+            }
+            OverlayAction::OpenExternalSource(source) => self.open_external_resume_picker(source),
+            OverlayAction::ImportExternal(external) => self.import_external_session(external),
+            OverlayAction::ApplyModel { index, effort } => self.apply_model(index, effort),
+            OverlayAction::SetMode(mode) => self.set_mode(mode),
+            OverlayAction::FolderTrust(choice) => self.apply_folder_trust_choice(choice),
+            OverlayAction::ApplyAgentModel { kind, choice } => {
+                self.apply_agent_model(&kind, choice)
+            }
+            // Suspends the terminal, so it cannot run inside the dialog's key
+            // handler; the dialog is still open and takes the revision.
+            OverlayAction::EditPlan => self.edit_plan_externally(),
+            OverlayAction::Approved(_) => unreachable!("handled by on_overlay_flow"),
+        }
+    }
+
+    fn finish_approval(
+        &mut self,
+        dialog: Dialog,
+        reply: oneshot::Sender<Approval>,
+        approval: Approval,
+    ) {
+        // A plan approval chose the mode execution runs under. The agent loop
+        // applies it to the Session; mirror it into the frontend's own view so
+        // the status line updates at once.
+        if let Some(mode) = approval.set_mode {
+            self.committed_mode = mode;
+            self.mode_label = mode.label().to_string();
+            self.pending_mode.clear();
+        }
+        self.bake_approval_record(&dialog, &approval);
+        let _ = reply.send(approval);
+        self.meter.resume_from_user();
+    }
+
+    fn on_dialog_mouse(&mut self, mouse: MouseEvent) {
+        // A proposed edit/write is deliberately baked into the transcript in
+        // full before its compact approval dialog opens. The dialog must not
+        // trap the wheel, or a long diff becomes visible only through the few
+        // transcript rows left above the panel with no way to inspect it.
+        let plan_owns_wheel = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::as_dialog)
+            .is_some_and(Dialog::owns_wheel);
+        if !plan_owns_wheel {
+            match mouse.kind {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    self.transcript.wheel(
+                        mouse.column,
+                        mouse.row,
+                        mouse.kind == MouseEventKind::ScrollUp,
+                        WHEEL_STEP,
+                    );
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let width = area_width(&self.terminal);
+        let height = area_height(&self.terminal);
+        let budget = height.saturating_sub(6);
+        let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) else {
+            return;
+        };
+        // Match `redraw`'s panel geometry so a screen coordinate is translated
+        // to the panel's border-free content row, not the transcript behind
+        // the modal.
+        let lines = dialog.render(width, budget);
+        let panel_h = (lines.len() as u16 + 2)
+            .min(height.saturating_sub(4))
+            .max(1);
+        let panel_top = height.saturating_sub(panel_h);
+        if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
+            return;
+        }
+        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        let col = mouse.column.saturating_sub(1) as usize;
+        if !dialog.is_plan() {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                dialog.note_mouse_down(row, col, width);
+            }
+            return;
+        }
+        match mouse.kind {
+            // The plan pane owns its own viewport, including while its feedback
+            // editor has focus. Do not let the modal trap the reviewer at the
+            // current block while they are composing the keep-planning reason.
+            MouseEventKind::ScrollUp => dialog.plan_mouse_wheel(true, width, budget),
+            MouseEventKind::ScrollDown => dialog.plan_mouse_wheel(false, width, budget),
+            MouseEventKind::Down(MouseButton::Left) => {
+                dialog.plan_mouse_down(row, col, width, budget)
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                dialog.plan_mouse_drag(row, col, width, budget)
+            }
+            MouseEventKind::Up(MouseButton::Left) => dialog.plan_mouse_up(row, col, width, budget),
+            _ => {}
+        }
+    }
+
+    /// Mouse input while an overlay is open. Returns whether the overlay
+    /// consumed it; only the keyboard-driven resume picker declines, so the
+    /// wheel still reaches the transcript behind it.
+    fn on_overlay_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let Some(overlay) = self.overlay.as_ref() else {
+            return false;
+        };
+        if !overlay.owns_mouse() {
+            return false;
+        }
+        // The approval dialog has its own richer mouse behaviour (plan panes,
+        // note carets, drag selection), driven by geometry it owns.
+        if overlay.as_dialog().is_some() {
+            self.on_dialog_mouse(mouse);
+            return true;
+        }
+        let height = area_height(&self.terminal);
+        let lines = overlay.render(&self.overlay_ctx());
+        let panel_h = (lines.len() as u16 + 2)
+            .min(height.saturating_sub(4))
+            .max(1);
+        let panel_top = height.saturating_sub(panel_h);
+        let inside = mouse.row > panel_top && mouse.row < panel_top + panel_h.saturating_sub(1);
+        if !inside {
+            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                let flow = overlay.on_click_away();
+                self.on_overlay_flow(flow);
+            } else if matches!(mouse.kind, MouseEventKind::Moved) {
+                self.drive_overlay(|overlay, ctx| {
+                    overlay.set_hovered_row(None, ctx);
+                    Flow::Stay
+                });
+            }
+            return true;
+        }
+        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        if matches!(mouse.kind, MouseEventKind::Moved) {
+            self.drive_overlay(|overlay, ctx| {
+                overlay.set_hovered_row(Some(row), ctx);
+                Flow::Stay
+            });
+            return true;
+        }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.drive_overlay(|overlay, ctx| overlay.handle_mouse_row(row, ctx));
+        }
+        true
+    }
+
+    fn on_status_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let hover = self
+            .status_hitboxes
+            .and_then(|hitboxes| status_hover_at(hitboxes, mouse.column, mouse.row));
+        if hover == self.status_hover {
+            return hover.is_some();
+        }
+        self.status_hover = hover;
+        if hover.is_some() {
+            // A status value is an interactive control, not transcript content:
+            // clear a prior tool-row highlight before painting its replacement.
+            self.active_transcript_mut().clear_hover();
+        }
+        hover.is_some()
+    }
+
+    fn on_status_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let Some(hitboxes) = self.status_hitboxes else {
+            return false;
+        };
+        if rect_contains(hitboxes.mode, mouse.column, mouse.row) {
+            self.status_hover = None;
+            self.open_mode_picker();
+            return true;
+        }
+        if rect_contains(hitboxes.model, mouse.column, mouse.row) {
+            self.status_hover = None;
+            self.open_model_picker();
+            return true;
+        }
+        false
+    }
+
+    fn on_live_panel_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let target = self.panel_target_at(mouse.column, mouse.row);
+        let inside = self.live_panel_hitbox.as_ref().is_some_and(|hitbox| {
+            mouse.column >= hitbox.rect.x
+                && mouse.column < hitbox.rect.right()
+                && mouse.row >= hitbox.rect.y
+                && mouse.row < hitbox.rect.bottom()
+        });
+        if target != self.live_panel_hover {
+            self.live_panel_hover = target;
+        }
+        if inside {
+            self.status_hover = None;
+            self.active_transcript_mut().clear_hover();
+        }
+        inside
+    }
+
+    fn on_live_panel_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return false;
+        }
+        let Some(target) = self.panel_target_at(mouse.column, mouse.row) else {
+            return false;
+        };
+        match target {
+            PanelTarget::Main => self.open_view(ViewId::Main),
+            // The bottom tree is navigation only. Detail belongs to the parent
+            // conversation's task card, which has the normal fold/double-click
+            // interaction.
+            PanelTarget::Task(run) => self.open_view(ViewId::TaskRun(run)),
+        }
+        true
+    }
+
+    fn on_term_event(&mut self, ev: Event) {
+        match ev {
+            Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
+                self.on_key(key)
+            }
+            Event::Paste(text) => {
+                // An overlay owns interaction while it is on screen. In
+                // particular, multiline terminal pastes must not leak into
+                // the hidden main editor and then make the restored panel jump.
+                if let Some(overlay) = self.overlay.as_mut() {
+                    overlay.paste_text(text);
+                } else if self.rewind_nav.is_none() {
+                    self.on_paste_text(text);
+                }
+            }
+            Event::Mouse(mouse) => {
+                // A modal owns mouse input too. Without this guard a plan drag
+                // selects and copies the hidden transcript instead of
+                // producing a plan comment.
+                if self.on_overlay_mouse(mouse) {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved)
+                    && self.on_live_panel_mouse_moved(mouse)
+                {
+                    return;
+                }
+                if self.on_live_panel_mouse_down(mouse) {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved) && self.on_status_mouse_moved(mouse)
+                {
+                    return;
+                }
+                if self.on_status_mouse_down(mouse) {
+                    return;
+                }
+                match mouse.kind {
+                    MouseEventKind::Moved => self
+                        .active_transcript_mut()
+                        .mouse_moved(mouse.column, mouse.row),
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = mouse.kind == MouseEventKind::ScrollUp;
+                        // Over the input box the wheel scrolls the prompt itself:
+                        // a long multi-line paste only shows six rows at a time, so
+                        // the wheel walks the visual cursor through it without
+                        // clicking or reaching for the arrow keys. The viewport is
+                        // cursor-derived, so moving the cursor scrolls the window.
+                        // Everywhere else — including while an approval dialog is
+                        // open (input hitbox is None then) — the wheel scrolls the
+                        // transcript so the reviewer can scroll the pre-baked diff.
+                        // Over the input the wheel nudges the prompt one line per
+                        // notch (not a page); a short prompt or one already at its
+                        // edge can't consume it, so the transcript scrolls instead.
+                        let moved_input = self.wheel_over_input(mouse.row)
+                            && if up {
+                                self.editor_visual_up()
+                            } else {
+                                self.editor_visual_down()
+                            };
+                        if !moved_input {
+                            self.active_transcript_mut().wheel(
+                                mouse.column,
+                                mouse.row,
+                                up,
+                                WHEEL_STEP,
+                            );
+                        }
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        self.drag_scroll = None;
+                        let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
+                        if !taken_by_input {
+                            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                                if let Some(url) =
+                                    self.active_transcript().link_at(mouse.column, mouse.row)
+                                {
+                                    self.open_link(&url);
+                                    return;
+                                }
+                            }
+                            self.active_transcript_mut()
+                                .mouse_down(mouse.column, mouse.row);
+                        }
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        if self.input_mouse_active {
+                            self.input_mouse_drag(mouse.column, mouse.row);
+                        } else {
+                            let drag_edge = {
+                                let transcript = self.active_transcript_mut();
+                                transcript.mouse_drag(mouse.column, mouse.row);
+                                transcript.drag_edge(mouse.row)
+                            };
+                            // Arm edge auto-scroll when the drag reaches a view
+                            // edge; disarm the moment it returns inside.
+                            self.drag_scroll = drag_edge.map(|up| (up, mouse.column, mouse.row));
+                        }
+                    }
+                    // Any button release ends the drag (defensive: some terminals
+                    // report the release with a non-Left button code).
+                    MouseEventKind::Up(_) => self.finish_drag(mouse.column, mouse.row),
+                    _ => {}
+                }
+            }
+            // ratatui's autoresize adapts on the next draw; the transcript
+            // rewraps lazily from the new area width.
+            Event::Resize(..) => {
+                self.status_hover = None;
+                self.live_panel_hover = None;
+                self.active_transcript_mut().clear_hover();
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) {
+        // An overlay — any picker, or the approval dialog — owns the keyboard
+        // while it is on screen.
+        if self.overlay.is_some() {
+            self.drive_overlay(|overlay, ctx| overlay.handle_key(key, ctx));
+            return;
+        }
+
+        if !matches!(self.active_view, ViewId::Main) {
+            match key.code {
+                KeyCode::Esc => self.open_view(ViewId::Main),
+                KeyCode::PageUp => self.active_transcript_mut().page_up(),
+                KeyCode::PageDown => self.active_transcript_mut().page_down(),
+                KeyCode::Up => self.active_transcript_mut().scroll_up(1),
+                KeyCode::Down => self.active_transcript_mut().scroll_down(1),
+                _ => {}
+            }
+            return;
+        }
+
+        // Rewind navigation captures everything while active: the
+        // transcript itself shows the target, keys move between inputs.
+        if self.rewind_nav.is_some() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Esc keeps the double-Esc rhythm: each press jumps to
+                // the next-older input.
+                KeyCode::Esc | KeyCode::Up => {
+                    let nav = self.rewind_nav.as_mut().expect("nav present");
+                    nav.pos = nav.pos.saturating_sub(1);
+                    self.apply_rewind_nav();
+                }
+                KeyCode::Down => {
+                    let nav = self.rewind_nav.as_mut().expect("nav present");
+                    if nav.pos + 1 < nav.candidates.len() {
+                        nav.pos += 1;
+                        self.apply_rewind_nav();
+                    } else {
+                        // Past the newest input: leave navigation.
+                        self.exit_rewind_nav();
+                    }
+                }
+                KeyCode::Enter => self.confirm_rewind_nav(false),
+                KeyCode::Char('r') if ctrl => self.confirm_rewind_nav(true),
+                KeyCode::Char('c') if ctrl => self.exit_rewind_nav(),
+                _ => {}
+            }
+            return;
+        }
+
+        let running = matches!(self.phase, Phase::Running { .. });
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl && key_char_eq(&key, 'a') {
+            self.editor.select_all();
+            return;
+        }
+        if (alt || (ctrl && shift)) && key_char_eq(&key, 'c') {
+            self.copy_editor_selection_or_prompt();
+            return;
+        }
+        if (alt || (ctrl && shift)) && key_char_eq(&key, 'x') {
+            self.cut_editor_selection_or_prompt();
+            return;
+        }
+        // Paste before the general Char handler: with Shift held the code is
+        // 'V', so a bare `Char('v')` arm would miss Ctrl+Shift+V and instead
+        // type a literal "V". key_char_eq is case-insensitive.
+        if (ctrl || alt) && key_char_eq(&key, 'v') {
+            self.paste_from_clipboard();
+            return;
+        }
+        match key.code {
+            KeyCode::Char('c') if ctrl => {
+                // Ctrl+C interrupts, it never quits: a reflexive ctrl+c to stop
+                // a runaway turn must not also throw the session away. `/exit`
+                // (or ctrl+d) is the way out, and the footer says so.
+                // Copy lives on Ctrl+Shift+C / Alt+C and mouse-release, so this
+                // key never has to disambiguate copy vs interrupt.
+                if running {
+                    // Anything queued was queued to be said *now* — cancelling
+                    // hands it to the turn that starts on the way out.
+                    self.cancel_turn();
+                } else if !self.editor.is_empty() || !self.attachments.is_empty() {
+                    self.clear_draft();
+                } else {
+                    self.bake(vec![Line::styled(
+                        "ctrl+c interrupts; /exit or ctrl+d quits",
+                        theme::dim(),
+                    )]);
+                }
+            }
+            KeyCode::Char('d') if ctrl && self.editor.is_empty() => self.should_exit = true,
+            // Esc peels off the newest thing first: a queued prompt, then the
+            // turn, then the draft. So esc takes a message back without killing
+            // the work in flight, and esc-esc does both — while ctrl+c always
+            // means "stop now, and say what I queued".
+            KeyCode::Esc if running && !self.pending.is_empty() => self.discard_queued(),
+            KeyCode::Esc => {
+                if running {
+                    self.cancel_turn();
+                } else if self
+                    .last_esc
+                    .take()
+                    .is_some_and(|t| t.elapsed() < DOUBLE_ESC)
+                {
+                    self.open_rewind();
+                } else {
+                    self.clear_draft();
+                    self.last_esc = Some(Instant::now());
+                }
+            }
+            KeyCode::Char('j') if ctrl => self.editor.newline(),
+            KeyCode::Enter if alt || shift || ctrl => self.editor.newline(),
+            KeyCode::Enter if self.accept_reference_completion() => {}
+            KeyCode::Enter => self.submit(running),
+            KeyCode::BackTab => self.cycle_mode(),
+            KeyCode::Tab => {
+                if let Some(completion) = self.popup_selection() {
+                    self.accept_completion(completion);
+                }
+            }
+            KeyCode::Up => {
+                if self.popup_active() {
+                    self.popup_index = self.popup_index.saturating_sub(1);
+                } else if !self.editor_visual_up() && self.editor.line_count() == 1 {
+                    // History recall is a single-line convenience. In a
+                    // multi-line prompt the top edge just stops — pressing up
+                    // there must not wipe the draft and jump to a history entry.
+                    self.editor.history_prev();
+                }
+            }
+            KeyCode::Down => {
+                if self.popup_active() {
+                    self.popup_index =
+                        (self.popup_index + 1).min(self.completion_matches().len() - 1);
+                } else if !self.editor_visual_down() && self.editor.line_count() == 1 {
+                    self.editor.history_next();
+                }
+            }
+            KeyCode::Left => self.editor.left(),
+            // → on an empty input takes the ghost suggestion; everywhere else
+            // it is still just a cursor move. Accepting copies rather than
+            // consumes: the ghost then hides because the input is no longer
+            // empty, exactly as if the user had typed it — so clearing the
+            // input brings it back, and nothing needs to be re-requested.
+            KeyCode::Right if self.editor.is_empty() && self.suggestion.is_some() => {
+                if let Some(suggestion) = self.suggestion.clone() {
+                    self.editor.insert_str(&suggestion);
+                }
+            }
+            KeyCode::Right => self.editor.right(),
+            KeyCode::Home => self.editor.home(),
+            KeyCode::End => self.editor.end(),
+            KeyCode::PageUp => self.transcript.page_up(),
+            KeyCode::PageDown => self.transcript.page_down(),
+            KeyCode::Backspace => {
+                self.dismissed_reference = None;
+                let consumed_attachment = self.backspace_attachment_token();
+                if !consumed_attachment {
+                    self.editor.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                self.dismissed_reference = None;
+                self.editor.delete();
+            }
+            KeyCode::Char(c) => {
+                self.dismissed_reference = None;
+                self.editor.insert_char(c);
+                self.popup_index = 0;
+            }
+            _ => {}
+        }
+        // Typing does *not* destroy the guess — it only hides it (the ghost
+        // draws on an empty input). Type two characters, delete them, and it is
+        // back, with no second request: it stays valid until the thing it was
+        // predicting actually happens (a submit, a clear, a rewind).
+    }
+
+    // ---------------------------------------------------------- rewind
+
+    fn open_link(&mut self, url: &str) {
+        match open_http_url(url) {
+            Ok(()) => self.notice = Some(("opened link in browser".into(), Instant::now())),
+            Err(error) => {
+                self.notice = Some((format!("could not open link: {error}"), Instant::now()))
+            }
+        }
+    }
+
+    // ----------------------------------------------------------- input mouse
+
+    // ----------------------------------------------------------- paste/copy
+
+    // ------------------------------------------------------- rendering
+}
+
+fn open_http_url(raw: &str) -> Result<(), String> {
+    let parsed = url::Url::parse(raw).map_err(|_| "invalid URL")?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("only http(s) links can be opened".into());
+    }
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer.exe").arg(raw).spawn();
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(raw).spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(raw).spawn();
+    #[cfg(not(any(target_os = "windows", target_os = "macos", unix)))]
+    let result: Result<std::process::Child, std::io::Error> = Err(std::io::Error::other(
+        "no browser launcher for this platform",
+    ));
+    result.map(|_| ()).map_err(|error| error.to_string())
+}
+
+/// Build the editor invocation from `$VISUAL`/`$EDITOR` (falling back to `vi`),
+/// splitting the spec so a wrapper like `code --wait` keeps its flags, then
+/// appending the file to open.
+fn editor_command(path: &std::path::Path) -> std::process::Command {
+    let spec = std::env::var("VISUAL")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| {
+            std::env::var("EDITOR")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+        })
+        .unwrap_or_else(|| "vi".to_string());
+    let mut parts = spec.split_whitespace();
+    let program = parts.next().unwrap_or("vi");
+    let mut cmd = std::process::Command::new(program);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    cmd.arg(path);
+    cmd
+}
+
+fn key_char_eq(key: &KeyEvent, target: char) -> bool {
+    matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&target))
+}
+
+async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEvent> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Resolves when the running turn finishes; pends forever when idle.
+async fn join_phase(phase: &mut Phase) -> (Session, Result<(), AgentError>) {
+    match phase {
+        Phase::Running { handle, .. } => match handle.await {
+            Ok(done) => done,
+            Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+        },
+        Phase::Idle => std::future::pending().await,
+    }
+}
+
+/// Resolves when a disk-heavy external import finishes; pends otherwise so it
+/// composes cleanly with the terminal event loop.
+async fn join_external_import(
+    import: &mut Option<
+        JoinHandle<(
+            ExternalSource,
+            Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+        )>,
+    >,
+) -> (
+    ExternalSource,
+    Result<tcode_core::Resumed, tcode_core::store::StoreError>,
+) {
+    match import {
+        Some(handle) => match handle.await {
+            Ok(done) => done,
+            Err(join_err) => std::panic::resume_unwind(join_err.into_panic()),
+        },
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shimmer_text_preserves_content_and_animates_the_amber_status() {
+        let first = shimmer_text("⠋ responding", 0, theme::WARN);
+        let later = shimmer_text("⠋ responding", 5, theme::WARN);
+        let text = first
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "⠋ responding");
+        assert!(
+            first
+                .iter()
+                .zip(later.iter())
+                .any(|(before, after)| before.style.fg != after.style.fg),
+            "the main running label has a moving highlight"
+        );
+    }
+
+    #[test]
+    fn live_task_detail_keeps_summary_activity_and_recent_steps() {
+        let lines = task_live_detail(
+            "Trace session persistence and resume flow",
+            &["Read task_trace.rs".into(), "Grep task runs".into()],
+        );
+        let status = task_plain_status("Search task traces");
+        let text = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(text.contains("Trace session persistence and resume flow"));
+        assert!(!text.contains("Search task traces"));
+        assert_eq!(
+            status
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "      └ Search task traces"
+        );
+        assert_eq!(status[0].spans[0].style, theme::dim());
+        assert!(text.contains("└ Read task_trace.rs"));
+        assert!(text.contains("└ Grep task runs"));
+        assert!(
+            lines
+                .iter()
+                .all(|line| line.style.fg == Some(crate::theme::DIM)),
+            "task summary and recent activity stay uniformly dim"
+        );
+    }
+
+    #[test]
+    fn single_task_header_highlights_the_agent_kind() {
+        let spans = task_header_summary("Explore · inspect the implementation");
+        assert_eq!(spans[0].style.fg, Some(theme::OK));
+        assert_eq!(spans[2].style, ratatui::style::Style::default());
+    }
+
+    #[test]
+    fn status_hitboxes_follow_display_width_and_clip_to_terminal() {
+        let hits = status_hitboxes(Rect::new(0, 7, 24, 1), "→ default", "模型 model");
+        assert!(rect_contains(hits.mode, 7, 7));
+        assert!(!rect_contains(hits.model, 7, 7));
+        assert!(rect_contains(hits.model, hits.model.x, 7));
+        assert!(hits.model.right() <= 24);
+
+        let clipped = status_hitboxes(Rect::new(0, 0, 8, 1), "accept-edits", "model");
+        assert_eq!(clipped.mode.right(), 8);
+        assert_eq!(clipped.model.width, 0);
+    }
+
+    #[test]
+    fn status_hover_targets_only_the_clickable_values() {
+        let hits = status_hitboxes(Rect::new(0, 7, 40, 1), "default", "model");
+        assert_eq!(status_hover_at(hits, 2, 7), None, "the mode label is inert");
+        assert_eq!(
+            status_hover_at(hits, hits.mode.x, 7),
+            Some(StatusHover::Mode)
+        );
+        assert_eq!(
+            status_hover_at(hits, hits.model.x, 7),
+            Some(StatusHover::Model)
+        );
+        assert_eq!(status_hover_at(hits, 39, 7), None);
+    }
+
+    #[test]
+    fn tip_source_reflows_without_losing_text() {
+        let tip = "ctrl+c stops the turn and sends queued prompts right away — it never exits";
+        let expected = format!("  ✻ tip: {tip}");
+
+        let narrow = crate::transcript::wrap_lines(vec![tip_line(tip)], 20);
+        assert!(narrow.len() > 1, "the narrow terminal wraps the tip");
+        assert_eq!(
+            narrow
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            expected
+        );
+
+        let wide = crate::transcript::wrap_lines(vec![tip_line(tip)], 120);
+        assert_eq!(wide.len(), 1, "a wider terminal restores one row");
+        assert_eq!(
+            wide[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            expected
+        );
+    }
+
+    #[test]
+    fn attachment_placeholder_is_stable_per_id() {
+        let img = Attachment::Image {
+            id: 2,
+            bytes: Vec::new(),
+            media_type: "image/png",
+            label: "Image #2".into(),
+        };
+        let txt = Attachment::Text {
+            id: 7,
+            content: String::new(),
+            label: "Pasted text #7".into(),
+        };
+        assert_eq!(img.placeholder(), "[Image #2]");
+        assert_eq!(txt.placeholder(), "[Pasted text #7]");
+    }
+
+    #[test]
+    fn inline_token_backspaces_as_a_unit() {
+        // Mirrors `backspace_attachment_token`: a backspace right after a
+        // token deletes the whole token, leaving unrelated text (and unicode
+        // before it) intact.
+        let mut e = Editor::new();
+        e.insert_str("你好 ");
+        let token = "[Image #1]";
+        e.insert_str(token);
+        let pos = e.position();
+        let before: String = e.lines()[pos.row].chars().take(pos.col).collect();
+        assert!(before.ends_with(token));
+        for _ in 0..token.chars().count() {
+            e.backspace();
+        }
+        assert_eq!(e.text(), "你好 ");
+    }
+
+    #[test]
+    fn accepted_reference_completion_inserts_a_separator() {
+        let mut editor = Editor::new();
+        editor.insert_str("review @app");
+        App::apply_reference_completion(
+            &mut editor,
+            Position { row: 0, col: 7 },
+            Position { row: 0, col: 11 },
+            "@src/app.rs",
+        );
+        assert_eq!(editor.text(), "review @src/app.rs ");
+    }
+
+    #[test]
+    fn sent_prompt_echo_accents_reference_paths() {
+        let echo = prompt_echo("review @src/app.rs", &[]);
+        let accented: Vec<_> = echo[1]
+            .spans
+            .iter()
+            .filter(|span| span.style.fg == Some(theme::ACCENT))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(accented, ["@src/app.rs"]);
+    }
+}
