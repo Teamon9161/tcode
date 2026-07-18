@@ -371,8 +371,8 @@ impl Session {
 
     /// Guidance injected when the model next receives a user interaction. Raw
     /// text; the ledger wraps it as a note.
-    const PLAN_ENTER_NOTE: &'static str = include_str!("../../../../prompts/plan-mode-enter.md");
-    const PLAN_EXIT_NOTE: &'static str = include_str!("../../../../prompts/plan-mode-exit.md");
+    const PLAN_ENTER_NOTE: &'static str = include_str!("../../prompts/agent/plan-mode-enter.md");
+    const PLAN_EXIT_NOTE: &'static str = include_str!("../../prompts/agent/plan-mode-exit.md");
 
     /// Commit a staged permission-mode switch, if one is pending. Returns the
     /// new mode only when it differs from the current one, so a net-zero cycle

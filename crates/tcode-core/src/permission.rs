@@ -158,10 +158,9 @@ pub fn pattern_match(pattern: &str, text: &str) -> bool {
 pub struct Approval {
     pub decision: ApprovalDecision,
     pub comment: Option<String>,
-    /// A permission-mode transition the approval carries. Set only by the plan
-    /// review dialog (approving a plan chooses the mode execution runs under);
-    /// the agent loop applies it generically. `None` for every ordinary
-    /// approval, which never changes the mode.
+    /// A permission-mode transition the approval carries. Plan review and an
+    /// "allow all edits" approval choose the mode execution runs under; the
+    /// agent loop applies it generically. `None` leaves the mode unchanged.
     pub set_mode: Option<PermissionMode>,
     /// Replacement input to execute after an approval. This preserves the
     /// assistant's append-only tool-use entry while allowing a review surface
@@ -204,6 +203,7 @@ pub trait Approver: Send + Sync {
         tool: &str,
         summary: &str,
         descriptor: &str,
+        is_edit: bool,
         allows_project: bool,
         input: &Value,
     ) -> Approval;

@@ -1,6 +1,6 @@
-mod agent_defs;
+mod agent;
 mod frontmatter;
-mod fs_tools;
+mod fs;
 mod grounding;
 mod interaction;
 mod mcp;
@@ -9,16 +9,14 @@ mod plan;
 mod search;
 mod shell;
 mod skills;
-mod task;
 mod view_image;
 mod web;
 
-#[cfg(test)]
-mod view_image_tests;
-
-pub use agent_defs::{
-    keeps_tool, AgentDef, AgentModelHint, AgentRegistry, AgentSource, MAX_TASK_DEPTH,
+pub use agent::defs::{
+    keeps_tool, AgentDef, AgentModelHint, AgentRegistry, AgentSource, ToolPolicy, ToolSelector,
+    MAX_TASK_DEPTH,
 };
+pub use agent::AgentTool;
 pub use grounding::{
     environment_snapshot, project_map, project_map_with_scratch, startup_context_with_scratch,
 };
@@ -29,7 +27,6 @@ pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,
 };
-pub use task::{TaskTool, TASK_AGENT_KINDS};
 pub use view_image::ViewImageTool;
 pub use web::{trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool};
 
@@ -95,10 +92,10 @@ pub fn builtin_tools_with_skills_and_web_fetch(
     web_fetch: WebFetchTool,
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(fs_tools::ReadTool),
-        Arc::new(fs_tools::WriteTool),
-        Arc::new(fs_tools::AppendTool),
-        Arc::new(fs_tools::EditTool),
+        Arc::new(fs::ReadTool),
+        Arc::new(fs::WriteTool),
+        Arc::new(fs::AppendTool),
+        Arc::new(fs::EditTool),
         Arc::new(search::GrepTool),
         Arc::new(search::GlobTool),
         Arc::new(web_fetch),

@@ -10,7 +10,7 @@ use tcode_core::{
     PermissionRequest, Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
 };
 
-const SYSTEM: &str = include_str!("../../../prompts/view-image-system.md");
+const SYSTEM: &str = include_str!("../../prompts/view-image-system.md");
 static RUN: AtomicU64 = AtomicU64::new(0);
 
 /// Delegate image understanding to the configured vision model without putting
@@ -177,3 +177,6 @@ impl Tool for ViewImageTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

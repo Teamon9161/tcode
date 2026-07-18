@@ -23,6 +23,9 @@ pub struct Dialog {
     pub descriptor: String,
     /// Only ordinary tool authorization requests can add a project rule.
     project_option: bool,
+    /// File mutation approvals offer a session-wide accept-edits transition
+    /// instead of descriptor-specific allow rules.
+    is_edit: bool,
     /// ToolStart-format call summary. A declined call never emits
     /// ToolStart, so the dialog supplies the line to bake instead.
     pub call_summary: String,
@@ -267,13 +270,25 @@ impl Choice {
     }
 }
 
-const OPTIONS: [(&str, ApprovalDecision); 2] = [
-    ("Yes", ApprovalDecision::Yes),
-    ("Yes, for this session", ApprovalDecision::YesSession),
+const OPTIONS: [(&str, ApprovalDecision, Option<PermissionMode>); 2] = [
+    ("Yes", ApprovalDecision::Yes, None),
+    ("Yes, for this session", ApprovalDecision::YesSession, None),
 ];
-const PROJECT_OPTION: (&str, ApprovalDecision) =
-    ("Yes, allow in this project", ApprovalDecision::YesProject);
-const DENY_OPTION: (&str, ApprovalDecision) = ("No", ApprovalDecision::No);
+const EDIT_OPTIONS: [(&str, ApprovalDecision, Option<PermissionMode>); 2] = [
+    ("Yes", ApprovalDecision::Yes, None),
+    (
+        "Yes, allow all edits",
+        ApprovalDecision::Yes,
+        Some(PermissionMode::AcceptEdits),
+    ),
+];
+const PROJECT_OPTION: (&str, ApprovalDecision, Option<PermissionMode>) = (
+    "Yes, allow in this project",
+    ApprovalDecision::YesProject,
+    None,
+);
+const DENY_OPTION: (&str, ApprovalDecision, Option<PermissionMode>) =
+    ("No", ApprovalDecision::No, None);
 
 /// "  note: " prefix width; continuation rows are indented to match.
 const NOTE_INDENT: usize = 8;
@@ -402,11 +417,13 @@ impl Dialog {
         summary: String,
         descriptor: String,
         call_summary: String,
+        is_edit: bool,
         project_option: bool,
     ) -> Self {
         Self {
             summary,
             descriptor,
+            is_edit,
             project_option,
             call_summary,
             selected: 0,
@@ -436,6 +453,7 @@ impl Dialog {
         Self {
             summary: title,
             descriptor: "exit_plan".into(),
+            is_edit: false,
             project_option: false,
             call_summary: String::new(),
             selected: 0,
@@ -521,6 +539,7 @@ impl Dialog {
         Self {
             summary,
             descriptor: "ask_user".into(),
+            is_edit: false,
             project_option: false,
             call_summary: String::new(),
             selected: 0,
@@ -585,7 +604,13 @@ impl Dialog {
         }
     }
 
-    fn approval_options(&self) -> Vec<(&'static str, ApprovalDecision)> {
+    fn approval_options(&self) -> Vec<(&'static str, ApprovalDecision, Option<PermissionMode>)> {
+        if self.is_edit {
+            return EDIT_OPTIONS
+                .into_iter()
+                .chain(std::iter::once(DENY_OPTION))
+                .collect();
+        }
         let mut options = OPTIONS.to_vec();
         if self.project_option {
             options.push(PROJECT_OPTION);
@@ -608,11 +633,13 @@ impl Dialog {
             K::Tab => self.note_focused = !self.note_focused,
             K::Enter => {
                 let note = self.note_text();
-                let decision = options[self.selected].1;
-                return DialogResult::Done(Approval::simple(
+                let (_, decision, set_mode) = options[self.selected];
+                return DialogResult::Done(Approval {
                     decision,
-                    Some(note).filter(|s| !s.is_empty()),
-                ));
+                    comment: Some(note).filter(|s| !s.is_empty()),
+                    set_mode,
+                    approved_input: None,
+                });
             }
             K::Esc => {
                 if self.note_focused {
@@ -887,7 +914,7 @@ impl Dialog {
             out.push(Line::styled("● ", theme::accent()));
         }
         let options = self.approval_options();
-        for (i, (label, decision)) in options.iter().enumerate() {
+        for (i, (label, decision, set_mode)) in options.iter().enumerate() {
             let marker = if i == self.selected { "▸ " } else { "  " };
             let label = match decision {
                 ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
@@ -896,6 +923,7 @@ impl Dialog {
                 _ => (*label).to_string(),
             };
             let color = match decision {
+                ApprovalDecision::Yes if set_mode.is_some() => theme::ACCENT,
                 ApprovalDecision::Yes => theme::OK,
                 ApprovalDecision::YesSession | ApprovalDecision::YesProject => theme::ACCENT,
                 ApprovalDecision::No => theme::ERROR,
@@ -1876,10 +1904,21 @@ mod tests {
 
     fn dialog() -> Dialog {
         Dialog::new(
+            "run cargo test".into(),
+            "run(cargo test)".into(),
+            "run(cargo test)".into(),
+            false,
+            false,
+        )
+    }
+
+    fn edit_dialog() -> Dialog {
+        Dialog::new(
             "edit src/main.rs".into(),
             "edit(src/main.rs)".into(),
             "edit(src/main.rs)".into(),
-            false,
+            true,
+            true,
         )
     }
 
@@ -2227,6 +2266,22 @@ mod tests {
             panic!("second esc should decline");
         };
         assert_eq!(a.decision, ApprovalDecision::No);
+    }
+
+    #[test]
+    fn edit_approval_switches_to_accept_edits_without_a_descriptor_rule() {
+        let mut d = edit_dialog();
+        let screen = screen(&d, 80);
+        assert!(screen.contains("Yes, allow all edits"));
+        assert!(!screen.contains("for this session"));
+        assert!(!screen.contains("allow in this project"));
+
+        d.handle_key(key(KeyCode::Down));
+        let DialogResult::Done(approval) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should confirm the edit-mode transition");
+        };
+        assert_eq!(approval.decision, ApprovalDecision::Yes);
+        assert_eq!(approval.set_mode, Some(PermissionMode::AcceptEdits));
     }
 
     #[test]

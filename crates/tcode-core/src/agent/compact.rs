@@ -9,7 +9,7 @@ use crate::types::ContentBlock;
 
 use super::{Agent, AgentError, AgentEvent, Session};
 
-const COMPACT_PROMPT: &str = include_str!("../../../../prompts/compact.md");
+const COMPACT_PROMPT: &str = include_str!("../../prompts/agent/compact.md");
 
 impl Agent {
     /// Summarize the whole ledger into one entry — the single deliberate

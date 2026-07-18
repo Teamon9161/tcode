@@ -9,6 +9,7 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 dirs = { workspace = true }
 grep-regex = "0.1"
 grep-searcher = "0.1"

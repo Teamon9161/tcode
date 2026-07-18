@@ -137,8 +137,8 @@ impl SafetyClassifier for ProviderSafetyClassifier {
 
 /// The two stages share the policy as their cached prefix and differ only in
 /// this suffix (see `Request::system_suffix`).
-const FAST_STAGE: &str = include_str!("../../../../prompts/auto-classifier-fast.md");
-const REASONED_STAGE: &str = include_str!("../../../../prompts/auto-classifier-reasoned.md");
+const FAST_STAGE: &str = include_str!("../../prompts/auto_mode/fast.md");
+const REASONED_STAGE: &str = include_str!("../../prompts/auto_mode/reasoned.md");
 
 /// The verdict word on its own line, tolerating decoration the model adds
 /// despite the prompt (`**BLOCK**`, `ALLOW.`, `` `ALLOW` ``). Deliberately not

@@ -20,44 +20,7 @@ const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
 
-const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("../prompts/interactive-agent-system.md");
-const AUTO_CLASSIFIER_POLICY: &str = include_str!("../prompts/auto-classifier-policy.md");
-
-/// Fixed classifier policy with optional user-owned global refinements. The
-/// classifier never receives project-local config, because a repository must
-/// not be able to relax the safety gate that protects it.
-fn auto_policy(config: &Config) -> String {
-    let mut policy = format!("{AUTO_CLASSIFIER_POLICY}\n");
-    let append = |policy: &mut String, heading: &str, rules: &[String]| {
-        if rules.is_empty() {
-            return;
-        }
-        policy.push_str(heading);
-        policy.push('\n');
-        for rule in rules {
-            policy.push_str("- ");
-            policy.push_str(rule);
-            policy.push('\n');
-        }
-        policy.push('\n');
-    };
-    append(
-        &mut policy,
-        "Hard deny rules (never override):",
-        &config.auto_mode.hard_deny,
-    );
-    append(
-        &mut policy,
-        "Soft deny rules (specific user intent may override):",
-        &config.auto_mode.soft_deny,
-    );
-    append(
-        &mut policy,
-        "Allowed exceptions to soft denies:",
-        &config.auto_mode.allow,
-    );
-    policy
-}
+const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("prompts/interactive-agent-system.md");
 
 const CONFIG_HEADER: &str = "\
 # tcode global configuration — created by the setup wizard.
@@ -112,14 +75,20 @@ fn build_agent_menu(
     config: &Config,
     menu: &tcode_tui::ModelMenu,
     pinned: AgentModels,
+    agent_defs: &tcode_tools::AgentRegistry,
 ) -> tcode_tui::AgentMenu {
-    let roles: Vec<tcode_tui::AgentRole> = AgentRole::ALL
-        .iter()
-        .map(|role| tcode_tui::AgentRole {
+    let roles: Vec<tcode_tui::AgentRole> = agent_defs
+        .visible_defs(None)
+        .map(|def| tcode_tui::AgentRole {
+            key: def.name.clone(),
+            label: def.name.clone(),
+            allows_off: false,
+        })
+        .chain(AgentRole::ALL.iter().map(|role| tcode_tui::AgentRole {
             key: role.key().to_string(),
             label: role.label().to_string(),
             allows_off: role.allows_off(),
-        })
+        }))
         .collect();
     let watchdog = config.watchdog.clone();
     let profiles = config.profiles.clone();
@@ -153,17 +122,22 @@ fn build_agent_menu(
         })
         .collect();
 
+    let off_by_default: std::collections::BTreeSet<String> = roles
+        .iter()
+        .filter(|role| role.allows_off)
+        .map(|role| role.key.clone())
+        .collect();
     let pin: tcode_tui::PinFn = Box::new(move |kind, choice| {
-        let role = AgentRole::from_key(kind).expect("menu only exposes registered roles");
+        let allows_off = off_by_default.contains(kind);
         match choice {
             tcode_tui::AgentModelChoice::Off => {
                 pinned.unpin(kind);
-                persist_agent_pin(role, None, false);
+                persist_agent_pin(kind, allows_off, None, false);
                 Ok("off".to_string())
             }
             tcode_tui::AgentModelChoice::Inherit => {
                 pinned.pin_inherit(kind);
-                persist_agent_pin(role, None, true);
+                persist_agent_pin(kind, allows_off, None, true);
                 Ok("inherit (main model)".to_string())
             }
             tcode_tui::AgentModelChoice::Model { option, effort } => {
@@ -182,7 +156,7 @@ fn build_agent_menu(
                     .map_err(|e| e.to_string())?;
                 let label = active.describe();
                 pinned.pin(kind, active);
-                persist_agent_pin(role, Some(&selection), true);
+                persist_agent_pin(kind, allows_off, Some(&selection), true);
                 Ok(label)
             }
         }
@@ -192,11 +166,11 @@ fn build_agent_menu(
 
 /// State entries override `[agents.*]`: an explicit `enabled` lets opt-in
 /// roles preserve the distinction between "off" and "inherit main model".
-fn persist_agent_pin(role: AgentRole, selection: Option<&Selection>, enabled: bool) {
-    let enabled = role.allows_off().then_some(enabled);
+fn persist_agent_pin(kind: &str, allows_off: bool, selection: Option<&Selection>, enabled: bool) {
+    let enabled = allows_off.then_some(enabled);
     ModelState::update(|state| {
         state.agents.insert(
-            role.key().to_string(),
+            kind.to_string(),
             match selection {
                 Some(s) => AgentConfig {
                     profile: Some(s.profile.clone()),
@@ -491,15 +465,42 @@ async fn main() -> anyhow::Result<()> {
 
     // Everything /model can switch to, with the swap logic attached.
     let mut menu = build_menu(&config, &selection, model_cell.clone());
-    // Builtin task kinds + user-defined agents (`.tcode/agents/*.md`), one
-    // registry shared by the task tool. Front-matter model hints become
-    // `[agents.<name>]` defaults, so hand-written config and `/agents` picks
-    // win through the ordinary resolution below.
-    let (agent_defs, agent_warnings) = tcode_tools::AgentRegistry::discover(&cwd);
+    // Builtin agent kinds plus user-defined `.tcode/agents/*.md` share one
+    // registry. Validate their capability policies only after MCP connections
+    // have supplied the exact delegated inventory.
+    let (mut agent_defs, agent_warnings) = tcode_tools::AgentRegistry::discover(&cwd);
     for warning in &agent_warnings {
         eprintln!("{DIM}warning: {warning}{RESET}");
     }
-    for def in agent_defs.custom() {
+    let classifier_policy = tcode_core::classifier_policy(&config.auto_mode);
+    let trusted_read_hosts =
+        tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
+    // MCP servers from config; a broken server warns instead of blocking.
+    let mcp_tools = if config.mcp_servers.is_empty() {
+        Vec::new()
+    } else {
+        let (mcp_tools, warnings) =
+            tcode_tools::connect_mcp_servers(&config.mcp_servers, &cwd).await;
+        for warning in warnings {
+            eprintln!("{DIM}warning: {warning}{RESET}");
+        }
+        mcp_tools
+    };
+    let definition_validator = tcode_tools::AgentTool::new(
+        model_cell.clone(),
+        config.watchdog.clone(),
+        config.limits.tool_output_tokens,
+        cwd.clone(),
+    )
+    .with_trusted_read_hosts(trusted_read_hosts.clone())
+    .with_extension_tools(mcp_tools.clone());
+    for warning in definition_validator.validate_definitions(&mut agent_defs, &cwd) {
+        eprintln!("{DIM}warning: {warning}{RESET}");
+    }
+    // Front-matter model hints become `[agents.<name>]` defaults only for
+    // definitions which survived capability validation. Hand-written config
+    // and `/agents` picks still win through ordinary resolution below.
+    for def in agent_defs.visible_defs(None) {
         if let Some(hint) = &def.model {
             config
                 .agents
@@ -534,7 +535,7 @@ async fn main() -> anyhow::Result<()> {
         }
         None => None,
     };
-    // Live sub-agent pins, shared by the `task` tool and `/agents`.
+    // Live sub-agent pins, shared by the `agent` tool and `/agents`.
     let pinned = agent_models(&config, &selection);
     if let Some(def) = &cli_agent {
         // A pinned model for the named agent becomes the session model
@@ -543,15 +544,12 @@ async fn main() -> anyhow::Result<()> {
             model_cell.swap(model);
         }
     }
-    let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone());
+    let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
 
     let system = match &cli_agent {
         Some(def) => def.system.clone(),
         None => INTERACTIVE_AGENT_SYSTEM.to_string(),
     };
-    let classifier_policy = auto_policy(&config);
-    let trusted_read_hosts =
-        tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
     // Discovered once and handed to both the tool and the frontends (TUI
     // completion/`/name` fallback, plain REPL fallback) so they never see a
     // different skill list than the `skill` tool the model calls.
@@ -566,7 +564,11 @@ async fn main() -> anyhow::Result<()> {
         model_cell.clone(),
         pinned.clone(),
     )));
-    let task_tool = tcode_tools::TaskTool::new(
+    tools.push(Arc::new(tcode_tools::UpdateProgressTool));
+    tools.push(Arc::new(tcode_tools::AskUserTool));
+    tools.push(Arc::new(tcode_tools::AddNoteTool));
+    tools.extend(mcp_tools.iter().cloned());
+    let agent_tool = tcode_tools::AgentTool::new(
         model_cell.clone(),
         config.watchdog.clone(),
         config.limits.tool_output_tokens,
@@ -579,36 +581,19 @@ async fn main() -> anyhow::Result<()> {
         config.limits.auto_compact,
         config.limits.auto_compact_percent,
     )
-    .with_trusted_read_hosts(trusted_read_hosts.clone());
-    tools.push(Arc::new(tcode_tools::UpdateProgressTool));
-    tools.push(Arc::new(tcode_tools::AskUserTool));
-    tools.push(Arc::new(tcode_tools::AddNoteTool));
-    // MCP servers from config; a broken server warns instead of blocking.
-    if !config.mcp_servers.is_empty() {
-        let (mcp_tools, warnings) =
-            tcode_tools::connect_mcp_servers(&config.mcp_servers, &cwd).await;
-        for warning in warnings {
-            eprintln!("{DIM}warning: {warning}{RESET}");
-        }
-        tools.extend(mcp_tools);
-    }
-    // Allowlists may only be checked against the fully assembled toolset
-    // (MCP included); definitions with unknown names stay usable elsewhere.
-    let tool_names: Vec<&str> = tools.iter().map(|tool| tool.name()).collect();
-    for warning in agent_defs.validate_tools(&tool_names) {
-        eprintln!("{DIM}warning: {warning}{RESET}");
-    }
+    .with_trusted_read_hosts(trusted_read_hosts.clone())
+    .with_extension_tools(mcp_tools);
     // A named-agent run shapes the toolset last: allowlist filtering over
-    // everything assembled above, then the task tool — which is granted by
+    // everything assembled above, then the agent tool — which is granted by
     // the definition's `agents` field alone, outside the allowlist tiers.
     match &cli_agent {
         Some(def) => {
             tools.retain(|tool| tcode_tools::keeps_tool(def, tool.as_ref()));
             if !def.agents.is_empty() {
-                tools.push(Arc::new(task_tool.scoped_to(def)));
+                tools.push(Arc::new(agent_tool.scoped_to(def)));
             }
         }
-        None => tools.push(Arc::new(task_tool)),
+        None => tools.push(Arc::new(agent_tool)),
     }
     let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
         model_cell.clone(),
@@ -745,7 +730,8 @@ async fn main() -> anyhow::Result<()> {
                         // error.
                         session = *returned_session;
                         menu = build_menu(&config, &selection, model_cell.clone());
-                        agent_menu = build_agent_menu(&config, &menu, pinned.clone());
+                        agent_menu =
+                            build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
                         continue;
                     };
                     let path = updated.write_global(CONFIG_HEADER)?;
@@ -767,7 +753,12 @@ async fn main() -> anyhow::Result<()> {
                     )?;
                     model_cell.swap(active);
                     menu = build_menu(&runtime_config, &runtime_selection, model_cell.clone());
-                    agent_menu = build_agent_menu(&runtime_config, &menu, pinned.clone());
+                    agent_menu = build_agent_menu(
+                        &runtime_config,
+                        &menu,
+                        pinned.clone(),
+                        agent_defs.as_ref(),
+                    );
                     session = *returned_session;
                     println!("{DIM}updated {}; reopening tcode{RESET}", path.display());
                 }

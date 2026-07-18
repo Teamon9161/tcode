@@ -147,6 +147,12 @@ impl PermissionRequest {
     pub fn allows_rule(&self) -> bool {
         matches!(self, PermissionRequest::Ask { .. })
     }
+
+    /// Whether this authorization covers a file mutation that accept-edits
+    /// mode may approve without an additional prompt.
+    pub fn is_edit(&self) -> bool {
+        matches!(self, PermissionRequest::Ask { is_edit: true, .. })
+    }
 }
 
 #[cfg(test)]
@@ -385,6 +391,12 @@ pub trait Tool: Send + Sync {
     /// the gate so a 50KB log never floods the context.
     fn gates_output(&self) -> bool {
         true
+    }
+    /// Whether this invocation's output should pass through the token-budget
+    /// blob gate. Static tools inherit `gates_output`; input-selecting tools
+    /// such as `agent` may make the choice from their registered definition.
+    fn gates_output_for(&self, _input: &Value) -> bool {
+        self.gates_output()
     }
     /// Optionally reduce a successful result before the central output gate.
     /// Tools whose output has a stable, domain-specific success format can

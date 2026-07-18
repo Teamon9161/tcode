@@ -118,6 +118,7 @@ pub struct AskMsg {
     pub tool: String,
     pub summary: String,
     pub descriptor: String,
+    pub is_edit: bool,
     pub allows_project: bool,
     pub input: serde_json::Value,
     pub reply: oneshot::Sender<Approval>,
@@ -135,6 +136,7 @@ impl Approver for ChannelApprover {
         tool: &str,
         summary: &str,
         descriptor: &str,
+        is_edit: bool,
         allows_project: bool,
         input: &serde_json::Value,
     ) -> Approval {
@@ -143,6 +145,7 @@ impl Approver for ChannelApprover {
             tool: tool.to_string(),
             summary: summary.to_string(),
             descriptor: descriptor.to_string(),
+            is_edit,
             allows_project,
             input: input.clone(),
             reply,
@@ -826,6 +829,7 @@ impl App {
                             ask.summary,
                             ask.descriptor,
                             call_summary,
+                            ask.is_edit,
                             ask.allows_project,
                         )
                     };
@@ -5543,11 +5547,11 @@ fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
 fn task_header_summary(summary: &str) -> Vec<Span<'static>> {
     match summary.split_once(" · ") {
         Some((kind, objective)) => vec![
-            Span::styled(kind.to_string(), theme::dim()),
+            Span::styled(kind.to_string(), theme::ok()),
             Span::styled(" · ", theme::dim()),
             Span::styled(objective.to_string(), ratatui::style::Style::default()),
         ],
-        None => vec![Span::styled(summary.to_string(), theme::dim())],
+        None => vec![Span::styled(summary.to_string(), theme::ok())],
     }
 }
 
@@ -6349,6 +6353,13 @@ mod tests {
                 .all(|line| line.style.fg == Some(crate::theme::DIM)),
             "task summary and recent activity stay uniformly dim"
         );
+    }
+
+    #[test]
+    fn single_task_header_highlights_the_agent_kind() {
+        let spans = task_header_summary("Explore · inspect the implementation");
+        assert_eq!(spans[0].style.fg, Some(theme::OK));
+        assert_eq!(spans[2].style, ratatui::style::Style::default());
     }
 
     #[test]

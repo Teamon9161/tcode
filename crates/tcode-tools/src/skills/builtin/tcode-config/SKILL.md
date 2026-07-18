@@ -1,0 +1,292 @@
+---
+name: tcode-config
+description: Configure tcode profiles, models, sub-agents, permissions, limits, MCP servers, and skills
+---
+
+# Configure tcode
+
+Use this skill whenever the user asks how to configure tcode, add or switch a
+provider/model, pin a sub-agent model, create an agent definition, tune
+permissions or limits, connect MCP, or add a skill.
+
+## Configuration locations and precedence
+
+Use these locations deliberately:
+
+- `~/.tcode/config.toml` is the user-level configuration. Put API-key
+  environment-variable names and personal provider profiles here.
+- `.tcode/config.toml` is the project overlay. It is appropriate for
+  project-specific profiles, sub-agent pins, permissions, hooks, and MCP
+  servers. Do not put credentials in a repository configuration file.
+- Built-in defaults load first, then the global file, then the project overlay.
+  Profile entries merge by name; a model entry with the same `name` replaces
+  its catalog entry.
+- `~/.tcode/state.toml` is runtime state written by `/model`, `/agents`, and
+  other UI choices. Do not hand-edit it for normal configuration: its selected
+  model and agent pins override the corresponding hand-written defaults.
+
+For the initial selection, CLI `--profile` / `--model` win over saved state;
+saved state wins over `config.toml` defaults. Start a one-off run with, for
+example:
+
+```powershell
+tcode --profile anthropic --model claude-sonnet-5
+```
+
+Before editing any configuration, read the applicable existing TOML. Preserve
+unrelated profiles and user comments. If a saved `/model` or `/agents` choice
+appears to defeat the new default, explain that it lives in `state.toml` and
+use the interactive picker to change it rather than deleting state blindly.
+
+## Profiles and models
+
+Choose a default profile and define profiles under `[profiles.<name>]`.
+Providers are `anthropic`, `openai` (any OpenAI-compatible Chat Completions
+endpoint), and `codex` (a ChatGPT subscription through the Codex backend).
+Prefer `api_key_env` to `api_key` so secrets stay out of TOML.
+
+```toml
+default_profile = "work"
+
+[profiles.work]
+provider = "openai"
+api_key_env = "WORK_API_KEY"
+base_url = "https://api.example.com/v1" # omit for OpenAI's default endpoint
+
+[[profiles.work.models]]
+name = "example-coder"
+label = "Example Coder"
+context_window = 200000
+max_tokens = 16000
+vision = true
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+```
+
+`model = "example-coder"` is a shorthand for a single selectable model.
+Use `models` when model metadata matters: `context_window`, `max_tokens`,
+`vision`, and valid `efforts`. Do not invent a context window or effort level;
+leave unknown metadata unset.
+
+Use `/model` during a session to list and select a model (and optional effort):
+
+```text
+/model
+/model example-coder high
+```
+
+The builtin catalog already contains profiles such as `anthropic`, `openai`,
+`codex`, `deepseek`, and `openrouter`; normally only add an environment variable
+or override/add the models actually used. The Codex profile uses its local login
+and runtime model catalog, not an API key.
+
+## Watchdog and retries
+
+`[watchdog]` controls provider request recovery. The defaults are intentionally
+conservative: avoid reducing them merely because a healthy request is faster.
+
+```toml
+[watchdog]
+idle_timeout_secs = 30
+connect_timeout_secs = 60
+max_retries = 5
+initial_backoff_ms = 1000
+max_backoff_ms = 30000
+```
+
+`idle_timeout_secs` is the maximum silence between streamed response chunks.
+`connect_timeout_secs` is the maximum wait for response headers / first byte,
+not just TCP connection setup; slow reasoning models can legitimately need much
+of this time. `max_retries` is the retry limit. Backoff starts at
+`initial_backoff_ms`, doubles for each retry, and is capped by
+`max_backoff_ms`.
+
+## Sub-agent model pins
+
+`[agents.<kind>]` pins a delegated agent or auxiliary role to a model. Omitted
+fields inherit the current main model. A pin can name a profile, a model, and
+an effort; a bare model is resolved against the profile that offers it when
+possible.
+
+```toml
+[agents.explore]
+profile = "openai"
+model = "gpt-5.6-luna"
+effort = "low"
+
+[agents.plan]
+profile = "anthropic"
+model = "claude-sonnet-5"
+
+[agents.fetch]
+enabled = true # opt in to web_fetch(prompt = "...") using the main model
+```
+
+`/agents` lists and changes these assignments interactively; those choices are
+persisted in `state.toml` and override `[agents.*]`. Builtin task kinds are
+`explore`, `plan`, and `general`. Auxiliary roles include `auto`, `suggest`,
+`vision`, and opt-in `fetch` (shown as `web-fetch` in the picker). Keep `auto`
+and `suggest` on a small, inexpensive model if explicitly pinning them: they
+are convenience requests, not the main coding session.
+
+## Custom agent definitions
+
+Create one Markdown file per agent at `.tcode/agents/<name>.md` for a project
+or `~/.tcode/agents/<name>.md` for personal reuse. Project definitions take
+precedence. The filename supplies `name` when omitted; names must match
+`^[a-z0-9][a-z0-9_-]{0,47}$`. `explore`, `plan`, and `general` are reserved
+builtin names and cannot be overridden.
+
+The YAML frontmatter controls capability and defaults; the Markdown body is the
+agent's system prompt:
+
+```markdown
+---
+name: reviewer
+description: Inspect a change and return evidence-backed review notes
+readonly: true
+tools: [read, grep, glob]
+agents: [explore]
+profile: openai
+model: gpt-5.6-luna
+effort: low
+maxTurns: 40
+gatesOutput: false
+max_exchanges: 0
+---
+
+Review the requested change. Cite files and lines, distinguish facts from
+inferences, and return a concise report.
+```
+
+Key rules:
+
+- `description` and a non-empty Markdown body are required.
+- `tools` is an allowlist; `disallowedTools` is a denylist. They are mutually
+  exclusive. Selectors also support `mcp__*` and `mcp__<server>__*`.
+- `readonly: true` is a hard ceiling: mutating tools are removed even if they
+  appear in `tools`.
+- `agents` is the allowlist of nested task kinds. Omit it to make a leaf agent.
+- `maxTurns` is a positive integer limiting model round-trips for that task.
+  `max_steps` is legacy and should not be used.
+- `gatesOutput` defaults to `true`. Set it to `false` only when the parent needs
+  the complete final report without a blob read-back. It bypasses only the
+  parent-facing final-report blob gate; the sub-agent's internal tool outputs
+  still use its normal output budget.
+- `max_exchanges: 0` makes the task one-shot; a positive value permits that many
+  follow-up exchanges on its live session.
+
+Frontmatter `profile` / `model` / `effort` supplies a default pin. Explicit
+`[agents.<name>]` configuration and `/agents` selections take precedence.
+
+## Permissions and limits
+
+```toml
+[permissions]
+mode = "default" # plan | default | accept-edits | auto | unsafe
+allow = ["run(cargo test *)"]
+ask = ["shell(rm *)"]
+deny = ["shell(rm -rf *)"]
+
+[limits]
+auto_compact = true
+auto_compact_percent = 85
+tool_output_tokens = 8000
+max_steps_per_turn = 500
+
+[ui]
+suggest_next = true
+show_reasoning = false
+```
+
+Rules use the descriptors shown in approval prompts, with `*` as the wildcard.
+`deny` and `ask` override broad allows. `accept-edits` auto-approves file edits
+only; shell and other non-edit actions still require approval. `unsafe` bypasses
+routine prompts but deny rules still apply. Prefer `default` or `accept-edits`
+for normal work.
+
+`auto_compact` enables automatic history compaction; set it to `false` only if
+you intentionally manage compaction with `/compact`. `auto_compact_percent` is
+the context occupancy threshold and is clamped to `1..=100`. `tool_output_tokens`
+caps ordinary tool-output context; large output becomes a scratch blob that the
+agent can page or read. Do not raise it merely to avoid a single follow-up: use
+an agent definition's targeted `gatesOutput: false` only for a final report the
+parent genuinely needs whole. `max_steps_per_turn` limits the main agent's model
+round-trips; a custom agent's `maxTurns` is separate.
+
+`ui.suggest_next` controls the post-turn next-prompt guess and costs one small
+auxiliary request per turn. `ui.show_reasoning` only displays provider reasoning
+summaries; it does not change provider behaviour.
+
+## Auto Mode policy
+
+`[auto_mode]` is global-only safety configuration: project overlays cannot
+loosen it. Its values are natural-language rules supplied to the safety
+classifier, not descriptor patterns:
+
+```toml
+[auto_mode]
+hard_deny = ["Never deploy or publish anything."]
+soft_deny = ["Avoid modifying CI configuration unless the user explicitly asks."]
+allow = ["Creating files inside the session scratch directory is allowed."]
+trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]
+```
+
+`hard_deny` rules cannot be overridden. `soft_deny` rules may be overridden by
+specific user intent; `allow` adds exceptions to those soft denials.
+`trusted_read_hosts` contains exact host names for tool-declared anonymous HTTPS
+read targets only. It does not permit shell, bash, arbitrary URLs, credentials,
+or non-default ports. Keep this list small and global because it influences
+Auto Mode safety decisions.
+
+## Hooks
+
+Hooks run an external command around matching tool calls in the project working
+directory. Each hook receives a JSON object on stdin with `event`, `tool`,
+`input`, `output`, and `cwd`; stdout is discarded and stderr is reported.
+
+```toml
+[[hooks]]
+event = "post_tool_use" # pre_tool_use | post_tool_use
+matcher = "edit|write" # `*` wildcard and `|` alternatives
+command = "cargo fmt"
+timeout_secs = 30
+```
+
+`pre_tool_use` runs before the tool. An exit code of `2` blocks that call, using
+stderr as the reason; other non-zero exits are reported but do not block it.
+`post_tool_use` runs after the tool and reports any failure. `timeout_secs`
+defaults to `30`; do not use a hook to perform long-running work.
+
+## MCP and skills
+
+Configure stdio MCP servers as follows:
+
+```toml
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+env = { LOG_LEVEL = "info" }
+```
+
+Use the server's documented command and arguments. `env` values are passed
+literally; tcode does not expand `${...}` there. Prefer launching through a
+small wrapper or setting the real environment in the parent process when a
+server needs secrets. MCP tools register as `mcp__github__<tool>` and can be
+selected in agent tool policies.
+
+For a project skill, add `.tcode/skills/<name>/SKILL.md`; for a personal one,
+use `~/.tcode/skills/<name>/SKILL.md`. A skill begins with `name` and
+description frontmatter, then contains instructions loaded on demand. Filesystem
+skills override a builtin skill with the same name.
+
+## Safe configuration workflow
+
+1. Identify whether the change is personal/global or project-specific.
+2. Read the active `config.toml` and any relevant agent or skill file first.
+3. Make the smallest TOML or Markdown change that expresses the requested
+   behavior. Never copy credentials into a repository.
+4. Validate syntax with the project's available checks, then restart tcode or
+   start a fresh session to observe configuration loading.
+5. For model and agent choices, use `/model` and `/agents` to confirm the
+   effective selection; report if saved state overrides the file.

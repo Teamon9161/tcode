@@ -30,8 +30,8 @@ pub use agent::{
 };
 pub use agent_roles::{AgentRole, AgentRoleMeta, RoleDefault};
 pub use auto_mode::{
-    AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision, ClassifierRequest,
-    ClassifierTranscript, ProviderSafetyClassifier, SafetyClassifier,
+    classifier_policy, AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision,
+    ClassifierRequest, ClassifierTranscript, ProviderSafetyClassifier, SafetyClassifier,
 };
 pub use background::{BackgroundTasks, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
@@ -40,7 +40,7 @@ pub use environment::{EnvironmentSnapshot, GitSnapshot, StartupContext};
 pub use export::export_markdown;
 pub use hooks::{HookDef, HookEvent, Hooks};
 pub use import::import_entries;
-pub use ledger::{Entry, Ledger, LedgerSink};
+pub use ledger::{Entry, Ledger, LedgerSink, SKILL_ECHO_OPEN};
 pub use memory::{MemoryManager, MemoryUpdate};
 pub use permission::{Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules};
 pub use provider::{

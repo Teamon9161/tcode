@@ -47,7 +47,7 @@ const ANSWERED_HEAD: usize = 1_000;
 /// session. Late is the same as never here.
 const SUGGEST_TIMEOUT: Duration = Duration::from_secs(20);
 
-const SUGGEST_SYSTEM: &str = include_str!("../../../../prompts/suggest-system.md");
+const SUGGEST_SYSTEM: &str = include_str!("../../prompts/agent/suggest-system.md");
 
 /// The closing turn of the suggestion's own conversation. Constant, so it never
 /// disturbs the append-only spine in front of it.

@@ -14,7 +14,7 @@ const MAINTENANCE_TURNS: u32 = 20;
 const MAINTENANCE_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const SOURCE_MARKER: &str = "tcode-memory-source: ";
 const PROJECT_MARKER: &str = "tcode-memory-project: ";
-const AUTO_MEMORY_SYSTEM: &str = include_str!("../../../prompts/memory-system.md");
+const AUTO_MEMORY_SYSTEM: &str = include_str!("../prompts/memory/system.md");
 
 #[derive(Debug, Clone)]
 struct Project {

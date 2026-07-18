@@ -12,13 +12,18 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use crate::frontmatter::{clip, front_matter, strip_front_matter};
-use tcode_core::{PermissionRequest, PromptVariables, Tool, ToolCtx, ToolOutput};
+use tcode_core::{PermissionRequest, PromptVariables, Tool, ToolCtx, ToolOutput, SKILL_ECHO_OPEN};
 
 /// One listed line per skill; longer descriptions are clipped, not dropped.
 const DESCRIPTION_CAP: usize = 200;
 /// Budget for the whole listing inside the tool description (~1.5k tokens).
 /// Skills beyond it stay invocable but appear as names only.
 const LISTING_CAP: usize = 6_000;
+
+// Rust cannot expand `include_str!` over a directory. The build script scans
+// `src/skills/builtin/*/SKILL.md` and emits this resource manifest, so adding a
+// builtin skill never requires a Rust registration edit.
+include!(concat!(env!("OUT_DIR"), "/builtin_skills.rs"));
 
 /// Where a skill's SKILL.md body comes from. `Builtin` skills ship inside the
 /// binary (`include_str!`), so upgrading tcode upgrades them too; a
@@ -40,13 +45,20 @@ pub struct Skill {
 /// lives at `.tcode/skills/<name>/SKILL.md` (or `~/.tcode/skills/<name>/`),
 /// found first by `discover_skills` and so preferred by its first-wins dedup.
 fn builtin_skills() -> Vec<Skill> {
-    let body = include_str!("../../../prompts/skills/init/SKILL.md");
-    let meta = front_matter(body);
-    vec![Skill {
-        name: meta.get("name").cloned().unwrap_or_else(|| "init".into()),
-        description: meta.get("description").cloned().unwrap_or_default(),
-        source: SkillSource::Builtin(body),
-    }]
+    BUILTIN_SKILL_FILES
+        .iter()
+        .map(|(_, fallback_name, body)| {
+            let meta = front_matter(body);
+            Skill {
+                name: meta
+                    .get("name")
+                    .cloned()
+                    .unwrap_or_else(|| (*fallback_name).into()),
+                description: meta.get("description").cloned().unwrap_or_default(),
+                source: SkillSource::Builtin(body),
+            }
+        })
+        .collect()
 }
 
 pub struct SkillTool {
@@ -167,10 +179,13 @@ pub fn render_skill(
 /// append, one turn cheaper than making the model call the tool itself. The
 /// sentinel lets a transcript recognize and fold this back down from the
 /// ledger text alone — live and replay both call `parse_skill_echo` on it, so
-/// there is exactly one place that knows the format.
+/// there is exactly one place that knows the format. The opening marker is
+/// `tcode_core::SKILL_ECHO_OPEN` because core also has to recognize it: the
+/// body is a repository file wearing a user message's clothes, and Auto Mode's
+/// authorization check must not read it as the user speaking.
 pub fn wrap_skill_echo(name: &str, args: &str, body: &str) -> String {
     format!(
-        "<user-skill name=\"{}\" args=\"{}\">\n{body}\n</user-skill>",
+        "{SKILL_ECHO_OPEN}name=\"{}\" args=\"{}\">\n{body}\n</user-skill>",
         escape_attr(name),
         escape_attr(args),
     )
@@ -185,7 +200,7 @@ pub struct SkillEcho {
 }
 
 pub fn parse_skill_echo(text: &str) -> Option<SkillEcho> {
-    let rest = text.strip_prefix("<user-skill ")?;
+    let rest = text.strip_prefix(SKILL_ECHO_OPEN)?;
     let (tag, after_tag) = rest.split_once('>')?;
     let name = attr(tag, "name")?;
     let args = attr(tag, "args").unwrap_or_default();
@@ -409,29 +424,69 @@ mod tests {
     }
 
     #[test]
-    fn discover_skills_always_includes_builtin_init() {
-        let tmp = tempfile::tempdir().unwrap();
-        let skills = discover_skills(tmp.path());
-        let init = skills
-            .iter()
-            .find(|skill| skill.name == "init")
-            .expect("builtin init skill present with no filesystem skills");
-        assert!(matches!(init.source, SkillSource::Builtin(_)));
-        assert!(!init.description.is_empty());
+    fn generated_manifest_entries_become_builtin_skills() {
+        let builtins = builtin_skills();
+        assert_eq!(builtins.len(), BUILTIN_SKILL_FILES.len());
+
+        for ((_, fallback_name, body), skill) in BUILTIN_SKILL_FILES.iter().zip(&builtins) {
+            let meta = front_matter(body);
+            let expected_name = meta
+                .get("name")
+                .map(String::as_str)
+                .unwrap_or(fallback_name);
+            assert_eq!(skill.name, expected_name);
+            assert_eq!(
+                skill.description,
+                meta.get("description")
+                    .map(String::as_str)
+                    .unwrap_or_default()
+            );
+            assert!(matches!(skill.source, SkillSource::Builtin(source) if source == *body));
+        }
     }
 
     #[test]
-    fn filesystem_skill_overrides_builtin_of_the_same_name() {
+    fn builtin_configuration_skill_is_discoverable() {
+        let skill = builtin_skills()
+            .into_iter()
+            .find(|skill| skill.name == "tcode-config")
+            .expect("configuration skill is embedded");
+        assert_eq!(
+            skill.description,
+            "Configure tcode profiles, models, sub-agents, permissions, limits, MCP servers, and skills"
+        );
+        let SkillSource::Builtin(body) = skill.source else {
+            panic!("configuration skill must be builtin");
+        };
+        assert!(body.contains("## Profiles and models"));
+        assert!(body.contains("## Watchdog and retries"));
+        assert!(body.contains("## Custom agent definitions"));
+        assert!(body.contains("## Auto Mode policy"));
+        assert!(body.contains("## Hooks"));
+    }
+
+    #[test]
+    fn filesystem_skill_overrides_a_generated_builtin() {
+        let builtin = builtin_skills()
+            .into_iter()
+            .next()
+            .expect("build script requires at least one builtin skill");
         let tmp = tempfile::tempdir().unwrap();
-        let dir = tmp.path().join(".tcode/skills/init");
+        let dir = tmp.path().join(".tcode/skills/override");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
             dir.join("SKILL.md"),
-            "---\nname: init\ndescription: custom override\n---\ncustom steps",
+            format!(
+                "---\nname: {}\ndescription: custom override\n---\ncustom steps",
+                builtin.name
+            ),
         )
         .unwrap();
         let skills = discover_skills(tmp.path());
-        let matches: Vec<&Skill> = skills.iter().filter(|skill| skill.name == "init").collect();
+        let matches: Vec<&Skill> = skills
+            .iter()
+            .filter(|skill| skill.name == builtin.name)
+            .collect();
         assert_eq!(matches.len(), 1, "override must not duplicate the builtin");
         assert_eq!(matches[0].description, "custom override");
         assert!(matches!(matches[0].source, SkillSource::Dir(_)));

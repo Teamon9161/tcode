@@ -4,6 +4,14 @@ use serde_json::Value;
 use crate::store::LogEvent;
 use crate::types::{ContentBlock, Message, Role};
 
+/// Opening sentinel of a `/name` skill invocation carried inside an
+/// `Entry::User` block. The wrapper's full format belongs to the skills module
+/// in `tcode-tools`, but the marker lives here because core has to recognize
+/// the provenance without depending on tools: the text arrived as a user
+/// message, yet its body came from a repository file, so anything deciding
+/// what the *user* authorized must be able to tell the two apart.
+pub const SKILL_ECHO_OPEN: &str = "<user-skill ";
+
 /// One unit of conversation history. Entries are the source of truth;
 /// API messages are a derived view (`as_messages`).
 #[derive(Debug, Clone, Serialize, Deserialize)]

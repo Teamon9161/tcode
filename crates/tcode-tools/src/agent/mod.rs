@@ -1,7 +1,9 @@
-//! Sub-agents: the `task` tool runs a nested agent loop with its own
+//! Sub-agents: the `agent` tool runs a nested agent loop with its own
 //! fresh ledger and a restricted tool set. The parent context only pays
 //! for the prompt and the final report — the sub-agent's exploration
 //! tokens never enter the parent's window.
+
+pub(crate) mod defs;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -14,13 +16,13 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentEvent, AgentModels, AgentRole, Approval, ApprovalDecision, Approver,
+    ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
     ContentBlock, DelegateEvent, Entry, ModelCell, PermissionMode, PermissionRequest,
     PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, TaskRunStatus, Tool,
     ToolCtx, ToolOutput,
 };
 
-use crate::agent_defs::{keeps_tool, AgentDef, AgentRegistry};
+use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry};
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.
@@ -33,6 +35,7 @@ impl Approver for NeverAsk {
         _tool: &str,
         _summary: &str,
         _descriptor: &str,
+        _is_edit: bool,
         _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
@@ -42,11 +45,6 @@ impl Approver for NeverAsk {
         )
     }
 }
-
-/// The sub-agent kinds `task` dispatches to. The shared role registry owns
-/// the complete `/agents` catalogue; this compatibility view names only task
-/// inputs.
-pub const TASK_AGENT_KINDS: [&str; 3] = AgentRole::TASK_KEYS;
 
 /// Parked resumable runs per task-tool instance; oldest is evicted beyond
 /// this. Each parked run keeps its whole ledger in memory.
@@ -65,7 +63,7 @@ struct LiveTask {
     seq: u64,
 }
 
-pub struct TaskTool {
+pub struct AgentTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
     model: ModelCell,
     /// Per-kind pins (`[agents.<kind>]`, or `/agents`). A pinned kind does
@@ -79,6 +77,9 @@ pub struct TaskTool {
     auto_compact: bool,
     auto_compact_percent: u8,
     trusted_read_hosts: crate::TrustedReadHosts,
+    /// Extra tools assembled by the composition root (currently MCP). They are
+    /// injected into both selector validation and each delegated toolset.
+    extension_tools: Vec<Arc<dyn Tool>>,
     /// Builtin task kinds and discovered custom agents, one registry.
     defs: Arc<AgentRegistry>,
     /// Spawnable subset for a nested instance; `None` = the whole registry.
@@ -95,7 +96,7 @@ pub struct TaskTool {
     live: Arc<Mutex<HashMap<String, LiveTask>>>,
 }
 
-impl TaskTool {
+impl AgentTool {
     pub fn new(
         model: ModelCell,
         watchdog: WatchdogConfig,
@@ -112,7 +113,8 @@ impl TaskTool {
             auto_compact: true,
             auto_compact_percent: 85,
             trusted_read_hosts: crate::trusted_read_hosts(Vec::new()),
-            description: task_description(&defs, None),
+            extension_tools: Vec::new(),
+            description: agent_description(&defs, None),
             defs,
             allowed: None,
             depth: 0,
@@ -126,9 +128,16 @@ impl TaskTool {
         self
     }
 
+    /// Supply extensions such as already-connected MCP tools. The same set is
+    /// used by every delegated agent, then filtered by its ToolPolicy.
+    pub fn with_extension_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.extension_tools = tools;
+        self
+    }
+
     /// Dispatch to this registry instead of the builtin-only default.
     pub fn with_agent_defs(mut self, defs: Arc<AgentRegistry>) -> Self {
-        self.description = task_description(&defs, self.allowed.as_deref());
+        self.description = agent_description(&defs, self.allowed.as_deref());
         self.defs = defs;
         self
     }
@@ -137,7 +146,7 @@ impl TaskTool {
     /// definition's spawn list becomes the whole schema, already one level
     /// deep (the process itself is that agent). Call after `with_agent_defs`.
     pub fn scoped_to(mut self, def: &AgentDef) -> Self {
-        self.description = task_description(&self.defs, Some(&def.agents));
+        self.description = agent_description(&self.defs, Some(&def.agents));
         self.allowed = Some(def.agents.clone());
         self.depth = 1;
         self
@@ -172,26 +181,41 @@ impl TaskTool {
             .unwrap_or_else(|| self.model.snapshot())
     }
 
-    /// The definition-derived toolset. Read-only agents get only
-    /// side-effect-free tools; builtin `plan` additionally loses `exit_plan`
-    /// (approval and the plan-mode transition remain exclusive to the
-    /// parent); an allowlist restricts further.
-    fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
+    /// Build the common delegated inventory before an agent-specific policy is
+    /// applied. Validation uses this same inventory, so MCP selectors can only
+    /// advertise tools a delegated agent will actually receive.
+    fn base_tools(&self, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
         let mut tools = crate::builtin_tools_with_web_fetch(
             cwd,
             crate::WebFetchTool::new(self.trusted_read_hosts.clone()).with_summarizer(
                 crate::FetchSummarizer::new(model.clone(), self.pinned.clone()),
             ),
         );
+        tools.extend(self.extension_tools.iter().cloned());
         tools.push(Arc::new(crate::ViewImageTool::new(
-            model.clone(),
+            model,
             self.pinned.clone(),
         )));
+        tools
+    }
+
+    /// Warn about, and remove, custom definitions whose tool policies cannot
+    /// produce a usable delegated toolset in this environment.
+    pub fn validate_definitions(&self, defs: &mut AgentRegistry, cwd: &Path) -> Vec<String> {
+        defs.validate_for_tools(&self.base_tools(cwd, self.model.clone()))
+    }
+
+    /// The definition-derived toolset. Read-only agents get only
+    /// side-effect-free tools; builtin `plan` additionally loses `exit_plan`
+    /// (approval and the plan-mode transition remain exclusive to the
+    /// parent); an allowlist restricts further.
+    fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
+        let mut tools = self.base_tools(cwd, model.clone());
         tools.retain(|tool| keeps_tool(def, tool.as_ref()));
         // Delegation is granted by the `agents` field alone — deliberately
         // outside the allowlist/read-only tiers — and bounded by depth, so
         // definition cycles terminate without graph analysis.
-        if !def.agents.is_empty() && self.depth < crate::agent_defs::MAX_TASK_DEPTH {
+        if !def.agents.is_empty() && self.depth < crate::agent::defs::MAX_TASK_DEPTH {
             tools.push(Arc::new(self.child(def, model)));
         }
         tools
@@ -201,8 +225,8 @@ impl TaskTool {
     /// and pins, spawn set restricted to the definition's list, one level
     /// deeper. The child's parent handle is the sub-agent's own model cell,
     /// so an unpinned grandchild inherits its spawner, not the top level.
-    fn child(&self, def: &AgentDef, model: ModelCell) -> TaskTool {
-        TaskTool {
+    fn child(&self, def: &AgentDef, model: ModelCell) -> AgentTool {
+        AgentTool {
             model,
             pinned: self.pinned.clone(),
             watchdog: self.watchdog.clone(),
@@ -211,7 +235,8 @@ impl TaskTool {
             auto_compact: self.auto_compact,
             auto_compact_percent: self.auto_compact_percent,
             trusted_read_hosts: self.trusted_read_hosts.clone(),
-            description: task_description(&self.defs, Some(&def.agents)),
+            extension_tools: self.extension_tools.clone(),
+            description: agent_description(&self.defs, Some(&def.agents)),
             defs: self.defs.clone(),
             allowed: Some(def.agents.clone()),
             depth: self.depth + 1,
@@ -247,46 +272,21 @@ impl TaskTool {
     }
 }
 
-/// Tool description for a given registry view. The unrestricted text keeps
-/// the hand-written builtin paragraph verbatim (byte-identical prefix when no
-/// custom agents exist); a restricted (nested) view describes exactly the
-/// spawnable set instead.
-fn task_description(defs: &AgentRegistry, allow: Option<&[String]>) -> String {
-    let base = match allow {
-        None => {
-            "Delegate a bounded subtask to a sub-agent with its own fresh \
-             context. Use agent='explore' for read-only reconnaissance that \
-             returns a report (cheap: its exploration never enters your \
-             context). Use agent='plan' for a read-only implementation-plan \
-             draft that the parent must still review and submit. Use \
-             agent='general' for independent multi-step work. Give a complete, \
-             self-contained prompt and a very short task summary in the same language as that prompt; \
-             the sub-agent sees nothing of this conversation and cannot ask questions."
-                .to_string()
-        }
-        Some(allow) => {
-            let mut base = String::from(
-                "Delegate a bounded subtask to a sub-agent with its own fresh \
-                 context. Give a complete, self-contained prompt and a very \
-                 short task summary in the same language as that prompt; the \
-                 sub-agent sees nothing of this conversation and cannot ask \
-                 questions.\n\nAvailable agents:\n",
-            );
-            for name in defs.names_for(Some(allow)) {
-                if let Some(def) = defs.get(name) {
-                    if matches!(def.source, crate::AgentSource::Builtin) {
-                        base.push_str(&format!("- {}: {}\n", def.name, def.description));
-                    }
-                }
-            }
-            base
-        }
-    };
-    format!("{base}{}", defs.custom_listing(allow))
+/// The model-facing catalogue and the input schema both read the same registry,
+/// so an agent definition can never advertise a name or description different
+/// from the one AgentTool dispatches.
+fn agent_description(defs: &AgentRegistry, allow: Option<&[String]>) -> String {
+    format!(
+        "Delegate a bounded subtask to an isolated agent with its own fresh context. \
+         Give a complete, self-contained prompt and a very short task summary in the \
+         same language as that prompt; the agent sees nothing of this conversation \
+         and cannot ask the user questions.\n\n{}",
+        defs.catalogue(allow)
+    )
 }
 
 /// Input schema for a given registry view; the enum is the spawnable set.
-fn task_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
+fn agent_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -305,7 +305,7 @@ fn task_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
     })
 }
 
-/// Keep legacy/direct task calls useful while the tool schema nudges models to
+/// Keep legacy/direct agent calls useful while the tool schema nudges models to
 /// supply an intentional one-line summary.
 fn prompt_summary(prompt: &str) -> String {
     const MAX_CHARS: usize = 88;
@@ -321,38 +321,11 @@ fn prompt_summary(prompt: &str) -> String {
     format!("{capped}…")
 }
 
-fn task_batch_label(inputs: &[&Value]) -> String {
-    let count = inputs.len();
-    let kinds: Vec<&str> = inputs
-        .iter()
-        .filter_map(|input| input["agent"].as_str())
-        .collect();
-    let kind = match kinds.as_slice() {
-        ["explore", ..] if kinds.iter().all(|kind| *kind == "explore") => "Explore",
-        ["plan", ..] if kinds.iter().all(|kind| *kind == "plan") => "Plan",
-        ["general", ..] if kinds.iter().all(|kind| *kind == "general") => "Delegate",
-        _ => "Delegate",
-    };
-    format!(
-        "{kind} {count} {}",
-        if count == 1 { "task" } else { "tasks" }
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{task_batch_label, task_description, task_schema, TASK_AGENT_KINDS};
-    use crate::agent_defs::AgentRegistry;
+    use super::{agent_description, agent_schema};
+    use crate::agent::defs::AgentRegistry;
     use serde_json::json;
-
-    #[test]
-    fn task_batch_labels_name_the_delegated_work() {
-        let explore = json!({"agent": "explore"});
-        let plan = json!({"agent": "plan"});
-        assert_eq!(task_batch_label(&[&explore]), "Explore 1 task");
-        assert_eq!(task_batch_label(&[&explore, &explore]), "Explore 2 tasks");
-        assert_eq!(task_batch_label(&[&plan, &explore]), "Delegate 2 tasks");
-    }
 
     fn registry_with(defs: &[(&str, &str)]) -> AgentRegistry {
         let tmp = tempfile::tempdir().unwrap();
@@ -370,22 +343,41 @@ mod tests {
         registry
     }
 
+    use tcode_core::Tool;
+
+    #[test]
+    fn agent_definition_can_bypass_only_its_parent_report_gate() {
+        let registry = std::sync::Arc::new(registry_with(&[("verbose", "gatesOutput: false")]));
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_agent_defs(registry);
+
+        assert!(!task.gates_output_for(&json!({"agent": "verbose"})));
+        assert!(!task.gates_output_for(&json!({"agent": "explore"})));
+        assert!(!task.gates_output_for(&json!({"agent": "plan"})));
+        assert!(task.gates_output_for(&json!({"agent": "general"})));
+        assert!(task.gates_output_for(&json!({"agent": "missing"})));
+    }
+
     #[test]
     fn schema_enum_and_description_track_custom_agents() {
         let registry = registry_with(&[("investor", "agents: quant-dev"), ("quant-dev", "")]);
-        let schema = task_schema(&registry, None);
+        let schema = agent_schema(&registry, None);
         let kinds: Vec<&str> = schema["properties"]["agent"]["enum"]
             .as_array()
             .unwrap()
             .iter()
             .filter_map(|v| v.as_str())
             .collect();
-        assert_eq!(
-            kinds,
-            ["explore", "plan", "general", "investor", "quant-dev"]
-        );
-        assert!(TASK_AGENT_KINDS.iter().all(|kind| kinds.contains(kind)));
-        let description = task_description(&registry, None);
+        let builtins = AgentRegistry::builtin();
+        let mut expected: Vec<&str> = builtins.names_for(None);
+        expected.extend(["investor", "quant-dev"]);
+        assert_eq!(kinds, expected);
+        let description = agent_description(&registry, None);
         assert!(description.contains("investor: investor agent"));
     }
 
@@ -393,20 +385,26 @@ mod tests {
     fn a_spawn_allowlist_restricts_schema_and_description() {
         let registry = registry_with(&[("investor", "agents: quant-dev"), ("quant-dev", "")]);
         let allow = vec!["quant-dev".to_string()];
-        let schema = task_schema(&registry, Some(&allow));
+        let schema = agent_schema(&registry, Some(&allow));
         assert_eq!(schema["properties"]["agent"]["enum"], json!(["quant-dev"]));
-        let description = task_description(&registry, Some(&allow));
+        let description = agent_description(&registry, Some(&allow));
         assert!(description.contains("quant-dev:"));
         assert!(!description.contains("investor:"));
         assert!(!description.contains("agent='explore'"));
     }
 
     #[test]
-    fn without_custom_agents_the_description_is_the_static_paragraph() {
+    fn without_custom_agents_the_description_lists_embedded_definitions() {
         let registry = AgentRegistry::builtin();
-        let description = task_description(&registry, None);
-        assert!(description.ends_with("cannot ask questions."));
-        assert!(!description.contains("Custom agents"));
+        let description = agent_description(&registry, None);
+        assert!(description.contains("Available agents:"));
+        for def in registry.visible_defs(None) {
+            assert!(description.contains(&format!(
+                "{}{}:",
+                def.name,
+                if def.read_only { " [read-only]" } else { "" }
+            )));
+        }
     }
 
     /// Never streams: toolset-shape tests construct models without talking.
@@ -441,14 +439,64 @@ mod tests {
         })
     }
 
+    struct McpStub;
+
+    #[async_trait::async_trait]
+    impl tcode_core::Tool for McpStub {
+        fn name(&self) -> &str {
+            "mcp__github__issue"
+        }
+
+        fn description(&self) -> &str {
+            "test MCP tool"
+        }
+
+        fn input_schema(&self) -> serde_json::Value {
+            json!({"type": "object"})
+        }
+
+        fn permission(&self, _input: &serde_json::Value) -> tcode_core::PermissionRequest {
+            tcode_core::PermissionRequest::None
+        }
+
+        async fn run(
+            &self,
+            _input: serde_json::Value,
+            _ctx: &tcode_core::ToolCtx,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> tcode_core::ToolOutput {
+            tcode_core::ToolOutput::ok("")
+        }
+    }
+
+    #[test]
+    fn mcp_selectors_filter_the_same_extensions_subagents_receive() {
+        let mut registry = registry_with(&[("github-reader", "tools: [mcp__github__*]")]);
+        let tool = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_extension_tools(vec![std::sync::Arc::new(McpStub)]);
+        assert!(tool
+            .validate_definitions(&mut registry, &std::env::temp_dir())
+            .is_empty());
+        let registry = std::sync::Arc::new(registry);
+        let tool = tool.with_agent_defs(registry.clone());
+        let def = registry.get("github-reader").unwrap();
+        let tools = tool.sub_tools(def, &std::env::temp_dir(), null_model());
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "mcp__github__issue");
+    }
+
     #[test]
     fn nesting_is_granted_by_the_agents_field_and_bounded_by_depth() {
-        use tcode_core::Tool as _;
         let registry = std::sync::Arc::new(registry_with(&[
             ("investor", "agents: quant-dev"),
             ("quant-dev", ""),
         ]));
-        let task = super::TaskTool::new(
+        let task = super::AgentTool::new(
             null_model(),
             Default::default(),
             2_000,
@@ -459,12 +507,12 @@ mod tests {
         let leaf = registry.get("quant-dev").unwrap();
         let tmp = std::env::temp_dir();
 
-        // A spawner gets a task tool whose schema is exactly its spawn list.
+        // A spawner gets an agent tool whose schema is exactly its spawn list.
         let tools = task.sub_tools(investor, &tmp, null_model());
         let child = tools
             .iter()
-            .find(|tool| tool.name() == "task")
-            .expect("spawner receives a task tool");
+            .find(|tool| tool.name() == "agent")
+            .expect("spawner receives an agent tool");
         assert_eq!(
             child.input_schema()["properties"]["agent"]["enum"],
             json!(["quant-dev"])
@@ -474,7 +522,7 @@ mod tests {
         assert!(!task
             .sub_tools(leaf, &tmp, null_model())
             .iter()
-            .any(|tool| tool.name() == "task"));
+            .any(|tool| tool.name() == "agent"));
 
         // Depth bound: instances at MAX_TASK_DEPTH stop handing the tool out.
         let d2 = task
@@ -484,18 +532,18 @@ mod tests {
         assert!(d2
             .sub_tools(investor, &tmp, null_model())
             .iter()
-            .any(|tool| tool.name() == "task"));
+            .any(|tool| tool.name() == "agent"));
         assert!(!d3
             .sub_tools(investor, &tmp, null_model())
             .iter()
-            .any(|tool| tool.name() == "task"));
+            .any(|tool| tool.name() == "agent"));
     }
 }
 
 #[async_trait]
-impl Tool for TaskTool {
+impl Tool for AgentTool {
     fn name(&self) -> &str {
-        "task"
+        "agent"
     }
 
     fn description(&self) -> &str {
@@ -503,7 +551,7 @@ impl Tool for TaskTool {
     }
 
     fn input_schema(&self) -> Value {
-        task_schema(&self.defs, self.allowed.as_deref())
+        agent_schema(&self.defs, self.allowed.as_deref())
     }
 
     fn batch_policy_for(&self, input: &Value) -> tcode_core::BatchPolicy {
@@ -521,7 +569,18 @@ impl Tool for TaskTool {
     }
 
     fn batch_label(&self, inputs: &[&Value]) -> String {
-        task_batch_label(inputs)
+        let count = inputs.len();
+        format!(
+            "Delegate {count} {}",
+            if count == 1 { "agent" } else { "agents" }
+        )
+    }
+
+    fn gates_output_for(&self, input: &Value) -> bool {
+        input["agent"]
+            .as_str()
+            .and_then(|kind| self.def_for(kind))
+            .is_none_or(|def| def.gates_output)
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {
@@ -532,7 +591,7 @@ impl Tool for TaskTool {
                 let prompt = input["prompt"].as_str().unwrap_or("?");
                 let preview: String = prompt.chars().take(60).collect();
                 PermissionRequest::Ask {
-                    descriptor: format!("task({})", def.name),
+                    descriptor: format!("agent({})", def.name),
                     aliases: Vec::new(),
                     summary: format!("delegate to sub-agent: {preview}"),
                     is_edit: false,
@@ -616,7 +675,7 @@ impl Tool for TaskTool {
             PermissionMode::Auto,
             PermissionRules::default(),
         )
-        .with_cache_scope(format!("task-{kind}-{run}"));
+        .with_cache_scope(format!("agent-{kind}-{run}"));
 
         let run = match self
             .drive(
@@ -639,7 +698,7 @@ impl Tool for TaskTool {
         if def.max_exchanges > 0 {
             let id = run.run_id.clone();
             let header = format!(
-                "[{kind} sub-agent {id} on {model_name}: {}; resumable — call task with \
+                "[{kind} sub-agent {id} on {model_name}: {}; resumable — call agent with \
                  agent=\"{kind}\", resume=\"{id}\" for up to {} follow-up turns]",
                 run.stats, def.max_exchanges
             );
@@ -672,7 +731,7 @@ struct TaskRunOutcome {
     report: String,
 }
 
-impl TaskTool {
+impl AgentTool {
     /// Continue a parked run: same session, same cache scope, pure append —
     /// a follow-up costs only the increment on a full prefix cache hit.
     #[allow(clippy::too_many_arguments)]
@@ -694,8 +753,8 @@ impl TaskTool {
             };
             parked.sort();
             return ToolOutput::err(format!(
-                "no resumable task '{id}' — it may have expired, hit its follow-up limit, \
-                 or be resuming concurrently. Resumable now: [{}]. Start a fresh task instead.",
+                "no resumable agent run '{id}' — it may have expired, hit its follow-up limit, \
+                 or be resuming concurrently. Resumable now: [{}]. Start a fresh agent run instead.",
                 parked.join(", ")
             ));
         };
@@ -706,7 +765,7 @@ impl TaskTool {
                 .expect("live tasks lock")
                 .insert(id.to_string(), task);
             return ToolOutput::err(format!(
-                "task '{id}' belongs to agent '{owner}'; call it with agent=\"{owner}\""
+                "agent run '{id}' belongs to agent '{owner}'; call agent with agent=\"{owner}\""
             ));
         }
         task.exchanges_left -= 1;
@@ -734,7 +793,7 @@ impl TaskTool {
                     self.park(id, task);
                     format!("{left} follow-up turns left")
                 } else {
-                    "follow-up limit reached, task closed".to_string()
+                    "follow-up limit reached, agent run closed".to_string()
                 };
                 ToolOutput::ok(format!(
                     "[{} sub-agent {id} resumed on {model_name}: {}; {note}]\n{}",

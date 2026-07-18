@@ -128,9 +128,9 @@ impl ToolRenderer for DefaultRenderer {
 
 /// A sub-agent's report is prose the model wrote for a human to read — it
 /// arrives as Markdown and must not be shown as literal `#` and `**`.
-struct TaskRenderer;
+struct AgentRenderer;
 
-impl ToolRenderer for TaskRenderer {
+impl ToolRenderer for AgentRenderer {
     fn header_tone(&self) -> HeaderTone {
         HeaderTone::Task
     }
@@ -447,7 +447,7 @@ impl RenderRegistry {
                 "grep" | "glob" => Box::new(PatternRenderer { quiet }),
                 "web_fetch" => Box::new(WebFetchRenderer),
                 "view_image" => Box::new(ViewImageRenderer),
-                "task" => Box::new(TaskRenderer),
+                "agent" => Box::new(AgentRenderer),
                 "update_progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),
                 "exit_plan" => Box::new(ExitPlanRenderer),
@@ -455,9 +455,13 @@ impl RenderRegistry {
             };
             renderers.insert(name.to_string(), renderer);
         }
-        // Existing JSONL sessions retain the retired call name and schema. Keep
-        // their progress pane visible on resume without exposing that name to
-        // new model requests.
+        // Existing JSONL sessions retain retired tool names and schemas. Keep
+        // their specialized renderers on resume without exposing those names
+        // to new model requests.
+        if renderers.contains_key("agent") {
+            renderers.insert("task".into(), Box::new(AgentRenderer));
+            display_names.insert("task".into(), "Agent".into());
+        }
         if renderers.contains_key("update_progress") {
             renderers.insert("update_plan".into(), Box::new(ProgressRenderer));
         }
@@ -584,8 +588,48 @@ mod tests {
         RenderRegistry::from_tools(&tcode_tools::builtin_tools(&std::env::temp_dir()))
     }
 
-    /// The machine-checked replacement for the old "keep this list in sync
-    /// with core's ParallelReadOnly set by hand" comment.
+    struct AgentStub;
+
+    #[async_trait::async_trait]
+    impl Tool for AgentStub {
+        fn name(&self) -> &str {
+            "agent"
+        }
+
+        fn description(&self) -> &str {
+            "test agent"
+        }
+
+        fn input_schema(&self) -> Value {
+            json!({"type": "object"})
+        }
+
+        fn permission(&self, _input: &Value) -> tcode_core::PermissionRequest {
+            tcode_core::PermissionRequest::None
+        }
+
+        async fn run(
+            &self,
+            _input: Value,
+            _ctx: &tcode_core::ToolCtx,
+            _cancel: &tokio_util::sync::CancellationToken,
+        ) -> tcode_core::ToolOutput {
+            tcode_core::ToolOutput::ok("")
+        }
+    }
+
+    #[test]
+    fn agent_renderer_keeps_a_task_alias_for_legacy_replay() {
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(AgentStub)];
+        let registry = RenderRegistry::from_tools(&tools);
+        let input = json!({"agent": "explore", "prompt": "survey"});
+        assert_eq!(registry.get("agent").header_tone(), HeaderTone::Task);
+        assert_eq!(registry.get("task").header_tone(), HeaderTone::Task);
+        assert!(registry.get("task").folds_result(&input));
+        assert!(registry.get("task").markdown_detail(Some(&input)));
+        assert_eq!(registry.display_name("task"), "Agent");
+    }
+
     #[test]
     fn quiet_output_tracks_core_parallel_read_only_policy() {
         let registry = registry();
@@ -622,7 +666,7 @@ mod tests {
 
     #[test]
     fn task_header_shows_kind_and_parent_authored_summary() {
-        let renderer = TaskRenderer;
+        let renderer = AgentRenderer;
         let explore = json!({
             "agent": "explore",
             "summary": "inspect TUI rendering",

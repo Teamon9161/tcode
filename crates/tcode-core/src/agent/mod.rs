@@ -37,10 +37,10 @@ use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 pub const DEFAULT_MAX_STEPS: usize = 500;
 
 /// Appended to the system prompt while `/dogfood` is on.
-const DOGFOOD_SYSTEM: &str = include_str!("../../../../prompts/dogfood.md");
+const DOGFOOD_SYSTEM: &str = include_str!("../../prompts/agent/dogfood.md");
 
 /// Appended to the Auto Mode classifier policy with machine-local folder trust.
-const FOLDER_TRUST_POLICY: &str = include_str!("../../../../prompts/folder-trust.md");
+const FOLDER_TRUST_POLICY: &str = include_str!("../../prompts/auto_mode/folder-trust.md");
 
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
@@ -849,8 +849,8 @@ impl Agent {
             // An approval may replace the artifact that actually runs (the
             // original tool use stays immutable in the ledger).
             let mut approved_input: Option<Value> = None;
-            // A mode transition an approval carried (only the plan-review
-            // dialog sets one). Applied generically before the tool runs.
+            // A mode transition carried by an approval is applied before its
+            // tool runs, so subsequent calls observe the approved mode.
             let mut applied_mode: Option<PermissionMode> = None;
             let is_user_question = matches!(request, PermissionRequest::UserInput { .. });
             match self
@@ -878,6 +878,7 @@ impl Agent {
                             name,
                             request.summary(),
                             &request.approval_label(),
+                            request.is_edit(),
                             request.allows_rule(),
                             input,
                         )
@@ -929,9 +930,8 @@ impl Agent {
             let model_input = input;
             let input = approved_input.as_ref().unwrap_or(model_input);
 
-            // A plan approval switches the permission mode before the tool
-            // runs, so the mode the tool executes under (and reports) is the
-            // approved one, and its note is already synced.
+            // Apply an approval-carried mode transition before the tool runs,
+            // so the executing call and later calls observe the same mode.
             if let Some(mode) = applied_mode {
                 session.apply_approved_mode(mode);
             }
@@ -1008,12 +1008,12 @@ impl Agent {
             for note in post.notes {
                 output.content.push_str(&format!("\n[hook] {note}"));
             }
-            let mut output = self.gate(session, name, output);
+            let mut output = self.gate(session, name, input, output);
             // Tell the model, in the same result, which mode execution now runs
-            // under. Only a plan approval sets `applied_mode`.
+            // under after the approval.
             if let Some(mode) = applied_mode.filter(|_| !output.is_error) {
                 output.content.push_str(&format!(
-                    "\n\nPermission mode is now {}. Proceed with the plan.",
+                    "\n\nPermission mode is now {}. Proceed with the task.",
                     mode.label()
                 ));
             }
@@ -1147,7 +1147,7 @@ impl Agent {
             for note in post.notes {
                 output.content.push_str(&format!("\n[hook] {note}"));
             }
-            let output = self.gate(session, &name, output);
+            let output = self.gate(session, &name, &input, output);
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
@@ -1348,11 +1348,13 @@ impl Agent {
                             name,
                             &summary,
                             &request.approval_label(),
+                            request.is_edit(),
                             request.allows_rule(),
                             input,
                         )
                         .await;
                     session.mark_mode_delivery();
+                    let applied_mode = approval.set_mode;
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1393,6 +1395,9 @@ impl Agent {
                             awaiting_user_input |= awaits;
                             declined = Some(reason);
                         }
+                    }
+                    if let Some(mode) = applied_mode {
+                        session.apply_approved_mode(mode);
                     }
                 }
             }
@@ -1578,7 +1583,7 @@ impl Agent {
                     output.content.push_str(&format!("\n[hook] {note}"));
                 }
             }
-            let output = self.gate(session, &name, output);
+            let output = self.gate(session, &name, &input, output);
             let state = if !ran {
                 "skipped"
             } else if output.is_error {
@@ -1733,11 +1738,13 @@ impl Agent {
                             name,
                             summary,
                             &request.approval_label(),
+                            request.is_edit(),
                             request.allows_rule(),
                             input,
                         )
                         .await;
                     session.mark_mode_delivery();
+                    let applied_mode = approval.set_mode;
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             if let Some(note) = approval.comment {
@@ -1795,6 +1802,9 @@ impl Agent {
                                 awaiting_user_input,
                             });
                         }
+                    }
+                    if let Some(mode) = applied_mode {
+                        session.apply_approved_mode(mode);
                     }
                     // Only ask once for the whole batch
                     break;
@@ -1864,7 +1874,7 @@ impl Agent {
             for note in post.notes {
                 output.content.push_str(&format!("\n[hook] {note}"));
             }
-            let output = self.gate(session, name, output);
+            let output = self.gate(session, name, input, output);
 
             self.emit(
                 events,
@@ -2089,11 +2099,16 @@ impl Agent {
             .collect()
     }
 
-    /// Central token-budget gate for tool outputs. Locating/content tools
-    /// opt out (`gates_output` = false): their output is precise and
-    /// self-paginating, so spilling it to a file would only force a re-`read`
-    /// of a result the model needed whole.
-    fn gate(&self, session: &mut Session, tool: &str, output: ToolOutput) -> ToolOutput {
+    /// Central token-budget gate for tool outputs. Locating/content tools and
+    /// selected agent definitions may opt out; a dynamic tool receives its
+    /// original input so the decision stays with the tool implementation.
+    fn gate(
+        &self,
+        session: &mut Session,
+        tool: &str,
+        input: &Value,
+        output: ToolOutput,
+    ) -> ToolOutput {
         let is_error = output.is_error;
         let images = output.images;
         let tool_impl = self.tool(tool);
@@ -2105,7 +2120,7 @@ impl Agent {
                 None => output.content,
             }
         };
-        let gates = tool_impl.is_none_or(|tool| tool.gates_output());
+        let gates = tool_impl.is_none_or(|tool| tool.gates_output_for(input));
         if !gates {
             return ToolOutput {
                 content,

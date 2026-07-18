@@ -33,6 +33,7 @@ impl Approver for LineApprover {
         tool: &str,
         summary: &str,
         descriptor: &str,
+        is_edit: bool,
         allows_project: bool,
         input: &Value,
     ) -> Approval {
@@ -56,11 +57,16 @@ impl Approver for LineApprover {
         }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
-        let project_choice = allows_project
+        let project_choice = (!is_edit && allows_project)
             .then(|| format!(" / p (allow in this project: {descriptor})"))
             .unwrap_or_default();
+        let choices = if is_edit {
+            "y / e (allow all edits for this session) / n"
+        } else {
+            "y / a (this session)"
+        };
         print!(
-            "{DIM}  allow? y / a (this session: {descriptor}){project_choice} / n — append a note after y or n, e.g. \"y but use --dry-run\"{RESET}\n  > "
+            "{DIM}  allow? {choices}{project_choice} — append a note after y, e, or n, e.g. \"y but use --dry-run\"{RESET}\n  > "
         );
         let _ = std::io::stdout().flush();
         loop {
@@ -82,13 +88,20 @@ impl Approver for LineApprover {
                 Some((h, r)) => (h, Some(r.trim().to_string()).filter(|s| !s.is_empty())),
                 None => (line, None),
             };
-            let decision = match head.to_lowercase().as_str() {
-                "y" | "yes" | "" => ApprovalDecision::Yes,
-                "a" | "always" => ApprovalDecision::YesSession,
-                "p" | "project" if allows_project => ApprovalDecision::YesProject,
-                "n" | "no" => ApprovalDecision::No,
+            let (decision, set_mode) = match head.to_lowercase().as_str() {
+                "y" | "yes" | "" => (ApprovalDecision::Yes, None),
+                "e" | "edits" if is_edit => {
+                    (ApprovalDecision::Yes, Some(PermissionMode::AcceptEdits))
+                }
+                "a" | "always" if !is_edit => (ApprovalDecision::YesSession, None),
+                "p" | "project" if !is_edit && allows_project => {
+                    (ApprovalDecision::YesProject, None)
+                }
+                "n" | "no" => (ApprovalDecision::No, None),
                 _ => {
-                    let choices = if allows_project {
+                    let choices = if is_edit {
+                        "y / e / n"
+                    } else if allows_project {
                         "y / a / p / n"
                     } else {
                         "y / a / n"
@@ -98,7 +111,12 @@ impl Approver for LineApprover {
                     continue;
                 }
             };
-            return Approval::simple(decision, rest);
+            return Approval {
+                decision,
+                comment: rest,
+                set_mode,
+                approved_input: None,
+            };
         }
     }
 }

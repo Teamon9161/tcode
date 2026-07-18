@@ -103,6 +103,7 @@ impl Approver for ScriptedApprover {
         _tool: &str,
         _summary: &str,
         descriptor: &str,
+        _is_edit: bool,
         _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
@@ -1008,7 +1009,7 @@ async fn explore_sub_agent_returns_only_the_report() {
         tool_use("t1", "read", r#"{"path": "lib.rs"}"#),
         text_done("report: lib.rs defines f()"),
     ]);
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(provider),
         WatchdogConfig::default(),
         2000,
@@ -1030,18 +1031,18 @@ async fn explore_sub_agent_returns_only_the_report() {
 }
 
 #[tokio::test]
-async fn read_only_tasks_share_the_parallel_batch_path() {
+async fn read_only_agents_share_the_parallel_batch_path() {
     let dir = tempfile::tempdir().unwrap();
     let parent = MockProvider::new(vec![
         tool_uses(&[
             (
                 "t1",
-                "task",
+                "agent",
                 r#"{"agent":"explore","prompt":"inspect first"}"#,
             ),
             (
                 "t2",
-                "task",
+                "agent",
                 r#"{"agent":"plan","prompt":"inspect second"}"#,
             ),
         ]),
@@ -1050,7 +1051,7 @@ async fn read_only_tasks_share_the_parallel_batch_path() {
         text_done("done"),
     ]);
     let mut agent = agent(parent);
-    agent.tools.push(Arc::new(tcode_tools::TaskTool::new(
+    agent.tools.push(Arc::new(tcode_tools::AgentTool::new(
         agent.model.clone(),
         WatchdogConfig::default(),
         2_000,
@@ -1064,12 +1065,12 @@ async fn read_only_tasks_share_the_parallel_batch_path() {
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::ToolBatchStart { label, calls }
-            if label == "Delegate 2 tasks" && calls.len() == 2
+            if label == "Delegate 2 agents" && calls.len() == 2
     )));
     assert!(approver.asked.lock().unwrap().is_empty());
     assert_eq!(
         agent.batch_display_label(&session, &assistant_calls(&session)),
-        Some("Delegate 2 tasks".into())
+        Some("Delegate 2 agents".into())
     );
 }
 
@@ -1082,7 +1083,7 @@ async fn plan_sub_agent_returns_a_draft_under_the_planning_prompt() {
         tool_use("t1", "read", r#"{"path": "lib.rs"}"#),
         text_done("## Implementation plan\n\n1. Update lib.rs and add a test."),
     ]);
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(provider.clone()),
         WatchdogConfig::default(),
         2000,
@@ -2218,14 +2219,14 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
     let parent = MockProvider::new(vec![
         tool_use(
             "t1",
-            "task",
+            "agent",
             r#"{"agent":"explore","prompt":"survey the repo"}"#,
         ),
         text_done("relayed"),
     ]);
     let explore = MockProvider::named("cheap-scout-1", vec![text_done("the report")]);
 
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(parent.clone()),
         WatchdogConfig::default(),
         2000,
@@ -2262,7 +2263,7 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
     let report = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            AgentEvent::ToolEnd { name, content, .. } if name == "agent" => Some(content.clone()),
             _ => None,
         })
         .expect("task returned a report");
@@ -2505,6 +2506,7 @@ impl Approver for StagingApprover {
         _tool: &str,
         _summary: &str,
         _descriptor: &str,
+        _is_edit: bool,
         _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
@@ -2520,6 +2522,45 @@ fn plan_enter_notes(session: &Session) -> usize {
         .iter()
         .filter(|e| matches!(e, Entry::Note(text) if text.contains("read-only planning phase")))
         .count()
+}
+
+#[tokio::test]
+async fn edit_approval_can_switch_the_whole_file_mutation_batch_to_accept_edits() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"old","new_string":"new"}"#,
+            ),
+            ("t2", "append", r#"{"path":"b.txt","content":"created"}"#),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::with_response(Approval {
+        decision: ApprovalDecision::Yes,
+        comment: None,
+        set_mode: Some(PermissionMode::AcceptEdits),
+        approved_input: None,
+    });
+
+    run(&agent, &mut session, &approver, "make both changes").await;
+
+    assert_eq!(session.mode, PermissionMode::AcceptEdits);
+    assert_eq!(approver.asked.lock().unwrap().len(), 1);
+    assert!(session.rules.allow.is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "created"
+    );
 }
 
 #[tokio::test]
@@ -2694,7 +2735,7 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
 
 /// A parent agent with a `task` tool whose `explore` kind is pinned to `sub`.
 fn task_agent(parent: Arc<MockProvider>, sub: Arc<MockProvider>) -> Agent {
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(parent.clone()),
         WatchdogConfig::default(),
         2000,
@@ -2722,7 +2763,7 @@ async fn a_task_run_streams_tagged_events_and_persists_a_trace() {
     let parent = MockProvider::new(vec![
         tool_use(
             "call-7",
-            "task",
+            "agent",
             r#"{"agent":"explore","prompt":"survey","summary":"survey the repository"}"#,
         ),
         text_done("relayed"),
@@ -2811,8 +2852,12 @@ async fn a_parallel_explore_batch_forwards_each_run_distinctly() {
     let root = tempfile::tempdir().unwrap();
     let parent = MockProvider::new(vec![
         tool_uses(&[
-            ("c1", "task", r#"{"agent":"explore","prompt":"look left"}"#),
-            ("c2", "task", r#"{"agent":"explore","prompt":"look right"}"#),
+            ("c1", "agent", r#"{"agent":"explore","prompt":"look left"}"#),
+            (
+                "c2",
+                "agent",
+                r#"{"agent":"explore","prompt":"look right"}"#,
+            ),
         ]),
         text_done("combined"),
     ]);
@@ -3022,13 +3067,13 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
         // Parent delegates to the investor.
         tool_use(
             "p1",
-            "task",
+            "agent",
             r#"{"agent":"investor","prompt":"grow the book","summary":"invest"}"#,
         ),
         // Investor delegates a backtest to quant-dev.
         tool_use(
             "i1",
-            "task",
+            "agent",
             r#"{"agent":"quant-dev","prompt":"backtest momentum","summary":"backtest"}"#,
         ),
         // quant-dev reports.
@@ -3038,7 +3083,7 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
         // Parent's closing word.
         text_done("done"),
     ]);
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(provider.clone()),
         WatchdogConfig::default(),
         2_000,
@@ -3065,10 +3110,10 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
     let quant_scope = requests[2].cache_scope.clone();
     assert!(investor_scope
         .as_deref()
-        .is_some_and(|scope| scope.starts_with("task-investor-")));
+        .is_some_and(|scope| scope.starts_with("agent-investor-")));
     assert!(quant_scope
         .as_deref()
-        .is_some_and(|scope| scope.starts_with("task-quant-dev-")));
+        .is_some_and(|scope| scope.starts_with("agent-quant-dev-")));
     assert_ne!(investor_scope, quant_scope);
     // The investor's second turn stays in its own append-only scope.
     assert_eq!(requests[3].cache_scope, investor_scope);
@@ -3083,7 +3128,7 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
     let report = events
         .iter()
         .find_map(|e| match e {
-            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            AgentEvent::ToolEnd { name, content, .. } if name == "agent" => Some(content.clone()),
             _ => None,
         })
         .expect("task returned a report");
@@ -3110,7 +3155,7 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
         // Parent delegates a backtest.
         tool_use(
             "p1",
-            "task",
+            "agent",
             r#"{"agent":"quant-dev","prompt":"backtest idea A","summary":"backtest"}"#,
         ),
         // quant-dev's first report.
@@ -3118,7 +3163,7 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
         // Parent pushes back — resumes the SAME run (its id is t1).
         tool_use(
             "p2",
-            "task",
+            "agent",
             r#"{"agent":"quant-dev","prompt":"drawdown too high, add a stop","resume":"t1","summary":"refine"}"#,
         ),
         // quant-dev's refined answer.
@@ -3126,7 +3171,7 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
         // Parent closes.
         text_done("shipped"),
     ]);
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(provider.clone()),
         WatchdogConfig::default(),
         2_000,
@@ -3145,7 +3190,7 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
     let reports: Vec<String> = events
         .iter()
         .filter_map(|e| match e {
-            AgentEvent::ToolEnd { name, content, .. } if name == "task" => Some(content.clone()),
+            AgentEvent::ToolEnd { name, content, .. } if name == "agent" => Some(content.clone()),
             _ => None,
         })
         .collect();
@@ -3181,7 +3226,7 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
 /// A resume that names an unknown id fails with a self-healing error that
 /// lists what is actually resumable, instead of silently starting fresh.
 #[tokio::test]
-async fn resuming_an_unknown_task_is_a_self_healing_error() {
+async fn resuming_an_unknown_agent_run_is_a_self_healing_error() {
     use tcode_core::Tool as _;
     let root = tempfile::tempdir().unwrap();
     let registry = custom_registry(
@@ -3193,7 +3238,7 @@ async fn resuming_an_unknown_task_is_a_self_healing_error() {
         )],
     );
     let provider = MockProvider::new(vec![text_done("unused")]);
-    let task = tcode_tools::TaskTool::new(
+    let task = tcode_tools::AgentTool::new(
         cell(provider),
         WatchdogConfig::default(),
         2_000,
@@ -3212,12 +3257,12 @@ async fn resuming_an_unknown_task_is_a_self_healing_error() {
 
     assert!(out.is_error);
     assert!(
-        out.content.contains("no resumable task 't99'"),
+        out.content.contains("no resumable agent run 't99'"),
         "{}",
         out.content
     );
     assert!(
-        out.content.contains("Start a fresh task"),
+        out.content.contains("Start a fresh agent run"),
         "{}",
         out.content
     );
