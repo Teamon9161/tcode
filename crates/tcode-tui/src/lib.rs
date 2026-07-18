@@ -6,6 +6,7 @@
 
 mod app;
 mod approval;
+mod composer;
 mod diff;
 mod editor;
 mod folder_trust_picker;
