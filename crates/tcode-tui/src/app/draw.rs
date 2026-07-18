@@ -9,6 +9,101 @@
 //! mode_label, spinner, anim_frame, notice, retry_wait, hitboxes.
 
 use super::*;
+use crate::composer::EditorLayout;
+
+/// What `redraw` measured before laying the panel out. Passed as one struct
+/// because every field is needed by both the height calculation and the paint.
+struct PanelInput<'a> {
+    running: bool,
+    viewing_trace: bool,
+    width: u16,
+    editor: &'a EditorLayout,
+    editor_start: usize,
+    ghost_lines: Option<Vec<String>>,
+    panel_lines: Vec<Line<'static>>,
+    status: Line<'static>,
+    hint: Line<'static>,
+}
+
+/// One horizontal band of the bottom panel, in paint order.
+///
+/// A section knows its own height. That is the point: the panel's total height
+/// is the sum, so a section can never be drawn at a size the layout did not
+/// reserve for it.
+enum Section {
+    /// A picker or the approval dialog. Owns the whole panel while open.
+    Overlay(Vec<Line<'static>>),
+    /// The persistent agent tree, in its own bordered box.
+    LivePanel(Vec<Line<'static>>),
+    /// Breathing room between the transcript and the live status line.
+    Gap,
+    Status(Line<'static>),
+    Queued(Vec<Line<'static>>),
+    Input(Vec<Line<'static>>),
+    ContextMeter {
+        used: u64,
+        window: u64,
+        estimated: bool,
+    },
+    RateLimit(tcode_core::RateLimits),
+    Popup(Vec<Line<'static>>),
+    Hint(Line<'static>),
+}
+
+impl Section {
+    /// Rows this section occupies, borders included.
+    fn height(&self) -> u16 {
+        match self {
+            Section::Overlay(lines) | Section::LivePanel(lines) => lines.len() as u16 + 2,
+            Section::Input(lines) => lines.len().clamp(1, 6) as u16 + 2,
+            Section::Queued(lines) | Section::Popup(lines) => lines.len() as u16,
+            Section::Gap
+            | Section::Status(_)
+            | Section::ContextMeter { .. }
+            | Section::RateLimit(_)
+            | Section::Hint(_) => 1,
+        }
+    }
+}
+
+/// Where the bottom panel sits, and how tall it is.
+///
+/// Painting and mouse hit-testing both ask this. When each computed it
+/// separately, a change to the panel's height silently moved clicks a row off
+/// whatever they appeared to land on.
+#[derive(Clone, Copy)]
+pub(super) struct PanelGeometry {
+    height: u16,
+    pub(super) top: u16,
+}
+
+impl PanelGeometry {
+    fn new(desired: u16, area_height: u16) -> Self {
+        // The transcript keeps at least a few visible rows.
+        let height = desired.min(area_height.saturating_sub(4)).max(1);
+        Self {
+            height,
+            top: area_height.saturating_sub(height),
+        }
+    }
+
+    /// The border-free content row a screen row falls on, or `None` when the
+    /// pointer is outside the panel or on its border.
+    pub(super) fn content_row(&self, row: u16) -> Option<usize> {
+        (row > self.top && row < self.top + self.height.saturating_sub(1))
+            .then(|| row.saturating_sub(self.top + 1) as usize)
+    }
+}
+
+/// The rounded box shared by the overlay, the agent tree and the input.
+fn bordered(lines: Vec<Line<'static>>, border: ratatui::style::Style) -> Paragraph<'static> {
+    use ratatui::widgets::{Block, BorderType};
+    Paragraph::new(Text::from(lines)).block(
+        Block::bordered()
+            .border_type(BorderType::Rounded)
+            .border_style(border),
+    )
+}
 
 /// The agent tree's rendered area plus the action target each inner row owns
 /// (border rows excluded, indexes parallel the panel's content lines).
@@ -362,53 +457,46 @@ impl App {
             Phase::Running { started, .. } => Some(*started),
             Phase::Idle => None,
         };
-        let status = self.status_line(running, started);
-        let hint = self.idle_hint();
+        let width = area_width(&self.terminal);
         let status_model_label = self.agent.model.snapshot().describe();
+        let mode_label = self.mode_label.clone();
+        // Rewind navigation takes over the hint row, so its status values are
+        // not clickable while it is active.
+        let status_clickable = self.rewind_nav.is_none();
         let viewing_trace = !matches!(self.active_view, ViewId::Main);
-        let dialog_lines = self
-            .overlay
-            .as_ref()
-            .map(|overlay| overlay.render(&self.overlay_ctx()));
         // A focused note in the approval dialog exposes its caret cell (set by
-        // the `render` just above). Anchoring the real terminal cursor there
-        // keeps the OS IME composition window tracking the caret. Pickers have
-        // no caret, so `cursor_cell` is `None` for them by construction.
+        // `Overlay::render`). Anchoring the real terminal cursor there keeps
+        // the OS IME composition window tracking the caret. Pickers have no
+        // caret, so `cursor_cell` is `None` for them by construction.
         let dialog_cursor = self.overlay.as_ref().and_then(Overlay::cursor_cell);
-        let editor = editor_layout(&self.editor, area_width(&self.terminal));
-        // Ghost text only appears while the input is empty and idle. Its visual
-        // rows use the editor's own width calculation below.
-        let ghost = self
+        let editor = editor_layout(&self.editor, width);
+        let editor_start = editor.cursor_row.saturating_sub(5);
+        // Ghost text only appears while the input is empty and idle, and uses
+        // the same width calculation as real input so a long suggestion cannot
+        // overrun the box.
+        let ghost_lines = self
             .suggestion
             .clone()
-            .filter(|_| self.editor.is_empty() && !running);
-        // Ghost text uses the same width calculation as actual input. Its rows
-        // remain read-only, but a longer suggestion must not overrun the box.
-        let ghost_lines = ghost.as_deref().map(|text| {
-            ghost_visual_lines(&format!("{text}  → to accept"), area_width(&self.terminal))
-        });
-        let popup: Vec<(String, String)> = if self.popup_active() {
-            self.completion_matches()
-                .into_iter()
-                .map(|completion| (completion.label, completion.description))
-                .collect()
-        } else {
-            Vec::new()
-        };
-        let popup_index = self.popup_index.min(popup.len().saturating_sub(1));
+            .filter(|_| self.editor.is_empty() && !running)
+            .map(|text| ghost_visual_lines(&format!("{text}  \u{2192} to accept"), width));
         let (panel_lines, panel_targets) = self.live_panel_lines();
-        let queued_lines = if viewing_trace {
-            Vec::new()
-        } else {
-            self.queued_lines(area_width(&self.terminal))
-        };
 
-        use ratatui::widgets::{Block, BorderType, Clear};
+        let sections = self.panel_sections(PanelInput {
+            running,
+            viewing_trace,
+            width,
+            editor: &editor,
+            editor_start,
+            ghost_lines,
+            panel_lines,
+            status: self.status_line(running, started),
+            hint: self.idle_hint(),
+        });
 
-        // The input box geometry is only known during layout; capture it so
-        // mouse hit-testing (selection/copy in the prompt) can map screen
-        // coordinates back to editor positions. None when a dialog/picker
-        // replaces the input box.
+        use ratatui::widgets::Clear;
+
+        // Hitboxes are only known once the layout is placed; capture them so
+        // mouse handling can map screen coordinates back to what was drawn.
         let mut captured_input: Option<InputHitbox> = None;
         let mut captured_status: Option<StatusHitboxes> = None;
         let mut captured_panel: Option<Rect> = None;
@@ -433,46 +521,19 @@ impl App {
             // previous, taller panel survive after the layout moves.
             frame.render_widget(Clear, area);
 
-            // ------- bottom panel height (transcript gets the rest) -------
-            let editor_start = editor.cursor_row.saturating_sub(5);
-            let editor_h = ghost_lines
-                .as_ref()
-                .map(|lines| lines.len().min(6))
-                .unwrap_or_else(|| editor.lines.len() - editor_start)
-                .clamp(1, 6) as u16;
-            let panel_h = if let Some(lines) = &dialog_lines {
-                lines.len() as u16 + 2
-            } else if viewing_trace {
-                (!panel_lines.is_empty() as u16) * (panel_lines.len() as u16 + 2)
-            } else {
-                let mut h = editor_h + 2 + 2; // input box + context meter + hint
-                if running {
-                    // Leave a breathing row after the transcript before the
-                    // live status line, rather than pinning "responding" to
-                    // the last rendered transcript row.
-                    h += 2; // separator + spinner/status line above the input box
-                }
-                h += queued_lines.len() as u16;
-                if !panel_lines.is_empty() {
-                    h += panel_lines.len() as u16 + 2;
-                }
-                if self.meter.rate_limits.is_some() {
-                    h += 1;
-                }
-                h + popup.len() as u16
-            };
-            // The transcript keeps at least a few visible rows.
-            let panel_h = panel_h.min(area.height.saturating_sub(4)).max(1);
-            let split = area.height.saturating_sub(panel_h);
+            // The panel is exactly as tall as its sections say; the transcript
+            // gets the rest.
+            let geometry =
+                PanelGeometry::new(sections.iter().map(Section::height).sum(), area.height);
             transcript.render(
                 frame.buffer_mut(),
                 Rect {
-                    height: split,
+                    height: geometry.top,
                     ..area
                 },
             );
 
-            let mut y = area.y + split;
+            let mut y = area.y + geometry.top;
             let row = |y: u16, h: u16| Rect {
                 x: area.x,
                 y,
@@ -480,175 +541,67 @@ impl App {
                 height: h.min(area.bottom().saturating_sub(y)),
             };
 
-            // Pickers and approval dialogs own the panel: a rounded
-            // accent-bordered box signals "keys go here now".
-            if let Some(lines) = dialog_lines {
-                let h = lines.len() as u16 + 2;
-                frame.render_widget(
-                    Paragraph::new(Text::from(lines)).block(
-                        Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .border_style(theme::border_active()),
-                    ),
-                    row(y, h),
-                );
-                // Place the terminal cursor on the focused note caret (+1 for
-                // the block border) so the IME follows it. Without this the
-                // hardware cursor stays hidden and IME composition detaches.
-                if let Some((crow, ccol)) = dialog_cursor {
-                    frame.set_cursor_position((area.x + 1 + ccol, y + 1 + crow));
-                }
-                return;
-            }
-
-            if viewing_trace {
-                if !panel_lines.is_empty() {
-                    let h = panel_lines.len() as u16 + 2;
-                    let rect = row(y, h);
-                    frame.render_widget(
-                        Paragraph::new(Text::from(panel_lines)).block(
-                            Block::bordered()
-                                .border_type(BorderType::Rounded)
-                                .border_style(theme::border()),
-                        ),
-                        rect,
-                    );
-                    captured_panel = Some(rect);
-                }
-                return;
-            }
-
-            if !panel_lines.is_empty() {
-                let h = panel_lines.len() as u16 + 2;
-                let rect = row(y, h);
-                frame.render_widget(
-                    Paragraph::new(Text::from(panel_lines)).block(
-                        Block::bordered()
-                            .border_type(BorderType::Rounded)
-                            .border_style(theme::border()),
-                    ),
-                    rect,
-                );
-                captured_panel = Some(rect);
-                y += h;
-            }
-
-            if running {
-                // The reserved row separates completed transcript content from
-                // the live turn indicator.
-                y += 1;
-                frame.render_widget(Paragraph::new(status), row(y, 1));
-                y += 1;
-            }
-
-            // Prompts already sent by the user but not yet by us: they sit
-            // between the spinner and the input box, where the next thing to
-            // reach the model belongs.
-            if !queued_lines.is_empty() {
-                let h = queued_lines.len() as u16;
-                frame.render_widget(Paragraph::new(Text::from(queued_lines)), row(y, h));
-                y += h;
-            }
-
-            // Input inside a rounded box, Claude Code style.
-            // Show the cursor even when a long multi-line prompt exceeds
-            // the six-row input box.
-            let inner: Vec<Line> = if let Some(lines) = &ghost_lines {
-                lines
-                    .iter()
-                    .take(6)
-                    .enumerate()
-                    .map(|(index, line)| {
-                        Line::from(vec![
-                            Span::styled(
-                                if index == 0 { "› " } else { "  " },
-                                theme::user_prompt(),
-                            ),
-                            Span::styled(line.clone(), theme::dim()),
-                        ])
-                    })
-                    .collect()
-            } else {
-                editor.lines[editor_start..]
-                    .iter()
-                    .take(6)
-                    .map(|vl| {
-                        let mut spans = vec![Span::styled(
-                            if vl.first_logical_line { "› " } else { "  " },
-                            theme::user_prompt(),
-                        )];
-                        match vl.selection {
-                            Some(selection) => spans.extend(input_spans(
-                                &vl.text,
-                                Some(selection),
-                                &self.reference_index,
-                            )),
-                            None => {
-                                spans.extend(input_spans(&vl.text, None, &self.reference_index))
-                            }
+            for section in sections {
+                let height = section.height();
+                let rect = row(y, height);
+                match section {
+                    // Pickers and approval dialogs own the panel: a rounded
+                    // accent-bordered box signals "keys go here now".
+                    Section::Overlay(lines) => {
+                        frame.render_widget(bordered(lines, theme::border_active()), rect);
+                        // Place the terminal cursor on the focused note caret
+                        // (+1 for the block border) so the IME follows it.
+                        // Without this the hardware cursor stays hidden and IME
+                        // composition detaches.
+                        if let Some((crow, ccol)) = dialog_cursor {
+                            frame.set_cursor_position((area.x + 1 + ccol, y + 1 + crow));
                         }
-                        Line::from(spans)
-                    })
-                    .collect()
-            };
-            let box_y = y;
-            let input_rect = row(y, editor_h + 2);
-            captured_input = Some(InputHitbox {
-                rect: input_rect,
-                editor_start,
-            });
-            frame.render_widget(
-                Paragraph::new(Text::from(inner)).block(
-                    Block::bordered()
-                        .border_type(BorderType::Rounded)
-                        .border_style(theme::border()),
-                ),
-                input_rect,
-            );
-            y += editor_h + 2;
-            frame.set_cursor_position((
-                area.x + 3 + editor.cursor_col as u16,
-                box_y + 1 + (editor.cursor_row - editor_start) as u16,
-            ));
-
-            frame.render_widget(
-                Paragraph::new(context_progress_line(
-                    self.meter.context_tokens,
-                    self.agent.model.snapshot().context_window,
-                    area.width,
-                    self.meter.context_estimated,
-                )),
-                row(y, 1),
-            );
-            y += 1;
-
-            if let Some(limits) = self.meter.rate_limits {
-                frame.render_widget(Paragraph::new(rate_limit_line(limits)), row(y, 1));
-                y += 1;
+                    }
+                    Section::LivePanel(lines) => {
+                        frame.render_widget(bordered(lines, theme::border()), rect);
+                        captured_panel = Some(rect);
+                    }
+                    // The reserved row separates completed transcript content
+                    // from the live turn indicator.
+                    Section::Gap => {}
+                    Section::Status(line) => frame.render_widget(Paragraph::new(line), rect),
+                    Section::Queued(lines) => {
+                        frame.render_widget(Paragraph::new(Text::from(lines)), rect)
+                    }
+                    Section::Input(lines) => {
+                        captured_input = Some(InputHitbox { rect, editor_start });
+                        frame.render_widget(bordered(lines, theme::border()), rect);
+                        // Show the cursor even when a long multi-line prompt
+                        // exceeds the six-row input box.
+                        frame.set_cursor_position((
+                            area.x + 3 + editor.cursor_col as u16,
+                            y + 1 + (editor.cursor_row - editor_start) as u16,
+                        ));
+                    }
+                    Section::ContextMeter {
+                        used,
+                        window,
+                        estimated,
+                    } => frame.render_widget(
+                        Paragraph::new(context_progress_line(used, window, area.width, estimated)),
+                        rect,
+                    ),
+                    Section::RateLimit(limits) => {
+                        frame.render_widget(Paragraph::new(rate_limit_line(limits)), rect)
+                    }
+                    Section::Popup(lines) => {
+                        frame.render_widget(Paragraph::new(Text::from(lines)), rect)
+                    }
+                    Section::Hint(line) => {
+                        if status_clickable {
+                            captured_status =
+                                Some(status_hitboxes(rect, &mode_label, &status_model_label));
+                        }
+                        frame.render_widget(Paragraph::new(line), rect);
+                    }
+                }
+                y += height;
             }
-
-            for (i, (c, d)) in popup.iter().enumerate() {
-                let line = if i == popup_index {
-                    Line::from(vec![
-                        Span::styled("  ▸ ".to_string(), theme::accent()),
-                        Span::styled(format!("{c:<10}"), theme::user_prompt()),
-                        Span::styled(format!(" {d}"), theme::accent()),
-                    ])
-                } else {
-                    Line::styled(format!("    {c:<10} {d}"), theme::dim())
-                };
-                frame.render_widget(Paragraph::new(line), row(y, 1));
-                y += 1;
-            }
-
-            if self.rewind_nav.is_none() {
-                captured_status = Some(status_hitboxes(
-                    row(y, 1),
-                    &self.mode_label,
-                    &status_model_label,
-                ));
-            }
-            frame.render_widget(Paragraph::new(hint), row(y, 1));
         })?;
         self.input_hitbox = captured_input;
         self.status_hitboxes = captured_status;
@@ -657,6 +610,128 @@ impl App {
             targets: panel_targets,
         });
         Ok(())
+    }
+
+    /// The bottom panel, top to bottom. An overlay replaces the whole panel; a
+    /// trace view shows only the agent tree; otherwise the full stack.
+    ///
+    /// This is the only place the panel's composition is decided, so `redraw`
+    /// never has to keep a running height in step with what it later paints.
+    fn panel_sections(&self, input: PanelInput<'_>) -> Vec<Section> {
+        if let Some(overlay) = self.overlay.as_ref() {
+            return vec![Section::Overlay(overlay.render(&self.overlay_ctx()))];
+        }
+        if input.viewing_trace {
+            return match input.panel_lines.is_empty() {
+                true => Vec::new(),
+                false => vec![Section::LivePanel(input.panel_lines)],
+            };
+        }
+
+        let input_lines = self.input_lines(&input);
+        let mut sections = Vec::new();
+        if !input.panel_lines.is_empty() {
+            sections.push(Section::LivePanel(input.panel_lines));
+        }
+        if input.running {
+            sections.push(Section::Gap);
+            sections.push(Section::Status(input.status));
+        }
+        // Prompts already sent by the user but not yet by us: they sit between
+        // the spinner and the input box, where the next thing to reach the
+        // model belongs.
+        let queued = self.queued_lines(input.width);
+        if !queued.is_empty() {
+            sections.push(Section::Queued(queued));
+        }
+        sections.push(Section::Input(input_lines));
+        sections.push(Section::ContextMeter {
+            used: self.meter.context_tokens,
+            window: self.agent.model.snapshot().context_window,
+            estimated: self.meter.context_estimated,
+        });
+        if let Some(limits) = self.meter.rate_limits {
+            sections.push(Section::RateLimit(limits));
+        }
+        if self.popup_active() {
+            sections.push(Section::Popup(self.popup_lines()));
+        }
+        sections.push(Section::Hint(input.hint));
+        sections
+    }
+
+    /// Inner rows of the input box: either the ghost suggestion or the real
+    /// prompt, both under the same rail.
+    fn input_lines(&self, input: &PanelInput<'_>) -> Vec<Line<'static>> {
+        if let Some(lines) = &input.ghost_lines {
+            return lines
+                .iter()
+                .take(6)
+                .enumerate()
+                .map(|(index, line)| {
+                    Line::from(vec![
+                        Span::styled(
+                            if index == 0 { "\u{203a} " } else { "  " },
+                            theme::user_prompt(),
+                        ),
+                        Span::styled(line.clone(), theme::dim()),
+                    ])
+                })
+                .collect();
+        }
+        input.editor.lines[input.editor_start..]
+            .iter()
+            .take(6)
+            .map(|visual| {
+                let mut spans = vec![Span::styled(
+                    if visual.first_logical_line {
+                        "\u{203a} "
+                    } else {
+                        "  "
+                    },
+                    theme::user_prompt(),
+                )];
+                spans.extend(input_spans(
+                    &visual.text,
+                    visual.selection,
+                    &self.reference_index,
+                ));
+                Line::from(spans)
+            })
+            .collect()
+    }
+
+    fn popup_lines(&self) -> Vec<Line<'static>> {
+        let matches = self.completion_matches();
+        let selected = self.popup_index.min(matches.len().saturating_sub(1));
+        matches
+            .into_iter()
+            .enumerate()
+            .map(|(index, completion)| {
+                let (label, description) = (completion.label, completion.description);
+                if index == selected {
+                    Line::from(vec![
+                        Span::styled("  \u{25b8} ".to_string(), theme::accent()),
+                        Span::styled(format!("{label:<10}"), theme::user_prompt()),
+                        Span::styled(format!(" {description}"), theme::accent()),
+                    ])
+                } else {
+                    Line::styled(format!("    {label:<10} {description}"), theme::dim())
+                }
+            })
+            .collect()
+    }
+
+    /// The panel an open overlay produces. Mouse hit-testing calls this, so it
+    /// agrees with what `redraw` painted by construction rather than by a
+    /// duplicated formula.
+    pub(super) fn overlay_geometry(&self) -> Option<PanelGeometry> {
+        let overlay = self.overlay.as_ref()?;
+        let section = Section::Overlay(overlay.render(&self.overlay_ctx()));
+        Some(PanelGeometry::new(
+            section.height(),
+            area_height(&self.terminal),
+        ))
     }
 
     /// Spinner line shown above the input while a turn runs. The sparkle
@@ -768,5 +843,66 @@ impl App {
         }
         spans.push(Span::styled(" · /help".to_string(), theme::dim()));
         Line::from(spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rows(n: usize) -> Vec<Line<'static>> {
+        vec![Line::raw("x"); n]
+    }
+
+    /// The panel is exactly the sum of its sections. That is what lets
+    /// painting and hit-testing share one geometry instead of each keeping a
+    /// running height in step by hand.
+    #[test]
+    fn panel_height_is_the_sum_of_its_sections() {
+        let sections = vec![
+            Section::LivePanel(rows(3)),
+            Section::Gap,
+            Section::Status(Line::raw("")),
+            Section::Input(rows(2)),
+            Section::ContextMeter {
+                used: 0,
+                window: 1,
+                estimated: false,
+            },
+            Section::Hint(Line::raw("")),
+        ];
+        let total: u16 = sections.iter().map(Section::height).sum();
+        assert_eq!(total, 5 + 1 + 1 + 4 + 1 + 1);
+    }
+
+    /// However long the prompt, the input box shows at most six rows, and it
+    /// never collapses to nothing when the draft is empty.
+    #[test]
+    fn the_input_box_stays_between_one_and_six_rows() {
+        assert_eq!(Section::Input(rows(0)).height(), 3);
+        assert_eq!(Section::Input(rows(1)).height(), 3);
+        assert_eq!(Section::Input(rows(20)).height(), 8);
+    }
+
+    /// A panel that wants the whole screen still leaves the transcript
+    /// readable behind it.
+    #[test]
+    fn a_tall_panel_still_leaves_the_transcript_visible() {
+        let geometry = PanelGeometry::new(100, 20);
+        assert_eq!(geometry.height, 16);
+        assert_eq!(geometry.top, 4);
+    }
+
+    /// Border rows are not content. A click on the box edge must not be
+    /// reported as the first or last row inside it.
+    #[test]
+    fn content_rows_exclude_the_panel_border() {
+        let geometry = PanelGeometry::new(6, 20);
+        assert_eq!(geometry.top, 14);
+        assert_eq!(geometry.content_row(14), None, "top border");
+        assert_eq!(geometry.content_row(15), Some(0));
+        assert_eq!(geometry.content_row(18), Some(3));
+        assert_eq!(geometry.content_row(19), None, "bottom border");
+        assert_eq!(geometry.content_row(2), None, "transcript above the panel");
     }
 }

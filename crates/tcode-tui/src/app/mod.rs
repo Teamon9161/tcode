@@ -778,23 +778,18 @@ impl App {
         }
 
         let width = area_width(&self.terminal);
-        let height = area_height(&self.terminal);
-        let budget = height.saturating_sub(6);
+        let budget = area_height(&self.terminal).saturating_sub(6);
+        // Ask the layout where the panel is rather than reconstructing it: a
+        // click must land on the row that was actually painted.
+        let Some(row) = self
+            .overlay_geometry()
+            .and_then(|geometry| geometry.content_row(mouse.row))
+        else {
+            return;
+        };
         let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) else {
             return;
         };
-        // Match `redraw`'s panel geometry so a screen coordinate is translated
-        // to the panel's border-free content row, not the transcript behind
-        // the modal.
-        let lines = dialog.render(width, budget);
-        let panel_h = (lines.len() as u16 + 2)
-            .min(height.saturating_sub(4))
-            .max(1);
-        let panel_top = height.saturating_sub(panel_h);
-        if mouse.row <= panel_top || mouse.row >= panel_top + panel_h.saturating_sub(1) {
-            return;
-        }
-        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
         let col = mouse.column.saturating_sub(1) as usize;
         if !dialog.is_plan() {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
@@ -835,16 +830,16 @@ impl App {
             self.on_dialog_mouse(mouse);
             return true;
         }
-        let height = area_height(&self.terminal);
-        let lines = overlay.render(&self.overlay_ctx());
-        let panel_h = (lines.len() as u16 + 2)
-            .min(height.saturating_sub(4))
-            .max(1);
-        let panel_top = height.saturating_sub(panel_h);
-        let inside = mouse.row > panel_top && mouse.row < panel_top + panel_h.saturating_sub(1);
-        if !inside {
+        // Ask the layout where the panel is rather than reconstructing it: a
+        // click must land on the row that was actually painted.
+        let geometry = self.overlay_geometry().expect("overlay present");
+        let Some(row) = geometry.content_row(mouse.row) else {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                let flow = overlay.on_click_away();
+                let flow = self
+                    .overlay
+                    .as_ref()
+                    .expect("overlay present")
+                    .on_click_away();
                 self.on_overlay_flow(flow);
             } else if matches!(mouse.kind, MouseEventKind::Moved) {
                 self.drive_overlay(|overlay, ctx| {
@@ -853,8 +848,7 @@ impl App {
                 });
             }
             return true;
-        }
-        let row = mouse.row.saturating_sub(panel_top + 1) as usize;
+        };
         if matches!(mouse.kind, MouseEventKind::Moved) {
             self.drive_overlay(|overlay, ctx| {
                 overlay.set_hovered_row(Some(row), ctx);
