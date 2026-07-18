@@ -1584,147 +1584,14 @@ impl App {
                 name,
                 summary,
                 input,
-            } => {
-                self.space_before_response = false;
-                match self.renderers.get(&name).route() {
-                    CallRoute::Progress => {
-                        self.update_progress(&input);
-                        self.state_label = "updating progress".into();
-                        return;
-                    }
-                    // The question and its answer are already baked by the
-                    // approval dialog; a second header is noise.
-                    CallRoute::Silent => return,
-                    CallRoute::Transcript => {}
-                }
-                // Recompute the header from name+input so a long/multi-line
-                // shell command gets a capped preview and folded detail,
-                // instead of the raw command string core put in `summary`.
-                let _ = summary;
-                let summary = self.display_summary(&self.renderers.get(&name).header(
-                    &name,
-                    &input,
-                    Some(&self.cwd),
-                ));
-                self.bake_live_text();
-                self.finish_thinking();
-                if !self.pending_batch.is_empty() {
-                    self.state_label = format!("running: {summary}");
-                    return;
-                }
-                // If this call's diff was already baked in full while its
-                // approval dialog was open, keep that block — don't render a
-                // second, capped copy.
-                let header_index = if self.change_prebake.take().is_none() {
-                    self.bake_call_start(&name, &input)
-                } else {
-                    None
-                };
-                // A bare call's header shimmers while the tool runs; calls
-                // whose record is a baked body (diff/preview) stay static.
-                self.transcript.set_live_head(header_index);
-                self.pending_tool = Some(PendingCall {
-                    call_id,
-                    detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
-                    header: Vec::new(),
-                    header_index,
-                });
-                self.state_label = format!("running: {summary}");
-            }
+            } => self.on_tool_start(call_id, name, summary, input),
             AgentEvent::ToolEnd {
                 call_id,
                 name,
                 preview,
                 content,
                 is_error,
-            } => {
-                if !is_error
-                    && self
-                        .agent
-                        .tools
-                        .iter()
-                        .any(|tool| tool.name() == name && tool.is_mutating())
-                {
-                    self.refresh_reference_index();
-                }
-                if !matches!(self.renderers.get(&name).route(), CallRoute::Transcript) {
-                    self.state_label = "responding".into();
-                    return;
-                }
-                let task_run = self
-                    .task_runs
-                    .iter()
-                    .find(|run| run.parent_call == call_id)
-                    .map(|run| run.id.clone());
-                let linked_run = task_run
-                    .as_ref()
-                    .and_then(|run| {
-                        self.task_runs
-                            .iter()
-                            .find(|entry| entry.id == *run && entry.block.is_none())
-                    })
-                    .map(|run| run.id.clone());
-                let blocks_before = self.transcript.block_count();
-                let entry = self
-                    .pending_tool
-                    .take()
-                    .filter(|entry| entry.call_id == call_id)
-                    .or_else(|| {
-                        let position = self
-                            .pending_batch
-                            .iter()
-                            .position(|entry| entry.call_id == call_id)?;
-                        self.pending_batch.remove(position)
-                    });
-                // Last in-flight call finished: stop the header shimmer.
-                if self.pending_tool.is_none() && self.pending_batch.is_empty() {
-                    self.transcript.set_live_head(None);
-                }
-                // Recover the call's input (stashed as JSON) to decide whether
-                // the output is markdown before the result is appended to it.
-                let (input, record) = match entry {
-                    Some(entry) => {
-                        let record = match entry.header_index {
-                            Some(index) => CallRecord::HeaderBlock(index),
-                            None if !entry.header.is_empty() => {
-                                let header = entry.header;
-                                CallRecord::Batch(header)
-                            }
-                            None => CallRecord::Baked,
-                        };
-                        (
-                            serde_json::from_str::<serde_json::Value>(&entry.detail).ok(),
-                            record,
-                        )
-                    }
-                    None => (None, CallRecord::Baked),
-                };
-                // The gated result is exactly what is appended to the next
-                // model request, so it belongs in the in-between estimate.
-                self.meter.add_context(approx_tokens(&content) as u64);
-                let report = task_run.as_ref().map(|_| task_result_text(&content));
-                self.bake_call_result(
-                    &name,
-                    input.as_ref(),
-                    &preview,
-                    report.as_deref().unwrap_or(&content),
-                    is_error,
-                    record,
-                );
-                if let Some(run) =
-                    linked_run.filter(|_| self.transcript.block_count() > blocks_before)
-                {
-                    if let Some(index) = self.transcript.last_block_index() {
-                        self.transcript.link_task_run(index, run.clone());
-                        if let Some(entry) = self.task_runs.iter_mut().find(|entry| entry.id == run)
-                        {
-                            entry.block = Some(index);
-                        }
-                    }
-                }
-                self.space_before_response = true;
-                self.state_label = "responding".into();
-            }
+            } => self.on_tool_end(call_id, name, preview, content, is_error),
             AgentEvent::ReferencesExpanded {
                 labels,
                 added_tokens,
@@ -1850,60 +1717,7 @@ impl App {
                 model,
                 prompt,
                 summary,
-            } => {
-                // ToolStart always precedes a task's delegated start. Single
-                // calls already have a header block; batch calls receive their
-                // link when their item bakes at ToolEnd.
-                let mut block = self
-                    .pending_tool
-                    .as_ref()
-                    .filter(|call| call.call_id == parent_call)
-                    .and_then(|call| call.header_index);
-                if let Some(index) = block {
-                    self.transcript.link_task_run(index, run.clone());
-                    self.transcript.attach_detail(
-                        index,
-                        task_summary_detail(&summary),
-                        OUTPUT_VIEW_ROWS,
-                    );
-                    self.transcript
-                        .set_live_status(index, Some(task_plain_status("starting…")));
-                } else if let Some(position) = self
-                    .pending_batch
-                    .iter()
-                    .position(|call| call.call_id == parent_call)
-                {
-                    // A parallel task's batch item normally waits for its
-                    // result. It is a live trace card, though, so bake it now
-                    // and retain the header index for the eventual report.
-                    let mut call = self
-                        .pending_batch
-                        .remove(position)
-                        .expect("position checked");
-                    let index = self.transcript.block_count();
-                    self.bake(std::mem::take(&mut call.header));
-                    call.header_index = Some(index);
-                    self.pending_batch.insert(position, call);
-                    block = Some(index);
-                    self.transcript.link_task_run(index, run.clone());
-                    self.transcript.attach_detail(
-                        index,
-                        task_summary_detail(&summary),
-                        OUTPUT_VIEW_ROWS,
-                    );
-                    self.transcript
-                        .set_live_status(index, Some(task_plain_status("starting…")));
-                }
-                self.task_runs.push(UiTaskRun::new(
-                    run,
-                    parent_call,
-                    kind,
-                    model,
-                    prompt,
-                    summary,
-                    block,
-                ));
-            }
+            } => self.on_task_run_started(run, parent_call, kind, model, prompt, summary),
             AgentEvent::TaskRunFinished {
                 run,
                 status,
@@ -1984,6 +1798,215 @@ impl App {
 
     /// Bake the original human wording of an approved annotation. Both the
     /// post-result core event and resumed `Entry::UserNote` reach this path.
+    /// A tool call started: route it, bake its header, and mark it in flight.
+    fn on_tool_start(
+        &mut self,
+        call_id: String,
+        name: String,
+        summary: String,
+        input: serde_json::Value,
+    ) {
+        self.space_before_response = false;
+        match self.renderers.get(&name).route() {
+            CallRoute::Progress => {
+                self.update_progress(&input);
+                self.state_label = "updating progress".into();
+                return;
+            }
+            // The question and its answer are already baked by the
+            // approval dialog; a second header is noise.
+            CallRoute::Silent => return,
+            CallRoute::Transcript => {}
+        }
+        // Recompute the header from name+input so a long/multi-line
+        // shell command gets a capped preview and folded detail,
+        // instead of the raw command string core put in `summary`.
+        let _ = summary;
+        let summary = self.display_summary(&self.renderers.get(&name).header(
+            &name,
+            &input,
+            Some(&self.cwd),
+        ));
+        self.bake_live_text();
+        self.finish_thinking();
+        if !self.pending_batch.is_empty() {
+            self.state_label = format!("running: {summary}");
+            return;
+        }
+        // If this call's diff was already baked in full while its
+        // approval dialog was open, keep that block — don't render a
+        // second, capped copy.
+        let header_index = if self.change_prebake.take().is_none() {
+            self.bake_call_start(&name, &input)
+        } else {
+            None
+        };
+        // A bare call's header shimmers while the tool runs; calls
+        // whose record is a baked body (diff/preview) stay static.
+        self.transcript.set_live_head(header_index);
+        self.pending_tool = Some(PendingCall {
+            call_id,
+            detail: serde_json::to_string_pretty(&input).unwrap_or_default(),
+            header: Vec::new(),
+            header_index,
+        });
+        self.state_label = format!("running: {summary}");
+    }
+
+    /// A tool call finished: bake its result into the record its header owns,
+    /// and link it back to a sub-agent run when one produced it.
+    fn on_tool_end(
+        &mut self,
+        call_id: String,
+        name: String,
+        preview: String,
+        content: String,
+        is_error: bool,
+    ) {
+        if !is_error
+            && self
+                .agent
+                .tools
+                .iter()
+                .any(|tool| tool.name() == name && tool.is_mutating())
+        {
+            self.refresh_reference_index();
+        }
+        if !matches!(self.renderers.get(&name).route(), CallRoute::Transcript) {
+            self.state_label = "responding".into();
+            return;
+        }
+        let task_run = self
+            .task_runs
+            .iter()
+            .find(|run| run.parent_call == call_id)
+            .map(|run| run.id.clone());
+        let linked_run = task_run
+            .as_ref()
+            .and_then(|run| {
+                self.task_runs
+                    .iter()
+                    .find(|entry| entry.id == *run && entry.block.is_none())
+            })
+            .map(|run| run.id.clone());
+        let blocks_before = self.transcript.block_count();
+        let entry = self
+            .pending_tool
+            .take()
+            .filter(|entry| entry.call_id == call_id)
+            .or_else(|| {
+                let position = self
+                    .pending_batch
+                    .iter()
+                    .position(|entry| entry.call_id == call_id)?;
+                self.pending_batch.remove(position)
+            });
+        // Last in-flight call finished: stop the header shimmer.
+        if self.pending_tool.is_none() && self.pending_batch.is_empty() {
+            self.transcript.set_live_head(None);
+        }
+        // Recover the call's input (stashed as JSON) to decide whether
+        // the output is markdown before the result is appended to it.
+        let (input, record) = match entry {
+            Some(entry) => {
+                let record = match entry.header_index {
+                    Some(index) => CallRecord::HeaderBlock(index),
+                    None if !entry.header.is_empty() => {
+                        let header = entry.header;
+                        CallRecord::Batch(header)
+                    }
+                    None => CallRecord::Baked,
+                };
+                (
+                    serde_json::from_str::<serde_json::Value>(&entry.detail).ok(),
+                    record,
+                )
+            }
+            None => (None, CallRecord::Baked),
+        };
+        // The gated result is exactly what is appended to the next
+        // model request, so it belongs in the in-between estimate.
+        self.meter.add_context(approx_tokens(&content) as u64);
+        let report = task_run.as_ref().map(|_| task_result_text(&content));
+        self.bake_call_result(
+            &name,
+            input.as_ref(),
+            &preview,
+            report.as_deref().unwrap_or(&content),
+            is_error,
+            record,
+        );
+        if let Some(run) = linked_run.filter(|_| self.transcript.block_count() > blocks_before) {
+            if let Some(index) = self.transcript.last_block_index() {
+                self.transcript.link_task_run(index, run.clone());
+                if let Some(entry) = self.task_runs.iter_mut().find(|entry| entry.id == run) {
+                    entry.block = Some(index);
+                }
+            }
+        }
+        self.space_before_response = true;
+        self.state_label = "responding".into();
+    }
+
+    /// A sub-agent run began. Its live trace card hangs off the parent call's
+    /// header block, which a batch item has to bake early to obtain.
+    fn on_task_run_started(
+        &mut self,
+        run: String,
+        parent_call: String,
+        kind: String,
+        model: String,
+        prompt: String,
+        summary: String,
+    ) {
+        // ToolStart always precedes a task's delegated start. Single
+        // calls already have a header block; batch calls receive their
+        // link when their item bakes at ToolEnd.
+        let mut block = self
+            .pending_tool
+            .as_ref()
+            .filter(|call| call.call_id == parent_call)
+            .and_then(|call| call.header_index);
+        if let Some(index) = block {
+            self.transcript.link_task_run(index, run.clone());
+            self.transcript
+                .attach_detail(index, task_summary_detail(&summary), OUTPUT_VIEW_ROWS);
+            self.transcript
+                .set_live_status(index, Some(task_plain_status("starting…")));
+        } else if let Some(position) = self
+            .pending_batch
+            .iter()
+            .position(|call| call.call_id == parent_call)
+        {
+            // A parallel task's batch item normally waits for its
+            // result. It is a live trace card, though, so bake it now
+            // and retain the header index for the eventual report.
+            let mut call = self
+                .pending_batch
+                .remove(position)
+                .expect("position checked");
+            let index = self.transcript.block_count();
+            self.bake(std::mem::take(&mut call.header));
+            call.header_index = Some(index);
+            self.pending_batch.insert(position, call);
+            block = Some(index);
+            self.transcript.link_task_run(index, run.clone());
+            self.transcript
+                .attach_detail(index, task_summary_detail(&summary), OUTPUT_VIEW_ROWS);
+            self.transcript
+                .set_live_status(index, Some(task_plain_status("starting…")));
+        }
+        self.task_runs.push(UiTaskRun::new(
+            run,
+            parent_call,
+            kind,
+            model,
+            prompt,
+            summary,
+            block,
+        ));
+    }
+
     fn bake_user_note(&mut self, text: &str) {
         let mut lines = vec![Line::default()];
         lines.extend(quote_lines(Some(NOTE_LABEL), text));
