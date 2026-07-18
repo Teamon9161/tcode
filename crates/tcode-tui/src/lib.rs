@@ -20,6 +20,7 @@ mod render;
 mod resume;
 mod theme;
 mod transcript;
+mod usage;
 mod view;
 mod view_picker;
 pub mod wizard;

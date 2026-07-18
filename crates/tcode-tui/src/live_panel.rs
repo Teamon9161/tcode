@@ -13,6 +13,7 @@ use tcode_core::{AgentEvent, TaskRunStatus, Usage};
 use crate::render::RenderRegistry;
 use crate::theme;
 use crate::transcript::wrap_lines;
+use crate::usage::{add_usage, token_count};
 
 /// Progress rows stay small and predictable; long phase lists render a focused
 /// window instead of stealing scroll focus from the transcript.
@@ -383,22 +384,6 @@ fn fmt_elapsed(secs: u64) -> String {
     } else {
         format!("{}m{:02}s", secs / 60, secs % 60)
     }
-}
-
-fn token_count(tokens: u64) -> String {
-    if tokens >= 1_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        tokens.to_string()
-    }
-}
-
-fn add_usage(mut total: Usage, usage: Usage) -> Usage {
-    total.input_tokens += usage.input_tokens;
-    total.output_tokens += usage.output_tokens;
-    total.cache_read_tokens += usage.cache_read_tokens;
-    total.cache_write_tokens += usage.cache_write_tokens;
-    total
 }
 
 fn title_case(name: &str) -> String {

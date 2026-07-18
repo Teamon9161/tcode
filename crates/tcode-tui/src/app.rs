@@ -42,6 +42,9 @@ use crate::render::{
 };
 use crate::resume;
 use crate::transcript::Transcript;
+use crate::usage::{
+    context_progress_line, rate_limit_line, token_count, turn_summary_line, TurnMeter,
+};
 use crate::view::{BakeCtx, SessionView};
 use crate::view_picker::{self, ViewId};
 use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
@@ -519,35 +522,15 @@ pub struct App {
     thinking_text: String,
     thinking_since: Option<Instant>,
     show_reasoning: bool,
-    out_tokens: usize,
-    delegated_usage: Usage,
-    rate_limits: Option<tcode_core::RateLimits>,
-    /// Time the running turn was deliberately paused for a human decision.
-    /// Completion receipts report active execution time, not time spent away
-    /// from the terminal deciding about a change or answering a question.
-    user_wait_started: Option<Instant>,
-    user_wait_total: Duration,
-    /// Best available estimate of the conversation currently occupying the
-    /// model window. A completed provider usage event replaces estimates;
-    /// streamed output and tool results keep it moving between those events.
-    context_tokens: u64,
-    /// Start of the current model request. This lets a retry discard the
-    /// speculative streamed-token estimate from the failed attempt.
-    context_step_start: u64,
-    /// Session JSONL stores messages, not provider token counters. A resumed
-    /// conversation starts from a local estimate until its next response
-    /// supplies an authoritative usage event.
-    context_estimated: bool,
+    /// Token accounting for the status row and the turn receipt. These
+    /// figures move together, so they live behind one type — see `usage.rs`.
+    meter: TurnMeter,
     state_label: String,
-    turn_usage: Usage,
     mode_label: String,
     spinner: usize,
     /// Monotonic 100ms shimmer frame for the main running status and in-flight
     /// tool headers. Unlike `spinner` it never wraps, so the sweep stays continuous.
     anim_frame: usize,
-    /// Cache-read share of the previous turn; the regression sentinel
-    /// compares against it so cache decay is visible immediately.
-    prev_cache_ratio: Option<f64>,
     should_exit: bool,
     provider_setup_requested: bool,
     /// Transient feedback ("copied 3 lines") shown in the hint row.
@@ -681,21 +664,12 @@ impl App {
             thinking_text: String::new(),
             thinking_since: None,
             show_reasoning,
-            out_tokens: 0,
-            delegated_usage: Usage::default(),
-            rate_limits: None,
-            user_wait_started: None,
-            user_wait_total: Duration::ZERO,
-            context_tokens,
-            context_step_start: context_tokens,
-            context_estimated,
+            meter: TurnMeter::new(context_tokens, context_estimated),
             state_label: String::new(),
             retry_wait: None,
-            turn_usage: Usage::default(),
             mode_label,
             spinner: 0,
             anim_frame: 0,
-            prev_cache_ratio: None,
             should_exit: false,
             provider_setup_requested: false,
             notice: None,
@@ -767,9 +741,7 @@ impl App {
                     }
                 }
                 Some(ask) = self.ask_rx.recv() => {
-                    if self.user_wait_started.is_none() {
-                        self.user_wait_started = Some(Instant::now());
-                    }
+                    self.meter.pause_for_user();
                     let dialog = if ask.tool == "ask_user" {
                         Dialog::questions(ask.summary, &ask.input)
                     } else if ask.tool == "exit_plan" {
@@ -1318,8 +1290,10 @@ impl App {
                 _ => None,
             })
             .sum();
-        self.context_tokens = session.last_prompt_tokens.saturating_add(prompt_tokens);
-        self.context_step_start = self.context_tokens;
+        self.meter.set_context(
+            session.last_prompt_tokens.saturating_add(prompt_tokens),
+            self.meter.context_estimated,
+        );
         // Echo the user input into the transcript, tagged with the ledger
         // index its User entry is about to occupy (rewind jumps to it).
         let entry_index = session.ledger.entries().len();
@@ -1331,11 +1305,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
-        self.turn_usage = Usage::default();
-        self.delegated_usage = Usage::default();
-        self.user_wait_started = None;
-        self.user_wait_total = Duration::ZERO;
-        self.out_tokens = 0;
+        self.meter.start_turn();
         self.thinking_chars = 0;
         self.state_label = "sending".into();
 
@@ -1399,11 +1369,7 @@ impl App {
 
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
-        self.turn_usage = Usage::default();
-        self.delegated_usage = Usage::default();
-        self.user_wait_started = None;
-        self.user_wait_total = Duration::ZERO;
-        self.out_tokens = 0;
+        self.meter.start_turn();
         self.thinking_chars = 0;
         self.state_label = "monitor event".into();
 
@@ -1438,13 +1404,9 @@ impl App {
             return;
         }
         session.turn_usage = Usage::default();
-        self.turn_usage = Usage::default();
-        self.delegated_usage = Usage::default();
-        self.user_wait_started = None;
-        self.user_wait_total = Duration::ZERO;
-        self.out_tokens = 0;
+        self.meter.start_turn();
         // Legitimate prefix rewrite: don't false-alarm next turn.
-        self.prev_cache_ratio = None;
+        self.meter.forget_cache_baseline();
         self.state_label = "compacting".into();
         // Compaction reports through the same event channel a turn does, so
         // its summary is baked by the one `Compacted` handler either way.
@@ -1482,26 +1444,18 @@ impl App {
 
         let (mut session, result) = done;
         let elapsed = match &self.phase {
-            Phase::Running { started, .. } => started
-                .elapsed()
-                .saturating_sub(self.user_wait_total)
-                .saturating_sub(
-                    self.user_wait_started
-                        .map(|wait| wait.elapsed())
-                        .unwrap_or_default(),
-                )
-                .as_secs_f32(),
+            Phase::Running { started, .. } => self.meter.active_elapsed(*started),
             Phase::Idle => 0.0,
         };
         // The session's per-turn tally is authoritative (it also covers
         // compaction, which streams no Usage events to the UI).
-        self.turn_usage = add_usage(session.turn_usage, self.delegated_usage);
-        self.context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
-        if self.context_estimated {
+        self.meter.finish_turn(session.turn_usage);
+        let estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
+        if estimated {
             session.last_prompt_tokens = self.agent.estimate_context_tokens(&session);
         }
-        self.context_tokens = session.last_prompt_tokens;
-        self.context_step_start = self.context_tokens;
+        self.meter
+            .set_context(session.last_prompt_tokens, estimated);
         self.session = Some(session);
         self.phase = Phase::Idle;
         self.events_rx = None;
@@ -1525,26 +1479,17 @@ impl App {
                 theme::error_highlight(),
             )]);
         }
-        let u = self.turn_usage;
+        let u = self.meter.turn;
         self.bake(vec![turn_summary_line(elapsed, u)]);
-        // Cache regression sentinel: an append-only ledger should keep
-        // the hit share high; a sharp drop means something rewrote the
-        // prefix and deserves attention now, not on the monthly bill.
-        if u.total_input() > 0 {
-            let ratio = u.cache_read_tokens as f64 / u.total_input() as f64;
-            if let Some(prev) = self.prev_cache_ratio {
-                if prev >= 0.5 && ratio < prev * 0.5 {
-                    self.bake(vec![Line::styled(
-                        format!(
-                            "⚠ cache hit fell {:.0}% → {:.0}% — prompt prefix changed unexpectedly",
-                            prev * 100.0,
-                            ratio * 100.0
-                        ),
-                        ratatui::style::Style::default().fg(theme::WARN),
-                    )]);
-                }
-            }
-            self.prev_cache_ratio = Some(ratio);
+        if let Some((prev, ratio)) = self.meter.take_cache_regression() {
+            self.bake(vec![Line::styled(
+                format!(
+                    "⚠ cache hit fell {:.0}% → {:.0}% — prompt prefix changed unexpectedly",
+                    prev * 100.0,
+                    ratio * 100.0
+                ),
+                ratatui::style::Style::default().fg(theme::WARN),
+            )]);
         }
         // Whatever the loop never reached a boundary to deliver — a message
         // queued during the closing answer, or one queued right before ctrl+c —
@@ -1582,7 +1527,7 @@ impl App {
                 // The retry succeeded (or this is the first attempt): drop the
                 // countdown.
                 self.retry_wait = None;
-                self.context_step_start = self.context_tokens;
+                self.meter.begin_step();
                 self.state_label = "responding".into();
             }
             AgentEvent::TextDelta(t) => {
@@ -1592,8 +1537,7 @@ impl App {
                     self.space_before_response = false;
                 }
                 let tokens = approx_tokens(&t);
-                self.out_tokens += tokens;
-                self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
+                self.meter.on_streamed_tokens(tokens);
                 self.live_text.push_str(&t);
                 self.refresh_live_text();
                 self.state_label = "writing".into();
@@ -1603,8 +1547,7 @@ impl App {
                     self.thinking_since = Some(Instant::now());
                 }
                 let tokens = approx_tokens(&t);
-                self.out_tokens += tokens;
-                self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
+                self.meter.on_streamed_tokens(tokens);
                 self.thinking_chars += t.chars().count();
                 self.thinking_text.push_str(&t);
                 self.state_label = "thinking".into();
@@ -1614,8 +1557,7 @@ impl App {
                 // moves while the model assembles a call. The call header itself
                 // is rendered later by ToolStart, so nothing is baked here.
                 let tokens = approx_tokens(&t);
-                self.out_tokens += tokens;
-                self.context_tokens = self.context_tokens.saturating_add(tokens as u64);
+                self.meter.on_streamed_tokens(tokens);
                 self.state_label = "calling tool".into();
             }
             AgentEvent::ToolBatchStart { label, calls } => {
@@ -1774,9 +1716,7 @@ impl App {
                 };
                 // The gated result is exactly what is appended to the next
                 // model request, so it belongs in the in-between estimate.
-                self.context_tokens = self
-                    .context_tokens
-                    .saturating_add(approx_tokens(&content) as u64);
+                self.meter.add_context(approx_tokens(&content) as u64);
                 let report = task_run.as_ref().map(|_| task_result_text(&content));
                 self.bake_call_result(
                     &name,
@@ -1804,7 +1744,7 @@ impl App {
                 labels,
                 added_tokens,
             } => {
-                self.context_tokens = self.context_tokens.saturating_add(added_tokens as u64);
+                self.meter.add_context(added_tokens as u64);
                 let count = labels.len();
                 let summary = labels.into_iter().take(2).collect::<Vec<_>>().join(", ");
                 let more = if count > 2 {
@@ -1860,7 +1800,7 @@ impl App {
                 // the core ledger persists the same text as IncompleteAssistant.
                 self.bake_live_text();
                 self.finish_thinking();
-                self.context_tokens = self.context_step_start;
+                self.meter.rewind_step();
                 // Record the failure in red scrollback, then show a live
                 // countdown in the status line until the next attempt fires.
                 let retained = if partial_output_retained {
@@ -1880,24 +1820,17 @@ impl App {
                 self.state_label = format!("retrying ({attempt}/{max})");
             }
             AgentEvent::Usage(u) => {
-                self.turn_usage.input_tokens += u.input_tokens;
-                self.turn_usage.output_tokens += u.output_tokens;
-                self.turn_usage.cache_read_tokens += u.cache_read_tokens;
-                self.turn_usage.cache_write_tokens += u.cache_write_tokens;
+                self.meter.on_usage(u);
                 // Providers report the full prompt (cached tokens included)
                 // plus this response; this is the most accurate context
                 // figure available to the TUI.
-                self.context_tokens = u.total_input().saturating_add(u.output_tokens);
-                self.context_step_start = self.context_tokens;
-                self.context_estimated = false;
+                // `on_usage` also re-anchors the retry rewind point.
             }
-            AgentEvent::RateLimits(limits) => self.rate_limits = Some(limits),
+            AgentEvent::RateLimits(limits) => self.meter.rate_limits = Some(limits),
             AgentEvent::DelegatedUsage(u) => {
                 // Sub-agent requests are billable and should animate the
                 // turn's token counter, but run in an isolated context.
-                self.delegated_usage = add_usage(self.delegated_usage, u);
-                self.turn_usage = add_usage(self.turn_usage, u);
-                self.out_tokens = self.out_tokens.saturating_add(u.output_tokens as usize);
+                self.meter.on_delegated_usage(u);
                 self.state_label = "sub-agent working".into();
             }
             AgentEvent::TaskRunEvent { run, event } => {
@@ -1905,9 +1838,7 @@ impl App {
                 // Usage inside a run carries delegated semantics: billable,
                 // animates the counter, never the parent's context meter.
                 if let AgentEvent::Usage(u) | AgentEvent::DelegatedUsage(u) = event.as_ref() {
-                    self.delegated_usage = add_usage(self.delegated_usage, *u);
-                    self.turn_usage = add_usage(self.turn_usage, *u);
-                    self.out_tokens = self.out_tokens.saturating_add(u.output_tokens as usize);
+                    self.meter.on_delegated_usage(*u);
                 }
                 if let Some(position) = self.task_runs.iter().position(|entry| entry.id == run) {
                     let entry = &mut self.task_runs[position];
@@ -2016,7 +1947,7 @@ impl App {
                 )]);
                 self.state_label = "compacting".into();
                 // Legitimate prefix rewrite: don't false-alarm next turn.
-                self.prev_cache_ratio = None;
+                self.meter.forget_cache_baseline();
             }
             AgentEvent::Compacted(summary) => self.bake_compacted(&summary),
             AgentEvent::ModeChanged(mode) => {
@@ -2750,9 +2681,7 @@ impl App {
         }
         self.bake_approval_record(&dialog, &approval);
         let _ = reply.send(approval);
-        if let Some(wait_started) = self.user_wait_started.take() {
-            self.user_wait_total += wait_started.elapsed();
-        }
+        self.meter.resume_from_user();
     }
 
     fn on_dialog_mouse(&mut self, mouse: MouseEvent) {
@@ -3409,9 +3338,8 @@ impl App {
         self.transcript.truncate_from_entry(index);
         session.ledger.truncate_tail(index);
         session.last_prompt_tokens = self.agent.estimate_context_tokens(session);
-        self.context_tokens = session.last_prompt_tokens;
-        self.context_step_start = self.context_tokens;
-        self.context_estimated = !session.ledger.is_empty();
+        self.meter
+            .set_context(session.last_prompt_tokens, !session.ledger.is_empty());
         // Earlier reads are gone from the model's context: freshness
         // stubs would point at nothing. Reset it wholesale.
         session
@@ -3620,7 +3548,7 @@ impl App {
             // A running turn owns the session. /cost stays answerable from
             // the UI's own tally; everything else waits.
             if command.name() == "cost" {
-                let u = self.turn_usage;
+                let u = self.meter.turn;
                 self.bake(vec![Line::styled(
                     format!(
                         "last turn: in {} | out {} | cache r {} w {}",
@@ -3641,7 +3569,7 @@ impl App {
             session,
             opening_context: &self.opening_context,
             environment: &self.environment,
-            turn_usage: self.turn_usage,
+            turn_usage: self.meter.turn,
         };
         let outcome = self
             .registry
@@ -4296,14 +4224,13 @@ impl App {
             if session.last_prompt_tokens == 0 && !session.ledger.is_empty() {
                 session.last_prompt_tokens = self.agent.estimate_context_tokens(session);
             }
-            self.context_tokens = session.last_prompt_tokens;
-            self.context_estimated = !session.ledger.is_empty();
+            let estimated = !session.ledger.is_empty();
+            let tokens = session.last_prompt_tokens;
+            self.meter.set_context(tokens, estimated);
         } else {
-            self.context_tokens = 0;
-            self.context_estimated = false;
+            self.meter.set_context(0, false);
         }
-        self.context_step_start = self.context_tokens;
-        self.prev_cache_ratio = None;
+        self.meter.forget_cache_baseline();
         self.progress.clear();
         self.task_trace_root = self.session.as_ref().and_then(task_trace_root);
         self.task_runs = discover_task_runs(self.task_trace_root.as_deref());
@@ -4697,7 +4624,7 @@ impl App {
                 elapsed_secs: started
                     .map(|started| started.elapsed().as_secs())
                     .unwrap_or(0),
-                output_tokens: self.out_tokens,
+                output_tokens: self.meter.out_tokens,
             },
             area_width(&self.terminal),
             self.live_panel_hover.as_ref(),
@@ -4917,7 +4844,7 @@ impl App {
                 if !panel_lines.is_empty() {
                     h += panel_lines.len() as u16 + 2;
                 }
-                if self.rate_limits.is_some() {
+                if self.meter.rate_limits.is_some() {
                     h += 1;
                 }
                 h + popup.len() as u16
@@ -5074,16 +5001,16 @@ impl App {
 
             frame.render_widget(
                 Paragraph::new(context_progress_line(
-                    self.context_tokens,
+                    self.meter.context_tokens,
                     self.agent.model.snapshot().context_window,
                     area.width,
-                    self.context_estimated,
+                    self.meter.context_estimated,
                 )),
                 row(y, 1),
             );
             y += 1;
 
-            if let Some(limits) = self.rate_limits {
+            if let Some(limits) = self.meter.rate_limits {
                 frame.render_widget(Paragraph::new(rate_limit_line(limits)), row(y, 1));
                 y += 1;
             }
@@ -5154,7 +5081,7 @@ impl App {
         spans.push(Span::styled(
             format!(
                 " · {elapsed}s · ↓ ~{} tok · esc to cancel",
-                token_count(self.out_tokens as u64)
+                token_count(self.meter.out_tokens as u64)
             ),
             theme::dim(),
         ));
@@ -5181,7 +5108,7 @@ impl App {
                 ),
             ]);
         }
-        let u = self.turn_usage;
+        let u = self.meter.turn;
         let cache = (u.total_input() > 0).then(|| {
             format!(
                 "{}%",
@@ -5446,153 +5373,6 @@ fn result_preview(s: &str) -> String {
     line
 }
 
-/// One compact row below the editor. The meter intentionally reports the
-/// current conversation, rather than cumulative billable tokens: cached input
-/// still occupies context and must count toward the model window.
-fn context_progress_line(
-    used: u64,
-    window: u64,
-    terminal_width: u16,
-    estimated: bool,
-) -> Line<'static> {
-    let window = window.max(1);
-    let pct = used.saturating_mul(100).saturating_div(window).min(100);
-    let estimate_mark = if estimated { "≈" } else { "" };
-    let color = if pct >= 95 {
-        theme::ERROR
-    } else if pct >= 85 {
-        theme::WARN
-    } else {
-        theme::OK
-    };
-    let (label, bar_width) = if terminal_width < 42 {
-        ("  ctx ", 8usize)
-    } else {
-        ("  context ", 12usize)
-    };
-    let filled = if used == 0 {
-        0
-    } else {
-        ((bar_width as u64 * pct).div_ceil(100) as usize).min(bar_width)
-    };
-    let mut spans = vec![Span::styled(label, theme::dim())];
-    spans.extend(slim_bar(filled, bar_width, color));
-    spans.push(Span::styled(
-        format!(" {estimate_mark}{pct}%"),
-        ratatui::style::Style::default().fg(color),
-    ));
-    if terminal_width >= 42 {
-        spans.push(Span::styled(
-            format!(" · {}", token_count(window)),
-            theme::dim(),
-        ));
-    }
-    Line::from(spans)
-}
-
-/// The slim gauge shared by the context meter and the rate-limit row:
-/// a heavy coloured run over a dim dashed track.
-fn slim_bar(filled: usize, width: usize, color: ratatui::style::Color) -> [Span<'static>; 2] {
-    [
-        Span::styled(
-            "━".repeat(filled),
-            ratatui::style::Style::default().fg(color),
-        ),
-        Span::styled("╌".repeat(width.saturating_sub(filled)), theme::dim()),
-    ]
-}
-
-fn token_count(tokens: u64) -> String {
-    if tokens < 1_000 {
-        tokens.to_string()
-    } else if tokens < 10_000 {
-        format!("{:.1}k", tokens as f64 / 1_000.0)
-    } else {
-        format!("{}k", tokens.div_ceil(1_000))
-    }
-}
-
-fn rate_limit_line(limits: tcode_core::RateLimits) -> Line<'static> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs());
-    rate_limit_line_at(limits, now)
-}
-
-fn rate_limit_line_at(limits: tcode_core::RateLimits, now: u64) -> Line<'static> {
-    let primary_used = limits.primary.used_percent.clamp(0.0, 100.0);
-    let filled = ((primary_used / 100.0) * 12.0).round() as usize;
-    let color = usage_color(primary_used);
-    let mut spans = vec![Span::styled("  Codex 5h ", theme::dim())];
-    spans.extend(slim_bar(filled, 12, color));
-    spans.push(Span::styled(
-        format!(" {primary_used:.0}%"),
-        ratatui::style::Style::default().fg(color),
-    ));
-    append_reset_countdown(&mut spans, limits.primary.resets_at, now);
-
-    if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 80.0) {
-        let weekly_used = weekly.used_percent.clamp(0.0, 100.0);
-        let weekly_filled = ((weekly_used / 100.0) * 12.0).round() as usize;
-        let weekly_color = usage_color(weekly_used);
-        spans.push(Span::styled(" · week ", theme::dim()));
-        spans.extend(slim_bar(weekly_filled, 12, weekly_color));
-        spans.push(Span::styled(
-            format!(" {weekly_used:.0}%"),
-            ratatui::style::Style::default().fg(weekly_color),
-        ));
-        append_reset_countdown(&mut spans, weekly.resets_at, now);
-    }
-    Line::from(spans)
-}
-
-fn usage_color(used_percent: f64) -> ratatui::style::Color {
-    if used_percent >= 90.0 {
-        theme::ERROR
-    } else if used_percent >= 75.0 {
-        theme::WARN
-    } else {
-        theme::OK
-    }
-}
-
-fn append_reset_countdown(spans: &mut Vec<Span<'static>>, resets_at: u64, now: u64) {
-    let Some(remaining) = resets_at.checked_sub(now).filter(|&seconds| seconds > 0) else {
-        return;
-    };
-    spans.push(Span::styled(
-        format!(" ↻ {}", brief_duration(remaining)),
-        theme::dim(),
-    ));
-}
-
-/// Compact countdown for the status line: enough precision for a human to
-/// decide whether to wait, without turning the meter into a timestamp.
-fn brief_duration(seconds: u64) -> String {
-    if seconds < 60 {
-        "<1m".into()
-    } else if seconds < 3_600 {
-        format!("{}m", seconds.div_ceil(60))
-    } else if seconds < 86_400 {
-        format!("{}h{}m", seconds / 3_600, (seconds % 3_600).div_ceil(60))
-    } else {
-        format!("{}d", seconds.div_ceil(86_400))
-    }
-}
-
-fn add_usage(left: Usage, right: Usage) -> Usage {
-    Usage {
-        input_tokens: left.input_tokens.saturating_add(right.input_tokens),
-        output_tokens: left.output_tokens.saturating_add(right.output_tokens),
-        cache_read_tokens: left
-            .cache_read_tokens
-            .saturating_add(right.cache_read_tokens),
-        cache_write_tokens: left
-            .cache_write_tokens
-            .saturating_add(right.cache_write_tokens),
-    }
-}
-
 /// A human turn renders as a quoted block: an accent rail down the left, the
 /// text otherwise unadorned. A note stays under the same rail — it is the
 /// human speaking too — and is told apart by a coloured `Note:` opening its
@@ -5681,37 +5461,6 @@ fn quote_attachment_line(label: &str) -> Line<'static> {
 /// A turn boundary should read as a small receipt, not as an unstructured
 /// diagnostic log line. The numbers stay selectable/copyable terminal text,
 /// while colour and arrows make input, output and cache scannable.
-fn turn_summary_line(elapsed: f32, usage: Usage) -> Line<'static> {
-    let cache_pct = if usage.total_input() > 0 {
-        (usage.cache_read_tokens as f64 / usage.total_input() as f64 * 100.0).round()
-    } else {
-        0.0
-    };
-    let cache_style = if cache_pct > 0.0 {
-        theme::accent()
-    } else {
-        theme::dim()
-    };
-    Line::from(vec![
-        Span::styled("✓ completed ", theme::ok()),
-        Span::styled(format!("{elapsed:.1}s"), theme::bold()),
-        Span::styled(" · ↑", theme::dim()),
-        // Uncached input only: the tokens this turn actually paid full price
-        // for. Summing total_input() across a multi-step turn would recount
-        // the cached prefix on every request; the cache figure below shows
-        // how much of the full prompt was reused. This is a turn receipt, not
-        // the window-occupancy figure the context meter reports.
-        Span::styled(token_count(usage.input_tokens), theme::accent()),
-        Span::styled(" · ↓", theme::dim()),
-        Span::styled(
-            token_count(usage.output_tokens),
-            ratatui::style::Style::default().fg(theme::OK),
-        ),
-        Span::styled(" · cache ", theme::dim()),
-        Span::styled(format!("{cache_pct:.0}%"), cache_style),
-    ])
-}
-
 fn area_width(terminal: &Term) -> u16 {
     terminal.size().map(|s| s.width).unwrap_or(80)
 }
@@ -6524,142 +6273,5 @@ mod tests {
         assert!(!reference_boundary(&email, 2));
         let mention: Vec<char> = "read @src".chars().collect();
         assert!(reference_boundary(&mention, 5));
-    }
-
-    #[test]
-    fn normal_usage_meters_use_the_tool_green() {
-        let context = context_progress_line(20_000, 200_000, 80, false);
-        assert!(context
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(theme::OK)));
-
-        let limits = tcode_core::RateLimits {
-            primary: tcode_core::RateLimit {
-                used_percent: 30.0,
-                window_minutes: 300,
-                resets_at: 14_800,
-            },
-            secondary: None,
-        };
-        let rate_limit = rate_limit_line_at(limits, 10_000);
-        assert!(rate_limit
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(theme::OK)));
-    }
-
-    #[test]
-    fn context_meter_reports_percent_and_warning_color() {
-        let line = context_progress_line(170_000, 200_000, 80, false);
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(text.contains("context"));
-        assert!(text.contains("85% · 200k"));
-        assert!(!text.contains("170k/200k"));
-        assert!(line
-            .spans
-            .iter()
-            .any(|span| span.style.fg == Some(theme::WARN)));
-    }
-
-    #[test]
-    fn codex_rate_limit_line_shows_used_percent_and_reset_countdowns() {
-        let limits = tcode_core::RateLimits {
-            primary: tcode_core::RateLimit {
-                used_percent: 30.0,
-                window_minutes: 300,
-                resets_at: 14_800,
-            },
-            secondary: Some(tcode_core::RateLimit {
-                used_percent: 80.0,
-                window_minutes: 10_080,
-                resets_at: 269_200,
-            }),
-        };
-        let text = rate_limit_line_at(limits, 10_000)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert!(text.contains("Codex 5h"));
-        assert!(text.contains(" 30% ↻ 1h20m"));
-        assert!(text.contains("week "));
-        assert!(text.contains(" 80% ↻ 3d"));
-    }
-
-    #[test]
-    fn brief_duration_stays_compact_at_unit_boundaries() {
-        assert_eq!(brief_duration(59), "<1m");
-        assert_eq!(brief_duration(60), "1m");
-        assert_eq!(brief_duration(3_601), "1h1m");
-        assert_eq!(brief_duration(86_401), "2d");
-    }
-
-    #[test]
-    fn codex_rate_limit_line_hides_week_below_80_percent() {
-        let limits = tcode_core::RateLimits {
-            primary: tcode_core::RateLimit {
-                used_percent: 30.0,
-                window_minutes: 300,
-                resets_at: 0,
-            },
-            secondary: Some(tcode_core::RateLimit {
-                used_percent: 79.9,
-                window_minutes: 10_080,
-                resets_at: 0,
-            }),
-        };
-        let text = rate_limit_line(limits)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-
-        assert!(!text.contains("week"));
-    }
-
-    #[test]
-    fn turn_summary_is_a_scannable_receipt() {
-        let line = turn_summary_line(
-            2.5,
-            Usage {
-                input_tokens: 1_178,
-                output_tokens: 23,
-                ..Usage::default()
-            },
-        );
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert_eq!(text, "✓ completed 2.5s · ↑1.2k · ↓23 · cache 0%");
-    }
-
-    #[test]
-    fn delegated_usage_is_added_without_losing_cache_fields() {
-        let total = add_usage(
-            Usage {
-                input_tokens: 10,
-                output_tokens: 2,
-                cache_read_tokens: 3,
-                cache_write_tokens: 4,
-            },
-            Usage {
-                input_tokens: 20,
-                output_tokens: 5,
-                cache_read_tokens: 6,
-                cache_write_tokens: 7,
-            },
-        );
-        assert_eq!(total.input_tokens, 30);
-        assert_eq!(total.output_tokens, 7);
-        assert_eq!(total.cache_read_tokens, 9);
-        assert_eq!(total.cache_write_tokens, 11);
     }
 }
