@@ -14,6 +14,7 @@ mod markdown;
 mod mathfmt;
 mod mode_picker;
 mod model_picker;
+mod overlay;
 mod reference_style;
 mod render;
 mod resume;

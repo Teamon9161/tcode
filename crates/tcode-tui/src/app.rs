@@ -32,14 +32,15 @@ use tcode_importers::{
     import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
 };
 
-use crate::approval::{Dialog, DialogResult};
+use crate::approval::Dialog;
 use crate::editor::{Editor, Position};
 use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
 use crate::model_picker::{self, AgentMenu, ModelMenu};
+use crate::overlay::{Flow, Overlay, OverlayAction, OverlayCtx};
 use crate::render::{
     batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
 };
-use crate::resume::{self, PickResult as ResumePickResult};
+use crate::resume;
 use crate::transcript::Transcript;
 use crate::view::{BakeCtx, SessionView};
 use crate::view_picker::{self, ViewId};
@@ -467,7 +468,10 @@ pub struct App {
     /// pointer held still at the edge emits no further mouse events. Cleared on
     /// release or when the drag returns inside the view.
     drag_scroll: Option<(bool, u16, u16)>,
-    dialog: Option<(Dialog, oneshot::Sender<Approval>)>,
+    /// The single modal that can own the bottom panel: any picker, or the
+    /// approval dialog. They are mutually exclusive, so they share one slot —
+    /// see `overlay.rs` for why that matters.
+    overlay: Option<Overlay>,
     /// A change diff baked into the transcript while its approval dialog is
     /// open (so the full code is scrollable in the record, not cramped in
     /// the dialog). Holds the block-count mark to retract to on decline or
@@ -475,14 +479,8 @@ pub struct App {
     /// `ToolStart` to skip re-baking the diff.
     change_prebake: Option<usize>,
     rewind_nav: Option<RewindNav>,
-    resume_picker: Option<resume::Picker>,
     menu: ModelMenu,
-    model_picker: Option<model_picker::Picker>,
-    mode_picker: Option<crate::mode_picker::Picker>,
-    /// First-entry confirmation for a folder with no local trust record.
-    folder_trust_picker: Option<crate::folder_trust_picker::Picker>,
     agents: AgentMenu,
-    agent_picker: Option<model_picker::AgentPicker>,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
     dogfood: bool,
@@ -501,7 +499,6 @@ pub struct App {
     task_trace_root: Option<PathBuf>,
     active_view: ViewId,
     trace_view: Option<TraceView>,
-    view_picker: Option<view_picker::Picker>,
     last_esc: Option<Instant>,
     popup_index: usize,
     /// Tab accepted this exact `@` marker. Keep its completion closed until the
@@ -588,8 +585,8 @@ impl App {
         let cwd = session.tool_ctx.cwd.clone();
         let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let task_trace_root = task_trace_root(&session);
-        let folder_trust_picker =
-            (!session.folder_trust_known()).then(|| crate::folder_trust_picker::Picker::new(&cwd));
+        let overlay = (!session.folder_trust_known())
+            .then(|| Overlay::FolderTrust(crate::folder_trust_picker::Picker::new(&cwd)));
         let task_runs = discover_task_runs(task_trace_root.as_deref());
         let context_estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
         let context_tokens = if context_estimated {
@@ -661,16 +658,11 @@ impl App {
             input_mouse_active: false,
             input_dragged: false,
             drag_scroll: None,
-            dialog: None,
+            overlay,
             change_prebake: None,
             rewind_nav: None,
-            resume_picker: None,
             menu,
-            model_picker: None,
-            mode_picker: None,
-            folder_trust_picker,
             agents,
-            agent_picker: None,
             dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
@@ -679,7 +671,6 @@ impl App {
             task_trace_root,
             active_view: ViewId::Main,
             trace_view: None,
-            view_picker: None,
             last_esc: None,
             popup_index: 0,
             dismissed_reference: None,
@@ -834,7 +825,7 @@ impl App {
                         )
                     };
                     self.transcript.clear_hover();
-                    self.dialog = Some((dialog, ask.reply));
+                    self.overlay = Some(Overlay::approval(dialog, ask.reply));
                 }
                 done = join_phase(&mut self.phase) => {
                     self.on_turn_done(done);
@@ -1387,13 +1378,7 @@ impl App {
         self.monitor_deadline = None;
         // Don't start a turn underneath a modal (approval dialog, pickers,
         // rewind navigation); retry shortly instead of losing the events.
-        let modal_open = self.dialog.is_some()
-            || self.rewind_nav.is_some()
-            || self.resume_picker.is_some()
-            || self.model_picker.is_some()
-            || self.mode_picker.is_some()
-            || self.agent_picker.is_some()
-            || self.view_picker.is_some();
+        let modal_open = self.overlay.is_some() || self.rewind_nav.is_some();
         if modal_open {
             self.monitor_deadline = Some(tokio::time::Instant::now() + Duration::from_secs(1));
             return;
@@ -2182,7 +2167,12 @@ impl App {
     /// process, then restored and fully redrawn. A revision equal to the
     /// original is a no-op inside `revise_plan`.
     fn edit_plan_externally(&mut self) {
-        let Some(source) = self.dialog.as_ref().and_then(|(d, _)| d.plan_source()) else {
+        let Some(source) = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::as_dialog)
+            .and_then(Dialog::plan_source)
+        else {
             return;
         };
 
@@ -2257,7 +2247,7 @@ impl App {
                 (block, document)
             })
             .collect();
-        if let Some((dialog, _)) = self.dialog.as_mut() {
+        if let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) {
             dialog.revise_plan(edited, blocks);
         }
     }
@@ -2678,15 +2668,103 @@ impl App {
 
     // ------------------------------------------------------------ keys
 
+    fn overlay_ctx(&self) -> OverlayCtx<'_> {
+        OverlayCtx {
+            menu: &self.menu,
+            agents: &self.agents,
+            width: area_width(&self.terminal),
+            height: area_height(&self.terminal),
+        }
+    }
+
+    /// Hands one event to the active overlay and applies what it asks for.
+    /// The overlay is moved out for the duration so it can be mutated while
+    /// `OverlayCtx` still borrows the rest of `App`.
+    fn drive_overlay(&mut self, event: impl FnOnce(&mut Overlay, &OverlayCtx) -> Flow) {
+        let Some(mut overlay) = self.overlay.take() else {
+            return;
+        };
+        let flow = {
+            let ctx = self.overlay_ctx();
+            event(&mut overlay, &ctx)
+        };
+        self.overlay = Some(overlay);
+        self.on_overlay_flow(flow);
+    }
+
+    fn on_overlay_flow(&mut self, flow: Flow) {
+        match flow {
+            Flow::Stay => {}
+            Flow::Close => self.overlay = None,
+            Flow::ActInPlace(action) => self.apply_overlay_action(action),
+            // The approval reply channel lives in the overlay itself, so
+            // finishing an approval consumes the overlay rather than routing
+            // through `apply_overlay_action`.
+            Flow::Act(OverlayAction::Approved(approval)) => {
+                if let Some(Overlay::Approval(dialog, reply)) = self.overlay.take() {
+                    self.finish_approval(*dialog, reply, approval);
+                }
+            }
+            Flow::Act(action) => {
+                self.overlay = None;
+                self.apply_overlay_action(action);
+            }
+        }
+    }
+
+    fn apply_overlay_action(&mut self, action: OverlayAction) {
+        match action {
+            OverlayAction::OpenView(id) => self.open_view(id),
+            OverlayAction::ResumeSession(id) => self.resume_session(&id),
+            OverlayAction::ShowImportSources => {
+                self.overlay = Some(Overlay::Resume(resume::Picker::sources()))
+            }
+            OverlayAction::OpenExternalSource(source) => self.open_external_resume_picker(source),
+            OverlayAction::ImportExternal(external) => self.import_external_session(external),
+            OverlayAction::ApplyModel { index, effort } => self.apply_model(index, effort),
+            OverlayAction::SetMode(mode) => self.set_mode(mode),
+            OverlayAction::FolderTrust(choice) => self.apply_folder_trust_choice(choice),
+            OverlayAction::ApplyAgentModel { kind, choice } => {
+                self.apply_agent_model(&kind, choice)
+            }
+            // Suspends the terminal, so it cannot run inside the dialog's key
+            // handler; the dialog is still open and takes the revision.
+            OverlayAction::EditPlan => self.edit_plan_externally(),
+            OverlayAction::Approved(_) => unreachable!("handled by on_overlay_flow"),
+        }
+    }
+
+    fn finish_approval(
+        &mut self,
+        dialog: Dialog,
+        reply: oneshot::Sender<Approval>,
+        approval: Approval,
+    ) {
+        // A plan approval chose the mode execution runs under. The agent loop
+        // applies it to the Session; mirror it into the frontend's own view so
+        // the status line updates at once.
+        if let Some(mode) = approval.set_mode {
+            self.committed_mode = mode;
+            self.mode_label = mode.label().to_string();
+            self.pending_mode.clear();
+        }
+        self.bake_approval_record(&dialog, &approval);
+        let _ = reply.send(approval);
+        if let Some(wait_started) = self.user_wait_started.take() {
+            self.user_wait_total += wait_started.elapsed();
+        }
+    }
+
     fn on_dialog_mouse(&mut self, mouse: MouseEvent) {
         // A proposed edit/write is deliberately baked into the transcript in
         // full before its compact approval dialog opens. The dialog must not
         // trap the wheel, or a long diff becomes visible only through the few
         // transcript rows left above the panel with no way to inspect it.
         let plan_owns_wheel = self
-            .dialog
+            .overlay
             .as_ref()
-            .is_some_and(|(dialog, _)| dialog.owns_wheel());
+            .and_then(Overlay::as_dialog)
+            .is_some_and(Dialog::owns_wheel);
         if !plan_owns_wheel {
             match mouse.kind {
                 MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -2705,7 +2783,7 @@ impl App {
         let width = area_width(&self.terminal);
         let height = area_height(&self.terminal);
         let budget = height.saturating_sub(6);
-        let Some((dialog, _)) = self.dialog.as_mut() else {
+        let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) else {
             return;
         };
         // Match `redraw`'s panel geometry so a screen coordinate is translated
@@ -2744,51 +2822,24 @@ impl App {
         }
     }
 
-    fn set_picker_hover(&mut self, row: Option<usize>) {
-        if let Some(picker) = self.view_picker.as_mut() {
-            picker.set_hovered_row(row);
-        } else if let Some(picker) = self.model_picker.as_mut() {
-            picker.set_hovered_row(row);
-        } else if let Some(picker) = self.mode_picker.as_mut() {
-            picker.set_hovered_row(row);
-        } else if let Some(picker) = self.folder_trust_picker.as_mut() {
-            picker.set_hovered_row(row);
-        } else if let Some(picker) = self.agent_picker.as_mut() {
-            picker.set_hovered_row(row, &self.agents);
-        }
-    }
-
-    fn on_picker_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.view_picker.is_none()
-            && self.model_picker.is_none()
-            && self.mode_picker.is_none()
-            && self.folder_trust_picker.is_none()
-            && self.agent_picker.is_none()
-        {
+    /// Mouse input while an overlay is open. Returns whether the overlay
+    /// consumed it; only the keyboard-driven resume picker declines, so the
+    /// wheel still reaches the transcript behind it.
+    fn on_overlay_mouse(&mut self, mouse: MouseEvent) -> bool {
+        let Some(overlay) = self.overlay.as_ref() else {
+            return false;
+        };
+        if !overlay.owns_mouse() {
             return false;
         }
+        // The approval dialog has its own richer mouse behaviour (plan panes,
+        // note carets, drag selection), driven by geometry it owns.
+        if overlay.as_dialog().is_some() {
+            self.on_dialog_mouse(mouse);
+            return true;
+        }
         let height = area_height(&self.terminal);
-        let lines = self
-            .view_picker
-            .as_ref()
-            .map(|picker| picker.render())
-            .or_else(|| {
-                self.model_picker
-                    .as_ref()
-                    .map(|picker| picker.render(&self.menu))
-            })
-            .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
-            .or_else(|| {
-                self.folder_trust_picker
-                    .as_ref()
-                    .map(|picker| picker.render())
-            })
-            .or_else(|| {
-                self.agent_picker
-                    .as_ref()
-                    .map(|picker| picker.render(&self.menu, &self.agents))
-            })
-            .expect("picker present");
+        let lines = overlay.render(&self.overlay_ctx());
         let panel_h = (lines.len() as u16 + 2)
             .min(height.saturating_sub(4))
             .max(1);
@@ -2796,71 +2847,26 @@ impl App {
         let inside = mouse.row > panel_top && mouse.row < panel_top + panel_h.saturating_sub(1);
         if !inside {
             if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                self.view_picker = None;
-                self.model_picker = None;
-                self.mode_picker = None;
-                self.agent_picker = None;
+                let flow = overlay.on_click_away();
+                self.on_overlay_flow(flow);
             } else if matches!(mouse.kind, MouseEventKind::Moved) {
-                self.set_picker_hover(None);
+                self.drive_overlay(|overlay, ctx| {
+                    overlay.set_hovered_row(None, ctx);
+                    Flow::Stay
+                });
             }
             return true;
         }
         let row = mouse.row.saturating_sub(panel_top + 1) as usize;
         if matches!(mouse.kind, MouseEventKind::Moved) {
-            self.set_picker_hover(Some(row));
+            self.drive_overlay(|overlay, ctx| {
+                overlay.set_hovered_row(Some(row), ctx);
+                Flow::Stay
+            });
             return true;
         }
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-            return true;
-        }
-        if let Some(picker) = self.view_picker.as_mut() {
-            match picker.handle_mouse_row(row) {
-                view_picker::PickResult::Picked(id) => {
-                    self.view_picker = None;
-                    self.open_view(id);
-                }
-                view_picker::PickResult::Cancelled | view_picker::PickResult::Pending => {}
-            }
-        } else if let Some(picker) = self.model_picker.as_mut() {
-            match picker.handle_mouse_row(row) {
-                model_picker::PickResult::Picked {
-                    option: Some(index),
-                    effort,
-                } => {
-                    self.model_picker = None;
-                    self.apply_model(index, effort);
-                }
-                model_picker::PickResult::Cancelled
-                | model_picker::PickResult::Pending
-                | model_picker::PickResult::Picked { option: None, .. } => {}
-            }
-        } else if let Some(picker) = self.mode_picker.as_mut() {
-            match picker.handle_mouse_row(row) {
-                crate::mode_picker::PickResult::Picked(mode) => {
-                    self.mode_picker = None;
-                    self.set_mode(mode);
-                }
-                crate::mode_picker::PickResult::Cancelled
-                | crate::mode_picker::PickResult::Pending => {}
-            }
-        } else if let Some(picker) = self.folder_trust_picker.as_mut() {
-            match picker.handle_mouse_row(row) {
-                crate::folder_trust_picker::PickResult::Picked(choice) => {
-                    self.folder_trust_picker = None;
-                    self.apply_folder_trust_choice(choice);
-                }
-                crate::folder_trust_picker::PickResult::Cancelled
-                | crate::folder_trust_picker::PickResult::Pending => {}
-            }
-        } else if let Some(picker) = self.agent_picker.as_mut() {
-            match picker.handle_mouse_row(row, &self.menu, &self.agents) {
-                model_picker::AgentPick::Pending => {}
-                model_picker::AgentPick::Cancelled => self.agent_picker = None,
-                model_picker::AgentPick::Picked { kind, choice } => {
-                    self.agent_picker = None;
-                    self.apply_agent_model(&kind, choice);
-                }
-            }
+        if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            self.drive_overlay(|overlay, ctx| overlay.handle_mouse_row(row, ctx));
         }
         true
     }
@@ -2951,29 +2957,20 @@ impl App {
                 self.on_key(key)
             }
             Event::Paste(text) => {
-                // A dialog owns interaction while it is on screen. In
+                // An overlay owns interaction while it is on screen. In
                 // particular, multiline terminal pastes must not leak into
                 // the hidden main editor and then make the restored panel jump.
-                if let Some((dialog, _)) = self.dialog.as_mut() {
-                    dialog.paste_text(text);
-                } else if self.resume_picker.is_none()
-                    && self.model_picker.is_none()
-                    && self.mode_picker.is_none()
-                    && self.agent_picker.is_none()
-                    && self.rewind_nav.is_none()
-                {
+                if let Some(overlay) = self.overlay.as_mut() {
+                    overlay.paste_text(text);
+                } else if self.rewind_nav.is_none() {
                     self.on_paste_text(text);
                 }
             }
             Event::Mouse(mouse) => {
-                // A modal approval owns mouse input too. Without this guard a
-                // plan drag selects and copies the hidden transcript instead of
+                // A modal owns mouse input too. Without this guard a plan drag
+                // selects and copies the hidden transcript instead of
                 // producing a plan comment.
-                if self.dialog.is_some() {
-                    self.on_dialog_mouse(mouse);
-                    return;
-                }
-                if self.on_picker_mouse(mouse) {
+                if self.on_overlay_mouse(mouse) {
                     return;
                 }
                 if matches!(mouse.kind, MouseEventKind::Moved)
@@ -3071,89 +3068,10 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
-        if let Some(picker) = self.view_picker.as_mut() {
-            match picker.handle_key(key) {
-                view_picker::PickResult::Pending => {}
-                view_picker::PickResult::Cancelled => self.view_picker = None,
-                view_picker::PickResult::Picked(id) => {
-                    self.view_picker = None;
-                    self.open_view(id);
-                }
-            }
-            return;
-        }
-        // Model picker captures everything while open.
-        if let Some(picker) = self.resume_picker.as_mut() {
-            match picker.handle_key(key) {
-                ResumePickResult::Pending => {}
-                ResumePickResult::Cancelled => self.resume_picker = None,
-                ResumePickResult::Import => self.resume_picker = Some(resume::Picker::sources()),
-                ResumePickResult::Current(id) => {
-                    self.resume_picker = None;
-                    self.resume_session(&id);
-                }
-                ResumePickResult::Source(source) => self.open_external_resume_picker(source),
-                ResumePickResult::External(external) => {
-                    self.resume_picker = None;
-                    self.import_external_session(external);
-                }
-            }
-            return;
-        }
-
-        if let Some(picker) = self.model_picker.as_mut() {
-            match picker.handle_key(key) {
-                model_picker::PickResult::Pending => {}
-                model_picker::PickResult::Cancelled => self.model_picker = None,
-                model_picker::PickResult::Picked { option, effort } => {
-                    self.model_picker = None;
-                    // `/model` has no inherit row, so the option is always set.
-                    if let Some(index) = option {
-                        self.apply_model(index, effort);
-                    }
-                }
-            }
-            return;
-        }
-
-        if let Some(picker) = self.folder_trust_picker.as_mut() {
-            match picker.handle_key(key) {
-                crate::folder_trust_picker::PickResult::Pending => {}
-                crate::folder_trust_picker::PickResult::Cancelled => {
-                    self.folder_trust_picker = None;
-                    self.apply_folder_trust_choice(
-                        crate::folder_trust_picker::Choice::RejectSession,
-                    );
-                }
-                crate::folder_trust_picker::PickResult::Picked(choice) => {
-                    self.folder_trust_picker = None;
-                    self.apply_folder_trust_choice(choice);
-                }
-            }
-            return;
-        }
-
-        if let Some(picker) = self.mode_picker.as_mut() {
-            match picker.handle_key(key) {
-                crate::mode_picker::PickResult::Pending => {}
-                crate::mode_picker::PickResult::Cancelled => self.mode_picker = None,
-                crate::mode_picker::PickResult::Picked(mode) => {
-                    self.mode_picker = None;
-                    self.set_mode(mode);
-                }
-            }
-            return;
-        }
-
-        if let Some(picker) = self.agent_picker.as_mut() {
-            match picker.handle_key(key, &self.menu, &self.agents) {
-                model_picker::AgentPick::Pending => {}
-                model_picker::AgentPick::Cancelled => self.agent_picker = None,
-                model_picker::AgentPick::Picked { kind, choice } => {
-                    self.agent_picker = None;
-                    self.apply_agent_model(&kind, choice);
-                }
-            }
+        // An overlay — any picker, or the approval dialog — owns the keyboard
+        // while it is on screen.
+        if self.overlay.is_some() {
+            self.drive_overlay(|overlay, ctx| overlay.handle_key(key, ctx));
             return;
         }
 
@@ -3195,33 +3113,6 @@ impl App {
                 KeyCode::Char('r') if ctrl => self.confirm_rewind_nav(true),
                 KeyCode::Char('c') if ctrl => self.exit_rewind_nav(),
                 _ => {}
-            }
-            return;
-        }
-
-        // Approval dialog captures everything while open.
-        if let Some((dialog, _)) = self.dialog.as_mut() {
-            match dialog.handle_key(key) {
-                DialogResult::Pending => {}
-                // Open the plan in `$EDITOR`, then feed any revision back into
-                // the pane. Handled out here because it suspends the terminal.
-                DialogResult::EditPlan => self.edit_plan_externally(),
-                DialogResult::Done(approval) => {
-                    let (dialog, reply) = self.dialog.take().expect("dialog present");
-                    // A plan approval chose the mode execution runs under. The
-                    // agent loop applies it to the Session; mirror it into the
-                    // frontend's own view so the status line updates at once.
-                    if let Some(mode) = approval.set_mode {
-                        self.committed_mode = mode;
-                        self.mode_label = mode.label().to_string();
-                        self.pending_mode.clear();
-                    }
-                    self.bake_approval_record(&dialog, &approval);
-                    let _ = reply.send(approval);
-                    if let Some(wait_started) = self.user_wait_started.take() {
-                        self.user_wait_total += wait_started.elapsed();
-                    }
-                }
             }
             return;
         }
@@ -3608,28 +3499,32 @@ impl App {
         match remembered {
             Some(trust) => {
                 session.set_folder_trust(trust);
-                self.folder_trust_picker = None;
+                if matches!(self.overlay, Some(Overlay::FolderTrust(_))) {
+                    self.overlay = None;
+                }
             }
             None => {
                 session.clear_folder_trust();
-                self.folder_trust_picker = Some(crate::folder_trust_picker::Picker::new(&self.cwd));
+                self.overlay = Some(Overlay::FolderTrust(
+                    crate::folder_trust_picker::Picker::new(&self.cwd),
+                ));
             }
         }
     }
 
     fn open_mode_picker(&mut self) {
         let current = self.pending_mode.get().unwrap_or(self.committed_mode);
-        self.mode_picker = Some(crate::mode_picker::Picker::new(current));
+        self.overlay = Some(Overlay::Mode(crate::mode_picker::Picker::new(current)));
     }
 
     fn open_model_picker(&mut self) {
         let effort = self.agent.model.snapshot().effort;
-        self.model_picker = model_picker::Picker::new(&self.menu, effort.as_deref());
-        if self.model_picker.is_none() {
-            self.bake(vec![Line::styled(
+        match model_picker::Picker::new(&self.menu, effort.as_deref()) {
+            Some(picker) => self.overlay = Some(Overlay::Model(picker)),
+            None => self.bake(vec![Line::styled(
                 "no models configured — edit ~/.tcode/config.toml",
                 theme::dim(),
-            )]);
+            )]),
         }
     }
 
@@ -3706,7 +3601,7 @@ impl App {
                 return;
             }
             "/agents" => {
-                self.agent_picker = model_picker::AgentPicker::new(&self.agents);
+                self.overlay = model_picker::AgentPicker::new(&self.agents).map(Overlay::Agent);
                 return;
             }
             _ => {}
@@ -3980,7 +3875,7 @@ impl App {
         let Some((toward_older, x, y)) = self.drag_scroll else {
             return;
         };
-        if self.dialog.is_some() {
+        if self.overlay.is_some() {
             self.drag_scroll = None;
             return;
         }
@@ -4198,11 +4093,11 @@ impl App {
     // ------------------------------------------------------- rendering
 
     fn popup_active(&self) -> bool {
-        self.dialog.is_none() && !self.completion_matches().is_empty()
+        self.overlay.is_none() && !self.completion_matches().is_empty()
     }
 
     fn completion_matches(&self) -> Vec<CompletionMatch> {
-        if self.dialog.is_some() {
+        if self.overlay.is_some() {
             return Vec::new();
         }
         if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {
@@ -4414,7 +4309,10 @@ impl App {
         self.task_runs = discover_task_runs(self.task_trace_root.as_deref());
         self.active_view = ViewId::Main;
         self.trace_view = None;
-        self.view_picker = None;
+        // A view picker naming the discarded conversation must not survive it.
+        if matches!(self.overlay, Some(Overlay::View(_))) {
+            self.overlay = None;
+        }
         self.pending_tool = None;
         self.pending_batch.clear();
         self.thinking_text.clear();
@@ -4439,11 +4337,11 @@ impl App {
             return;
         };
         match tcode_core::SessionStore::list(&data_dir) {
-            Ok(sessions) => self.resume_picker = Some(resume::Picker::new(sessions)),
+            Ok(sessions) => self.overlay = Some(Overlay::Resume(resume::Picker::new(sessions))),
             // External import is useful even before tcode itself has stored a
             // prior conversation in this project.
             Err(tcode_core::store::StoreError::NoSession) => {
-                self.resume_picker = Some(resume::Picker::new(Vec::new()))
+                self.overlay = Some(Overlay::Resume(resume::Picker::new(Vec::new())))
             }
             Err(e) => self.bake(vec![Line::styled(
                 format!("cannot list resumable sessions: {e}"),
@@ -4455,9 +4353,9 @@ impl App {
     fn open_external_resume_picker(&mut self, source: ExternalSource) {
         let sessions = list_external_sessions(&self.cwd, source);
         match resume::Picker::external(source, sessions) {
-            Some(picker) => self.resume_picker = Some(picker),
+            Some(picker) => self.overlay = Some(Overlay::Resume(picker)),
             None => {
-                self.resume_picker = None;
+                self.overlay = None;
                 self.bake(vec![Line::styled(
                     format!("no {} conversations found for this project", source.label()),
                     theme::dim(),
@@ -4575,7 +4473,7 @@ impl App {
             self.notice = Some(("no other active sessions".into(), Instant::now()));
             return;
         }
-        self.view_picker = view_picker::Picker::new(entries, &self.active_view);
+        self.overlay = view_picker::Picker::new(entries, &self.active_view).map(Overlay::View);
     }
 
     fn open_view(&mut self, id: ViewId) {
@@ -4930,46 +4828,14 @@ impl App {
         let status_model_label = self.agent.model.snapshot().describe();
         let viewing_trace = !matches!(self.active_view, ViewId::Main);
         let dialog_lines = self
-            .view_picker
+            .overlay
             .as_ref()
-            .map(|picker| picker.render())
-            .or_else(|| self.resume_picker.as_ref().map(|picker| picker.render()))
-            .or_else(|| {
-                self.model_picker
-                    .as_ref()
-                    .map(|picker| picker.render(&self.menu))
-            })
-            .or_else(|| self.mode_picker.as_ref().map(|picker| picker.render()))
-            .or_else(|| {
-                self.folder_trust_picker
-                    .as_ref()
-                    .map(|picker| picker.render())
-            })
-            .or_else(|| {
-                self.agent_picker
-                    .as_ref()
-                    .map(|picker| picker.render(&self.menu, &self.agents))
-            })
-            .or_else(|| {
-                self.dialog.as_ref().map(|(dialog, _)| {
-                    let budget = area_height(&self.terminal).saturating_sub(6);
-                    dialog.render(area_width(&self.terminal), budget)
-                })
-            });
+            .map(|overlay| overlay.render(&self.overlay_ctx()));
         // A focused note in the approval dialog exposes its caret cell (set by
         // the `render` just above). Anchoring the real terminal cursor there
-        // keeps the OS IME composition window tracking the caret. Only valid
-        // when the dialog — not a picker — produced the lines this frame.
-        let dialog_owns_panel = dialog_lines.is_some()
-            && self.view_picker.is_none()
-            && self.resume_picker.is_none()
-            && self.model_picker.is_none()
-            && self.mode_picker.is_none()
-            && self.folder_trust_picker.is_none()
-            && self.agent_picker.is_none();
-        let dialog_cursor = dialog_owns_panel
-            .then(|| self.dialog.as_ref().and_then(|(d, _)| d.cursor_cell()))
-            .flatten();
+        // keeps the OS IME composition window tracking the caret. Pickers have
+        // no caret, so `cursor_cell` is `None` for them by construction.
+        let dialog_cursor = self.overlay.as_ref().and_then(Overlay::cursor_cell);
         let editor = editor_layout(&self.editor, area_width(&self.terminal));
         // Ghost text only appears while the input is empty and idle. Its visual
         // rows use the editor's own width calculation below.
@@ -5665,7 +5531,7 @@ fn rate_limit_line_at(limits: tcode_core::RateLimits, now: u64) -> Line<'static>
     ));
     append_reset_countdown(&mut spans, limits.primary.resets_at, now);
 
-    if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 65.0) {
+    if let Some(weekly) = limits.secondary.filter(|limit| limit.used_percent >= 80.0) {
         let weekly_used = weekly.used_percent.clamp(0.0, 100.0);
         let weekly_filled = ((weekly_used / 100.0) * 12.0).round() as usize;
         let weekly_color = usage_color(weekly_used);
@@ -6548,7 +6414,7 @@ mod tests {
             bytes: Some(1),
         }];
         let spans = input_spans(
-            "see @src/app.rs, but @not-a-file [Image #2] and me@example.com",
+            "see @src/app.rs, but @not-a-file [Image #2] [Pasted text #3] and me@example.com",
             None,
             &references,
         );
@@ -6557,7 +6423,7 @@ mod tests {
             .filter(|span| span.style.fg == Some(theme::ACCENT))
             .map(|span| span.content.as_ref())
             .collect();
-        assert_eq!(accented, ["@src/app.rs", "[Image #2]"]);
+        assert_eq!(accented, ["@src/app.rs", "[Image #2]", "[Pasted text #3]"]);
         let plain: String = spans
             .iter()
             .filter(|span| span.style.fg.is_none())
@@ -6709,7 +6575,7 @@ mod tests {
                 resets_at: 14_800,
             },
             secondary: Some(tcode_core::RateLimit {
-                used_percent: 65.0,
+                used_percent: 80.0,
                 window_minutes: 10_080,
                 resets_at: 269_200,
             }),
@@ -6723,7 +6589,7 @@ mod tests {
         assert!(text.contains("Codex 5h"));
         assert!(text.contains(" 30% ↻ 1h20m"));
         assert!(text.contains("week "));
-        assert!(text.contains(" 65% ↻ 3d"));
+        assert!(text.contains(" 80% ↻ 3d"));
     }
 
     #[test]
@@ -6735,7 +6601,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_rate_limit_line_hides_week_below_65_percent() {
+    fn codex_rate_limit_line_hides_week_below_80_percent() {
         let limits = tcode_core::RateLimits {
             primary: tcode_core::RateLimit {
                 used_percent: 30.0,
@@ -6743,7 +6609,7 @@ mod tests {
                 resets_at: 0,
             },
             secondary: Some(tcode_core::RateLimit {
-                used_percent: 64.9,
+                used_percent: 79.9,
                 window_minutes: 10_080,
                 resets_at: 0,
             }),

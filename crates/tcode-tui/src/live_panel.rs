@@ -20,6 +20,7 @@ const VISIBLE_PHASES: usize = 5;
 const ACTIVITY_CHARS: usize = 56;
 const STEP_HISTORY: usize = 3;
 
+#[derive(Clone)]
 pub struct ProgressPhase {
     pub phase: String,
     pub status: String,
@@ -297,9 +298,13 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
         return Vec::new();
     }
     let complete = progress.iter().filter(|item| item.is_completed()).count();
-    let (start, end) = visible_phase_range(progress, VISIBLE_PHASES);
+    // Preserve the model's order within each group, but keep finished work out
+    // of the way of the task the user is still following.
+    let mut ordered = progress.to_vec();
+    ordered.sort_by_key(|item| item.is_completed());
+    let (start, end) = visible_phase_range(&ordered, VISIBLE_PHASES);
     let hidden_before = start;
-    let hidden_after = progress.len().saturating_sub(end);
+    let hidden_after = ordered.len().saturating_sub(end);
     let mut lines = vec![Line::from(vec![
         Span::styled("  ┊ Progress ", theme::bold().fg(theme::ACCENT)),
         Span::styled(
@@ -318,9 +323,9 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
             theme::dim(),
         ));
     }
-    lines.extend(progress[start..end].iter().map(|item| {
+    lines.extend(ordered[start..end].iter().map(|item| {
         let (marker, style) = match item.status.as_str() {
-            "completed" => ("✓ ", Style::default().fg(theme::OK)),
+            "completed" => ("✓ ", theme::dim()),
             "in_progress" => ("● ", theme::accent()),
             _ => ("○ ", theme::dim()),
         };
@@ -329,9 +334,7 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
             Span::styled(
                 item.phase.clone(),
                 if item.status == "completed" {
-                    Style::default()
-                        .fg(theme::OK)
-                        .add_modifier(ratatui::style::Modifier::CROSSED_OUT)
+                    theme::dim().add_modifier(ratatui::style::Modifier::CROSSED_OUT)
                 } else if item.status == "pending" {
                     theme::dim()
                 } else {
@@ -447,6 +450,44 @@ mod tests {
             elapsed_secs: 15,
             output_tokens: 2_200,
         }
+    }
+
+    #[test]
+    fn completed_phases_follow_active_work_and_use_dim_style() {
+        let items = vec![
+            ProgressPhase {
+                phase: "done first".into(),
+                status: "completed".into(),
+            },
+            ProgressPhase {
+                phase: "next".into(),
+                status: "pending".into(),
+            },
+            ProgressPhase {
+                phase: "now".into(),
+                status: "in_progress".into(),
+            },
+            ProgressPhase {
+                phase: "done last".into(),
+                status: "completed".into(),
+            },
+        ];
+        let lines = progress_lines(&items);
+        let rendered = lines.iter().map(text).collect::<Vec<_>>();
+        assert_eq!(
+            rendered[1..],
+            [
+                "    ○ next",
+                "    ● now",
+                "    ✓ done first",
+                "    ✓ done last"
+            ]
+        );
+        assert_eq!(lines[3].spans[0].style, theme::dim());
+        assert_eq!(
+            lines[3].spans[1].style,
+            theme::dim().add_modifier(ratatui::style::Modifier::CROSSED_OUT)
+        );
     }
 
     #[test]
