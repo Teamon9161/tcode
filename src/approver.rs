@@ -57,9 +57,11 @@ impl Approver for LineApprover {
         }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
         print_change_preview(tool, input);
-        let project_choice = (!is_edit && allows_project)
-            .then(|| format!(" / p (allow in this project: {descriptor})"))
-            .unwrap_or_default();
+        let project_choice = if !is_edit && allows_project {
+            format!(" / p (allow in this project: {descriptor})")
+        } else {
+            String::new()
+        };
         let choices = if is_edit {
             "y / e (allow all edits for this session) / n"
         } else {
@@ -176,7 +178,7 @@ async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
 }
 
 /// Line-mode plan review: print the plan, offer the four decisions, and read
-/// one. Keep-planning collects feedback. Mirrors the TUI plan dialog.
+/// one. Feedback is optional when keeping the plan in review, mirroring the TUI.
 async fn review_plan_plain(input: &Value) -> Approval {
     let plan = input["plan"].as_str().unwrap_or("").trim();
     println!("\n{YELLOW}▤{RESET} {BOLD}Review plan{RESET}");
@@ -205,7 +207,7 @@ async fn review_plan_plain(input: &Value) -> Approval {
         println!("{DIM}  {}) {label}{RESET}", i + 1);
     }
     loop {
-        print!("{DIM}  choose 1-4 (append feedback, required for 4) > {RESET}");
+        print!("{DIM}  choose 1-4 (append feedback optionally) > {RESET}");
         let _ = std::io::stdout().flush();
         let (n, line) = read_line_blocking().await;
         if n == 0 {
@@ -223,10 +225,6 @@ async fn review_plan_plain(input: &Value) -> Approval {
             continue;
         };
         let (_, decision, set_mode) = options[index - 1];
-        if decision == ApprovalDecision::No && rest.is_none() {
-            println!("{DIM}  keep-planning needs feedback: 4 <what to change>{RESET}");
-            continue;
-        }
         return Approval {
             decision,
             comment: rest,

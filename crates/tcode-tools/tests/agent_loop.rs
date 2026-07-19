@@ -1240,6 +1240,51 @@ async fn plan_sub_agent_returns_a_draft_under_the_planning_prompt() {
     assert!(requests[0]
         .system
         .contains("implementation-planning specialist"));
+    assert!(requests[0]
+        .system
+        .contains("every reference project the user names"));
+    assert!(requests[0].tools.iter().any(|tool| tool.name == "ask_user"));
+}
+
+#[tokio::test]
+async fn plan_sub_agent_can_forward_a_blocking_question_to_the_user() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "parent-task",
+            "agent",
+            r#"{"agent":"plan","prompt":"draft a migration plan","summary":"plan the migration"}"#,
+        ),
+        text_done("parent received the draft"),
+    ]);
+    let sub = MockProvider::new(vec![
+        tool_use(
+            "question",
+            "ask_user",
+            r#"{"questions":[{"question":"Which migration path?","options":[{"label":"safe"},{"label":"fast"}]}]}"#,
+        ),
+        text_done("## Plan\n\nUse the safe migration path."),
+    ]);
+    let agent = plan_task_agent(parent, sub.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, Some("safe"));
+
+    run(&agent, &mut session, &approver, "delegate a plan").await;
+
+    assert_eq!(approver.asked.lock().unwrap().as_slice(), ["ask_user"]);
+    assert!(tool_results(&session)
+        .iter()
+        .any(|(content, error)| !error && content.contains("safe migration path")));
+    let requests = sub.requests.lock().unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "the answer must continue the same sub-agent turn"
+    );
+    assert!(requests[1]
+        .messages
+        .iter()
+        .any(|message| format!("{message:?}").contains("safe")));
 }
 
 #[tokio::test]
@@ -2778,6 +2823,86 @@ async fn exit_plan_approval_switches_mode_and_unblocks_edits() {
 }
 
 #[tokio::test]
+async fn plan_mode_allows_scratch_writes_but_not_project_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let scratch_file = session.tool_ctx.scratch_dir.join("research.txt");
+    let project_file = dir.path().join("should-not-exist.txt");
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "scratch",
+                "write",
+                &serde_json::json!({"path": scratch_file, "content": "notes"}).to_string(),
+            ),
+            (
+                "project",
+                "write",
+                &serde_json::json!({"path": project_file, "content": "blocked"}).to_string(),
+            ),
+        ]),
+        text_done("research complete"),
+    ]);
+    let agent = agent(provider);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    let events = run(&agent, &mut session, &approver, "research in scratch").await;
+
+    assert!(
+        matches!(std::fs::read_to_string(&scratch_file), Ok(ref content) if content == "notes"),
+        "tool results: {:?}; events: {events:#?}",
+        tool_results(&session)
+    );
+    assert!(
+        !project_file.exists(),
+        "plan mode must keep the project read-only"
+    );
+    assert!(approver.asked.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
+}
+
+#[tokio::test]
+async fn plan_mode_rejects_shell_even_when_cwd_is_scratch() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let project_file = dir.path().join("shell-must-not-write.txt");
+    let command = if cfg!(windows) {
+        format!(
+            "Set-Content -LiteralPath '{}' -Value blocked",
+            project_file.display()
+        )
+    } else {
+        format!("printf blocked > '{}'", project_file.display())
+    };
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "shell",
+            platform_shell_tool(),
+            &serde_json::json!({
+                "command": command,
+                "cwd": session.tool_ctx.scratch_dir,
+            })
+            .to_string(),
+        ),
+        text_done("research complete"),
+    ]);
+    let agent = agent(provider);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "research in scratch").await;
+
+    assert!(
+        !project_file.exists(),
+        "plan mode must reject shell execution"
+    );
+    assert!(approver.asked.lock().unwrap().is_empty());
+    let results = tool_results(&session);
+    assert!(results[0].1);
+    assert!(results[0].0.contains("blocked: plan mode is active"));
+    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
+}
+
+#[tokio::test]
 async fn exit_plan_rejection_keeps_plan_mode_and_returns_feedback() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![
@@ -2794,6 +2919,30 @@ async fn exit_plan_rejection_keeps_plan_mode_and_returns_feedback() {
     let results = tool_results(&session);
     assert!(results[0].1, "rejection is an error result");
     assert!(results[0].0.contains("add a rollback step"));
+}
+
+#[tokio::test]
+async fn exit_plan_rejection_without_feedback_pauses_for_user_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![tool_use(
+        "t1",
+        "exit_plan",
+        r#"{"plan":"Draft plan body."}"#,
+    )]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    let events = run(&agent, &mut session, &approver, "make a plan").await;
+
+    assert_eq!(session.mode, PermissionMode::Plan);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::AwaitingUserInput)));
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    let results = tool_results(&session);
+    assert!(results[0].1);
+    assert!(results[0].0.contains("Stop now and wait"));
 }
 
 #[tokio::test]
@@ -2877,6 +3026,24 @@ fn task_agent(parent: Arc<MockProvider>, sub: Arc<MockProvider>) -> Agent {
     .with_agent_models({
         let pins = AgentModels::default();
         pins.pin("explore", cell(sub).snapshot());
+        pins
+    });
+    Agent {
+        tools: vec![Arc::new(task)],
+        ..agent(parent)
+    }
+}
+
+fn plan_task_agent(parent: Arc<MockProvider>, sub: Arc<MockProvider>) -> Agent {
+    let task = tcode_tools::AgentTool::new(
+        cell(parent.clone()),
+        WatchdogConfig::default(),
+        2000,
+        std::env::temp_dir(),
+    )
+    .with_agent_models({
+        let pins = AgentModels::default();
+        pins.pin("plan", cell(sub).snapshot());
         pins
     });
     Agent {

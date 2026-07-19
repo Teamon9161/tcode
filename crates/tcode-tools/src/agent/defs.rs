@@ -133,6 +133,13 @@ impl ToolPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuestionPolicy {
+    #[default]
+    Disabled,
+    User,
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentDef {
     pub name: String,
@@ -140,8 +147,12 @@ pub struct AgentDef {
     /// The sub-agent's system prompt (markdown body of the definition file).
     pub system: String,
     /// A hard capability ceiling: mutating tools are removed before the
-    /// allowlist/denylist is considered, and delegated calls never prompt.
+    /// allowlist/denylist is considered. User questions are separately
+    /// governed by `question_policy`.
     pub read_only: bool,
+    /// Whether this agent may ask the human through its parent conversation.
+    /// Defaults to disabled; the parent UI remains the only interaction surface.
+    pub question_policy: QuestionPolicy,
     pub tool_policy: ToolPolicy,
     /// Agent kinds this one may spawn; empty = no `agent` tool (a leaf).
     pub agents: Vec<String>,
@@ -178,7 +189,7 @@ impl AgentRegistry {
         let defs = BUILTIN_AGENT_FILES
             .iter()
             .map(|(path, text)| {
-                let (def, warnings) = parse_def_text(text, None, AgentSource::Builtin(*path), path)
+                let (def, warnings) = parse_def_text(text, None, AgentSource::Builtin(path), path)
                     .unwrap_or_else(|error| panic!("invalid builtin agent {path}: {error}"));
                 assert!(warnings.is_empty(), "builtin agent {path}: {warnings:?}");
                 def
@@ -288,7 +299,7 @@ impl AgentRegistry {
         let mut out = String::from("Available agents:\n");
         let mut overflow = Vec::new();
         for def in self.visible_defs(allow) {
-            let readonly = def.read_only.then_some(" [read-only]").unwrap_or("");
+            let readonly = if def.read_only { " [read-only]" } else { "" };
             let line = format!(
                 "- {}{}: {}\n",
                 def.name,
@@ -423,7 +434,7 @@ fn valid_name(name: &str) -> bool {
 }
 
 fn value<'a>(meta: &'a Mapping, key: &str) -> Option<&'a Value> {
-    meta.get(&Value::String(key.to_string()))
+    meta.get(Value::String(key.to_string()))
 }
 
 fn string(meta: &Mapping, key: &str) -> Result<Option<String>, String> {
@@ -431,6 +442,14 @@ fn string(meta: &Mapping, key: &str) -> Result<Option<String>, String> {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(value)) => Ok(Some(value.clone())),
         Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn question_policy(meta: &Mapping) -> Result<QuestionPolicy, String> {
+    match string(meta, "questionPolicy")?.as_deref() {
+        None | Some("disabled") => Ok(QuestionPolicy::Disabled),
+        Some("user") => Ok(QuestionPolicy::User),
+        Some(_) => Err("`questionPolicy` must be `disabled` or `user`".into()),
     }
 }
 
@@ -586,6 +605,7 @@ fn parse_def_text(
             description,
             system,
             read_only: bool(&meta, "readonly")?,
+            question_policy: question_policy(&meta)?,
             tool_policy,
             agents: string_list(&meta, "agents")?.unwrap_or_default(),
             model: (!model.is_empty()).then_some(model),
@@ -622,6 +642,7 @@ mod tests {
             assert_eq!(registered.description, parsed.description);
             assert_eq!(registered.system, parsed.system);
             assert_eq!(registered.read_only, parsed.read_only);
+            assert_eq!(registered.question_policy, parsed.question_policy);
             assert_eq!(registered.tool_policy, parsed.tool_policy);
             assert_eq!(registered.agents, parsed.agents);
         }
@@ -655,8 +676,7 @@ mod tests {
         let tools = crate::builtin_tools(&std::env::temp_dir());
         assert!(tools
             .iter()
-            .filter(|tool| keeps_tool(&def, tool.as_ref()))
-            .next()
+            .find(|tool| keeps_tool(&def, tool.as_ref()))
             .is_none());
     }
 
@@ -682,6 +702,7 @@ mod tests {
         assert!(registry.get("helper").unwrap().gates_output);
         assert!(matches!(def.tool_policy, ToolPolicy::Allow(_)));
         assert_eq!(def.agents, ["helper"]);
+        assert_eq!(def.question_policy, QuestionPolicy::Disabled);
     }
 
     #[test]

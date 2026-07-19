@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::background::BackgroundTasks;
@@ -221,6 +221,19 @@ pub enum DelegateEvent {
     },
 }
 
+/// A delegated sub-agent's request to present a user question through its
+/// parent conversation. It carries the normal approval payload unchanged, so
+/// every frontend reuses its existing `ask_user` dialog and answer handling.
+pub struct DelegatedApprovalRequest {
+    pub tool: String,
+    pub summary: String,
+    pub descriptor: String,
+    pub is_edit: bool,
+    pub allows_project: bool,
+    pub input: Value,
+    pub reply: oneshot::Sender<Approval>,
+}
+
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx {
     pub cwd: PathBuf,
@@ -241,6 +254,7 @@ pub struct ToolCtx {
     /// session's scratch root.
     output_budget_tokens: usize,
     delegate: Mutex<Option<mpsc::UnboundedSender<DelegateEvent>>>,
+    delegated_approvals: Mutex<Option<mpsc::UnboundedSender<DelegatedApprovalRequest>>>,
 }
 
 static EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(0);
@@ -281,6 +295,7 @@ impl ToolCtx {
             task_traces: Mutex::new(TaskTraces::default()),
             output_budget_tokens,
             delegate: Mutex::new(None),
+            delegated_approvals: Mutex::new(None),
             cwd,
             scratch_dir,
         }
@@ -329,6 +344,30 @@ impl ToolCtx {
             .lock()
             .expect("delegate reporter lock")
             .clone()
+    }
+
+    pub fn delegated_approver(&self) -> Option<mpsc::UnboundedSender<DelegatedApprovalRequest>> {
+        self.delegated_approvals
+            .lock()
+            .expect("delegated approval lock")
+            .clone()
+    }
+
+    pub(crate) fn set_delegated_approver(
+        &self,
+        approver: mpsc::UnboundedSender<DelegatedApprovalRequest>,
+    ) {
+        *self
+            .delegated_approvals
+            .lock()
+            .expect("delegated approval lock") = Some(approver);
+    }
+
+    pub(crate) fn clear_delegated_approver(&self) {
+        *self
+            .delegated_approvals
+            .lock()
+            .expect("delegated approval lock") = None;
     }
 
     /// Bind (or unbind) where task traces persist. Called whenever the

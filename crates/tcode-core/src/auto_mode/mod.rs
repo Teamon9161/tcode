@@ -99,6 +99,16 @@ impl AutoModePolicy {
         }
     }
 
+    /// Whether a tool-declared target is inside this session's private scratch
+    /// root. Both sides resolve their deepest existing ancestor first, so a
+    /// scratch symlink or Windows junction cannot escape this boundary.
+    pub fn targets_scratch(&self, target: Option<&str>) -> bool {
+        let scratch = crate::memory::canonical_target(&self.scratch_root);
+        target.is_some_and(|target| {
+            crate::memory::canonical_target(&self.resolve(target)).starts_with(&scratch)
+        })
+    }
+
     pub fn route(&self, safety: AutoSafety, target: Option<&str>) -> AutoRoute {
         match safety {
             AutoSafety::Allow => AutoRoute::Allow,
@@ -108,8 +118,10 @@ impl AutoModePolicy {
                 let Some(target) = target else {
                     return AutoRoute::Classify;
                 };
-                let path = self.resolve(target);
-                if (path.starts_with(&self.project_root) || path.starts_with(&self.scratch_root))
+                let path = crate::memory::canonical_target(&self.resolve(target));
+                let project = crate::memory::canonical_target(&self.project_root);
+                let scratch = crate::memory::canonical_target(&self.scratch_root);
+                if (path.starts_with(&project) || path.starts_with(&scratch))
                     && !is_protected_path(&path)
                 {
                     AutoRoute::Allow
@@ -118,13 +130,11 @@ impl AutoModePolicy {
                 }
             }
             AutoSafety::AllowInScratch => {
-                let Some(target) = target else {
-                    return AutoRoute::Classify;
-                };
-                self.resolve(target)
-                    .starts_with(&self.scratch_root)
-                    .then_some(AutoRoute::Allow)
-                    .unwrap_or(AutoRoute::Classify)
+                if self.targets_scratch(target) {
+                    AutoRoute::Allow
+                } else {
+                    AutoRoute::Classify
+                }
             }
         }
     }
@@ -324,6 +334,11 @@ mod tests {
     #[test]
     fn in_project_or_session_scratch_edits_bypass_but_other_paths_do_not() {
         let policy = AutoModePolicy::new("/repo", "/scratch/runs/session");
+        assert!(
+            !policy.targets_scratch(Some("src/lib.rs")),
+            "the project must remain distinct from session scratch"
+        );
+        assert!(policy.targets_scratch(Some("/scratch/runs/session/probe.rs")));
         assert_eq!(
             policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some("src/lib.rs")),
             AutoRoute::Allow
@@ -359,6 +374,30 @@ mod tests {
         );
         assert_eq!(
             policy.route(AutoSafety::AllowInScratch, Some("/scratch/runs/other")),
+            AutoRoute::Classify
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scratch_boundary_rejects_a_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let scratch = root.path().join("scratch");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(&outside, scratch.join("escape")).unwrap();
+        let policy = AutoModePolicy::new(&project, &scratch);
+        let escaped = scratch.join("escape/notes.txt");
+        let escaped = escaped.to_string_lossy();
+
+        assert!(!policy.targets_scratch(Some(&escaped)));
+        assert_eq!(
+            policy.route(AutoSafety::AllowInScratch, Some(&escaped)),
             AutoRoute::Classify
         );
     }

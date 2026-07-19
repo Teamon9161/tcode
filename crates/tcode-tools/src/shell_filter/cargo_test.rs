@@ -50,6 +50,7 @@ fn compact_successful_test_output(output: &str) -> Option<String> {
 
     let lines: Vec<&str> = output.lines().collect();
     let mut passed = Vec::new();
+    let mut last_result = None;
     for (index, result) in lines.iter().enumerate() {
         if !result.trim_start().starts_with("test result: ok.") || result.contains("0 passed") {
             continue;
@@ -66,10 +67,17 @@ fn compact_successful_test_output(output: &str) -> Option<String> {
             .copied();
         if let Some(running) = running {
             passed.push(format!("{running}\n{result}"));
+            last_result = Some(index);
         }
     }
-    if passed.is_empty() {
-        return None;
+    let last_result = last_result?;
+
+    // A compound verification command often prints its workspace summary only
+    // after Cargo's final target. Keep that non-empty tail alongside the test
+    // evidence instead of making the model reopen the full spill file.
+    let tail = lines[last_result + 1..].to_vec().join("\n");
+    if !tail.trim().is_empty() {
+        passed.push(tail);
     }
 
     Some(format!(
@@ -114,6 +122,24 @@ test result: ok. 3 passed; 0 failed; 0 ignored";
         assert!(CargoTestFilter
             .apply("cd crates/tcode-core && cargo test", TWO_TARGETS)
             .is_some());
+    }
+
+    #[test]
+    fn compound_verification_keeps_the_workspace_summary_after_tests() {
+        let output = format!(
+            "{TWO_TARGETS}\n\n M crates/tcode-tools/src/shell.rs\n crates/tcode-tools/src/shell.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+        );
+        let folded = CargoTestFilter
+            .apply(
+                "cargo test && git status --short && git diff --stat",
+                &output,
+            )
+            .unwrap();
+        assert!(
+            folded.contains(" M crates/tcode-tools/src/shell.rs"),
+            "{folded}"
+        );
+        assert!(folded.contains("1 file changed"), "{folded}");
     }
 
     #[test]

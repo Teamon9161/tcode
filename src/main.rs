@@ -727,12 +727,14 @@ async fn main() -> anyhow::Result<()> {
             match tcode_tui::run(
                 agent.clone(),
                 session,
-                menu,
-                agent_menu,
-                opening_context.clone(),
-                environment.clone(),
-                config.ui.show_reasoning,
-                skills.clone(),
+                tcode_tui::TuiConfig {
+                    menu,
+                    agents: agent_menu,
+                    opening_context: opening_context.clone(),
+                    environment: environment.clone(),
+                    show_reasoning: config.ui.show_reasoning,
+                    skills: skills.clone(),
+                },
             )
             .await?
             {

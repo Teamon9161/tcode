@@ -11,18 +11,18 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
     ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
-    ContentBlock, DelegateEvent, Entry, ModelCell, PermissionMode, PermissionRequest,
-    PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, TaskRunStatus, Tool,
-    ToolCtx, ToolOutput,
+    ContentBlock, DelegateEvent, DelegatedApprovalRequest, Entry, ModelCell, PermissionMode,
+    PermissionRequest, PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session,
+    TaskRunStatus, Tool, ToolCtx, ToolOutput,
 };
 
-use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry};
+use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry, QuestionPolicy};
 
 /// Sub-agents run in unsafe mode and must never prompt; this approver is
 /// a safety net in case a deny-rule path still asks.
@@ -46,6 +46,49 @@ impl Approver for NeverAsk {
     }
 }
 
+/// Forward a permitted sub-agent question to the parent conversation's existing
+/// approver. The receiver is installed only while the parent executes this
+/// `agent` call, so a direct or orphaned run stays safely non-interactive.
+struct ParentUserBridge {
+    requests: mpsc::UnboundedSender<DelegatedApprovalRequest>,
+}
+
+#[async_trait]
+impl Approver for ParentUserBridge {
+    async fn ask(
+        &self,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        is_edit: bool,
+        allows_project: bool,
+        input: &Value,
+    ) -> Approval {
+        let (reply, response) = oneshot::channel();
+        let request = DelegatedApprovalRequest {
+            tool: tool.to_string(),
+            summary: summary.to_string(),
+            descriptor: descriptor.to_string(),
+            is_edit,
+            allows_project,
+            input: input.clone(),
+            reply,
+        };
+        if self.requests.send(request).is_err() {
+            return Approval::simple(
+                ApprovalDecision::No,
+                Some("the parent conversation is no longer available for questions".into()),
+            );
+        }
+        response.await.unwrap_or_else(|_| {
+            Approval::simple(
+                ApprovalDecision::No,
+                Some("the parent conversation stopped before answering".into()),
+            )
+        })
+    }
+}
+
 /// Parked resumable runs per task-tool instance; oldest is evicted beyond
 /// this. Each parked run keeps its whole ledger in memory.
 const MAX_LIVE_TASKS: usize = 8;
@@ -59,6 +102,7 @@ struct LiveTask {
     exchanges_left: u32,
     def_name: String,
     model_name: String,
+    question_policy: QuestionPolicy,
     /// Park order for oldest-first eviction.
     seq: u64,
 }
@@ -219,12 +263,16 @@ impl AgentTool {
     }
 
     /// The definition-derived toolset. Read-only agents get only
-    /// side-effect-free tools; builtin `plan` additionally loses `exit_plan`
-    /// (approval and the plan-mode transition remain exclusive to the
-    /// parent); an allowlist restricts further.
+    /// side-effect-free tools; a definition that explicitly allows user
+    /// questions receives `ask_user` through the parent bridge; builtin `plan`
+    /// still loses `exit_plan` (approval and the plan-mode transition remain
+    /// exclusive to the parent).
     fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
         let mut tools = self.base_tools(cwd, model.clone());
         tools.retain(|tool| keeps_tool(def, tool.as_ref()));
+        if def.question_policy == QuestionPolicy::User && def.tool_policy.keeps("ask_user") {
+            tools.push(Arc::new(crate::AskUserTool));
+        }
         // Delegation is granted by the `agents` field alone — deliberately
         // outside the allowlist/read-only tiers — and bounded by depth, so
         // definition cycles terminate without graph analysis.
@@ -293,8 +341,7 @@ fn agent_description(defs: &AgentRegistry, allow: Option<&[String]>) -> String {
     format!(
         "Delegate a bounded subtask to an isolated agent with its own fresh context. \
          Give a complete, self-contained prompt and a very short task summary in the \
-         same language as that prompt; the agent sees nothing of this conversation \
-         and cannot ask the user questions.\n\n{}",
+         same language as that prompt; the agent sees none of this conversation. Most agents cannot ask questions; agents with `questionPolicy: user` may use ask_user to ask the human through this parent conversation.\n\n{}",
         defs.catalogue(allow)
     )
 }
@@ -333,6 +380,461 @@ fn prompt_summary(prompt: &str) -> String {
     }
     let capped: String = first.chars().take(MAX_CHARS - 1).collect();
     format!("{capped}…")
+}
+
+#[async_trait]
+impl Tool for AgentTool {
+    fn name(&self) -> &str {
+        "agent"
+    }
+
+    fn description(&self) -> &str {
+        &self.description
+    }
+
+    fn input_schema(&self) -> Value {
+        agent_schema(&self.defs, self.allowed.as_deref())
+    }
+
+    fn batch_policy_for(&self, input: &Value) -> tcode_core::BatchPolicy {
+        // Resumed runs mutate parked session state; serialize them.
+        let read_only = input["resume"].as_str().is_none()
+            && input["agent"]
+                .as_str()
+                .and_then(|kind| self.def_for(kind))
+                .is_some_and(|def| def.read_only);
+        if read_only {
+            tcode_core::BatchPolicy::ParallelReadOnly
+        } else {
+            tcode_core::BatchPolicy::Isolated
+        }
+    }
+
+    fn batch_label(&self, inputs: &[&Value]) -> String {
+        let count = inputs.len();
+        format!(
+            "Delegate {count} {}",
+            if count == 1 { "agent" } else { "agents" }
+        )
+    }
+
+    fn gates_output_for(&self, input: &Value) -> bool {
+        input["agent"]
+            .as_str()
+            .and_then(|kind| self.def_for(kind))
+            .is_none_or(|def| def.gates_output)
+    }
+
+    fn permission(&self, input: &Value) -> PermissionRequest {
+        match input["agent"].as_str().and_then(|kind| self.def_for(kind)) {
+            // Read-only: never prompts.
+            Some(def) if def.read_only => PermissionRequest::None,
+            Some(def) => {
+                let prompt = input["prompt"].as_str().unwrap_or("?");
+                let preview: String = prompt.chars().take(60).collect();
+                PermissionRequest::Ask {
+                    descriptor: format!("agent({})", def.name),
+                    aliases: Vec::new(),
+                    summary: format!("delegate to sub-agent: {preview}"),
+                    is_edit: false,
+                }
+            }
+            // Unknown kind: run() fails immediately with a self-healing
+            // error before any side effect, so prompting would be noise.
+            None => PermissionRequest::None,
+        }
+    }
+
+    async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
+        // Only reachable through a caller that bypassed `run_with_call`; the
+        // run still works, its trace just cannot be tied to a ledger entry.
+        self.run_with_call("", input, ctx, cancel).await
+    }
+
+    async fn run_with_call(
+        &self,
+        call_id: &str,
+        input: Value,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str()) else {
+            return ToolOutput::err("missing required parameters: agent, prompt");
+        };
+        let summary = input["summary"]
+            .as_str()
+            .map(str::trim)
+            .filter(|summary| !summary.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| prompt_summary(prompt));
+        let Some(def) = self.def_for(kind) else {
+            return ToolOutput::err(format!(
+                "unknown agent '{kind}'; available: {}",
+                self.defs.names_for(self.allowed.as_deref()).join(", ")
+            ));
+        };
+        if let Some(id) = input["resume"]
+            .as_str()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            return self
+                .resume_run(id, def, prompt, &summary, call_id, ctx, cancel)
+                .await;
+        }
+        let system = def.system.clone();
+
+        let model = self.model_for(kind);
+        let model_name = model.provider.model().to_string();
+        let model = ModelCell::new(model);
+        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
+            model.clone(),
+            self.pinned.clone(),
+        ));
+        let agent = Agent {
+            model: model.clone(),
+            // A sub-agent has no input box, so it never suggests; it still
+            // carries the pins so its own classifier resolves the same way.
+            models: self.pinned.clone(),
+            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
+            system,
+            watchdog: self.watchdog.clone(),
+            hooks: Default::default(),
+            safety_classifier: Some(safety_classifier),
+            auto_policy: self.auto_policy.clone(),
+            max_steps: def.max_steps.unwrap_or(tcode_core::DEFAULT_MAX_STEPS),
+            auto_compact: self.auto_compact,
+            auto_compact_percent: self.auto_compact_percent,
+        };
+        // Every sub-agent run is its own conversation on (usually) the parent's
+        // provider. Sharing the parent's cache id would interleave two
+        // unrelated prefixes on it, so each run names its own scope.
+        static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut session = Session::new(
+            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
+                .with_model(model.clone()),
+            PermissionMode::Auto,
+            PermissionRules::default(),
+        )
+        .with_cache_scope(format!("agent-{kind}-{run}"));
+
+        let run = match self
+            .drive(
+                &agent,
+                &mut session,
+                kind,
+                &model_name,
+                def.question_policy,
+                prompt,
+                &summary,
+                call_id,
+                ctx,
+                cancel,
+            )
+            .await
+        {
+            Ok(run) => run,
+            Err(out) => return out,
+        };
+
+        if def.max_exchanges > 0 {
+            let id = run.run_id.clone();
+            let header = format!(
+                "[{kind} sub-agent {id} on {model_name}: {}; resumable — call agent with \
+                 agent=\"{kind}\", resume=\"{id}\" for up to {} follow-up turns]",
+                run.stats, def.max_exchanges
+            );
+            static PARK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            self.park(
+                &id,
+                LiveTask {
+                    agent,
+                    session,
+                    exchanges_left: def.max_exchanges,
+                    def_name: def.name.clone(),
+                    model_name,
+                    question_policy: def.question_policy,
+                    seq: PARK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                },
+            );
+            return ToolOutput::ok(format!("{header}\n{}", run.report));
+        }
+        ToolOutput::ok(format!(
+            "[{kind} sub-agent on {model_name}: {}]\n{}",
+            run.stats, run.report
+        ))
+    }
+}
+
+/// What one delegated turn produced, shared by fresh and resumed runs.
+struct TaskRunOutcome {
+    run_id: String,
+    /// `"{tool_calls} tool calls, in X | out Y tokens"`.
+    stats: String,
+    report: String,
+}
+
+impl AgentTool {
+    /// Continue a parked run: same session, same cache scope, pure append —
+    /// a follow-up costs only the increment on a full prefix cache hit.
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_run(
+        &self,
+        id: &str,
+        def: &AgentDef,
+        prompt: &str,
+        summary: &str,
+        call_id: &str,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
+        let taken = self.live.lock().expect("live tasks lock").remove(id);
+        let Some(mut task) = taken else {
+            let mut parked: Vec<String> = {
+                let live = self.live.lock().expect("live tasks lock");
+                live.keys().cloned().collect()
+            };
+            parked.sort();
+            return ToolOutput::err(format!(
+                "no resumable agent run '{id}' — it may have expired, hit its follow-up limit, \
+                 or be resuming concurrently. Resumable now: [{}]. Start a fresh agent run instead.",
+                parked.join(", ")
+            ));
+        };
+        if task.def_name != def.name {
+            let owner = task.def_name.clone();
+            self.live
+                .lock()
+                .expect("live tasks lock")
+                .insert(id.to_string(), task);
+            return ToolOutput::err(format!(
+                "agent run '{id}' belongs to agent '{owner}'; call agent with agent=\"{owner}\""
+            ));
+        }
+        task.exchanges_left -= 1;
+        let outcome = self
+            .drive(
+                &task.agent,
+                &mut task.session,
+                &def.name,
+                &task.model_name,
+                task.question_policy,
+                prompt,
+                summary,
+                call_id,
+                ctx,
+                cancel,
+            )
+            .await;
+        match outcome {
+            // A failed or cancelled follow-up drops the parked run: its
+            // session state is no longer trustworthy.
+            Err(out) => out,
+            Ok(run) => {
+                let left = task.exchanges_left;
+                let model_name = task.model_name.clone();
+                let note = if left > 0 {
+                    self.park(id, task);
+                    format!("{left} follow-up turns left")
+                } else {
+                    "follow-up limit reached, agent run closed".to_string()
+                };
+                ToolOutput::ok(format!(
+                    "[{} sub-agent {id} resumed on {model_name}: {}; {note}]\n{}",
+                    def.name, run.stats, run.report
+                ))
+            }
+        }
+    }
+
+    /// Run one turn of a delegated agent — trace, live-event forwarding,
+    /// report extraction — shared by fresh runs and resumed follow-ups.
+    #[allow(clippy::too_many_arguments)]
+    async fn drive(
+        &self,
+        agent: &Agent,
+        session: &mut Session,
+        kind: &str,
+        model_name: &str,
+        question_policy: QuestionPolicy,
+        prompt: &str,
+        summary: &str,
+        call_id: &str,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> Result<TaskRunOutcome, ToolOutput> {
+        // Trace: the run gets a stable per-session id, and (when the parent
+        // session persists) its own JSONL ledger log for the trace viewer.
+        // Nothing here enters the parent's provider ledger. A resumed run
+        // swaps in the new trace's sink, so each trace records its own turn.
+        let (run_id, trace) = ctx
+            .task_traces
+            .lock()
+            .expect("task traces lock")
+            .begin(call_id, kind, model_name, prompt, summary);
+        if let Some(trace) = &trace {
+            session.ledger.attach_sink(Box::new(trace.clone()));
+        }
+        let delegate = ctx.delegate_reporter();
+        if let Some(delegate) = &delegate {
+            // Best-effort visual/trace updates; losing them must never
+            // interrupt the sub-agent.
+            let _ = delegate.send(DelegateEvent::TaskStarted {
+                run: run_id.clone(),
+                parent_call: call_id.to_string(),
+                kind: kind.to_string(),
+                model: model_name.to_string(),
+                prompt: prompt.to_string(),
+                summary: summary.to_string(),
+            });
+        }
+
+        // Drain sub-agent events: count tool calls for the stats line and
+        // forward everything, tagged with the run id, so the parent UI can
+        // show live activity and a full trace. Streaming deltas coalesce so a
+        // chatty sub-agent does not cross the channel one token at a time.
+        let (tx, mut rx) = mpsc::channel(64);
+        let tagger = {
+            let delegate = delegate.clone();
+            let run = run_id.clone();
+            tokio::spawn(async move {
+                let send = |ev: AgentEvent| {
+                    if let Some(delegate) = &delegate {
+                        let _ = delegate.send(DelegateEvent::TaskEvent {
+                            run: run.clone(),
+                            event: Box::new(ev),
+                        });
+                    }
+                };
+                let mut tools = 0usize;
+                // At most one buffered delta run (text or thinking).
+                let mut pending: Option<AgentEvent> = None;
+                while let Some(ev) = rx.recv().await {
+                    match &ev {
+                        AgentEvent::ToolStart { .. } => tools += 1,
+                        // Parallel batches emit no per-call ToolStart.
+                        AgentEvent::ToolBatchStart { calls, .. } => tools += calls.len(),
+                        _ => {}
+                    }
+                    match (&mut pending, ev) {
+                        (Some(AgentEvent::TextDelta(buf)), AgentEvent::TextDelta(t)) => {
+                            buf.push_str(&t)
+                        }
+                        (Some(AgentEvent::ThinkingDelta(buf)), AgentEvent::ThinkingDelta(t)) => {
+                            buf.push_str(&t)
+                        }
+                        (slot, ev @ (AgentEvent::TextDelta(_) | AgentEvent::ThinkingDelta(_))) => {
+                            if let Some(prev) = slot.take() {
+                                send(prev);
+                            }
+                            *slot = Some(ev);
+                        }
+                        (slot, ev) => {
+                            if let Some(prev) = slot.take() {
+                                send(prev);
+                            }
+                            send(ev);
+                        }
+                    }
+                    let full = pending.as_ref().is_some_and(|ev| match ev {
+                        AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => t.len() >= 64,
+                        _ => false,
+                    });
+                    if full {
+                        send(pending.take().expect("checked above"));
+                    }
+                }
+                if let Some(prev) = pending.take() {
+                    send(prev);
+                }
+                tools
+            })
+        };
+
+        let bridge = (question_policy == QuestionPolicy::User)
+            .then(|| ctx.delegated_approver())
+            .flatten()
+            .map(|requests| ParentUserBridge { requests });
+        let never_ask = NeverAsk;
+        let approver: &dyn Approver = bridge
+            .as_ref()
+            .map(|bridge| bridge as &dyn Approver)
+            .unwrap_or(&never_ask);
+        let result = agent
+            .user_turn(
+                session,
+                vec![ContentBlock::Text {
+                    text: prompt.to_string(),
+                }],
+                &tx,
+                approver,
+                cancel.clone(),
+            )
+            .await;
+        drop(tx);
+        let tool_calls = tagger.await.unwrap_or(0);
+
+        let status = if result.is_err() {
+            TaskRunStatus::Failed
+        } else if cancel.is_cancelled() {
+            TaskRunStatus::Cancelled
+        } else {
+            TaskRunStatus::Done
+        };
+        let usage = session.turn_usage;
+        if let Some(trace) = &trace {
+            trace.finish(status, tool_calls, usage);
+        }
+        if let Some(delegate) = &delegate {
+            let _ = delegate.send(DelegateEvent::TaskFinished {
+                run: run_id.clone(),
+                status,
+                tool_calls,
+                usage,
+            });
+        }
+
+        if let Err(e) = result {
+            return Err(ToolOutput::err(format!("sub-agent failed: {e}")));
+        }
+        if cancel.is_cancelled() {
+            return Err(ToolOutput::err("sub-agent cancelled by user"));
+        }
+
+        // The report = text of the final assistant entry.
+        let report: String = session
+            .ledger
+            .entries()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                Entry::Assistant(blocks) => {
+                    let text: String = blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.trim().is_empty()).then_some(text)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "(sub-agent produced no report)".into());
+
+        let u = session.turn_usage;
+        Ok(TaskRunOutcome {
+            run_id,
+            stats: format!(
+                "{tool_calls} tool calls, in {} | out {} tokens",
+                u.total_input(),
+                u.output_tokens
+            ),
+            report,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -551,447 +1053,5 @@ mod tests {
             .sub_tools(investor, &tmp, null_model())
             .iter()
             .any(|tool| tool.name() == "agent"));
-    }
-}
-
-#[async_trait]
-impl Tool for AgentTool {
-    fn name(&self) -> &str {
-        "agent"
-    }
-
-    fn description(&self) -> &str {
-        &self.description
-    }
-
-    fn input_schema(&self) -> Value {
-        agent_schema(&self.defs, self.allowed.as_deref())
-    }
-
-    fn batch_policy_for(&self, input: &Value) -> tcode_core::BatchPolicy {
-        // Resumed runs mutate parked session state; serialize them.
-        let read_only = input["resume"].as_str().is_none()
-            && input["agent"]
-                .as_str()
-                .and_then(|kind| self.def_for(kind))
-                .is_some_and(|def| def.read_only);
-        if read_only {
-            tcode_core::BatchPolicy::ParallelReadOnly
-        } else {
-            tcode_core::BatchPolicy::Isolated
-        }
-    }
-
-    fn batch_label(&self, inputs: &[&Value]) -> String {
-        let count = inputs.len();
-        format!(
-            "Delegate {count} {}",
-            if count == 1 { "agent" } else { "agents" }
-        )
-    }
-
-    fn gates_output_for(&self, input: &Value) -> bool {
-        input["agent"]
-            .as_str()
-            .and_then(|kind| self.def_for(kind))
-            .is_none_or(|def| def.gates_output)
-    }
-
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        match input["agent"].as_str().and_then(|kind| self.def_for(kind)) {
-            // Read-only: never prompts.
-            Some(def) if def.read_only => PermissionRequest::None,
-            Some(def) => {
-                let prompt = input["prompt"].as_str().unwrap_or("?");
-                let preview: String = prompt.chars().take(60).collect();
-                PermissionRequest::Ask {
-                    descriptor: format!("agent({})", def.name),
-                    aliases: Vec::new(),
-                    summary: format!("delegate to sub-agent: {preview}"),
-                    is_edit: false,
-                }
-            }
-            // Unknown kind: run() fails immediately with a self-healing
-            // error before any side effect, so prompting would be noise.
-            None => PermissionRequest::None,
-        }
-    }
-
-    async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
-        // Only reachable through a caller that bypassed `run_with_call`; the
-        // run still works, its trace just cannot be tied to a ledger entry.
-        self.run_with_call("", input, ctx, cancel).await
-    }
-
-    async fn run_with_call(
-        &self,
-        call_id: &str,
-        input: Value,
-        ctx: &ToolCtx,
-        cancel: &CancellationToken,
-    ) -> ToolOutput {
-        let (Some(kind), Some(prompt)) = (input["agent"].as_str(), input["prompt"].as_str()) else {
-            return ToolOutput::err("missing required parameters: agent, prompt");
-        };
-        let summary = input["summary"]
-            .as_str()
-            .map(str::trim)
-            .filter(|summary| !summary.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| prompt_summary(prompt));
-        let Some(def) = self.def_for(kind) else {
-            return ToolOutput::err(format!(
-                "unknown agent '{kind}'; available: {}",
-                self.defs.names_for(self.allowed.as_deref()).join(", ")
-            ));
-        };
-        if let Some(id) = input["resume"]
-            .as_str()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-        {
-            return self
-                .resume_run(id, def, prompt, &summary, call_id, ctx, cancel)
-                .await;
-        }
-        let system = def.system.clone();
-
-        let model = self.model_for(kind);
-        let model_name = model.provider.model().to_string();
-        let model = ModelCell::new(model);
-        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
-            model.clone(),
-            self.pinned.clone(),
-        ));
-        let agent = Agent {
-            model: model.clone(),
-            // A sub-agent has no input box, so it never suggests; it still
-            // carries the pins so its own classifier resolves the same way.
-            models: self.pinned.clone(),
-            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
-            system,
-            watchdog: self.watchdog.clone(),
-            hooks: Default::default(),
-            safety_classifier: Some(safety_classifier),
-            auto_policy: self.auto_policy.clone(),
-            max_steps: def.max_steps.unwrap_or(tcode_core::DEFAULT_MAX_STEPS),
-            auto_compact: self.auto_compact,
-            auto_compact_percent: self.auto_compact_percent,
-        };
-        // Every sub-agent run is its own conversation on (usually) the parent's
-        // provider. Sharing the parent's cache id would interleave two
-        // unrelated prefixes on it, so each run names its own scope.
-        static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let mut session = Session::new(
-            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
-                .with_model(model.clone()),
-            PermissionMode::Auto,
-            PermissionRules::default(),
-        )
-        .with_cache_scope(format!("agent-{kind}-{run}"));
-
-        let run = match self
-            .drive(
-                &agent,
-                &mut session,
-                kind,
-                &model_name,
-                prompt,
-                &summary,
-                call_id,
-                ctx,
-                cancel,
-            )
-            .await
-        {
-            Ok(run) => run,
-            Err(out) => return out,
-        };
-
-        if def.max_exchanges > 0 {
-            let id = run.run_id.clone();
-            let header = format!(
-                "[{kind} sub-agent {id} on {model_name}: {}; resumable — call agent with \
-                 agent=\"{kind}\", resume=\"{id}\" for up to {} follow-up turns]",
-                run.stats, def.max_exchanges
-            );
-            static PARK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            self.park(
-                &id,
-                LiveTask {
-                    agent,
-                    session,
-                    exchanges_left: def.max_exchanges,
-                    def_name: def.name.clone(),
-                    model_name,
-                    seq: PARK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-                },
-            );
-            return ToolOutput::ok(format!("{header}\n{}", run.report));
-        }
-        ToolOutput::ok(format!(
-            "[{kind} sub-agent on {model_name}: {}]\n{}",
-            run.stats, run.report
-        ))
-    }
-}
-
-/// What one delegated turn produced, shared by fresh and resumed runs.
-struct TaskRunOutcome {
-    run_id: String,
-    /// `"{tool_calls} tool calls, in X | out Y tokens"`.
-    stats: String,
-    report: String,
-}
-
-impl AgentTool {
-    /// Continue a parked run: same session, same cache scope, pure append —
-    /// a follow-up costs only the increment on a full prefix cache hit.
-    #[allow(clippy::too_many_arguments)]
-    async fn resume_run(
-        &self,
-        id: &str,
-        def: &AgentDef,
-        prompt: &str,
-        summary: &str,
-        call_id: &str,
-        ctx: &ToolCtx,
-        cancel: &CancellationToken,
-    ) -> ToolOutput {
-        let taken = self.live.lock().expect("live tasks lock").remove(id);
-        let Some(mut task) = taken else {
-            let mut parked: Vec<String> = {
-                let live = self.live.lock().expect("live tasks lock");
-                live.keys().cloned().collect()
-            };
-            parked.sort();
-            return ToolOutput::err(format!(
-                "no resumable agent run '{id}' — it may have expired, hit its follow-up limit, \
-                 or be resuming concurrently. Resumable now: [{}]. Start a fresh agent run instead.",
-                parked.join(", ")
-            ));
-        };
-        if task.def_name != def.name {
-            let owner = task.def_name.clone();
-            self.live
-                .lock()
-                .expect("live tasks lock")
-                .insert(id.to_string(), task);
-            return ToolOutput::err(format!(
-                "agent run '{id}' belongs to agent '{owner}'; call agent with agent=\"{owner}\""
-            ));
-        }
-        task.exchanges_left -= 1;
-        let outcome = self
-            .drive(
-                &task.agent,
-                &mut task.session,
-                &def.name,
-                &task.model_name,
-                prompt,
-                summary,
-                call_id,
-                ctx,
-                cancel,
-            )
-            .await;
-        match outcome {
-            // A failed or cancelled follow-up drops the parked run: its
-            // session state is no longer trustworthy.
-            Err(out) => out,
-            Ok(run) => {
-                let left = task.exchanges_left;
-                let model_name = task.model_name.clone();
-                let note = if left > 0 {
-                    self.park(id, task);
-                    format!("{left} follow-up turns left")
-                } else {
-                    "follow-up limit reached, agent run closed".to_string()
-                };
-                ToolOutput::ok(format!(
-                    "[{} sub-agent {id} resumed on {model_name}: {}; {note}]\n{}",
-                    def.name, run.stats, run.report
-                ))
-            }
-        }
-    }
-
-    /// Run one turn of a delegated agent — trace, live-event forwarding,
-    /// report extraction — shared by fresh runs and resumed follow-ups.
-    #[allow(clippy::too_many_arguments)]
-    async fn drive(
-        &self,
-        agent: &Agent,
-        session: &mut Session,
-        kind: &str,
-        model_name: &str,
-        prompt: &str,
-        summary: &str,
-        call_id: &str,
-        ctx: &ToolCtx,
-        cancel: &CancellationToken,
-    ) -> Result<TaskRunOutcome, ToolOutput> {
-        // Trace: the run gets a stable per-session id, and (when the parent
-        // session persists) its own JSONL ledger log for the trace viewer.
-        // Nothing here enters the parent's provider ledger. A resumed run
-        // swaps in the new trace's sink, so each trace records its own turn.
-        let (run_id, trace) = ctx
-            .task_traces
-            .lock()
-            .expect("task traces lock")
-            .begin(call_id, kind, model_name, prompt, summary);
-        if let Some(trace) = &trace {
-            session.ledger.attach_sink(Box::new(trace.clone()));
-        }
-        let delegate = ctx.delegate_reporter();
-        if let Some(delegate) = &delegate {
-            // Best-effort visual/trace updates; losing them must never
-            // interrupt the sub-agent.
-            let _ = delegate.send(DelegateEvent::TaskStarted {
-                run: run_id.clone(),
-                parent_call: call_id.to_string(),
-                kind: kind.to_string(),
-                model: model_name.to_string(),
-                prompt: prompt.to_string(),
-                summary: summary.to_string(),
-            });
-        }
-
-        // Drain sub-agent events: count tool calls for the stats line and
-        // forward everything, tagged with the run id, so the parent UI can
-        // show live activity and a full trace. Streaming deltas coalesce so a
-        // chatty sub-agent does not cross the channel one token at a time.
-        let (tx, mut rx) = mpsc::channel(64);
-        let tagger = {
-            let delegate = delegate.clone();
-            let run = run_id.clone();
-            tokio::spawn(async move {
-                let send = |ev: AgentEvent| {
-                    if let Some(delegate) = &delegate {
-                        let _ = delegate.send(DelegateEvent::TaskEvent {
-                            run: run.clone(),
-                            event: Box::new(ev),
-                        });
-                    }
-                };
-                let mut tools = 0usize;
-                // At most one buffered delta run (text or thinking).
-                let mut pending: Option<AgentEvent> = None;
-                while let Some(ev) = rx.recv().await {
-                    match &ev {
-                        AgentEvent::ToolStart { .. } => tools += 1,
-                        // Parallel batches emit no per-call ToolStart.
-                        AgentEvent::ToolBatchStart { calls, .. } => tools += calls.len(),
-                        _ => {}
-                    }
-                    match (&mut pending, ev) {
-                        (Some(AgentEvent::TextDelta(buf)), AgentEvent::TextDelta(t)) => {
-                            buf.push_str(&t)
-                        }
-                        (Some(AgentEvent::ThinkingDelta(buf)), AgentEvent::ThinkingDelta(t)) => {
-                            buf.push_str(&t)
-                        }
-                        (slot, ev @ (AgentEvent::TextDelta(_) | AgentEvent::ThinkingDelta(_))) => {
-                            if let Some(prev) = slot.take() {
-                                send(prev);
-                            }
-                            *slot = Some(ev);
-                        }
-                        (slot, ev) => {
-                            if let Some(prev) = slot.take() {
-                                send(prev);
-                            }
-                            send(ev);
-                        }
-                    }
-                    let full = pending.as_ref().is_some_and(|ev| match ev {
-                        AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => t.len() >= 64,
-                        _ => false,
-                    });
-                    if full {
-                        send(pending.take().expect("checked above"));
-                    }
-                }
-                if let Some(prev) = pending.take() {
-                    send(prev);
-                }
-                tools
-            })
-        };
-
-        let result = agent
-            .user_turn(
-                session,
-                vec![ContentBlock::Text {
-                    text: prompt.to_string(),
-                }],
-                &tx,
-                &NeverAsk,
-                cancel.clone(),
-            )
-            .await;
-        drop(tx);
-        let tool_calls = tagger.await.unwrap_or(0);
-
-        let status = if result.is_err() {
-            TaskRunStatus::Failed
-        } else if cancel.is_cancelled() {
-            TaskRunStatus::Cancelled
-        } else {
-            TaskRunStatus::Done
-        };
-        let usage = session.turn_usage;
-        if let Some(trace) = &trace {
-            trace.finish(status, tool_calls, usage);
-        }
-        if let Some(delegate) = &delegate {
-            let _ = delegate.send(DelegateEvent::TaskFinished {
-                run: run_id.clone(),
-                status,
-                tool_calls,
-                usage,
-            });
-        }
-
-        if let Err(e) = result {
-            return Err(ToolOutput::err(format!("sub-agent failed: {e}")));
-        }
-        if cancel.is_cancelled() {
-            return Err(ToolOutput::err("sub-agent cancelled by user"));
-        }
-
-        // The report = text of the final assistant entry.
-        let report: String = session
-            .ledger
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                Entry::Assistant(blocks) => {
-                    let text: String = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.trim().is_empty()).then_some(text)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "(sub-agent produced no report)".into());
-
-        let u = session.turn_usage;
-        Ok(TaskRunOutcome {
-            run_id,
-            stats: format!(
-                "{tool_calls} tool calls, in {} | out {} tokens",
-                u.total_input(),
-                u.output_tokens
-            ),
-            report,
-        })
     }
 }

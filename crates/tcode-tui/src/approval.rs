@@ -169,13 +169,12 @@ impl PlanReview {
     }
 }
 
-/// One plan-review option. Approving carries a permission-mode transition; the
-/// keep-planning option carries none and requires feedback text.
+/// One plan-review option. Approving carries a permission-mode transition;
+/// declining without feedback pauses the turn until the user says more.
 struct PlanOption {
     label: &'static str,
     decision: ApprovalDecision,
     set_mode: Option<PermissionMode>,
-    requires_feedback: bool,
 }
 
 const PLAN_OPTIONS: [PlanOption; 4] = [
@@ -183,25 +182,21 @@ const PLAN_OPTIONS: [PlanOption; 4] = [
         label: "Yes, and approve edits manually",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::Default),
-        requires_feedback: false,
     },
     PlanOption {
         label: "Yes, and auto-accept edits",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::AcceptEdits),
-        requires_feedback: false,
     },
     PlanOption {
         label: "Yes, and use auto mode",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::Auto),
-        requires_feedback: false,
     },
     PlanOption {
         label: "No, keep planning",
         decision: ApprovalDecision::No,
         set_mode: None,
-        requires_feedback: true,
     },
 ];
 
@@ -1111,9 +1106,10 @@ impl Dialog {
                 // follow the normal append-only UserNote path; the
                 // keep-planning choice sends the same text back as feedback.
                 K::Tab => plan.feedback_focused = true,
-                // Leave the choices and resume reviewing the plan. A second Esc
-                // from plan browsing is the explicit keep-planning action.
-                K::Esc | K::Right => plan.options_focused = false,
+                // Esc explicitly declines the review. With no note, the core
+                // agent loop pauses rather than asking the model to guess.
+                K::Esc => return self.decline_plan(),
+                K::Right => plan.options_focused = false,
                 K::Up | K::Char('k') => plan.cursor = plan.cursor.saturating_sub(1),
                 K::Down | K::Char('j') => {
                     plan.cursor = (plan.cursor + 1).min(PLAN_OPTIONS.len() - 1)
@@ -1175,31 +1171,18 @@ impl Dialog {
     }
 
     fn submit_plan(&mut self) -> DialogResult {
-        let (decision, set_mode, requires, revised, approved_input) = {
+        let (decision, set_mode, revised, approved_input) = {
             let plan = self.plan.as_ref().expect("plan dialog");
             let opt = &PLAN_OPTIONS[plan.cursor];
             (
                 opt.decision,
                 opt.set_mode,
-                opt.requires_feedback,
                 plan.revised.clone(),
                 plan.approved_input(),
             )
         };
-        if requires {
-            // Keep-planning must say what to change; hold with feedback focused
-            // if neither an edit, a comment, nor free feedback was given.
-            let comment = self.assemble_feedback();
-            if comment.is_none() {
-                self.plan.as_mut().expect("plan dialog").feedback_focused = true;
-                return DialogResult::Pending;
-            }
-            return DialogResult::Done(Approval {
-                decision,
-                comment,
-                set_mode,
-                approved_input: None,
-            });
+        if decision == ApprovalDecision::No {
+            return self.decline_plan();
         }
         // Approval notes use the same append-only UserNote path as ordinary
         // approval annotations, so comments remain visible to the next turn and
@@ -1409,7 +1392,7 @@ impl Dialog {
             } else {
                 "  "
             };
-            let color = if opt.requires_feedback {
+            let color = if opt.decision == ApprovalDecision::No {
                 theme::ERROR
             } else {
                 theme::OK
@@ -1454,13 +1437,9 @@ impl Dialog {
         let hint = if plan.compose.is_some() {
             "  type comment · enter save · esc discard comment"
         } else if plan.feedback_focused {
-            if PLAN_OPTIONS[plan.cursor].requires_feedback {
-                "  type feedback · enter send · esc return to plan"
-            } else {
-                "  type note · enter confirm · esc return to plan"
-            }
+            "  type note or feedback · enter confirm · esc return to plan"
         } else if plan.options_focused {
-            "  ↑↓/1-4 choose · tab note · enter confirm · →/esc return to plan"
+            "  ↑↓/1-4 choose · tab note · enter confirm · → return to plan · esc decline"
         } else if plan.has_revision() {
             "  ↑↓ blocks · c comment · e edit · ←/1-4 choose · esc = keep planning"
         } else {
@@ -2481,12 +2460,8 @@ mod tests {
         d.handle_key(key(KeyCode::Char('c')));
         type_str(&mut d, "reword this");
         d.handle_key(key(KeyCode::Enter)); // save the comment, focus decisions
-        assert!(matches!(
-            d.handle_key(key(KeyCode::Esc)),
-            DialogResult::Pending
-        ));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
-            panic!("second esc keeps planning with the comment");
+            panic!("Esc keeps planning with the comment");
         };
         assert_eq!(a.decision, ApprovalDecision::No);
         let comment = a.comment.expect("assembled feedback");
@@ -2576,6 +2551,28 @@ mod tests {
     }
 
     #[test]
+    fn escape_from_plan_options_declines_without_feedback() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('4')));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
+            panic!("Esc from plan options must decline immediately");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.comment, None);
+    }
+
+    #[test]
+    fn plan_keep_planning_without_feedback_pauses_the_turn() {
+        let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Char('4')));
+        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter must decline without forcing a feedback editor");
+        };
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.comment, None);
+    }
+
+    #[test]
     fn plan_keep_planning_tab_opens_its_feedback_editor() {
         let mut d = plan_dialog("Body.");
         d.handle_key(key(KeyCode::Char('4')));
@@ -2660,24 +2657,6 @@ mod tests {
             0,
             "scrolling does not move the comment target"
         );
-    }
-
-    #[test]
-    fn plan_keep_planning_requires_a_reason() {
-        let mut d = plan_dialog("# T\n\nBody.");
-        d.handle_key(key(KeyCode::Char('4'))); // "keep planning"
-                                               // Enter with nothing to say holds the dialog, focusing the note.
-        assert!(matches!(
-            d.handle_key(key(KeyCode::Enter)),
-            DialogResult::Pending
-        ));
-        type_str(&mut d, "add error handling");
-        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
-            panic!("enter submits once a reason exists");
-        };
-        assert_eq!(a.decision, ApprovalDecision::No);
-        assert_eq!(a.comment.as_deref(), Some("add error handling"));
-        assert_eq!(a.set_mode, None);
     }
 
     #[test]

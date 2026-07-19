@@ -206,7 +206,7 @@ fn c() {
 }
 ";
     let old = "assert_eq!(a, b);";
-    assert!(matches!(replacement_plan(text, old, "x"), Err(_)));
+    assert!(replacement_plan(text, old, "x").is_err());
 }
 
 #[test]

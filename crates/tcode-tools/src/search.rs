@@ -128,14 +128,12 @@ struct Group {
     lines: Vec<Line>,
 }
 
-/// Collects matches and context into `Group`s. Match totals accumulate into a
-/// shared counter so the parallel walk can stop once the page is filled;
-/// completed groups are appended to the shared `groups` on `finish`.
+/// Collects all matches and their context from one file. The parallel walk
+/// appends completed groups to shared storage; global sorting and pagination
+/// happen only after the walk has finished or reached its deadline.
 struct GroupSink<'a> {
     file: String,
     groups: &'a Mutex<Vec<Group>>,
-    total: &'a AtomicUsize,
-    want: usize,
     cur: Vec<Line>,
     cur_matches: usize,
     out: Vec<Group>,
@@ -168,10 +166,8 @@ impl Sink for GroupSink<'_> {
                 is_match: true,
             });
             self.cur_matches += 1;
-            self.total.fetch_add(1, Ordering::Relaxed);
         }
-        // Stop this file once the requested page is full; the walk quits too.
-        Ok(self.total.load(Ordering::Relaxed) < self.want)
+        Ok(true)
     }
 
     fn context(&mut self, _s: &Searcher, c: &SinkContext<'_>) -> Result<bool, Self::Error> {
@@ -304,8 +300,6 @@ impl Tool for GrepTool {
             .unwrap_or(DEFAULT_MATCH_LIMIT)
             .max(1);
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-        // Collect just enough to fill the requested page, then stop.
-        let want = offset.saturating_add(limit);
         // -C sets both sides; -A/-B override it. Capped so context can't blow
         // up the output.
         let ctx_c = input["context"].as_u64().unwrap_or(0);
@@ -324,7 +318,6 @@ impl Tool for GrepTool {
         // the async runtime.
         let out = tokio::task::spawn_blocking(move || {
             let groups: Mutex<Vec<Group>> = Mutex::new(Vec::new());
-            let count = AtomicUsize::new(0);
             let files = AtomicUsize::new(0);
             let skipped_oversized = AtomicUsize::new(0);
             let timed_out = AtomicBool::new(false);
@@ -341,14 +334,13 @@ impl Tool for GrepTool {
                 let base: &Path = &base;
                 let cwd: &Path = &cwd;
                 let groups = &groups;
-                let count = &count;
                 let files = &files;
                 let skipped_oversized = &skipped_oversized;
                 let timed_out = &timed_out;
                 let cancel = &cancel;
                 Box::new(move |result| {
                     use ignore::WalkState;
-                    if cancel.is_cancelled() || count.load(Ordering::Relaxed) >= want {
+                    if cancel.is_cancelled() {
                         return WalkState::Quit;
                     }
                     if start.elapsed() > SEARCH_DEADLINE {
@@ -378,8 +370,6 @@ impl Tool for GrepTool {
                     let mut sink = GroupSink {
                         file: rel_display(path, cwd),
                         groups,
-                        total: count,
-                        want,
                         cur: Vec::new(),
                         cur_matches: 0,
                         out: Vec::new(),
@@ -758,6 +748,30 @@ mod tests {
         for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
             assert!(!glob_out.contains(cache), "{glob_out}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_paging_uses_global_path_order() {
+        let dir = scratch("paging", "TARGET a1\n");
+        std::fs::write(dir.join("b.rs"), "TARGET b1\n").unwrap();
+        std::fs::write(dir.join("z.rs"), "TARGET z1\n").unwrap();
+
+        let first = grep(&dir, json!({ "pattern": "TARGET", "head_limit": 1 })).await;
+        let second = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "head_limit": 1, "offset": 1 }),
+        )
+        .await;
+        let third = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "head_limit": 1, "offset": 2 }),
+        )
+        .await;
+
+        assert!(first.starts_with("a.rs:1: TARGET a1"), "{first}");
+        assert!(second.starts_with("b.rs:1: TARGET b1"), "{second}");
+        assert!(third.starts_with("z.rs:1: TARGET z1"), "{third}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

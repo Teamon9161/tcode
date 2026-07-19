@@ -483,9 +483,7 @@ impl Session {
         self.delivered_environment = delivered_environment.or_else(|| {
             // Old JSONL recorded environment changes only when it also appended
             // the Note, so its final stored snapshot is model-known.
-            self.environment
-                .clone()
-                .or_else(|| Some(startup_environment))
+            self.environment.clone().or(Some(startup_environment))
         });
         self.pending_environment_extra = None;
         self.pending_environment_delivery = false;

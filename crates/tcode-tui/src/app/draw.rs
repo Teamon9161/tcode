@@ -859,7 +859,7 @@ mod tests {
     /// running height in step by hand.
     #[test]
     fn panel_height_is_the_sum_of_its_sections() {
-        let sections = vec![
+        let sections = [
             Section::LivePanel(rows(3)),
             Section::Gap,
             Section::Status(Line::raw("")),

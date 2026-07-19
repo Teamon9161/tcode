@@ -563,10 +563,18 @@ mod tests {
     #[test]
     fn inline_emphasis_requires_a_small_local_change() {
         let local = "the quick red fox jumps over the lazy dog";
-        assert!(inline_emphasis_is_local(local, &[10..13]));
+        let local_change = 10..13;
+        assert!(inline_emphasis_is_local(
+            local,
+            std::slice::from_ref(&local_change)
+        ));
 
         let rewrite = "stable prefix followed by an extensively rewritten paragraph";
-        assert!(!inline_emphasis_is_local(rewrite, &[14..rewrite.len()]));
+        let rewrite_change = 14..rewrite.len();
+        assert!(!inline_emphasis_is_local(
+            rewrite,
+            std::slice::from_ref(&rewrite_change)
+        ));
         assert!(!inline_emphasis_is_local(
             "delete this line",
             &[0..6, 7..11, 12..16]
@@ -578,10 +586,8 @@ mod tests {
         let text = "prefix  changed words  suffix";
         let phrase = "  changed words  ";
         let start = text.find(phrase).unwrap();
-        assert_eq!(
-            trimmed_emphasis_ranges(text, vec![start..start + phrase.len()]),
-            vec![8..21]
-        );
+        let ranges = std::iter::once(start..start + phrase.len()).collect();
+        assert_eq!(trimmed_emphasis_ranges(text, ranges), vec![8..21]);
     }
 
     #[test]

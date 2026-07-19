@@ -53,18 +53,18 @@ pub enum Exit {
     ConfigureProvider(Box<Session>),
 }
 
+pub struct TuiConfig {
+    pub menu: ModelMenu,
+    pub agents: AgentMenu,
+    pub opening_context: OpeningContextFn,
+    pub environment: EnvironmentFn,
+    pub show_reasoning: bool,
+    pub skills: Vec<tcode_tools::Skill>,
+}
+
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
 /// the terminal is restored even if the app errors or panics.
-pub async fn run(
-    agent: Arc<Agent>,
-    session: Session,
-    menu: ModelMenu,
-    agents: AgentMenu,
-    opening_context: OpeningContextFn,
-    environment: EnvironmentFn,
-    show_reasoning: bool,
-    skills: Vec<tcode_tools::Skill>,
-) -> anyhow::Result<Exit> {
+pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyhow::Result<Exit> {
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -81,16 +81,7 @@ pub async fn run(
         default_hook(info);
     }));
 
-    let result = match App::new(
-        agent,
-        session,
-        menu,
-        agents,
-        opening_context,
-        environment,
-        show_reasoning,
-        skills,
-    ) {
+    let result = match App::new(agent, session, config) {
         Ok(mut app) => match app.run().await {
             Ok(()) if app.provider_setup_requested() => app
                 .take_session()

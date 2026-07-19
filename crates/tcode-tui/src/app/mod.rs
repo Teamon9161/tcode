@@ -373,13 +373,16 @@ impl App {
     pub fn new(
         agent: Arc<Agent>,
         mut session: Session,
-        menu: ModelMenu,
-        agents: AgentMenu,
-        opening_context: OpeningContextFn,
-        environment: EnvironmentFn,
-        show_reasoning: bool,
-        skills: Vec<tcode_tools::Skill>,
+        config: crate::TuiConfig,
     ) -> anyhow::Result<Self> {
+        let crate::TuiConfig {
+            menu,
+            agents,
+            opening_context,
+            environment,
+            show_reasoning,
+            skills,
+        } = config;
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
         let (reference_tx, reference_rx) = mpsc::channel(1);
