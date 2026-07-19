@@ -8,8 +8,10 @@ use tcode_core::freshness::{content_hash, ReadStatus};
 use tcode_core::images::detect_image_mime;
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
+use crate::redact::redact_lines;
+
 use super::{
-    not_found_help, numbered_capped, rel, DEFAULT_READ_LIMIT, MAX_IMAGE_SOURCE_BYTES,
+    clip_note, not_found_help, numbered_capped, rel, DEFAULT_READ_LIMIT, MAX_IMAGE_SOURCE_BYTES,
     MAX_READ_FILE_BYTES, MAX_READ_OUTPUT_BYTES, MIN_READ_WINDOW,
 };
 
@@ -256,13 +258,14 @@ impl Tool for ReadTool {
         if let Some(note) = overlap_note {
             out.push_str(&note);
         }
-        let (body, emitted) = numbered_capped(
-            &lines[view_start..view_end],
-            view_start + 1,
-            MAX_READ_OUTPUT_BYTES,
-        );
-        out.push_str(&body);
-        let shown_end = view_start + emitted;
+        // Redact before numbering: `read` is one of the two never-asking
+        // channels, so credential-shaped values must not enter context through
+        // it. `redact_lines` is line-count preserving, so line numbers below
+        // still address the real file. Pure CPU over at most 10 MB of text.
+        let view = redact_lines(&lines[view_start..view_end]);
+        let rendered = numbered_capped(&view, view_start + 1, MAX_READ_OUTPUT_BYTES);
+        out.push_str(&rendered.text);
+        let shown_end = view_start + rendered.emitted;
         let recorded_range = if view_start == 0 && shown_end == total {
             None
         } else {
@@ -278,6 +281,12 @@ impl Tool for ReadTool {
                 view_start + 1,
                 shown_end + 1
             ));
+        }
+        if let Some(note) = clip_note(&rendered.clipped) {
+            if !out.is_empty() && !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push_str(&note);
         }
         if out.is_empty() {
             out = "(empty file)".into();

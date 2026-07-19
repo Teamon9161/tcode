@@ -46,6 +46,8 @@ tcode 是一个类 Claude Code / Codex 的 Rust agent harness CLI。**`plan.md` 
 - 图片输入只能经 `tcode-core::images` 归一化：文件 read、`view_image` 与剪贴板入口复用同一长边/大小预算，禁止各自编码或缩放。
 - `ToolCtx` 的 `std::sync::Mutex`（freshness/blobs/memory）只在短临界区内持有：跨 `await` 持锁会让 future 非 Send，还会把整批写序列化在一个文件的磁盘延迟后面。
 - 自愈式错误的匹配回退（`edit` 的 punct/ws 归一化）跑在失败路径上，仍要控复杂度：行 key 每行只算一次，别在滑窗里重算（分配级 O(n·m)）。
+- **read/grep 改动了返回内容就必须三条齐全**（`redact.rs` + `fs/mod.rs::clip`）：① 标记自释（`…[+N chars]` / `[redacted: N chars, starts "…"]`，不许退回裸 `…`）；② `write`/`edit` 用同一个 `read_marker` 拒绝带标记的写回——freshness 只认行范围、认不出行内截断，模型照 context 重写就把标记写进文件；③ 错误与尾注说清怎么拿原文。**逐行上限是防单行 minified 巨行，不是第二道预算门**：真正的约束是 `MAX_READ_OUTPUT_BYTES`，所以 `MAX_LINE_CHARS` 必须远高于 prose/config/markdown 的自然行长（曾设 500，把 6 行小文件的正常长行也截了，模型得额外付一轮 shell 取回原文）。
+- **脱敏对 read 与 grep 同时生效，且必须保持行数**：这两个是全系统唯一免审通道，密钥进 context 就同时进了 provider、session JSONL 与带 `web_fetch` 的上下文；脱敏不是安全边界（`shell` 随时能读），价值是把泄漏从免审通道赶到受审通道。规则按**内容**判定不按路径（不开白名单），键名命中后值还要过形态检查（≥16 字符、无空白、非 `$VAR`/全大写环境变量名——指针不是秘密）。`redact_lines` 一行进一行出，PEM 私钥保留 BEGIN/END 行、只换块内正文，否则 read 的行号与文件错位。`shell` 与 `web_fetch` 有意不脱敏。
 
 **信任边界**
 

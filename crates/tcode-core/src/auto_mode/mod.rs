@@ -194,6 +194,16 @@ impl ClassifierTranscript {
             match entry {
                 Entry::User(blocks) => append_user_blocks(&mut text, blocks),
                 Entry::UserNote {
+                    about,
+                    answer: true,
+                    text: note,
+                } if about == "ask_user" => {
+                    // A structured question answer is the one approval note
+                    // with user-selected provenance. It remains distinct from a
+                    // free-form user message so the policy can limit its scope.
+                    append_tag(&mut text, "ask-user-answer", "tool=ask_user", note);
+                }
+                Entry::UserNote {
                     about, text: note, ..
                 } => {
                     append_tag(&mut text, "user-note", &format!("about={about}"), note);
@@ -330,6 +340,9 @@ mod tests {
         assert!(policy
             .contains("Soft deny rules (specific user intent may override):\n- avoid writes\n"));
         assert!(policy.contains("Allowed exceptions to soft denies:\n- temporary scratch files\n"));
+        assert!(
+            policy.contains("Treat `<user-note>` as a trusted user-authored approval annotation")
+        );
     }
 
     #[test]
@@ -453,6 +466,27 @@ mod tests {
             ),
             AutoRoute::Classify
         );
+    }
+
+    #[test]
+    fn ask_user_answers_keep_their_limited_authorization_provenance() {
+        let mut ledger = Ledger::new();
+        ledger.append(Entry::UserNote {
+            about: "ask_user".into(),
+            answer: true,
+            text: "authorize git push origin main".into(),
+        });
+        ledger.append(Entry::UserNote {
+            about: "edit".into(),
+            answer: false,
+            text: "looks good".into(),
+        });
+
+        let transcript = ClassifierTranscript::from_ledger(&ledger).text;
+        assert!(transcript.contains("<ask-user-answer tool=ask_user>"));
+        assert!(transcript.contains("authorize git push origin main"));
+        assert!(transcript.contains("<user-note about=edit>"));
+        assert!(!transcript.contains("<user>\nauthorize git push"));
     }
 
     #[test]

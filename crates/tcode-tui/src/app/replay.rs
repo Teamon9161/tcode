@@ -45,6 +45,10 @@ impl App {
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut resumed_progress: Option<serde_json::Value> = None;
         let mut calls: HashMap<String, ReplayCall> = HashMap::new();
+        // `ask_user` is silent as a tool call; retain its input until the
+        // following structured answer can rebuild the same Q&A record as live.
+        let mut answered_questions: std::collections::VecDeque<serde_json::Value> =
+            std::collections::VecDeque::new();
         let mut space_before_assistant_text = false;
         for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
             match entry {
@@ -202,9 +206,15 @@ impl App {
                         };
                         let call = calls.get(tool_use_id);
                         let name = call.map(|c| c.name.as_str()).unwrap_or("tool");
-                        // Plan/Silent calls render via the plan pane or their
-                        // approval record, exactly like the live path.
+                        // Plan/Silent calls render via their dedicated approval
+                        // record. `ask_user` carries the raw form until its
+                        // following UserNote reconstructs that same record.
                         if !matches!(self.renderers.get(name).route(), CallRoute::Transcript) {
+                            if name == "ask_user" && !*is_error {
+                                if let Some(call) = call {
+                                    answered_questions.push_back(call.input.clone());
+                                }
+                            }
                             continue;
                         }
                         // Flush the prose above so this call bakes as its own
@@ -264,11 +274,22 @@ impl App {
                         space_before_assistant_text = true;
                     }
                 }
+                tcode_core::Entry::UserNote {
+                    about,
+                    answer: true,
+                    text,
+                } if about == "ask_user" => {
+                    self.transcript.push(std::mem::take(&mut lines));
+                    if let Some(input) = answered_questions.pop_front() {
+                        let pairs = Dialog::question_answer_pairs_from_input(&input, text);
+                        self.bake_question_record(&pairs);
+                    } else {
+                        // Old or partial logs may lack the corresponding call;
+                        // retain the human's words rather than inventing a form.
+                        self.bake_user_note(text);
+                    }
+                }
                 tcode_core::Entry::UserNote { text, .. } => {
-                    // Approval annotations and `ask_user` answers both retain
-                    // the person's original wording on resume. Live questions
-                    // have a richer Q&A record, but that UI-only shape is not
-                    // persisted in the ledger.
                     self.bake_user_note(text);
                 }
                 tcode_core::Entry::Note(text) => {

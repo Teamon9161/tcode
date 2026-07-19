@@ -630,6 +630,14 @@ impl Agent {
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
+            // A cancellation can arrive after the final tool observes its token
+            // but before this batch reaches the append boundary. End this turn
+            // before it can consume Ctrl+C's queued handoff.
+            if cancel.is_cancelled() {
+                self.commit_interrupt(session, &[], &[], false);
+                self.emit(events, AgentEvent::Interrupted).await?;
+                return Ok(());
+            }
             if outcome.awaiting_user_input {
                 self.emit(events, AgentEvent::AwaitingUserInput).await?;
                 self.emit(events, AgentEvent::TurnEnd).await?;
@@ -2082,7 +2090,7 @@ impl Agent {
         session: &mut Session,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        for message in session.pending.take() {
+        for message in session.pending.take_at_safe_boundary() {
             session.mark_mode_delivery();
             let expanded =
                 crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)

@@ -5,6 +5,8 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::freshness::{content_hash, Visibility};
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
+use crate::redact::{marker_error, read_marker};
+
 use super::{rel, write_error, write_with_windows_retry};
 
 pub struct WriteTool;
@@ -82,6 +84,13 @@ impl Tool for WriteTool {
         else {
             return ToolOutput::err("missing required parameters: path, content");
         };
+        // `write` replaces the whole file from context, and the read-in-full
+        // gate only tracks *line ranges* — it cannot tell that a line the
+        // model saw was clipped or redacted inside. Without this check the
+        // markers `read` adds are a data-corruption seed.
+        if let Some(kind) = read_marker(content) {
+            return ToolOutput::err(marker_error(kind, "content"));
+        }
         let path = ctx.resolve(path_str);
         // The freshness lock is taken in short scopes rather than held across
         // the IO: a `std::sync::MutexGuard` alive across an `.await` would make

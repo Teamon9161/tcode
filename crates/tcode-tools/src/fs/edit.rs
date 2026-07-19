@@ -7,6 +7,8 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::freshness::content_hash;
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
+use crate::redact::{marker_error, read_marker};
+
 use super::{not_found_help, numbered, rel, write_error, write_with_windows_retry};
 
 pub struct EditTool;
@@ -116,6 +118,15 @@ impl Tool for EditTool {
         }
         if old == new {
             return ToolOutput::err("old_string and new_string are identical");
+        }
+        // Checked before matching, which a clipped `old_string` could never
+        // survive anyway: this turns the "no match, why?" puzzle into one
+        // sentence naming the cause. On `new_string` it is the real guard —
+        // that one would have been written to disk.
+        for (field, value) in [("old_string", old), ("new_string", new)] {
+            if let Some(kind) = read_marker(value) {
+                return ToolOutput::err(marker_error(kind, field));
+            }
         }
         let replace_all = input["replace_all"].as_bool().unwrap_or(false);
         let target_line = match input.get("target_line") {

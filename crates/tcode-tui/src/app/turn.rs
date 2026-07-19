@@ -255,7 +255,7 @@ impl App {
         // queued during the closing answer, or one queued right before ctrl+c —
         // becomes the next turn immediately. The user already pressed enter on
         // it; they should not have to press it again.
-        if let Some(message) = merge(self.pending.take()) {
+        if let Some(message) = merge(self.pending.take_for_next_turn()) {
             self.start_turn(message);
             return;
         }
@@ -789,6 +789,47 @@ impl App {
         ));
     }
 
+    /// Dedicated transcript record for a completed `ask_user` form. It keeps
+    /// the question adjacent to its answer and deliberately bypasses the normal
+    /// silent tool renderer, which would otherwise duplicate the interaction.
+    pub(super) fn bake_question_record(&mut self, pairs: &[(String, String)]) {
+        let mut lines = vec![Line::default()];
+        let count = pairs.len();
+        let mut header = vec![
+            Span::styled("● ", theme::ok()),
+            Span::styled(
+                "Ask user",
+                theme::ok().add_modifier(ratatui::style::Modifier::BOLD),
+            ),
+        ];
+        if count > 1 {
+            header.push(Span::styled(format!(" · {count} questions"), theme::dim()));
+        }
+        lines.push(Line::from(header));
+        for (index, (question, answer)) in pairs.iter().enumerate() {
+            let last = index + 1 == count;
+            let branch = if last { "└" } else { "├" };
+            let continuation = if last { " " } else { "│" };
+            let label = if count > 1 {
+                format!("{}. {question}", index + 1)
+            } else {
+                question.clone()
+            };
+            lines.push(Line::from(vec![
+                Span::styled(format!("  {branch} "), theme::dim()),
+                Span::styled(label, theme::bold()),
+            ]));
+            for (answer_row, row) in answer.lines().enumerate() {
+                let marker = if answer_row == 0 { "└" } else { " " };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {continuation}   {marker} "), theme::dim()),
+                    Span::styled(row.to_string(), theme::accent()),
+                ]));
+            }
+        }
+        self.bake(lines);
+    }
+
     pub(super) fn bake_user_note(&mut self, text: &str) {
         let mut lines = vec![Line::default()];
         lines.extend(quote_lines(Some(NOTE_LABEL), text));
@@ -834,22 +875,8 @@ impl App {
             return;
         }
         if dialog.is_question() {
-            let answer = approval.comment.clone().unwrap_or_default();
-            let mut lines = vec![Line::default()];
-            for (i, row) in dialog.summary.lines().enumerate() {
-                if i == 0 {
-                    lines.push(Line::from(vec![
-                        Span::styled("? ", theme::accent()),
-                        Span::styled(row.to_string(), theme::bold()),
-                    ]));
-                } else {
-                    lines.push(Line::styled(format!("  {row}"), theme::dim()));
-                }
-            }
-            for row in answer.lines() {
-                lines.push(Line::styled(format!("  ⎿ {row}"), theme::dim()));
-            }
-            self.bake(lines);
+            let answer = approval.comment.as_deref().unwrap_or_default();
+            self.bake_question_record(&dialog.question_answer_pairs(answer));
             return;
         }
         match approval.decision {
@@ -1147,7 +1174,7 @@ impl App {
     /// back (an older message, or the draft's attachments, which were already
     /// encoded into blocks) leaves a dim record instead of vanishing silently.
     pub(super) fn discard_queued(&mut self) {
-        let mut queued = self.pending.take();
+        let mut queued = self.pending.take_for_next_turn();
         let Some(last) = queued.pop() else {
             return;
         };

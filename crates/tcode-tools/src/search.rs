@@ -97,10 +97,20 @@ fn rel_display(path: &Path, base: &Path) -> String {
         .to_string()
 }
 
-/// Trim trailing whitespace and cap the line at a byte budget on a char
-/// boundary, so a single enormous line can't blow up the tool result.
+/// Trim trailing whitespace, redact credential-shaped values, and cap the line
+/// at a byte budget on a char boundary, so a single enormous line can't blow
+/// up the tool result.
+///
+/// Redaction comes before capping — the other order can cut a placeholder in
+/// half and leave the tail of a real key visible. `grep` shares this with
+/// `read` because it is equally never-asking, and `edit`'s contract counts
+/// grep output as "seen". It only sees one line at a time, so a PEM key body
+/// matched by grep is not recognized as such; that gap is acceptable since
+/// this was never a boundary shell couldn't walk around anyway.
 fn cap_line(line: &str) -> String {
     let s = line.trim_end();
+    let redacted = crate::redact::redact_line(s);
+    let s = redacted.as_deref().unwrap_or(s);
     if s.len() <= MAX_LINE_BYTES {
         return s.to_string();
     }

@@ -4,7 +4,13 @@ const DEFAULT_READ_LIMIT: usize = 2000;
 /// Requests below this are widened: extra lines are cheap, but a model
 /// walking a file in 10-line slices costs a round-trip per slice.
 const MIN_READ_WINDOW: usize = 120;
-const MAX_LINE_CHARS: usize = 500;
+/// Per-line ceiling. The real constraint on a read is `MAX_READ_OUTPUT_BYTES`
+/// below; this only stops one minified/JSONL line from spending the whole
+/// budget on noise. It is deliberately two orders of magnitude above prose,
+/// config and long markdown lines — a second gate that fires on ordinary
+/// files produces false positives that cost the model a shell round-trip to
+/// undo (the previous 500 did exactly that).
+const MAX_LINE_CHARS: usize = 16384;
 /// Files above this are never slurped into memory. A range read of a giant
 /// log/dataset belongs to grep or `sed -n`, not a full load.
 const MAX_READ_FILE_BYTES: u64 = 10 * 1024 * 1024;
@@ -55,31 +61,55 @@ fn write_error(path: &Path, error: &std::io::Error) -> String {
     }
 }
 
+/// Result of rendering numbered lines: what to emit, how far it got (so the
+/// caller can say where to resume), and which lines lost content on the way.
+struct Numbered {
+    text: String,
+    emitted: usize,
+    /// `(1-based line number, the line's true char count)` per clipped line.
+    /// Never silently drop content: what the model gets back is the basis for
+    /// its next `edit`, so a clip it does not know about becomes a failed
+    /// match one turn later.
+    clipped: Vec<(usize, usize)>,
+}
+
 /// Render numbered lines until the line count runs out or the byte budget is
-/// hit. Returns the text and how many lines were actually emitted, so the
-/// caller can tell the model where to resume.
-fn numbered_capped(lines: &[&str], start: usize, budget: usize) -> (String, usize) {
+/// hit.
+fn numbered_capped(lines: &[impl AsRef<str>], start: usize, budget: usize) -> Numbered {
     use std::fmt::Write as _;
 
     // One buffer for the whole read; a `format!` per line would allocate once
     // per line of every file the model reads.
-    let mut out = String::new();
+    let mut text = String::new();
     let mut emitted = 0;
+    let mut clipped_lines = Vec::new();
     for (i, line) in lines.iter().enumerate() {
+        let line = line.as_ref();
         let clipped = clip(line);
         // A row is the number, a tab, the line and a newline. Always emit at
         // least one so a single huge line still makes progress.
-        if emitted > 0 && out.len() + clipped.len() + 8 > budget {
+        if emitted > 0 && text.len() + clipped.len() + 8 > budget {
             break;
         }
-        let _ = writeln!(out, "{:>6}\t{clipped}", start + i);
+        if matches!(clipped, std::borrow::Cow::Owned(_)) {
+            clipped_lines.push((start + i, line.chars().count()));
+        }
+        let _ = writeln!(text, "{:>6}\t{clipped}", start + i);
         emitted += 1;
     }
-    (out, emitted)
+    Numbered {
+        text,
+        emitted,
+        clipped: clipped_lines,
+    }
 }
 
 /// Long lines are clipped by *character* count, so a wide line cannot blow the
 /// output budget. Borrowed unless it actually needs clipping.
+///
+/// The marker is self-describing (matching grep's `…[+N bytes]`) rather than a
+/// bare ellipsis: a bare `…` is indistinguishable from file content, so the
+/// model copies it into an `edit` and only finds out at the no-match error.
 fn clip(line: &str) -> std::borrow::Cow<'_, str> {
     // Cheap reject: a line can only exceed the char limit if it exceeds it in
     // bytes, and most lines are far below.
@@ -87,13 +117,37 @@ fn clip(line: &str) -> std::borrow::Cow<'_, str> {
         return std::borrow::Cow::Borrowed(line);
     }
     match line.char_indices().nth(MAX_LINE_CHARS) {
-        Some((cut, _)) => std::borrow::Cow::Owned(format!("{}…", &line[..cut])),
+        Some((cut, _)) => std::borrow::Cow::Owned(format!(
+            "{}…[+{} chars]",
+            &line[..cut],
+            line[cut..].chars().count()
+        )),
         None => std::borrow::Cow::Borrowed(line),
     }
 }
 
-fn numbered(lines: &[&str], start: usize) -> String {
-    numbered_capped(lines, start, usize::MAX).0
+/// Tail note naming every clipped line, so the model knows which lines it must
+/// not reuse verbatim and how to get the real text.
+fn clip_note(clipped: &[(usize, usize)]) -> Option<String> {
+    let (first, total) = *clipped.first()?;
+    let which = if clipped.len() == 1 {
+        format!("line {first} was clipped at {MAX_LINE_CHARS} of {total} chars")
+    } else {
+        let numbers: Vec<String> = clipped.iter().map(|(n, _)| n.to_string()).collect();
+        format!(
+            "lines {} were clipped at {MAX_LINE_CHARS} chars",
+            numbers.join(", ")
+        )
+    };
+    Some(format!(
+        "note: {which}; the \u{2026}[+N chars] marker is not file content, so a clipped \
+         line cannot be used as an edit old_string. Fetch such a line verbatim with grep \
+         (narrow pattern) or shell if you need it."
+    ))
+}
+
+fn numbered(lines: &[impl AsRef<str>], start: usize) -> String {
+    numbered_capped(lines, start, usize::MAX).text
 }
 
 /// Self-healing ENOENT: show what IS there so the model can correct the

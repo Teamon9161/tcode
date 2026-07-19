@@ -269,14 +269,15 @@ fn fast_verdict(output: &str) -> Option<bool> {
 }
 
 fn reasoned_verdict(output: &str) -> ClassifierDecision {
-    let mut lines = lines(output);
-    match lines.next().and_then(verdict_word) {
+    let lines: Vec<_> = lines(output).collect();
+    match lines.last().and_then(|line| verdict_word(line)) {
         Some(true) => ClassifierDecision::Allow,
         Some(false) => ClassifierDecision::Block {
-            reason: lines
-                .next()
-                .unwrap_or("The action is not safe or directly authorized.")
-                .to_string(),
+            reason: if lines.len() > 1 {
+                lines[..lines.len() - 1].join("\n")
+            } else {
+                "The action is not safe or directly authorized.".to_string()
+            },
         },
         None => ClassifierDecision::Unavailable {
             reason: format!("reasoned classifier returned an invalid verdict: {output:?}"),
@@ -294,11 +295,11 @@ mod tests {
         assert_eq!(fast_verdict("BLOCK"), Some(false));
         assert_eq!(fast_verdict("allow because"), None);
         assert_eq!(
-            reasoned_verdict("ALLOW\nignored"),
+            reasoned_verdict("looks safe\nALLOW"),
             ClassifierDecision::Allow
         );
         assert_eq!(
-            reasoned_verdict("BLOCK\nwould force-push shared history"),
+            reasoned_verdict("would force-push shared history\nBLOCK"),
             ClassifierDecision::Block {
                 reason: "would force-push shared history".into()
             }
@@ -316,7 +317,7 @@ mod tests {
         assert_eq!(fast_verdict("ALLOW BLOCK"), None);
         assert_eq!(fast_verdict(""), None);
         assert_eq!(
-            reasoned_verdict("**BLOCK**\n- deletes the remote branch"),
+            reasoned_verdict("- deletes the remote branch\n**BLOCK**"),
             ClassifierDecision::Block {
                 reason: "- deletes the remote branch".into()
             }
@@ -325,6 +326,12 @@ mod tests {
             reasoned_verdict("The command looks fine, so ALLOW."),
             ClassifierDecision::Unavailable { .. }
         ));
+    }
+
+    #[test]
+    fn reasoned_stage_requires_a_final_standalone_verdict() {
+        assert!(REASONED_STAGE.contains("final nonempty line must be exactly"));
+        assert!(REASONED_STAGE.contains("ALLOW or BLOCK"));
     }
 
     use std::collections::VecDeque;
@@ -445,7 +452,7 @@ mod tests {
         let (classifier, provider) = classifier(vec![
             Script::Output("BLOCK"),
             Script::Pending,
-            Script::Output("BLOCK\nThe command changes tracked files."),
+            Script::Output("The command changes tracked files.\nBLOCK"),
         ]);
 
         assert_eq!(

@@ -6,6 +6,7 @@ mod interaction;
 mod mcp;
 mod monitor;
 mod plan;
+mod redact;
 mod search;
 mod shell;
 mod shell_filter;

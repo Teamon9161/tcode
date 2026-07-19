@@ -621,11 +621,151 @@ fn long_lines_clip_on_char_boundaries() {
     // Multi-byte chars: clipping by byte index would panic or corrupt.
     let line = "の".repeat(MAX_LINE_CHARS + 10);
     let clipped = clip(&line);
-    assert_eq!(clipped.chars().count(), MAX_LINE_CHARS + 1); // + the ellipsis
-    assert!(clipped.ends_with('…'));
+    assert_eq!(clipped.chars().take(MAX_LINE_CHARS).count(), MAX_LINE_CHARS);
+    assert!(clipped.starts_with(&"の".repeat(MAX_LINE_CHARS)));
+    // The marker declares itself and says how much is missing.
+    assert!(
+        clipped.ends_with(&format!("\u{2026}[+{} chars]", 10)),
+        "{clipped}"
+    );
     // A line at the limit is passed through untouched, without allocating.
     let short = "の".repeat(4);
     assert!(matches!(clip(&short), std::borrow::Cow::Borrowed(_)));
+}
+
+/// The reported friction: a 6-line file with one 2000-char line came back
+/// truncated, and the model had to shell out for the real text. The byte
+/// budget, not a per-line rule an order of magnitude below it, is the
+/// constraint that matters.
+#[tokio::test]
+async fn ordinary_long_lines_are_returned_whole() {
+    let dir = std::env::temp_dir().join(format!("tcode-wide-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let wide = "x".repeat(2000);
+    std::fs::write(dir.join("notes.md"), format!("a\nb\n{wide}\nd\ne\nf\n")).unwrap();
+    let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+    let out = ReadTool
+        .run(
+            json!({ "path": "notes.md" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains(&wide), "the long line was clipped");
+    assert!(!out.content.contains("clipped at"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn oversized_lines_are_clipped_with_a_self_healing_note() {
+    let dir = std::env::temp_dir().join(format!("tcode-minified-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let huge = "y".repeat(MAX_LINE_CHARS + 500);
+    std::fs::write(dir.join("bundle.js"), format!("ok\n{huge}\nend\n")).unwrap();
+    let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+    let out = ReadTool
+        .run(
+            json!({ "path": "bundle.js" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains(&format!("\u{2026}[+{} chars]", 500)),
+        "{}",
+        out.content
+    );
+    assert!(
+        out.content.contains(&format!(
+            "note: line 2 was clipped at {MAX_LINE_CHARS} of {} chars",
+            MAX_LINE_CHARS + 500
+        )),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("grep"), "{}", out.content);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn read_redacts_credentials_and_write_refuses_the_placeholder() {
+    let dir = std::env::temp_dir().join(format!("tcode-redact-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let secret = "sk-ant-api03-zzzzzzzzzzzzzzzz";
+    let original = format!(
+        "[profile.deepseek]\nmodel = \"deepseek-chat\"\napi_key = \"{secret}\"\napi_key_env = \"DEEPSEEK_API_KEY\"\n"
+    );
+    std::fs::write(dir.join("config.toml"), &original).unwrap();
+    let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+    let out = ReadTool
+        .run(
+            json!({ "path": "config.toml" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        !out.content.contains(secret),
+        "the key leaked: {}",
+        out.content
+    );
+    assert!(out.content.contains("redacted"), "{}", out.content);
+    // The env-var pointer is information, not a secret: it must survive.
+    assert!(out.content.contains("DEEPSEEK_API_KEY"), "{}", out.content);
+
+    // Round-tripping what read returned would write the placeholder into the
+    // file. The freshness gate is satisfied here (full file seen), so this
+    // check is the only thing standing between the model and a broken config.
+    let rewritten = out
+        .content
+        .lines()
+        .map(|line| line.split_once('\t').map_or(line, |(_, rest)| rest))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let write = WriteTool
+        .run(
+            json!({ "path": "config.toml", "content": rewritten }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(write.is_error, "{}", write.content);
+    assert!(
+        write.content.contains("redaction marker"),
+        "{}",
+        write.content
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("config.toml")).unwrap(),
+        original,
+        "the file must be untouched"
+    );
+
+    // Same for a targeted edit whose old_string carries the placeholder.
+    let edit = EditTool
+        .run(
+            json!({
+                "path": "config.toml",
+                "old_string": format!("api_key = \"[redacted: {} chars, starts \"sk-a\"]\"", 29),
+                "new_string": "api_key = \"replaced\"",
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(edit.is_error, "{}", edit.content);
+    assert!(
+        edit.content.contains("redaction marker"),
+        "{}",
+        edit.content
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]

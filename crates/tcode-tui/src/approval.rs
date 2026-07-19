@@ -8,7 +8,7 @@
 //! as a paged form (←→ to switch questions, ↑↓ to choose, space to toggle
 //! multi-select). All answers aggregate into a single note comment.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -47,12 +47,23 @@ pub struct Dialog {
     /// Rows occupied by the visible note editor in the most recent render.
     /// This lets mouse clicks use the same wrapped geometry as the caret.
     note_hitbox: Cell<Option<NoteHitbox>>,
+    /// Rows occupied by selectable options in the most recent question render.
+    /// Mouse handling reads this instead of reconstructing wrapped two-column
+    /// geometry from scratch.
+    question_hitboxes: RefCell<Vec<QuestionOptionHitbox>>,
     /// Current panel width, captured during render so ↑↓ follows visual wraps.
     note_width: Cell<u16>,
 }
 
 #[derive(Clone, Copy)]
 struct NoteHitbox {
+    first_row: usize,
+    rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct QuestionOptionHitbox {
+    index: usize,
     first_row: usize,
     rows: usize,
 }
@@ -428,6 +439,7 @@ impl Dialog {
             plan: None,
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
+            question_hitboxes: RefCell::new(Vec::new()),
             note_width: Cell::new(80),
         }
     }
@@ -472,6 +484,7 @@ impl Dialog {
             }),
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
+            question_hitboxes: RefCell::new(Vec::new()),
             note_width: Cell::new(80),
         }
     }
@@ -544,8 +557,51 @@ impl Dialog {
             plan: None,
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
+            question_hitboxes: RefCell::new(Vec::new()),
             note_width: Cell::new(80),
         }
+    }
+
+    /// The human-readable question/answer pairs for the dedicated transcript
+    /// record. The submitted text stays ledger truth; live rendering reads the
+    /// page state so it never has to parse its own aggregate answer string.
+    pub fn question_answer_pairs(&self, submitted: &str) -> Vec<(String, String)> {
+        let q = self.questions.as_ref().expect("question dialog");
+        if q.pages.len() == 1 {
+            return vec![(q.pages[0].question.clone(), submitted.to_string())];
+        }
+        q.pages
+            .iter()
+            .map(|page| (page.question.clone(), page.answer()))
+            .collect()
+    }
+
+    /// Rebuild the same display pairs from a stored `ask_user` tool input and
+    /// its aggregated answer. Multi-question answers are emitted by
+    /// `submit_or_advance` as `N. question → answer`; old logs that cannot be
+    /// parsed remain readable as one answer instead of losing the user's words.
+    pub fn question_answer_pairs_from_input(
+        input: &Value,
+        submitted: &str,
+    ) -> Vec<(String, String)> {
+        let dialog = Self::questions(String::new(), input);
+        let q = dialog.questions.as_ref().expect("question dialog");
+        if q.pages.len() == 1 {
+            return vec![(q.pages[0].question.clone(), submitted.to_string())];
+        }
+        q.pages
+            .iter()
+            .enumerate()
+            .map(|(index, page)| {
+                let prefix = format!("{}. {} → ", index + 1, page.question);
+                let answer = submitted
+                    .lines()
+                    .find_map(|line| line.strip_prefix(&prefix))
+                    .unwrap_or(submitted)
+                    .to_string();
+                (page.question.clone(), answer)
+            })
+            .collect()
     }
 
     pub fn is_question(&self) -> bool {
@@ -802,6 +858,55 @@ impl Dialog {
         DialogResult::Done(Approval::simple(ApprovalDecision::Yes, Some(comment)))
     }
 
+    /// Update the active option from a rendered option row. Hovering uses the
+    /// same cursor as ↑↓, so descriptions and previews stay in sync with the
+    /// visual highlight without selecting or submitting anything.
+    pub fn question_mouse_moved(&mut self, row: usize) -> bool {
+        let Some(hit) = self
+            .question_hitboxes
+            .borrow()
+            .iter()
+            .find(|hit| row >= hit.first_row && row < hit.first_row + hit.rows)
+            .copied()
+        else {
+            return false;
+        };
+        let page = self.cur_page();
+        if page.cursor == hit.index {
+            return false;
+        }
+        page.cursor = hit.index;
+        self.note_focused = false;
+        self.focus_note_on_other();
+        true
+    }
+
+    /// Click mirrors keyboard selection: a single-select option only moves the
+    /// cursor, while a multi-select option toggles its checkmark. Enter remains
+    /// the explicit advance/submit action, preventing an exploratory click from
+    /// answering a multi-page form.
+    pub fn question_mouse_down(&mut self, row: usize) -> bool {
+        if !self.question_mouse_moved(row) {
+            let Some(hit) = self
+                .question_hitboxes
+                .borrow()
+                .iter()
+                .find(|hit| row >= hit.first_row && row < hit.first_row + hit.rows)
+                .copied()
+            else {
+                return false;
+            };
+            let page = self.cur_page();
+            page.cursor = hit.index;
+        }
+        if self.cur_page_multi() {
+            let page = self.cur_page();
+            let cursor = page.cursor;
+            page.chosen[cursor] = !page.chosen[cursor];
+        }
+        true
+    }
+
     pub fn note_mouse_down(&mut self, row: usize, col: usize, width: u16) -> bool {
         let Some(hitbox) = self.note_hitbox.get() else {
             return false;
@@ -865,6 +970,7 @@ impl Dialog {
         // Recomputed below only when a note is focused; stale between renders.
         self.cursor_cell.set(None);
         self.note_hitbox.set(None);
+        self.question_hitboxes.borrow_mut().clear();
         self.note_width.set(width);
         if self.plan.is_some() {
             return self.render_plan(width, height);
@@ -1504,9 +1610,16 @@ impl Dialog {
         // A narrow terminal cannot hold two readable columns; the compact list
         // is the graceful degradation, not a squeezed preview.
         if page.previewing() && (width as usize) >= MIN_COLUMNS {
-            out.extend(option_columns(page, width));
+            let first_row = out.len();
+            let (lines, mut hitboxes) = option_columns(page, width);
+            for hitbox in &mut hitboxes {
+                hitbox.first_row += first_row;
+            }
+            self.question_hitboxes.borrow_mut().extend(hitboxes);
+            out.extend(lines);
         } else {
             for (i, opt) in page.options.iter().enumerate() {
+                let first_row = out.len();
                 let marker = if i == page.cursor { "▸ " } else { "  " };
                 let check = if page.multi {
                     if page.chosen[i] {
@@ -1533,6 +1646,13 @@ impl Dialog {
                         }
                     }
                 }
+                self.question_hitboxes
+                    .borrow_mut()
+                    .push(QuestionOptionHitbox {
+                        index: i,
+                        first_row,
+                        rows: out.len() - first_row,
+                    });
             }
         }
         self.render_note(&page.note, width, &mut out);
@@ -1567,7 +1687,10 @@ fn option_style(cursor: bool) -> ratatui::style::Style {
 /// composed here rather than laid out as widgets — which also keeps the
 /// preview honest about its cost: every row it adds is a row the transcript
 /// above loses.
-fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
+fn option_columns(
+    page: &QuestionPage,
+    width: u16,
+) -> (Vec<Line<'static>>, Vec<QuestionOptionHitbox>) {
     use unicode_width::UnicodeWidthStr;
 
     let total = (width as usize).saturating_sub(4).max(20);
@@ -1591,7 +1714,9 @@ fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
     let right = total.saturating_sub(left + 3).max(1);
 
     let mut rows: Vec<(Vec<Span<'static>>, usize)> = Vec::new();
+    let mut hitboxes = Vec::new();
     for (i, opt) in page.options.iter().enumerate() {
+        let first_row = rows.len();
         let marker = if i == page.cursor { "▸ " } else { "  " };
         let head = format!("{marker}{}. {}", i + 1, opt.label);
         for row in wrap_cells(&head, left) {
@@ -1611,6 +1736,11 @@ fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
                 rows.push((vec![Span::styled(row, theme::dim())], used));
             }
         }
+        hitboxes.push(QuestionOptionHitbox {
+            index: i,
+            first_row,
+            rows: rows.len() - first_row,
+        });
     }
 
     // An option with no artifact to show leaves the panel blank rather than
@@ -1647,7 +1777,7 @@ fn option_columns(page: &QuestionPage, width: u16) -> Vec<Line<'static>> {
         }
         out.push(Line::from(spans));
     }
-    out
+    (out, hitboxes)
 }
 
 /// Prefix every line of a block's source with `> ` so a comment quotes the
@@ -2320,6 +2450,44 @@ mod tests {
 
     fn question_dialog(input: Value) -> Dialog {
         Dialog::questions("q".into(), &input)
+    }
+
+    #[test]
+    fn question_options_highlight_on_hover_and_select_on_click() {
+        let mut d = question_dialog(json!({
+            "questions": [{ "question": "Pick one", "options": ["A", "B", "C"] }]
+        }));
+        // Question row 0; options A/B/C occupy rows 1/2/3 in the compact list.
+        let _ = d.render(80, 40);
+        assert!(d.question_mouse_moved(2));
+        assert_eq!(d.questions.as_ref().unwrap().pages[0].cursor, 1);
+
+        // A click selects but does not submit; Enter remains the explicit answer.
+        assert!(d.question_mouse_down(2));
+        let DialogResult::Done(answer) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("Enter should submit the clicked option");
+        };
+        assert_eq!(answer.comment.as_deref(), Some("B"));
+    }
+
+    #[test]
+    fn clicking_a_multi_select_option_toggles_its_checkmark() {
+        let mut d = question_dialog(json!({
+            "questions": [{
+                "question": "Pick many",
+                "options": ["A", "B", "C"],
+                "multiSelect": true
+            }]
+        }));
+        let _ = d.render(80, 40);
+        assert!(d.question_mouse_down(1)); // A
+        let _ = d.render(80, 40);
+        assert!(d.question_mouse_down(3)); // C
+
+        let DialogResult::Done(answer) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("Enter should submit clicked selections");
+        };
+        assert_eq!(answer.comment.as_deref(), Some("A, C"));
     }
 
     #[test]

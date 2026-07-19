@@ -37,26 +37,54 @@ pub struct PendingMessage {
 ///
 /// A shared handle rather than a plain field: the frontend keeps taking input
 /// while the running turn owns the `Session`.
+#[derive(Default)]
+struct PendingState {
+    messages: VecDeque<PendingMessage>,
+    /// Ctrl+C ends the current turn, so anything already queued belongs to the
+    /// fresh turn the frontend starts after this worker exits.
+    defer_to_next_turn: bool,
+}
+
 #[derive(Clone, Default)]
-pub struct PendingInput(Arc<Mutex<VecDeque<PendingMessage>>>);
+pub struct PendingInput(Arc<Mutex<PendingState>>);
 
 impl PendingInput {
     pub fn push(&self, message: PendingMessage) {
         self.0
             .lock()
             .expect("pending input lock")
+            .messages
             .push_back(message);
     }
 
-    /// Hands over everything queued so far. Atomic, so the loop's boundary
-    /// drain and the frontend's end-of-turn flush can race harmlessly: exactly
-    /// one of them gets each message.
-    pub fn take(&self) -> Vec<PendingMessage> {
+    /// Make queued input unavailable to the current turn's safe-boundary drain.
+    /// The frontend consumes it after the worker exits, which gives the new turn
+    /// a fresh cancellation token.
+    pub fn defer_to_next_turn(&self) {
         self.0
             .lock()
             .expect("pending input lock")
-            .drain(..)
-            .collect()
+            .defer_to_next_turn = true;
+    }
+
+    /// Hands over messages that may legally join the current turn. A Ctrl+C
+    /// handoff is decided under the same lock as the drain, so a cancelled turn
+    /// cannot consume a message intended for its successor.
+    pub fn take_at_safe_boundary(&self) -> Vec<PendingMessage> {
+        let mut pending = self.0.lock().expect("pending input lock");
+        if pending.defer_to_next_turn {
+            return Vec::new();
+        }
+        pending.messages.drain(..).collect()
+    }
+
+    /// Hands over everything once the current worker has exited. Atomic, so the
+    /// loop's boundary drain and the frontend's end-of-turn flush can race
+    /// harmlessly: exactly one of them gets each message.
+    pub fn take_for_next_turn(&self) -> Vec<PendingMessage> {
+        let mut pending = self.0.lock().expect("pending input lock");
+        pending.defer_to_next_turn = false;
+        pending.messages.drain(..).collect()
     }
 
     /// What the frontend still owes the model, for display.
@@ -64,13 +92,18 @@ impl PendingInput {
         self.0
             .lock()
             .expect("pending input lock")
+            .messages
             .iter()
             .cloned()
             .collect()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.lock().expect("pending input lock").is_empty()
+        self.0
+            .lock()
+            .expect("pending input lock")
+            .messages
+            .is_empty()
     }
 }
 
@@ -723,11 +756,29 @@ fn path_key(path: &Path) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::Session;
+    use super::{PendingInput, PendingMessage, Session};
     use crate::cwd_scope::CwdScoped;
     use crate::{Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn ctrl_c_handoff_keeps_queued_messages_out_of_the_cancelled_turn() {
+        let pending = PendingInput::default();
+        pending.push(PendingMessage {
+            text: "start the new turn".into(),
+            attachments: vec![],
+            blocks: vec![],
+        });
+
+        pending.defer_to_next_turn();
+        assert!(pending.take_at_safe_boundary().is_empty());
+
+        let next_turn = pending.take_for_next_turn();
+        assert_eq!(next_turn.len(), 1);
+        assert_eq!(next_turn[0].text, "start the new turn");
+        assert!(pending.take_at_safe_boundary().is_empty());
+    }
 
     #[test]
     fn three_auto_mode_classifier_failures_pause_to_default() {

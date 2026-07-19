@@ -788,7 +788,19 @@ impl App {
         };
         let col = mouse.column.saturating_sub(1) as usize;
         if !dialog.is_plan() {
-            if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            if dialog.is_question() {
+                match mouse.kind {
+                    MouseEventKind::Moved => {
+                        dialog.question_mouse_moved(row);
+                    }
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if !dialog.question_mouse_down(row) {
+                            dialog.note_mouse_down(row, col, width);
+                        }
+                    }
+                    _ => {}
+                }
+            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
                 dialog.note_mouse_down(row, col, width);
             }
             return;
@@ -1145,8 +1157,10 @@ impl App {
                 // Copy lives on Ctrl+Shift+C / Alt+C and mouse-release, so this
                 // key never has to disambiguate copy vs interrupt.
                 if running {
-                    // Anything queued was queued to be said *now* — cancelling
-                    // hands it to the turn that starts on the way out.
+                    // Anything queued was queued to be said *now* — mark it for
+                    // the fresh turn before cancelling this worker, so no batch
+                    // boundary can attach it to the cancelled turn.
+                    self.pending.defer_to_next_turn();
                     self.cancel_turn();
                 } else if !self.editor.is_empty() || !self.attachments.is_empty() {
                     self.clear_draft();

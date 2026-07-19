@@ -2711,7 +2711,7 @@ async fn auto_mode_stage_two_block_prevents_shell_execution() {
     ]);
     let classifier = MockProvider::new(vec![
         text_done("BLOCK"),
-        text_done("BLOCK\nThe command writes a file without direct authorization."),
+        text_done("The command writes a file without direct authorization.\nBLOCK"),
     ]);
     let agent = auto_agent(main.clone(), classifier.clone());
     let mut session = session(root.path(), PermissionMode::Auto);
