@@ -82,7 +82,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          manifest_version="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+          manifest_version="$(sed -n '/^\[workspace\.package\]$/,/^\[/{s/^version = "\([^\"]*\)"$/\1/p}' Cargo.toml)"
           test "$version" = "$manifest_version" || {
             echo "tag v$version does not match Cargo.toml version $manifest_version" >&2
             exit 1

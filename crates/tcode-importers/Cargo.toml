@@ -1,6 +1,6 @@
 [package]
 name = "tcode-importers"
-version = "0.1.9"
+version.workspace = true
 edition = "2021"
 
 [dependencies]

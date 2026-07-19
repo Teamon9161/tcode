@@ -54,7 +54,7 @@ cargo clippy --workspace --all-targets
 
 ## Releasing
 
-GitHub Actions validates pushes and pull requests. A release is only published when a `v*` tag is pushed, and the tag must match the root `Cargo.toml` version. The release workflow builds these checksum-protected binaries in parallel:
+GitHub Actions validates pushes and pull requests. A release is only published when a `v*` tag is pushed, and the tag must match the root `Cargo.toml` `[workspace.package]` version. The release workflow builds these checksum-protected binaries in parallel:
 
 - `tcode-x86_64-linux` and `tcode-aarch64-linux` (statically linked musl)
 - `tcode-x86_64-macos` and `tcode-aarch64-macos`
