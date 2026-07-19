@@ -317,11 +317,12 @@ impl Tool for ShellTool {
     }
 
     fn auto_safety(&self, _input: &Value) -> AutoSafety {
-        AutoSafety::AllowInScratch
-    }
-
-    fn safety_target(&self, input: &Value) -> Option<String> {
-        Some(input["cwd"].as_str().unwrap_or(".").to_string())
+        // A declared `cwd` is not a containment boundary: the command inside it
+        // may name absolute paths, reach the network, or spawn anything. File
+        // tools can be fast-pathed on their target because the target *is* the
+        // whole effect; for a shell command it is only where it starts, so the
+        // classifier stays in the loop no matter where it is rooted.
+        AutoSafety::Classify
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {

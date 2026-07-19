@@ -716,6 +716,18 @@ async fn main() -> anyhow::Result<()> {
     let line_approver = approver::LineApprover::new(cli.prompt.is_none());
 
     if let Some(prompt) = cli.prompt {
+        // A one-shot has nobody waiting to approve, so a mode that asks will
+        // decline instead. Say so before the run rather than letting it be
+        // discovered one declined tool call and one model turn later. It is a
+        // notice, not a refusal: plenty of one-shot work is read-only and
+        // finishes fine in these modes.
+        if session.mode.expects_a_human() {
+            eprintln!(
+                "{DIM}note: -p has nobody to approve actions, so {} mode will decline anything \
+                 needing approval — pass --mode auto to run unattended{RESET}",
+                session.mode.label()
+            );
+        }
         run_turn(&agent, &mut session, prompt, &line_approver).await?;
         return Ok(());
     }

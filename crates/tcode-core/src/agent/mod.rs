@@ -19,15 +19,15 @@ use tokio_util::sync::CancellationToken;
 
 use crate::accumulate::ResponseAccumulator;
 use crate::auto_mode::{
-    is_protected_path, AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision,
-    ClassifierRequest, ClassifierTranscript, SafetyClassifier,
+    is_protected_path, AutoModePolicy, AutoRoute, ClassifierDecision, ClassifierRequest,
+    ClassifierTranscript, SafetyClassifier,
 };
 use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
 use crate::memory::MemoryUpdate;
 use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode};
 use crate::provider::{ProviderError, Request, StreamEvent};
-use crate::tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use crate::tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 
 /// Default ceiling on model round-trips per user turn; a runaway loop should
@@ -313,25 +313,10 @@ impl Agent {
         tool: &dyn Tool,
         check: PermissionCheck<'_>,
     ) -> Decision {
-        let initial = session.rules.decide(session.mode, check.request);
-        let safety = tool.auto_safety(check.input);
-        let target = tool.safety_target(check.input);
-        let plan_scratch =
-            AutoModePolicy::new(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir);
-        let initial = if matches!(initial, Decision::Deny(_))
-            && session.mode == PermissionMode::Plan
-            && tool.is_mutating()
-            && matches!(safety, AutoSafety::AllowInProjectOrScratchEdit)
-            && plan_scratch.targets_scratch(target.as_deref())
-        {
-            // Plan mode protects the project, not the session-private workspace.
-            // Preserve explicit project rules by re-evaluating the same request
-            // under Unsafe: deny and ask still win, only its mode denial lifts.
-            session.rules.decide(PermissionMode::Unsafe, check.request)
-        } else {
-            initial
-        };
-        let mut decision = initial;
+        // Plan mode needs no scratch exception of its own: it routes to the
+        // user exactly like Default, so an exception here would make planning
+        // *more* permissive than ordinary work for the same call.
+        let mut decision = session.rules.decide(session.mode, check.request);
         if matches!(decision, Decision::Allow)
             && matches!(session.mode, crate::permission::PermissionMode::Auto)
             && tool
@@ -348,7 +333,15 @@ impl Agent {
 
         let safety = tool.auto_safety(check.input);
         let target = tool.safety_target(check.input);
+        let memory_root = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .auto_dir()
+            .map(Path::to_path_buf);
         match AutoModePolicy::new(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir)
+            .with_memory_root(memory_root)
             .route(safety, target.as_deref())
         {
             AutoRoute::Allow => Decision::Allow,
@@ -994,7 +987,7 @@ impl Agent {
             }
             let mut output = self
                 .forward_delegates(
-                    &session.tool_ctx,
+                    session,
                     events,
                     Some(approver),
                     tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel),
@@ -1144,7 +1137,7 @@ impl Agent {
 
         let outputs = self
             .forward_delegates(
-                &session.tool_ctx,
+                session,
                 events,
                 None,
                 join_all(prepared.iter().map(|(id, _, input, tool)| {
@@ -1517,7 +1510,7 @@ impl Agent {
         // cancellation halts a lane.
         let lane_outputs = self
             .forward_delegates(
-                &session.tool_ctx,
+                session,
                 events,
                 Some(approver),
                 join_all(lanes.iter().map(|lane| {
@@ -1875,7 +1868,7 @@ impl Agent {
 
             let mut output = self
                 .forward_delegates(
-                    &session.tool_ctx,
+                    session,
                     events,
                     Some(approver),
                     tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel),
@@ -2249,13 +2242,21 @@ impl Agent {
     /// a run's finish line must never be lost to select timing.
     async fn forward_delegates<T>(
         &self,
-        tool_ctx: &ToolCtx,
+        session: &Session,
         events: &mpsc::Sender<AgentEvent>,
         approver: Option<&dyn Approver>,
         fut: impl std::future::Future<Output = T>,
     ) -> Result<T, AgentError> {
+        let tool_ctx = &session.tool_ctx;
         let (delegate_tx, mut delegate_rx) = mpsc::unbounded_channel();
         tool_ctx.set_delegate_reporter(delegate_tx);
+        // Delegated work inherits this conversation's permission stance. It is
+        // read at call time, not session start, so a mode switched mid-turn
+        // applies to the very next delegation.
+        tool_ctx.set_delegated_permissions(crate::tool::DelegatedPermissions {
+            mode: session.mode,
+            rules: session.rules.clone(),
+        });
         let mut approval_rx = approver.map(|_| mpsc::unbounded_channel());
         if let Some((approval_tx, _)) = &approval_rx {
             tool_ctx.set_delegated_approver(approval_tx.clone());
@@ -2280,6 +2281,7 @@ impl Agent {
         };
         tool_ctx.clear_delegate_reporter();
         tool_ctx.clear_delegated_approver();
+        tool_ctx.clear_delegated_permissions();
         while let Ok(ev) = delegate_rx.try_recv() {
             self.emit_delegate(events, ev).await?;
         }

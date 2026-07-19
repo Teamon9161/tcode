@@ -64,11 +64,10 @@ pub enum AutoSafety {
     Allow,
     /// A normal file edit is direct-safe only within the project or this
     /// session's private scratch root, outside protected instruction paths.
+    /// This fast path is limited to tools whose declared target is the entire
+    /// effect of the call — a command that merely *starts* somewhere does not
+    /// qualify, however private that directory is.
     AllowInProjectOrScratchEdit,
-    /// A shell command is direct-safe only when its working directory is this
-    /// session's private scratch root. This is intentionally not a shell
-    /// parser: commands that run elsewhere still reach the classifier.
-    AllowInScratch,
     /// The action needs a safety classifier decision.
     Classify,
     /// This is a request for user input and must always open the UI prompt.
@@ -82,6 +81,7 @@ pub enum AutoSafety {
 pub struct AutoModePolicy {
     project_root: PathBuf,
     scratch_root: PathBuf,
+    memory_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,17 +96,16 @@ impl AutoModePolicy {
         Self {
             project_root: lexical_normalize(project_root.into()),
             scratch_root: lexical_normalize(scratch_root.into()),
+            memory_root: None,
         }
     }
 
-    /// Whether a tool-declared target is inside this session's private scratch
-    /// root. Both sides resolve their deepest existing ancestor first, so a
-    /// scratch symlink or Windows junction cannot escape this boundary.
-    pub fn targets_scratch(&self, target: Option<&str>) -> bool {
-        let scratch = crate::memory::canonical_target(&self.scratch_root);
-        target.is_some_and(|target| {
-            crate::memory::canonical_target(&self.resolve(target)).starts_with(&scratch)
-        })
+    /// The automatic-memory directory, when this session has one. Writing there
+    /// is already declared legitimate by the classifier policy, so routing it
+    /// locally removes a classifier request that only ever rubber-stamps.
+    pub fn with_memory_root(mut self, memory_root: Option<impl Into<PathBuf>>) -> Self {
+        self.memory_root = memory_root.map(|root| lexical_normalize(root.into()));
+        self
     }
 
     pub fn route(&self, safety: AutoSafety, target: Option<&str>) -> AutoRoute {
@@ -121,16 +120,18 @@ impl AutoModePolicy {
                 let path = crate::memory::canonical_target(&self.resolve(target));
                 let project = crate::memory::canonical_target(&self.project_root);
                 let scratch = crate::memory::canonical_target(&self.scratch_root);
-                if (path.starts_with(&project) || path.starts_with(&scratch))
-                    && !is_protected_path(&path)
-                {
-                    AutoRoute::Allow
-                } else {
-                    AutoRoute::Classify
-                }
-            }
-            AutoSafety::AllowInScratch => {
-                if self.targets_scratch(target) {
+                // Scratch and automatic memory are checked before the protected
+                // path test and never subjected to it: that test guards project
+                // instruction files, but both of these roots live under
+                // `~/.tcode` itself, so applying it there would reject every
+                // real-world target — the exact bug this ordering fixes.
+                let memory = self
+                    .memory_root
+                    .as_ref()
+                    .map(|root| crate::memory::canonical_target(root));
+                let private = path.starts_with(&scratch)
+                    || memory.is_some_and(|memory| path.starts_with(&memory));
+                if private || (path.starts_with(&project) && !is_protected_path(&path)) {
                     AutoRoute::Allow
                 } else {
                     AutoRoute::Classify
@@ -334,11 +335,6 @@ mod tests {
     #[test]
     fn in_project_or_session_scratch_edits_bypass_but_other_paths_do_not() {
         let policy = AutoModePolicy::new("/repo", "/scratch/runs/session");
-        assert!(
-            !policy.targets_scratch(Some("src/lib.rs")),
-            "the project must remain distinct from session scratch"
-        );
-        assert!(policy.targets_scratch(Some("/scratch/runs/session/probe.rs")));
         assert_eq!(
             policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some("src/lib.rs")),
             AutoRoute::Allow
@@ -369,11 +365,63 @@ mod tests {
             AutoRoute::Allow
         );
         assert_eq!(
-            policy.route(AutoSafety::AllowInScratch, Some("/scratch/runs/session")),
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, None),
+            AutoRoute::Classify,
+            "a tool that declares no target has no boundary to fast-path on"
+        );
+    }
+
+    #[test]
+    fn scratch_under_dot_tcode_is_not_mistaken_for_a_protected_path() {
+        // The real scratch root lives at `~/.tcode/projects/<id>/scratchpad/…`,
+        // so a protected-path check applied to it rejected every production
+        // target while temp-dir tests kept passing.
+        let policy = AutoModePolicy::new(
+            "/repo",
+            "/home/u/.tcode/projects/abc/scratchpad/runs/session",
+        );
+        assert_eq!(
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some("/home/u/.tcode/projects/abc/scratchpad/runs/session/probe.rs")
+            ),
+            AutoRoute::Allow
+        );
+    }
+
+    #[test]
+    fn memory_root_edits_route_locally_only_when_configured() {
+        let memory = "/home/u/.tcode/projects/abc/memory";
+        let target = "/home/u/.tcode/projects/abc/memory/user-prefers-rust.md";
+        let unconfigured = AutoModePolicy::new("/repo", "/scratch/runs/session");
+        assert_eq!(
+            unconfigured.route(AutoSafety::AllowInProjectOrScratchEdit, Some(target)),
+            AutoRoute::Classify,
+            "without a memory root the boundary must not widen"
+        );
+
+        let policy = unconfigured.with_memory_root(Some(memory));
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some(target)),
             AutoRoute::Allow
         );
         assert_eq!(
-            policy.route(AutoSafety::AllowInScratch, Some("/scratch/runs/other")),
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some("/home/u/.tcode/projects/other/memory/notes.md")
+            ),
+            AutoRoute::Classify
+        );
+        assert_eq!(
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, Some("CLAUDE.md")),
+            AutoRoute::Classify,
+            "project protections must survive the new ordering"
+        );
+        assert_eq!(
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some(".tcode/config.toml")
+            ),
             AutoRoute::Classify
         );
     }
@@ -395,9 +443,11 @@ mod tests {
         let escaped = scratch.join("escape/notes.txt");
         let escaped = escaped.to_string_lossy();
 
-        assert!(!policy.targets_scratch(Some(&escaped)));
+        // The path is spelled inside scratch but resolves outside it. Both
+        // sides canonicalize their deepest existing ancestor, so a symlink or
+        // Windows junction cannot smuggle a target past the boundary.
         assert_eq!(
-            policy.route(AutoSafety::AllowInScratch, Some(&escaped)),
+            policy.route(AutoSafety::AllowInProjectOrScratchEdit, &escaped),
             AutoRoute::Classify
         );
     }

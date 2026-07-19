@@ -782,7 +782,7 @@ async fn decline_reason_reaches_the_model_and_blocks_the_write() {
 }
 
 #[tokio::test]
-async fn plan_mode_blocks_edits_without_prompting() {
+async fn plan_mode_routes_project_edits_to_the_user() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![
         tool_use("t1", "write", r#"{"path":"a.txt","content":"hi"}"#),
@@ -790,17 +790,35 @@ async fn plan_mode_blocks_edits_without_prompting() {
     ]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Plan);
+    // Plan mode says "not yet", not "never": the user is present and may want
+    // the plan itself written to a project file.
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "create a.txt").await;
 
-    assert!(
-        approver.asked.lock().unwrap().is_empty(),
-        "plan mode must not prompt"
+    assert_eq!(approver.asked.lock().unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "hi"
     );
+}
+
+#[tokio::test]
+async fn plan_mode_project_edit_declined_leaves_the_project_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "write", r#"{"path":"a.txt","content":"hi"}"#),
+        text_done("ok"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "create a.txt").await;
+
+    assert_eq!(approver.asked.lock().unwrap().len(), 1);
     assert!(!dir.path().join("a.txt").exists());
-    let results = tool_results(&session);
-    assert!(results[0].0.contains("plan mode"));
+    assert!(tool_results(&session)[0].1);
 }
 
 #[tokio::test]
@@ -1173,10 +1191,12 @@ async fn read_only_agents_share_the_parallel_batch_path() {
                 "agent",
                 r#"{"agent":"explore","prompt":"inspect first"}"#,
             ),
+            // Both must be read-only kinds: `plan` can change things now, so
+            // it is deliberately isolated rather than batched alongside.
             (
                 "t2",
                 "agent",
-                r#"{"agent":"plan","prompt":"inspect second"}"#,
+                r#"{"agent":"explore","prompt":"inspect second"}"#,
             ),
         ]),
         text_done("first report"),
@@ -1271,7 +1291,13 @@ async fn plan_sub_agent_can_forward_a_blocking_question_to_the_user() {
 
     run(&agent, &mut session, &approver, "delegate a plan").await;
 
-    assert_eq!(approver.asked.lock().unwrap().as_slice(), ["ask_user"]);
+    // `plan` is no longer read-only, so spawning it is itself an approval —
+    // then the sub-agent's own question reaches the same human through the
+    // parent bridge.
+    assert_eq!(
+        approver.asked.lock().unwrap().as_slice(),
+        ["agent(plan)", "ask_user"]
+    );
     assert!(tool_results(&session)
         .iter()
         .any(|(content, error)| !error && content.contains("safe migration path")));
@@ -2477,7 +2503,35 @@ async fn auto_mode_bypasses_classifier_for_normal_project_edits() {
 }
 
 #[tokio::test]
-async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
+async fn auto_mode_bypasses_classifier_for_session_scratch_writes() {
+    let root = tempfile::tempdir().unwrap();
+    let mut session = session(root.path(), PermissionMode::Auto);
+    // The real scratch root lives under `~/.tcode`, so this also guards the
+    // ordering that once let the protected-path check swallow every scratch
+    // target in production while temp-dir tests passed.
+    let probe = session.tool_ctx.scratch_dir.join("probe.txt");
+    let main = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "write",
+            &serde_json::json!({ "path": probe, "content": "scratch" }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![]);
+    let agent = auto_agent(main, classifier.clone());
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "leave a probe file").await;
+
+    assert!(probe.is_file());
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert!(classifier.requests.lock().unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
+}
+
+#[tokio::test]
+async fn auto_mode_sends_a_scratch_rooted_shell_command_to_the_classifier() {
     let root = tempfile::tempdir().unwrap();
     let mut session = session(root.path(), PermissionMode::Auto);
     let scratch = session.tool_ctx.scratch_dir.clone();
@@ -2494,7 +2548,7 @@ async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
         ),
         text_done("done"),
     ]);
-    let classifier = MockProvider::new(vec![]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW")]);
     let agent = auto_agent(main, classifier.clone());
     let approver = ScriptedApprover::new(ApprovalDecision::No, None);
 
@@ -2506,9 +2560,12 @@ async fn auto_mode_bypasses_classifier_for_session_scratch_work() {
     )
     .await;
 
+    // A declared cwd bounds nothing: the command inside it could name any
+    // absolute path, so rooting it in scratch must not skip the classifier.
+    assert_eq!(classifier.requests.lock().unwrap().len(), 1);
     assert!(approver.asked.lock().unwrap().is_empty());
-    assert!(classifier.requests.lock().unwrap().is_empty());
     assert!(!session.tool_ctx.scratch_dir.join("probe.txt").exists());
+    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
 }
 
 #[tokio::test]
@@ -2698,7 +2755,7 @@ fn plan_enter_notes(session: &Session) -> usize {
         .ledger
         .entries()
         .iter()
-        .filter(|e| matches!(e, Entry::Note(text) if text.contains("read-only planning phase")))
+        .filter(|e| matches!(e, Entry::Note(text) if text.contains("Finish the plan before you start changing anything")))
         .count()
 }
 
@@ -2823,86 +2880,6 @@ async fn exit_plan_approval_switches_mode_and_unblocks_edits() {
 }
 
 #[tokio::test]
-async fn plan_mode_allows_scratch_writes_but_not_project_writes() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let scratch_file = session.tool_ctx.scratch_dir.join("research.txt");
-    let project_file = dir.path().join("should-not-exist.txt");
-    let provider = MockProvider::new(vec![
-        tool_uses(&[
-            (
-                "scratch",
-                "write",
-                &serde_json::json!({"path": scratch_file, "content": "notes"}).to_string(),
-            ),
-            (
-                "project",
-                "write",
-                &serde_json::json!({"path": project_file, "content": "blocked"}).to_string(),
-            ),
-        ]),
-        text_done("research complete"),
-    ]);
-    let agent = agent(provider);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
-
-    let events = run(&agent, &mut session, &approver, "research in scratch").await;
-
-    assert!(
-        matches!(std::fs::read_to_string(&scratch_file), Ok(ref content) if content == "notes"),
-        "tool results: {:?}; events: {events:#?}",
-        tool_results(&session)
-    );
-    assert!(
-        !project_file.exists(),
-        "plan mode must keep the project read-only"
-    );
-    assert!(approver.asked.lock().unwrap().is_empty());
-    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
-}
-
-#[tokio::test]
-async fn plan_mode_rejects_shell_even_when_cwd_is_scratch() {
-    let dir = tempfile::tempdir().unwrap();
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let project_file = dir.path().join("shell-must-not-write.txt");
-    let command = if cfg!(windows) {
-        format!(
-            "Set-Content -LiteralPath '{}' -Value blocked",
-            project_file.display()
-        )
-    } else {
-        format!("printf blocked > '{}'", project_file.display())
-    };
-    let provider = MockProvider::new(vec![
-        tool_use(
-            "shell",
-            platform_shell_tool(),
-            &serde_json::json!({
-                "command": command,
-                "cwd": session.tool_ctx.scratch_dir,
-            })
-            .to_string(),
-        ),
-        text_done("research complete"),
-    ]);
-    let agent = agent(provider);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
-
-    run(&agent, &mut session, &approver, "research in scratch").await;
-
-    assert!(
-        !project_file.exists(),
-        "plan mode must reject shell execution"
-    );
-    assert!(approver.asked.lock().unwrap().is_empty());
-    let results = tool_results(&session);
-    assert!(results[0].1);
-    assert!(results[0].0.contains("blocked: plan mode is active"));
-    let _ = std::fs::remove_dir_all(&session.tool_ctx.scratch_dir);
-}
-
-#[tokio::test]
 async fn exit_plan_rejection_keeps_plan_mode_and_returns_feedback() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![
@@ -2995,23 +2972,19 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
 
     let events = run(&agent, &mut session, &approver, "edit twice").await;
 
-    // First edit executed under the pre-switch mode; the second was blocked
-    // once the staged switch to plan committed at the boundary.
+    // The switch staged mid-batch lands on the session only once the boundary
+    // is reached, and the guidance note that marks the boundary is injected
+    // exactly once there.
     assert_eq!(session.mode, PermissionMode::Plan);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "two"
-    );
     assert!(events
         .iter()
         .any(|e| matches!(e, AgentEvent::ModeChanged(PermissionMode::Plan))));
-    // Entering plan injects exactly one guidance note after the approval
-    // interaction reaches the batch boundary.
     assert_eq!(plan_enter_notes(&session), 1);
-    let results = tool_results(&session);
-    assert!(
-        results.last().unwrap().0.contains("plan mode"),
-        "second edit must be blocked by plan mode"
+    // Both edits applied: this approver says yes, and plan mode asks rather
+    // than refusing. What the mode changes is who decides, not whether it ran.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "three"
     );
 }
 
@@ -3565,5 +3538,174 @@ async fn resuming_an_unknown_agent_run_is_a_self_healing_error() {
         out.content.contains("Start a fresh agent run"),
         "{}",
         out.content
+    );
+}
+
+/// A parent whose `general` (mutating) and `explore` (read-only) kinds both run
+/// on `sub`, with a classifier that allows anything it is asked about.
+fn inheritance_agent(
+    parent: Arc<MockProvider>,
+    sub: Arc<MockProvider>,
+    classifier: Arc<MockProvider>,
+) -> Agent {
+    let base = auto_agent(parent, classifier);
+    let pins = base.models.clone();
+    pins.pin("general", cell(sub.clone()).snapshot());
+    pins.pin("explore", cell(sub.clone()).snapshot());
+    pins.pin("plan", cell(sub).snapshot());
+    let task = tcode_tools::AgentTool::new(
+        base.model.clone(),
+        WatchdogConfig::default(),
+        2000,
+        std::env::temp_dir(),
+    )
+    .with_agent_models(pins);
+    Agent {
+        tools: vec![Arc::new(task)],
+        ..base
+    }
+}
+
+fn marker_command(marker: &std::path::Path) -> String {
+    if cfg!(windows) {
+        format!("Set-Content -LiteralPath '{}' -Value ran", marker.display())
+    } else {
+        format!("printf ran > '{}'", marker.display())
+    }
+}
+
+#[tokio::test]
+async fn a_parent_deny_rule_reaches_delegated_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("sub-ran.txt");
+    let sub = MockProvider::new(vec![
+        tool_use(
+            "s1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": marker_command(&marker) }).to_string(),
+        ),
+        text_done("sub done"),
+    ]);
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "agent",
+            r#"{"agent":"general","prompt":"write the marker"}"#,
+        ),
+        text_done("parent done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW"), text_done("ALLOW")]);
+    let agent = inheritance_agent(parent, sub, classifier);
+    let mut session = session(dir.path(), PermissionMode::Auto);
+    // A standing prohibition the user wrote in their own config. Delegating the
+    // work must not be a way around it.
+    session.rules.deny.push("run(*)".into());
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "delegate").await;
+
+    assert!(
+        !marker.exists(),
+        "a sub-agent must obey the parent's deny rules"
+    );
+}
+
+#[tokio::test]
+async fn a_delegated_run_asks_the_parent_when_the_inherited_mode_asks() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("sub-ran.txt");
+    let sub = MockProvider::new(vec![
+        tool_use(
+            "s1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": marker_command(&marker) }).to_string(),
+        ),
+        text_done("sub done"),
+    ]);
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "agent",
+            r#"{"agent":"general","prompt":"write the marker"}"#,
+        ),
+        text_done("parent done"),
+    ]);
+    let classifier = MockProvider::new(vec![]);
+    let agent = inheritance_agent(parent, sub, classifier);
+    // Default mode: the user wants to be asked. `general` declares no
+    // questionPolicy, so before inheritance this could only ever be refused.
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "delegate").await;
+
+    let asked = approver.asked.lock().unwrap().clone();
+    assert!(
+        asked.iter().any(|descriptor| descriptor.contains("run(")),
+        "the sub-agent's command should have reached the parent's approver: {asked:?}"
+    );
+    assert!(marker.exists(), "and running once approved");
+}
+
+#[tokio::test]
+async fn a_read_only_agent_stays_read_only_under_a_permissive_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("explore-ran.txt");
+    let sub = MockProvider::new(vec![
+        tool_use(
+            "s1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": marker_command(&marker) }).to_string(),
+        ),
+        text_done("sub done"),
+    ]);
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "agent",
+            r#"{"agent":"explore","prompt":"look around"}"#,
+        ),
+        text_done("parent done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW"), text_done("ALLOW")]);
+    let agent = inheritance_agent(parent, sub, classifier);
+    // Unsafe: the most permissive stance there is. `readonly` is a capability
+    // ceiling, not a gate, so there is no shell tool to inherit a mode for.
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "delegate").await;
+
+    assert!(
+        !marker.exists(),
+        "an inherited permissive mode must not hand a read-only agent a way to mutate"
+    );
+}
+
+#[tokio::test]
+async fn a_sub_agent_cannot_submit_a_plan_for_review() {
+    let dir = tempfile::tempdir().unwrap();
+    let sub = MockProvider::new(vec![
+        tool_use("s1", "exit_plan", r#"{"plan":"Do the thing."}"#),
+        text_done("## Draft\n\nthe draft"),
+    ]);
+    let parent = MockProvider::new(vec![
+        tool_use("t1", "agent", r#"{"agent":"plan","prompt":"draft a plan"}"#),
+        text_done("parent done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW"), text_done("ALLOW")]);
+    let agent = inheritance_agent(parent, sub, classifier);
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "delegate a plan").await;
+
+    // Approving a plan carries a permission-mode transition on this
+    // conversation; a delegated run must not be able to reach for it.
+    assert_eq!(session.mode, PermissionMode::Plan);
+    let asked = approver.asked.lock().unwrap().clone();
+    assert!(
+        !asked.iter().any(|descriptor| descriptor == "exit_plan"),
+        "no plan review should have been raised: {asked:?}"
     );
 }

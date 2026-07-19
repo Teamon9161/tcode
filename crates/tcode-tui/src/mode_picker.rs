@@ -81,7 +81,7 @@ impl Picker {
             let marker = if selected { "▸ " } else { "  " };
             let current = if current { " ✓" } else { "" };
             let description = match mode {
-                PermissionMode::Plan => "read-only tools only",
+                PermissionMode::Plan => "plan first; changes need your approval",
                 PermissionMode::Default => "ask when rules require it",
                 PermissionMode::AcceptEdits => "approve file edits automatically",
                 PermissionMode::Auto => "classifier reviews routine actions",

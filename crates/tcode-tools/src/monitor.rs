@@ -98,11 +98,9 @@ impl Tool for MonitorTool {
     }
 
     fn auto_safety(&self, _input: &Value) -> AutoSafety {
-        AutoSafety::AllowInScratch
-    }
-
-    fn safety_target(&self, _input: &Value) -> Option<String> {
-        Some(".".to_string())
+        // Same reasoning as `shell`: this runs an arbitrary command, and the
+        // directory it starts in bounds nothing.
+        AutoSafety::Classify
     }
 
     fn permission(&self, input: &Value) -> PermissionRequest {

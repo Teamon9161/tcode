@@ -24,8 +24,8 @@ use tcode_core::{
 
 use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry, QuestionPolicy};
 
-/// Sub-agents run in unsafe mode and must never prompt; this approver is
-/// a safety net in case a deny-rule path still asks.
+/// Fallback for a run with no parent conversation to escalate to — a direct or
+/// orphaned run. Declining is the only safe answer: there is nobody to ask.
 struct NeverAsk;
 
 #[async_trait]
@@ -46,9 +46,11 @@ impl Approver for NeverAsk {
     }
 }
 
-/// Forward a permitted sub-agent question to the parent conversation's existing
-/// approver. The receiver is installed only while the parent executes this
-/// `agent` call, so a direct or orphaned run stays safely non-interactive.
+/// Forward a delegated run's approvals and permitted questions to the parent
+/// conversation's existing approver, so an inherited mode that asks reaches the
+/// same human the parent would have asked. The receiver is installed only while
+/// the parent executes this `agent` call, so a direct or orphaned run stays
+/// safely non-interactive.
 struct ParentUserBridge {
     requests: mpsc::UnboundedSender<DelegatedApprovalRequest>,
 }
@@ -102,7 +104,6 @@ struct LiveTask {
     exchanges_left: u32,
     def_name: String,
     model_name: String,
-    question_policy: QuestionPolicy,
     /// Park order for oldest-first eviction.
     seq: u64,
 }
@@ -264,11 +265,23 @@ impl AgentTool {
 
     /// The definition-derived toolset. Read-only agents get only
     /// side-effect-free tools; a definition that explicitly allows user
-    /// questions receives `ask_user` through the parent bridge; builtin `plan`
-    /// still loses `exit_plan` (approval and the plan-mode transition remain
-    /// exclusive to the parent).
+    /// questions receives `ask_user` through the parent bridge.
     fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
         let mut tools = self.base_tools(cwd, model.clone());
+        // Submitting a plan for review carries a permission-mode transition on
+        // the *parent* conversation, so it is structurally not a sub-agent's to
+        // make — no delegated run gets one, whatever its definition says. The
+        // discriminator is the request type rather than the tool's name: a tool
+        // that asks for plan review is exactly the tool that cannot be
+        // delegated. (The main agent keeps it in every mode on purpose: the
+        // toolset is part of the cached prefix, so it stays put and
+        // `PermissionRules::decide` self-heals the out-of-plan-mode call.)
+        tools.retain(|tool| {
+            !matches!(
+                tool.permission(&json!({})),
+                PermissionRequest::PlanReview { .. }
+            )
+        });
         tools.retain(|tool| keeps_tool(def, tool.as_ref()));
         if def.question_policy == QuestionPolicy::User && def.tool_policy.keeps("ask_user") {
             tools.push(Arc::new(crate::AskUserTool));
@@ -511,11 +524,20 @@ impl Tool for AgentTool {
         // unrelated prefixes on it, so each run names its own scope.
         static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Delegated work is still the caller's work: it runs under the mode and
+        // rules the user chose for this conversation, not a stance of its own.
+        // The definition's `readonly` ceiling is the orthogonal knob — it has
+        // already removed mutating tools from `sub_tools`, so a permissive
+        // inherited mode cannot hand an explore agent something to mutate with.
+        let inherited = ctx.delegated_permissions();
+        let (mode, rules) = inherited
+            .map(|permissions| (permissions.mode, permissions.rules))
+            .unwrap_or_else(|| (PermissionMode::Auto, PermissionRules::default()));
         let mut session = Session::new(
             ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
                 .with_model(model.clone()),
-            PermissionMode::Auto,
-            PermissionRules::default(),
+            mode,
+            rules,
         )
         .with_cache_scope(format!("agent-{kind}-{run}"));
 
@@ -525,7 +547,6 @@ impl Tool for AgentTool {
                 &mut session,
                 kind,
                 &model_name,
-                def.question_policy,
                 prompt,
                 &summary,
                 call_id,
@@ -554,7 +575,6 @@ impl Tool for AgentTool {
                     exchanges_left: def.max_exchanges,
                     def_name: def.name.clone(),
                     model_name,
-                    question_policy: def.question_policy,
                     seq: PARK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 },
             );
@@ -613,13 +633,19 @@ impl AgentTool {
             ));
         }
         task.exchanges_left -= 1;
+        // A follow-up is a fresh delegation of the caller's current stance, not
+        // a replay of the one in force when this run was first parked: the user
+        // may have changed mode or rules in between.
+        if let Some(permissions) = ctx.delegated_permissions() {
+            task.session.mode = permissions.mode;
+            task.session.rules = permissions.rules;
+        }
         let outcome = self
             .drive(
                 &task.agent,
                 &mut task.session,
                 &def.name,
                 &task.model_name,
-                task.question_policy,
                 prompt,
                 summary,
                 call_id,
@@ -657,7 +683,6 @@ impl AgentTool {
         session: &mut Session,
         kind: &str,
         model_name: &str,
-        question_policy: QuestionPolicy,
         prompt: &str,
         summary: &str,
         call_id: &str,
@@ -752,9 +777,13 @@ impl AgentTool {
             })
         };
 
-        let bridge = (question_policy == QuestionPolicy::User)
-            .then(|| ctx.delegated_approver())
-            .flatten()
+        // Permission approvals always reach the parent. `questionPolicy` gates
+        // the `ask_user` *tool* — whether this agent may ask open-ended
+        // questions — which is a different thing from whether the human gets to
+        // decide about an action it is about to take. Without this, inheriting
+        // a mode that asks would silently become a mode that refuses.
+        let bridge = ctx
+            .delegated_approver()
             .map(|requests| ParentUserBridge { requests });
         let never_ask = NeverAsk;
         let approver: &dyn Approver = bridge

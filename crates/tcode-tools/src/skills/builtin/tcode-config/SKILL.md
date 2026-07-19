@@ -165,7 +165,12 @@ Key rules:
 - `tools` is an allowlist; `disallowedTools` is a denylist. They are mutually
   exclusive. Selectors also support `mcp__*` and `mcp__<server>__*`.
 - `readonly: true` is a hard ceiling: mutating tools are removed even if they
-  appear in `tools`.
+  appear in `tools`. It is stronger than any permission mode, because the tool
+  is absent rather than gated — there is no approval that could re-enable it.
+  It also makes the agent spawnable without approval and lets sibling runs go
+  in parallel. Omit it when the agent legitimately needs to change things: a
+  sub-agent inherits the caller's permission mode and rules, so its actions
+  reach the same approval path the parent's own would have.
 - `agents` is the allowlist of nested task kinds. Omit it to make a leaf agent.
 - `maxTurns` is a positive integer limiting model round-trips for that task.
   `max_steps` is legacy and should not be used.

@@ -255,6 +255,18 @@ pub struct ToolCtx {
     output_budget_tokens: usize,
     delegate: Mutex<Option<mpsc::UnboundedSender<DelegateEvent>>>,
     delegated_approvals: Mutex<Option<mpsc::UnboundedSender<DelegatedApprovalRequest>>>,
+    delegated_permissions: Mutex<Option<DelegatedPermissions>>,
+}
+
+/// The parent conversation's permission stance, installed for the duration of a
+/// delegating tool call. Work handed to a sub-agent is still this session's
+/// work: the user chose a mode and wrote rules for it, and a delegated run must
+/// not quietly get a different deal. Capability ceilings are a separate
+/// concern — an agent definition still narrows its own toolset on top of this.
+#[derive(Debug, Clone)]
+pub struct DelegatedPermissions {
+    pub mode: crate::permission::PermissionMode,
+    pub rules: crate::permission::PermissionRules,
 }
 
 static EPHEMERAL_SESSION: AtomicU64 = AtomicU64::new(0);
@@ -285,6 +297,11 @@ impl ToolCtx {
         // Sweep every session's stale files from the shared parent; this run's
         // blobs and background logs then stay inside its own child directory.
         crate::store::sweep_scratchpad(&crate::store::scratchpad_dir(&cwd));
+        // Scratch is handed to the model as a path it may use, and is a working
+        // directory a command can be launched in — not merely a prefix that
+        // file writes create on demand. It has to exist before the first tool
+        // runs, or `shell(cwd=scratch)` fails on a directory we promised.
+        let _ = std::fs::create_dir_all(&scratch_dir);
         let tool_output = scratch_dir.join("tool-output");
         Self {
             freshness: Mutex::new(FreshnessTracker::default()),
@@ -296,6 +313,7 @@ impl ToolCtx {
             output_budget_tokens,
             delegate: Mutex::new(None),
             delegated_approvals: Mutex::new(None),
+            delegated_permissions: Mutex::new(None),
             cwd,
             scratch_dir,
         }
@@ -306,6 +324,7 @@ impl ToolCtx {
     /// blobs deliberately belong to the conversation that created them.
     pub fn rebind_scratch_dir(&mut self, scratch_dir: PathBuf) {
         self.scratch_dir = scratch_dir.clone();
+        let _ = std::fs::create_dir_all(&scratch_dir);
         let tool_output = scratch_dir.join("tool-output");
         self.blobs = Mutex::new(BlobStore::new(
             tool_output.clone(),
@@ -368,6 +387,29 @@ impl ToolCtx {
             .delegated_approvals
             .lock()
             .expect("delegated approval lock") = None;
+    }
+
+    /// The parent's mode and rules, when this call is running inside one.
+    /// `None` means there is no parent conversation to inherit from.
+    pub fn delegated_permissions(&self) -> Option<DelegatedPermissions> {
+        self.delegated_permissions
+            .lock()
+            .expect("delegated permission lock")
+            .clone()
+    }
+
+    pub(crate) fn set_delegated_permissions(&self, permissions: DelegatedPermissions) {
+        *self
+            .delegated_permissions
+            .lock()
+            .expect("delegated permission lock") = Some(permissions);
+    }
+
+    pub(crate) fn clear_delegated_permissions(&self) {
+        *self
+            .delegated_permissions
+            .lock()
+            .expect("delegated permission lock") = None;
     }
 
     /// Bind (or unbind) where task traces persist. Called whenever the

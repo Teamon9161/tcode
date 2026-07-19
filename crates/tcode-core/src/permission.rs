@@ -33,6 +33,24 @@ impl PermissionMode {
         }
     }
 
+    /// Whether this mode routes an ordinary side-effecting action to a human.
+    /// Derived by asking `decide` rather than restating its arms, so it cannot
+    /// drift from the real policy. Rules are excluded on purpose: this answers
+    /// "does this mode expect somebody to be there", not "will this specific
+    /// call prompt".
+    pub fn expects_a_human(&self) -> bool {
+        let probe = PermissionRequest::Ask {
+            descriptor: String::new(),
+            aliases: Vec::new(),
+            summary: String::new(),
+            is_edit: false,
+        };
+        matches!(
+            PermissionRules::default().decide(*self, &probe),
+            Decision::Ask
+        )
+    }
+
     pub fn cycle(&self) -> Self {
         match self {
             PermissionMode::Default => PermissionMode::AcceptEdits,
@@ -105,9 +123,13 @@ impl PermissionRules {
             return Decision::Ask;
         }
         match mode {
-            PermissionMode::Plan => {
-                Decision::Deny("blocked: plan mode is active; only read-only tools may run".into())
-            }
+            // Plan mode deliberately has no arm of its own: it is a coordination
+            // signal ("finish the plan before you start changing things"), not a
+            // capability boundary, so it routes to the human exactly like
+            // Default rather than refusing on the user's behalf. Asking the
+            // model to hold off is the prompt's job; deciding to make an
+            // exception — saving the plan to a file, running a build — is the
+            // user's, and they have to be able to say yes.
             PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
             PermissionMode::Auto => {
@@ -331,14 +353,48 @@ mod tests {
             rules.decide(PermissionMode::AcceptEdits, &shell),
             Decision::Ask
         );
-        assert!(matches!(
-            rules.decide(PermissionMode::Plan, &edit),
-            Decision::Deny(_)
-        ));
+        // Plan mode reaches the human rather than refusing on their behalf.
+        assert_eq!(rules.decide(PermissionMode::Plan, &edit), Decision::Ask);
+        assert_eq!(rules.decide(PermissionMode::Plan, &shell), Decision::Ask);
         assert_eq!(
             rules.decide(PermissionMode::Unsafe, &shell),
             Decision::Allow
         );
         assert_eq!(rules.decide(PermissionMode::Default, &shell), Decision::Ask);
+    }
+
+    #[test]
+    fn modes_that_route_to_a_human_are_derived_from_decide() {
+        for mode in [
+            PermissionMode::Plan,
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+        ] {
+            assert!(mode.expects_a_human(), "{mode:?} routes to a human");
+        }
+        // Auto only reaches a human when its classifier is unavailable, which
+        // is an outage rather than the mode's normal path.
+        for mode in [PermissionMode::Auto, PermissionMode::Unsafe] {
+            assert!(!mode.expects_a_human(), "{mode:?} runs unattended");
+        }
+    }
+
+    #[test]
+    fn plan_mode_honours_the_same_rules_default_mode_does() {
+        let rules = PermissionRules {
+            allow: vec!["shell(cargo test)".into()],
+            ask: vec![],
+            deny: vec!["edit(secrets.rs)".into()],
+        };
+        // An allow rule is a standing user decision; plan mode is about when to
+        // start work, not about re-litigating rules the user already wrote.
+        assert_eq!(
+            rules.decide(PermissionMode::Plan, &ask("shell(cargo test)", false)),
+            Decision::Allow
+        );
+        assert!(matches!(
+            rules.decide(PermissionMode::Plan, &ask("edit(secrets.rs)", true)),
+            Decision::Deny(_)
+        ));
     }
 }
