@@ -226,32 +226,13 @@ impl App {
     }
 
     /// End a selection drag: stop any auto-scroll, then copy like a normal
-    /// mouse-up. Reached from a real `Up`; a click anywhere always lands here
-    /// (or in `mouse_down`), so a stuck auto-scroll is one click away from
-    /// clearing — the timer never traps input.
+    /// mouse-up. A plain click immediately folds or unfolds the block under it.
     pub(super) fn finish_drag(&mut self, x: u16, y: u16) {
         self.drag_scroll = None;
         if self.input_mouse_active {
             self.input_mouse_up(x, y);
-        } else {
-            let linked = self.active_transcript().selected_task_run();
-            let copied = self.active_transcript_mut().mouse_up();
-            if let Some(run) = linked {
-                let double = self
-                    .last_task_card_click
-                    .as_ref()
-                    .is_some_and(|(previous, at)| {
-                        previous == &run && at.elapsed() <= TASK_CARD_DOUBLE_CLICK
-                    });
-                if double {
-                    self.last_task_card_click = None;
-                    self.open_view(ViewId::TaskRun(run));
-                } else {
-                    self.last_task_card_click = Some((run, Instant::now()));
-                }
-            } else if let Some(text) = copied {
-                self.copy_selection(text);
-            }
+        } else if let Some(text) = self.active_transcript_mut().mouse_up() {
+            self.copy_selection(text);
         }
     }
 

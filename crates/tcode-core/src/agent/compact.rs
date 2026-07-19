@@ -3,6 +3,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::accumulate::ResponseAccumulator;
+use crate::agent_roles::AgentRole;
 use crate::ledger::Entry;
 use crate::provider::Request;
 use crate::types::ContentBlock;
@@ -47,7 +48,12 @@ impl Agent {
                 text: compact_prompt(focus),
             }],
         });
-        let model = self.model.snapshot();
+        // A pin selects the summarizer without changing when compaction starts:
+        // that threshold remains tied to the main conversation model's window.
+        let model = self
+            .models
+            .resolve(AgentRole::Compact, &self.model)
+            .expect("compact always inherits the main model");
         let req = Request {
             model: model.provider.model().to_string(),
             system: self.system_prompt(session),

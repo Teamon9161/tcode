@@ -127,6 +127,11 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             AgentEvent::ModeChanged(mode) => {
                 println!("{DIM}[permission mode → {}]{RESET}", mode.label());
             }
+            AgentEvent::AutoClassifierUnavailable(reason) => {
+                println!(
+                    "{YELLOW}[Auto classifier unavailable; asking you instead: {reason}]{RESET}"
+                );
+            }
             AgentEvent::AutoModePaused(notice) => {
                 println!("{YELLOW}[{notice}]{RESET}");
             }

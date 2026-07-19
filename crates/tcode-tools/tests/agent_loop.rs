@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
-    ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
+    ActiveModel, Agent, AgentEvent, AgentModels, AgentRole, Approval, ApprovalDecision, Approver,
     CacheStrategy, ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules,
     Provider, ProviderError, ProviderSafetyClassifier, Request, SafetyClassifier, Session,
     StopReason, StreamEvent, ToolCtx, Usage,
@@ -1291,13 +1291,9 @@ async fn plan_sub_agent_can_forward_a_blocking_question_to_the_user() {
 
     run(&agent, &mut session, &approver, "delegate a plan").await;
 
-    // `plan` is no longer read-only, so spawning it is itself an approval —
-    // then the sub-agent's own question reaches the same human through the
-    // parent bridge.
-    assert_eq!(
-        approver.asked.lock().unwrap().as_slice(),
-        ["agent(plan)", "ask_user"]
-    );
+    // Delegation itself needs no approval. The plan agent's question still
+    // reaches the same human through the parent bridge.
+    assert_eq!(approver.asked.lock().unwrap().as_slice(), ["ask_user"]);
     assert!(tool_results(&session)
         .iter()
         .any(|(content, error)| !error && content.contains("safe migration path")));
@@ -2666,20 +2662,33 @@ async fn auto_mode_classifier_outages_pause_and_notify_the_frontend() {
         text_done("not a verdict"),
         text_done("not a verdict"),
         text_done("not a verdict"),
+        text_done("not a verdict"),
+        text_done("not a verdict"),
+        text_done("not a verdict"),
     ]);
     let agent = auto_agent(main, classifier);
     let mut session = session(root.path(), PermissionMode::Auto);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
-    run(&agent, &mut session, &approver, "run first").await;
+    let first_events = run(&agent, &mut session, &approver, "run first").await;
     run(&agent, &mut session, &approver, "run second").await;
     let events = run(&agent, &mut session, &approver, "run third").await;
 
+    assert!(first_events.iter().any(|event| matches!(
+        event,
+        AgentEvent::AutoClassifierUnavailable(reason)
+            if reason.contains("fast classifier returned an invalid verdict")
+    )));
     assert_eq!(session.mode, PermissionMode::Default);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::ModeChanged(PermissionMode::Default))));
     assert!(events.iter().any(|event| matches!(
         event,
         AgentEvent::AutoModePaused(notice)
-            if notice.contains("classifier failures") && notice.contains("/agents")
+            if notice.contains("classifier failures")
+                && notice.contains("/agents")
+                && notice.contains("Last classifier failure: fast classifier failed after 2 attempts")
     )));
 }
 
@@ -3216,10 +3225,13 @@ async fn auto_compacts_after_a_tool_batch_before_the_next_model_request() {
             "add_note",
             &serde_json::json!({ "text": large_note.clone() }).to_string(),
         ),
-        text_done("summary of the earlier work"),
         text_done("finished after compaction"),
     ]);
+    let compact = MockProvider::named("compact-1", vec![text_done("summary of the earlier work")]);
     let mut agent = agent(provider.clone());
+    agent
+        .models
+        .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
     agent.model.swap(ActiveModel {
         provider: provider.clone(),
         max_tokens: 1024,
@@ -3240,8 +3252,15 @@ async fn auto_compacts_after_a_tool_batch_before_the_next_model_request() {
         .any(|event| matches!(event, AgentEvent::Compacted(summary)
         if summary == "summary of the earlier work")));
     let requests = provider.requests.lock().unwrap();
-    assert_eq!(requests.len(), 3, "turn, compaction, then continuation");
-    let continuation = requests[2]
+    assert_eq!(requests.len(), 2, "turn, then continuation");
+    let compact_requests = compact.requests.lock().unwrap();
+    assert_eq!(
+        compact_requests.len(),
+        1,
+        "the compact pin receives the summary request"
+    );
+    assert_eq!(compact_requests[0].model, "compact-1");
+    let continuation = requests[1]
         .messages
         .iter()
         .flat_map(|message| &message.content)
@@ -3640,8 +3659,13 @@ async fn a_delegated_run_asks_the_parent_when_the_inherited_mode_asks() {
     run(&agent, &mut session, &approver, "delegate").await;
 
     let asked = approver.asked.lock().unwrap().clone();
+    assert_eq!(
+        asked.len(),
+        1,
+        "delegation itself must not prompt: {asked:?}"
+    );
     assert!(
-        asked.iter().any(|descriptor| descriptor.contains("run(")),
+        asked[0].starts_with("run("),
         "the sub-agent's command should have reached the parent's approver: {asked:?}"
     );
     assert!(marker.exists(), "and running once approved");

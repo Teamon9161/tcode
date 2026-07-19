@@ -1,9 +1,12 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 use super::{ClassifierDecision, ClassifierRequest, SafetyClassifier};
 use crate::agent_roles::AgentRole;
+use crate::config::AutoClassifierConfig;
 use crate::provider::{AgentModels, ModelCell, Request, StreamEvent};
 use crate::types::{ContentBlock, Message, Role};
 
@@ -15,6 +18,16 @@ use crate::types::{ContentBlock, Message, Role};
 /// outage and takes Auto Mode offline. Both stages share it; stage one is
 /// short because its prompt says so, not because it is capped.
 const VERDICT_MAX_TOKENS: u32 = 1_024;
+
+struct ClassifierStage {
+    name: &'static str,
+    suffix: &'static str,
+    max_tokens: u32,
+    effort: Option<String>,
+    timeout: Duration,
+    accepts: fn(&str) -> bool,
+}
+
 /// The classifier runs on the agent's provider but never on the agent's
 /// prefix. Each `ClassifierRequest` carries a session-specific cache scope so
 /// dynamically-expanded policy never shares a provider cache ID with another
@@ -27,6 +40,7 @@ const VERDICT_MAX_TOKENS: u32 = 1_024;
 pub struct ProviderSafetyClassifier {
     parent_model: ModelCell,
     pinned: AgentModels,
+    config: AutoClassifierConfig,
 }
 
 impl ProviderSafetyClassifier {
@@ -36,7 +50,16 @@ impl ProviderSafetyClassifier {
         Self {
             parent_model,
             pinned,
+            config: AutoClassifierConfig::default(),
         }
+    }
+
+    /// Supply the user-global stage deadlines and retry policy. This remains
+    /// separate from the ordinary provider watchdog: a live SSE stream can
+    /// still fail to produce a usable safety verdict.
+    pub fn with_config(mut self, config: AutoClassifierConfig) -> Self {
+        self.config = config;
+        self
     }
 
     fn model(&self) -> crate::provider::ActiveModel {
@@ -45,7 +68,7 @@ impl ProviderSafetyClassifier {
             .expect("auto always inherits the main model")
     }
 
-    async fn run_stage(
+    async fn run_stage_once(
         &self,
         request: &ClassifierRequest,
         suffix: &str,
@@ -94,6 +117,68 @@ impl ProviderSafetyClassifier {
         }
         Ok(output)
     }
+
+    /// Run one stage to a *valid* verdict, cancelling a timed-out stream before
+    /// immediately retrying it at most once. The deadline is intentionally
+    /// end-to-end: a response-created frame or SSE heartbeat cannot keep an
+    /// unresponsive classifier alive forever.
+    async fn run_stage(
+        &self,
+        request: &ClassifierRequest,
+        stage: ClassifierStage,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
+        let attempts = self.config.retry_count + 1;
+        let mut last_failure = String::new();
+        for attempt in 1..=attempts {
+            let attempt_cancel = cancel.child_token();
+            let result = tokio::select! {
+                _ = cancel.cancelled() => return Err(format!("{} classifier cancelled", stage.name)),
+                result = tokio::time::timeout(
+                    stage.timeout,
+                    self.run_stage_once(
+                        request,
+                        stage.suffix,
+                        stage.max_tokens,
+                        stage.effort.clone(),
+                        attempt_cancel.clone(),
+                    ),
+                ) => result,
+            };
+            // Drop/cancel the old stream before opening the next request. A
+            // provider may otherwise keep its prior HTTP body alive after this
+            // task stops awaiting it.
+            attempt_cancel.cancel();
+            match result {
+                Ok(Ok(output)) if (stage.accepts)(&output) => return Ok(output),
+                Ok(Ok(output)) => {
+                    last_failure = format!(
+                        "{} classifier returned an invalid verdict: {output:?}",
+                        stage.name
+                    )
+                }
+                Ok(Err(reason)) => last_failure = reason,
+                Err(_) => {
+                    last_failure = format!(
+                        "{} classifier timed out after {}s",
+                        stage.name,
+                        stage.timeout.as_secs()
+                    )
+                }
+            }
+            if attempt < attempts {
+                continue;
+            }
+        }
+        if attempts > 1 {
+            Err(format!(
+                "{} classifier failed after {attempts} attempts: {last_failure}",
+                stage.name
+            ))
+        } else {
+            Err(last_failure)
+        }
+    }
 }
 
 #[async_trait]
@@ -106,9 +191,14 @@ impl SafetyClassifier for ProviderSafetyClassifier {
         let fast = self
             .run_stage(
                 &request,
-                FAST_STAGE,
-                VERDICT_MAX_TOKENS,
-                Some("off".into()),
+                ClassifierStage {
+                    name: "fast",
+                    suffix: FAST_STAGE,
+                    max_tokens: VERDICT_MAX_TOKENS,
+                    effort: Some("off".into()),
+                    timeout: self.config.fast_timeout,
+                    accepts: |output| fast_verdict(output).is_some(),
+                },
                 cancel.clone(),
             )
             .await;
@@ -121,7 +211,23 @@ impl SafetyClassifier for ProviderSafetyClassifier {
             Some(false) => {
                 let effort = self.model().effort;
                 let reasoned = self
-                    .run_stage(&request, REASONED_STAGE, VERDICT_MAX_TOKENS, effort, cancel)
+                    .run_stage(
+                        &request,
+                        ClassifierStage {
+                            name: "reasoned",
+                            suffix: REASONED_STAGE,
+                            max_tokens: VERDICT_MAX_TOKENS,
+                            effort,
+                            timeout: self.config.reasoned_timeout,
+                            accepts: |output| {
+                                !matches!(
+                                    reasoned_verdict(output),
+                                    ClassifierDecision::Unavailable { .. }
+                                )
+                            },
+                        },
+                        cancel,
+                    )
                     .await;
                 match reasoned {
                     Ok(output) => reasoned_verdict(&output),
@@ -219,5 +325,166 @@ mod tests {
             reasoned_verdict("The command looks fine, so ALLOW."),
             ClassifierDecision::Unavailable { .. }
         ));
+    }
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::auto_mode::ClassifierTranscript;
+    use crate::provider::{ActiveModel, CacheStrategy, EventStream, Provider, ProviderError};
+    use crate::types::StopReason;
+
+    enum Script {
+        Pending,
+        Output(&'static str),
+        StreamError(&'static str),
+    }
+
+    struct ScriptedProvider {
+        scripts: Mutex<VecDeque<Script>>,
+        cancellations: Mutex<Vec<CancellationToken>>,
+        requests: AtomicUsize,
+    }
+
+    impl ScriptedProvider {
+        fn new(scripts: Vec<Script>) -> Self {
+            Self {
+                scripts: Mutex::new(scripts.into()),
+                cancellations: Mutex::new(Vec::new()),
+                requests: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Provider for ScriptedProvider {
+        fn name(&self) -> &str {
+            "scripted"
+        }
+
+        fn model(&self) -> &str {
+            "scripted-model"
+        }
+
+        fn cache_strategy(&self) -> CacheStrategy {
+            CacheStrategy::ImplicitPrefix
+        }
+
+        async fn stream(
+            &self,
+            _req: Request,
+            cancel: CancellationToken,
+        ) -> Result<EventStream, ProviderError> {
+            self.requests.fetch_add(1, Ordering::Relaxed);
+            self.cancellations.lock().unwrap().push(cancel);
+            match self.scripts.lock().unwrap().pop_front().unwrap() {
+                Script::Pending => Ok(futures::stream::pending().boxed()),
+                Script::Output(output) => Ok(futures::stream::iter([
+                    Ok(StreamEvent::TextDelta(output.to_string())),
+                    Ok(StreamEvent::Done(StopReason::EndTurn)),
+                ])
+                .boxed()),
+                Script::StreamError(message) => Ok(futures::stream::iter([Err(
+                    ProviderError::Network(message.into()),
+                )])
+                .boxed()),
+            }
+        }
+    }
+
+    fn classifier(scripts: Vec<Script>) -> (ProviderSafetyClassifier, Arc<ScriptedProvider>) {
+        let provider = Arc::new(ScriptedProvider::new(scripts));
+        let model = ActiveModel {
+            provider: provider.clone(),
+            max_tokens: 1_024,
+            context_window: 32_768,
+            effort: None,
+        };
+        let config = AutoClassifierConfig {
+            fast_timeout: Duration::from_millis(1),
+            reasoned_timeout: Duration::from_millis(1),
+            retry_count: 1,
+        };
+        (
+            ProviderSafetyClassifier::new(ModelCell::new(model), AgentModels::default())
+                .with_config(config),
+            provider,
+        )
+    }
+
+    fn request() -> ClassifierRequest {
+        ClassifierRequest {
+            policy: "classifier policy".into(),
+            cache_scope: "auto-classifier:test".into(),
+            transcript: ClassifierTranscript::default(),
+            tool_name: "shell".into(),
+            input: serde_json::json!({"command": "echo ok"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_timeout_cancels_the_attempt_and_retries_to_a_verdict() {
+        let (classifier, provider) = classifier(vec![Script::Pending, Script::Output("ALLOW")]);
+
+        assert_eq!(
+            classifier
+                .classify(request(), CancellationToken::new())
+                .await,
+            ClassifierDecision::Allow
+        );
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 2);
+        assert!(
+            provider.cancellations.lock().unwrap()[0].is_cancelled(),
+            "the timed-out stream must be cancelled before retrying"
+        );
+    }
+
+    #[tokio::test]
+    async fn reasoned_timeout_retries_without_repeating_the_fast_stage() {
+        let (classifier, provider) = classifier(vec![
+            Script::Output("BLOCK"),
+            Script::Pending,
+            Script::Output("BLOCK\nThe command changes tracked files."),
+        ]);
+
+        assert_eq!(
+            classifier
+                .classify(request(), CancellationToken::new())
+                .await,
+            ClassifierDecision::Block {
+                reason: "The command changes tracked files.".into(),
+            }
+        );
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn stream_errors_and_invalid_verdicts_each_retry_once() {
+        let (retry_classifier, provider) = classifier(vec![
+            Script::StreamError("temporary provider outage"),
+            Script::Output("ALLOW"),
+        ]);
+        assert_eq!(
+            retry_classifier
+                .classify(request(), CancellationToken::new())
+                .await,
+            ClassifierDecision::Allow
+        );
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 2);
+
+        let (classifier, provider) = classifier(vec![
+            Script::Output("not a verdict"),
+            Script::Output("still not a verdict"),
+        ]);
+        assert!(matches!(
+            classifier
+                .classify(request(), CancellationToken::new())
+                .await,
+            ClassifierDecision::Unavailable { reason }
+                if reason.contains("fast classifier failed after 2 attempts")
+                    && reason.contains("invalid verdict")
+        ));
+        assert_eq!(provider.requests.load(Ordering::Relaxed), 2);
     }
 }

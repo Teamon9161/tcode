@@ -169,6 +169,10 @@ pub enum AgentEvent {
     /// status marker and bakes a record — the transcript is the source of
     /// truth for which boundary a mode took effect at.
     ModeChanged(crate::permission::PermissionMode),
+    /// The Auto Mode classifier could not return a usable verdict for this call,
+    /// so the agent is asking the human instead. This is frontend-only
+    /// observability: it never becomes model-visible ledger context.
+    AutoClassifierUnavailable(String),
     /// The classifier was unavailable repeatedly, so the session falls back
     /// to ordinary human approvals until Auto Mode is explicitly re-enabled.
     AutoModePaused(String),
@@ -195,10 +199,10 @@ pub enum AgentError {
 pub struct Agent {
     /// Swappable model handle; each turn snapshots it once.
     pub model: crate::provider::ModelCell,
-    /// Pinned auxiliary model roles (`[agents.<role>]`, `/agents`). Only the
-    /// roles the agent itself runs are read here — `suggest` today; sub-agent
-    /// kinds are resolved by the `task` tool, which shares the same handle.
-    /// An unpinned role follows `model`.
+    /// Pinned auxiliary model roles (`[agents.<role>]`, `/agents`). The agent
+    /// resolves `compact` and `suggest` here; sub-agent kinds are resolved by
+    /// the `task` tool, which shares the same handle. An unpinned role follows
+    /// `model`.
     pub models: crate::provider::AgentModels,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
@@ -225,6 +229,25 @@ struct PermissionCheck<'a> {
     request: &'a PermissionRequest,
     cancel: &'a CancellationToken,
     events: &'a mpsc::Sender<AgentEvent>,
+}
+
+/// Provider errors and invalid model output are useful to the person choosing
+/// `/agents`, but neither may flood the transcript or status line.
+fn classifier_failure_reason(reason: &str) -> String {
+    const MAX_CHARS: usize = 360;
+    let normalized = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut preview: String = normalized.chars().take(MAX_CHARS).collect();
+    if normalized.chars().nth(MAX_CHARS).is_some() {
+        preview.push('…');
+    }
+    preview
+}
+
+fn classifier_failure_notice(notice: String, reason: &str) -> String {
+    format!(
+        "{notice}\nLast classifier failure: {}",
+        classifier_failure_reason(reason)
+    )
 }
 
 impl Agent {
@@ -387,6 +410,19 @@ impl Agent {
                     }
                     ClassifierDecision::Block { reason } => {
                         let paused = session.record_auto_classification(false);
+                        if let Some(notice) = &paused {
+                            // This is a real mode change, not a staged UI request.
+                            // Keep every frontend's mode mirror authoritative through
+                            // the same event used at normal safe boundaries.
+                            let _ = check
+                                .events
+                                .send(AgentEvent::ModeChanged(PermissionMode::Default))
+                                .await;
+                            let _ = check
+                                .events
+                                .send(AgentEvent::AutoModePaused(notice.clone()))
+                                .await;
+                        }
                         let paused = paused
                             .map(|notice| format!("\n{notice}"))
                             .unwrap_or_default();
@@ -394,9 +430,23 @@ impl Agent {
                             "Blocked by Auto Mode safety classifier: {reason}\nFind a safer alternative. Do not try to route around this boundary.{paused}"
                         ))
                     }
-                    ClassifierDecision::Unavailable { .. } => {
+                    ClassifierDecision::Unavailable { reason } => {
+                        let failure = classifier_failure_reason(&reason);
+                        let _ = check
+                            .events
+                            .send(AgentEvent::AutoClassifierUnavailable(failure))
+                            .await;
                         if let Some(notice) = session.record_auto_classifier_unavailable() {
-                            let _ = check.events.send(AgentEvent::AutoModePaused(notice)).await;
+                            let _ = check
+                                .events
+                                .send(AgentEvent::ModeChanged(PermissionMode::Default))
+                                .await;
+                            let _ = check
+                                .events
+                                .send(AgentEvent::AutoModePaused(classifier_failure_notice(
+                                    notice, &reason,
+                                )))
+                                .await;
                         }
                         Decision::Ask
                     }

@@ -486,6 +486,7 @@ async fn main() -> anyhow::Result<()> {
         tcode_tools::ShellFilters::disabled()
     });
     let classifier_policy = tcode_core::classifier_policy(&config.auto_mode);
+    let classifier_config = config.auto_mode.classifier_config();
     let trusted_read_hosts =
         tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
     // MCP servers from config; a broken server warns instead of blocking.
@@ -591,6 +592,7 @@ async fn main() -> anyhow::Result<()> {
     .with_agent_models(pinned.clone())
     .with_agent_defs(agent_defs.clone())
     .with_auto_policy(classifier_policy.clone())
+    .with_auto_classifier_config(classifier_config)
     .with_auto_compact(
         config.limits.auto_compact,
         config.limits.auto_compact_percent,
@@ -610,10 +612,10 @@ async fn main() -> anyhow::Result<()> {
         }
         None => tools.push(Arc::new(agent_tool)),
     }
-    let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
-        model_cell.clone(),
-        pinned.clone(),
-    ));
+    let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
+        ProviderSafetyClassifier::new(model_cell.clone(), pinned.clone())
+            .with_config(classifier_config),
+    );
     let agent = Arc::new(Agent {
         model: model_cell.clone(),
         models: pinned.clone(),

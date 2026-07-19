@@ -119,6 +119,7 @@ pub struct AgentTool {
     watchdog: WatchdogConfig,
     output_budget: usize,
     auto_policy: String,
+    auto_classifier_config: tcode_core::config::AutoClassifierConfig,
     auto_compact: bool,
     auto_compact_percent: u8,
     trusted_read_hosts: crate::TrustedReadHosts,
@@ -159,6 +160,7 @@ impl AgentTool {
             watchdog,
             output_budget,
             auto_policy: String::new(),
+            auto_classifier_config: Default::default(),
             auto_compact: true,
             auto_compact_percent: 85,
             trusted_read_hosts: crate::trusted_read_hosts(Vec::new()),
@@ -206,6 +208,16 @@ impl AgentTool {
     /// config never reaches this field, even for delegated work.
     pub fn with_auto_policy(mut self, policy: String) -> Self {
         self.auto_policy = policy;
+        self
+    }
+
+    /// Supply the parent session's user-global classifier timing policy to each
+    /// isolated sub-agent. Project-local configuration never reaches it.
+    pub fn with_auto_classifier_config(
+        mut self,
+        config: tcode_core::config::AutoClassifierConfig,
+    ) -> Self {
+        self.auto_classifier_config = config;
         self
     }
 
@@ -306,6 +318,7 @@ impl AgentTool {
             watchdog: self.watchdog.clone(),
             output_budget: self.output_budget,
             auto_policy: self.auto_policy.clone(),
+            auto_classifier_config: self.auto_classifier_config,
             auto_compact: self.auto_compact,
             auto_compact_percent: self.auto_compact_percent,
             trusted_read_hosts: self.trusted_read_hosts.clone(),
@@ -438,24 +451,11 @@ impl Tool for AgentTool {
             .is_none_or(|def| def.gates_output)
     }
 
-    fn permission(&self, input: &Value) -> PermissionRequest {
-        match input["agent"].as_str().and_then(|kind| self.def_for(kind)) {
-            // Read-only: never prompts.
-            Some(def) if def.read_only => PermissionRequest::None,
-            Some(def) => {
-                let prompt = input["prompt"].as_str().unwrap_or("?");
-                let preview: String = prompt.chars().take(60).collect();
-                PermissionRequest::Ask {
-                    descriptor: format!("agent({})", def.name),
-                    aliases: Vec::new(),
-                    summary: format!("delegate to sub-agent: {preview}"),
-                    is_edit: false,
-                }
-            }
-            // Unknown kind: run() fails immediately with a self-healing
-            // error before any side effect, so prompting would be noise.
-            None => PermissionRequest::None,
-        }
+    fn permission(&self, _input: &Value) -> PermissionRequest {
+        // Delegation only creates an isolated agent session. The delegated agent
+        // inherits the parent's mode and rules, so each actual side-effecting
+        // tool call reaches the same approval boundary as a direct call.
+        PermissionRequest::None
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
@@ -500,10 +500,10 @@ impl Tool for AgentTool {
         let model = self.model_for(kind);
         let model_name = model.provider.model().to_string();
         let model = ModelCell::new(model);
-        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(ProviderSafetyClassifier::new(
-            model.clone(),
-            self.pinned.clone(),
-        ));
+        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
+            ProviderSafetyClassifier::new(model.clone(), self.pinned.clone())
+                .with_config(self.auto_classifier_config),
+        );
         let agent = Agent {
             model: model.clone(),
             // A sub-agent has no input box, so it never suggests; it still
@@ -906,6 +906,23 @@ mod tests {
         assert!(!task.gates_output_for(&json!({"agent": "plan"})));
         assert!(task.gates_output_for(&json!({"agent": "general"})));
         assert!(task.gates_output_for(&json!({"agent": "missing"})));
+    }
+
+    #[test]
+    fn delegating_any_builtin_agent_needs_no_approval() {
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        );
+
+        for kind in ["explore", "plan", "general"] {
+            assert!(matches!(
+                task.permission(&json!({"agent": kind, "prompt": "do work"})),
+                tcode_core::PermissionRequest::None
+            ));
+        }
     }
 
     #[test]

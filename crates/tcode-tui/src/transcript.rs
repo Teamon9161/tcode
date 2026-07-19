@@ -52,6 +52,9 @@ pub struct Transcript {
     /// Collapsible block currently under the pointer. Its header receives the
     /// same static foreground lift used by the running shimmer.
     hovered: Option<usize>,
+    /// Task trace header under a Ctrl-hover. It is underlined to advertise that
+    /// Ctrl+click opens the isolated sub-agent trace.
+    trace_hovered: Option<usize>,
     /// Tick frame used only when painting an in-flight tool header. Keeping it
     /// out of the wrapped block data preserves the transcript's resize-only reflow.
     animation_frame: usize,
@@ -221,8 +224,8 @@ impl Block {
                 // so wrapping is computed once for the combined row. Appending it
                 // after wrapping lets the terminal/ratatui push it onto a stray
                 // extra row on narrow panes. A task trace link coexists with this
-                // ordinary foldout: click folds its summary/report, double-click
-                // opens the isolated sub-agent trace.
+                // ordinary foldout: click folds its summary/report, Ctrl+click
+                // on its header opens the isolated sub-agent trace.
                 last.spans.push(Span::styled(
                     format!("  ({} lines)", detail.lines.len()),
                     crate::theme::dim(),
@@ -296,6 +299,7 @@ impl Transcript {
             selection: None,
             highlight: None,
             hovered: None,
+            trace_hovered: None,
             animation_frame: 0,
             live_head: None,
         }
@@ -440,15 +444,14 @@ impl Transcript {
         }
     }
 
-    /// The task trace link under a pending click, if any. The caller uses it
-    /// after `mouse_up()` has performed the ordinary foldout toggle, so one
-    /// click expands the task card and a second quick click can open its trace.
-    pub fn selected_task_run(&self) -> Option<String> {
-        let selection = self.selection?;
-        (selection.anchor == selection.head)
-            .then_some(selection.anchor.0)
-            .and_then(|row| self.block_at(row).map(|(index, _)| index))
-            .and_then(|index| self.blocks[index].task_run.clone())
+    /// Task trace associated with a task-card header at the given screen cell.
+    /// The detail body remains a normal text-selection surface.
+    pub fn task_run_at(&self, x: u16, y: u16) -> Option<String> {
+        let (row, _) = self.pos_at(x, y)?;
+        let (index, within_block) = self.block_at(row)?;
+        (within_block < self.blocks[index].head_wrapped.len())
+            .then(|| self.blocks[index].task_run.clone())
+            .flatten()
     }
 
     /// Extend the last head line of an existing block — a tool-result
@@ -607,6 +610,7 @@ impl Transcript {
         self.selection = None;
         self.highlight = None;
         self.hovered = None;
+        self.trace_hovered = None;
         self.live_head = None;
     }
 
@@ -625,6 +629,7 @@ impl Transcript {
         self.selection = None;
         self.highlight = None;
         self.hovered = None;
+        self.trace_hovered = None;
         self.scroll = 0;
         self.rebuild_cum();
     }
@@ -665,6 +670,7 @@ impl Transcript {
         self.selection = None;
         self.highlight = None;
         self.hovered = None;
+        self.trace_hovered = None;
         self.scroll = 0;
         self.rebuild_cum();
         true
@@ -679,6 +685,7 @@ impl Transcript {
         // Row coordinates shift when everything rewraps.
         self.selection = None;
         self.hovered = None;
+        self.trace_hovered = None;
         for block in &mut self.blocks {
             block.rewrap(width);
         }
@@ -779,6 +786,8 @@ impl Transcript {
                 // A task card uses the same quiet, dim treatment as the live
                 // agent tree. Only ordinary in-flight tool headers shimmer.
                 let is_hovered_head = self.hovered == Some(index) && i < block.head_wrapped.len();
+                let is_trace_hovered_head =
+                    self.trace_hovered == Some(index) && i < block.head_wrapped.len();
                 let is_live_head = self.live_head == Some(index)
                     && block.task_run.is_none()
                     && i < block.head_wrapped.len();
@@ -797,6 +806,13 @@ impl Transcript {
                         let cell = &mut buf[(area.x + x as u16, y)];
                         let base = cell.style().fg.unwrap_or(ratatui::style::Color::Reset);
                         cell.set_fg(crate::theme::hover_color(base));
+                    }
+                }
+                if is_trace_hovered_head {
+                    for x in 0..content_width {
+                        buf[(area.x + x as u16, y)]
+                            .modifier
+                            .insert(Modifier::UNDERLINED);
                     }
                 }
                 if is_live_head {
@@ -865,24 +881,24 @@ impl Transcript {
         ))
     }
 
-    /// Update hover state from a terminal mouse-move event. The fold affordance
-    /// is always visible; hover only marks the actionable block.
-    pub fn mouse_moved(&mut self, x: u16, y: u16) {
-        let hovered = self
-            .pos_at(x, y)
-            .and_then(|(row, _)| self.block_at(row))
-            .map(|(index, _)| index)
-            .filter(|&index| {
-                self.blocks[index].detail.is_some() || self.blocks[index].task_run.is_some()
-            });
-        if hovered == self.hovered {
-            return;
-        }
-        self.hovered = hovered;
+    /// Update hover state from a terminal mouse-move event. Ctrl+hover on a
+    /// task-card header additionally advertises its trace navigation link.
+    pub fn mouse_moved(&mut self, x: u16, y: u16, ctrl: bool) {
+        let at = self.pos_at(x, y).and_then(|(row, _)| self.block_at(row));
+        self.hovered = at.map(|(index, _)| index).filter(|&index| {
+            self.blocks[index].detail.is_some() || self.blocks[index].task_run.is_some()
+        });
+        self.trace_hovered = at
+            .filter(|(index, within_block)| {
+                ctrl && *within_block < self.blocks[*index].head_wrapped.len()
+                    && self.blocks[*index].task_run.is_some()
+            })
+            .map(|(index, _)| index);
     }
 
     pub fn clear_hover(&mut self) {
         self.hovered = None;
+        self.trace_hovered = None;
     }
 
     /// Wheel input: an open, overflowing detail region under the cursor
@@ -913,7 +929,13 @@ impl Transcript {
         let Some((index, _)) = self.block_at(row) else {
             return;
         };
-        let block = &mut self.blocks[index];
+        self.toggle_block(index);
+    }
+
+    fn toggle_block(&mut self, index: usize) {
+        let Some(block) = self.blocks.get_mut(index) else {
+            return;
+        };
         let Some(detail) = block.detail.as_mut() else {
             return;
         };
@@ -1520,6 +1542,46 @@ mod tests {
     }
 
     #[test]
+    fn linked_task_card_clicks_open_its_detail_immediately() {
+        let mut t = Transcript::new(30);
+        t.push_with_detail(
+            vec![Line::raw("● Explore · inspect renderer")],
+            vec![Line::raw("task detail")],
+            false,
+            5,
+        );
+        t.link_task_run(0, "t1");
+        let area = Rect::new(0, 0, 30, 5);
+        let mut buffer = Buffer::empty(area);
+        t.render(&mut buffer, area);
+
+        t.mouse_down(0, 0);
+        assert_eq!(t.mouse_up(), None);
+        assert_eq!(t.total(), 3, "a task card opens on its first plain click");
+    }
+
+    #[test]
+    fn ctrl_hovered_task_card_keeps_its_highlight_and_advertises_its_trace() {
+        let mut t = Transcript::new(40);
+        t.push_with_detail(
+            vec![Line::from(vec![Span::styled("Task", crate::theme::ok())])],
+            vec![Line::raw("task detail")],
+            false,
+            5,
+        );
+        t.link_task_run(0, "t1");
+        let area = Rect::new(0, 0, 40, 4);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+
+        t.mouse_moved(0, 0, true);
+        t.render(&mut buf, area);
+        assert_eq!(t.task_run_at(0, 0).as_deref(), Some("t1"));
+        assert_eq!(buf[(0, 0)].fg, crate::theme::hover_color(crate::theme::OK));
+        assert!(buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
     fn hovered_dim_tool_header_uses_the_static_running_highlight() {
         let mut t = Transcript::new(40);
         t.push_with_detail(
@@ -1536,7 +1598,7 @@ mod tests {
         t.render(&mut buf, area);
         let before_hover = buf[(0, 0)].style();
 
-        t.mouse_moved(0, 0);
+        t.mouse_moved(0, 0, false);
         t.render(&mut buf, area);
         assert_ne!(buf[(0, 0)].style(), before_hover);
         assert_eq!(buf[(0, 0)].fg, crate::theme::hover_color(crate::theme::DIM));
@@ -1564,7 +1626,7 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
 
-        t.mouse_moved(0, 0);
+        t.mouse_moved(0, 0, false);
         t.render(&mut buf, area);
         assert_eq!(buf[(0, 0)].fg, crate::theme::hover_color(crate::theme::OK));
         assert!(!buf[(0, 0)].modifier.contains(Modifier::UNDERLINED));
@@ -1583,10 +1645,10 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
 
-        t.mouse_moved(0, 0);
+        t.mouse_moved(0, 0, false);
         assert_eq!(t.hovered, Some(0));
 
-        t.mouse_moved(0, 1);
+        t.mouse_moved(0, 1, false);
         assert_eq!(t.hovered, None);
         t.render(&mut buf, area);
         assert!(buffer_text(&buf, area).contains("(3 lines)"));
@@ -1672,7 +1734,7 @@ mod tests {
 
         // The fold affordance is always visible on the call row; click opens it.
         assert!(buffer_text(&buf, area).contains("(3 lines)"));
-        t.mouse_moved(0, 0);
+        t.mouse_moved(0, 0, false);
         t.mouse_down(0, 0);
         t.mouse_up();
         let mut buf = Buffer::empty(area);
@@ -1695,7 +1757,7 @@ mod tests {
         t.render(&mut buf, area);
         // Closed details always advertise their size, not only on hover.
         assert!(buffer_text(&buf, area).contains("(3 lines)"));
-        t.mouse_moved(0, 0);
+        t.mouse_moved(0, 0, false);
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert!(buffer_text(&buf, area).contains("(3 lines)"));

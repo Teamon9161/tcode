@@ -1,4 +1,4 @@
-//! The one modal that can own the bottom panel.
+//! The one modal that owns the bottom panel's primary content.
 //!
 //! Pickers and the approval dialog are mutually exclusive by construction:
 //! only one of them can hold keyboard focus, render into the panel, or place
@@ -83,6 +83,12 @@ impl Overlay {
         Overlay::Approval(Box::new(dialog), reply)
     }
 
+    /// An approval keeps the mode status visible: it is still a pending turn,
+    /// so `shift+tab` can stage the mode that takes effect after the decision.
+    pub fn keeps_status_hint(&self) -> bool {
+        matches!(self, Overlay::Approval(..))
+    }
+
     /// The approval dialog is the only overlay with editable text, so it is
     /// the only one that can place a caret for the OS IME.
     pub fn cursor_cell(&self) -> Option<(u16, u16)> {
@@ -129,7 +135,7 @@ impl Overlay {
             Overlay::Mode(picker) => picker.render(),
             Overlay::FolderTrust(picker) => picker.render(),
             Overlay::Agent(picker) => picker.render(ctx.menu, ctx.agents),
-            Overlay::Approval(dialog, _) => dialog.render(ctx.width, ctx.height.saturating_sub(6)),
+            Overlay::Approval(dialog, _) => dialog.render(ctx.width, ctx.height.saturating_sub(7)),
         }
     }
 
@@ -304,6 +310,17 @@ mod tests {
 
     fn trust_overlay() -> Overlay {
         Overlay::FolderTrust(folder_trust_picker::Picker::new(Path::new("/tmp")))
+    }
+
+    #[test]
+    fn approval_keeps_the_mode_status_visible() {
+        let (reply, _rx) = oneshot::channel();
+        let overlay = Overlay::approval(
+            Dialog::new("summary".into(), "tool".into(), "call".into(), false, false),
+            reply,
+        );
+        assert!(overlay.keeps_status_hint());
+        assert!(!mode_overlay().keeps_status_hint());
     }
 
     #[test]

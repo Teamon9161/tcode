@@ -31,7 +31,8 @@ struct PanelInput<'a> {
 /// is the sum, so a section can never be drawn at a size the layout did not
 /// reserve for it.
 enum Section {
-    /// A picker or the approval dialog. Owns the whole panel while open.
+    /// A picker or approval dialog owns the panel's primary content. An
+    /// approval additionally leaves the status hint below it visible.
     Overlay(Vec<Line<'static>>),
     /// The persistent agent tree, in its own bordered box.
     LivePanel(Vec<Line<'static>>),
@@ -103,6 +104,16 @@ fn bordered(lines: Vec<Line<'static>>, border: ratatui::style::Style) -> Paragra
             .border_type(BorderType::Rounded)
             .border_style(border),
     )
+}
+
+/// A trace has no editor or status line. Keep its navigation visible even
+/// after the sub-agent has finished and dropped out of the live tree.
+fn trace_navigation_lines(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.push(Line::styled("  esc to return to Main agent", theme::dim()));
+    lines
 }
 
 /// The agent tree's rendered area plus the action target each inner row owns
@@ -460,15 +471,10 @@ impl App {
         let width = area_width(&self.terminal);
         let status_model_label = self.agent.model.snapshot().describe();
         let mode_label = self.mode_label.clone();
-        // Rewind navigation takes over the hint row, so its status values are
-        // not clickable while it is active.
-        let status_clickable = self.rewind_nav.is_none();
+        // Rewind navigation and an overlay take over interaction, so status
+        // values remain visible but are not clickable while either is active.
+        let status_clickable = self.rewind_nav.is_none() && self.overlay.is_none();
         let viewing_trace = !matches!(self.active_view, ViewId::Main);
-        // A focused note in the approval dialog exposes its caret cell (set by
-        // `Overlay::render`). Anchoring the real terminal cursor there keeps
-        // the OS IME composition window tracking the caret. Pickers have no
-        // caret, so `cursor_cell` is `None` for them by construction.
-        let dialog_cursor = self.overlay.as_ref().and_then(Overlay::cursor_cell);
         let editor = editor_layout(&self.editor, width);
         let editor_start = editor.cursor_row.saturating_sub(5);
         // Ghost text only appears while the input is empty and idle, and uses
@@ -479,7 +485,11 @@ impl App {
             .clone()
             .filter(|_| self.editor.is_empty() && !running)
             .map(|text| ghost_visual_lines(&format!("{text}  \u{2192} to accept"), width));
-        let (panel_lines, panel_targets) = self.live_panel_lines();
+        let (mut panel_lines, mut panel_targets) = self.live_panel_lines();
+        if viewing_trace {
+            panel_lines = trace_navigation_lines(panel_lines);
+            panel_targets.resize(panel_lines.len(), None);
+        }
 
         let sections = self.panel_sections(PanelInput {
             running,
@@ -492,6 +502,11 @@ impl App {
             status: self.status_line(running, started),
             hint: self.idle_hint(),
         });
+
+        // Overlay rendering calculates a focused note's caret cell. Read it
+        // after `panel_sections` renders the overlay so keyboard movement and
+        // the terminal cursor update in the same frame.
+        let dialog_cursor = self.overlay.as_ref().and_then(Overlay::cursor_cell);
 
         use ratatui::widgets::Clear;
 
@@ -545,8 +560,9 @@ impl App {
                 let height = section.height();
                 let rect = row(y, height);
                 match section {
-                    // Pickers and approval dialogs own the panel: a rounded
-                    // accent-bordered box signals "keys go here now".
+                    // Pickers and approval dialogs own the panel's main
+                    // content: a rounded accent border signals where most
+                    // keys go. Approval keeps the mode hint below this box.
                     Section::Overlay(lines) => {
                         frame.render_widget(bordered(lines, theme::border_active()), rect);
                         // Place the terminal cursor on the focused note caret
@@ -619,13 +635,14 @@ impl App {
     /// never has to keep a running height in step with what it later paints.
     fn panel_sections(&self, input: PanelInput<'_>) -> Vec<Section> {
         if let Some(overlay) = self.overlay.as_ref() {
-            return vec![Section::Overlay(overlay.render(&self.overlay_ctx()))];
+            let mut sections = vec![Section::Overlay(overlay.render(&self.overlay_ctx()))];
+            if overlay.keeps_status_hint() {
+                sections.push(Section::Hint(input.hint));
+            }
+            return sections;
         }
         if input.viewing_trace {
-            return match input.panel_lines.is_empty() {
-                true => Vec::new(),
-                false => vec![Section::LivePanel(input.panel_lines)],
-            };
+            return vec![Section::LivePanel(input.panel_lines)];
         }
 
         let input_lines = self.input_lines(&input);
@@ -728,8 +745,9 @@ impl App {
     pub(super) fn overlay_geometry(&self) -> Option<PanelGeometry> {
         let overlay = self.overlay.as_ref()?;
         let section = Section::Overlay(overlay.render(&self.overlay_ctx()));
+        let status_height = u16::from(overlay.keeps_status_hint());
         Some(PanelGeometry::new(
-            section.height(),
+            section.height() + status_height,
             area_height(&self.terminal),
         ))
     }
@@ -904,5 +922,20 @@ mod tests {
         assert_eq!(geometry.content_row(18), Some(3));
         assert_eq!(geometry.content_row(19), None, "bottom border");
         assert_eq!(geometry.content_row(2), None, "transcript above the panel");
+    }
+
+    #[test]
+    fn trace_navigation_remains_visible_without_live_agent_rows() {
+        let lines = trace_navigation_lines(Vec::new());
+        assert_eq!(lines.len(), 1);
+        assert_eq!(
+            lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "  esc to return to Main agent"
+        );
+        assert_eq!(lines[0].style, theme::dim());
     }
 }

@@ -33,9 +33,8 @@ impl ProgressPhase {
     }
 }
 
-/// An actionable tree row. The app maps it to the appropriate single- or
-/// double-click behavior, while this module only decides which rendered row
-/// belongs to which target.
+/// An actionable tree row. The app maps it to navigation behavior, while this
+/// module only decides which rendered row belongs to which target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PanelTarget {
     Main,

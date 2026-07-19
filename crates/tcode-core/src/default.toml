@@ -19,6 +19,12 @@ auto_compact_percent = 85
 shell_output_filters = true
 
 [auto_mode]
+# Stage deadlines cover the whole classification attempt through a parseable
+# verdict, not merely the provider's byte-level stream idle time. A stage gets
+# one immediate retry after timeout, transport failure, or invalid verdict.
+fast_timeout_secs = 10
+reasoned_timeout_secs = 20
+retry_count = 1
 trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]
 
 [profiles.anthropic]

@@ -41,8 +41,8 @@ pub struct Dialog {
     plan: Option<PlanReview>,
     /// The focused note caret's cell within the rendered dialog lines, set on
     /// each `render`. The frontend places the real terminal cursor there so the
-    /// OS IME composition window has an anchor that tracks the caret; the
-    /// in-buffer `▏` is only the visual marker. `None` when no note is focused.
+    /// OS IME composition window has an anchor that tracks the caret. `None`
+    /// when no note is focused.
     cursor_cell: Cell<Option<(u16, u16)>>,
     /// Rows occupied by the visible note editor in the most recent render.
     /// This lets mouse clicks use the same wrapped geometry as the caret.
@@ -820,45 +820,31 @@ impl Dialog {
         true
     }
 
-    fn note_rows(&self, note: &Editor, width: u16) -> Vec<String> {
-        let text = note.text();
-        let display = if self.note_focused {
-            let col = note.position().col;
-            let byte = text
-                .char_indices()
-                .nth(col)
-                .map(|(b, _)| b)
-                .unwrap_or(text.len());
-            format!("{}▏{}", &text[..byte], &text[byte..])
-        } else {
-            text
-        };
+    fn note_rows(&self, note: &Editor, width: u16) -> WrappedEditor {
         let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
-        wrap_cells(&display, avail)
+        wrap_editor(
+            &note.text(),
+            self.note_focused.then(|| note.cursor().1),
+            avail,
+        )
     }
 
     fn render_note(&self, note: &Editor, width: u16, out: &mut Vec<Line<'static>>) {
-        use unicode_width::UnicodeWidthStr;
         let note_style = if self.note_focused {
             theme::accent()
         } else {
             theme::dim()
         };
         let first_row = out.len();
-        let rows = self.note_rows(note, width);
+        let layout = self.note_rows(note, width);
         self.note_hitbox.set(Some(NoteHitbox {
             first_row,
-            rows: rows.len(),
+            rows: layout.rows.len(),
         }));
-        for (i, row) in rows.iter().enumerate() {
-            // The `▏` sentinel marks the caret; record its cell (before pushing,
-            // so `out.len()` is this row's index) so the terminal cursor — and
-            // the IME anchored to it — lands on it. NOTE_INDENT is the prefix.
-            if self.note_focused {
-                if let Some(bar) = row.find('▏') {
-                    let col = NOTE_INDENT + UnicodeWidthStr::width(&row[..bar]);
-                    self.cursor_cell.set(Some((out.len() as u16, col as u16)));
-                }
+        for (i, row) in layout.rows.iter().enumerate() {
+            if let Some((_, caret_col)) = layout.caret.filter(|(row, _)| *row == i) {
+                self.cursor_cell
+                    .set(Some((out.len() as u16, (NOTE_INDENT + caret_col) as u16)));
             }
             let prefix = if i == 0 { "  note: " } else { "        " };
             out.push(Line::from(vec![
@@ -1459,31 +1445,27 @@ impl Dialog {
         width: u16,
         out: &mut Vec<Line<'static>>,
     ) {
-        let text = editor.text();
-        let display = if focused {
-            let (_, col) = editor.cursor();
-            let byte = text
-                .char_indices()
-                .nth(col)
-                .map(|(b, _)| b)
-                .unwrap_or(text.len());
-            format!("{}▏{}", &text[..byte], &text[byte..])
-        } else {
-            text
-        };
         let avail = (width as usize).saturating_sub(NOTE_INDENT + 2).max(10);
+        let layout = wrap_editor(&editor.text(), focused.then(|| editor.cursor().1), avail);
         let style = if focused {
             theme::accent()
         } else {
             theme::dim()
         };
         let indent = " ".repeat(NOTE_INDENT);
-        for (i, row) in wrap_cells(&display, avail).iter().enumerate() {
+        for (i, row) in layout.rows.iter().enumerate() {
             let prefix = if i == 0 {
                 format!("  {label} ")
             } else {
                 indent.clone()
             };
+            if let Some((_, caret_col)) = layout.caret.filter(|(row, _)| *row == i) {
+                use unicode_width::UnicodeWidthStr;
+                self.cursor_cell.set(Some((
+                    out.len() as u16,
+                    (UnicodeWidthStr::width(prefix.as_str()) + caret_col) as u16,
+                )));
+            }
             out.push(Line::from(vec![
                 Span::styled(prefix, style),
                 Span::raw(row.clone()),
@@ -1859,6 +1841,40 @@ fn approval_rule_label(descriptor: &str) -> String {
     label
 }
 
+/// Rows of an editor and the logical terminal cell for its caret. The caret is
+/// deliberately metadata, not a rendered glyph: inserting a sentinel into the
+/// text would shift the suffix and change where a line wraps.
+struct WrappedEditor {
+    rows: Vec<String>,
+    caret: Option<(usize, usize)>,
+}
+
+fn wrap_editor(text: &str, caret: Option<usize>, width: usize) -> WrappedEditor {
+    use unicode_width::UnicodeWidthStr;
+
+    let rows = wrap_cells(text, width);
+    let mut starts = Vec::with_capacity(rows.len());
+    let mut start = 0usize;
+    for row in &rows {
+        starts.push(start);
+        start += UnicodeWidthStr::width(row.as_str());
+    }
+
+    // At a soft-wrap boundary, prefer the following row. This matches the
+    // prompt composer and leaves the cursor before the character it addresses.
+    let caret = caret.and_then(|caret| {
+        rows.iter()
+            .enumerate()
+            .rposition(|(index, row)| {
+                let start = starts[index];
+                caret >= start && caret <= start + UnicodeWidthStr::width(row.as_str())
+            })
+            .map(|index| (index, caret.saturating_sub(starts[index])))
+    });
+
+    WrappedEditor { rows, caret }
+}
+
 fn wrap_cells(text: &str, width: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthChar;
     let mut rows = vec![String::new()];
@@ -2180,6 +2196,35 @@ mod tests {
         let _ = d.render(80, 40);
         let (_, col) = d.cursor_cell().expect("caret after wide character");
         assert_eq!(col, (NOTE_INDENT + 3) as u16);
+    }
+
+    #[test]
+    fn note_cursor_does_not_insert_a_rendered_cell() {
+        let mut d = dialog();
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "abc");
+        d.handle_key(key(KeyCode::Left));
+
+        let screen = screen(&d, 80);
+        assert!(
+            screen.contains("note: abc"),
+            "note text stays contiguous: {screen}"
+        );
+        assert!(
+            !screen.contains('▏'),
+            "the terminal cursor, not a rendered character, marks the caret: {screen}"
+        );
+    }
+
+    #[test]
+    fn wrapped_editor_preserves_text_and_places_boundary_caret_on_next_row() {
+        let layout = wrap_editor("abcdefghi", Some(6), 6);
+        assert_eq!(layout.rows, ["abcdef", "ghi"]);
+        assert_eq!(layout.caret, Some((1, 0)));
+
+        let layout = wrap_editor("a中b", Some(3), 10);
+        assert_eq!(layout.rows, ["a中b"]);
+        assert_eq!(layout.caret, Some((0, 3)));
     }
 
     #[test]

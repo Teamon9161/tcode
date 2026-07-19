@@ -13,6 +13,8 @@
 //!   function_call on the next request; we stash the whole item JSON in
 //!   `ContentBlock::Thinking.signature`.
 
+use std::collections::BTreeMap;
+
 use async_stream::stream;
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
@@ -331,6 +333,65 @@ fn usage_from(v: &Value) -> tcode_core::Usage {
     }
 }
 
+/// Each output-text stream is identified independently, so a finalized payload
+/// can complete a response which streamed no deltas without duplicating text
+/// already delivered to callers.
+type OutputTextKey = (u64, u64);
+
+fn output_text_key(data: &Value) -> OutputTextKey {
+    (
+        data["output_index"].as_u64().unwrap_or(0),
+        data["content_index"].as_u64().unwrap_or(0),
+    )
+}
+
+fn record_output_text_delta(
+    data: &Value,
+    emitted: &mut BTreeMap<OutputTextKey, String>,
+) -> Option<String> {
+    let delta = data["delta"].as_str()?;
+    emitted
+        .entry(output_text_key(data))
+        .or_default()
+        .push_str(delta);
+    Some(delta.to_string())
+}
+
+fn finalized_output_text_suffix(
+    data: &Value,
+    emitted: &mut BTreeMap<OutputTextKey, String>,
+) -> Option<String> {
+    let text = data["text"].as_str()?;
+    let previous = emitted.entry(output_text_key(data)).or_default();
+    let suffix = text.strip_prefix(previous.as_str())?.to_string();
+    previous.clear();
+    previous.push_str(text);
+    Some(suffix)
+}
+
+fn non_empty_string(value: Option<&str>) -> Option<&str> {
+    value.filter(|value| !value.trim().is_empty())
+}
+
+/// Codex uses both Responses-shaped `response.failed` events and top-level
+/// `error` events. Prefer a server message, but preserve a code when it is all
+/// the server provides instead of erasing the diagnostic behind a generic text.
+fn stream_error_message(data: &Value) -> String {
+    let message = non_empty_string(data["response"]["error"]["message"].as_str())
+        .or_else(|| non_empty_string(data["error"]["message"].as_str()))
+        .or_else(|| non_empty_string(data["message"].as_str()));
+    if let Some(message) = message {
+        return message.to_string();
+    }
+
+    let code = non_empty_string(data["response"]["error"]["code"].as_str())
+        .or_else(|| non_empty_string(data["error"]["code"].as_str()));
+    match code {
+        Some(code) => format!("response failed (code: {code})"),
+        None => "response failed".to_string(),
+    }
+}
+
 #[async_trait]
 impl Provider for CodexProvider {
     fn name(&self) -> &str {
@@ -365,6 +426,7 @@ impl Provider for CodexProvider {
         let mut sse = idle_guard(resp.bytes_stream(), self.watchdog.idle_timeout()).eventsource();
         let raw: EventStream = Box::pin(stream! {
             let mut saw_tool_use = false;
+            let mut emitted_text = BTreeMap::<OutputTextKey, String>::new();
             // Codex reports subscription usage only in the response headers of
             // each /responses call — never in the SSE body — so this is the one
             // place we learn it.
@@ -386,8 +448,15 @@ impl Provider for CodexProvider {
                 match data["type"].as_str().unwrap_or_default() {
                     "response.created" => yield Ok(StreamEvent::Started),
                     "response.output_text.delta" => {
-                        if let Some(t) = data["delta"].as_str() {
-                            yield Ok(StreamEvent::TextDelta(t.to_string()));
+                        if let Some(delta) = record_output_text_delta(&data, &mut emitted_text) {
+                            yield Ok(StreamEvent::TextDelta(delta));
+                        }
+                    }
+                    "response.output_text.done" => {
+                        if let Some(suffix) = finalized_output_text_suffix(&data, &mut emitted_text) {
+                            if !suffix.is_empty() {
+                                yield Ok(StreamEvent::TextDelta(suffix));
+                            }
                         }
                     }
                     "response.reasoning_summary_text.delta" => {
@@ -439,12 +508,10 @@ impl Provider for CodexProvider {
                         return;
                     }
                     "response.failed" | "error" => {
-                        let msg = data["response"]["error"]["message"]
-                            .as_str()
-                            .or(data["message"].as_str())
-                            .unwrap_or("response failed")
-                            .to_string();
-                        yield Err(ProviderError::Api { status: 0, message: msg });
+                        yield Err(ProviderError::Api {
+                            status: 0,
+                            message: stream_error_message(&data),
+                        });
                         return;
                     }
                     _ => {}
@@ -570,6 +637,101 @@ mod tests {
         assert_eq!(
             body_with_effort(Some("high"))["reasoning"],
             json!({ "effort": "high", "summary": "auto" })
+        );
+    }
+
+    #[test]
+    fn finalized_output_text_emits_a_done_only_verdict() {
+        let mut emitted = BTreeMap::new();
+        let done = json!({
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "ALLOW",
+        });
+
+        assert_eq!(
+            finalized_output_text_suffix(&done, &mut emitted).as_deref(),
+            Some("ALLOW")
+        );
+    }
+
+    #[test]
+    fn finalized_output_text_emits_only_the_delta_suffix() {
+        let mut emitted = BTreeMap::new();
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "AL",
+        });
+        let done = json!({
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "ALLOW",
+        });
+
+        assert_eq!(
+            record_output_text_delta(&delta, &mut emitted).as_deref(),
+            Some("AL")
+        );
+        assert_eq!(
+            finalized_output_text_suffix(&done, &mut emitted).as_deref(),
+            Some("LOW")
+        );
+    }
+
+    #[test]
+    fn finalized_output_text_does_not_repeat_complete_deltas() {
+        let mut emitted = BTreeMap::new();
+        let delta = json!({
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": "ALLOW",
+        });
+        let done = json!({
+            "type": "response.output_text.done",
+            "output_index": 0,
+            "content_index": 0,
+            "text": "ALLOW",
+        });
+
+        record_output_text_delta(&delta, &mut emitted);
+        assert_eq!(
+            finalized_output_text_suffix(&done, &mut emitted).as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn stream_error_message_prefers_response_failure_detail() {
+        let data = json!({
+            "type": "response.failed",
+            "response": { "error": { "message": "model is unavailable" } },
+        });
+        assert_eq!(stream_error_message(&data), "model is unavailable");
+    }
+
+    #[test]
+    fn stream_error_message_reads_the_top_level_error_shape() {
+        let data = json!({
+            "type": "error",
+            "error": { "code": "rate_limit_exceeded", "message": "Try again later." },
+        });
+        assert_eq!(stream_error_message(&data), "Try again later.");
+    }
+
+    #[test]
+    fn stream_error_message_preserves_code_without_a_message() {
+        let data = json!({
+            "type": "error",
+            "error": { "code": "model_not_found" },
+        });
+        assert_eq!(
+            stream_error_message(&data),
+            "response failed (code: model_not_found)"
         );
     }
 

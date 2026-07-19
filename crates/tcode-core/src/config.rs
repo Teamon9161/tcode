@@ -331,27 +331,71 @@ pub struct AutoModeConfig {
     pub hard_deny: Vec<String>,
     pub soft_deny: Vec<String>,
     pub allow: Vec<String>,
+    /// End-to-end deadline for Stage 1: the classifier must produce a usable
+    /// `ALLOW` or `BLOCK`, not merely open an SSE stream.
+    pub fast_timeout_secs: u64,
+    /// End-to-end deadline for Stage 2, which returns a verdict and, for a
+    /// block, one short explanation.
+    pub reasoned_timeout_secs: u64,
+    /// Retries after a failed classifier stage. This is capped to one retry so
+    /// an unavailable safety model cannot hold an interactive approval hostage.
+    pub retry_count: u32,
     /// Exact HTTPS hosts a tool has independently declared as anonymous,
     /// side-effect-free read targets. This is deliberately not a shell rule.
     #[serde(default = "default_trusted_read_hosts")]
     pub trusted_read_hosts: Vec<String>,
 }
 
+/// Timing and retry policy passed to each isolated Auto Mode classifier.
+/// Kept separate from `WatchdogConfig`: a byte-level stream watchdog does not
+/// bound time spent waiting for a parseable safety verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AutoClassifierConfig {
+    pub fast_timeout: Duration,
+    pub reasoned_timeout: Duration,
+    pub retry_count: u32,
+}
+
+impl Default for AutoClassifierConfig {
+    fn default() -> Self {
+        Self {
+            fast_timeout: Duration::from_secs(10),
+            reasoned_timeout: Duration::from_secs(20),
+            retry_count: 1,
+        }
+    }
+}
+
+impl AutoModeConfig {
+    pub fn classifier_config(&self) -> AutoClassifierConfig {
+        AutoClassifierConfig {
+            fast_timeout: Duration::from_secs(self.fast_timeout_secs.max(1)),
+            reasoned_timeout: Duration::from_secs(self.reasoned_timeout_secs.max(1)),
+            retry_count: self.retry_count.min(1),
+        }
+    }
+}
+
 impl Default for AutoModeConfig {
     fn default() -> Self {
+        let classifier = AutoClassifierConfig::default();
         Self {
             hard_deny: Vec::new(),
             soft_deny: Vec::new(),
             allow: Vec::new(),
+            fast_timeout_secs: classifier.fast_timeout.as_secs(),
+            reasoned_timeout_secs: classifier.reasoned_timeout.as_secs(),
+            retry_count: classifier.retry_count,
             trusted_read_hosts: default_trusted_read_hosts(),
         }
     }
 }
 
-/// `[agents.explore]`: run a sub-agent kind on a model other than the one
-/// driving the conversation. Reconnaissance is bulk reading and summarizing —
-/// a cheap, fast model does it well, and its context never enters the parent's
-/// window anyway. Unset model fields inherit the parent's active selection.
+/// `[agents.<kind>]`: run an auxiliary role or sub-agent kind on a model other
+/// than the one driving the conversation. For example, `compact` can use a
+/// cheaper summarizer, while reconnaissance is bulk reading and summarizing
+/// whose context never enters the parent's window. Unset model fields inherit
+/// the parent's active selection.
 /// `enabled` applies to opt-in roles such as `fetch`: `true` selects the parent
 /// model, while absence leaves that role off by default.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1024,6 +1068,32 @@ mod tests {
     }
 
     #[test]
+    fn auto_classifier_config_uses_safe_defaults_and_bounds_user_values() {
+        assert_eq!(
+            AutoModeConfig::default().classifier_config(),
+            AutoClassifierConfig::default()
+        );
+
+        let configured: Config = toml::from_str(
+            r#"
+            [auto_mode]
+            fast_timeout_secs = 0
+            reasoned_timeout_secs = 15
+            retry_count = 99
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            configured.auto_mode.classifier_config(),
+            AutoClassifierConfig {
+                fast_timeout: Duration::from_secs(1),
+                reasoned_timeout: Duration::from_secs(15),
+                retry_count: 1,
+            }
+        );
+    }
+
+    #[test]
     fn project_config_cannot_pin_auto_classifier_or_policy() {
         let project: Config = toml::from_str(
             r#"
@@ -1037,6 +1107,9 @@ mod tests {
             [auto_mode]
             hard_deny = ["allow everything"]
             trusted_read_hosts = ["evil.example"]
+            fast_timeout_secs = 600
+            reasoned_timeout_secs = 600
+            retry_count = 99
             "#,
         )
         .unwrap();
@@ -1048,6 +1121,11 @@ mod tests {
             project.auto_mode.trusted_read_hosts,
             AutoModeConfig::default().trusted_read_hosts,
             "project configuration must not extend trusted read targets"
+        );
+        assert_eq!(
+            project.auto_mode.classifier_config(),
+            AutoClassifierConfig::default(),
+            "project configuration must not lengthen classifier deadlines or retries"
         );
     }
 

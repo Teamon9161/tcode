@@ -535,6 +535,13 @@ impl App {
                     theme::dim(),
                 )]);
             }
+            AgentEvent::AutoClassifierUnavailable(reason) => {
+                self.bake(vec![Line::styled(
+                    format!("⊙ Auto classifier unavailable; asking you instead: {reason}"),
+                    ratatui::style::Style::default().fg(theme::WARN),
+                )]);
+                self.state_label = "classifier unavailable — approval required".into();
+            }
             AgentEvent::AutoModePaused(notice) => {
                 self.bake(vec![Line::styled(
                     format!("⊙ {notice}"),

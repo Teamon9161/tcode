@@ -251,6 +251,13 @@ impl SessionView {
                 )]);
             }
             AgentEvent::Compacted(summary) => self.bake_compacted(summary, ctx),
+            AgentEvent::AutoClassifierUnavailable(reason) => {
+                self.finish(ctx);
+                self.bake(vec![Line::styled(
+                    format!("⊙ Auto classifier unavailable; asking you instead: {reason}"),
+                    ratatui::style::Style::default().fg(theme::WARN),
+                )]);
+            }
             AgentEvent::Interrupted | AgentEvent::TurnEnd => self.finish(ctx),
             _ => {}
         }

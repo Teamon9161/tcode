@@ -90,10 +90,6 @@ const NOTE_LABEL: &str = "Note: ";
 /// bulk or flicker of the legacy sparkle animation.
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// The time window that turns two clicks on a parent task card into opening
-/// its isolated sub-agent trace.
-const TASK_CARD_DOUBLE_CLICK: Duration = Duration::from_millis(450);
-
 const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " █  █▄▄ █▄█ █▄▀ ██▄"];
 
 /// One of these shows per launch, picked at random: a discovery channel
@@ -108,7 +104,7 @@ const TIPS: [&str; 10] = [
     "/model switches model mid-session · /agents pins sub-agent models",
     "/resume picks up an earlier session · /export saves the transcript",
     "/compact squeezes a long conversation back into budget",
-    "click the agent tree to expand a task; double-click it to open its trace",
+    "click a task to expand it · ctrl+click its title to open its trace",
     "/note slips the model an aside without starting a turn",
 ];
 
@@ -280,8 +276,6 @@ pub struct App {
     /// Tree row currently under the pointer; rendered with the shared hover
     /// background so its click behavior is discoverable.
     live_panel_hover: Option<PanelTarget>,
-    /// Previous parent-task-card press for double-click-to-open-trace behavior.
-    last_task_card_click: Option<(String, Instant)>,
     /// Which clickable status value the pointer currently rests over.
     status_hover: Option<StatusHover>,
     input_mouse_active: bool,
@@ -461,7 +455,6 @@ impl App {
             status_hitboxes: None,
             live_panel_hitbox: None,
             live_panel_hover: None,
-            last_task_card_click: None,
             status_hover: None,
             input_mouse_active: false,
             input_dragged: false,
@@ -929,8 +922,7 @@ impl App {
         match target {
             PanelTarget::Main => self.open_view(ViewId::Main),
             // The bottom tree is navigation only. Detail belongs to the parent
-            // conversation's task card, which has the normal fold/double-click
-            // interaction.
+            // conversation's task card, while Ctrl+clicking its title opens this trace.
             PanelTarget::Task(run) => self.open_view(ViewId::TaskRun(run)),
         }
         true
@@ -974,9 +966,11 @@ impl App {
                     return;
                 }
                 match mouse.kind {
-                    MouseEventKind::Moved => self
-                        .active_transcript_mut()
-                        .mouse_moved(mouse.column, mouse.row),
+                    MouseEventKind::Moved => self.active_transcript_mut().mouse_moved(
+                        mouse.column,
+                        mouse.row,
+                        mouse.modifiers.contains(KeyModifiers::CONTROL),
+                    ),
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = mouse.kind == MouseEventKind::ScrollUp;
                         // Over the input box the wheel scrolls the prompt itself:
@@ -1010,6 +1004,13 @@ impl App {
                         let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
                         if !taken_by_input {
                             if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                                if let Some(run) = self
+                                    .active_transcript()
+                                    .task_run_at(mouse.column, mouse.row)
+                                {
+                                    self.open_view(ViewId::TaskRun(run));
+                                    return;
+                                }
                                 if let Some(url) =
                                     self.active_transcript().link_at(mouse.column, mouse.row)
                                 {
@@ -1053,6 +1054,17 @@ impl App {
     }
 
     fn on_key(&mut self, key: KeyEvent) {
+        // A pending approval keeps its mode status visible. Let its one global
+        // shortcut through while all other keys still belong to the dialog.
+        if matches!(key.code, KeyCode::BackTab)
+            && self
+                .overlay
+                .as_ref()
+                .is_some_and(Overlay::keeps_status_hint)
+        {
+            self.cycle_mode();
+            return;
+        }
         // An overlay — any picker, or the approval dialog — owns the keyboard
         // while it is on screen.
         if self.overlay.is_some() {

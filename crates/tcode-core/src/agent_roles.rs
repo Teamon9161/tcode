@@ -4,6 +4,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentRole {
     Auto,
+    Compact,
     Suggest,
     Vision,
     Fetch,
@@ -23,13 +24,24 @@ pub struct AgentRoleMeta {
 }
 
 impl AgentRole {
-    pub const ALL: [Self; 4] = [Self::Auto, Self::Suggest, Self::Vision, Self::Fetch];
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Compact,
+        Self::Suggest,
+        Self::Vision,
+        Self::Fetch,
+    ];
 
     pub const fn meta(self) -> AgentRoleMeta {
         match self {
             Self::Auto => AgentRoleMeta {
                 key: "auto",
                 label: "auto",
+                default: RoleDefault::InheritMain,
+            },
+            Self::Compact => AgentRoleMeta {
+                key: "compact",
+                label: "compact",
                 default: RoleDefault::InheritMain,
             },
             Self::Suggest => AgentRoleMeta {
@@ -73,7 +85,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_metadata_keeps_fetch_off_by_default() {
+    fn role_metadata_keeps_compact_inheriting_and_fetch_off_by_default() {
+        assert_eq!(AgentRole::Compact.key(), "compact");
+        assert_eq!(AgentRole::Compact.default(), RoleDefault::InheritMain);
         assert_eq!(AgentRole::Fetch.label(), "web-fetch");
         assert!(AgentRole::Fetch.allows_off());
         assert!(AgentRole::ALL
