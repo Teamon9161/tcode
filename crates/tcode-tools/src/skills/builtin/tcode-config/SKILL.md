@@ -124,7 +124,9 @@ enabled = true # opt in to web_fetch(prompt = "...") using the main model
 
 `/agents` lists and changes these assignments interactively; those choices are
 persisted in `state.toml` and override `[agents.*]`. Builtin task kinds are
-`explore`, `plan`, and `general`. Auxiliary roles include `auto`, `suggest`,
+`explore`, `plan`, `general`, and `orchestrator` (a tool-less coordinator that
+only delegates to the other kinds; pin it to an inexpensive model). Auxiliary
+roles include `auto`, `suggest`,
 `vision`, and opt-in `fetch` (shown as `web-fetch` in the picker). Keep `auto`
 and `suggest` on a small, inexpensive model if explicitly pinning them: they
 are convenience requests, not the main coding session.
@@ -134,8 +136,8 @@ are convenience requests, not the main coding session.
 Create one Markdown file per agent at `.tcode/agents/<name>.md` for a project
 or `~/.tcode/agents/<name>.md` for personal reuse. Project definitions take
 precedence. The filename supplies `name` when omitted; names must match
-`^[a-z0-9][a-z0-9_-]{0,47}$`. `explore`, `plan`, and `general` are reserved
-builtin names and cannot be overridden.
+`^[a-z0-9][a-z0-9_-]{0,47}$`. `explore`, `plan`, `general`, and `orchestrator`
+are reserved builtin names and cannot be overridden.
 
 The YAML frontmatter controls capability and defaults; the Markdown body is the
 agent's system prompt:
@@ -171,7 +173,12 @@ Key rules:
   in parallel. Omit it when the agent legitimately needs to change things: a
   sub-agent inherits the caller's permission mode and rules, so its actions
   reach the same approval path the parent's own would have.
-- `agents` is the allowlist of nested task kinds. Omit it to make a leaf agent.
+- `agents` is the allowlist of nested task kinds; `disallowedAgents` is the
+  denylist form: every registered kind except those listed and the agent
+  itself, so it automatically covers kinds defined later (the builtin
+  `orchestrator` uses `disallowedAgents: []` to coordinate all agents,
+  including custom ones). The two forms are mutually exclusive. Omit both to
+  make a leaf agent.
 - `maxTurns` is a positive integer limiting model round-trips for that task.
   `max_steps` is legacy and should not be used.
 - `gatesOutput` defaults to `true`. Set it to `false` only when the parent needs

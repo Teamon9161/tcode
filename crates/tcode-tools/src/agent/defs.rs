@@ -140,6 +140,30 @@ pub enum QuestionPolicy {
     User,
 }
 
+/// Which agent kinds a definition may spawn, mirroring `tools` /
+/// `disallowedTools`. An allowlist names the spawnable kinds (empty = leaf);
+/// a denylist spawns every registered kind except those listed and itself,
+/// so a coordinator automatically covers kinds defined after it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpawnPolicy {
+    Allow(Vec<String>),
+    Deny(Vec<String>),
+}
+
+impl Default for SpawnPolicy {
+    fn default() -> Self {
+        Self::Allow(Vec::new())
+    }
+}
+
+impl SpawnPolicy {
+    fn list_mut(&mut self) -> &mut Vec<String> {
+        match self {
+            Self::Allow(names) | Self::Deny(names) => names,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentDef {
     pub name: String,
@@ -154,8 +178,9 @@ pub struct AgentDef {
     /// Defaults to disabled; the parent UI remains the only interaction surface.
     pub question_policy: QuestionPolicy,
     pub tool_policy: ToolPolicy,
-    /// Agent kinds this one may spawn; empty = no `agent` tool (a leaf).
-    pub agents: Vec<String>,
+    /// Agent kinds this one may spawn; the default (empty allowlist) is a
+    /// leaf with no `agent` tool. Resolve through `AgentRegistry::spawn_list`.
+    pub spawn: SpawnPolicy,
     pub model: Option<AgentModelHint>,
     /// Maximum model round-trips in one delegated turn.
     pub max_steps: Option<usize>,
@@ -245,17 +270,26 @@ impl AgentRegistry {
         let known: BTreeSet<String> = registry.defs.iter().map(|def| def.name.clone()).collect();
         for def in &mut registry.defs {
             let name = def.name.clone();
-            def.agents.retain(|target| {
+            let is_allow = matches!(def.spawn, SpawnPolicy::Allow(_));
+            let key = if is_allow {
+                "agents"
+            } else {
+                "disallowedAgents"
+            };
+            def.spawn.list_mut().retain(|target| {
                 if *target == name {
-                    warnings.push(format!(
-                        "agent '{name}': spawning itself is bounded only by agent depth; dropped from its agents list"
-                    ));
+                    if is_allow {
+                        warnings.push(format!(
+                            "agent '{name}': spawning itself is bounded only by agent depth; dropped from its agents list"
+                        ));
+                    }
+                    // In a denylist self is implicitly excluded already.
                     return false;
                 }
                 let ok = known.contains(target);
                 if !ok {
                     warnings.push(format!(
-                        "agent '{name}': unknown agent '{target}' in agents list, dropped"
+                        "agent '{name}': unknown agent '{target}' in {key} list, dropped"
                     ));
                 }
                 ok
@@ -408,15 +442,32 @@ impl AgentRegistry {
         let known: BTreeSet<String> = self.defs.iter().map(|def| def.name.clone()).collect();
         for def in &mut self.defs {
             let name = def.name.clone();
-            def.agents.retain(|target| {
+            let is_allow = matches!(def.spawn, SpawnPolicy::Allow(_));
+            def.spawn.list_mut().retain(|target| {
                 let ok = known.contains(target);
-                if !ok {
+                if !ok && is_allow {
+                    // A skipped kind vanishing from a denylist changes nothing.
                     warnings.push(format!(
                         "agent '{name}': agent '{target}' was skipped and was dropped from its agents list"
                     ));
                 }
                 ok
             });
+        }
+    }
+
+    /// The concrete kinds `def` may spawn. A denylist resolves against the
+    /// current registry, so it covers custom kinds discovered after the
+    /// definition was written. An empty result means a leaf: no `agent` tool.
+    pub fn spawn_list(&self, def: &AgentDef) -> Vec<String> {
+        match &def.spawn {
+            SpawnPolicy::Allow(names) => names.clone(),
+            SpawnPolicy::Deny(denied) => self
+                .defs
+                .iter()
+                .map(|other| other.name.clone())
+                .filter(|name| *name != def.name && !denied.contains(name))
+                .collect(),
         }
     }
 }
@@ -583,6 +634,19 @@ fn parse_def_text(
         (None, None) => ToolPolicy::Inherit,
         (Some(_), Some(_)) => unreachable!("checked above"),
     };
+    let allow_agents = string_list(&meta, "agents")?;
+    let deny_agents = string_list(&meta, "disallowedAgents")?;
+    let spawn = match (allow_agents, deny_agents) {
+        (Some(_), Some(_)) => {
+            return Err(
+                "`agents` and `disallowedAgents` are mutually exclusive; choose an allowlist or a denylist"
+                    .into(),
+            )
+        }
+        (Some(names), None) => SpawnPolicy::Allow(names),
+        (None, Some(names)) => SpawnPolicy::Deny(names),
+        (None, None) => SpawnPolicy::default(),
+    };
     let max_turns = usize(&meta, "maxTurns")?;
     let legacy_max_steps = usize(&meta, "max_steps")?;
     if max_turns.is_some() && legacy_max_steps.is_some() {
@@ -607,7 +671,7 @@ fn parse_def_text(
             read_only: bool(&meta, "readonly")?,
             question_policy: question_policy(&meta)?,
             tool_policy,
-            agents: string_list(&meta, "agents")?.unwrap_or_default(),
+            spawn,
             model: (!model.is_empty()).then_some(model),
             max_steps: max_turns.or(legacy_max_steps),
             gates_output: bool_or(&meta, "gatesOutput", true)?,
@@ -644,7 +708,7 @@ mod tests {
             assert_eq!(registered.read_only, parsed.read_only);
             assert_eq!(registered.question_policy, parsed.question_policy);
             assert_eq!(registered.tool_policy, parsed.tool_policy);
-            assert_eq!(registered.agents, parsed.agents);
+            assert_eq!(registered.spawn, parsed.spawn);
         }
     }
 
@@ -701,8 +765,44 @@ mod tests {
         assert!(!def.gates_output);
         assert!(registry.get("helper").unwrap().gates_output);
         assert!(matches!(def.tool_policy, ToolPolicy::Allow(_)));
-        assert_eq!(def.agents, ["helper"]);
+        assert_eq!(registry.spawn_list(def), ["helper"]);
         assert_eq!(def.question_policy, QuestionPolicy::Disabled);
+    }
+
+    #[test]
+    fn a_denylist_spawn_policy_covers_later_defined_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".tcode/agents");
+        write_def(
+            &dir,
+            "coordinator.md",
+            "---\ndescription: d\ndisallowedAgents: [plan]\n---\nbody",
+        );
+        write_def(&dir, "worker.md", "---\ndescription: d\n---\nbody");
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let spawn = registry.spawn_list(registry.get("coordinator").unwrap());
+        assert!(spawn.contains(&"worker".to_string()));
+        assert!(spawn.contains(&"explore".to_string()));
+        assert!(!spawn.contains(&"plan".to_string()));
+        assert!(!spawn.contains(&"coordinator".to_string()));
+        // A definition without either key stays a leaf.
+        assert!(registry
+            .spawn_list(registry.get("worker").unwrap())
+            .is_empty());
+    }
+
+    #[test]
+    fn spawn_allow_and_deny_forms_are_mutually_exclusive() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            &tmp.path().join(".tcode/agents"),
+            "both.md",
+            "---\ndescription: d\nagents: [explore]\ndisallowedAgents: [plan]\n---\nbody",
+        );
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(registry.get("both").is_none());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
     }
 
     #[test]

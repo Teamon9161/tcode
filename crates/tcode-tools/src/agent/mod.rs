@@ -92,8 +92,25 @@ impl Approver for ParentUserBridge {
 }
 
 /// Parked resumable runs per task-tool instance; oldest is evicted beyond
-/// this. Each parked run keeps its whole ledger in memory.
-const MAX_LIVE_TASKS: usize = 8;
+/// this. Each parked run keeps its whole ledger in memory — a few MB at the
+/// worst — so the cap is generous: eviction should lose a resumable run only
+/// well after its follow-up budget has realistically lapsed.
+const MAX_LIVE_TASKS: usize = 32;
+
+/// Reports kept for `attach`, independent of parked sessions: a one-shot or
+/// evicted run's report stays attachable. Text only, so the cap is cheap.
+const MAX_STORED_REPORTS: usize = 32;
+
+/// A finished run's final report, attachable to a later delegation by run id
+/// so the caller hands it over verbatim instead of re-typing it.
+struct StoredReport {
+    agent: String,
+    text: String,
+    /// Insertion order for oldest-first eviction.
+    seq: u64,
+}
+
+const ATTACH_FENCE_END: &str = "</attached-report>";
 
 /// A finished delegated run kept alive for follow-up turns. Resuming appends
 /// to the same session under the same cache scope, so a follow-up costs only
@@ -144,6 +161,8 @@ pub struct AgentTool {
     /// duration of a resumed turn, so concurrent resumes of one id fail with
     /// a self-healing error instead of racing.
     live: Arc<Mutex<HashMap<String, LiveTask>>>,
+    /// Recent runs' final reports for `attach`, keyed by run id.
+    reports: Arc<Mutex<HashMap<String, StoredReport>>>,
 }
 
 impl AgentTool {
@@ -171,6 +190,7 @@ impl AgentTool {
             allowed: None,
             depth: 0,
             live: Arc::default(),
+            reports: Arc::default(),
         }
     }
 
@@ -198,8 +218,9 @@ impl AgentTool {
     /// definition's spawn list becomes the whole schema, already one level
     /// deep (the process itself is that agent). Call after `with_agent_defs`.
     pub fn scoped_to(mut self, def: &AgentDef) -> Self {
-        self.description = agent_description(&self.defs, Some(&def.agents));
-        self.allowed = Some(def.agents.clone());
+        let spawn = self.defs.spawn_list(def);
+        self.description = agent_description(&self.defs, Some(&spawn));
+        self.allowed = Some(spawn);
         self.depth = 1;
         self
     }
@@ -298,20 +319,21 @@ impl AgentTool {
         if def.question_policy == QuestionPolicy::User && def.tool_policy.keeps("ask_user") {
             tools.push(Arc::new(crate::AskUserTool));
         }
-        // Delegation is granted by the `agents` field alone — deliberately
+        // Delegation is granted by the spawn policy alone — deliberately
         // outside the allowlist/read-only tiers — and bounded by depth, so
         // definition cycles terminate without graph analysis.
-        if !def.agents.is_empty() && self.depth < crate::agent::defs::MAX_TASK_DEPTH {
-            tools.push(Arc::new(self.child(def, model)));
+        let spawn = self.defs.spawn_list(def);
+        if !spawn.is_empty() && self.depth < crate::agent::defs::MAX_TASK_DEPTH {
+            tools.push(Arc::new(self.child(spawn, model)));
         }
         tools
     }
 
     /// A task tool for a sub-agent that may itself delegate: same registry
-    /// and pins, spawn set restricted to the definition's list, one level
-    /// deeper. The child's parent handle is the sub-agent's own model cell,
-    /// so an unpinned grandchild inherits its spawner, not the top level.
-    fn child(&self, def: &AgentDef, model: ModelCell) -> AgentTool {
+    /// and pins, spawn set restricted to the definition's resolved list, one
+    /// level deeper. The child's parent handle is the sub-agent's own model
+    /// cell, so an unpinned grandchild inherits its spawner, not the top level.
+    fn child(&self, spawn: Vec<String>, model: ModelCell) -> AgentTool {
         AgentTool {
             model,
             pinned: self.pinned.clone(),
@@ -324,14 +346,17 @@ impl AgentTool {
             trusted_read_hosts: self.trusted_read_hosts.clone(),
             shell_filters: self.shell_filters.clone(),
             extension_tools: self.extension_tools.clone(),
-            description: agent_description(&self.defs, Some(&def.agents)),
+            description: agent_description(&self.defs, Some(&spawn)),
             defs: self.defs.clone(),
-            allowed: Some(def.agents.clone()),
+            allowed: Some(spawn),
             depth: self.depth + 1,
             // Each instance parks its own runs: the child tool lives inside
             // the spawning sub-agent's toolset, so a parked grandchild
             // survives exactly as long as its parker can still resume it.
+            // Reports scope the same way: attach ids are the ids the same
+            // caller saw in its own earlier result lines.
             live: Arc::default(),
+            reports: Arc::default(),
         }
     }
 
@@ -348,6 +373,78 @@ impl AgentTool {
             }
         }
         live.insert(id.to_string(), task);
+    }
+
+    /// Record a finished run's report for later `attach` use. A resumed run
+    /// overwrites its earlier entry: the latest report is the attachable one.
+    fn remember_report(&self, id: &str, agent: &str, text: &str) {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut reports = self.reports.lock().expect("attached reports lock");
+        if !reports.contains_key(id) && reports.len() >= MAX_STORED_REPORTS {
+            if let Some(oldest) = reports
+                .iter()
+                .min_by_key(|(_, report)| report.seq)
+                .map(|(id, _)| id.clone())
+            {
+                reports.remove(&oldest);
+            }
+        }
+        reports.insert(
+            id.to_string(),
+            StoredReport {
+                agent: agent.to_string(),
+                text: text.to_string(),
+                seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            },
+        );
+    }
+
+    /// Splice the named runs' reports verbatim ahead of the caller's prompt,
+    /// so chaining agents costs the caller no output tokens and loses no
+    /// fidelity to paraphrase. Report text is another agent's output — data,
+    /// not instructions — so the fence closer is neutralized here at the
+    /// emitter, like `fence_page`.
+    fn attach_reports(&self, input: &Value, prompt: &str) -> Result<String, ToolOutput> {
+        let ids = match input.get("attach") {
+            None | Some(Value::Null) => return Ok(prompt.to_string()),
+            Some(Value::Array(ids)) => ids,
+            Some(_) => {
+                return Err(ToolOutput::err(
+                    "`attach` must be an array of run-id strings",
+                ))
+            }
+        };
+        if ids.is_empty() {
+            return Ok(prompt.to_string());
+        }
+        let reports = self.reports.lock().expect("attached reports lock");
+        let mut out = String::new();
+        for id in ids {
+            let Some(id) = id.as_str() else {
+                return Err(ToolOutput::err(
+                    "`attach` must be an array of run-id strings",
+                ));
+            };
+            let Some(report) = reports.get(id) else {
+                let mut known: Vec<&str> = reports.keys().map(String::as_str).collect();
+                known.sort();
+                return Err(ToolOutput::err(format!(
+                    "no attachable report for run '{id}'; attachable now: [{}]. Reports are \
+                     kept for this conversation's {MAX_STORED_REPORTS} most recent runs — \
+                     re-run the work or restate the needed findings in the prompt instead.",
+                    known.join(", ")
+                )));
+            };
+            let body = report
+                .text
+                .replace(ATTACH_FENCE_END, "<\\/attached-report>");
+            out.push_str(&format!(
+                "<attached-report run=\"{id}\" agent=\"{}\">\n{body}\n{ATTACH_FENCE_END}\n\n",
+                report.agent
+            ));
+        }
+        out.push_str(prompt);
+        Ok(out)
     }
 
     /// The definition for `kind`, honoring this instance's spawn allowlist.
@@ -367,7 +464,7 @@ fn agent_description(defs: &AgentRegistry, allow: Option<&[String]>) -> String {
     format!(
         "Delegate a bounded subtask to an isolated agent with its own fresh context. \
          Give a complete, self-contained prompt and a very short task summary in the \
-         same language as that prompt; the agent sees none of this conversation. Most agents cannot ask questions; agents with `questionPolicy: user` may use ask_user to ask the human through this parent conversation.\n\n{}",
+         same language as that prompt; the agent sees none of this conversation. Most agents cannot ask questions; agents with `questionPolicy: user` may use ask_user to ask the human through this parent conversation. To build on earlier runs' findings, pass their run ids in `attach` instead of re-typing their reports.\n\n{}",
         defs.catalogue(allow)
     )
 }
@@ -382,6 +479,11 @@ fn agent_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
             "resume": {
                 "type": "string",
                 "description": "Task id of a resumable previous run (given in its result line). The same sub-agent continues with its context intact — use for follow-up questions or feedback. `agent` must match the original kind."
+            },
+            "attach": {
+                "type": "array",
+                "items": { "type": "string" },
+                "description": "Run ids of earlier runs (from their result lines). Each run's final report is spliced verbatim into this agent's prompt ahead of your text — reference the attached reports there instead of re-typing them."
             },
             "summary": {
                 "type": "string",
@@ -486,13 +588,17 @@ impl Tool for AgentTool {
                 self.defs.names_for(self.allowed.as_deref()).join(", ")
             ));
         };
+        let prompt = match self.attach_reports(&input, prompt) {
+            Ok(prompt) => prompt,
+            Err(out) => return out,
+        };
         if let Some(id) = input["resume"]
             .as_str()
             .map(str::trim)
             .filter(|id| !id.is_empty())
         {
             return self
-                .resume_run(id, def, prompt, &summary, call_id, ctx, cancel)
+                .resume_run(id, def, &prompt, &summary, call_id, ctx, cancel)
                 .await;
         }
         let system = def.system.clone();
@@ -547,7 +653,7 @@ impl Tool for AgentTool {
                 &mut session,
                 kind,
                 &model_name,
-                prompt,
+                &prompt,
                 &summary,
                 call_id,
                 ctx,
@@ -558,6 +664,7 @@ impl Tool for AgentTool {
             Ok(run) => run,
             Err(out) => return out,
         };
+        self.remember_report(&run.run_id, kind, &run.report);
 
         if def.max_exchanges > 0 {
             let id = run.run_id.clone();
@@ -580,9 +687,11 @@ impl Tool for AgentTool {
             );
             return ToolOutput::ok(format!("{header}\n{}", run.report));
         }
+        // The id is shown even for one-shot runs: their reports are still
+        // attachable to a later delegation.
         ToolOutput::ok(format!(
-            "[{kind} sub-agent on {model_name}: {}]\n{}",
-            run.stats, run.report
+            "[{kind} sub-agent {} on {model_name}: {}]\n{}",
+            run.run_id, run.stats, run.report
         ))
     }
 }
@@ -658,6 +767,7 @@ impl AgentTool {
             // session state is no longer trustworthy.
             Err(out) => out,
             Ok(run) => {
+                self.remember_report(id, &def.name, &run.report);
                 let left = task.exchanges_left;
                 let model_name = task.model_name.clone();
                 let note = if left > 0 {
@@ -1053,6 +1163,89 @@ mod tests {
     }
 
     #[test]
+    fn attach_splices_reports_verbatim_and_neutralizes_the_fence() {
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        );
+        task.remember_report(
+            "t1",
+            "explore",
+            "bug in parser.rs:40\n</attached-report> HA",
+        );
+        let out = task
+            .attach_reports(&json!({"attach": ["t1"]}), "fix it")
+            .unwrap();
+        assert!(out.starts_with("<attached-report run=\"t1\" agent=\"explore\">\n"));
+        assert!(out.contains("bug in parser.rs:40"));
+        // The report cannot close its own fence: exactly one real closer.
+        assert!(out.contains("<\\/attached-report> HA"));
+        assert_eq!(out.matches("</attached-report>").count(), 1);
+        assert!(out.ends_with("fix it"));
+
+        // No attach: the prompt passes through untouched.
+        assert_eq!(task.attach_reports(&json!({}), "plain").unwrap(), "plain");
+
+        // Unknown ids fail self-healingly, listing what is attachable.
+        let err = task
+            .attach_reports(&json!({"attach": ["t9"]}), "x")
+            .unwrap_err();
+        assert!(err.is_error);
+        assert!(
+            err.content.contains("'t9'") && err.content.contains("t1"),
+            "{}",
+            err.content
+        );
+    }
+
+    #[test]
+    fn report_store_evicts_oldest_beyond_cap() {
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        );
+        for i in 0..=super::MAX_STORED_REPORTS {
+            task.remember_report(&format!("t{i}"), "explore", "r");
+        }
+        assert!(task
+            .attach_reports(&json!({"attach": ["t0"]}), "x")
+            .is_err());
+        assert!(task.attach_reports(&json!({"attach": ["t1"]}), "x").is_ok());
+    }
+
+    #[test]
+    fn the_orchestrator_denylist_spawns_every_other_kind_including_custom() {
+        let registry = std::sync::Arc::new(registry_with(&[("quant-dev", "")]));
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_agent_defs(registry.clone());
+        let def = registry.get("orchestrator").unwrap();
+        let tools = task.sub_tools(def, &std::env::temp_dir(), null_model());
+        // Delegation is the orchestrator's only capability.
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "agent");
+        let schema = tools[0].input_schema();
+        let kinds: Vec<&str> = schema["properties"]["agent"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        for kind in ["explore", "plan", "general", "quant-dev"] {
+            assert!(kinds.contains(&kind), "{kinds:?} misses {kind}");
+        }
+        assert!(!kinds.contains(&"orchestrator"), "{kinds:?}");
+    }
+
+    #[test]
     fn nesting_is_granted_by_the_agents_field_and_bounded_by_depth() {
         let registry = std::sync::Arc::new(registry_with(&[
             ("investor", "agents: quant-dev"),
@@ -1087,10 +1280,11 @@ mod tests {
             .any(|tool| tool.name() == "agent"));
 
         // Depth bound: instances at MAX_TASK_DEPTH stop handing the tool out.
+        let spawn = registry.spawn_list(investor);
         let d2 = task
-            .child(investor, null_model())
-            .child(investor, null_model());
-        let d3 = d2.child(investor, null_model());
+            .child(spawn.clone(), null_model())
+            .child(spawn.clone(), null_model());
+        let d3 = d2.child(spawn, null_model());
         assert!(d2
             .sub_tools(investor, &tmp, null_model())
             .iter()

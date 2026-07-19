@@ -602,11 +602,11 @@ async fn main() -> anyhow::Result<()> {
     .with_extension_tools(mcp_tools);
     // A named-agent run shapes the toolset last: allowlist filtering over
     // everything assembled above, then the agent tool — which is granted by
-    // the definition's `agents` field alone, outside the allowlist tiers.
+    // the definition's spawn policy alone, outside the allowlist tiers.
     match &cli_agent {
         Some(def) => {
             tools.retain(|tool| tcode_tools::keeps_tool(def, tool.as_ref()));
-            if !def.agents.is_empty() {
+            if !agent_defs.spawn_list(def).is_empty() {
                 tools.push(Arc::new(agent_tool.scoped_to(def)));
             }
         }

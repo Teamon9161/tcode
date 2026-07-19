@@ -3,6 +3,7 @@ name: explore
 description: Read-only reconnaissance that returns a report
 readonly: true
 gatesOutput: false
+max_exchanges: 3
 ---
 # tcode exploration sub-agent
 

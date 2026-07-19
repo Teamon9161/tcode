@@ -2468,10 +2468,8 @@ async fn a_pinned_sub_agent_runs_on_its_own_model() {
         })
         .expect("task returned a report");
     // The model that actually did the work is named in the report.
-    assert!(
-        report.contains("explore sub-agent on cheap-scout-1"),
-        "{report}"
-    );
+    assert!(report.contains("explore sub-agent"), "{report}");
+    assert!(report.contains("on cheap-scout-1"), "{report}");
     assert!(report.contains("the report"), "{report}");
 }
 
@@ -3513,6 +3511,74 @@ async fn a_resumable_sub_agent_continues_the_same_session() {
         "the resumed turn left the earlier exchange byte-identical (prefix cache hit)"
     );
     assert!(resumed.iter().any(|t| t.contains("add a stop")));
+}
+
+/// `attach` hands one run's report to the next delegation verbatim: the
+/// caller pays no output tokens to re-type it and the text arrives fenced,
+/// with the fence closer neutralized inside the body.
+#[tokio::test]
+async fn an_attached_report_reaches_the_next_delegation_verbatim() {
+    let root = tempfile::tempdir().unwrap();
+    let registry = custom_registry(
+        root.path(),
+        &[
+            ("scout", "readonly: true", "You are the scout."),
+            ("builder", "", "You are the builder."),
+        ],
+    );
+    let provider = MockProvider::new(vec![
+        // Parent scouts first.
+        tool_use(
+            "p1",
+            "agent",
+            r#"{"agent":"scout","prompt":"find the bug","summary":"scout"}"#,
+        ),
+        // The scout's report (run id t1).
+        text_done("the bug is in parser.rs:40"),
+        // Parent chains the fix, attaching the scout's report instead of
+        // re-typing it.
+        tool_use(
+            "p2",
+            "agent",
+            r#"{"agent":"builder","prompt":"fix the bug per the attached report","attach":["t1"],"summary":"fix"}"#,
+        ),
+        // The builder's report.
+        text_done("fixed"),
+        // Parent closes.
+        text_done("done"),
+    ]);
+    let task = tcode_tools::AgentTool::new(
+        cell(provider.clone()),
+        WatchdogConfig::default(),
+        2_000,
+        root.path().to_path_buf(),
+    )
+    .with_agent_defs(registry);
+    let agent = Agent {
+        tools: vec![Arc::new(task)],
+        ..agent(provider.clone())
+    };
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "fix the parser bug").await;
+
+    // requests: parent p1, scout, parent p2, builder, parent close.
+    let requests = provider.requests.lock().unwrap();
+    assert_eq!(requests.len(), 5);
+    let builder_prompt = task_texts(&requests[3].messages).join("\n");
+    assert!(
+        builder_prompt.contains("<attached-report run=\"t1\" agent=\"scout\">"),
+        "{builder_prompt}"
+    );
+    assert!(
+        builder_prompt.contains("the bug is in parser.rs:40"),
+        "{builder_prompt}"
+    );
+    assert!(
+        builder_prompt.contains("fix the bug per the attached report"),
+        "{builder_prompt}"
+    );
 }
 
 /// A resume that names an unknown id fails with a self-healing error that
