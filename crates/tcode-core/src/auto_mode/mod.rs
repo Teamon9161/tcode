@@ -447,7 +447,10 @@ mod tests {
         // sides canonicalize their deepest existing ancestor, so a symlink or
         // Windows junction cannot smuggle a target past the boundary.
         assert_eq!(
-            policy.route(AutoSafety::AllowInProjectOrScratchEdit, &escaped),
+            policy.route(
+                AutoSafety::AllowInProjectOrScratchEdit,
+                Some(escaped.as_ref()),
+            ),
             AutoRoute::Classify
         );
     }
