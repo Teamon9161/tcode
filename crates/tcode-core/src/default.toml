@@ -13,6 +13,10 @@
 # `auto_compact_percent` is clamped to 1..=100 when the agent runs.
 auto_compact = true
 auto_compact_percent = 85
+# Set `shell_output_filters = false` to hand every successful shell output to
+# the model verbatim. Only the user's config decides this; a project's
+# `.tcode/config.toml` cannot turn it back on.
+shell_output_filters = true
 
 [auto_mode]
 trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]

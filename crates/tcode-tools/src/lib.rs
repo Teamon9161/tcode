@@ -8,6 +8,7 @@ mod monitor;
 mod plan;
 mod search;
 mod shell;
+mod shell_filter;
 mod skills;
 mod view_image;
 mod web;
@@ -23,6 +24,7 @@ pub use grounding::{
 pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
 pub use mcp::connect_mcp_servers;
 pub use shell::ShellKind;
+pub use shell_filter::{OutputFilter, ShellFilters};
 pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,
@@ -46,6 +48,7 @@ pub fn builtin_tools(cwd: &Path) -> Vec<Arc<dyn Tool>> {
     builtin_tools_with_skills_and_web_fetch(
         discover_skills(cwd),
         WebFetchTool::new(trusted_read_hosts(Vec::new())),
+        Arc::new(ShellFilters::load(cwd).0),
     )
 }
 
@@ -58,11 +61,16 @@ pub fn builtin_tools_with_trusted_read_hosts(
     builtin_tools_with_skills_and_web_fetch(
         discover_skills(cwd),
         WebFetchTool::new(trusted_read_hosts),
+        Arc::new(ShellFilters::load(cwd).0),
     )
 }
 
 pub fn builtin_tools_with_web_fetch(cwd: &Path, web_fetch: WebFetchTool) -> Vec<Arc<dyn Tool>> {
-    builtin_tools_with_skills_and_web_fetch(discover_skills(cwd), web_fetch)
+    builtin_tools_with_skills_and_web_fetch(
+        discover_skills(cwd),
+        web_fetch,
+        Arc::new(ShellFilters::load(cwd).0),
+    )
 }
 
 /// Same toolset, but with skill discovery already done by the caller. Lets a
@@ -73,6 +81,7 @@ pub fn builtin_tools_with_skills(skills: Vec<Skill>) -> Vec<Arc<dyn Tool>> {
     builtin_tools_with_skills_and_web_fetch(
         skills,
         WebFetchTool::new(trusted_read_hosts(Vec::new())),
+        Arc::new(ShellFilters::builtin().0),
     )
 }
 
@@ -82,7 +91,11 @@ pub fn builtin_tools_with_skills_and_trusted_read_hosts(
     skills: Vec<Skill>,
     trusted_read_hosts: TrustedReadHosts,
 ) -> Vec<Arc<dyn Tool>> {
-    builtin_tools_with_skills_and_web_fetch(skills, WebFetchTool::new(trusted_read_hosts))
+    builtin_tools_with_skills_and_web_fetch(
+        skills,
+        WebFetchTool::new(trusted_read_hosts),
+        Arc::new(ShellFilters::builtin().0),
+    )
 }
 
 /// Build a toolset around a fully configured `web_fetch` instance. Its
@@ -90,6 +103,7 @@ pub fn builtin_tools_with_skills_and_trusted_read_hosts(
 pub fn builtin_tools_with_skills_and_web_fetch(
     skills: Vec<Skill>,
     web_fetch: WebFetchTool,
+    filters: Arc<ShellFilters>,
 ) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(fs::ReadTool),
@@ -108,9 +122,15 @@ pub fn builtin_tools_with_skills_and_web_fetch(
     } else {
         ShellKind::Bash
     };
-    tools.push(Arc::new(shell::ShellTool::new(primary_shell)));
+    tools.push(Arc::new(shell::ShellTool::with_filters(
+        primary_shell,
+        filters.clone(),
+    )));
     if cfg!(windows) && shell::bash_available() {
-        tools.push(Arc::new(shell::ShellTool::new(ShellKind::Bash)));
+        tools.push(Arc::new(shell::ShellTool::with_filters(
+            ShellKind::Bash,
+            filters,
+        )));
     }
     // The monitor speaks the platform's primary shell, like `shell`.
     tools.push(Arc::new(monitor::MonitorTool::new(primary_shell)));

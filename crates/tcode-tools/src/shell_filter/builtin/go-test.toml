@@ -1,0 +1,45 @@
+[filters.go-test]
+description = "Drop go test's per-test RUN/PASS trace; keep the package results and every failure"
+# `-v` prints the trace on purpose, so the filter stands aside for it.
+match_command = "\\bgo\\s+test\\b"
+exclude_command = "(^|\\s)-v(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^=== (RUN|PAUSE|CONT|NAME)\\b",
+  "^\\s*--- (PASS|SKIP):",
+  "^PASS$",
+]
+
+[[tests.go-test]]
+name = "passing tests collapse to their package lines"
+input = """
+=== RUN   TestParse
+--- PASS: TestParse (0.00s)
+=== RUN   TestRender
+=== PAUSE TestRender
+=== CONT  TestRender
+--- PASS: TestRender (0.01s)
+PASS
+ok  \texample.com/pkg\t0.012s
+ok  \texample.com/pkg/sub\t0.004s
+"""
+expected = "ok  \texample.com/pkg\t0.012s\nok  \texample.com/pkg/sub\t0.004s"
+
+[[tests.go-test]]
+name = "a failure keeps its trace"
+input = """
+=== RUN   TestParse
+--- PASS: TestParse (0.00s)
+=== RUN   TestRender
+    render_test.go:42: got 3, want 4
+--- FAIL: TestRender (0.01s)
+FAIL
+FAIL\texample.com/pkg\t0.013s
+"""
+expected = """
+    render_test.go:42: got 3, want 4
+--- FAIL: TestRender (0.01s)
+FAIL
+FAIL\texample.com/pkg\t0.013s\
+"""

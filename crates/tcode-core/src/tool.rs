@@ -18,6 +18,21 @@ use crate::types::Usage;
 use crate::auto_mode::AutoSafety;
 pub use crate::permission::{Approval, ApprovalDecision, Approver};
 
+/// A shortened stand-in for a successful tool output, and the name of the rule
+/// that produced it.
+///
+/// The name is not decoration. What the reader needs to know is not *how much*
+/// was removed — a large removal is usually progress spam and a small one may
+/// not be — but *what kind* of thing was removed, and the rule's name is the
+/// only cheap answer. It also keeps the reduction attributable: a rule can come
+/// from a repository's own configuration, and repository-supplied rules must
+/// not be able to rewrite what a tool reported anonymously.
+#[derive(Debug, Clone)]
+pub struct Compacted {
+    pub text: String,
+    pub by: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -402,8 +417,14 @@ pub trait Tool: Send + Sync {
     /// Tools whose output has a stable, domain-specific success format can
     /// preserve its useful evidence without spending context on repetition.
     /// Failures always bypass this hook unchanged for diagnosis.
-    fn compact_success_output(&self, output: String) -> String {
-        output
+    ///
+    /// The original input comes along because reduction can depend on what was
+    /// asked (`shell` matches filters against the command string, and skips
+    /// invocations that already spill their output elsewhere). `None` means
+    /// nothing was removed, which is what lets the caller decide — without an
+    /// O(n) comparison — whether the full text has to be preserved on disk.
+    fn compact_success_output(&self, _input: &Value, _output: &str) -> Option<Compacted> {
+        None
     }
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput;
     /// Entry point the agent loop uses, carrying the provider-issued tool_use

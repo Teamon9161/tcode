@@ -1,0 +1,48 @@
+[filters.cargo-build]
+description = "Drop cargo's per-crate progress; keep warnings, errors and the final status"
+# Not anchored: real commands are compound (`cd crates/x && cargo check`).
+# `cargo test` is excluded because folding its target blocks needs the native
+# cargo-test filter, and the first matching filter in the chain is the only one
+# that runs. A verbose build was asked for on purpose and is left alone.
+match_command = "\\bcargo\\s+(build|check|clippy|fix)\\b"
+exclude_command = "\\bcargo\\s+test\\b|(^|\\s)(-v|--verbose)(\\s|$)"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*(Compiling|Checking|Downloading|Downloaded|Fresh|Updating|Locking|Adding|Blocking|Installing|Removing|Packaging|Verifying)\\s",
+]
+
+[[tests.cargo-build]]
+name = "progress goes, the final status stays"
+input = """
+    Updating crates.io index
+      Adding regex v1.11.1
+   Compiling proc-macro2 v1.0.86
+   Compiling unicode-ident v1.0.12
+    Checking tcode-core v0.1.8
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.89s
+"""
+expected = "    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.89s"
+
+[[tests.cargo-build]]
+name = "diagnostics are never progress"
+input = """
+   Compiling tcode-tools v0.1.8
+warning: unused variable: `x`
+ --> src/lib.rs:3:9
+  |
+3 |     let x = 1;
+  |         ^ help: if this is intentional, prefix it with an underscore
+
+warning: `tcode-tools` (lib) generated 1 warning
+    Finished `dev` profile in 2.10s
+"""
+expected = """
+warning: unused variable: `x`
+ --> src/lib.rs:3:9
+  |
+3 |     let x = 1;
+  |         ^ help: if this is intentional, prefix it with an underscore
+warning: `tcode-tools` (lib) generated 1 warning
+    Finished `dev` profile in 2.10s\
+"""

@@ -255,6 +255,12 @@ pub struct LimitsConfig {
     /// Model round-trips per user turn before the harness ends the turn
     /// (runaway guard; the user can always ask to continue).
     pub max_steps_per_turn: usize,
+    /// Whether successful `shell` output passes through the declarative
+    /// output filters (built-in, plus `~/.tcode/filters.toml` and
+    /// `.tcode/filters.toml`). Lives under `limits` so it is settled by the
+    /// user's own configuration: a checked-out repository cannot re-enable
+    /// filtering the user turned off.
+    pub shell_output_filters: bool,
 }
 
 impl Default for LimitsConfig {
@@ -264,6 +270,7 @@ impl Default for LimitsConfig {
             auto_compact_percent: 85,
             tool_output_tokens: 8000,
             max_steps_per_turn: crate::agent::DEFAULT_MAX_STEPS,
+            shell_output_filters: true,
         }
     }
 }

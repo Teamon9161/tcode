@@ -90,6 +90,16 @@ impl BlobStore {
         out
     }
 
+    /// Park a full output in the same `tool-output/` directory the gate spills
+    /// to, without judging its size. Used when something upstream has already
+    /// decided to shorten the text and needs somewhere to keep the original,
+    /// so the model can still read what was dropped. Returns None when the
+    /// write fails — the caller must then keep the unshortened text.
+    pub fn save(&mut self, tool: &str, full: &str) -> Option<String> {
+        self.counter += 1;
+        self.write_overflow(tool, full)
+    }
+
     /// Write the full output to `tool-output/NNN-<tool>.txt`, creating the
     /// directory lazily. Returns the path as a string, or None if it could not
     /// be written (the preview is still returned either way).

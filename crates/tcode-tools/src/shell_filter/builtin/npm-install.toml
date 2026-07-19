@@ -1,0 +1,48 @@
+[filters.npm-install]
+description = "Drop npm's notice/warn/funding chatter; keep the package counts and audit result"
+match_command = "\\bnpm\\s+(install|i|ci|add|update|uninstall|remove)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^npm (notice|warn|WARN|http)",
+  "^\\d+ packages? (are|is) looking for funding",
+  "^\\s*run `npm fund` for details",
+]
+
+[[tests.npm-install]]
+name = "deprecation notices and funding pitches go, the result stays"
+input = """
+npm warn deprecated inflight@1.0.6: This module is not supported, and leaks memory.
+npm warn deprecated glob@7.2.3: Glob versions prior to v9 are no longer supported.
+npm notice New major version of npm available! 10.2.4 -> 11.0.0
+
+added 214 packages, and audited 215 packages in 3s
+
+45 packages are looking for funding
+  run `npm fund` for details
+
+found 0 vulnerabilities
+"""
+expected = """
+added 214 packages, and audited 215 packages in 3s
+found 0 vulnerabilities\
+"""
+
+[[tests.npm-install]]
+name = "a real audit finding is not chatter"
+input = """
+npm warn deprecated request@2.88.2: request has been deprecated
+
+added 3 packages in 1s
+
+2 high severity vulnerabilities
+
+To address all issues, run:
+  npm audit fix
+"""
+expected = """
+added 3 packages in 1s
+2 high severity vulnerabilities
+To address all issues, run:
+  npm audit fix\
+"""

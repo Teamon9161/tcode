@@ -1,10 +1,13 @@
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio_util::sync::CancellationToken;
+
+use crate::shell_filter::ShellFilters;
 
 use tcode_core::{
     AutoSafety, BatchPolicy, PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput,
@@ -79,11 +82,21 @@ fn which_bash() -> Option<std::path::PathBuf> {
 
 pub struct ShellTool {
     kind: ShellKind,
+    /// Shared with every other consumer of the chain, so `/cd` re-derives the
+    /// project's rules once for all of them.
+    filters: Arc<ShellFilters>,
 }
 
 impl ShellTool {
+    /// Without a chain nothing is filtered — the honest default for a tool
+    /// built outside the composition root.
+    #[cfg(test)]
     pub fn new(kind: ShellKind) -> Self {
-        Self { kind }
+        Self::with_filters(kind, Arc::new(ShellFilters::disabled()))
+    }
+
+    pub fn with_filters(kind: ShellKind, filters: Arc<ShellFilters>) -> Self {
+        Self { kind, filters }
     }
 
     fn command(&self, script: &str, cwd: &std::path::Path) -> tokio::process::Command {
@@ -243,57 +256,6 @@ pub(crate) fn spawn_line_reader(
     })
 }
 
-/// Successful test runs often contain several nearly-identical target blocks
-/// (especially doctests and crates with zero tests). Keep one result for every
-/// target that actually ran tests, plus the shell's final status, while avoiding
-/// needless context use. Any error-like marker leaves the original output
-/// untouched for diagnosis.
-fn compact_successful_test_output(output: String) -> String {
-    if !(output.contains("test result: ok.")
-        && output.contains("running ")
-        && !output.contains("test result: FAILED")
-        && !output.contains("error:")
-        && !output.contains("failures:"))
-    {
-        return output;
-    }
-
-    let lines: Vec<&str> = output.lines().collect();
-    let mut passed = Vec::new();
-    for (index, result) in lines.iter().enumerate() {
-        if !result.trim_start().starts_with("test result: ok.") || result.contains("0 passed") {
-            continue;
-        }
-        let running = lines[..index]
-            .iter()
-            .rev()
-            .find(|line| {
-                let trimmed = line.trim_start();
-                trimmed.starts_with("running ")
-                    && trimmed.contains(" tests")
-                    && !trimmed.contains("running 0 tests")
-            })
-            .copied();
-        if let Some(running) = running {
-            passed.push(format!("{running}\n{result}"));
-        }
-    }
-    if passed.is_empty() {
-        return output;
-    }
-
-    let status = lines
-        .iter()
-        .rev()
-        .find(|line| line.starts_with("(exit code "))
-        .copied()
-        .unwrap_or("test result: ok.");
-    format!(
-        "{}\n… successful test output folded …\n{status}",
-        passed.join("\n")
-    )
-}
-
 #[async_trait]
 impl Tool for ShellTool {
     fn name(&self) -> &str {
@@ -384,8 +346,17 @@ impl Tool for ShellTool {
         BatchPolicy::SequentialBatch
     }
 
-    fn compact_success_output(&self, output: String) -> String {
-        compact_successful_test_output(output)
+    /// Invocations that already park their full output elsewhere are left
+    /// alone: `final` mode returns a deliberate tail of a saved log, and a
+    /// background run returns a task id rather than output. Filtering either
+    /// would spill a second copy of the same text for nothing.
+    fn compact_success_output(&self, input: &Value, output: &str) -> Option<tcode_core::Compacted> {
+        let diverted = input["run_in_background"].as_bool().unwrap_or(false)
+            || input["output_mode"].as_str() == Some("final");
+        if diverted {
+            return None;
+        }
+        self.filters.apply(input["command"].as_str()?, output)
     }
 
     async fn run(&self, input: Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {

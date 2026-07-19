@@ -37,7 +37,13 @@
       "Bash(timeout 20 cargo run --quiet --)",
       "Read(//home/teamon/.local/share/claude/versions/**)",
       "PowerShell(cargo build *)",
-      "PowerShell(cargo info *)"
+      "PowerShell(cargo info *)",
+      "Bash(awk -F: '{print $1\" \"$0}')",
+      "Bash(awk '{lines[NR]=$1; text[NR]=$0} END {for\\(i=1;i<NR;i++\\) {d=lines[i+1]-lines[i]; if\\(d>80\\) print d\" \"text[i]}}')",
+      "Bash(sed 's/:.*//')",
+      "Read(//tmp/**)",
+      "Bash(awk '{split\\($0,a,\" \"\\); l=$1} {arr[NR]=$0; ln[NR]=l} END {for\\(i=1;i<NR;i++\\){d=ln[i+1]-ln[i]; if\\(d>70\\) print d\" \"arr[i]}}')",
+      "Bash(git clone *)"
     ]
   }
 }

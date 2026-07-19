@@ -472,6 +472,19 @@ async fn main() -> anyhow::Result<()> {
     for warning in &agent_warnings {
         eprintln!("{DIM}warning: {warning}{RESET}");
     }
+    // Shell output filters: built-ins plus the user's and the project's
+    // `filters.toml`. `[limits] shell_output_filters` is read from the user's
+    // own configuration only, so a checked-out repository cannot switch
+    // filtering back on for someone who turned it off.
+    let shell_filters = Arc::new(if config.limits.shell_output_filters {
+        let (filters, warnings) = tcode_tools::ShellFilters::load(&cwd);
+        for warning in warnings {
+            eprintln!("{DIM}warning: {warning}{RESET}");
+        }
+        filters
+    } else {
+        tcode_tools::ShellFilters::disabled()
+    });
     let classifier_policy = tcode_core::classifier_policy(&config.auto_mode);
     let trusted_read_hosts =
         tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
@@ -559,6 +572,7 @@ async fn main() -> anyhow::Result<()> {
         tcode_tools::WebFetchTool::new(trusted_read_hosts.clone()).with_summarizer(
             tcode_tools::FetchSummarizer::new(model_cell.clone(), pinned.clone()),
         ),
+        shell_filters.clone(),
     );
     tools.push(Arc::new(tcode_tools::ViewImageTool::new(
         model_cell.clone(),
@@ -582,6 +596,7 @@ async fn main() -> anyhow::Result<()> {
         config.limits.auto_compact_percent,
     )
     .with_trusted_read_hosts(trusted_read_hosts.clone())
+    .with_shell_filters(shell_filters.clone())
     .with_extension_tools(mcp_tools);
     // A named-agent run shapes the toolset last: allowlist filtering over
     // everything assembled above, then the agent tool — which is granted by
@@ -638,6 +653,9 @@ async fn main() -> anyhow::Result<()> {
         rules,
     );
     session.set_dogfood(state.dogfood);
+    // The chain the tools already hold; registering it is what makes `/cd`
+    // re-read the new directory's `.tcode/filters.toml`.
+    session.register_cwd_scope(shell_filters.clone());
     if let Some(trust) = state.folder_trust_for(&cwd) {
         session.set_folder_trust(trust);
     }

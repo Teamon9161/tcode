@@ -77,6 +77,10 @@ pub struct AgentTool {
     auto_compact: bool,
     auto_compact_percent: u8,
     trusted_read_hosts: crate::TrustedReadHosts,
+    /// The parent's already-compiled filter chain. Shared rather than
+    /// re-loaded so a sub-agent's `shell` filters exactly like the parent's,
+    /// and so `/cd` re-derives the project rules once for both.
+    shell_filters: Arc<crate::ShellFilters>,
     /// Extra tools assembled by the composition root (currently MCP). They are
     /// injected into both selector validation and each delegated toolset.
     extension_tools: Vec<Arc<dyn Tool>>,
@@ -113,6 +117,7 @@ impl AgentTool {
             auto_compact: true,
             auto_compact_percent: 85,
             trusted_read_hosts: crate::trusted_read_hosts(Vec::new()),
+            shell_filters: Arc::new(crate::ShellFilters::disabled()),
             extension_tools: Vec::new(),
             description: agent_description(&defs, None),
             defs,
@@ -173,6 +178,13 @@ impl AgentTool {
         self
     }
 
+    /// Share the parent process's compiled filter chain with every isolated
+    /// sub-agent, instead of each one re-reading and re-compiling the files.
+    pub fn with_shell_filters(mut self, filters: Arc<crate::ShellFilters>) -> Self {
+        self.shell_filters = filters;
+        self
+    }
+
     /// The pinned model for `kind`, else a snapshot of the parent's. String
     /// keyed so custom kinds resolve through `[agents.<name>]` for free.
     fn model_for(&self, kind: &str) -> ActiveModel {
@@ -185,11 +197,12 @@ impl AgentTool {
     /// applied. Validation uses this same inventory, so MCP selectors can only
     /// advertise tools a delegated agent will actually receive.
     fn base_tools(&self, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
-        let mut tools = crate::builtin_tools_with_web_fetch(
-            cwd,
+        let mut tools = crate::builtin_tools_with_skills_and_web_fetch(
+            crate::discover_skills(cwd),
             crate::WebFetchTool::new(self.trusted_read_hosts.clone()).with_summarizer(
                 crate::FetchSummarizer::new(model.clone(), self.pinned.clone()),
             ),
+            self.shell_filters.clone(),
         );
         tools.extend(self.extension_tools.iter().cloned());
         tools.push(Arc::new(crate::ViewImageTool::new(
@@ -235,6 +248,7 @@ impl AgentTool {
             auto_compact: self.auto_compact,
             auto_compact_percent: self.auto_compact_percent,
             trusted_read_hosts: self.trusted_read_hosts.clone(),
+            shell_filters: self.shell_filters.clone(),
             extension_tools: self.extension_tools.clone(),
             description: agent_description(&self.defs, Some(&def.agents)),
             defs: self.defs.clone(),

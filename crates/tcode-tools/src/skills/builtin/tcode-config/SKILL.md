@@ -193,6 +193,7 @@ auto_compact = true
 auto_compact_percent = 85
 tool_output_tokens = 8000
 max_steps_per_turn = 500
+shell_output_filters = true
 
 [ui]
 suggest_next = true
@@ -212,7 +213,11 @@ caps ordinary tool-output context; large output becomes a scratch blob that the
 agent can page or read. Do not raise it merely to avoid a single follow-up: use
 an agent definition's targeted `gatesOutput: false` only for a final report the
 parent genuinely needs whole. `max_steps_per_turn` limits the main agent's model
-round-trips; a custom agent's `maxTurns` is separate.
+round-trips; a custom agent's `maxTurns` is separate. `shell_output_filters`
+(default `true`) turns the declarative shell output filters on or off; see
+"Shell output filters" below. Like every other `[limits]` field it is read from
+the **user's** config only — a project's `.tcode/config.toml` cannot re-enable
+filtering you turned off.
 
 `ui.suggest_next` controls the post-turn next-prompt guess and costs one small
 auxiliary request per turn. `ui.show_reasoning` only displays provider reasoning
@@ -279,6 +284,87 @@ For a project skill, add `.tcode/skills/<name>/SKILL.md`; for a personal one,
 use `~/.tcode/skills/<name>/SKILL.md`. A skill begins with `name` and
 description frontmatter, then contains instructions loaded on demand. Filesystem
 skills override a builtin skill with the same name.
+
+## Shell output filters
+
+Successful `shell`/`bash` output passes through a filter chain that removes
+predictable noise (progress counters, install banners, per-crate "Compiling"
+lines). Failures are never filtered — a diagnostic always reaches the model
+whole — and neither is `output_mode = "final"` or `run_in_background`, which
+already park their output elsewhere.
+
+Filters live in `filters.toml`, looked up in this order, first match wins:
+
+1. `<project>/.tcode/filters.toml`
+2. `~/.tcode/filters.toml`
+3. built-in (`cargo-build`, `cargo-test`, `git-status`, `git-transfer`,
+   `npm-install`, `pip-install`, `pytest`, `go-test`)
+
+There is deliberately no `git diff` filter. A diff is information-dense: its
+only pure noise is the `index`/`---`/`+++` headers, about 4% of the text.
+Anything beyond that means dropping context lines, and large diffs are already
+handled better by the output gate, which keeps a per-file summary and saves the
+full text to a file.
+
+A filter whose name matches one from a lower level **replaces** it; tcode warns
+at startup when that happens. The project file follows `/cd`: changing
+directories re-reads the new directory's filters and reports any problem with
+them.
+
+```toml
+[filters.my-tool]
+description = "Drop my-tool's progress lines"
+match_command = "\\bmy-tool\\s+build\\b"   # regex over the whole command string
+exclude_command = "(^|\\s)--verbose(\\s|$)" # skip when this also matches
+strip_ansi = true
+strip_lines_matching = ["^\\s*$", "^Downloading "]
+max_lines = 40
+on_empty = "my-tool: ok"
+
+[[tests.my-tool]]
+name = "progress goes, the result stays"
+input = """
+Downloading thing
+Built 3 targets
+"""
+expected = "Built 3 targets"
+```
+
+| Field | Type | Meaning |
+|---|---|---|
+| `description` | string | Documentation only |
+| `match_command` | regex | Required. Matched against the full command string — do not anchor with `^`, real commands are compound (`cd x && cargo build`) |
+| `exclude_command` | regex | Skip the filter when this also matches. Stands in for a negative lookahead, which the regex engine does not support |
+| `strip_ansi` | bool | Remove ANSI escapes first (default `false`) |
+| `replace` | `[{pattern, replacement}]` | Line-by-line substitutions, chained in order; `$1` refers to a capture |
+| `match_output` | `[{pattern, message, unless}]` | Collapse the whole output to `message` when `pattern` matches; skipped if `unless` also matches. First rule wins |
+| `strip_lines_matching` | regex[] | Drop matching lines |
+| `keep_lines_matching` | regex[] | Keep only matching lines. Mutually exclusive with `strip_lines_matching` |
+| `truncate_lines_at` | int | Cut each line to N characters |
+| `tail_lines` | int | Keep the last N lines |
+| `max_lines` | int | Keep the first N lines |
+| `on_empty` | string | Text to emit when nothing survived |
+
+Pipeline order: `strip_ansi` → `replace` → `match_output` →
+`strip_lines_matching`/`keep_lines_matching` → `truncate_lines_at` →
+`tail_lines` → `max_lines` → `on_empty`.
+
+Every `[[tests.<name>]]` case runs the pipeline against `input` and compares it
+to `expected`, ignoring `match_command` — so a test states what the rules do.
+Write at least one per filter; the built-in set is required to have them.
+
+Two guarantees are worth relying on. Filtering never loses anything: when an
+output is shortened the harness saves the untouched text and appends
+`[filtered by <filter>: full output at <path>]`, which the agent can `read` or
+`grep`. The line names the rule rather than counting the removed lines: a large
+removal is usually progress spam, so a count invites re-reading exactly what
+the filter saved, while the rule's name says what kind of thing went. And
+filtering never costs more than it saves: a result that is not smaller than the
+original is discarded and the original is sent.
+
+Unknown fields are an error rather than a silently inert rule. A `filters.toml`
+that fails to parse costs only its own filters, with a warning; the rest of the
+chain keeps working.
 
 ## Safe configuration workflow
 

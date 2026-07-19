@@ -2112,13 +2112,33 @@ impl Agent {
         let is_error = output.is_error;
         let images = output.images;
         let tool_impl = self.tool(tool);
-        let content = if is_error {
-            output.content
-        } else {
-            match tool_impl {
-                Some(tool) => tool.compact_success_output(output.content),
-                None => output.content,
+        let shortened = (!is_error)
+            .then(|| tool_impl?.compact_success_output(input, &output.content))
+            .flatten();
+        // The pointer back to the untouched text is appended here rather than
+        // by whoever shortened the output: a tool's reduction rules can come
+        // from repository-controlled data, and data must not be able to make
+        // its own removals invisible. Failing to save means keeping the
+        // original — a shortened output without a way back is never sent.
+        //
+        // It names the rule, and deliberately does not say how much was
+        // removed. A count is the wrong signal in both directions: a big one
+        // usually means progress spam, and acting on it costs back everything
+        // the reduction saved plus a round trip, while a small one can still
+        // have taken something that mattered. The rule's name answers the
+        // question a count only seems to.
+        let content = match shortened {
+            Some(short) => {
+                let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
+                match blobs.save(tool, &output.content) {
+                    Some(path) => format!(
+                        "{}\n[filtered by {}: full output at {path}]",
+                        short.text, short.by
+                    ),
+                    None => output.content,
+                }
             }
+            None => output.content,
         };
         let gates = tool_impl.is_none_or(|tool| tool.gates_output_for(input));
         if !gates {

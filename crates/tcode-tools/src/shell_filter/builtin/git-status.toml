@@ -1,0 +1,68 @@
+[filters.git-status]
+description = "Drop git status's `(use \"git ...\")` hints, which are UI for a human at a terminal"
+match_command = "\\bgit\\s+status\\b"
+# The porcelain forms carry no hints; filtering them would only cost a spill
+# file for removing nothing.
+exclude_command = "--porcelain|--short|--long|(^|\\s)-s(\\s|$)"
+strip_ansi = true
+# One rule for both shapes the hint takes: a line of its own, and a suffix on
+# a line that also says something ("no changes added to commit (use …)").
+replace = [
+  { pattern = "\\s*\\(use \"git[^)]*\\)\\s*$", replacement = "" },
+]
+strip_lines_matching = ["^\\s*$"]
+
+[[tests.git-status]]
+name = "standalone hints go, the file list stays"
+input = """
+On branch main
+Your branch is ahead of 'origin/main' by 6 commits.
+  (use "git push" to publish your local commits)
+
+Changes not staged for commit:
+  (use "git add <file>..." to update what will be committed)
+  (use "git restore <file>..." to discard changes in working directory)
+\tmodified:   Cargo.toml
+\tmodified:   src/main.rs
+
+no changes added to commit (use "git add" and/or "git commit -a")
+"""
+expected = """
+On branch main
+Your branch is ahead of 'origin/main' by 6 commits.
+Changes not staged for commit:
+\tmodified:   Cargo.toml
+\tmodified:   src/main.rs
+no changes added to commit\
+"""
+
+[[tests.git-status]]
+name = "a trailing hint is removed without losing what the line said"
+input = """
+On branch main
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+\tnotes.md
+
+nothing added to commit but untracked files present (use "git add" to track)
+"""
+expected = """
+On branch main
+Untracked files:
+\tnotes.md
+nothing added to commit but untracked files present\
+"""
+
+[[tests.git-status]]
+name = "a clean tree keeps its answer"
+input = """
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+"""
+expected = """
+On branch main
+Your branch is up to date with 'origin/main'.
+nothing to commit, working tree clean\
+"""

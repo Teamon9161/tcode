@@ -1,0 +1,58 @@
+[filters.pytest]
+description = "Drop pytest's environment header; keep the progress lines and the summary"
+match_command = "\\b(pytest|py\\.test|python -m pytest|python3 -m pytest|uv run pytest)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^=+ test session starts =+$",
+  "^(platform \\w+ -- Python|cachedir:|rootdir:|configfile:|testpaths:|plugins:|collecting|collected )",
+]
+
+[[tests.pytest]]
+name = "the header is the same every run and pays for itself every run"
+input = """
+============================= test session starts ==============================
+platform linux -- Python 3.11.6, pytest-7.4.3, pluggy-1.3.0
+cachedir: .pytest_cache
+rootdir: /home/u/proj
+configfile: pyproject.toml
+plugins: cov-4.1.0, anyio-4.1.0
+collected 42 items
+
+tests/test_api.py ...... [ 52%]
+tests/test_db.py .... [100%]
+
+============================== 42 passed in 1.23s ==============================
+"""
+expected = """
+tests/test_api.py ...... [ 52%]
+tests/test_db.py .... [100%]
+============================== 42 passed in 1.23s ==============================\
+"""
+
+[[tests.pytest]]
+name = "a failure report is not header"
+input = """
+============================= test session starts ==============================
+platform linux -- Python 3.11.6, pytest-7.4.3, pluggy-1.3.0
+rootdir: /home/u/proj
+collected 2 items
+
+tests/test_api.py .F [100%]
+
+=================================== FAILURES ===================================
+______________________________ test_returns_json _______________________________
+E       assert 500 == 200
+=========================== short test summary info ============================
+FAILED tests/test_api.py::test_returns_json - assert 500 == 200
+========================= 1 failed, 1 passed in 0.31s ==========================
+"""
+expected = """
+tests/test_api.py .F [100%]
+=================================== FAILURES ===================================
+______________________________ test_returns_json _______________________________
+E       assert 500 == 200
+=========================== short test summary info ============================
+FAILED tests/test_api.py::test_returns_json - assert 500 == 200
+========================= 1 failed, 1 passed in 0.31s ==========================\
+"""

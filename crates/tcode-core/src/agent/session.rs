@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::config::FolderTrust;
+use crate::cwd_scope::{CwdScoped, CwdScopes};
 use crate::environment::{EnvironmentSnapshot, StartupContext};
 use crate::ledger::Ledger;
 use crate::permission::{PermissionMode, PermissionRules};
@@ -120,6 +121,10 @@ pub struct CwdChange {
     /// Memory discovered for the target directory. The command combines this
     /// with the structured environment diff into one append-only Note.
     pub memory_note: Option<String>,
+    /// What the re-derived `CwdScoped` state has to say about the new
+    /// directory. Shown to the user; never sent to the model, since it
+    /// describes harness configuration rather than the conversation.
+    pub scope_notes: Vec<String>,
 }
 
 /// Mutable per-conversation state.
@@ -195,6 +200,9 @@ pub struct Session {
     /// construction. They only change as part of a full conversation
     /// replacement, which also changes the provider cache scope.
     prompt_variables: PromptVariables,
+    /// State the frontend derived from the working directory, re-derived by
+    /// `change_cwd`. See `CwdScoped` for what belongs here and what must not.
+    cwd_scopes: CwdScopes,
 }
 
 impl Session {
@@ -248,7 +256,15 @@ impl Session {
             pending_environment_delivery: false,
             pending_memory_note: None,
             prompt_variables,
+            cwd_scopes: CwdScopes::default(),
         }
+    }
+
+    /// Register state that has to follow the working directory. Anything
+    /// registered is re-derived by every `change_cwd`; read `CwdScoped` before
+    /// adding one, since some cwd-derived state cannot be swapped mid-session.
+    pub fn register_cwd_scope(&mut self, scoped: Arc<dyn CwdScoped>) {
+        self.cwd_scopes.push(scoped);
     }
 
     /// Names this session's provider cache scope. Every conversation that is
@@ -582,6 +598,7 @@ impl Session {
                 changed: false,
                 refresh_opening_context: false,
                 memory_note: None,
+                scope_notes: Vec::new(),
             });
         };
         if same_path(&old, &new) {
@@ -591,11 +608,16 @@ impl Session {
                 changed: false,
                 refresh_opening_context: false,
                 memory_note: None,
+                scope_notes: Vec::new(),
             });
         }
 
         let refresh_opening_context = self.ledger.is_empty();
         self.tool_ctx.cwd = new.clone();
+        // One place, for every registered scope, on every real change — so a
+        // capability discovered from the project directory cannot go on
+        // answering from the directory the process happened to start in.
+        let scope_notes = self.cwd_scopes.rescope_all(&new);
         if refresh_opening_context {
             self.tool_ctx.memory = std::sync::Mutex::new(crate::MemoryManager::new(&new));
             self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
@@ -605,6 +627,7 @@ impl Session {
                 changed: true,
                 refresh_opening_context: true,
                 memory_note: None,
+                scope_notes,
             });
         }
 
@@ -621,6 +644,7 @@ impl Session {
             changed: true,
             refresh_opening_context: false,
             memory_note,
+            scope_notes,
         })
     }
 
@@ -702,7 +726,10 @@ fn path_key(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::Session;
+    use crate::cwd_scope::CwdScoped;
     use crate::{Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn three_auto_mode_classifier_failures_pause_to_default() {
@@ -855,6 +882,42 @@ mod tests {
         assert!(session
             .classifier_cache_scope()
             .starts_with("auto-classifier:main:resumed-session:"));
+    }
+
+    /// Registration is the whole mechanism: a frontend that registers its
+    /// cwd-derived state gets it re-derived without remembering to, and only
+    /// when the directory actually moved.
+    #[test]
+    fn change_cwd_rederives_registered_scopes() {
+        struct Seen(Mutex<Vec<PathBuf>>);
+        impl CwdScoped for Seen {
+            fn rescope(&self, cwd: &Path) -> Vec<String> {
+                self.0.lock().unwrap().push(cwd.to_path_buf());
+                Vec::new()
+            }
+        }
+
+        let root = std::env::temp_dir().join(format!("tcode-cd-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("child")).unwrap();
+        let root = root.canonicalize().unwrap();
+        let child = root.join("child").canonicalize().unwrap();
+
+        let mut session = Session::new(
+            ToolCtx::new(root.clone(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        let seen = Arc::new(Seen(Mutex::new(Vec::new())));
+        session.register_cwd_scope(seen.clone());
+
+        session.change_cwd("child").unwrap();
+        // Same directory again: nothing moved, so nothing is re-derived.
+        session.change_cwd(".").unwrap();
+        session.change_cwd("..").unwrap();
+
+        assert_eq!(*seen.0.lock().unwrap(), [child, root.clone()]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

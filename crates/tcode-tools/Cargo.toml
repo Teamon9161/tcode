@@ -8,7 +8,10 @@ tcode-core = { path = "../tcode-core" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
+regex = { workspace = true }
+serde = { workspace = true }
 serde_json = { workspace = true }
+toml = { workspace = true }
 serde_yaml = { workspace = true }
 dirs = { workspace = true }
 grep-regex = "0.1"

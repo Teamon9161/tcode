@@ -1,0 +1,49 @@
+[filters.git-transfer]
+description = "Drop object-transfer progress from git clone/fetch/pull/push"
+match_command = "\\bgit\\s+(clone|fetch|pull|push)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^(remote: )?(Enumerating|Counting|Compressing|Total|Receiving|Resolving|Unpacking|Writing) ",
+]
+
+[[tests.git-transfer]]
+name = "a clone keeps only what happened"
+input = """
+Cloning into 'rtk'...
+remote: Enumerating objects: 12043, done.
+remote: Counting objects: 100% (1204/1204), done.
+remote: Compressing objects: 100% (567/567), done.
+remote: Total 12043 (delta 800), reused 1100 (delta 700), pack-reused 10839
+Receiving objects: 100% (12043/12043), 21.10 MiB | 5.00 MiB/s, done.
+Resolving deltas: 100% (8001/8001), done.
+"""
+expected = "Cloning into 'rtk'..."
+
+[[tests.git-transfer]]
+name = "a push keeps the branch mapping and any hook output"
+input = """
+Enumerating objects: 5, done.
+Counting objects: 100% (5/5), done.
+Writing objects: 100% (3/3), 312 bytes | 312.00 KiB/s, done.
+Total 3 (delta 2), reused 0 (delta 0)
+remote: Resolving deltas: 100% (2/2), completed with 2 local objects.
+To github.com:example/repo.git
+   899be63..a1b2c3d  main -> main
+"""
+expected = """
+To github.com:example/repo.git
+   899be63..a1b2c3d  main -> main\
+"""
+
+[[tests.git-transfer]]
+name = "a failure is left whole"
+input = """
+Enumerating objects: 5, done.
+error: failed to push some refs to 'github.com:example/repo.git'
+hint: Updates were rejected because the remote contains work that you do not
+"""
+expected = """
+error: failed to push some refs to 'github.com:example/repo.git'
+hint: Updates were rejected because the remote contains work that you do not\
+"""

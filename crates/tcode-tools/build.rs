@@ -31,12 +31,46 @@ fn skill_files(dir: &Path) -> Vec<PathBuf> {
     files
 }
 
+/// Concatenate the built-in shell output filters into one TOML document, in
+/// name order so the embedded blob is reproducible. Each file defines one
+/// filter and its inline tests; the test suite parses this blob and runs them.
+fn filter_blob(dir: &Path) -> String {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", dir.display()))
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "toml")
+        })
+        .collect();
+    files.sort();
+    assert!(
+        !files.is_empty(),
+        "{} contains no builtin filters",
+        dir.display()
+    );
+    let mut blob = String::new();
+    for file in files {
+        println!("cargo:rerun-if-changed={}", file.display());
+        blob.push_str(&format!(
+            "# --- {} ---\n",
+            file.file_name().unwrap().to_string_lossy()
+        ));
+        blob.push_str(&fs::read_to_string(&file).expect("read builtin filter"));
+        blob.push('\n');
+    }
+    blob
+}
+
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("manifest directory"));
     let agent_dir = manifest_dir.join("src/agent/builtin");
     let skill_dir = manifest_dir.join("src/skills/builtin");
+    let filter_dir = manifest_dir.join("src/shell_filter/builtin");
     println!("cargo:rerun-if-changed={}", agent_dir.display());
     println!("cargo:rerun-if-changed={}", skill_dir.display());
+    println!("cargo:rerun-if-changed={}", filter_dir.display());
 
     let agents = markdown_files(&agent_dir);
     assert!(
@@ -81,4 +115,9 @@ fn main() {
         .expect("write builtin agent manifest");
     fs::write(out_dir.join("builtin_skills.rs"), skill_manifest)
         .expect("write builtin skill manifest");
+    fs::write(
+        out_dir.join("builtin_filters.toml"),
+        filter_blob(&filter_dir),
+    )
+    .expect("write builtin filter blob");
 }

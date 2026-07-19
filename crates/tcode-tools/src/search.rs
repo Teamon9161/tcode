@@ -17,9 +17,10 @@ const DEFAULT_MATCH_LIMIT: usize = 200;
 /// match *count*; this bounds the *bytes* per match.
 const MAX_LINE_BYTES: usize = 512;
 /// grep never reads files larger than this — content search over multi-MB
-/// files is both slow and useless. Applies to grep only, not glob (name
+/// files is both slow and useless. This still admits ordinary source files
+/// when a narrow glob selects them. Applies to grep only, not glob (name
 /// search must still find large files).
-const MAX_FILE_BYTES: u64 = 256 * 1024;
+const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Ceiling on -A/-B/-C context so a wide window over many matches cannot
 /// balloon the (un-gated) grep output.
 const MAX_CONTEXT: u64 = 30;
@@ -234,7 +235,8 @@ impl Tool for GrepTool {
          `before` (-B) or `after` (-A) — one search with context often gives \
          you enough to edit without a follow-up read. Filter files with \
          `glob`; cap matches with head_limit (default 200) and page with \
-         offset."
+         offset. Skips files over 512 KiB and built/cache directories; reports \
+         oversized skips when they explain an empty result."
     }
 
     fn input_schema(&self) -> Value {
@@ -324,12 +326,11 @@ impl Tool for GrepTool {
             let groups: Mutex<Vec<Group>> = Mutex::new(Vec::new());
             let count = AtomicUsize::new(0);
             let files = AtomicUsize::new(0);
+            let skipped_oversized = AtomicUsize::new(0);
             let timed_out = AtomicBool::new(false);
             let start = Instant::now();
 
-            let mut builder = walk_builder(&base);
-            builder.max_filesize(Some(MAX_FILE_BYTES));
-            builder.build_parallel().run(|| {
+            walk_builder(&base).build_parallel().run(|| {
                 let mut searcher = SearcherBuilder::new()
                     .line_number(true)
                     .before_context(before)
@@ -342,6 +343,7 @@ impl Tool for GrepTool {
                 let groups = &groups;
                 let count = &count;
                 let files = &files;
+                let skipped_oversized = &skipped_oversized;
                 let timed_out = &timed_out;
                 let cancel = &cancel;
                 Box::new(move |result| {
@@ -365,6 +367,13 @@ impl Tool for GrepTool {
                             return WalkState::Continue;
                         }
                     }
+                    if entry
+                        .metadata()
+                        .is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES)
+                    {
+                        skipped_oversized.fetch_add(1, Ordering::Relaxed);
+                        return WalkState::Continue;
+                    }
                     files.fetch_add(1, Ordering::Relaxed);
                     let mut sink = GroupSink {
                         file: rel_display(path, cwd),
@@ -385,6 +394,7 @@ impl Tool for GrepTool {
             groups.sort_by(|a, b| a.file.cmp(&b.file).then(a.first.cmp(&b.first)));
             let total: usize = groups.iter().map(|g| g.matches).sum();
             let files = files.load(Ordering::Relaxed);
+            let skipped_oversized = skipped_oversized.load(Ordering::Relaxed);
             let timed_out = timed_out.load(Ordering::Relaxed);
 
             // Page by *matches*: keep whole groups that overlap the window so
@@ -406,6 +416,14 @@ impl Tool for GrepTool {
             if selected.is_empty() {
                 let mut m =
                     format!("no matches for /{pattern}/ ({files} files scanned{glob_note})");
+                if skipped_oversized > 0 {
+                    let noun = if skipped_oversized == 1 { "file" } else { "files" };
+                    m.push_str(&format!(
+                        "\n[{skipped_oversized} {noun} over {} KiB skipped — narrow `path` and use `read`, or use shell for an unbounded search]",
+                        MAX_FILE_BYTES / 1024
+                    ));
+                }
+                m.push_str("\n[.gitignore entries and built/cache directories are excluded]");
                 if timed_out {
                     m.push_str(&format!(
                         "\n[search timed out after {}s before finishing — narrow the path or glob]",
@@ -690,6 +708,33 @@ mod tests {
         )
         .await;
         assert!(out.ends_with("app.rs:1: TARGET"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_glob_searches_source_files_over_the_legacy_size_limit() {
+        let dir = scratch("large-glob", "");
+        let content = format!("{}\nTARGET\n", "x".repeat(256 * 1024));
+        std::fs::write(dir.join("large.rs"), content).unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET", "glob": "large.rs" })).await;
+        assert!(out.ends_with("large.rs:2: TARGET"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_files_skipped_by_its_size_limit() {
+        let dir = scratch("oversized", "");
+        let content = format!("{}\nTARGET\n", "x".repeat(MAX_FILE_BYTES as usize));
+        std::fs::write(dir.join("large.rs"), content).unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET", "glob": "large.rs" })).await;
+        assert!(out.starts_with("no matches for /TARGET/ (0 files scanned, glob large.rs)"));
+        assert!(out.contains("[1 file over 512 KiB skipped"), "{out}");
+        assert!(
+            out.contains("[.gitignore entries and built/cache directories are excluded]"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

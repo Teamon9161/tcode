@@ -1,0 +1,37 @@
+[filters.pip-install]
+description = "Drop pip's per-package resolution and download lines; keep what was installed"
+match_command = "\\b(pip|pip3|uv pip|python -m pip|python3 -m pip)\\s+(install|uninstall)\\b"
+strip_ansi = true
+strip_lines_matching = [
+  "^\\s*$",
+  "^\\s*(Collecting|Downloading|Using cached|Requirement already satisfied|Obtaining|Preparing metadata|Building wheel|Created wheel|Stored in directory|Saved |Getting requirements)",
+  "^\\s*Installing collected packages:",
+  "^\\[notice\\]",
+]
+
+[[tests.pip-install]]
+name = "resolution noise goes, the installed set stays"
+input = """
+Collecting requests
+  Downloading requests-2.31.0-py3-none-any.whl (62 kB)
+Collecting certifi>=2017.4.17
+  Using cached certifi-2023.11.17-py3-none-any.whl (162 kB)
+Requirement already satisfied: idna<4 in ./venv/lib/python3.11/site-packages (3.6)
+Installing collected packages: certifi, requests
+Successfully installed certifi-2023.11.17 requests-2.31.0
+
+[notice] A new release of pip is available: 23.3.1 -> 24.0
+"""
+expected = "Successfully installed certifi-2023.11.17 requests-2.31.0"
+
+[[tests.pip-install]]
+name = "a resolver error survives"
+input = """
+Collecting requests==99.0
+ERROR: Could not find a version that satisfies the requirement requests==99.0
+ERROR: No matching distribution found for requests==99.0
+"""
+expected = """
+ERROR: Could not find a version that satisfies the requirement requests==99.0
+ERROR: No matching distribution found for requests==99.0\
+"""

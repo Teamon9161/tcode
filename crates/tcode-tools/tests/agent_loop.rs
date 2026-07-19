@@ -906,11 +906,32 @@ async fn shell_tool_runs_and_reports_exit_code() {
 #[tokio::test]
 async fn shell_tool_preserves_each_successful_test_target_in_a_chain() {
     let dir = tempfile::tempdir().unwrap();
+    // The shape of a real `cargo test --workspace`: the targets that ran tests
+    // are the evidence, the empty ones and the build chatter are the
+    // repetition the fold exists to remove.
+    let lines = [
+        "   Compiling tcode-core v0.1.8",
+        "    Finished `test` profile in 4.2s",
+        "running 2 tests",
+        "test result: ok. 2 passed; 0 failed; 0 ignored",
+        "running 0 tests",
+        "test result: ok. 0 passed; 0 failed; 0 ignored",
+        "running 3 tests",
+        "test result: ok. 3 passed; 0 failed; 0 ignored",
+        "running 0 tests",
+        "test result: ok. 0 passed; 0 failed; 0 ignored",
+    ];
+    let quoted: Vec<String> = lines.iter().map(|line| format!("'{line}'")).collect();
     let command = if cfg!(windows) {
-        "Write-Output 'running 2 tests'; Write-Output 'test result: ok. 2 passed; 0 failed'; Write-Output 'running 3 tests'; Write-Output 'test result: ok. 3 passed; 0 failed'"
+        quoted
+            .iter()
+            .map(|line| format!("Write-Output {line}"))
+            .collect::<Vec<_>>()
+            .join("; ")
     } else {
-        "printf '%s\\n' 'running 2 tests' 'test result: ok. 2 passed; 0 failed' && printf '%s\\n' 'running 3 tests' 'test result: ok. 3 passed; 0 failed'"
+        format!("printf '%s\\n' {}", quoted.join(" "))
     };
+    let command = command.as_str();
     let tool_name = platform_shell_tool();
     let provider = MockProvider::new(vec![
         tool_use(
@@ -933,6 +954,118 @@ async fn shell_tool_preserves_each_successful_test_target_in_a_chain() {
     assert!(result.0.contains("2 passed"), "{}", result.0);
     assert!(result.0.contains("3 passed"), "{}", result.0);
     assert!(result.0.contains("(exit code 0)"), "{}", result.0);
+
+    // Filtering is never a one-way door. The harness — not the filter —
+    // appends where the untouched output went, and that file really holds it.
+    let path = saved_filter_path(&result.0);
+    let full = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+    assert!(full.contains("running 0 tests"), "{full}");
+    assert!(full.contains("(exit code 0)"), "{full}");
+}
+
+/// The path in the pointer line the gate appends when a filter shortened a
+/// successful output.
+fn saved_filter_path(output: &str) -> String {
+    let marker = "full output at ";
+    let start = output
+        .rfind(marker)
+        .unwrap_or_else(|| panic!("no pointer line in: {output}"))
+        + marker.len();
+    let rest = &output[start..];
+    rest[..rest.find(']').expect("terminated pointer line")].to_string()
+}
+
+/// An agent whose `shell` filters come from `dir` — the composition root's
+/// job, done here so a test can put a `.tcode/filters.toml` in front of it.
+fn agent_rooted_at(provider: Arc<MockProvider>, dir: &std::path::Path) -> Agent {
+    Agent {
+        tools: tcode_tools::builtin_tools(dir),
+        ..agent(provider)
+    }
+}
+
+/// A repository's own `filters.toml` outranks the built-in of the same name.
+/// This is the extension point: a project describes its own noisy commands
+/// without rebuilding the harness.
+#[tokio::test]
+async fn a_project_filter_shadows_the_builtin_and_output_is_recoverable() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join(".tcode")).unwrap();
+    std::fs::write(
+        dir.path().join(".tcode").join("filters.toml"),
+        "[filters.cargo-build]\nmatch_command = \"noisy-marker\"\n\
+         strip_lines_matching = [\"^chatter\"]\n",
+    )
+    .unwrap();
+
+    let command = if cfg!(windows) {
+        "Write-Output 'chatter one'; Write-Output 'chatter two'; Write-Output 'kept line'; Write-Output '# noisy-marker'"
+    } else {
+        "printf '%s\\n' 'chatter one' 'chatter two' 'kept line' '# noisy-marker'"
+    };
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": command }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let agent = agent_rooted_at(provider, dir.path());
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "run the noisy command").await;
+
+    let result = &tool_results(&session)[0];
+    assert!(!result.1, "{}", result.0);
+    assert!(!result.0.contains("chatter"), "{}", result.0);
+    assert!(result.0.contains("kept line"), "{}", result.0);
+    assert!(result.0.contains("(exit code 0)"), "{}", result.0);
+
+    let full = std::fs::read_to_string(saved_filter_path(&result.0)).unwrap();
+    assert!(
+        full.contains("chatter one") && full.contains("chatter two"),
+        "{full}"
+    );
+}
+
+/// `ShellFilters::disabled()` is what `[limits] shell_output_filters = false`
+/// builds. Nothing is filtered, and nothing is spilled to explain a filtering
+/// that did not happen.
+#[tokio::test]
+async fn disabled_filters_let_every_successful_output_through() {
+    let dir = tempfile::tempdir().unwrap();
+    let command = if cfg!(windows) {
+        "Write-Output 'running 2 tests'; Write-Output 'test result: ok. 2 passed; 0 failed'"
+    } else {
+        "printf '%s\\n' 'running 2 tests' 'test result: ok. 2 passed; 0 failed'"
+    };
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            platform_shell_tool(),
+            &serde_json::json!({ "command": command }).to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let agent = Agent {
+        tools: tcode_tools::builtin_tools_with_skills_and_web_fetch(
+            Vec::new(),
+            tcode_tools::WebFetchTool::new(tcode_tools::trusted_read_hosts(Vec::new())),
+            Arc::new(tcode_tools::ShellFilters::disabled()),
+        ),
+        ..agent(provider)
+    };
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "run the tests").await;
+
+    let result = &tool_results(&session)[0];
+    assert!(!result.0.contains("[filtered:"), "{}", result.0);
+    assert!(!result.0.contains("folded"), "{}", result.0);
+    assert!(result.0.contains("running 2 tests"), "{}", result.0);
 }
 
 #[tokio::test]

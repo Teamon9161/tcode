@@ -7,6 +7,7 @@ pub mod blobs;
 pub mod checkpoint;
 pub mod commands;
 pub mod config;
+pub mod cwd_scope;
 pub mod environment;
 pub mod export;
 pub mod freshness;
@@ -36,6 +37,7 @@ pub use auto_mode::{
 pub use background::{BackgroundTasks, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
 pub use config::FolderTrust;
+pub use cwd_scope::{CwdScoped, CwdScopes};
 pub use environment::{EnvironmentSnapshot, GitSnapshot, StartupContext};
 pub use export::export_markdown;
 pub use hooks::{HookDef, HookEvent, Hooks};
@@ -51,5 +53,7 @@ pub use references::{expand_references, index_project, ReferenceCandidate, Refer
 pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use task_trace::{TaskRunLoad, TaskRunMeta, TaskRunStatus, TaskTraces, TraceStore};
 pub use template::PromptVariables;
-pub use tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolCtx, ToolOutput};
+pub use tool::{
+    BatchPolicy, Compacted, DelegateEvent, PermissionRequest, Tool, ToolCtx, ToolOutput,
+};
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

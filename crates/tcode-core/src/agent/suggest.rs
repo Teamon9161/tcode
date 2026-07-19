@@ -58,6 +58,42 @@ const ASK: &str = "What do I type next?";
 /// user starts typing, so it must not borrow the session.
 pub struct SuggestRequest {
     messages: Vec<Message>,
+    expected_script: Option<WritingSystem>,
+}
+
+/// The small set of writing systems that need a guard against a model switching
+/// languages mid-suggestion. Latin remains allowed alongside every one for code
+/// identifiers and technical terms.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WritingSystem {
+    Latin,
+    Han,
+    Japanese,
+    Hangul,
+    Cyrillic,
+    Arabic,
+    Devanagari,
+    Greek,
+    Hebrew,
+    Thai,
+}
+
+impl WritingSystem {
+    fn of(c: char) -> Option<Self> {
+        match c {
+            'A'..='Z' | 'a'..='z' | '\u{00c0}'..='\u{024f}' => Some(Self::Latin),
+            '\u{4e00}'..='\u{9fff}' | '\u{3400}'..='\u{4dbf}' => Some(Self::Han),
+            '\u{3040}'..='\u{30ff}' => Some(Self::Japanese),
+            '\u{ac00}'..='\u{d7af}' | '\u{1100}'..='\u{11ff}' => Some(Self::Hangul),
+            '\u{0400}'..='\u{052f}' => Some(Self::Cyrillic),
+            '\u{0600}'..='\u{06ff}' | '\u{0750}'..='\u{077f}' => Some(Self::Arabic),
+            '\u{0900}'..='\u{097f}' => Some(Self::Devanagari),
+            '\u{0370}'..='\u{03ff}' => Some(Self::Greek),
+            '\u{0590}'..='\u{05ff}' => Some(Self::Hebrew),
+            '\u{0e00}'..='\u{0e7f}' => Some(Self::Thai),
+            _ => None,
+        }
+    }
 }
 
 impl Agent {
@@ -73,6 +109,7 @@ impl Agent {
         if exchanges.is_empty() {
             return None;
         }
+        let expected_script = dominant_script(&exchanges.last()?.0);
         let mut messages = Vec::with_capacity(exchanges.len() * 2 + 1);
         for (asked, answered) in exchanges {
             messages.push(text_message(Role::User, head(&asked, ASKED_HEAD)));
@@ -82,7 +119,10 @@ impl Agent {
             ));
         }
         messages.push(text_message(Role::User, ASK.to_string()));
-        Some(SuggestRequest { messages })
+        Some(SuggestRequest {
+            messages,
+            expected_script,
+        })
     }
 
     /// Every failure mode is the same failure mode: no suggestion. A dead
@@ -105,6 +145,7 @@ impl Agent {
             max_tokens: SUGGEST_MAX_TOKENS,
             effort: Some("off".into()),
         };
+        let expected_script = req.expected_script;
         let guess = async {
             let mut stream = model.provider.stream(request, cancel).await.ok()?;
             let mut text = String::new();
@@ -115,7 +156,7 @@ impl Agent {
                     _ => {}
                 }
             }
-            clean(&text)
+            clean(&text, expected_script)
         };
         tokio::time::timeout(SUGGEST_TIMEOUT, guess).await.ok()?
     }
@@ -207,17 +248,47 @@ fn head(text: &str, limit: usize) -> String {
 }
 
 /// One undecorated line, or nothing. A model that answers with prose, a
-/// refusal, or a paragraph yields no suggestion rather than a bad one.
-fn clean(text: &str) -> Option<String> {
+/// refusal, a paragraph, controls, or an unexpected writing system yields no
+/// suggestion rather than a misleading ghost prompt.
+fn clean(text: &str, expected_script: Option<WritingSystem>) -> Option<String> {
     let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
     let line = line
         .trim_matches(|c| c == '"' || c == '`' || c == '\'')
         .trim();
     let long = line.chars().count() > MAX_CHARS;
-    if line.is_empty() || long || line.eq_ignore_ascii_case("none") {
+    if line.is_empty()
+        || long
+        || line.eq_ignore_ascii_case("none")
+        || line.chars().any(char::is_control)
+        || !uses_expected_script(line, expected_script)
+    {
         return None;
     }
     Some(line.to_string())
+}
+
+fn dominant_script(text: &str) -> Option<WritingSystem> {
+    let mut counts = std::collections::BTreeMap::<u8, (WritingSystem, usize)>::new();
+    for system in text.chars().filter_map(WritingSystem::of) {
+        let key = system as u8;
+        let entry = counts.entry(key).or_insert((system, 0));
+        entry.1 += 1;
+    }
+    counts
+        .into_values()
+        .max_by_key(|(_, count)| *count)
+        .map(|(system, _)| system)
+}
+
+fn uses_expected_script(text: &str, expected: Option<WritingSystem>) -> bool {
+    let Some(expected) = expected else {
+        return true;
+    };
+    text.chars().filter_map(WritingSystem::of).all(|actual| {
+        actual == expected
+            || actual == WritingSystem::Latin
+            || (expected == WritingSystem::Japanese && actual == WritingSystem::Han)
+    })
 }
 
 #[cfg(test)]
@@ -235,14 +306,32 @@ mod tests {
 
     #[test]
     fn only_a_bare_one_line_instruction_becomes_a_suggestion() {
-        assert_eq!(clean("run the tests"), Some("run the tests".into()));
         assert_eq!(
-            clean("\n\"fix the failing test\"\n"),
+            clean("run the tests", Some(WritingSystem::Latin)),
+            Some("run the tests".into())
+        );
+        assert_eq!(
+            clean("\n\"fix the failing test\"\n", Some(WritingSystem::Latin)),
             Some("fix the failing test".into())
         );
-        assert_eq!(clean("NONE"), None);
-        assert_eq!(clean(""), None);
-        assert_eq!(clean(&"x".repeat(MAX_CHARS + 1)), None);
+        assert_eq!(clean("NONE", Some(WritingSystem::Latin)), None);
+        assert_eq!(clean("", Some(WritingSystem::Latin)), None);
+        assert_eq!(
+            clean(&"x".repeat(MAX_CHARS + 1), Some(WritingSystem::Latin)),
+            None
+        );
+    }
+
+    #[test]
+    fn suggestion_rejects_a_foreign_script_or_control_char() {
+        assert_eq!(dominant_script("修复这个问题"), Some(WritingSystem::Han));
+        assert_eq!(
+            clean("修复这个问题", Some(WritingSystem::Han)),
+            Some("修复这个问题".into())
+        );
+        assert_eq!(clean("修复这个问题 끝", Some(WritingSystem::Han)), None);
+        assert_eq!(clean("fix it 修复", Some(WritingSystem::Latin)), None);
+        assert_eq!(clean("fix\u{0007} it", Some(WritingSystem::Latin)), None);
     }
 
     /// The spine is prose only: no tool calls, no tool results, no mid-turn

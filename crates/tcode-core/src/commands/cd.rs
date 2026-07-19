@@ -1,4 +1,4 @@
-use super::{CommandCtx, CommandOutcome, SlashCommand};
+use super::{CommandCtx, CommandMessage, CommandOutcome, MessageKind, SlashCommand};
 
 pub struct CdCommand;
 
@@ -23,12 +23,21 @@ impl SlashCommand for CdCommand {
                     ctx.session
                         .sync_environment(environment, change.memory_note);
                 }
-                if change.changed {
-                    let _ = std::env::set_current_dir(&change.new);
-                    CommandOutcome::info(format!("cwd → {}", change.new.display()))
-                } else {
-                    CommandOutcome::info(format!("cwd: {}", change.new.display()))
+                if !change.changed {
+                    return CommandOutcome::info(format!("cwd: {}", change.new.display()));
                 }
+                let _ = std::env::set_current_dir(&change.new);
+                let mut outcome = CommandOutcome::info(format!("cwd → {}", change.new.display()));
+                // What the new directory's configuration had to say. Silence
+                // here would leave the user guessing why rules they can see in
+                // the repository are doing nothing.
+                for note in change.scope_notes {
+                    outcome.messages.push(CommandMessage {
+                        kind: MessageKind::Note,
+                        text: note,
+                    });
+                }
+                outcome
             }
             Err(e) => CommandOutcome::error(e),
         }
