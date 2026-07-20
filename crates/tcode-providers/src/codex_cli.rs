@@ -73,7 +73,7 @@ pub(crate) fn save_tokens(access_token: &str, refresh_token: &str, id_token: Opt
 /// user models always win over the CLI cache and fallback list.
 pub fn hydrate_codex_models(config: &mut Config) {
     for profile in config.profiles.values_mut() {
-        if profile.provider == ProviderKind::Codex
+        if profile.provider == Some(ProviderKind::Codex)
             && profile.models.is_empty()
             && profile.model.is_none()
         {

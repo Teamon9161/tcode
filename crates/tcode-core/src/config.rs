@@ -26,6 +26,10 @@ pub enum ConfigError {
     MissingApiKey { profile: String, var: String },
     #[error("profile '{0}' has no models configured")]
     NoModels(String),
+    #[error(
+        "profile '{0}' has no provider (set `provider = \"anthropic\" | \"openai\" | \"codex\"`)"
+    )]
+    NoProvider(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,7 +89,13 @@ impl ModelDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Profile {
-    pub provider: ProviderKind,
+    /// Absent in a *layer*: this file only overrides parts of a profile the
+    /// layer below already defines. Every field here is optional for the same
+    /// reason — a user config that only carries `api_key` must parse, and
+    /// completeness is checked once, after all layers are merged
+    /// (`Config::validate`), not per file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<ProviderKind>,
     /// Single-model shorthand; merged after `models` entries.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
@@ -113,7 +123,7 @@ impl Profile {
     /// provider-default) environment variable. ChatGPT profiles don't
     /// use API keys at all.
     pub fn api_key(&self, profile_name: &str) -> Result<String, ConfigError> {
-        if self.provider == ProviderKind::Codex {
+        if self.provider == Some(ProviderKind::Codex) {
             return Ok(String::new());
         }
         if let Some(key) = &self.api_key {
@@ -121,8 +131,8 @@ impl Profile {
         }
         let var = self.api_key_env.clone().unwrap_or_else(|| {
             match self.provider {
-                ProviderKind::Anthropic => "ANTHROPIC_API_KEY",
-                ProviderKind::Openai | ProviderKind::Codex => "OPENAI_API_KEY",
+                Some(ProviderKind::Anthropic) | None => "ANTHROPIC_API_KEY",
+                Some(ProviderKind::Openai) | Some(ProviderKind::Codex) => "OPENAI_API_KEY",
             }
             .to_string()
         });
@@ -148,8 +158,10 @@ impl Profile {
     /// Overlay `over` onto self: scalar fields win when set; models merge
     /// by `name` (same name replaced, new name appended). This is how a
     /// user profile extends or overrides a same-named default profile.
-    fn merge(&mut self, over: Profile) {
-        self.provider = over.provider;
+    pub fn merge(&mut self, over: Profile) {
+        if over.provider.is_some() {
+            self.provider = over.provider;
+        }
         if over.model.is_some() {
             self.model = over.model;
         }
@@ -716,12 +728,7 @@ impl Config {
                 .unwrap_or_else(|| parent.profile.clone()),
             (None, None) => parent.profile.clone(),
         };
-        let profile = self.profiles.get(&name).ok_or_else(|| {
-            ConfigError::UnknownProfile(
-                name.clone(),
-                self.profiles.keys().cloned().collect::<Vec<_>>().join(", "),
-            )
-        })?;
+        let profile = self.complete_profile(&name)?;
         let defs = profile.model_defs();
         let model = match &over.model {
             // An unknown name is passed through verbatim, as `select` does:
@@ -762,12 +769,23 @@ impl Config {
             .or(self.default_profile.as_deref())
             .or_else(|| self.profiles.keys().next().map(|s| s.as_str()))
             .unwrap_or("anthropic");
-        match self.profiles.get(name) {
-            Some(p) => Ok((name.to_string(), p)),
-            None => Err(ConfigError::UnknownProfile(
+        self.complete_profile(name).map(|p| (name.to_string(), p))
+    }
+
+    /// Look up a profile that is fit to be used. Completeness is checked here,
+    /// on the merged result and only for the profile actually being selected:
+    /// an incomplete entry the user never selects is their business, and must
+    /// not keep the session from starting.
+    fn complete_profile(&self, name: &str) -> Result<&Profile, ConfigError> {
+        let profile = self.profiles.get(name).ok_or_else(|| {
+            ConfigError::UnknownProfile(
                 name.to_string(),
                 self.profiles.keys().cloned().collect::<Vec<_>>().join(", "),
-            )),
+            )
+        })?;
+        match profile.provider {
+            Some(_) => Ok(profile),
+            None => Err(ConfigError::NoProvider(name.to_string())),
         }
     }
 
@@ -781,8 +799,10 @@ impl Config {
         state: &ModelState,
     ) -> Result<Selection, ConfigError> {
         // --model without --profile searches every profile for the name.
+        // An incomplete profile is skipped rather than matched: it could not
+        // be built, and silently landing in it would report the wrong problem.
         if let (None, Some(m)) = (profile_flag, model_flag) {
-            for (name, p) in &self.profiles {
+            for (name, p) in self.profiles.iter().filter(|(_, p)| p.provider.is_some()) {
                 if let Some(def) = p.model_defs().into_iter().find(|d| d.name == m) {
                     return Ok(self.finish(name.clone(), def, None, state));
                 }
@@ -1167,6 +1187,70 @@ mod tests {
             .models
             .iter()
             .any(|m| m.name == "deepseek-v4-flash"));
+    }
+
+    /// Each config file is a patch, not a whole profile: adding a key to a
+    /// built-in profile must not require restating `provider` (and the layers
+    /// below must keep the provider they declared).
+    #[test]
+    fn a_layer_may_carry_only_an_api_key() {
+        let user: Config = toml::from_str(
+            r#"
+            [profiles.deepseek]
+            api_key = "sk-test"
+            "#,
+        )
+        .expect("a partial profile parses");
+
+        let mut config = Config::defaults();
+        let base = config.profiles["deepseek"].clone();
+        config.merge_global(user);
+
+        let deepseek = &config.profiles["deepseek"];
+        assert_eq!(deepseek.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(
+            deepseek.provider, base.provider,
+            "provider survives a patch"
+        );
+        assert_eq!(deepseek.base_url, base.base_url);
+        assert_eq!(deepseek.models.len(), base.models.len());
+        config.profile(Some("deepseek")).expect("usable");
+    }
+
+    /// A profile no layer ever completed is an error only for whoever selects
+    /// it: it names the offending profile, and — the reason the check is not
+    /// eager — leaving it in the file does not stop an unrelated profile from
+    /// starting a session.
+    #[test]
+    fn an_incomplete_profile_fails_only_when_it_is_the_one_selected() {
+        let mut config = Config::defaults();
+        config.merge_global(
+            toml::from_str(
+                r#"
+                default_profile = "deepseek"
+
+                [profiles.mystery]
+                api_key = "sk-test"
+                "#,
+            )
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            config.profile(Some("mystery")),
+            Err(ConfigError::NoProvider(name)) if name == "mystery"
+        ));
+        config
+            .select(None, None, &ModelState::default())
+            .expect("an unrelated incomplete profile must not block startup");
+        // Nor may it be reached by a bare `--model` search.
+        assert_eq!(
+            config
+                .select(None, Some("deepseek-v4-pro"), &ModelState::default())
+                .unwrap()
+                .profile,
+            "deepseek"
+        );
     }
 
     #[test]

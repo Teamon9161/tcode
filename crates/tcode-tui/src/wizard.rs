@@ -12,7 +12,7 @@ use crossterm::event::{
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use tcode_core::config::{presets, Config, ModelDef, ModelState, Profile, ProviderKind};
+use tcode_core::config::{Config, ModelDef, ModelState, Profile, ProviderKind};
 use tcode_providers::codex_auth_available;
 
 const CYAN: &str = "\x1b[36m";
@@ -40,69 +40,56 @@ impl Drop for RawGuard {
 }
 
 struct Candidate {
-    id: &'static str,
-    title: &'static str,
+    id: String,
+    title: String,
     status: String,
     detected: bool,
-    key_env: Option<&'static str>,
+    key_env: Option<String>,
 }
 
 fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Candidate> {
-    let env_or_inline = |var: &str, id: &str| {
-        if std::env::var(var).is_ok() {
-            (format!("{GREEN}${var}{RESET} ✓"), true)
-        } else if profiles.get(id).is_some_and(|p| p.api_key.is_some()) {
-            (format!("{GREEN}inline key{RESET} ✓"), true)
-        } else {
-            (format!("{DIM}not configured{RESET}"), false)
-        }
-    };
-    let codex_ok = codex_auth_available();
-    let (a_status, a_found) = env_or_inline("ANTHROPIC_API_KEY", "anthropic");
-    let (o_status, o_found) = env_or_inline("OPENAI_API_KEY", "openai");
-    let (d_status, d_found) = env_or_inline("DEEPSEEK_API_KEY", "deepseek");
-    let (r_status, r_found) = env_or_inline("OPENROUTER_API_KEY", "openrouter");
-    vec![
-        Candidate {
-            id: "codex",
-            title: "ChatGPT subscription (reuse Codex login)",
-            status: if codex_ok {
-                "~/.codex/auth.json ✓".into()
+    profiles
+        .iter()
+        .map(|(id, profile)| {
+            let key_env = profile.api_key_env.clone();
+            let (status, detected) = if profile.provider == Some(ProviderKind::Codex) {
+                let ok = codex_auth_available();
+                (
+                    if ok {
+                        "~/.codex/auth.json ✓".into()
+                    } else {
+                        "not logged in — run `codex login` first".into()
+                    },
+                    ok,
+                )
+            } else if let Some(ref var) = key_env {
+                if std::env::var(var).is_ok() {
+                    (format!("{GREEN}${var}{RESET} ✓"), true)
+                } else if profile.api_key.is_some() {
+                    (format!("{GREEN}inline key{RESET} ✓"), true)
+                } else {
+                    (format!("{DIM}not configured{RESET}"), false)
+                }
+            } else if profile.api_key.is_some() {
+                (format!("{GREEN}inline key{RESET} ✓"), true)
             } else {
-                "not logged in — run `codex login` first".into()
-            },
-            detected: codex_ok,
-            key_env: None,
-        },
-        Candidate {
-            id: "anthropic",
-            title: "Anthropic API",
-            status: a_status,
-            detected: a_found,
-            key_env: Some("ANTHROPIC_API_KEY"),
-        },
-        Candidate {
-            id: "openai",
-            title: "OpenAI API",
-            status: o_status,
-            detected: o_found,
-            key_env: Some("OPENAI_API_KEY"),
-        },
-        Candidate {
-            id: "deepseek",
-            title: "DeepSeek (Anthropic-compatible endpoint)",
-            status: d_status,
-            detected: d_found,
-            key_env: Some("DEEPSEEK_API_KEY"),
-        },
-        Candidate {
-            id: "openrouter",
-            title: "OpenRouter (Anthropic-compatible endpoint)",
-            status: r_status,
-            detected: r_found,
-            key_env: Some("OPENROUTER_API_KEY"),
-        },
-    ]
+                (format!("{DIM}not configured{RESET}"), false)
+            };
+            let provider_label = match profile.provider {
+                Some(ProviderKind::Anthropic) => "Anthropic",
+                Some(ProviderKind::Openai) => "OpenAI",
+                Some(ProviderKind::Codex) => "Codex",
+                None => "unset",
+            };
+            Candidate {
+                id: id.clone(),
+                title: format!("{id} ({provider_label})"),
+                status,
+                detected,
+                key_env,
+            }
+        })
+        .collect()
 }
 
 /// Returns None if the user cancelled. On success the caller writes the
@@ -136,9 +123,21 @@ fn run_with(
         "{DIM}keys are saved in ~/.tcode/config.toml; environment variables also work{RESET}\n"
     );
 
-    let cands = candidates(&config.profiles);
-    let Some((chosen, customs)) = select_providers(&cands, &config.profiles, missing_profile)?
-    else {
+    // Build the discoverable profile catalogue: defaults as the base layer,
+    // user/project overrides on top (same-key → merge, new-key → insert).
+    // config.profiles stays clean for serialization.
+    let mut catalogue = Config::defaults().profiles;
+    for (key, profile) in &config.profiles {
+        match catalogue.get_mut(key) {
+            Some(existing) => existing.merge(profile.clone()),
+            None => {
+                catalogue.insert(key.clone(), profile.clone());
+            }
+        }
+    }
+
+    let cands = candidates(&catalogue);
+    let Some((chosen, customs)) = select_providers(&cands, &catalogue, missing_profile)? else {
         return Ok(None);
     };
     if chosen.is_empty() && customs.is_empty() {
@@ -148,20 +147,28 @@ fn run_with(
 
     for &(i, ref inline_key) in &chosen {
         let cand = &cands[i];
-        if let Some(profile) = config.profiles.get_mut(cand.id) {
+        if let Some(profile) = config.profiles.get_mut(&cand.id) {
             if let Some(key) = inline_key {
                 profile.api_key = Some(key.clone());
             }
         } else {
-            let profile: Profile = match cand.id {
-                "codex" => presets::codex(),
-                "anthropic" => presets::anthropic(inline_key.clone()),
-                "openai" => presets::openai(inline_key.clone()),
-                "deepseek" => presets::deepseek(inline_key.clone()),
-                "openrouter" => presets::openrouter(inline_key.clone()),
-                _ => unreachable!(),
-            };
-            config.profiles.insert(cand.id.to_string(), profile);
+            // Profile only exists in defaults — insert a minimal entry so
+            // the key is serialized to ~/.tcode/config.toml. Everything else
+            // (models, base_url, etc.) stays in the system catalogue.
+            config.profiles.insert(
+                cand.id.clone(),
+                Profile {
+                    provider: catalogue[&cand.id].provider,
+                    api_key: inline_key.clone(),
+                    model: None,
+                    models: Vec::new(),
+                    api_key_env: None,
+                    base_url: None,
+                    max_tokens: None,
+                    context_window: None,
+                    vision: None,
+                },
+            );
         }
     }
     for (name, profile) in customs {
@@ -187,6 +194,13 @@ fn run_with(
     // serialized back into ~/.tcode/config.toml.
     let mut model_config = config.clone();
     tcode_providers::hydrate_codex_models(&mut model_config);
+
+    // Reconfigure (slash-command /provider) only configures credentials —
+    // the current model selection stays in place.
+    if missing_profile.is_some() {
+        config.default_profile = Some(missing_profile.unwrap().to_string());
+        return Ok(Some((config, ModelState::default())));
+    }
 
     // Default model across everything just configured.
     let mut options: Vec<(String, String, Option<String>)> = Vec::new();
@@ -267,7 +281,7 @@ fn select_providers(
 
     let mut entries: Vec<Entry> = (0..cands.len())
         .map(|i| {
-            let existing_key = profiles.get(cands[i].id).and_then(|p| p.api_key.clone());
+            let existing_key = profiles.get(&cands[i].id).and_then(|p| p.api_key.clone());
             Entry {
                 selected: initial_selected(i),
                 key: existing_key,
@@ -296,9 +310,12 @@ fn select_providers(
             let key_status = if let Some(key) = &entries[i].key {
                 format!("{GREEN}key set{RESET} {DIM}({} chars){RESET}", key.len())
             } else {
-                let has_env = cand.key_env.is_some_and(|v| std::env::var(v).is_ok());
+                let has_env = cand
+                    .key_env
+                    .as_deref()
+                    .is_some_and(|v| std::env::var(v).is_ok());
                 if has_env {
-                    format!("{GREEN}${}{RESET}", cand.key_env.unwrap())
+                    format!("{GREEN}${}{RESET}", cand.key_env.as_deref().unwrap())
                 } else {
                     cand.status.clone()
                 }
@@ -325,6 +342,8 @@ fn select_providers(
         out.flush()?;
         let k = read_key()?;
         if is_cancel(&k) {
+            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+            out.flush()?;
             return Ok(None);
         }
         match k.code {
@@ -339,8 +358,8 @@ fn select_providers(
             KeyCode::Tab => {
                 // Inline key input for the current candidate
                 let cand = &cands[cursor];
-                let var = cand.key_env.unwrap_or("API_KEY");
-                let key = read_inline_key(cand.id, var, &mut out)?;
+                let var = cand.key_env.as_deref().unwrap_or("API_KEY");
+                let key = read_inline_key(&cand.id, var, &mut out)?;
                 match key {
                     InlineKeyResult::Set(k) => {
                         entries[cursor].key = Some(k);
@@ -360,6 +379,8 @@ fn select_providers(
                     .filter(|(_, e)| e.selected)
                     .map(|(i, e)| (i, e.key.clone()))
                     .collect();
+                queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+                out.flush()?;
                 return Ok(Some((result, customs)));
             }
             _ => {}
@@ -526,7 +547,7 @@ fn read_custom_provider(out: &mut std::io::Stdout) -> anyhow::Result<Option<Cust
         InlineKeyResult::Skip | InlineKeyResult::Cancelled => None,
     };
     let profile = Profile {
-        provider,
+        provider: Some(provider),
         model: None,
         models,
         api_key,
@@ -561,29 +582,27 @@ fn select_one(title: &str, items: &[String], start: usize) -> anyhow::Result<Opt
         out.flush()?;
         let k = read_key()?;
         if is_cancel(&k) {
+            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+            out.flush()?;
             return Ok(None);
         }
         match k.code {
             KeyCode::Up => cursor = cursor.saturating_sub(1),
             KeyCode::Down => cursor = (cursor + 1).min(items.len() - 1),
-            KeyCode::Enter => return Ok(Some(cursor)),
+            KeyCode::Enter => {
+                queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+                out.flush()?;
+                return Ok(Some(cursor));
+            }
             _ => {}
         }
     }
 }
 
-/// Non-interactive fallback config (pipes/CI): env-key profiles only.
+/// Non-interactive fallback config (pipes/CI): all profiles from the
+/// built-in catalogue, defaulting to "anthropic".
 pub fn default_config() -> Config {
-    let mut config = Config::default();
-    config
-        .profiles
-        .insert("anthropic".into(), presets::anthropic(None));
-    config
-        .profiles
-        .insert("openai".into(), presets::openai(None));
-    if codex_auth_available() {
-        config.profiles.insert("codex".into(), presets::codex());
-    }
+    let mut config = Config::defaults();
     config.default_profile = Some("anthropic".into());
     config
 }

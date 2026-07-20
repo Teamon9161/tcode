@@ -80,6 +80,24 @@ The builtin catalog already contains profiles such as `anthropic`, `openai`,
 or override/add the models actually used. The Codex profile uses its local login
 and runtime model catalog, not an API key.
 
+Every field of a profile is optional in any single file, because a file is a
+patch, not a whole profile. To add a key to a builtin profile, write only that
+key — `provider`, `base_url` and `models` keep coming from the layer below:
+
+```toml
+[profiles.deepseek]
+api_key_env = "DEEPSEEK_API_KEY"
+```
+
+The three layers merge builtin catalog → `~/.tcode/config.toml` →
+`.tcode/config.toml`, scalar fields overriding and `models` merging by `name`.
+Requirements are checked on the merged result, and only for the profile actually
+selected: a profile no layer ever gave a `provider` fails with an error naming
+it when it is chosen, while leaving it in the file does not stop a session on
+another profile. So a brand-new profile (one not in the catalog) must declare
+`provider` itself — only profiles that exist in the catalog can be patched with
+`api_key` alone.
+
 ## Watchdog and retries
 
 `[watchdog]` controls provider request recovery. The defaults are intentionally

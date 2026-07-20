@@ -20,8 +20,13 @@ use tcode_core::{ActiveModel, Provider};
 /// remain inside their adapter rather than leaking into core configuration.
 pub fn profile_is_usable(profile_name: &str, profile: &Profile) -> bool {
     match profile.provider {
-        ProviderKind::Codex => codex_auth_available(),
-        ProviderKind::Anthropic | ProviderKind::Openai => profile.api_key(profile_name).is_ok(),
+        Some(ProviderKind::Codex) => codex_auth_available(),
+        Some(ProviderKind::Anthropic | ProviderKind::Openai) => {
+            profile.api_key(profile_name).is_ok()
+        }
+        // Only a profile whose layers never named a provider; `Config::load`
+        // rejects it, so it can never be the active one.
+        None => false,
     }
 }
 
@@ -33,7 +38,10 @@ pub fn build(
     model: &ModelDef,
     watchdog: &WatchdogConfig,
 ) -> Result<Arc<dyn Provider>, tcode_core::config::ConfigError> {
-    Ok(match profile.provider {
+    let kind = profile
+        .provider
+        .ok_or_else(|| tcode_core::config::ConfigError::NoProvider(profile_name.to_string()))?;
+    Ok(match kind {
         ProviderKind::Anthropic => Arc::new(
             AnthropicProvider::new(
                 profile.api_key(profile_name)?,
