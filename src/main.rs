@@ -408,6 +408,18 @@ async fn main() -> anyhow::Result<()> {
         .context("cannot determine working directory")?
         .canonicalize()
         .context("cannot canonicalize working directory")?;
+    // On Windows, canonicalize returns the `\\?\` extended-path form.
+    // Strip it: the prefix is an API flag, not a user-visible path part,
+    // and the model will see this string in its environment section.
+    #[cfg(windows)]
+    let cwd = {
+        let s = cwd.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            std::path::PathBuf::from(rest)
+        } else {
+            cwd
+        }
+    };
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
     // First run: no global config yet. Interactive terminals get the

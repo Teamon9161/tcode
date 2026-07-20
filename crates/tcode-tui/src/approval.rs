@@ -51,6 +51,9 @@ pub struct Dialog {
     /// Mouse handling reads this instead of reconstructing wrapped two-column
     /// geometry from scratch.
     question_hitboxes: RefCell<Vec<QuestionOptionHitbox>>,
+    /// Contiguous option rows in a normal authorization prompt. Unlike questions,
+    /// these options are always single-line and a click confirms the decision.
+    approval_option_rows: Cell<Option<OptionRows>>,
     /// Current panel width, captured during render so ↑↓ follows visual wraps.
     note_width: Cell<u16>,
 }
@@ -66,6 +69,12 @@ struct QuestionOptionHitbox {
     index: usize,
     first_row: usize,
     rows: usize,
+}
+
+#[derive(Clone, Copy)]
+struct OptionRows {
+    first_row: usize,
+    count: usize,
 }
 
 /// The plan-review surface: the plan itself rendered inside the panel,
@@ -307,6 +316,15 @@ const MAX_PREVIEW_ROWS: usize = 14;
 const MIN_COLUMNS: usize = 50;
 const OPTION_COLUMN_MIN: usize = 16;
 
+/// The ordinary approval dialog's summary is a heading, not the review
+/// surface — a diff or a long/multi-line command is already baked into the
+/// scrollable transcript above before this dialog opens (see the `ask_rx`
+/// handler in `app/mod.rs`), and this widget owns no scrolling of its own.
+/// Capped so a renderer that still hands it a large raw string (a novel
+/// tool, an mcp server description) can never push the Yes/No choices off
+/// screen with nothing able to scroll them back into view.
+const MAX_SUMMARY_ROWS: usize = 6;
+
 const OTHER_LABEL: &str = "Other";
 
 /// Blocks the plan pane jumps on PageUp/PageDown.
@@ -440,6 +458,7 @@ impl Dialog {
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
             question_hitboxes: RefCell::new(Vec::new()),
+            approval_option_rows: Cell::new(None),
             note_width: Cell::new(80),
         }
     }
@@ -485,6 +504,7 @@ impl Dialog {
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
             question_hitboxes: RefCell::new(Vec::new()),
+            approval_option_rows: Cell::new(None),
             note_width: Cell::new(80),
         }
     }
@@ -558,6 +578,7 @@ impl Dialog {
             cursor_cell: Cell::new(None),
             note_hitbox: Cell::new(None),
             question_hitboxes: RefCell::new(Vec::new()),
+            approval_option_rows: Cell::new(None),
             note_width: Cell::new(80),
         }
     }
@@ -858,10 +879,13 @@ impl Dialog {
         DialogResult::Done(Approval::simple(ApprovalDecision::Yes, Some(comment)))
     }
 
-    /// Update the active option from a rendered option row. Hovering uses the
-    /// same cursor as ↑↓, so descriptions and previews stay in sync with the
-    /// visual highlight without selecting or submitting anything.
+    /// Update the active question option from a rendered row. Note editing owns
+    /// the pointer until its focus leaves: merely moving the mouse while typing
+    /// must not replace the answer the annotation applies to.
     pub fn question_mouse_moved(&mut self, row: usize) -> bool {
+        if self.note_focused {
+            return false;
+        }
         let Some(hit) = self
             .question_hitboxes
             .borrow()
@@ -876,7 +900,6 @@ impl Dialog {
             return false;
         }
         page.cursor = hit.index;
-        self.note_focused = false;
         self.focus_note_on_other();
         true
     }
@@ -884,8 +907,12 @@ impl Dialog {
     /// Click mirrors keyboard selection: a single-select option only moves the
     /// cursor, while a multi-select option toggles its checkmark. Enter remains
     /// the explicit advance/submit action, preventing an exploratory click from
-    /// answering a multi-page form.
+    /// answering a multi-page form. While Note has focus, clicks leave both the
+    /// note and the selected answer untouched.
     pub fn question_mouse_down(&mut self, row: usize) -> bool {
+        if self.note_focused {
+            return false;
+        }
         if !self.question_mouse_moved(row) {
             let Some(hit) = self
                 .question_hitboxes
@@ -905,6 +932,51 @@ impl Dialog {
             page.chosen[cursor] = !page.chosen[cursor];
         }
         true
+    }
+
+    /// Hovering an authorization option follows keyboard selection unless the
+    /// Note editor owns focus.
+    pub fn approval_mouse_moved(&mut self, row: usize) -> bool {
+        if self.note_focused {
+            return false;
+        }
+        let Some(rows) = self.approval_option_rows.get() else {
+            return false;
+        };
+        let Some(index) = row
+            .checked_sub(rows.first_row)
+            .filter(|index| *index < rows.count)
+        else {
+            return false;
+        };
+        if self.selected == index {
+            return false;
+        }
+        self.selected = index;
+        true
+    }
+
+    /// A click on an authorization option confirms it directly. Annotation is
+    /// deliberately an explicit mode: while its editor is focused, option clicks
+    /// are inert rather than accidentally granting or declining permission.
+    pub fn approval_mouse_down(&mut self, row: usize) -> Option<Approval> {
+        if self.note_focused {
+            return None;
+        }
+        if !self.approval_mouse_moved(row) {
+            let rows = self.approval_option_rows.get()?;
+            let index = row
+                .checked_sub(rows.first_row)
+                .filter(|index| *index < rows.count)?;
+            self.selected = index;
+        }
+        let (_, decision, set_mode) = self.approval_options()[self.selected];
+        Some(Approval {
+            decision,
+            comment: None,
+            set_mode,
+            approved_input: None,
+        })
     }
 
     pub fn note_mouse_down(&mut self, row: usize, col: usize, width: u16) -> bool {
@@ -971,6 +1043,7 @@ impl Dialog {
         self.cursor_cell.set(None);
         self.note_hitbox.set(None);
         self.question_hitboxes.borrow_mut().clear();
+        self.approval_option_rows.set(None);
         self.note_width.set(width);
         if self.plan.is_some() {
             return self.render_plan(width, height);
@@ -979,13 +1052,17 @@ impl Dialog {
             return self.render_questions(width);
         }
         // Render the summary line-by-line and wrapped, so a long or multi-line
-        // shell command shows in full instead of corrupting a single Line.
+        // shell command shows in full instead of corrupting a single Line —
+        // but capped, since this heading is not the review surface (see
+        // `MAX_SUMMARY_ROWS`).
         let avail = (width as usize).saturating_sub(4).max(20);
-        let summary_rows: Vec<String> = self
+        let mut summary_rows: Vec<String> = self
             .summary
             .lines()
             .flat_map(|line| wrap_cells(line, avail))
             .collect();
+        let overflow_rows = summary_rows.len().saturating_sub(MAX_SUMMARY_ROWS);
+        summary_rows.truncate(MAX_SUMMARY_ROWS);
         let mut out: Vec<Line<'static>> = Vec::new();
         for (i, row) in summary_rows.into_iter().enumerate() {
             if i == 0 {
@@ -997,10 +1074,21 @@ impl Dialog {
                 out.push(Line::styled(format!("  {row}"), theme::dim()));
             }
         }
+        if overflow_rows > 0 {
+            out.push(Line::styled(
+                format!("  … (+{overflow_rows} more lines)"),
+                theme::dim(),
+            ));
+        }
         if out.is_empty() {
             out.push(Line::styled("● ", theme::accent()));
         }
         let options = self.approval_options();
+        let first_option_row = out.len();
+        self.approval_option_rows.set(Some(OptionRows {
+            first_row: first_option_row,
+            count: options.len(),
+        }));
         for (i, (label, decision, set_mode)) in options.iter().enumerate() {
             let marker = if i == self.selected { "▸ " } else { "  " };
             let label = match decision {
@@ -1030,7 +1118,7 @@ impl Dialog {
         self.render_note(&self.note, width, &mut out);
         out.push(Line::styled(
             format!(
-                "  ↑↓/1-{} choose · type/tab note · enter confirm · esc = no",
+                "  ↑↓/1-{} choose · click confirm · type/tab note · enter confirm · esc = no",
                 options.len()
             ),
             theme::dim(),
@@ -2246,6 +2334,49 @@ mod tests {
     }
 
     #[test]
+    fn authorization_option_click_confirms_when_note_is_unfocused() {
+        let mut d = dialog();
+        d.render(80, 40);
+        let approval = d
+            .approval_mouse_down(2)
+            .expect("the second rendered option should be clickable");
+        assert_eq!(approval.decision, ApprovalDecision::YesSession);
+    }
+
+    #[test]
+    fn note_focus_blocks_authorization_hover_and_click_confirmation() {
+        let mut d = dialog();
+        d.render(80, 40);
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "only this command");
+
+        assert!(!d.approval_mouse_moved(2));
+        assert!(d.approval_mouse_down(2).is_none());
+
+        let DialogResult::Done(approval) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should confirm the unchanged option");
+        };
+        assert_eq!(approval.decision, ApprovalDecision::Yes);
+        assert_eq!(approval.comment.as_deref(), Some("only this command"));
+    }
+
+    #[test]
+    fn note_focus_blocks_question_hover_and_click_selection() {
+        let mut d = menu();
+        d.render(80, 40);
+        d.handle_key(key(KeyCode::Tab));
+        type_str(&mut d, "because A");
+
+        assert!(!d.question_mouse_moved(2));
+        assert!(!d.question_mouse_down(2));
+
+        let DialogResult::Done(approval) = d.handle_key(key(KeyCode::Enter)) else {
+            panic!("enter should answer the unchanged option");
+        };
+        assert_eq!(approval.comment.as_deref(), Some("A — because A"));
+    }
+
+    #[test]
     fn dialog_paste_flattens_newlines_into_its_note() {
         let mut d = dialog();
         d.paste_text("keep this\nwith the details".into());
@@ -2406,6 +2537,31 @@ mod tests {
             .count();
         assert!(rows >= 2, "60-char note must wrap at width 40");
         assert!(d.render(40, 40).len() > d.render(200, 40).len());
+    }
+
+    /// A tool-supplied summary can in principle be arbitrarily long (a raw
+    /// shell command before the approval prebake caps it, or any future
+    /// renderer that forgets to). This dialog owns no scrolling of its own,
+    /// so the summary must stay capped or a long one pushes the Yes/No
+    /// choices below the visible panel with nothing able to bring them back.
+    #[test]
+    fn a_long_summary_is_capped_so_the_options_stay_reachable() {
+        let huge = (0..40)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let d = Dialog::new(huge, "run(x)".into(), "run(x)".into(), false, false);
+        let lines = d.render(80, 200);
+        let rows = d.approval_option_rows.get().expect("options rendered");
+        assert!(
+            rows.first_row <= MAX_SUMMARY_ROWS + 1,
+            "options must land within the capped summary, not {} rows down",
+            rows.first_row
+        );
+        let overflow_marker = lines
+            .iter()
+            .any(|l| l.spans.iter().any(|s| s.content.contains("more lines")));
+        assert!(overflow_marker, "truncation must be visible, not silent");
     }
 
     #[test]

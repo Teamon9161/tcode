@@ -590,16 +590,28 @@ impl App {
                             .collect();
                         Dialog::plan(ask.summary, ask.input.clone(), blocks)
                     } else {
-                        // A change proposal (edit/write) is baked into the
-                        // transcript now — in full, scrollable as part of the
-                        // record — so the reviewer reads the whole diff there
-                        // rather than in the cramped dialog. On decline it is
-                        // retracted; on approval the upcoming ToolStart skips
-                        // re-baking it (see `change_prebake`).
-                        let call_summary = self.display_summary(
-                            &tcode_core::agent::summarize_call(&ask.tool, &ask.input),
-                        );
-                        let change = self.renderers.get(&ask.tool).body(&ask.input);
+                        // A change proposal (edit/write) or a long/multi-line
+                        // shell command is baked into the transcript now — in
+                        // full, scrollable as part of the record — so the
+                        // reviewer reads the whole thing there rather than in
+                        // the cramped dialog. On decline it is retracted; on
+                        // approval the upcoming ToolStart skips re-baking it
+                        // (see `change_prebake`).
+                        //
+                        // The summary is recomputed from name+input through
+                        // the renderer, not taken as the raw string core put
+                        // in `summary`: a long/multi-line shell command needs
+                        // the same capped preview ToolStart uses (see
+                        // `on_tool_start`), or its full, possibly multi-line
+                        // text fills the compact dialog with no way to scroll
+                        // past it to the Yes/No choices.
+                        let renderer = self.renderers.get(&ask.tool);
+                        let call_summary = self.display_summary(&renderer.header(
+                            &ask.tool,
+                            &ask.input,
+                            Some(&self.cwd),
+                        ));
+                        let change = renderer.approval_detail(&ask.input);
                         if !change.is_empty() {
                             self.bake_live_text();
                             self.finish_thinking();
@@ -611,10 +623,10 @@ impl App {
                             lines.push(Line::default());
                             self.bake(lines);
                         }
-                        // Diff lives in the transcript; the dialog carries only
-                        // the choices.
+                        // The diff/command lives in the transcript; the dialog
+                        // carries only the choices.
                         Dialog::new(
-                            ask.summary,
+                            call_summary.clone(),
                             ask.descriptor,
                             call_summary,
                             ask.is_edit,
@@ -790,42 +802,65 @@ impl App {
         else {
             return;
         };
-        let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) else {
-            return;
-        };
-        let col = mouse.column.saturating_sub(1) as usize;
-        if !dialog.is_plan() {
-            if dialog.is_question() {
-                match mouse.kind {
-                    MouseEventKind::Moved => {
-                        dialog.question_mouse_moved(row);
-                    }
-                    MouseEventKind::Down(MouseButton::Left) => {
-                        if !dialog.question_mouse_down(row) {
-                            dialog.note_mouse_down(row, col, width);
+        let approval = {
+            let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) else {
+                return;
+            };
+            let col = mouse.column.saturating_sub(1) as usize;
+            if !dialog.is_plan() {
+                if dialog.is_question() {
+                    match mouse.kind {
+                        MouseEventKind::Moved => {
+                            dialog.question_mouse_moved(row);
                         }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if !dialog.question_mouse_down(row) {
+                                dialog.note_mouse_down(row, col, width);
+                            }
+                        }
+                        _ => {}
+                    }
+                    None
+                } else {
+                    match mouse.kind {
+                        MouseEventKind::Moved => {
+                            dialog.approval_mouse_moved(row);
+                            None
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            if let Some(approval) = dialog.approval_mouse_down(row) {
+                                Some(approval)
+                            } else {
+                                dialog.note_mouse_down(row, col, width);
+                                None
+                            }
+                        }
+                        _ => None,
+                    }
+                }
+            } else {
+                match mouse.kind {
+                    // The plan pane owns its own viewport, including while its feedback
+                    // editor has focus. Do not let the modal trap the reviewer at the
+                    // current block while they are composing the keep-planning reason.
+                    MouseEventKind::ScrollUp => dialog.plan_mouse_wheel(true, width, budget),
+                    MouseEventKind::ScrollDown => dialog.plan_mouse_wheel(false, width, budget),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        dialog.plan_mouse_down(row, col, width, budget)
+                    }
+                    MouseEventKind::Drag(MouseButton::Left) => {
+                        dialog.plan_mouse_drag(row, col, width, budget)
+                    }
+                    MouseEventKind::Up(MouseButton::Left) => {
+                        dialog.plan_mouse_up(row, col, width, budget)
                     }
                     _ => {}
                 }
-            } else if matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
-                dialog.note_mouse_down(row, col, width);
+                None
             }
-            return;
-        }
-        match mouse.kind {
-            // The plan pane owns its own viewport, including while its feedback
-            // editor has focus. Do not let the modal trap the reviewer at the
-            // current block while they are composing the keep-planning reason.
-            MouseEventKind::ScrollUp => dialog.plan_mouse_wheel(true, width, budget),
-            MouseEventKind::ScrollDown => dialog.plan_mouse_wheel(false, width, budget),
-            MouseEventKind::Down(MouseButton::Left) => {
-                dialog.plan_mouse_down(row, col, width, budget)
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                dialog.plan_mouse_drag(row, col, width, budget)
-            }
-            MouseEventKind::Up(MouseButton::Left) => dialog.plan_mouse_up(row, col, width, budget),
-            _ => {}
+        };
+        if let Some(approval) = approval {
+            self.on_overlay_flow(Flow::Act(OverlayAction::Approved(approval)));
         }
     }
 

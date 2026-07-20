@@ -728,6 +728,17 @@ fn resolve_cd_target(current: &Path, arg: &str) -> Result<Option<PathBuf>, Strin
     let resolved = candidate
         .canonicalize()
         .map_err(|e| format!("cannot cd to {}: {e}", candidate.display()))?;
+    // On Windows, canonicalize returns the `\\?\` extended-path form.
+    // Strip it so the cwd we store looks normal to the model.
+    #[cfg(windows)]
+    let resolved = {
+        let s = resolved.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            resolved
+        }
+    };
     if !resolved.is_dir() {
         return Err(format!("not a directory: {}", resolved.display()));
     }
@@ -761,6 +772,21 @@ mod tests {
     use crate::{Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+
+    /// Canonicalize and strip the `\\?\` extended-path prefix that Windows
+    /// `std::fs::canonicalize` emits. The stripped form matches what
+    /// `resolve_cd_target` now produces.
+    fn canonicalized(path: impl AsRef<Path>) -> PathBuf {
+        let path = std::fs::canonicalize(path.as_ref()).unwrap();
+        #[cfg(windows)]
+        {
+            let s = path.to_string_lossy();
+            if let Some(rest) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(rest);
+            }
+        }
+        path
+    }
 
     #[test]
     fn ctrl_c_handoff_keeps_queued_messages_out_of_the_cancelled_turn() {
@@ -949,8 +975,8 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tcode-cd-scope-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("child")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let child = root.join("child").canonicalize().unwrap();
+        let root = canonicalized(root);
+        let child = canonicalized(root.join("child"));
 
         let mut session = Session::new(
             ToolCtx::new(root.clone(), 1_000),
@@ -978,8 +1004,8 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("child")).unwrap();
-        let root = root.canonicalize().unwrap();
-        let child = root.join("child").canonicalize().unwrap();
+        let root = canonicalized(root);
+        let child = canonicalized(root.join("child"));
 
         let mut session = Session::new(
             ToolCtx::new(root.clone(), 1_000),

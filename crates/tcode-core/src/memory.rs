@@ -613,10 +613,28 @@ pub(crate) fn canonical_target(path: &Path) -> PathBuf {
 }
 
 fn canonical_or_normal(path: &Path) -> PathBuf {
-    fs::canonicalize(path).unwrap_or_else(|_| normalize(path.to_path_buf()))
+    normalize(fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf()))
 }
 
+/// Lexically normalize `./..` and strip the Windows `\\?\` extended-path
+/// prefix that `std::fs::canonicalize` emits. The stripped form is the
+/// ordinary `C:\...` spelling — same location, no filesystem calls.
 fn normalize(path: PathBuf) -> PathBuf {
+    // On Windows, canonicalize returns `\\?\C:\...` (extended-path) form.
+    // Strip the prefix so we store, display, and compare the normal `C:\...`
+    // spelling. The prefix is an API flag, not part of the path identity.
+    #[cfg(windows)]
+    let path = {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            PathBuf::from(rest)
+        } else {
+            path
+        }
+    };
+    #[cfg(not(windows))]
+    let path = path;
+
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {

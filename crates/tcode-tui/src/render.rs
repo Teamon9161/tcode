@@ -92,6 +92,17 @@ pub trait ToolRenderer: Send + Sync {
         Vec::new()
     }
 
+    /// Full content shown in the transcript while this call's approval
+    /// dialog is open, so the reviewer reads the whole thing there —
+    /// scrollable, as part of the record — rather than in the compact
+    /// dialog. Defaults to `body()` (edit/write diffs already qualify).
+    /// Shell overrides this because its full command is normally kept
+    /// folded (`initial_detail`) to stay out of the way; approval is
+    /// exactly when it must be visible before the user decides.
+    fn approval_detail(&self, input: &Value) -> Vec<Line<'static>> {
+        self.body(input)
+    }
+
     /// Compact text for an indented batch row.
     fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
         shorten_summary_path(&tcode_core::agent::summarize_call(name, input), cwd)
@@ -209,6 +220,10 @@ impl ToolRenderer for ShellRenderer {
     }
 
     fn initial_detail(&self, input: &Value) -> Vec<Line<'static>> {
+        diff::command_block(command_of(input))
+    }
+
+    fn approval_detail(&self, input: &Value) -> Vec<Line<'static>> {
         diff::command_block(command_of(input))
     }
 
@@ -439,7 +454,7 @@ impl RenderRegistry {
             display_names.insert(name.to_string(), tool.display_name());
             let quiet = tool.batch_policy() == BatchPolicy::ParallelReadOnly;
             let renderer: Box<dyn ToolRenderer> = match name {
-                "shell" | "bash" => Box::new(ShellRenderer),
+                "shell" | "bash" | "monitor" => Box::new(ShellRenderer),
                 "edit" => Box::new(EditRenderer),
                 "write" => Box::new(WriteRenderer),
                 "append" => Box::new(AppendRenderer),
@@ -722,6 +737,29 @@ mod tests {
         assert!(long_header.ends_with("…)"));
         assert!(long_header.chars().count() <= "bash(".len() + SHELL_HEADER_PREVIEW_MAX + 2);
         assert!(renderer.folds_result(&long));
+    }
+
+    /// A long/multi-line command must be readable in full while its approval
+    /// dialog is open (the dialog itself only shows a capped header), so
+    /// `approval_detail` — unlike `body`, which batch items also render and
+    /// which must stay compact — surfaces the same block `initial_detail`
+    /// folds behind the header.
+    #[test]
+    fn shell_approval_detail_surfaces_the_full_command_but_body_stays_empty() {
+        let renderer = ShellRenderer;
+        let short = json!({ "command": "git status" });
+        assert!(renderer.approval_detail(&short).is_empty());
+        assert!(renderer.body(&short).is_empty());
+
+        let multiline = json!({ "command": "a\nb" });
+        assert!(!renderer.approval_detail(&multiline).is_empty());
+        assert_eq!(
+            renderer.approval_detail(&multiline),
+            renderer.initial_detail(&multiline)
+        );
+        // Batch items render `body`, not `approval_detail` — a batch of shell
+        // calls must stay compact even when one command is long.
+        assert!(renderer.body(&multiline).is_empty());
     }
 
     /// Real grep calls almost always carry a `path`, which outranks `pattern`
