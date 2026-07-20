@@ -19,6 +19,7 @@ mod overlay;
 mod reference_style;
 mod render;
 mod resume;
+mod surface;
 mod theme;
 mod transcript;
 mod usage;

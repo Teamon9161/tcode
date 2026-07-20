@@ -2846,6 +2846,7 @@ dependencies = [
  "tcode-importers",
  "tcode-providers",
  "tcode-tools",
+ "tempfile",
  "tokio",
  "tokio-util",
  "unicode-width 0.2.0",

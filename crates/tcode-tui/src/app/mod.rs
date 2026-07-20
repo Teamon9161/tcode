@@ -1,3 +1,6 @@
+#[cfg(test)]
+mod harness;
+
 mod bake;
 mod commands;
 mod draw;
@@ -14,7 +17,6 @@ use rewind::*;
 use views::*;
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Stdout;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -24,7 +26,6 @@ use crossterm::event::{
     Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
@@ -62,6 +63,7 @@ use crate::render::{
     batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
 };
 use crate::resume;
+use crate::surface::Surface;
 use crate::transcript::Transcript;
 use crate::usage::{
     context_progress_line, rate_limit_line, token_count, turn_summary_line, TurnMeter,
@@ -70,7 +72,7 @@ use crate::view::{BakeCtx, SessionView};
 use crate::view_picker::{self, ViewId};
 use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
 
-type Term = Terminal<CrosstermBackend<Stdout>>;
+type Term = Terminal<Surface>;
 
 /// Lines scrolled per mouse-wheel event.
 const WHEEL_STEP: usize = 3;
@@ -420,8 +422,19 @@ struct RetryWait {
 impl App {
     pub fn new(
         agent: Arc<Agent>,
+        session: Session,
+        config: crate::TuiConfig,
+    ) -> anyhow::Result<Self> {
+        Self::on_surface(agent, session, config, Surface::live())
+    }
+
+    /// Build the app painting onto `surface`. Production passes the terminal;
+    /// a test passes an in-memory buffer so it can read frames back.
+    fn on_surface(
+        agent: Arc<Agent>,
         mut session: Session,
         config: crate::TuiConfig,
+        surface: Surface,
     ) -> anyhow::Result<Self> {
         let crate::TuiConfig {
             menu,
@@ -454,7 +467,7 @@ impl App {
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
         let renderers = RenderRegistry::from_tools(&agent.tools);
-        let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+        let mut terminal = Terminal::new(surface)?;
         // EnterAlternateScreen does not guarantee a blank physical buffer: on
         // some terminals a prior tcode frame survives a leave/re-enter cycle.
         // Ratatui's first diff sees a blank logical buffer and would otherwise
@@ -1723,5 +1736,120 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect();
         assert_eq!(accented, ["@src/app.rs"]);
+    }
+
+    fn edit_call(path: &str, old: &str, new: &str) -> AskCall {
+        AskCall {
+            tool: "edit".into(),
+            summary: format!("edit({path})"),
+            descriptor: format!("edit({path})"),
+            is_edit: true,
+            allows_project: false,
+            input: serde_json::json!({
+                "path": path,
+                "old_string": old,
+                "new_string": new,
+            }),
+        }
+    }
+
+    /// The combined review's whole promise: every diff is on screen *before*
+    /// the reviewer answers, and taking the review apart puts the screen back
+    /// the way it was so the per-call flow can re-propose them one at a time.
+    #[test]
+    fn taking_a_combined_review_apart_retracts_every_baked_diff() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("alpha.rs"),
+            "fn alpha() {}
+",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("beta.rs"),
+            "fn beta() {}
+",
+        )
+        .unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let (tx, mut rx) = oneshot::channel();
+        app.open_review(AskMsg {
+            label: "Edit 2 files".into(),
+            calls: vec![
+                edit_call("alpha.rs", "fn alpha() {}", "fn alpha() -> u8 { 1 }"),
+                edit_call("beta.rs", "fn beta() {}", "fn beta() -> u8 { 2 }"),
+            ],
+            reply: ApprovalReply::Batch(tx),
+        });
+
+        let reviewing = app.frame();
+        assert!(
+            reviewing.contains("fn alpha() -> u8 { 1 }")
+                && reviewing.contains("fn beta() -> u8 { 2 }"),
+            "both diffs are readable before any answer:
+{reviewing}"
+        );
+        assert!(reviewing.contains("Edit 2 files"));
+        assert!(reviewing.contains("Review one at a time"));
+
+        // Options are Yes / Yes, allow all edits / Review one at a time / No.
+        app.press(KeyCode::Down);
+        app.press(KeyCode::Down);
+        app.press(KeyCode::Enter);
+
+        let after = app.frame();
+        assert!(
+            !after.contains("fn alpha() -> u8 { 1 }") && !after.contains("fn beta() -> u8 { 2 }"),
+            "the combined review's diffs are retracted:
+{after}"
+        );
+        assert!(
+            !after.contains("Review one at a time"),
+            "the pane is closed"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(BatchApproval::Individually)),
+            "the agent loop is told to prompt per call, not given an answer"
+        );
+    }
+
+    /// Declining the whole set retracts the diffs too — the batch header and
+    /// per-call results become the record instead.
+    #[test]
+    fn declining_a_combined_review_retracts_its_diffs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("alpha.rs"),
+            "fn alpha() {}
+",
+        )
+        .unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let (tx, mut rx) = oneshot::channel();
+        app.open_review(AskMsg {
+            label: "Edit 2 files".into(),
+            calls: vec![
+                edit_call("alpha.rs", "fn alpha() {}", "fn alpha() -> u8 { 1 }"),
+                edit_call("beta.rs", "fn beta() {}", "fn beta() -> u8 { 2 }"),
+            ],
+            reply: ApprovalReply::Batch(tx),
+        });
+        assert!(app.frame().contains("fn alpha() -> u8 { 1 }"));
+
+        app.press(KeyCode::Esc);
+
+        let after = app.frame();
+        assert!(
+            !after.contains("fn alpha() -> u8 { 1 }"),
+            "a declined change leaves no diff behind:
+{after}"
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(BatchApproval::All(Approval {
+                decision: ApprovalDecision::No,
+                ..
+            }))
+        ));
     }
 }
