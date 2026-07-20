@@ -191,7 +191,7 @@ pub struct Session {
     pub turn_usage: Usage,
     /// `/dogfood`: also report harness tool defects while working.
     dogfood: bool,
-    /// `/suggestions`: guess the next prompt when the turn ends. Session state
+    /// `/suggest`: guess the next prompt when the turn ends. Session state
     /// rather than a frontend flag, so the toggle and its persistence work the
     /// same way from the TUI and the REPL.
     suggestions: bool,
@@ -276,7 +276,7 @@ impl Session {
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
             dogfood: false,
-            suggestions: true,
+            suggestions: false,
             auto_consecutive_denials: 0,
             auto_total_denials: 0,
             auto_consecutive_unavailable: 0,

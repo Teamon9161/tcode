@@ -248,7 +248,7 @@ pub struct App {
     /// accepted with →. It belongs to the turn that produced it and survives
     /// typing — the ghost hides while the input has text and comes back when it
     /// is empty again, without a second request. Whether to ask for one at all
-    /// is `Session::suggestions` (`/suggestions`).
+    /// is `Session::suggestions` (`/suggest`).
     suggestion: Option<String>,
     suggest_cancel: Option<CancellationToken>,
     /// Which guess is current. A reply carrying an older generation is a guess

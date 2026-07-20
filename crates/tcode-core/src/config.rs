@@ -312,7 +312,7 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self {
-            suggest_next: true,
+            suggest_next: false,
             show_reasoning: false,
         }
     }
@@ -453,7 +453,7 @@ pub struct ModelState {
     /// `/dogfood`, so it survives a restart instead of being re-toggled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dogfood: bool,
-    /// `/suggestions`. Absent = follow `[ui] suggest_next` from config.toml;
+    /// `/suggest`. Absent = follow `[ui] suggest_next` from config.toml;
     /// the runtime toggle is what the user last chose, so it wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<bool>,

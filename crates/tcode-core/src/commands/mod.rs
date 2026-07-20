@@ -290,18 +290,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "/cd",
-                "/mode",
-                "/cost",
-                "/compact",
-                "/clear",
-                "/resume",
-                "/note",
-                "/plan",
-                "/memory",
-                "/export",
-                "/exit",
-                "/suggestions",
+                "/cd", "/mode", "/cost", "/compact", "/clear", "/resume", "/note", "/plan",
+                "/memory", "/export", "/exit", "/suggest",
             ]
         );
     }

@@ -661,7 +661,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(trust) = state.folder_trust_for(&cwd) {
         session.set_folder_trust(trust);
     }
-    // `/suggestions` last, else the config default. Same precedence as the
+    // `/suggest` last, else the config default. Same precedence as the
     // model choice: what the user last chose beats what the file says.
     session.set_suggestions(state.suggestions.unwrap_or(config.ui.suggest_next));
 

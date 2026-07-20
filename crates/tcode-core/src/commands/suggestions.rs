@@ -1,4 +1,4 @@
-//! `/suggestions`: the greyed-out guess at your next prompt (→ accepts it).
+//! `/suggest` (alias `/suggestions`): the greyed-out guess at your next prompt (→ accepts it).
 //!
 //! It costs one small request per turn, so it has to be refusable without
 //! editing a config file — and the choice has to outlive the session, because
@@ -10,7 +10,11 @@ pub struct SuggestionsCommand;
 
 impl SlashCommand for SuggestionsCommand {
     fn name(&self) -> &'static str {
-        "suggestions"
+        "suggest"
+    }
+
+    fn aliases(&self) -> &'static [&'static str] {
+        &["suggestions"]
     }
 
     fn help(&self) -> &'static str {
@@ -23,9 +27,7 @@ impl SlashCommand for SuggestionsCommand {
             "on" => true,
             "off" => false,
             other => {
-                return CommandOutcome::error(format!(
-                    "usage: /suggestions [on|off] (got '{other}')"
-                ))
+                return CommandOutcome::error(format!("usage: /suggest [on|off] (got '{other}')"))
             }
         };
         if on == ctx.session.suggestions() {
@@ -60,22 +62,23 @@ mod tests {
             environment: &environment,
             turn_usage: Usage::default(),
         };
-        assert!(ctx.session.suggestions(), "on by default");
+        assert!(!ctx.session.suggestions(), "off by default");
 
         let outcome = SuggestionsCommand.run(&mut ctx, "");
-        assert!(!ctx.session.suggestions());
+        assert!(ctx.session.suggestions());
         assert!(matches!(
             outcome.effects[0],
-            CommandEffect::PersistSuggestions(false)
+            CommandEffect::PersistSuggestions(true)
         ));
 
-        SuggestionsCommand.run(&mut ctx, "on");
-        assert!(ctx.session.suggestions());
+        SuggestionsCommand.run(&mut ctx, "off");
+        assert!(!ctx.session.suggestions());
         assert!(SuggestionsCommand.run(&mut ctx, "sideways").messages[0]
             .text
             .contains("usage"));
 
         let registry = CommandRegistry::builtin();
-        assert!(registry.entries().any(|(name, _)| name == "/suggestions"));
+        assert!(registry.entries().any(|(name, _)| name == "/suggest"));
+        assert_eq!(registry.find("/suggestions").unwrap().name(), "suggest");
     }
 }

@@ -1129,7 +1129,7 @@ impl App {
     /// Ask, off-thread, what the user probably wants next. It runs on its own
     /// small prose conversation and its own model role (see `Agent::suggest`),
     /// so a turn only pays for its newest pair — but it is still a request,
-    /// hence `[ui] suggest_next` and `/suggestions`.
+    /// hence `[ui] suggest_next` and `/suggest`.
     pub(super) fn start_suggestion(&mut self) {
         self.drop_suggestion();
         if !self.editor.is_empty() {
