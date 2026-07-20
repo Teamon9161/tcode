@@ -10,9 +10,9 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
     ActiveModel, Agent, AgentEvent, AgentModels, AgentRole, Approval, ApprovalDecision, Approver,
-    CacheStrategy, ContentBlock, Entry, EventStream, ModelCell, PermissionMode, PermissionRules,
-    Provider, ProviderError, ProviderSafetyClassifier, Request, SafetyClassifier, Session,
-    StopReason, StreamEvent, ToolCtx, Usage,
+    BatchApproval, BatchAsk, CacheStrategy, ContentBlock, Entry, EventStream, ModelCell,
+    PermissionMode, PermissionRules, Provider, ProviderError, ProviderSafetyClassifier, Request,
+    SafetyClassifier, Session, StopReason, StreamEvent, ToolCtx, Usage,
 };
 
 fn cell(provider: Arc<MockProvider>) -> ModelCell {
@@ -109,6 +109,64 @@ impl Approver for ScriptedApprover {
     ) -> Approval {
         self.asked.lock().unwrap().push(descriptor.to_string());
         self.response.clone()
+    }
+}
+
+/// A front end that reviews a whole change set at once. `batches` records the
+/// label and the summaries it was shown, so a test can assert the reviewer saw
+/// every change before answering.
+struct BatchApprover {
+    response: BatchApproval,
+    batches: Mutex<Vec<(String, Vec<String>)>>,
+    asked: Mutex<Vec<String>>,
+}
+
+impl BatchApprover {
+    fn answering(approval: Approval) -> Self {
+        Self {
+            response: BatchApproval::All(approval),
+            batches: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Sees the combined review, then asks for the per-call flow instead.
+    fn taking_apart() -> Self {
+        Self {
+            response: BatchApproval::Individually,
+            batches: Mutex::new(Vec::new()),
+            asked: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl Approver for BatchApprover {
+    async fn ask(
+        &self,
+        _tool: &str,
+        _summary: &str,
+        descriptor: &str,
+        _is_edit: bool,
+        _allows_project: bool,
+        _input: &serde_json::Value,
+    ) -> Approval {
+        self.asked.lock().unwrap().push(descriptor.to_string());
+        Approval::simple(ApprovalDecision::Yes, None)
+    }
+
+    async fn ask_batch(&self, label: &str, calls: &[BatchAsk<'_>]) -> BatchApproval {
+        self.batches.lock().unwrap().push((
+            label.to_string(),
+            calls
+                .iter()
+                .map(|call| call.descriptor.to_string())
+                .collect(),
+        ));
+        match &self.response {
+            BatchApproval::All(approval) => BatchApproval::All(approval.clone()),
+            BatchApproval::Individually => BatchApproval::Individually,
+        }
     }
 }
 
@@ -2645,6 +2703,55 @@ async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
         .is_some_and(|scope| scope.starts_with("auto-classifier:")));
 }
 
+/// The classifier judges a transcript, not a single call, and the transcript
+/// already holds every call in the batch. Asking once per call would send
+/// byte-identical requests and pay for each.
+#[tokio::test]
+async fn one_classifier_request_covers_a_whole_batch() {
+    let root = tempfile::tempdir().unwrap();
+    // `.tcode` is protected, so these edits route to the classifier instead of
+    // Auto Mode's in-project fast path.
+    std::fs::create_dir_all(root.path().join(".tcode")).unwrap();
+    std::fs::write(root.path().join(".tcode/one.md"), "old").unwrap();
+    std::fs::write(root.path().join(".tcode/two.md"), "old").unwrap();
+    let main = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":".tcode/one.md","old_string":"old","new_string":"new"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":".tcode/two.md","old_string":"old","new_string":"new"}"#,
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let classifier = MockProvider::new(vec![text_done("ALLOW")]);
+    let agent = auto_agent(main.clone(), classifier.clone());
+    let mut session = session(root.path(), PermissionMode::Auto);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
+
+    run(&agent, &mut session, &approver, "update both notes").await;
+
+    assert_eq!(
+        classifier.requests.lock().unwrap().len(),
+        1,
+        "the batch shares one verdict"
+    );
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".tcode/one.md")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join(".tcode/two.md")).unwrap(),
+        "new"
+    );
+}
+
 #[tokio::test]
 async fn auto_mode_classifier_outages_pause_and_notify_the_frontend() {
     let root = tempfile::tempdir().unwrap();
@@ -2803,6 +2910,143 @@ async fn edit_approval_can_switch_the_whole_file_mutation_batch_to_accept_edits(
         std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
         "created"
     );
+}
+
+/// The point of a combined review: the reviewer is shown every diff in the
+/// batch and answers once, instead of deciding each change before seeing the
+/// next one.
+#[tokio::test]
+async fn one_combined_review_covers_every_change_in_the_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "old").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"old","new_string":"new"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":"b.txt","old_string":"old","new_string":"new"}"#,
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = BatchApprover::answering(Approval::simple(ApprovalDecision::Yes, None));
+
+    run(&agent, &mut session, &approver, "change both files").await;
+
+    let batches = approver.batches.lock().unwrap();
+    assert_eq!(batches.len(), 1, "one review for the whole change set");
+    assert_eq!(batches[0].1.len(), 2, "both changes were shown");
+    // The review names the change set exactly as the transcript header will.
+    assert_eq!(batches[0].0, "Edit 2 files");
+    assert!(
+        approver.asked.lock().unwrap().is_empty(),
+        "a combined answer leaves no per-call prompt"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "new"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "new"
+    );
+}
+
+/// Taking the review apart must retract the combined answer entirely: every
+/// change goes back through its own prompt.
+#[tokio::test]
+async fn taking_a_combined_review_apart_falls_back_to_per_call_prompts() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "old").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"old","new_string":"new"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":"b.txt","old_string":"old","new_string":"new"}"#,
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = BatchApprover::taking_apart();
+
+    run(&agent, &mut session, &approver, "change both files").await;
+
+    assert_eq!(approver.batches.lock().unwrap().len(), 1);
+    assert_eq!(
+        approver.asked.lock().unwrap().len(),
+        2,
+        "every change gets its own prompt after the review is taken apart"
+    );
+}
+
+/// A declined combined review must leave every file on disk untouched and tell
+/// the model so per call.
+#[tokio::test]
+async fn declining_a_combined_review_writes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "old").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"old","new_string":"new"}"#,
+            ),
+            (
+                "t2",
+                "edit",
+                r#"{"path":"b.txt","old_string":"old","new_string":"new"}"#,
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = BatchApprover::answering(Approval::simple(
+        ApprovalDecision::No,
+        Some("not yet".into()),
+    ));
+
+    run(&agent, &mut session, &approver, "change both files").await;
+
+    assert!(approver.asked.lock().unwrap().is_empty());
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "old"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("b.txt")).unwrap(),
+        "old"
+    );
+    let declined = session
+        .ledger
+        .as_messages()
+        .iter()
+        .flat_map(|message| message.content.clone())
+        .filter(|block| {
+            matches!(block, ContentBlock::ToolResult { content, is_error: true, .. }
+                if content.contains("not yet"))
+        })
+        .count();
+    assert_eq!(declined, 2, "each call learns the review declined it");
 }
 
 #[tokio::test]

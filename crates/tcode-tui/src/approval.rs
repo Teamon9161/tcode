@@ -29,6 +29,9 @@ pub struct Dialog {
     /// ToolStart-format call summary. A declined call never emits
     /// ToolStart, so the dialog supplies the line to bake instead.
     pub call_summary: String,
+    /// How many changes this one review covers. `1` is an ordinary prompt;
+    /// more adds the option to take the review apart.
+    batch: usize,
     selected: usize,
     /// Single-line note editor: full cursor movement, wraps on render.
     note: Editor,
@@ -285,25 +288,64 @@ impl Choice {
     }
 }
 
-const OPTIONS: [(&str, ApprovalDecision, Option<PermissionMode>); 2] = [
-    ("Yes", ApprovalDecision::Yes, None),
-    ("Yes, for this session", ApprovalDecision::YesSession, None),
-];
-const EDIT_OPTIONS: [(&str, ApprovalDecision, Option<PermissionMode>); 2] = [
-    ("Yes", ApprovalDecision::Yes, None),
+/// What confirming an option does. Most options carry a decision; a combined
+/// review adds one that carries none — it withdraws the review so the changes
+/// are asked about one at a time instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Decide(ApprovalDecision, Option<PermissionMode>),
+    Individually,
+}
+
+impl Outcome {
+    /// Options that persist an allow rule name the rule in their label.
+    fn names_rule(self) -> bool {
+        matches!(
+            self,
+            Outcome::Decide(
+                ApprovalDecision::YesSession | ApprovalDecision::YesProject,
+                _
+            )
+        )
+    }
+
+    fn color(self) -> ratatui::style::Color {
+        match self {
+            Outcome::Decide(ApprovalDecision::Yes, None) => theme::OK,
+            Outcome::Decide(ApprovalDecision::Yes, Some(_)) => theme::ACCENT,
+            Outcome::Decide(ApprovalDecision::YesSession | ApprovalDecision::YesProject, _) => {
+                theme::ACCENT
+            }
+            Outcome::Decide(ApprovalDecision::No, _) => theme::ERROR,
+            // Neither an approval nor a refusal: it only changes how the rest
+            // of the review is presented.
+            Outcome::Individually => theme::ACCENT,
+        }
+    }
+}
+
+const OPTIONS: [(&str, Outcome); 2] = [
+    ("Yes", Outcome::Decide(ApprovalDecision::Yes, None)),
     (
-        "Yes, allow all edits",
-        ApprovalDecision::Yes,
-        Some(PermissionMode::AcceptEdits),
+        "Yes, for this session",
+        Outcome::Decide(ApprovalDecision::YesSession, None),
     ),
 ];
-const PROJECT_OPTION: (&str, ApprovalDecision, Option<PermissionMode>) = (
+const EDIT_OPTIONS: [(&str, Outcome); 2] = [
+    ("Yes", Outcome::Decide(ApprovalDecision::Yes, None)),
+    (
+        "Yes, allow all edits",
+        Outcome::Decide(ApprovalDecision::Yes, Some(PermissionMode::AcceptEdits)),
+    ),
+];
+const PROJECT_OPTION: (&str, Outcome) = (
     "Yes, allow in this project",
-    ApprovalDecision::YesProject,
-    None,
+    Outcome::Decide(ApprovalDecision::YesProject, None),
 );
-const DENY_OPTION: (&str, ApprovalDecision, Option<PermissionMode>) =
-    ("No", ApprovalDecision::No, None);
+/// Offered only by a combined review: retract the whole set of diffs and let
+/// the per-call flow re-propose them one by one.
+const INDIVIDUALLY_OPTION: (&str, Outcome) = ("Review one at a time", Outcome::Individually);
+const DENY_OPTION: (&str, Outcome) = ("No", Outcome::Decide(ApprovalDecision::No, None));
 
 /// "  note: " prefix width; continuation rows are indented to match.
 const NOTE_INDENT: usize = 8;
@@ -346,6 +388,9 @@ fn plan_viewport(height: u16, row_count: usize) -> usize {
 pub enum DialogResult {
     Pending,
     Done(Approval),
+    /// A combined review the reviewer chose to take apart. Only a batch dialog
+    /// offers the option that produces this.
+    Individually,
     /// The plan pane asked to open the plan in `$EDITOR`. The frontend owns the
     /// terminal suspend/resume, so it handles this rather than the dialog.
     EditPlan,
@@ -450,6 +495,7 @@ impl Dialog {
             is_edit,
             project_option,
             call_summary,
+            batch: 1,
             selected: 0,
             note: Editor::new(),
             note_focused: false,
@@ -460,6 +506,16 @@ impl Dialog {
             question_hitboxes: RefCell::new(Vec::new()),
             approval_option_rows: Cell::new(None),
             note_width: Cell::new(80),
+        }
+    }
+
+    /// A combined review of `changes` pending changes. Every diff is already
+    /// baked into the transcript, so this pane carries only the choices — plus
+    /// the option to retract them all and review one at a time.
+    pub fn batch(label: String, changes: usize, is_edit: bool) -> Self {
+        Self {
+            batch: changes,
+            ..Self::new(label.clone(), String::new(), label, is_edit, false)
         }
     }
 
@@ -481,6 +537,7 @@ impl Dialog {
             descriptor: "exit_plan".into(),
             is_edit: false,
             project_option: false,
+            batch: 1,
             call_summary: String::new(),
             selected: 0,
             note: Editor::new(),
@@ -569,6 +626,7 @@ impl Dialog {
             descriptor: "ask_user".into(),
             is_edit: false,
             project_option: false,
+            batch: 1,
             call_summary: String::new(),
             selected: 0,
             note: Editor::new(),
@@ -633,6 +691,11 @@ impl Dialog {
         self.plan.is_some()
     }
 
+    /// A combined review of several changes rather than a single prompt.
+    pub fn is_batch(&self) -> bool {
+        self.batch > 1
+    }
+
     /// Only plan review owns a scrollable body. Ordinary tool approvals keep
     /// their choices compact while the pre-baked change remains scrollable in
     /// the transcript behind the dialog.
@@ -676,16 +739,21 @@ impl Dialog {
         }
     }
 
-    fn approval_options(&self) -> Vec<(&'static str, ApprovalDecision, Option<PermissionMode>)> {
-        if self.is_edit {
-            return EDIT_OPTIONS
-                .into_iter()
-                .chain(std::iter::once(DENY_OPTION))
-                .collect();
-        }
-        let mut options = OPTIONS.to_vec();
-        if self.project_option {
-            options.push(PROJECT_OPTION);
+    fn approval_options(&self) -> Vec<(&'static str, Outcome)> {
+        let mut options = if self.is_edit {
+            EDIT_OPTIONS.to_vec()
+        } else {
+            let mut options = OPTIONS.to_vec();
+            if self.project_option {
+                options.push(PROJECT_OPTION);
+            }
+            options
+        };
+        if self.is_batch() {
+            // A rule names one descriptor, and a combined review has several —
+            // there is nothing coherent for such an option to persist.
+            options.retain(|(_, outcome)| !outcome.names_rule());
+            options.push(INDIVIDUALLY_OPTION);
         }
         options.push(DENY_OPTION);
         options
@@ -705,7 +773,9 @@ impl Dialog {
             K::Tab => self.note_focused = !self.note_focused,
             K::Enter => {
                 let note = self.note_text();
-                let (_, decision, set_mode) = options[self.selected];
+                let Outcome::Decide(decision, set_mode) = options[self.selected].1 else {
+                    return DialogResult::Individually;
+                };
                 return DialogResult::Done(Approval {
                     decision,
                     comment: Some(note).filter(|s| !s.is_empty()),
@@ -959,7 +1029,7 @@ impl Dialog {
     /// A click on an authorization option confirms it directly. Annotation is
     /// deliberately an explicit mode: while its editor is focused, option clicks
     /// are inert rather than accidentally granting or declining permission.
-    pub fn approval_mouse_down(&mut self, row: usize) -> Option<Approval> {
+    pub fn approval_mouse_down(&mut self, row: usize) -> Option<DialogResult> {
         if self.note_focused {
             return None;
         }
@@ -970,13 +1040,15 @@ impl Dialog {
                 .filter(|index| *index < rows.count)?;
             self.selected = index;
         }
-        let (_, decision, set_mode) = self.approval_options()[self.selected];
-        Some(Approval {
+        let Outcome::Decide(decision, set_mode) = self.approval_options()[self.selected].1 else {
+            return Some(DialogResult::Individually);
+        };
+        Some(DialogResult::Done(Approval {
             decision,
             comment: None,
             set_mode,
             approved_input: None,
-        })
+        }))
     }
 
     pub fn note_mouse_down(&mut self, row: usize, col: usize, width: u16) -> bool {
@@ -1089,20 +1161,14 @@ impl Dialog {
             first_row: first_option_row,
             count: options.len(),
         }));
-        for (i, (label, decision, set_mode)) in options.iter().enumerate() {
+        for (i, (label, outcome)) in options.iter().enumerate() {
             let marker = if i == self.selected { "▸ " } else { "  " };
-            let label = match decision {
-                ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
-                    format!("{label} ({})", approval_rule_label(&self.descriptor))
-                }
-                _ => (*label).to_string(),
+            let label = if outcome.names_rule() {
+                format!("{label} ({})", approval_rule_label(&self.descriptor))
+            } else {
+                (*label).to_string()
             };
-            let color = match decision {
-                ApprovalDecision::Yes if set_mode.is_some() => theme::ACCENT,
-                ApprovalDecision::Yes => theme::OK,
-                ApprovalDecision::YesSession | ApprovalDecision::YesProject => theme::ACCENT,
-                ApprovalDecision::No => theme::ERROR,
-            };
+            let color = outcome.color();
             let style = if i == self.selected {
                 ratatui::style::Style::default()
                     .fg(color)
@@ -2136,6 +2202,34 @@ mod tests {
     }
 
     #[test]
+    fn only_a_combined_review_can_be_taken_apart() {
+        assert!(
+            !screen(&edit_dialog(), 80).contains("Review one at a time"),
+            "a single prompt has nothing to take apart"
+        );
+
+        let batch = Dialog::batch("Edit 3 files".into(), 3, true);
+        let screen = screen(&batch, 80);
+        assert!(screen.contains("Edit 3 files"));
+        assert!(screen.contains("Review one at a time"));
+    }
+
+    #[test]
+    fn taking_a_combined_review_apart_answers_nothing() {
+        let mut d = Dialog::batch("Edit 3 files".into(), 3, true);
+        // Yes, Yes+allow all edits, Review one at a time.
+        d.handle_key(key(KeyCode::Down));
+        d.handle_key(key(KeyCode::Down));
+        assert!(
+            matches!(
+                d.handle_key(key(KeyCode::Enter)),
+                DialogResult::Individually
+            ),
+            "the option carries no decision — it withdraws the review"
+        );
+    }
+
+    #[test]
     fn approval_rule_label_collapses_multiline_and_long_commands() {
         assert_eq!(approval_rule_label("run(cargo build)"), "run(cargo build)");
         let multiline = "run(cargo build\n&& cargo test)";
@@ -2337,9 +2431,12 @@ mod tests {
     fn authorization_option_click_confirms_when_note_is_unfocused() {
         let mut d = dialog();
         d.render(80, 40);
-        let approval = d
+        let DialogResult::Done(approval) = d
             .approval_mouse_down(2)
-            .expect("the second rendered option should be clickable");
+            .expect("the second rendered option should be clickable")
+        else {
+            panic!("clicking an authorization option confirms it");
+        };
         assert_eq!(approval.decision, ApprovalDecision::YesSession);
     }
 

@@ -44,7 +44,9 @@ pub use hooks::{HookDef, HookEvent, Hooks};
 pub use import::import_entries;
 pub use ledger::{Entry, Ledger, LedgerSink, SKILL_ECHO_OPEN};
 pub use memory::{MemoryManager, MemoryUpdate};
-pub use permission::{Approval, ApprovalDecision, Approver, PermissionMode, PermissionRules};
+pub use permission::{
+    Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk, PermissionMode, PermissionRules,
+};
 pub use provider::{
     ActiveModel, AgentModels, AgentPin, CacheStrategy, EventStream, ModelCell, Provider,
     ProviderError, Request, StreamEvent,

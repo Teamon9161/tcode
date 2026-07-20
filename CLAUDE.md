@@ -48,6 +48,8 @@ tcode 是一个类 Claude Code / Codex 的 Rust agent harness CLI。**`plan.md` 
 - 自愈式错误的匹配回退（`edit` 的 punct/ws 归一化）跑在失败路径上，仍要控复杂度：行 key 每行只算一次，别在滑窗里重算（分配级 O(n·m)）。
 - **read/grep 改动了返回内容就必须三条齐全**（`redact.rs` + `fs/mod.rs::clip`）：① 标记自释（`…[+N chars]` / `[redacted: N chars, starts "…"]`，不许退回裸 `…`）；② `write`/`edit` 用同一个 `read_marker` 拒绝带标记的写回——freshness 只认行范围、认不出行内截断，模型照 context 重写就把标记写进文件；③ 错误与尾注说清怎么拿原文。**逐行上限是防单行 minified 巨行，不是第二道预算门**：真正的约束是 `MAX_READ_OUTPUT_BYTES`，所以 `MAX_LINE_CHARS` 必须远高于 prose/config/markdown 的自然行长（曾设 500，把 6 行小文件的正常长行也截了，模型得额外付一轮 shell 取回原文）。
 - **脱敏对 read 与 grep 同时生效，且必须保持行数**：这两个是全系统唯一免审通道，密钥进 context 就同时进了 provider、session JSONL 与带 `web_fetch` 的上下文；脱敏不是安全边界（`shell` 随时能读），价值是把泄漏从免审通道赶到受审通道。规则按**内容**判定不按路径（不开白名单），键名命中后值还要过形态检查（≥16 字符、无空白、非 `$VAR`/全大写环境变量名——指针不是秘密）。`redact_lines` 一行进一行出，PEM 私钥保留 BEGIN/END 行、只换块内正文，否则 read 的行号与文件错位。`shell` 与 `web_fetch` 有意不脱敏。
+- **合并审批只能覆盖"本来就会逐个弹窗"的调用**：`combined_change_review` 的候选筛选只认 `session.rules.decide` 判出的 `Decision::Ask`——这一步是纯函数，不发分类器请求、不改 mode，所以"组装这次审批"本身不可能授权任何东西；Auto Mode 走 `Decision::Auto`→Classify 的调用一律保留各自的独立提示。答复只回填给 `CombinedReview::covered` 里记下的下标，屏幕上没出现过的调用永远拿不到这个答复。前端答不出（通道断、不支持）时返回 `Individually` 退回逐个流程，**不得**代用户判 No。
+- **Auto Mode 分类器判决按批缓存，不按调用**：`ClassifierRequest` 只有 policy / cache_scope / 整份转录，而承载这一批全部 tool_use 的 assistant 条目在第一次权限检查前就已在 ledger 里——逐个调用发的是字节相同的请求。`BatchClassification` 缓存的是**已解析的 `Decision`** 而非原始判决，这样暂停计数与 mode 变更事件每批恰好发生一次（缓存原始判决会让一批 N 个调用把连续 block 计数放大 N 倍）。
 
 **信任边界**
 

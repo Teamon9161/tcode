@@ -215,6 +215,28 @@ pub enum ApprovalDecision {
     No,
 }
 
+/// One pending call inside a combined review. The fields mirror `Approver::ask`
+/// exactly, so a front end can drive one item through the same widgets it
+/// already uses for a single prompt.
+pub struct BatchAsk<'a> {
+    pub tool: &'a str,
+    pub summary: &'a str,
+    pub descriptor: &'a str,
+    pub is_edit: bool,
+    pub allows_project: bool,
+    pub input: &'a Value,
+}
+
+/// The outcome of a combined review. The reviewer either answers once for the
+/// whole set or asks to see the calls one at a time.
+pub enum BatchApproval {
+    /// This one answer applies to every call that was offered.
+    All(Approval),
+    /// Fall back to asking each call separately — the per-call flow is the
+    /// authority, so nothing here needs to encode a partial verdict.
+    Individually,
+}
+
 /// UI-side implementation of the interactive approval prompt.
 #[async_trait]
 pub trait Approver: Send + Sync {
@@ -229,6 +251,18 @@ pub trait Approver: Send + Sync {
         allows_project: bool,
         input: &Value,
     ) -> Approval;
+
+    /// Review several pending calls at once. Only calls the harness would
+    /// otherwise prompt for individually are offered here, so answering `All`
+    /// can never authorize more than the per-call flow would have asked about.
+    /// `label` is the batch header the agent loop would use for these calls,
+    /// so the review names the change set exactly as the transcript will.
+    ///
+    /// The default keeps the per-call flow, so a front end that cannot show
+    /// several changes at once needs no implementation of its own.
+    async fn ask_batch(&self, _label: &str, _calls: &[BatchAsk<'_>]) -> BatchApproval {
+        BatchApproval::Individually
+    }
 }
 
 #[cfg(test)]

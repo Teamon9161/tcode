@@ -25,7 +25,9 @@ use crate::auto_mode::{
 use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
 use crate::memory::MemoryUpdate;
-use crate::permission::{ApprovalDecision, Approver, Decision, PermissionMode};
+use crate::permission::{
+    ApprovalDecision, Approver, BatchApproval, BatchAsk, Decision, PermissionMode,
+};
 use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolOutput};
 use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
@@ -228,7 +230,40 @@ struct PermissionCheck<'a> {
     request: &'a PermissionRequest,
     cancel: &'a CancellationToken,
     events: &'a mpsc::Sender<AgentEvent>,
+    /// Shared across one tool batch — see `BatchClassification`.
+    classified: &'a mut BatchClassification,
 }
+
+/// The answer a combined review gave, after its session side effects (mode
+/// transition, persisted rules, note) have already been applied exactly once.
+enum CombinedVerdict {
+    Approved,
+    Declined {
+        reason: String,
+        /// A decline with no guidance pauses the turn for the user.
+        awaits: bool,
+    },
+}
+
+/// A combined review of several pending changes. `covered` holds the indices of
+/// the calls the reviewer actually saw; a call outside that set never inherits
+/// the answer, so the batch can only ever authorize what was on screen.
+struct CombinedReview {
+    covered: HashSet<usize>,
+    verdict: CombinedVerdict,
+}
+
+/// The Auto Mode classifier verdict for one tool batch.
+///
+/// The classifier judges a transcript, not a single call: `ClassifierRequest`
+/// carries only the policy, the cache scope and `ClassifierTranscript`, and the
+/// assistant entry holding *every* call in this batch is already in the ledger
+/// before the first permission check runs. So asking once per call sends
+/// byte-identical requests and pays for each one. Caching the resolved
+/// `Decision` — not the raw verdict — also keeps the side effects (pause
+/// accounting, mode-change events) at exactly one per batch instead of N.
+#[derive(Default)]
+struct BatchClassification(Option<Decision>);
 
 /// Provider errors and invalid model output are useful to the person choosing
 /// `/agents`, but neither may flood the transcript or status line.
@@ -369,85 +404,97 @@ impl Agent {
             AutoRoute::Allow => Decision::Allow,
             AutoRoute::Prompt => Decision::Ask,
             AutoRoute::Classify => {
-                let Some(classifier) = &self.safety_classifier else {
-                    return Decision::Ask;
-                };
-                let instructions = session
-                    .tool_ctx
-                    .memory
-                    .lock()
-                    .expect("memory lock")
-                    .classifier_instructions();
-                let policy = if instructions.is_empty() {
-                    self.auto_policy.clone()
-                } else {
-                    format!(
-                        "{}\n\n# Active project instructions\n{}",
-                        self.auto_policy, instructions
-                    )
-                };
-                let folder_trust = match session.folder_trust() {
-                    crate::config::FolderTrust::Trusted => "trusted",
-                    crate::config::FolderTrust::Untrusted => "untrusted",
-                };
-                let policy = format!(
-                    "{policy}\n\n{}",
-                    FOLDER_TRUST_POLICY.replace("${TCODE_FOLDER_TRUST}", folder_trust)
-                );
-                let policy = session.prompt_variables().expand(&policy);
-                let request = ClassifierRequest {
-                    policy,
-                    cache_scope: session.classifier_cache_scope(),
-                    transcript: ClassifierTranscript::from_ledger(&session.ledger),
-                };
-                match classifier.classify(request, check.cancel.clone()).await {
-                    ClassifierDecision::Allow => {
-                        session.record_auto_classification(true);
-                        Decision::Allow
-                    }
-                    ClassifierDecision::Block { reason } => {
-                        let paused = session.record_auto_classification(false);
-                        if let Some(notice) = &paused {
-                            // This is a real mode change, not a staged UI request.
-                            // Keep every frontend's mode mirror authoritative through
-                            // the same event used at normal safe boundaries.
-                            let _ = check
-                                .events
-                                .send(AgentEvent::ModeChanged(PermissionMode::Default))
-                                .await;
-                            let _ = check
-                                .events
-                                .send(AgentEvent::AutoModePaused(notice.clone()))
-                                .await;
-                        }
-                        let paused = paused
-                            .map(|notice| format!("\n{notice}"))
-                            .unwrap_or_default();
-                        Decision::Deny(format!(
+                if let Some(cached) = check.classified.0.clone() {
+                    return cached;
+                }
+                let decision = self.classify(session, &check).await;
+                *check.classified = BatchClassification(Some(decision.clone()));
+                decision
+            }
+        }
+    }
+
+    /// Ask the independent Auto Mode classifier about the current transcript.
+    /// Callers reach this through `permission_decision`, which memoizes the
+    /// result for the batch.
+    async fn classify(&self, session: &mut Session, check: &PermissionCheck<'_>) -> Decision {
+        let Some(classifier) = &self.safety_classifier else {
+            return Decision::Ask;
+        };
+        let instructions = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .classifier_instructions();
+        let policy = if instructions.is_empty() {
+            self.auto_policy.clone()
+        } else {
+            format!(
+                "{}\n\n# Active project instructions\n{}",
+                self.auto_policy, instructions
+            )
+        };
+        let folder_trust = match session.folder_trust() {
+            crate::config::FolderTrust::Trusted => "trusted",
+            crate::config::FolderTrust::Untrusted => "untrusted",
+        };
+        let policy = format!(
+            "{policy}\n\n{}",
+            FOLDER_TRUST_POLICY.replace("${TCODE_FOLDER_TRUST}", folder_trust)
+        );
+        let policy = session.prompt_variables().expand(&policy);
+        let request = ClassifierRequest {
+            policy,
+            cache_scope: session.classifier_cache_scope(),
+            transcript: ClassifierTranscript::from_ledger(&session.ledger),
+        };
+        match classifier.classify(request, check.cancel.clone()).await {
+            ClassifierDecision::Allow => {
+                session.record_auto_classification(true);
+                Decision::Allow
+            }
+            ClassifierDecision::Block { reason } => {
+                let paused = session.record_auto_classification(false);
+                if let Some(notice) = &paused {
+                    // This is a real mode change, not a staged UI request.
+                    // Keep every frontend's mode mirror authoritative through
+                    // the same event used at normal safe boundaries.
+                    let _ = check
+                        .events
+                        .send(AgentEvent::ModeChanged(PermissionMode::Default))
+                        .await;
+                    let _ = check
+                        .events
+                        .send(AgentEvent::AutoModePaused(notice.clone()))
+                        .await;
+                }
+                let paused = paused
+                    .map(|notice| format!("\n{notice}"))
+                    .unwrap_or_default();
+                Decision::Deny(format!(
                             "Blocked by Auto Mode safety classifier: {reason}\nFind a safer alternative. Do not try to route around this boundary.{paused}"
                         ))
-                    }
-                    ClassifierDecision::Unavailable { reason } => {
-                        let failure = classifier_failure_reason(&reason);
-                        let _ = check
-                            .events
-                            .send(AgentEvent::AutoClassifierUnavailable(failure))
-                            .await;
-                        if let Some(notice) = session.record_auto_classifier_unavailable() {
-                            let _ = check
-                                .events
-                                .send(AgentEvent::ModeChanged(PermissionMode::Default))
-                                .await;
-                            let _ = check
-                                .events
-                                .send(AgentEvent::AutoModePaused(classifier_failure_notice(
-                                    notice, &reason,
-                                )))
-                                .await;
-                        }
-                        Decision::Ask
-                    }
+            }
+            ClassifierDecision::Unavailable { reason } => {
+                let failure = classifier_failure_reason(&reason);
+                let _ = check
+                    .events
+                    .send(AgentEvent::AutoClassifierUnavailable(failure))
+                    .await;
+                if let Some(notice) = session.record_auto_classifier_unavailable() {
+                    let _ = check
+                        .events
+                        .send(AgentEvent::ModeChanged(PermissionMode::Default))
+                        .await;
+                    let _ = check
+                        .events
+                        .send(AgentEvent::AutoModePaused(classifier_failure_notice(
+                            notice, &reason,
+                        )))
+                        .await;
                 }
+                Decision::Ask
             }
         }
     }
@@ -870,6 +917,7 @@ impl Agent {
         let mut declined = false;
         let mut awaiting_user_input = false;
         let mut interrupted_at: Option<usize> = None;
+        let mut classified = BatchClassification::default();
 
         for (i, (id, name, input)) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
@@ -927,6 +975,7 @@ impl Agent {
                         request: &request,
                         cancel,
                         events,
+                        classified: &mut classified,
                     },
                 )
                 .await
@@ -1341,6 +1390,121 @@ impl Agent {
     /// asking. After preflight, hooks/checkpoints for every call that will
     /// actually run are complete before the first mutation; calls to one path
     /// preserve the model's order, while separate paths run concurrently.
+    /// Offer every change in this batch for one review instead of a dialog per
+    /// call. Reviewing the whole change set at once is what a human actually
+    /// wants to do before saying yes; the per-call flow only ever revealed the
+    /// next diff after the previous one was already decided.
+    ///
+    /// Only calls the permission rules resolve to a plain `Ask` are offered.
+    /// That check is pure — no classifier request, no mode transition — so
+    /// assembling the offer cannot authorize anything by itself, and Auto
+    /// Mode's classifier-routed calls keep their individual prompts.
+    async fn combined_change_review(
+        &self,
+        session: &mut Session,
+        calls: &[(String, String, Value)],
+        approver: &dyn Approver,
+        notes: &mut Vec<Entry>,
+    ) -> Option<CombinedReview> {
+        let offered: Vec<(usize, String, PermissionRequest, &Value)> = calls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (_, name, input))| {
+                let tool = self.tool(name)?;
+                let request = tool.permission(input);
+                matches!(session.rules.decide(session.mode, &request), Decision::Ask)
+                    .then(|| (index, name.clone(), request, input))
+            })
+            .collect();
+        if offered.len() < 2 {
+            return None;
+        }
+
+        // `approval_label` allocates, so the descriptors outlive the borrows
+        // handed to the front end.
+        let descriptors: Vec<String> = offered
+            .iter()
+            .map(|(_, _, request, _)| request.approval_label())
+            .collect();
+        let asks: Vec<BatchAsk<'_>> = offered
+            .iter()
+            .zip(&descriptors)
+            .map(|((_, name, request, input), descriptor)| {
+                let PermissionRequest::Ask { summary, .. } = request else {
+                    unreachable!("only plain Ask requests are offered")
+                };
+                BatchAsk {
+                    tool: name,
+                    summary,
+                    descriptor,
+                    is_edit: request.is_edit(),
+                    allows_project: request.allows_rule(),
+                    input,
+                }
+            })
+            .collect();
+        // Name the change set exactly as its transcript header will, by asking
+        // the loop's own labeller rather than re-deriving the rule here.
+        let offered_calls: Vec<(String, String, Value)> = offered
+            .iter()
+            .map(|(index, name, _, input)| {
+                (calls[*index].0.clone(), name.clone(), (*input).clone())
+            })
+            .collect();
+        let label = self
+            .batch_display_label(session, &offered_calls)
+            .unwrap_or_else(|| format!("{} changes", offered.len()));
+
+        let BatchApproval::All(approval) = approver.ask_batch(&label, &asks).await else {
+            return None;
+        };
+        drop(asks);
+
+        session.mark_mode_delivery();
+        if matches!(
+            approval.decision,
+            ApprovalDecision::YesSession | ApprovalDecision::YesProject
+        ) {
+            // The answer covers every call it was shown for, so each one earns
+            // its own rule — a batch has no single descriptor to persist.
+            for (_, _, request, _) in &offered {
+                self.persist_approval_rule(session, request, approval.decision, notes)
+                    .await;
+            }
+        }
+        if let Some(note) = approval.comment.clone() {
+            notes.push(Entry::UserNote {
+                about: offered[0].1.clone(),
+                answer: false,
+                text: note,
+            });
+        }
+        if let Some(mode) = approval.set_mode {
+            session.apply_approved_mode(mode);
+        }
+
+        let verdict = match approval.decision {
+            ApprovalDecision::No => {
+                let (reason, awaits) = match approval.comment {
+                    Some(comment) => (
+                        format!("User declined this action. Reason: {comment}"),
+                        false,
+                    ),
+                    None => (
+                        "User declined this action without further guidance. Stop now and wait for the user's next instruction; do not guess an alternative.".to_string(),
+                        true,
+                    ),
+                };
+                CombinedVerdict::Declined { reason, awaits }
+            }
+            _ => CombinedVerdict::Approved,
+        };
+        Some(CombinedReview {
+            covered: offered.iter().map(|(index, ..)| *index).collect(),
+            verdict,
+        })
+    }
+
     async fn run_file_mutation_lanes(
         &self,
         session: &mut Session,
@@ -1361,8 +1525,19 @@ impl Agent {
         let mut notes: Vec<Entry> = Vec::new();
         let mut declined_paths: HashMap<PathBuf, String> = HashMap::new();
         let mut awaiting_user_input = false;
+        let mut classified = BatchClassification::default();
 
-        for (id, name, input) in calls {
+        if cancel.is_cancelled() {
+            return self.cancel_unstarted_batch(session, calls, true);
+        }
+        // One review for the whole change set, when there is more than one
+        // change to review. `None` means the front end wants — or can only
+        // offer — the per-call flow below, which stays the authority.
+        let combined = self
+            .combined_change_review(session, calls, approver, &mut notes)
+            .await;
+
+        for (index, (id, name, input)) in calls.iter().enumerate() {
             if cancel.is_cancelled() {
                 return self.cancel_unstarted_batch(session, calls, true);
             }
@@ -1393,12 +1568,29 @@ impl Agent {
                         request: &request,
                         cancel,
                         events,
+                        classified: &mut classified,
                     },
                 )
                 .await
             {
                 Decision::Allow => {}
                 Decision::Deny(reason) => declined = Some(reason),
+                // The combined review already answered for this call. It only
+                // ever covers calls the rules resolved to a plain `Ask`, so an
+                // `Auto` call still reaches its own prompt below.
+                Decision::Ask
+                    if combined
+                        .as_ref()
+                        .is_some_and(|review| review.covered.contains(&index)) =>
+                {
+                    match &combined.as_ref().expect("covered").verdict {
+                        CombinedVerdict::Approved => {}
+                        CombinedVerdict::Declined { reason, awaits } => {
+                            awaiting_user_input |= *awaits;
+                            declined = Some(reason.clone());
+                        }
+                    }
+                }
                 Decision::Ask | Decision::Auto => {
                     let PermissionRequest::Ask {
                         descriptor: _,
@@ -1746,6 +1938,7 @@ impl Agent {
         }
 
         let batch_label = sequential_batch_label(prepared.len());
+        let mut classified = BatchClassification::default();
 
         // Combined approval: ask once for the whole batch.
         for (id, name, input, tool) in &prepared {
@@ -1759,6 +1952,7 @@ impl Agent {
                         request: &request,
                         cancel,
                         events,
+                        classified: &mut classified,
                     },
                 )
                 .await

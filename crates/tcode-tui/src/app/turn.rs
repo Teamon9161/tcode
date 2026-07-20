@@ -890,6 +890,12 @@ impl App {
                 if let Some(mark) = self.change_prebake.take() {
                     self.transcript.truncate_blocks(mark);
                 }
+                // A declined combined review still emits its batch header and a
+                // result per call, so the record is already complete; a summary
+                // line here would only duplicate the batch's own first row.
+                if dialog.is_batch() {
+                    return;
+                }
                 let reason = approval
                     .comment
                     .as_deref()

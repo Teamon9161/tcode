@@ -39,15 +39,15 @@ use tcode_core::commands::{
     CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
 };
 use tcode_core::{
-    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, ContentBlock, FolderTrust,
-    PendingMessage, ReferenceCandidate, Session, Usage,
+    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk,
+    ContentBlock, FolderTrust, PendingMessage, ReferenceCandidate, Session, Usage,
 };
 
 use tcode_importers::{
     import_external_session, list_external_sessions, ExternalSessionInfo, ExternalSource,
 };
 
-use crate::approval::Dialog;
+use crate::approval::{Dialog, DialogResult};
 use crate::composer::{
     editor_layout, format_bytes, ghost_visual_lines, input_spans, move_editor_visual,
     paste_should_fold, reference_basename, reference_basename_path, reference_boundary,
@@ -57,7 +57,7 @@ use crate::composer::{
 use crate::editor::{Editor, Position};
 use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
 use crate::model_picker::{self, AgentMenu, ModelMenu};
-use crate::overlay::{Flow, Overlay, OverlayAction, OverlayCtx};
+use crate::overlay::{ApprovalReply, Flow, Overlay, OverlayAction, OverlayCtx};
 use crate::render::{
     batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
 };
@@ -122,14 +122,34 @@ const UI_COMMANDS: [(&str, &str); 5] = [
     ("/provider", "configure or switch provider"),
 ];
 
-pub struct AskMsg {
+/// One call under review. A combined review carries several of these; every
+/// other prompt carries exactly one.
+pub struct AskCall {
     pub tool: String,
     pub summary: String,
     pub descriptor: String,
     pub is_edit: bool,
     pub allows_project: bool,
     pub input: serde_json::Value,
-    pub reply: oneshot::Sender<Approval>,
+}
+
+pub struct AskMsg {
+    /// The batch header for a combined review, as the agent loop names it.
+    /// Empty for a single prompt.
+    pub label: String,
+    pub calls: Vec<AskCall>,
+    pub reply: ApprovalReply,
+}
+
+impl AskMsg {
+    /// The one call a single prompt is about.
+    pub fn only(&self) -> &AskCall {
+        &self.calls[0]
+    }
+
+    fn is_batch(&self) -> bool {
+        self.calls.len() > 1
+    }
 }
 
 /// Approver that forwards prompts into the UI loop.
@@ -150,19 +170,48 @@ impl Approver for ChannelApprover {
     ) -> Approval {
         let (reply, rx) = oneshot::channel();
         let msg = AskMsg {
-            tool: tool.to_string(),
-            summary: summary.to_string(),
-            descriptor: descriptor.to_string(),
-            is_edit,
-            allows_project,
-            input: input.clone(),
-            reply,
+            label: String::new(),
+            calls: vec![AskCall {
+                tool: tool.to_string(),
+                summary: summary.to_string(),
+                descriptor: descriptor.to_string(),
+                is_edit,
+                allows_project,
+                input: input.clone(),
+            }],
+            reply: ApprovalReply::One(reply),
         };
         if self.tx.send(msg).await.is_err() {
             return Approval::simple(ApprovalDecision::No, Some("UI unavailable".into()));
         }
         rx.await
             .unwrap_or_else(|_| Approval::simple(ApprovalDecision::No, None))
+    }
+
+    async fn ask_batch(&self, label: &str, calls: &[BatchAsk<'_>]) -> BatchApproval {
+        let (reply, rx) = oneshot::channel();
+        let msg = AskMsg {
+            label: label.to_string(),
+            calls: calls
+                .iter()
+                .map(|call| AskCall {
+                    tool: call.tool.to_string(),
+                    summary: call.summary.to_string(),
+                    descriptor: call.descriptor.to_string(),
+                    is_edit: call.is_edit,
+                    allows_project: call.allows_project,
+                    input: call.input.clone(),
+                })
+                .collect(),
+            reply: ApprovalReply::Batch(reply),
+        };
+        // A review that never reaches the UI must not decline the batch on the
+        // user's behalf: the per-call flow still has its own prompt for each
+        // call, and that path already knows how to fail closed.
+        if self.tx.send(msg).await.is_err() {
+            return BatchApproval::Individually;
+        }
+        rx.await.unwrap_or(BatchApproval::Individually)
     }
 }
 
@@ -566,75 +615,7 @@ impl App {
                     }
                 }
                 Some(ask) = self.ask_rx.recv() => {
-                    self.meter.pause_for_user();
-                    let dialog = if ask.tool == "ask_user" {
-                        Dialog::questions(ask.summary, &ask.input)
-                    } else if ask.tool == "exit_plan" {
-                        // The plan is the review surface, but it lives inside the
-                        // pane now (block-navigable, commentable) rather than in
-                        // the transcript. Split it into blocks and pre-render each
-                        // so the hot key path never re-parses markdown. On
-                        // approval the tool runs and its ToolStart bakes the plan
-                        // into the transcript; on decline `bake_approval_record`
-                        // bakes it — either way the transcript record matches
-                        // replay's ExitPlanRenderer output.
-                        self.bake_live_text();
-                        self.finish_thinking();
-                        let source = ask.input["plan"].as_str().unwrap_or("").trim();
-                        let blocks = markdown::split_blocks(source)
-                            .into_iter()
-                            .map(|block| {
-                                let document = self.md.parse(&block);
-                                (block, document)
-                            })
-                            .collect();
-                        Dialog::plan(ask.summary, ask.input.clone(), blocks)
-                    } else {
-                        // A change proposal (edit/write) or a long/multi-line
-                        // shell command is baked into the transcript now — in
-                        // full, scrollable as part of the record — so the
-                        // reviewer reads the whole thing there rather than in
-                        // the cramped dialog. On decline it is retracted; on
-                        // approval the upcoming ToolStart skips re-baking it
-                        // (see `change_prebake`).
-                        //
-                        // The summary is recomputed from name+input through
-                        // the renderer, not taken as the raw string core put
-                        // in `summary`: a long/multi-line shell command needs
-                        // the same capped preview ToolStart uses (see
-                        // `on_tool_start`), or its full, possibly multi-line
-                        // text fills the compact dialog with no way to scroll
-                        // past it to the Yes/No choices.
-                        let renderer = self.renderers.get(&ask.tool);
-                        let call_summary = self.display_summary(&renderer.header(
-                            &ask.tool,
-                            &ask.input,
-                            Some(&self.cwd),
-                        ));
-                        let change = renderer.approval_detail(&ask.input);
-                        if !change.is_empty() {
-                            self.bake_live_text();
-                            self.finish_thinking();
-                            self.change_prebake = Some(self.transcript.block_count());
-                            let mut spans: Vec<Span> = self.colored_tool_summary(&call_summary);
-                            spans.insert(0, Span::styled("● ", theme::accent()));
-                            let mut lines = vec![Line::default(), Line::from(spans)];
-                            lines.extend(change);
-                            lines.push(Line::default());
-                            self.bake(lines);
-                        }
-                        // The diff/command lives in the transcript; the dialog
-                        // carries only the choices.
-                        Dialog::new(
-                            call_summary.clone(),
-                            ask.descriptor,
-                            call_summary,
-                            ask.is_edit,
-                            ask.allows_project,
-                        )
-                    };
-                    self.transcript.clear_hover();
-                    self.overlay = Some(Overlay::approval(dialog, ask.reply));
+                    self.open_review(ask);
                 }
                 done = join_phase(&mut self.phase) => {
                     self.on_turn_done(done);
@@ -706,6 +687,103 @@ impl App {
         self.on_overlay_flow(flow);
     }
 
+    /// Open the review pane for a pending authorization: a question form, a
+    /// plan, or one or more proposed changes.
+    fn open_review(&mut self, ask: AskMsg) {
+        self.meter.pause_for_user();
+        let dialog = if ask.only().tool == "ask_user" {
+            Dialog::questions(ask.only().summary.clone(), &ask.only().input)
+        } else if ask.only().tool == "exit_plan" {
+            // The plan is the review surface, but it lives inside the
+            // pane now (block-navigable, commentable) rather than in
+            // the transcript. Split it into blocks and pre-render each
+            // so the hot key path never re-parses markdown. On
+            // approval the tool runs and its ToolStart bakes the plan
+            // into the transcript; on decline `bake_approval_record`
+            // bakes it — either way the transcript record matches
+            // replay's ExitPlanRenderer output.
+            self.bake_live_text();
+            self.finish_thinking();
+            let source = ask.only().input["plan"].as_str().unwrap_or("").trim();
+            let blocks = markdown::split_blocks(source)
+                .into_iter()
+                .map(|block| {
+                    let document = self.md.parse(&block);
+                    (block, document)
+                })
+                .collect();
+            Dialog::plan(ask.only().summary.clone(), ask.only().input.clone(), blocks)
+        } else {
+            self.bake_proposed_changes(&ask)
+        };
+        self.transcript.clear_hover();
+        self.overlay = Some(Overlay::approval(dialog, ask.reply));
+    }
+
+    /// Bake every proposed change into the transcript and build the dialog that
+    /// asks about them. A change proposal (edit/write) or a long/multi-line
+    /// shell command goes into the transcript in full — scrollable as part of
+    /// the record — so the reviewer reads the whole thing there rather than in
+    /// the cramped dialog. A combined review bakes all of its changes under one
+    /// mark, so declining or taking the review apart retracts them together.
+    /// On approval the upcoming ToolStart skips re-baking (see
+    /// `change_prebake`).
+    fn bake_proposed_changes(&mut self, ask: &AskMsg) -> Dialog {
+        // The summary is recomputed from name+input through the renderer, not
+        // taken as the raw string core put in `summary`: a long/multi-line
+        // shell command needs the same capped preview ToolStart uses (see
+        // `on_tool_start`), or its full, possibly multi-line text fills the
+        // compact dialog with no way to scroll past it to the choices.
+        let rendered: Vec<(String, Vec<Line<'static>>)> = ask
+            .calls
+            .iter()
+            .map(|call| {
+                let renderer = self.renderers.get(&call.tool);
+                let summary = self.display_summary(&renderer.header(
+                    &call.tool,
+                    &call.input,
+                    Some(&self.cwd),
+                ));
+                (summary, renderer.approval_detail(&call.input))
+            })
+            .collect();
+
+        if rendered.iter().any(|(_, change)| !change.is_empty()) {
+            self.bake_live_text();
+            self.finish_thinking();
+            self.change_prebake = Some(self.transcript.block_count());
+            for (summary, change) in &rendered {
+                if change.is_empty() {
+                    continue;
+                }
+                let mut spans: Vec<Span> = self.colored_tool_summary(summary);
+                spans.insert(0, Span::styled("● ", theme::accent()));
+                let mut lines = vec![Line::default(), Line::from(spans)];
+                lines.extend(change.clone());
+                lines.push(Line::default());
+                self.bake(lines);
+            }
+        }
+
+        // The diffs live in the transcript; the dialog carries only the choices.
+        if ask.is_batch() {
+            return Dialog::batch(
+                ask.label.clone(),
+                ask.calls.len(),
+                ask.calls.iter().all(|call| call.is_edit),
+            );
+        }
+        let call = ask.only();
+        let summary = rendered[0].0.clone();
+        Dialog::new(
+            summary.clone(),
+            call.descriptor.clone(),
+            summary,
+            call.is_edit,
+            call.allows_project,
+        )
+    }
+
     fn on_overlay_flow(&mut self, flow: Flow) {
         match flow {
             Flow::Stay => {}
@@ -717,6 +795,11 @@ impl App {
             Flow::Act(OverlayAction::Approved(approval)) => {
                 if let Some(Overlay::Approval(dialog, reply)) = self.overlay.take() {
                     self.finish_approval(*dialog, reply, approval);
+                }
+            }
+            Flow::Act(OverlayAction::ReviewIndividually) => {
+                if let Some(Overlay::Approval(_, reply)) = self.overlay.take() {
+                    self.review_individually(reply);
                 }
             }
             Flow::Act(action) => {
@@ -744,16 +827,26 @@ impl App {
             // Suspends the terminal, so it cannot run inside the dialog's key
             // handler; the dialog is still open and takes the revision.
             OverlayAction::EditPlan => self.edit_plan_externally(),
-            OverlayAction::Approved(_) => unreachable!("handled by on_overlay_flow"),
+            OverlayAction::Approved(_) | OverlayAction::ReviewIndividually => {
+                unreachable!("handled by on_overlay_flow")
+            }
         }
     }
 
-    fn finish_approval(
-        &mut self,
-        dialog: Dialog,
-        reply: oneshot::Sender<Approval>,
-        approval: Approval,
-    ) {
+    /// The reviewer took a combined review apart. Retract every diff it baked —
+    /// the per-call flow re-proposes them one at a time — and hand the batch
+    /// back to the agent loop unanswered.
+    fn review_individually(&mut self, reply: ApprovalReply) {
+        if let Some(mark) = self.change_prebake.take() {
+            self.transcript.truncate_blocks(mark);
+        }
+        if let ApprovalReply::Batch(tx) = reply {
+            let _ = tx.send(BatchApproval::Individually);
+        }
+        self.meter.resume_from_user();
+    }
+
+    fn finish_approval(&mut self, dialog: Dialog, reply: ApprovalReply, approval: Approval) {
         // A plan approval chose the mode execution runs under. The agent loop
         // applies it to the Session; mirror it into the frontend's own view so
         // the status line updates at once.
@@ -763,7 +856,14 @@ impl App {
             self.pending_mode.clear();
         }
         self.bake_approval_record(&dialog, &approval);
-        let _ = reply.send(approval);
+        match reply {
+            ApprovalReply::One(tx) => {
+                let _ = tx.send(approval);
+            }
+            ApprovalReply::Batch(tx) => {
+                let _ = tx.send(BatchApproval::All(approval));
+            }
+        }
         self.meter.resume_from_user();
     }
 
@@ -859,8 +959,14 @@ impl App {
                 None
             }
         };
-        if let Some(approval) = approval {
-            self.on_overlay_flow(Flow::Act(OverlayAction::Approved(approval)));
+        match approval {
+            Some(DialogResult::Done(approval)) => {
+                self.on_overlay_flow(Flow::Act(OverlayAction::Approved(approval)))
+            }
+            Some(DialogResult::Individually) => {
+                self.on_overlay_flow(Flow::Act(OverlayAction::ReviewIndividually))
+            }
+            Some(DialogResult::Pending | DialogResult::EditPlan) | None => {}
         }
     }
 

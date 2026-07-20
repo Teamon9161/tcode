@@ -12,7 +12,7 @@
 
 use crossterm::event::KeyEvent;
 use ratatui::text::Line;
-use tcode_core::{Approval, PermissionMode};
+use tcode_core::{Approval, BatchApproval, PermissionMode};
 use tcode_importers::{ExternalSessionInfo, ExternalSource};
 use tokio::sync::oneshot;
 
@@ -54,6 +54,10 @@ pub enum OverlayAction {
     /// Only `Overlay::Approval` produces this, and the reply channel it needs
     /// lives in that variant — see `App::on_overlay_flow`.
     Approved(Approval),
+    /// A combined review the reviewer took apart: retract its diffs and let the
+    /// agent loop prompt for each change on its own. Same channel ownership as
+    /// `Approved`.
+    ReviewIndividually,
 }
 
 /// What the app should do with the overlay after it handled an event.
@@ -75,11 +79,18 @@ pub enum Overlay {
     Mode(mode_picker::Picker),
     FolderTrust(folder_trust_picker::Picker),
     Agent(model_picker::AgentPicker),
-    Approval(Box<Dialog>, oneshot::Sender<Approval>),
+    Approval(Box<Dialog>, ApprovalReply),
+}
+
+/// Where a review's answer goes. A combined review can also be handed back for
+/// per-call prompts — an outcome a single prompt has no way to express.
+pub enum ApprovalReply {
+    One(oneshot::Sender<Approval>),
+    Batch(oneshot::Sender<BatchApproval>),
 }
 
 impl Overlay {
-    pub fn approval(dialog: Dialog, reply: oneshot::Sender<Approval>) -> Self {
+    pub fn approval(dialog: Dialog, reply: ApprovalReply) -> Self {
         Overlay::Approval(Box::new(dialog), reply)
     }
 
@@ -191,6 +202,7 @@ impl Overlay {
                 DialogResult::Pending => Flow::Stay,
                 DialogResult::EditPlan => Flow::ActInPlace(OverlayAction::EditPlan),
                 DialogResult::Done(approval) => Flow::Act(OverlayAction::Approved(approval)),
+                DialogResult::Individually => Flow::Act(OverlayAction::ReviewIndividually),
             },
         }
     }
@@ -317,7 +329,7 @@ mod tests {
         let (reply, _rx) = oneshot::channel();
         let overlay = Overlay::approval(
             Dialog::new("summary".into(), "tool".into(), "call".into(), false, false),
-            reply,
+            ApprovalReply::One(reply),
         );
         assert!(overlay.keeps_status_hint());
         assert!(!mode_overlay().keeps_status_hint());
