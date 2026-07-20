@@ -129,7 +129,7 @@ impl Tool for AddNoteTool {
         "add_note"
     }
     fn description(&self) -> &str {
-        "Record a concise durable note for the current conversation before continuing. Use it for decisions, constraints, or handoff context."
+        "Record one concise, high-value handoff note in the current conversation. Use it only for a user decision, verified constraint, or unfinished-work boundary that later steps must retain. This is not progress tracking and does not write persistent auto memory."
     }
     fn input_schema(&self) -> Value {
         json!({ "type": "object", "properties": { "text": { "type": "string" } }, "required": ["text"] })
