@@ -189,13 +189,20 @@ pub struct Setup {
     /// credentials are being fixed, so the model selection is left alone.
     missing_profile: Option<String>,
     step: Step,
+    /// The existing `~/.tcode/state.toml` at the moment setup was opened.
+    /// The wizard only manages `profile`, `model`, and `effort` — every
+    /// other field (folder trust, agent pins, dogfood, …) must survive
+    /// the save that follows.
+    existing_state: ModelState,
 }
 
 impl Setup {
     /// `config` is the user's global config (`Config::default()` on first
     /// run). `missing_profile` names the profile whose credentials sent us
-    /// here, if any.
-    pub fn new(config: Config, missing_profile: Option<&str>) -> Self {
+    /// here, if any. `existing_state` is the current `~/.tcode/state.toml`;
+    /// callers should pass `ModelState::load()` unless this is the first-run
+    /// wizard (in which case there is nothing to preserve).
+    pub fn new(config: Config, missing_profile: Option<&str>, existing_state: ModelState) -> Self {
         // Defaults as the base layer, the user's overrides on top — the same
         // order `Config::load` uses, so the wizard offers what would run.
         let mut catalogue = Config::defaults().profiles;
@@ -227,6 +234,7 @@ impl Setup {
             customs: Vec::new(),
             missing_profile: missing_profile.map(String::from),
             step: Step::Providers { cursor: 0 },
+            existing_state,
         }
     }
 
@@ -639,7 +647,7 @@ impl Setup {
 
         if let Some(profile) = self.missing_profile.clone() {
             self.config.default_profile = Some(profile);
-            return self.done(ModelState::default());
+            return self.done(self.existing_state.clone());
         }
 
         // Models are offered from the *merged* view, the one the runtime will
@@ -670,7 +678,7 @@ impl Setup {
             // the default and let the user name a model in config.toml.
             0 => {
                 self.config.default_profile = configured.first().cloned();
-                self.done(ModelState::default())
+                self.done(self.existing_state.clone())
             }
             // A single model is not a question worth asking.
             1 => self.pick_model(&options[0]),
@@ -706,12 +714,11 @@ impl Setup {
 
     fn pick_model(&mut self, choice: &ModelChoice) -> Progress {
         self.config.default_profile = Some(choice.profile.clone());
-        self.done(ModelState {
-            profile: Some(choice.profile.clone()),
-            model: Some(choice.model.clone()),
-            effort: choice.effort.clone(),
-            ..ModelState::default()
-        })
+        let mut state = self.existing_state.clone();
+        state.profile = Some(choice.profile.clone());
+        state.model = Some(choice.model.clone());
+        state.effort = choice.effort.clone();
+        self.done(state)
     }
 
     fn done(&mut self, state: ModelState) -> Progress {
@@ -844,7 +851,7 @@ mod tests {
     /// keep coming from the catalogue and stay correct when it is updated.
     #[test]
     fn a_builtin_profile_is_saved_as_a_key_only_patch() {
-        let mut setup = Setup::new(Config::default(), None);
+        let mut setup = Setup::new(Config::default(), None, ModelState::default());
         // Which providers auto-detect depends on this machine's environment;
         // start from nothing so the walk below is the only thing under test.
         deselect_all(&mut setup);
@@ -882,7 +889,7 @@ mod tests {
     /// own: no layer below it knows the name.
     #[test]
     fn a_custom_endpoint_is_written_whole() {
-        let mut setup = Setup::new(Config::default(), None);
+        let mut setup = Setup::new(Config::default(), None, ModelState::default());
         deselect_all(&mut setup);
         setup.on_key(key(KeyCode::Char('c')));
         type_str(&mut setup, "groq");
@@ -912,7 +919,7 @@ mod tests {
     /// must survive it. Only Esc on the list itself abandons setup.
     #[test]
     fn escaping_a_field_keeps_the_selection() {
-        let mut setup = Setup::new(Config::default(), None);
+        let mut setup = Setup::new(Config::default(), None, ModelState::default());
         go_to(&mut setup, "deepseek");
         setup.on_key(key(KeyCode::Char(' ')));
         setup.on_key(key(KeyCode::Char('c')));
@@ -942,7 +949,7 @@ mod tests {
     /// silently move the user's default model.
     #[test]
     fn reconfiguring_one_profile_leaves_the_model_choice_alone() {
-        let mut setup = Setup::new(Config::default(), Some("openrouter"));
+        let mut setup = Setup::new(Config::default(), Some("openrouter"), ModelState::default());
         let row = setup
             .view()
             .rows
@@ -961,7 +968,7 @@ mod tests {
     /// into the field, and on the list it must not act as keystrokes.
     #[test]
     fn paste_lands_in_the_field_and_is_inert_on_the_list() {
-        let mut setup = Setup::new(Config::default(), None);
+        let mut setup = Setup::new(Config::default(), None, ModelState::default());
         setup.on_paste("sk-pasted".into());
         assert!(setup.customs.is_empty());
         assert!(matches!(setup.step, Step::Providers { .. }));
@@ -981,7 +988,7 @@ mod tests {
     /// config that would overwrite what is already on disk.
     #[test]
     fn confirming_an_empty_selection_cancels() {
-        let mut setup = Setup::new(Config::default(), None);
+        let mut setup = Setup::new(Config::default(), None, ModelState::default());
         for entry in &mut setup.entries {
             entry.selected = false;
         }

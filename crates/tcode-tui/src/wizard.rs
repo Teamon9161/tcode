@@ -47,7 +47,7 @@ pub fn run() -> anyhow::Result<Option<(Config, ModelState)>> {
     println!(
         "{BOLD}tcode setup{RESET} {DIM}— no config found, let's create ~/.tcode/config.toml{RESET}"
     );
-    run_setup(Setup::new(Config::default(), None))
+    run_setup(Setup::new(Config::default(), None, ModelState::default()))
 }
 
 /// Reconfigure a profile whose credentials are missing. Existing profiles and
@@ -59,7 +59,7 @@ pub fn reconfigure(
     println!(
         "{BOLD}tcode setup{RESET} {DIM}— profile '{missing_profile}' is not configured; choose a provider{RESET}"
     );
-    run_setup(Setup::new(config, Some(missing_profile)))
+    run_setup(Setup::new(config, Some(missing_profile), ModelState::load()))
 }
 
 fn run_setup(mut setup: Setup) -> anyhow::Result<Option<(Config, ModelState)>> {

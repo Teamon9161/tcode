@@ -123,7 +123,7 @@ impl App {
             .map(|opt| opt.profile.clone());
         match (self.provider_setup.load)() {
             Ok(global) => {
-                let setup = crate::setup::Setup::new(global, profile.as_deref());
+                let setup = crate::setup::Setup::new(global, profile.as_deref(), tcode_core::config::ModelState::load());
                 self.overlay = Some(Overlay::Provider(Box::new(setup)));
             }
             Err(e) => self.bake(vec![Line::styled(
