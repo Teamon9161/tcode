@@ -1,19 +1,21 @@
-//! First-run setup: pick providers, paste keys, choose a default model.
-//! Runs before the inline TUI exists, so it renders directly with
-//! crossterm in raw mode (↑↓ move, space toggles, enter confirms).
+//! First-run setup, drawn straight to the terminal with crossterm.
+//!
+//! This renderer exists because `App::new` needs an `Arc<Agent>`, i.e. a
+//! provider that was already built — precisely what setup is there to
+//! produce. So the first run and a startup with unusable credentials cannot
+//! be an overlay. Everything it decides lives in `setup.rs`; the in-session
+//! `/provider` overlay drives the same state machine.
 
 use std::io::{stdout, Write};
 
 use crossterm::cursor::MoveTo;
-use crossterm::event::{
-    DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
-};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use tcode_core::config::{Config, ModelDef, ModelState, Profile, ProviderKind};
-use tcode_providers::codex_auth_available;
+use tcode_core::config::{Config, ModelState};
+
+use crate::setup::{Mark, Progress, Row, Setup, Tone, View};
 
 const CYAN: &str = "\x1b[36m";
 const GREEN: &str = "\x1b[32m";
@@ -39,63 +41,13 @@ impl Drop for RawGuard {
     }
 }
 
-struct Candidate {
-    id: String,
-    title: String,
-    status: String,
-    detected: bool,
-    key_env: Option<String>,
-}
-
-fn candidates(profiles: &std::collections::BTreeMap<String, Profile>) -> Vec<Candidate> {
-    profiles
-        .iter()
-        .map(|(id, profile)| {
-            let key_env = profile.api_key_env.clone();
-            let (status, detected) = if profile.provider == Some(ProviderKind::Codex) {
-                let ok = codex_auth_available();
-                (
-                    if ok {
-                        "~/.codex/auth.json ✓".into()
-                    } else {
-                        "not logged in — run `codex login` first".into()
-                    },
-                    ok,
-                )
-            } else if let Some(ref var) = key_env {
-                if std::env::var(var).is_ok() {
-                    (format!("{GREEN}${var}{RESET} ✓"), true)
-                } else if profile.api_key.is_some() {
-                    (format!("{GREEN}inline key{RESET} ✓"), true)
-                } else {
-                    (format!("{DIM}not configured{RESET}"), false)
-                }
-            } else if profile.api_key.is_some() {
-                (format!("{GREEN}inline key{RESET} ✓"), true)
-            } else {
-                (format!("{DIM}not configured{RESET}"), false)
-            };
-            let provider_label = match profile.provider {
-                Some(ProviderKind::Anthropic) => "Anthropic",
-                Some(ProviderKind::Openai) => "OpenAI",
-                Some(ProviderKind::Codex) => "Codex",
-                None => "unset",
-            };
-            Candidate {
-                id: id.clone(),
-                title: format!("{id} ({provider_label})"),
-                status,
-                detected,
-                key_env,
-            }
-        })
-        .collect()
-}
-
 /// Returns None if the user cancelled. On success the caller writes the
 /// config and state to disk.
 pub fn run() -> anyhow::Result<Option<(Config, ModelState)>> {
-    run_with(Config::default(), None)
+    println!(
+        "{BOLD}tcode setup{RESET} {DIM}— no config found, let's create ~/.tcode/config.toml{RESET}"
+    );
+    run_setup(Setup::new(Config::default(), None))
 }
 
 /// Reconfigure a profile whose credentials are missing. Existing profiles and
@@ -104,499 +56,64 @@ pub fn reconfigure(
     config: Config,
     missing_profile: &str,
 ) -> anyhow::Result<Option<(Config, ModelState)>> {
-    run_with(config, Some(missing_profile))
+    println!(
+        "{BOLD}tcode setup{RESET} {DIM}— profile '{missing_profile}' is not configured; choose a provider{RESET}"
+    );
+    run_setup(Setup::new(config, Some(missing_profile)))
 }
 
-fn run_with(
-    mut config: Config,
-    missing_profile: Option<&str>,
-) -> anyhow::Result<Option<(Config, ModelState)>> {
-    match missing_profile {
-        Some(profile) => println!(
-            "{BOLD}tcode setup{RESET} {DIM}— profile '{profile}' is not configured; choose a provider{RESET}"
-        ),
-        None => println!(
-            "{BOLD}tcode setup{RESET} {DIM}— no config found, let's create ~/.tcode/config.toml{RESET}"
-        ),
-    }
+fn run_setup(mut setup: Setup) -> anyhow::Result<Option<(Config, ModelState)>> {
     println!(
         "{DIM}keys are saved in ~/.tcode/config.toml; environment variables also work{RESET}\n"
     );
-
-    // Build the discoverable profile catalogue: defaults as the base layer,
-    // user/project overrides on top (same-key → merge, new-key → insert).
-    // config.profiles stays clean for serialization.
-    let mut catalogue = Config::defaults().profiles;
-    for (key, profile) in &config.profiles {
-        match catalogue.get_mut(key) {
-            Some(existing) => existing.merge(profile.clone()),
-            None => {
-                catalogue.insert(key.clone(), profile.clone());
-            }
-        }
-    }
-
-    let cands = candidates(&catalogue);
-    let Some((chosen, customs)) = select_providers(&cands, &catalogue, missing_profile)? else {
-        return Ok(None);
-    };
-    if chosen.is_empty() && customs.is_empty() {
-        println!("{DIM}nothing selected — setup cancelled{RESET}");
-        return Ok(None);
-    }
-
-    for &(i, ref inline_key) in &chosen {
-        let cand = &cands[i];
-        if let Some(profile) = config.profiles.get_mut(&cand.id) {
-            if let Some(key) = inline_key {
-                profile.api_key = Some(key.clone());
-            }
-        } else {
-            // Profile only exists in defaults — insert a minimal entry so
-            // the key is serialized to ~/.tcode/config.toml. Everything else
-            // (models, base_url, etc.) stays in the system catalogue.
-            config.profiles.insert(
-                cand.id.clone(),
-                Profile {
-                    provider: catalogue[&cand.id].provider,
-                    api_key: inline_key.clone(),
-                    model: None,
-                    models: Vec::new(),
-                    api_key_env: None,
-                    base_url: None,
-                    max_tokens: None,
-                    context_window: None,
-                    vision: None,
-                },
-            );
-        }
-    }
-    for (name, profile) in customs {
-        config.profiles.insert(name, profile);
-    }
-
-    // Names of everything just configured, in selection order: presets then
-    // custom endpoints.
-    let mut configured: Vec<String> = chosen
-        .iter()
-        .map(|&(i, _)| cands[i].id.to_string())
-        .collect();
-    configured.extend(
-        config
-            .profiles
-            .keys()
-            .filter(|k| !cands.iter().any(|c| c.id == k.as_str()))
-            .cloned(),
-    );
-
-    // Dynamic provider catalogues are needed to choose a model, but they are
-    // runtime observations rather than user configuration and must not be
-    // serialized back into ~/.tcode/config.toml.
-    let mut model_config = config.clone();
-    tcode_providers::hydrate_codex_models(&mut model_config);
-
-    // Reconfigure (slash-command /provider) only configures credentials —
-    // the current model selection stays in place.
-    if missing_profile.is_some() {
-        config.default_profile = Some(missing_profile.unwrap().to_string());
-        return Ok(Some((config, ModelState::default())));
-    }
-
-    // Default model across everything just configured.
-    let mut options: Vec<(String, String, Option<String>)> = Vec::new();
-    let mut labels: Vec<String> = Vec::new();
-    for pname in &configured {
-        let Some(profile) = model_config.profiles.get(pname) else {
-            continue;
-        };
-        for def in profile.model_defs() {
-            labels.push(format!("{pname} · {}", def.display()));
-            options.push((pname.clone(), def.name.clone(), def.default_effort.clone()));
-        }
-    }
-    let default_idx = match options.len() {
-        0 => {
-            println!("{DIM}selected providers expose no models — edit config.toml manually{RESET}");
-            None
-        }
-        1 => Some(0),
-        _ => select_one("default model:", &labels, 0)?,
-    };
-    let Some(idx) = default_idx.or((!options.is_empty()).then_some(0)) else {
-        config.default_profile = configured.first().cloned();
-        return Ok(Some((config, ModelState::default())));
-    };
-    let (profile, model, effort) = options[idx].clone();
-    config.default_profile = Some(profile.clone());
-    let state = ModelState {
-        profile: Some(profile),
-        model: Some(model),
-        effort,
-        ..ModelState::default()
-    };
-    Ok(Some((config, state)))
-}
-
-fn read_key() -> std::io::Result<KeyEvent> {
-    loop {
-        if let Event::Key(k) = crossterm::event::read()? {
-            if k.kind != KeyEventKind::Release {
-                return Ok(k);
-            }
-        }
-    }
-}
-
-fn is_cancel(k: &KeyEvent) -> bool {
-    k.code == KeyCode::Esc
-        || (k.code == KeyCode::Char('c') && k.modifiers.contains(KeyModifiers::CONTROL))
-}
-
-/// Candidate indices chosen in the wizard, each with an optional inline
-/// API key (None = use the env var).
-type ProviderSelection = Vec<(usize, Option<String>)>;
-
-/// A custom endpoint the user defined with `c`: profile name + profile.
-type CustomProfile = (String, Profile);
-
-/// Select providers and optionally enter API keys inline via Tab. Returns
-/// the chosen presets plus any custom endpoints defined with `c`. None =
-/// user cancelled.
-fn select_providers(
-    cands: &[Candidate],
-    profiles: &std::collections::BTreeMap<String, Profile>,
-    missing_profile: Option<&str>,
-) -> anyhow::Result<Option<(ProviderSelection, Vec<CustomProfile>)>> {
-    #[derive(Clone)]
-    struct Entry {
-        selected: bool,
-        key: Option<String>,
-    }
-
-    let initial_selected = |i: usize| -> bool {
-        missing_profile
-            .map(|profile| cands[i].id == profile || cands[i].detected)
-            .unwrap_or(cands[i].detected)
-    };
-
-    let mut entries: Vec<Entry> = (0..cands.len())
-        .map(|i| {
-            let existing_key = profiles.get(&cands[i].id).and_then(|p| p.api_key.clone());
-            Entry {
-                selected: initial_selected(i),
-                key: existing_key,
-            }
-        })
-        .collect();
-
-    let mut cursor = 0usize;
-    let mut customs: Vec<(String, Profile)> = Vec::new();
     let _guard = RawGuard::new()?;
     let mut out = stdout();
     loop {
-        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-        write!(
-            out,
-            "{BOLD}providers to configure{RESET}  {DIM}(space = toggle, tab = set key){RESET}\r\n"
-        )?;
-        for (i, cand) in cands.iter().enumerate() {
-            let ptr = if i == cursor { "▸" } else { " " };
-            let mark = if entries[i].selected {
-                format!("{CYAN}[x]{RESET}")
-            } else {
-                "[ ]".into()
-            };
-            // Show key status
-            let key_status = if let Some(key) = &entries[i].key {
-                format!("{GREEN}key set{RESET} {DIM}({} chars){RESET}", key.len())
-            } else {
-                let has_env = cand
-                    .key_env
-                    .as_deref()
-                    .is_some_and(|v| std::env::var(v).is_ok());
-                if has_env {
-                    format!("{GREEN}${}{RESET}", cand.key_env.as_deref().unwrap())
-                } else {
-                    cand.status.clone()
-                }
-            };
-            // If the candidate has an inline key from the config already,
-            // the "key set" display above already matches. If there's no entry
-            // key and no env var, use the candidate's pre-computed status from
-            // candidates() which checks both env and config.
-            // The status below is only reached when both entry.key and env are absent.
-
-            write!(out, " {ptr} {mark} {}  {key_status}\r\n", cand.title)?;
-        }
-        for (name, profile) in &customs {
-            write!(
-                out,
-                "   {CYAN}[x]{RESET} {name} {DIM}(custom · {} model(s)){RESET}\r\n",
-                profile.models.len()
-            )?;
-        }
-        write!(
-            out,
-            "{DIM}   ↑↓ move · space toggle · tab key · c add custom endpoint · enter confirm · esc cancel{RESET}\r\n"
-        )?;
-        out.flush()?;
-        let k = read_key()?;
-        if is_cancel(&k) {
+        draw(&mut out, &setup.view())?;
+        let progress = match crossterm::event::read()? {
+            Event::Key(key) if key.kind != KeyEventKind::Release => setup.on_key(key),
+            Event::Paste(text) => setup.on_paste(text),
+            _ => Progress::Stay,
+        };
+        if let Progress::Done(outcome) = progress {
             queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
             out.flush()?;
-            return Ok(None);
-        }
-        match k.code {
-            KeyCode::Up => cursor = cursor.saturating_sub(1),
-            KeyCode::Down => cursor = (cursor + 1).min(cands.len() - 1),
-            KeyCode::Char(' ') => entries[cursor].selected = !entries[cursor].selected,
-            KeyCode::Char('c') => {
-                if let Some(custom) = read_custom_provider(&mut out)? {
-                    customs.push(custom);
-                }
+            if outcome.is_none() {
+                println!("{DIM}setup cancelled{RESET}");
             }
-            KeyCode::Tab => {
-                // Inline key input for the current candidate
-                let cand = &cands[cursor];
-                let var = cand.key_env.as_deref().unwrap_or("API_KEY");
-                let key = read_inline_key(&cand.id, var, &mut out)?;
-                match key {
-                    InlineKeyResult::Set(k) => {
-                        entries[cursor].key = Some(k);
-                        entries[cursor].selected = true;
-                    }
-                    InlineKeyResult::Skip => {
-                        entries[cursor].key = None;
-                        entries[cursor].selected = true;
-                    }
-                    InlineKeyResult::Cancelled => {}
-                }
-            }
-            KeyCode::Enter => {
-                let result: Vec<(usize, Option<String>)> = entries
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, e)| e.selected)
-                    .map(|(i, e)| (i, e.key.clone()))
-                    .collect();
-                queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-                out.flush()?;
-                return Ok(Some((result, customs)));
-            }
-            _ => {}
+            return Ok(outcome.map(|boxed| *boxed));
         }
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
-enum InlineKeyResult {
-    Set(String),
-    Skip,
-    Cancelled,
-}
-
-/// Inline key input that appears at the bottom of the selection screen.
-/// Returns the key, "skip" (use env var), or "cancelled".
-fn read_inline_key(
-    label: &str,
-    var: &str,
-    out: &mut std::io::Stdout,
-) -> anyhow::Result<InlineKeyResult> {
-    let mut buf = String::new();
-    let mut pasted = false;
-    loop {
-        let hint = if pasted {
-            "  [pasted · Enter to confirm]"
-        } else if buf.is_empty() {
-            "  [type or paste (Ctrl+Shift+V) · Esc skip]"
-        } else {
-            "  [Enter confirm · Esc skip]"
-        };
-        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-        write!(
-            out,
-            "{BOLD}{label} API key{RESET}  {DIM}(empty = ${var}){RESET}\r\n\r\n"
-        )?;
-        if buf.is_empty() {
-            write!(out, "  {DIM}<type or paste key here>{RESET}")?;
-        } else {
-            write!(out, "  {}", "•".repeat(buf.chars().count()))?;
-        }
-        write!(out, "{hint}")?;
-        out.flush()?;
-        match crossterm::event::read()? {
-            Event::Paste(text) => {
-                let text = text.trim();
-                if !text.is_empty() {
-                    buf.push_str(text);
-                    pasted = true;
-                }
-            }
-            Event::Key(k) if k.kind != KeyEventKind::Release => {
-                if is_cancel(&k) {
-                    // Esc: skip (go back to selection without setting key)
-                    return Ok(InlineKeyResult::Cancelled);
-                }
-                match k.code {
-                    KeyCode::Enter => {
-                        let trimmed = buf.trim().to_string();
-                        return if trimmed.is_empty() {
-                            Ok(InlineKeyResult::Skip)
-                        } else {
-                            Ok(InlineKeyResult::Set(trimmed))
-                        };
-                    }
-                    KeyCode::Backspace => {
-                        buf.pop();
-                        pasted = false;
-                    }
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => {
-                        buf.push(c);
-                    }
-                    KeyCode::Tab => {
-                        // Tab during input = confirm (same as Enter)
-                        let trimmed = buf.trim().to_string();
-                        return if trimmed.is_empty() {
-                            Ok(InlineKeyResult::Skip)
-                        } else {
-                            Ok(InlineKeyResult::Set(trimmed))
-                        };
-                    }
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
+fn draw(out: &mut std::io::Stdout, view: &View) -> std::io::Result<()> {
+    queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
+    write!(out, "{BOLD}{}{RESET}\r\n", view.title)?;
+    for row in &view.rows {
+        write!(out, "{}\r\n", line(row))?;
     }
+    write!(out, "{DIM}   {}{RESET}\r\n", view.hint)?;
+    out.flush()
 }
 
-/// Read a single unmasked line (name, URL, model id). None = cancelled.
-fn read_line(title: &str, hint: &str, out: &mut std::io::Stdout) -> anyhow::Result<Option<String>> {
-    let mut buf = String::new();
-    loop {
-        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-        write!(
-            out,
-            "{BOLD}{title}{RESET}  {DIM}{hint}{RESET}\r\n\r\n  {buf}▏"
-        )?;
-        out.flush()?;
-        match crossterm::event::read()? {
-            Event::Paste(text) => buf.push_str(text.trim()),
-            Event::Key(k) if k.kind != KeyEventKind::Release => {
-                if is_cancel(&k) {
-                    return Ok(None);
-                }
-                match k.code {
-                    KeyCode::Enter => return Ok(Some(buf.trim().to_string())),
-                    KeyCode::Backspace => {
-                        buf.pop();
-                    }
-                    KeyCode::Char(c) if !k.modifiers.contains(KeyModifiers::CONTROL) => buf.push(c),
-                    _ => {}
-                }
-            }
-            _ => {}
-        }
-    }
-}
-
-/// Interactively define a custom OpenAI/Anthropic-compatible profile:
-/// name, wire protocol, base URL, models, and key. None = cancelled.
-fn read_custom_provider(out: &mut std::io::Stdout) -> anyhow::Result<Option<CustomProfile>> {
-    let Some(name) = read_line("profile name", "e.g. openrouter, groq, local", out)? else {
-        return Ok(None);
+fn line(row: &Row) -> String {
+    let pointer = if row.active { "▸" } else { " " };
+    let mark = match row.mark {
+        Mark::Checked => format!(" {CYAN}[x]{RESET}"),
+        Mark::Unchecked => " [ ]".into(),
+        Mark::None => String::new(),
     };
-    if name.is_empty() {
-        return Ok(None);
-    }
-    let Some(kind_idx) = select_one(
-        "wire protocol:",
-        &[
-            "openai (Chat Completions / OpenAI-compatible)".into(),
-            "anthropic (Messages / Anthropic-compatible)".into(),
-        ],
-        0,
-    )?
-    else {
-        return Ok(None);
-    };
-    let provider = if kind_idx == 0 {
-        ProviderKind::Openai
+    let label = if row.active && row.mark == Mark::None {
+        format!("{CYAN}{}{RESET}", row.label)
     } else {
-        ProviderKind::Anthropic
+        row.label.clone()
     };
-    let Some(base_url) = read_line("base URL", "e.g. https://openrouter.ai/api/v1", out)? else {
-        return Ok(None);
+    let status = match (row.status.is_empty(), row.tone) {
+        (true, _) => String::new(),
+        (false, Tone::Ok) => format!("  {GREEN}{}{RESET}", row.status),
+        (false, Tone::Dim) => format!("  {DIM}{}{RESET}", row.status),
     };
-    let Some(models_raw) = read_line(
-        "model id(s)",
-        "comma-separated, e.g. gpt-5.6, deepseek-v4-pro",
-        out,
-    )?
-    else {
-        return Ok(None);
-    };
-    let models: Vec<ModelDef> = models_raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(ModelDef::bare)
-        .collect();
-    let api_key = match read_inline_key(&name, "API_KEY", out)? {
-        InlineKeyResult::Set(k) => Some(k),
-        InlineKeyResult::Skip | InlineKeyResult::Cancelled => None,
-    };
-    let profile = Profile {
-        provider: Some(provider),
-        model: None,
-        models,
-        api_key,
-        // No inline key → fall back to <NAME>_API_KEY (uppercased).
-        api_key_env: Some(format!("{}_API_KEY", name.to_ascii_uppercase())),
-        base_url: (!base_url.is_empty()).then_some(base_url),
-        max_tokens: None,
-        context_window: None,
-        vision: None,
-    };
-    Ok(Some((name, profile)))
-}
-
-fn select_one(title: &str, items: &[String], start: usize) -> anyhow::Result<Option<usize>> {
-    let mut cursor = start.min(items.len().saturating_sub(1));
-    let _guard = RawGuard::new()?;
-    let mut out = stdout();
-    loop {
-        queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-        write!(out, "{BOLD}{title}{RESET}\r\n")?;
-        for (i, label) in items.iter().enumerate() {
-            if i == cursor {
-                write!(out, " {CYAN}▸ {label}{RESET}\r\n")?;
-            } else {
-                write!(out, "   {label}\r\n")?;
-            }
-        }
-        write!(
-            out,
-            "{DIM}   ↑↓ move · enter confirm · esc cancel{RESET}\r\n"
-        )?;
-        out.flush()?;
-        let k = read_key()?;
-        if is_cancel(&k) {
-            queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-            out.flush()?;
-            return Ok(None);
-        }
-        match k.code {
-            KeyCode::Up => cursor = cursor.saturating_sub(1),
-            KeyCode::Down => cursor = (cursor + 1).min(items.len() - 1),
-            KeyCode::Enter => {
-                queue!(out, MoveTo(0, 0), Clear(ClearType::All))?;
-                out.flush()?;
-                return Ok(Some(cursor));
-            }
-            _ => {}
-        }
-    }
+    format!(" {pointer}{mark} {label}{status}")
 }
 
 /// Non-interactive fallback config (pipes/CI): all profiles from the

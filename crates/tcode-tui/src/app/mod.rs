@@ -356,6 +356,9 @@ pub struct App {
     rewind_nav: Option<RewindNav>,
     menu: ModelMenu,
     agents: AgentMenu,
+    /// `/provider`'s two effects: read the user's config, and persist what
+    /// the form produced. The binary owns both.
+    provider_setup: crate::ProviderSetup,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
     dogfood: bool,
@@ -404,7 +407,6 @@ pub struct App {
     /// tool headers. Unlike `spinner` it never wraps, so the sweep stays continuous.
     anim_frame: usize,
     should_exit: bool,
-    provider_setup_requested: bool,
     /// Transient feedback ("copied 3 lines") shown in the hint row.
     notice: Option<(String, Instant)>,
     /// Active retry backoff: countdown deadline plus attempt/max, rendered red
@@ -439,6 +441,7 @@ impl App {
         let crate::TuiConfig {
             menu,
             agents,
+            provider_setup,
             opening_context,
             environment,
             show_reasoning,
@@ -533,6 +536,7 @@ impl App {
             rewind_nav: None,
             menu,
             agents,
+            provider_setup,
             dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
@@ -558,7 +562,6 @@ impl App {
             spinner: 0,
             anim_frame: 0,
             should_exit: false,
-            provider_setup_requested: false,
             notice: None,
         })
     }
@@ -660,16 +663,6 @@ impl App {
             }
         }
         Ok(())
-    }
-
-    pub fn provider_setup_requested(&self) -> bool {
-        self.provider_setup_requested
-    }
-
-    /// Recover the active session when the app intentionally exits to launch
-    /// the provider wizard.
-    pub fn take_session(&mut self) -> Option<Session> {
-        self.session.take()
     }
 
     // ------------------------------------------------------------ turn
@@ -832,6 +825,7 @@ impl App {
             OverlayAction::OpenExternalSource(source) => self.open_external_resume_picker(source),
             OverlayAction::ImportExternal(external) => self.import_external_session(external),
             OverlayAction::ApplyModel { index, effort } => self.apply_model(index, effort),
+            OverlayAction::ApplySetup(done) => self.apply_setup(done),
             OverlayAction::SetMode(mode) => self.set_mode(mode),
             OverlayAction::FolderTrust(choice) => self.apply_folder_trust_choice(choice),
             OverlayAction::ApplyAgentModel { kind, choice } => {
@@ -1563,6 +1557,90 @@ async fn join_external_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/provider` used to quit the TUI, run a bare-terminal wizard and
+    /// rebuild the app around the returned session. It is an overlay now:
+    /// the app must stay up, and what it hands the binary to persist must
+    /// carry the key that was typed.
+    #[test]
+    fn provider_setup_is_an_overlay_and_yields_the_edited_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved: Arc<std::sync::Mutex<Option<tcode_core::config::Config>>> = Arc::default();
+        let sink = saved.clone();
+        let mut app = harness::app_with_provider_setup(
+            dir.path(),
+            90,
+            40,
+            crate::ProviderSetup {
+                load: Box::new(|| Ok(tcode_core::config::Config::default())),
+                apply: Box::new(move |config, _state| {
+                    *sink.lock().unwrap() = Some(config);
+                    Ok((
+                        ModelMenu {
+                            options: Vec::new(),
+                            current: 0,
+                            switch: Box::new(|_, _| Err("rebuilt".into())),
+                        },
+                        AgentMenu {
+                            roles: Vec::new(),
+                            pins: Vec::new(),
+                            pin: Box::new(|_, _| Err("rebuilt".into())),
+                        },
+                    ))
+                }),
+            },
+        );
+
+        app.run_slash("/provider");
+        let form = app.frame();
+        assert!(
+            form.contains("providers to configure"),
+            "setup is on screen, not a torn-down terminal:\n{form}"
+        );
+        assert!(!app.should_exit, "the session stays open");
+
+        // Walk to a builtin profile, open its key field, type, confirm.
+        fn cursor_on(app: &mut App, name: &str) -> bool {
+            // The overlay paints inside a bordered panel, so the cursor mark
+            // is mid-line rather than at the start.
+            app.frame()
+                .lines()
+                .any(|line| line.contains('▸') && line.contains(name))
+        }
+        let mut steps = 0;
+        while !cursor_on(&mut app, "deepseek") {
+            app.press(KeyCode::Down);
+            steps += 1;
+            assert!(steps < 20, "deepseek is reachable with the arrow keys");
+        }
+        app.press(KeyCode::Tab);
+        for c in "sk-typed".chars() {
+            app.press(KeyCode::Char(c));
+        }
+        let masked = app.frame();
+        assert!(
+            masked.contains("••••••••") && !masked.contains("sk-typed"),
+            "a key is never echoed in the clear:\n{masked}"
+        );
+        app.press(KeyCode::Enter); // key → list
+        app.press(KeyCode::Enter); // list → model choice
+        app.press(KeyCode::Enter); // model → done
+
+        let config = saved.lock().unwrap().take().expect("setup was applied");
+        assert!(
+            config
+                .profiles
+                .values()
+                .any(|p| p.api_key.as_deref() == Some("sk-typed")),
+            "the typed key reaches the binary that persists it"
+        );
+        let after = app.frame();
+        assert!(
+            !after.contains("providers to configure"),
+            "the overlay closes once applied:\n{after}"
+        );
+        assert!(after.contains("providers configured"));
+    }
 
     #[test]
     fn shimmer_text_preserves_content_and_animates_the_amber_status() {

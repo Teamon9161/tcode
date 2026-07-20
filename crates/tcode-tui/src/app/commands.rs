@@ -112,6 +112,57 @@ impl App {
         }
     }
 
+    /// `/provider`: edit credentials without leaving the conversation. Seeded
+    /// with the user's own config only — a project overlay must never be
+    /// copied into `~/.tcode/config.toml`.
+    pub(super) fn open_provider_setup(&mut self) {
+        let profile = self
+            .menu
+            .options
+            .get(self.menu.current)
+            .map(|opt| opt.profile.clone());
+        match (self.provider_setup.load)() {
+            Ok(global) => {
+                let setup = crate::setup::Setup::new(global, profile.as_deref());
+                self.overlay = Some(Overlay::Provider(Box::new(setup)));
+            }
+            Err(e) => self.bake(vec![Line::styled(
+                format!("cannot read the global config: {e}"),
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    /// Persist a finished setup and take the rebuilt menus. The provider swap
+    /// happens inside the closure, so a running turn keeps its snapshot
+    /// exactly as a `/model` switch does.
+    pub(super) fn apply_setup(
+        &mut self,
+        done: Box<(tcode_core::config::Config, tcode_core::config::ModelState)>,
+    ) {
+        let (config, state) = *done;
+        match (self.provider_setup.apply)(config, state) {
+            Ok((menu, agents)) => {
+                self.menu = menu;
+                self.agents = agents;
+                let current = self
+                    .menu
+                    .options
+                    .get(self.menu.current)
+                    .map(|opt| format!("{} · {}", opt.profile, opt.def.display()))
+                    .unwrap_or_else(|| "no models configured".into());
+                self.bake(vec![Line::styled(
+                    format!("providers configured — {current} · /model to switch"),
+                    theme::dim(),
+                )]);
+            }
+            Err(e) => self.bake(vec![Line::styled(
+                format!("cannot save provider setup: {e}"),
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
     /// Hot-swap the shared ModelCell; a running turn finishes on its
     /// snapshot, the next request uses the new model.
     pub(super) fn apply_model(&mut self, index: usize, effort: Option<String>) {
@@ -176,8 +227,7 @@ impl App {
                 return;
             }
             "/provider" => {
-                self.provider_setup_requested = true;
-                self.should_exit = true;
+                self.open_provider_setup();
                 return;
             }
             "/model" => {

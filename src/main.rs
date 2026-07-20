@@ -3,6 +3,7 @@ mod printer;
 mod update;
 
 use std::io::{IsTerminal, Write as _};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -185,6 +186,46 @@ fn persist_agent_pin(kind: &str, allows_off: bool, selection: Option<&Selection>
             },
         );
     });
+}
+
+/// Persist what `/provider` produced, then rebuild everything downstream of
+/// the config: reload all three layers, swap the provider into the shared
+/// cell (so a running turn keeps its snapshot), and hand back both menus.
+/// The TUI owns none of this — it only reports the result.
+fn build_provider_setup(
+    cwd: PathBuf,
+    model_cell: ModelCell,
+    pinned: AgentModels,
+    agent_defs: Arc<tcode_tools::AgentRegistry>,
+) -> tcode_tui::ProviderSetup {
+    let apply = move |updated: Config, state: ModelState| {
+        let describe = |e: std::fmt::Arguments| e.to_string();
+        updated
+            .write_global(CONFIG_HEADER)
+            .map_err(|e| describe(format_args!("{e}")))?;
+        state.save();
+
+        let mut config = Config::load(&cwd).map_err(|e| describe(format_args!("{e}")))?;
+        tcode_providers::hydrate_codex_models(&mut config);
+        let selection = config
+            .select(None, None, &state)
+            .map_err(|e| describe(format_args!("{e}")))?;
+        let profile = config
+            .profiles
+            .get(&selection.profile)
+            .ok_or_else(|| format!("profile '{}' disappeared after setup", selection.profile))?;
+        let active = tcode_providers::build_active(profile, &selection, &config.watchdog)
+            .map_err(|e| describe(format_args!("{e}")))?;
+        model_cell.swap(active);
+
+        let menu = build_menu(&config, &selection, model_cell.clone());
+        let agents = build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
+        Ok((menu, agents))
+    };
+    tcode_tui::ProviderSetup {
+        load: Box::new(|| Config::load_global().map_err(|e| e.to_string())),
+        apply: Box::new(apply),
+    }
 }
 
 /// Flatten every profile's models into the /model menu, wiring the
@@ -476,7 +517,7 @@ async fn main() -> anyhow::Result<()> {
     let model_cell = ModelCell::new(active_model);
 
     // Everything /model can switch to, with the swap logic attached.
-    let mut menu = build_menu(&config, &selection, model_cell.clone());
+    let menu = build_menu(&config, &selection, model_cell.clone());
     // Builtin agent kinds plus user-defined `.tcode/agents/*.md` share one
     // registry. Validate their capability policies only after MCP connections
     // have supplied the exact delegated inventory.
@@ -749,67 +790,25 @@ async fn main() -> anyhow::Result<()> {
     // Interactive: full TUI on a real terminal, plain line REPL otherwise
     // (pipes, CI, dumb terminals).
     if interactive {
-        loop {
-            match tcode_tui::run(
-                agent.clone(),
-                session,
-                tcode_tui::TuiConfig {
-                    menu,
-                    agents: agent_menu,
-                    opening_context: opening_context.clone(),
-                    environment: environment.clone(),
-                    show_reasoning: config.ui.show_reasoning,
-                    skills: skills.clone(),
-                },
-            )
-            .await?
-            {
-                tcode_tui::Exit::Quit => return Ok(()),
-                tcode_tui::Exit::ConfigureProvider(returned_session) => {
-                    let global = Config::load_global()?;
-                    let Some((updated, state)) =
-                        tcode_tui::wizard::reconfigure(global, &selection.profile)?
-                    else {
-                        // Esc only cancels the provider wizard. The existing
-                        // session and active model are still valid, so restore
-                        // the TUI instead of turning a no-op into a process
-                        // error.
-                        session = *returned_session;
-                        menu = build_menu(&config, &selection, model_cell.clone());
-                        agent_menu =
-                            build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
-                        continue;
-                    };
-                    let path = updated.write_global(CONFIG_HEADER)?;
-                    state.save();
-
-                    // Rebuild the selected provider in the existing shared
-                    // model cell, then reopen the same conversation.
-                    let mut runtime_config = Config::load(&cwd)?;
-                    tcode_providers::hydrate_codex_models(&mut runtime_config);
-                    let runtime_selection = runtime_config.select(None, None, &state)?;
-                    let profile = runtime_config
-                        .profiles
-                        .get(&runtime_selection.profile)
-                        .context("selected profile disappeared after setup")?;
-                    let active = tcode_providers::build_active(
-                        profile,
-                        &runtime_selection,
-                        &runtime_config.watchdog,
-                    )?;
-                    model_cell.swap(active);
-                    menu = build_menu(&runtime_config, &runtime_selection, model_cell.clone());
-                    agent_menu = build_agent_menu(
-                        &runtime_config,
-                        &menu,
-                        pinned.clone(),
-                        agent_defs.as_ref(),
-                    );
-                    session = *returned_session;
-                    println!("{DIM}updated {}; reopening tcode{RESET}", path.display());
-                }
-            }
-        }
+        return tcode_tui::run(
+            agent.clone(),
+            session,
+            tcode_tui::TuiConfig {
+                menu,
+                agents: agent_menu,
+                provider_setup: build_provider_setup(
+                    cwd.clone(),
+                    model_cell.clone(),
+                    pinned.clone(),
+                    agent_defs.clone(),
+                ),
+                opening_context: opening_context.clone(),
+                environment: environment.clone(),
+                show_reasoning: config.ui.show_reasoning,
+                skills: skills.clone(),
+            },
+        )
+        .await;
     }
 
     let registry = CommandRegistry::builtin();

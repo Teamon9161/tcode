@@ -70,6 +70,12 @@ fn config() -> crate::TuiConfig {
             pins: Vec::new(),
             pin: Box::new(|_, _| Err("no pinning in tests".into())),
         },
+        provider_setup: crate::ProviderSetup {
+            // Never the real ~/.tcode/config.toml: tests must neither depend
+            // on this machine's providers nor be able to overwrite them.
+            load: Box::new(|| Ok(tcode_core::config::Config::default())),
+            apply: Box::new(|_, _| Err("no provider setup in tests".into())),
+        },
         opening_context: Arc::new(|cwd: &Path, _| tcode_core::StartupContext {
             text: String::new(),
             environment: environment(cwd),
@@ -82,6 +88,29 @@ fn config() -> crate::TuiConfig {
 
 /// An app painting into a `width`x`height` buffer, rooted at `cwd`.
 pub(super) fn app(cwd: &Path, width: u16, height: u16) -> App {
+    app_with(cwd, width, height, config())
+}
+
+/// Same, with the `/provider` effects replaced so a test can observe what
+/// setup produced without any of it reaching the disk.
+pub(super) fn app_with_provider_setup(
+    cwd: &Path,
+    width: u16,
+    height: u16,
+    provider_setup: crate::ProviderSetup,
+) -> App {
+    app_with(
+        cwd,
+        width,
+        height,
+        crate::TuiConfig {
+            provider_setup,
+            ..config()
+        },
+    )
+}
+
+fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> App {
     let agent = Agent {
         model: ModelCell::new(ActiveModel {
             provider: Arc::new(StubProvider),
@@ -108,7 +137,7 @@ pub(super) fn app(cwd: &Path, width: u16, height: u16) -> App {
     App::on_surface(
         Arc::new(agent),
         session,
-        config(),
+        config,
         Surface::Test(ratatui::backend::TestBackend::new(width, height)),
     )
     .expect("a test surface always builds")

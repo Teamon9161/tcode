@@ -16,9 +16,11 @@ mod mathfmt;
 mod mode_picker;
 mod model_picker;
 mod overlay;
+mod provider_picker;
 mod reference_style;
 mod render;
 mod resume;
+mod setup;
 mod surface;
 mod theme;
 mod transcript;
@@ -38,6 +40,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use tcode_core::config::{Config, ModelState};
 use tcode_core::{Agent, Session};
 
 pub use app::App;
@@ -46,17 +49,25 @@ pub use model_picker::{
 };
 pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
 
-pub enum Exit {
-    Quit,
-    /// The provider wizard runs outside the inline TUI. Return the live
-    /// session so startup can reconfigure the model and immediately reopen
-    /// it. Boxed: `Session` is large and `Quit` carries nothing.
-    ConfigureProvider(Box<Session>),
+/// The two effects `/provider` needs. Both live in the binary crate, like
+/// `SwitchFn` and `PinFn`, so the TUI depends neither on the concrete
+/// providers nor on where config.toml lives.
+pub struct ProviderSetup {
+    /// The user's own global config, to seed the form. Never the merged
+    /// runtime config: a project overlay must not be copied into
+    /// `~/.tcode/config.toml` by saving.
+    pub load: Box<dyn Fn() -> Result<Config, String> + Send + Sync>,
+    /// Persist the result and rebuild everything derived from it: the active
+    /// provider in the shared `ModelCell`, then both menus.
+    #[allow(clippy::type_complexity)]
+    pub apply:
+        Box<dyn Fn(Config, ModelState) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
 }
 
 pub struct TuiConfig {
     pub menu: ModelMenu,
     pub agents: AgentMenu,
+    pub provider_setup: ProviderSetup,
     pub opening_context: OpeningContextFn,
     pub environment: EnvironmentFn,
     pub show_reasoning: bool,
@@ -65,7 +76,7 @@ pub struct TuiConfig {
 
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
 /// the terminal is restored even if the app errors or panics.
-pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyhow::Result<Exit> {
+pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyhow::Result<()> {
     enable_raw_mode()?;
     execute!(
         stdout(),
@@ -83,16 +94,7 @@ pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyh
     }));
 
     let result = match App::new(agent, session, config) {
-        Ok(mut app) => match app.run().await {
-            Ok(()) if app.provider_setup_requested() => app
-                .take_session()
-                .map(|session| Exit::ConfigureProvider(Box::new(session)))
-                .ok_or_else(|| {
-                    anyhow::anyhow!("provider setup requested without an active session")
-                }),
-            Ok(()) => Ok(Exit::Quit),
-            Err(error) => Err(error),
-        },
+        Ok(mut app) => app.run().await,
         Err(e) => Err(e),
     };
 

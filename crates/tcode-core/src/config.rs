@@ -119,6 +119,23 @@ pub struct Profile {
 }
 
 impl Profile {
+    /// An empty patch: overrides nothing. Layering a profile that only sets
+    /// a field or two onto the catalogue is the normal case, so building one
+    /// should not mean listing every field as `None`.
+    pub fn patch() -> Self {
+        Self {
+            provider: None,
+            model: None,
+            models: Vec::new(),
+            api_key: None,
+            api_key_env: None,
+            base_url: None,
+            max_tokens: None,
+            context_window: None,
+            vision: None,
+        }
+    }
+
     /// Resolve the API key: inline value, then the configured (or
     /// provider-default) environment variable. ChatGPT profiles don't
     /// use API keys at all.

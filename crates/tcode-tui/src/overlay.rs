@@ -51,6 +51,10 @@ pub enum OverlayAction {
     /// Suspends the terminal, so it cannot run inside the dialog's own key
     /// handler. The dialog stays open and takes the revision afterwards.
     EditPlan,
+    /// A finished `/provider` run: persist it and rebuild everything derived
+    /// from the config. Only the binary can do that, so it arrives as an
+    /// action like every other.
+    ApplySetup(Box<(tcode_core::config::Config, tcode_core::config::ModelState)>),
     /// Only `Overlay::Approval` produces this, and the reply channel it needs
     /// lives in that variant — see `App::on_overlay_flow`.
     Approved(Approval),
@@ -79,6 +83,8 @@ pub enum Overlay {
     Mode(mode_picker::Picker),
     FolderTrust(folder_trust_picker::Picker),
     Agent(model_picker::AgentPicker),
+    /// `/provider`. Boxed because it carries a whole `Config` being edited.
+    Provider(Box<crate::setup::Setup>),
     Approval(Box<Dialog>, ApprovalReply),
 }
 
@@ -133,8 +139,14 @@ impl Overlay {
     /// swallow it so a multiline paste cannot leak into the hidden editor and
     /// make the panel jump when the picker closes.
     pub fn paste_text(&mut self, text: String) {
-        if let Overlay::Approval(dialog, _) = self {
-            dialog.paste_text(text);
+        match self {
+            Overlay::Approval(dialog, _) => dialog.paste_text(text),
+            // An API key is nearly always pasted; setup itself decides
+            // whether the current step has a field to take it.
+            Overlay::Provider(setup) => {
+                setup.on_paste(text);
+            }
+            _ => {}
         }
     }
 
@@ -146,6 +158,7 @@ impl Overlay {
             Overlay::Mode(picker) => picker.render(),
             Overlay::FolderTrust(picker) => picker.render(),
             Overlay::Agent(picker) => picker.render(ctx.menu, ctx.agents),
+            Overlay::Provider(setup) => crate::provider_picker::render(&setup.view()),
             Overlay::Approval(dialog, _) => dialog.render(ctx.width, ctx.height.saturating_sub(7)),
         }
     }
@@ -157,7 +170,9 @@ impl Overlay {
             Overlay::Mode(picker) => picker.set_hovered_row(row),
             Overlay::FolderTrust(picker) => picker.set_hovered_row(row),
             Overlay::Agent(picker) => picker.set_hovered_row(row, ctx.agents),
-            Overlay::Resume(_) | Overlay::Approval(..) => {}
+            // Setup is a keyboard form (fields, not just rows); hover would
+            // have to move a text cursor to mean anything.
+            Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => {}
         }
     }
 
@@ -198,6 +213,13 @@ impl Overlay {
                 }
             },
             Overlay::Agent(picker) => agent_flow(picker.handle_key(key, ctx.menu, ctx.agents)),
+            Overlay::Provider(setup) => match setup.on_key(key) {
+                crate::setup::Progress::Stay => Flow::Stay,
+                crate::setup::Progress::Done(None) => Flow::Close,
+                crate::setup::Progress::Done(Some(done)) => {
+                    Flow::Act(OverlayAction::ApplySetup(done))
+                }
+            },
             Overlay::Approval(dialog, _) => match dialog.handle_key(key) {
                 DialogResult::Pending => Flow::Stay,
                 DialogResult::EditPlan => Flow::ActInPlace(OverlayAction::EditPlan),
@@ -236,7 +258,7 @@ impl Overlay {
                     flow => flow,
                 }
             }
-            Overlay::Resume(_) | Overlay::Approval(..) => Flow::Stay,
+            Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => Flow::Stay,
         }
     }
 
@@ -247,8 +269,12 @@ impl Overlay {
             Overlay::View(_) | Overlay::Model(_) | Overlay::Mode(_) | Overlay::Agent(_) => {
                 Flow::Close
             }
-            // The trust prompt and an approval must be answered, not dodged.
-            Overlay::FolderTrust(_) | Overlay::Approval(..) | Overlay::Resume(_) => Flow::Stay,
+            // The trust prompt and an approval must be answered, not dodged;
+            // setup holds a half-typed key a stray click must not discard.
+            Overlay::FolderTrust(_)
+            | Overlay::Approval(..)
+            | Overlay::Resume(_)
+            | Overlay::Provider(_) => Flow::Stay,
         }
     }
 }
