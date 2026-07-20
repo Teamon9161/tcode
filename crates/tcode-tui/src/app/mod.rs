@@ -270,6 +270,11 @@ pub struct App {
     /// Clickable regions for the mode and model values in the idle status row.
     /// They are computed from the final rendered layout every frame.
     status_hitboxes: Option<StatusHitboxes>,
+    /// Centered control at the transcript's bottom edge while history is in view.
+    /// Captured from the final frame so a click cannot drift from its label.
+    jump_to_bottom_hitbox: Option<Rect>,
+    /// The jump control uses the same restrained hover lift as other TUI actions.
+    jump_to_bottom_hover: bool,
     /// Where the persistent agent tree rendered this frame and which action
     /// target each row owns.
     live_panel_hitbox: Option<PanelHitbox>,
@@ -453,6 +458,8 @@ impl App {
             clipboard: arboard::Clipboard::new().ok(),
             input_hitbox: None,
             status_hitboxes: None,
+            jump_to_bottom_hitbox: None,
+            jump_to_bottom_hover: false,
             live_panel_hitbox: None,
             live_panel_hover: None,
             status_hover: None,
@@ -906,6 +913,31 @@ impl App {
         false
     }
 
+    fn on_jump_to_bottom_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
+        let hover = self
+            .jump_to_bottom_hitbox
+            .is_some_and(|rect| rect_contains(rect, mouse.column, mouse.row));
+        self.jump_to_bottom_hover = hover;
+        if hover {
+            self.status_hover = None;
+            self.active_transcript_mut().clear_hover();
+        }
+        hover
+    }
+
+    fn on_jump_to_bottom_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !self
+                .jump_to_bottom_hitbox
+                .is_some_and(|rect| rect_contains(rect, mouse.column, mouse.row))
+        {
+            return false;
+        }
+        self.active_transcript_mut().scroll_to_bottom();
+        self.jump_to_bottom_hover = false;
+        true
+    }
+
     fn on_live_panel_mouse_moved(&mut self, mouse: MouseEvent) -> bool {
         let target = self.panel_target_at(mouse.column, mouse.row);
         let inside = self.live_panel_hitbox.as_ref().is_some_and(|hitbox| {
@@ -960,6 +992,14 @@ impl App {
                 // selects and copies the hidden transcript instead of
                 // producing a plan comment.
                 if self.on_overlay_mouse(mouse) {
+                    return;
+                }
+                if matches!(mouse.kind, MouseEventKind::Moved)
+                    && self.on_jump_to_bottom_mouse_moved(mouse)
+                {
+                    return;
+                }
+                if self.on_jump_to_bottom_mouse_down(mouse) {
                     return;
                 }
                 if matches!(mouse.kind, MouseEventKind::Moved)
@@ -1081,6 +1121,10 @@ impl App {
         // while it is on screen.
         if self.overlay.is_some() {
             self.drive_overlay(|overlay, ctx| overlay.handle_key(key, ctx));
+            return;
+        }
+        if matches!(key.code, KeyCode::End) && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.active_transcript_mut().scroll_to_bottom();
             return;
         }
 

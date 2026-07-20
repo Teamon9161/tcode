@@ -215,6 +215,52 @@ pub(super) fn rect_contains(rect: Rect, x: u16, y: u16) -> bool {
         && y < rect.bottom()
 }
 
+/// A compact, centered affordance over the transcript's bottom edge. It keeps
+/// the full shortcut when space permits, then degrades to a small arrow-only
+/// target rather than wrapping into the input panel.
+pub(super) fn jump_to_bottom_control(
+    row: Rect,
+    unseen_blocks: usize,
+    hovered: bool,
+) -> (Rect, Line<'static>) {
+    let full = if unseen_blocks == 0 {
+        " Jump to bottom  ↓ ".to_string()
+    } else {
+        format!(
+            " {unseen_blocks} new message{}  (ctrl+End)  ↓ ",
+            if unseen_blocks == 1 { "" } else { "s" }
+        )
+    };
+    let compact = if unseen_blocks == 0 {
+        " ↓ bottom ".to_string()
+    } else {
+        format!(" {unseen_blocks} new  ↓ ")
+    };
+    let label = if full.width() <= row.width as usize {
+        full
+    } else if compact.width() <= row.width as usize {
+        compact
+    } else {
+        "↓".to_string()
+    };
+    let width = label.width().min(row.width as usize) as u16;
+    let rect = Rect {
+        x: row.x + row.width.saturating_sub(width) / 2,
+        y: row.y,
+        width,
+        height: 1,
+    };
+    let base = ratatui::style::Style::default()
+        .fg(theme::DIM)
+        .bg(ratatui::style::Color::Rgb(43, 46, 52));
+    let style = if hovered {
+        theme::hover_style(base)
+    } else {
+        base
+    };
+    (rect, Line::styled(label, style))
+}
+
 pub(super) fn status_hover_at(hitboxes: StatusHitboxes, x: u16, y: u16) -> Option<StatusHover> {
     if rect_contains(hitboxes.mode, x, y) {
         Some(StatusHover::Mode)
@@ -514,8 +560,10 @@ impl App {
         // mouse handling can map screen coordinates back to what was drawn.
         let mut captured_input: Option<InputHitbox> = None;
         let mut captured_status: Option<StatusHitboxes> = None;
+        let mut captured_jump_to_bottom: Option<Rect> = None;
         let mut captured_panel: Option<Rect> = None;
         let animation_frame = self.anim_frame;
+        let jump_to_bottom_hover = self.jump_to_bottom_hover;
         let transcript = match &self.active_view {
             ViewId::Main => &mut self.transcript,
             ViewId::TaskRun(_) => {
@@ -547,6 +595,18 @@ impl App {
                     ..area
                 },
             );
+            if geometry.top > 0 && !transcript.is_following() {
+                let row = Rect {
+                    x: area.x,
+                    y: area.y + geometry.top - 1,
+                    width: area.width,
+                    height: 1,
+                };
+                let (rect, line) =
+                    jump_to_bottom_control(row, transcript.unseen_blocks(), jump_to_bottom_hover);
+                frame.render_widget(Paragraph::new(line), rect);
+                captured_jump_to_bottom = Some(rect);
+            }
 
             let mut y = area.y + geometry.top;
             let row = |y: u16, h: u16| Rect {
@@ -621,6 +681,7 @@ impl App {
         })?;
         self.input_hitbox = captured_input;
         self.status_hitboxes = captured_status;
+        self.jump_to_bottom_hitbox = captured_jump_to_bottom;
         self.live_panel_hitbox = captured_panel.map(|rect| PanelHitbox {
             rect,
             targets: panel_targets,
@@ -820,11 +881,6 @@ impl App {
                 (u.cache_read_tokens as f64 / u.total_input() as f64 * 100.0).round()
             )
         });
-        let scrolled = if self.transcript.is_following() {
-            ""
-        } else {
-            " · ↑ viewing history"
-        };
         let mode_style = if self.status_hover == Some(StatusHover::Mode) {
             theme::hover_style(theme::accent())
         } else {
@@ -850,7 +906,6 @@ impl App {
             spans.push(Span::styled(" · cache ", theme::dim()));
             spans.push(Span::styled(cache, theme::metadata()));
         }
-        spans.push(Span::styled(scrolled, theme::dim()));
         if let Some((text, _)) = self
             .notice
             .as_ref()
@@ -937,5 +992,30 @@ mod tests {
             "  esc to return to Main agent"
         );
         assert_eq!(lines[0].style, theme::dim());
+    }
+
+    #[test]
+    fn jump_control_centers_the_unseen_message_count_and_preserves_shortcut() {
+        let (rect, line) = jump_to_bottom_control(Rect::new(0, 9, 80, 1), 1, false);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, " 1 new message  (ctrl+End)  ↓ ");
+        assert_eq!(rect.x, (80 - text.width() as u16) / 2);
+        assert_eq!(rect.width, text.width() as u16);
+    }
+
+    #[test]
+    fn jump_control_falls_back_without_wrapping_on_narrow_terminal() {
+        let (rect, line) = jump_to_bottom_control(Rect::new(0, 0, 4, 1), 0, false);
+        let text = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(text, "↓");
+        assert_eq!(rect, Rect::new(1, 0, 1, 1));
     }
 }

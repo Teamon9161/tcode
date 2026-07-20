@@ -43,6 +43,9 @@ pub struct Transcript {
     scroll: usize,
     /// Height of the most recent render, for page-sized scrolling.
     view_height: usize,
+    /// Blocks appended after the reader left the tail. The jump control clears
+    /// this as soon as the tail becomes visible again.
+    unseen_blocks: usize,
     /// Geometry of the most recent render, for mouse hit-testing.
     view_area: Rect,
     view_top: usize,
@@ -294,6 +297,7 @@ impl Transcript {
             width: width.max(1),
             scroll: 0,
             view_height: 0,
+            unseen_blocks: 0,
             view_area: Rect::default(),
             view_top: 0,
             selection: None,
@@ -600,6 +604,7 @@ impl Transcript {
         // below; only scroll 0 follows the tail.
         if self.scroll > 0 {
             self.scroll += height;
+            self.unseen_blocks += 1;
         }
     }
 
@@ -607,6 +612,7 @@ impl Transcript {
         self.blocks.clear();
         self.cum.clear();
         self.scroll = 0;
+        self.unseen_blocks = 0;
         self.selection = None;
         self.highlight = None;
         self.hovered = None;
@@ -631,6 +637,7 @@ impl Transcript {
         self.hovered = None;
         self.trace_hovered = None;
         self.scroll = 0;
+        self.unseen_blocks = 0;
         self.rebuild_cum();
     }
 
@@ -672,6 +679,7 @@ impl Transcript {
         self.hovered = None;
         self.trace_hovered = None;
         self.scroll = 0;
+        self.unseen_blocks = 0;
         self.rebuild_cum();
         true
     }
@@ -715,6 +723,14 @@ impl Transcript {
 
     pub fn scroll_down(&mut self, n: usize) {
         self.scroll = self.scroll.saturating_sub(n);
+        if self.scroll == 0 {
+            self.unseen_blocks = 0;
+        }
+    }
+
+    /// Number of blocks appended after the reader left the tail.
+    pub fn unseen_blocks(&self) -> usize {
+        self.unseen_blocks
     }
 
     /// Distance from the tail. Auto-scroll compares this before/after a step to
@@ -733,6 +749,7 @@ impl Transcript {
 
     pub fn scroll_to_bottom(&mut self) {
         self.scroll = 0;
+        self.unseen_blocks = 0;
     }
 
     /// True when the view is pinned to the newest output.
@@ -1420,6 +1437,25 @@ mod tests {
         t.mouse_drag(3, 2);
         // Soft-wrapped rows join without a newline; block boundary keeps one.
         assert_eq!(t.mouse_up().as_deref(), Some("abcdefghi\nnext"));
+    }
+
+    #[test]
+    fn new_blocks_are_counted_until_the_reader_returns_to_the_tail() {
+        let mut t = Transcript::new(20);
+        for i in 0..6 {
+            t.push(vec![Line::raw(format!("line {i}"))]);
+        }
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        t.render(&mut buf, area);
+        t.scroll_up(2);
+        t.push(vec![Line::raw("new one")]);
+        t.push(vec![Line::raw("new two")]);
+        assert_eq!(t.unseen_blocks(), 2);
+
+        t.scroll_down(usize::MAX);
+        assert!(t.is_following());
+        assert_eq!(t.unseen_blocks(), 0);
     }
 
     #[test]
