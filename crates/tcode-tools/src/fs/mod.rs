@@ -73,9 +73,21 @@ struct Numbered {
     clipped: Vec<(usize, usize)>,
 }
 
-/// Render numbered lines until the line count runs out or the byte budget is
-/// hit.
-fn numbered_capped(lines: &[impl AsRef<str>], start: usize, budget: usize) -> Numbered {
+/// Render lines until the line count runs out or the byte budget is hit.
+///
+/// `number` is on for the few-line snippets `edit`/`append` echo back, where a
+/// number orients the model in the file it just changed for ~7 bytes a line. It
+/// is off for `read`, where those 7 bytes are paid on every line of every file
+/// and buy nothing: `edit` matches exact strings, freshness tracks line
+/// *ranges*, `grep` numbers its own hits, and `read`'s footer states the window
+/// bounds. That left only citing `file.rs:42` from memory — not worth what it
+/// costs on a long session.
+fn numbered_capped(
+    lines: &[impl AsRef<str>],
+    start: usize,
+    budget: usize,
+    number: bool,
+) -> Numbered {
     use std::fmt::Write as _;
 
     // One buffer for the whole read; a `format!` per line would allocate once
@@ -83,18 +95,24 @@ fn numbered_capped(lines: &[impl AsRef<str>], start: usize, budget: usize) -> Nu
     let mut text = String::new();
     let mut emitted = 0;
     let mut clipped_lines = Vec::new();
+    // A numbered row is the number, a tab, the line and a newline; a plain row
+    // is the line and a newline.
+    let overhead = if number { 8 } else { 1 };
     for (i, line) in lines.iter().enumerate() {
         let line = line.as_ref();
         let clipped = clip(line);
-        // A row is the number, a tab, the line and a newline. Always emit at
-        // least one so a single huge line still makes progress.
-        if emitted > 0 && text.len() + clipped.len() + 8 > budget {
+        // Always emit at least one so a single huge line still makes progress.
+        if emitted > 0 && text.len() + clipped.len() + overhead > budget {
             break;
         }
         if matches!(clipped, std::borrow::Cow::Owned(_)) {
             clipped_lines.push((start + i, line.chars().count()));
         }
-        let _ = writeln!(text, "{:>6}\t{clipped}", start + i);
+        let _ = if number {
+            writeln!(text, "{:>6}\t{clipped}", start + i)
+        } else {
+            writeln!(text, "{clipped}")
+        };
         emitted += 1;
     }
     Numbered {
@@ -147,7 +165,7 @@ fn clip_note(clipped: &[(usize, usize)]) -> Option<String> {
 }
 
 fn numbered(lines: &[impl AsRef<str>], start: usize) -> String {
-    numbered_capped(lines, start, usize::MAX).text
+    numbered_capped(lines, start, usize::MAX, true).text
 }
 
 /// Self-healing ENOENT: show what IS there so the model can correct the
@@ -200,5 +218,5 @@ mod tests;
 
 pub(crate) use append::AppendTool;
 pub(crate) use edit::EditTool;
-pub(crate) use read::ReadTool;
+pub use read::ReadTool;
 pub(crate) use write::WriteTool;

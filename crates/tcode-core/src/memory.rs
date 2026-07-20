@@ -449,7 +449,10 @@ fn append_sources<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBu
     let start = out.len();
     for source in sources {
         if out.len().saturating_sub(start) >= cap {
-            out.push_str("... (instruction budget exhausted)\n");
+            out.push_str(&format!(
+                "... (instruction budget exhausted; {} and any later instruction file were not loaded — read them if this task touches their area)\n",
+                source.display()
+            ));
             break;
         }
         let Ok(text) = fs::read_to_string(source) else {
@@ -457,7 +460,26 @@ fn append_sources<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBu
         };
         out.push_str(&format!("## {}\n", source.display()));
         let remaining = cap.saturating_sub(out.len().saturating_sub(start));
-        out.push_str(&truncate_utf8(&text, remaining));
+        if text.len() <= remaining {
+            out.push_str(&text);
+        } else {
+            // A silently halved instruction file is worse than none: the model
+            // follows what it read and never learns the rest exists. Same
+            // self-describing-marker rule `read`/`grep` follow for clipped
+            // output — a bare "(truncated)" does not say what is missing.
+            let mut end = remaining;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&text[..end]);
+            out.push_str(&format!(
+                "\n[truncated: {end} of {} bytes of this file are shown; the instruction \
+                 budget ran out here. Read {} directly if the task touches an area the \
+                 loaded part does not cover.]\n",
+                text.len(),
+                source.display()
+            ));
+        }
         out.push('\n');
     }
 }
@@ -712,6 +734,38 @@ mod tests {
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    /// An instruction file over the budget used to be cut mid-sentence with no
+    /// trace, so the model followed half a CLAUDE.md and never learned the rest
+    /// existed. Same self-describing-marker rule `read`/`grep` follow: say what
+    /// is missing and how to get it.
+    #[test]
+    fn an_oversized_instruction_file_says_it_was_truncated_and_where_to_read_it() {
+        let base = temp("cap");
+        let home = base.join("home");
+        let root = base.join("repo");
+        fs::create_dir_all(home.join(".tcode")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        let body = format!("HEAD\n{}\nTAIL-MARKER", "filler line\n".repeat(2_000));
+        assert!(body.len() > INSTRUCTION_CAP, "fixture must exceed the cap");
+        fs::write(root.join("AGENTS.md"), &body).unwrap();
+
+        let manager = MemoryManager::new_with_home(&root, Some(home));
+        let prompt = manager.startup_prompt();
+
+        assert!(prompt.contains("HEAD"), "the loaded part must survive");
+        assert!(!prompt.contains("TAIL-MARKER"), "the tail must be cut");
+        assert!(
+            prompt.contains("[truncated:") && prompt.contains("bytes of this file are shown"),
+            "truncation must be self-describing: {}",
+            &prompt[prompt.len().saturating_sub(400)..]
+        );
+        assert!(
+            prompt.contains("AGENTS.md"),
+            "the marker must name the file to read"
+        );
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]

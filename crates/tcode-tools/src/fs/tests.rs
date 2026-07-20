@@ -722,12 +722,8 @@ async fn read_redacts_credentials_and_write_refuses_the_placeholder() {
     // Round-tripping what read returned would write the placeholder into the
     // file. The freshness gate is satisfied here (full file seen), so this
     // check is the only thing standing between the model and a broken config.
-    let rewritten = out
-        .content
-        .lines()
-        .map(|line| line.split_once('\t').map_or(line, |(_, rest)| rest))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // `read` returns content verbatim, so this is a literal round-trip.
+    let rewritten = out.content.clone();
     let write = WriteTool
         .run(
             json!({ "path": "config.toml", "content": rewritten }),
@@ -874,6 +870,53 @@ async fn run_append(ctx: &ToolCtx, path: &str, content: &str) -> ToolOutput {
 
 async fn run_read(ctx: &ToolCtx, input: Value) -> ToolOutput {
     ReadTool.run(input, ctx, &CancellationToken::new()).await
+}
+
+/// `read` emits file content verbatim: no line-number gutter, so the bytes it
+/// returns are the bytes on disk. An `edit` built from what the model saw must
+/// match, which is exactly what a reintroduced gutter would silently break.
+#[tokio::test]
+async fn read_returns_content_verbatim_without_a_line_number_gutter() {
+    let dir = std::env::temp_dir().join(format!("tcode-verbatim-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let body = "alpha\n    indented\nbeta\n";
+    std::fs::write(dir.join("f.txt"), body).unwrap();
+    let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+    let out = run_read(&ctx, json!({ "path": "f.txt" })).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content, body, "read must not reshape file content");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Without a gutter, an offset read's footer is the only thing that says which
+/// lines arrived — so it must appear even when the window reaches EOF.
+#[tokio::test]
+async fn offset_read_reports_its_line_range_even_when_it_reaches_the_end() {
+    let dir = std::env::temp_dir().join(format!("tcode-range-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let body: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+    std::fs::write(dir.join("f.txt"), &body).unwrap();
+    let ctx = ToolCtx::new(dir.clone(), 10_000);
+
+    let out = run_read(&ctx, json!({ "path": "f.txt", "offset": 150 })).await;
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("[showing lines 150-200 of 200]"),
+        "offset read must state its range: {}",
+        out.content
+    );
+    // A whole-file read starts at line 1; saying so would be noise.
+    let ctx2 = ToolCtx::new(dir.clone(), 10_000);
+    let whole = run_read(&ctx2, json!({ "path": "f.txt" })).await;
+    assert!(
+        !whole.content.contains("[showing lines"),
+        "whole-file read needs no range footer: {}",
+        whole.content
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[tokio::test]

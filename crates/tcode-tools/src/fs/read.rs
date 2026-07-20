@@ -45,13 +45,14 @@ impl Tool for ReadTool {
     }
 
     fn description(&self) -> &str {
-        "Read a file with line numbers. Use offset/limit for large files; \
-         limits under 120 lines are widened to 120, so read generous windows \
-         instead of many small slices. Images (png/jpeg/gif/webp) come \
-         straight into context so you can see them. If the harness reports the \
-         file unchanged since your last read, the content is already in your \
-         context — do not re-read; pass force=true only if you have a \
-         specific reason."
+        "Read a file. Content comes back verbatim, without a line-number \
+         gutter: when you need to cite a line, count from the first line of the \
+         range the footer reports. Use offset/limit for large files; limits \
+         under 120 lines are widened to 120, so read generous windows instead \
+         of many small slices. Images (png/jpeg/gif/webp) come straight into \
+         context so you can see them. If the harness reports the file unchanged \
+         since your last read, the content is already in your context — do not \
+         re-read; pass force=true only if you have a specific reason."
     }
 
     fn input_schema(&self) -> Value {
@@ -263,7 +264,7 @@ impl Tool for ReadTool {
         // it. `redact_lines` is line-count preserving, so line numbers below
         // still address the real file. Pure CPU over at most 10 MB of text.
         let view = redact_lines(&lines[view_start..view_end]);
-        let rendered = numbered_capped(&view, view_start + 1, MAX_READ_OUTPUT_BYTES);
+        let rendered = numbered_capped(&view, view_start + 1, MAX_READ_OUTPUT_BYTES, false);
         out.push_str(&rendered.text);
         let shown_end = view_start + rendered.emitted;
         let recorded_range = if view_start == 0 && shown_end == total {
@@ -280,6 +281,14 @@ impl Tool for ReadTool {
                 "[showing lines {}-{shown_end} of {total}; continue with offset={}]",
                 view_start + 1,
                 shown_end + 1
+            ));
+        } else if view_start > 0 {
+            // Without a gutter this footer is the only thing that says where the
+            // window starts. Omitted for a whole-file read, where the first line
+            // is line 1 and saying so is noise.
+            out.push_str(&format!(
+                "[showing lines {}-{shown_end} of {total}]",
+                view_start + 1
             ));
         }
         if let Some(note) = clip_note(&rendered.clipped) {
