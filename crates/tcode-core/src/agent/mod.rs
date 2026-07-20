@@ -224,7 +224,6 @@ pub struct Agent {
 }
 
 struct PermissionCheck<'a> {
-    name: &'a str,
     input: &'a Value,
     request: &'a PermissionRequest,
     cancel: &'a CancellationToken,
@@ -400,8 +399,6 @@ impl Agent {
                     policy,
                     cache_scope: session.classifier_cache_scope(),
                     transcript: ClassifierTranscript::from_ledger(&session.ledger),
-                    tool_name: check.name.to_string(),
-                    input: check.input.clone(),
                 };
                 match classifier.classify(request, check.cancel.clone()).await {
                     ClassifierDecision::Allow => {
@@ -926,7 +923,6 @@ impl Agent {
                     session,
                     tool.as_ref(),
                     PermissionCheck {
-                        name,
                         input,
                         request: &request,
                         cancel,
@@ -1393,7 +1389,6 @@ impl Agent {
                     session,
                     tool.as_ref(),
                     PermissionCheck {
-                        name,
                         input,
                         request: &request,
                         cancel,
@@ -1760,7 +1755,6 @@ impl Agent {
                     session,
                     tool.as_ref(),
                     PermissionCheck {
-                        name,
                         input,
                         request: &request,
                         cancel,

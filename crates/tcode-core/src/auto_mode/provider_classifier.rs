@@ -79,13 +79,13 @@ impl ProviderSafetyClassifier {
         let model = self.model();
         let messages = vec![Message {
             role: Role::User,
-            content: vec![ContentBlock::Text {
-                text: request
-                    .transcript
-                    .clone()
-                    .with_pending_call(&request.tool_name, &request.input)
-                    .text,
-            }],
+            content: request
+                .transcript
+                .blocks
+                .iter()
+                .cloned()
+                .map(|text| ContentBlock::Text { text })
+                .collect(),
         }];
         let req = Request {
             model: model.provider.model().to_string(),
@@ -351,6 +351,7 @@ mod tests {
     struct ScriptedProvider {
         scripts: Mutex<VecDeque<Script>>,
         cancellations: Mutex<Vec<CancellationToken>>,
+        captured_requests: Mutex<Vec<Request>>,
         requests: AtomicUsize,
     }
 
@@ -359,6 +360,7 @@ mod tests {
             Self {
                 scripts: Mutex::new(scripts.into()),
                 cancellations: Mutex::new(Vec::new()),
+                captured_requests: Mutex::new(Vec::new()),
                 requests: AtomicUsize::new(0),
             }
         }
@@ -380,10 +382,11 @@ mod tests {
 
         async fn stream(
             &self,
-            _req: Request,
+            req: Request,
             cancel: CancellationToken,
         ) -> Result<EventStream, ProviderError> {
             self.requests.fetch_add(1, Ordering::Relaxed);
+            self.captured_requests.lock().unwrap().push(req);
             self.cancellations.lock().unwrap().push(cancel);
             match self.scripts.lock().unwrap().pop_front().unwrap() {
                 Script::Pending => Ok(futures::stream::pending().boxed()),
@@ -425,9 +428,49 @@ mod tests {
             policy: "classifier policy".into(),
             cache_scope: "auto-classifier:test".into(),
             transcript: ClassifierTranscript::default(),
-            tool_name: "shell".into(),
-            input: serde_json::json!({"command": "echo ok"}),
         }
+    }
+
+    #[tokio::test]
+    async fn provider_keeps_classifier_history_as_content_block_prefix() {
+        let (classifier, provider) =
+            classifier(vec![Script::Output("ALLOW"), Script::Output("ALLOW")]);
+        let mut first = request();
+        first.transcript.blocks = vec![
+            "<user>\nrun the tests\n</user>".into(),
+            "\n<tool-call name=shell>\n{\"command\":\"cargo test\"}\n</tool-call>".into(),
+        ];
+        let mut second = first.clone();
+        second.transcript.blocks.extend([
+            "\n<user>\nnow run the formatter\n</user>".into(),
+            "\n<tool-call name=shell>\n{\"command\":\"cargo fmt\"}\n</tool-call>".into(),
+        ]);
+
+        assert_eq!(
+            classifier.classify(first, CancellationToken::new()).await,
+            ClassifierDecision::Allow
+        );
+        assert_eq!(
+            classifier.classify(second, CancellationToken::new()).await,
+            ClassifierDecision::Allow
+        );
+
+        let requests = provider.captured_requests.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        let text_blocks = |request: &Request| {
+            request.messages[0]
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text { text } => text.clone(),
+                    _ => panic!("classifier content must contain only text blocks"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let initial = text_blocks(&requests[0]);
+        let later = text_blocks(&requests[1]);
+        assert_eq!(later[..initial.len()], initial);
+        assert_eq!(later.len(), initial.len() + 2);
     }
 
     #[tokio::test]

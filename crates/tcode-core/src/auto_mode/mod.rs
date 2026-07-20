@@ -7,7 +7,6 @@
 use std::path::{Component, Path, PathBuf};
 
 use async_trait::async_trait;
-use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::AutoModeConfig;
@@ -182,17 +181,21 @@ fn lexical_normalize(path: PathBuf) -> PathBuf {
 /// A transcript specifically for safety review. It is *not* a provider message
 /// conversion: excluding tool results and assistant prose is the injection
 /// boundary that makes the classifier independent of hostile content.
+///
+/// Every block is immutable once emitted. Providers cache at content-block
+/// boundaries, so later ledger entries extend this sanitized projection instead
+/// of rewriting its cacheable prefix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClassifierTranscript {
-    pub text: String,
+    pub blocks: Vec<String>,
 }
 
 impl ClassifierTranscript {
     pub fn from_ledger(ledger: &Ledger) -> Self {
-        let mut text = String::new();
+        let mut blocks = Vec::new();
         for entry in ledger.entries() {
             match entry {
-                Entry::User(blocks) => append_user_blocks(&mut text, blocks),
+                Entry::User(user_blocks) => append_user_blocks(&mut blocks, user_blocks),
                 Entry::UserNote {
                     about,
                     answer: true,
@@ -201,19 +204,19 @@ impl ClassifierTranscript {
                     // A structured question answer is the one approval note
                     // with user-selected provenance. It remains distinct from a
                     // free-form user message so the policy can limit its scope.
-                    append_tag(&mut text, "ask-user-answer", "tool=ask_user", note);
+                    push_tag(&mut blocks, "ask-user-answer", "tool=ask_user", note);
                 }
                 Entry::UserNote {
                     about, text: note, ..
                 } => {
-                    append_tag(&mut text, "user-note", &format!("about={about}"), note);
+                    push_tag(&mut blocks, "user-note", &format!("about={about}"), note);
                 }
-                Entry::Assistant(blocks) => {
-                    for block in blocks {
+                Entry::Assistant(assistant_blocks) => {
+                    for block in assistant_blocks {
                         if let ContentBlock::ToolUse { name, input, .. } = block {
                             let input =
                                 serde_json::to_string(input).unwrap_or_else(|_| "null".into());
-                            append_tag(&mut text, "tool-call", &format!("name={name}"), &input);
+                            push_tag(&mut blocks, "tool-call", &format!("name={name}"), &input);
                         }
                     }
                 }
@@ -226,22 +229,11 @@ impl ClassifierTranscript {
                 | Entry::ImportedTool { .. } => {}
             }
         }
-        Self { text }
-    }
-
-    pub fn with_pending_call(mut self, name: &str, input: &Value) -> Self {
-        let input = serde_json::to_string(input).unwrap_or_else(|_| "null".into());
-        append_tag(
-            &mut self.text,
-            "pending-tool-call",
-            &format!("name={name}"),
-            &input,
-        );
-        self
+        Self { blocks }
     }
 }
 
-fn append_user_blocks(out: &mut String, blocks: &[ContentBlock]) {
+fn append_user_blocks(out: &mut Vec<String>, blocks: &[ContentBlock]) {
     for block in blocks {
         let ContentBlock::Text { text } = block else {
             continue;
@@ -259,16 +251,17 @@ fn append_user_blocks(out: &mut String, blocks: &[ContentBlock]) {
         // `<user>`. Re-wrapping instead of trusting the inner tag also means a
         // body that forges `</user-skill>` still cannot reach `<user>`.
         if text.starts_with(SKILL_ECHO_OPEN) {
-            append_tag(out, "skill-body", "", text);
+            push_tag(out, "skill-body", "", text);
             continue;
         }
-        append_tag(out, "user", "", text);
+        push_tag(out, "user", "", text);
     }
 }
 
-fn append_tag(out: &mut String, tag: &str, attr: &str, text: &str) {
+fn push_tag(out: &mut Vec<String>, tag: &str, attr: &str, text: &str) {
+    let mut block = String::new();
     if !out.is_empty() {
-        out.push('\n');
+        block.push('\n');
     }
     // Content reaching the classifier is not all written by the user: a skill
     // body is a repository file, and a file that closes its own tag early
@@ -277,10 +270,11 @@ fn append_tag(out: &mut String, tag: &str, attr: &str, text: &str) {
     // this transcript emits delimits exactly the text it was given.
     let text = text.replace(&format!("</{tag}>"), &format!("<\\/{tag}>"));
     if attr.is_empty() {
-        out.push_str(&format!("<{tag}>\n{text}\n</{tag}>"));
+        block.push_str(&format!("<{tag}>\n{text}\n</{tag}>"));
     } else {
-        out.push_str(&format!("<{tag} {attr}>\n{text}\n</{tag}>"));
+        block.push_str(&format!("<{tag} {attr}>\n{text}\n</{tag}>"));
     }
+    out.push(block);
 }
 
 #[derive(Debug, Clone)]
@@ -292,8 +286,6 @@ pub struct ClassifierRequest {
     /// prefix. It must not share a cache id with another session.
     pub cache_scope: String,
     pub transcript: ClassifierTranscript,
-    pub tool_name: String,
-    pub input: Value,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,7 +474,7 @@ mod tests {
             text: "looks good".into(),
         });
 
-        let transcript = ClassifierTranscript::from_ledger(&ledger).text;
+        let transcript = ClassifierTranscript::from_ledger(&ledger).blocks.concat();
         assert!(transcript.contains("<ask-user-answer tool=ask_user>"));
         assert!(transcript.contains("authorize git push origin main"));
         assert!(transcript.contains("<user-note about=edit>"));
@@ -523,7 +515,7 @@ mod tests {
         ledger.append(Entry::Note("harness note".into()));
         ledger.append(Entry::Summary("compacted secret".into()));
 
-        let transcript = ClassifierTranscript::from_ledger(&ledger).text;
+        let transcript = ClassifierTranscript::from_ledger(&ledger).blocks.concat();
         assert!(transcript.contains("run the test suite"));
         assert!(transcript.contains("cargo test"));
         for excluded in [
@@ -536,6 +528,30 @@ mod tests {
         ] {
             assert!(!transcript.contains(excluded), "must exclude {excluded}");
         }
+    }
+
+    #[test]
+    fn transcript_extends_as_immutable_blocks_without_a_pending_call_duplicate() {
+        let mut ledger = Ledger::new();
+        ledger.append(Entry::User(vec![ContentBlock::Text {
+            text: "run the tests".into(),
+        }]));
+        let before = ClassifierTranscript::from_ledger(&ledger);
+
+        ledger.append(Entry::Assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "shell".into(),
+            input: json!({"command": "cargo test"}),
+        }]));
+        let after = ClassifierTranscript::from_ledger(&ledger);
+
+        assert_eq!(after.blocks[..before.blocks.len()], before.blocks);
+        assert_eq!(after.blocks.len(), before.blocks.len() + 1);
+        assert_eq!(
+            after.blocks.last().unwrap().matches("<tool-call ").count(),
+            1
+        );
+        assert!(!after.blocks.last().unwrap().contains("pending-tool-call"));
     }
 
     #[test]
@@ -553,7 +569,7 @@ mod tests {
             ),
         }]));
 
-        let transcript = ClassifierTranscript::from_ledger(&ledger).text;
+        let transcript = ClassifierTranscript::from_ledger(&ledger).blocks.concat();
         // The body is visible as context but never wears the `<user>` tag: the
         // block it lives in opens as `skill-body` and the forged close was
         // neutralized, so it cannot break out into an authorizing tag.
