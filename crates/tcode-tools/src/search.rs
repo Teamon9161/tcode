@@ -24,6 +24,13 @@ const MAX_FILE_BYTES: u64 = 512 * 1024;
 /// Ceiling on -A/-B/-C context so a wide window over many matches cannot
 /// balloon the (un-gated) grep output.
 const MAX_CONTEXT: u64 = 30;
+/// Per-file ceiling on matches. head_limit alone is not enough: files are
+/// emitted in path order, so one file with hundreds of hits (a generated
+/// binding, a lockfile-ish table, a test with a repeated symbol) eats the
+/// whole budget and the model never learns the pattern also occurs in ten
+/// other places. Capping per file trades depth in one file — reachable with
+/// `path` — for breadth across the tree, which is what a search is for.
+const MAX_MATCHES_PER_FILE: usize = 30;
 /// Wall-clock ceiling for a single search. Cancellation (Esc) still works;
 /// this is the automatic backstop so a walk over a huge tree returns a
 /// clearly-marked partial result instead of hanging.
@@ -237,12 +244,15 @@ impl Tool for GrepTool {
 
     fn description(&self) -> &str {
         "Search file contents with a regex (ripgrep engine, respects \
-         .gitignore). Pull surrounding code with `context` (-C, both sides), \
-         `before` (-B) or `after` (-A) — one search with context often gives \
-         you enough to edit without a follow-up read. Filter files with \
-         `glob`; cap matches with head_limit (default 200) and page with \
-         offset. Skips files over 512 KiB and built/cache directories; reports \
-         oversized skips when they explain an empty result."
+         .gitignore). Look for several symbols in one call with alternation — \
+         `foo|bar|baz` beats three searches. An all-lowercase pattern matches \
+         case-insensitively; any uppercase in it makes the match exact. Pull \
+         surrounding code with `context` (-C, both sides), `before` (-B) or \
+         `after` (-A) — one search with context often gives you enough to \
+         edit without a follow-up read. Filter files with `glob`; cap matches \
+         with head_limit (default 200) and page with offset. Skips files over \
+         512 KiB and built/cache directories; reports oversized skips when \
+         they explain an empty result."
     }
 
     fn input_schema(&self) -> Value {
@@ -252,7 +262,7 @@ impl Tool for GrepTool {
                 "pattern": { "type": "string", "description": "Regex to search for" },
                 "path": { "type": "string", "description": "Directory or file to search (default: cwd)" },
                 "glob": { "type": "string", "description": "Filter files, e.g. *.rs or src/**/*.toml" },
-                "case_insensitive": { "type": "boolean" },
+                "case_insensitive": { "type": "boolean", "description": "Force case-insensitive; only needed to widen a pattern that contains uppercase" },
                 "context": { "type": "integer", "description": "Context lines on both sides of each match (-C)" },
                 "before": { "type": "integer", "description": "Context lines before each match (-B); overrides context" },
                 "after": { "type": "integer", "description": "Context lines after each match (-A); overrides context" },
@@ -286,8 +296,14 @@ impl Tool for GrepTool {
         if !base.exists() {
             return ToolOutput::err(format!("search path does not exist: {}", base.display()));
         }
+        // Smart case: an all-lowercase pattern searches case-insensitively, an
+        // uppercase-bearing one stays exact. `case_insensitive` still wins
+        // outright (it short-circuits in grep-regex), so explicit intent is
+        // never overridden — this only fills in the case the model would
+        // otherwise discover by searching twice.
         let matcher = match RegexMatcherBuilder::new()
             .case_insensitive(input["case_insensitive"].as_bool().unwrap_or(false))
+            .case_smart(true)
             .build(pattern)
         {
             Ok(m) => m,
@@ -392,6 +408,60 @@ impl Tool for GrepTool {
             let mut groups = groups.into_inner().unwrap();
             // Parallel walk yields files out of order; sort for stable output.
             groups.sort_by(|a, b| a.file.cmp(&b.file).then(a.first.cmp(&b.first)));
+
+            // Apply the per-file cap before paging, so head_limit/offset count
+            // the matches actually reachable through this tool and paging stays
+            // self-consistent. The cut is at match granularity, not group
+            // granularity: with no context lines an entire file arrives as one
+            // group, so dropping whole groups would never fire. Trailing
+            // after-context past the last kept match goes too, leaving no
+            // dangling context. Single-file results are exempt — nothing can be
+            // crowded out, and a search aimed at one file should page with
+            // offset rather than silently lose its tail.
+            let mut hidden = 0usize;
+            let mut capped_files = 0usize;
+            if groups.windows(2).any(|w| w[0].file != w[1].file) {
+                let mut kept = Vec::with_capacity(groups.len());
+                let mut file = String::new();
+                let mut in_file = 0usize;
+                for mut g in groups {
+                    if g.file != file {
+                        file.clone_from(&g.file);
+                        in_file = 0;
+                    }
+                    let allowance = MAX_MATCHES_PER_FILE.saturating_sub(in_file);
+                    if allowance == 0 {
+                        hidden += g.matches;
+                        continue;
+                    }
+                    if g.matches <= allowance {
+                        in_file += g.matches;
+                        kept.push(g);
+                        continue;
+                    }
+                    // First group to cross the cap for this file: keep matches
+                    // up to the allowance, then cut.
+                    capped_files += 1;
+                    let mut taken = 0usize;
+                    let mut cut = g.lines.len();
+                    for (i, line) in g.lines.iter().enumerate() {
+                        if line.is_match {
+                            taken += 1;
+                            if taken == allowance {
+                                cut = i + 1;
+                                break;
+                            }
+                        }
+                    }
+                    hidden += g.matches - taken;
+                    g.lines.truncate(cut);
+                    g.matches = taken;
+                    in_file = MAX_MATCHES_PER_FILE;
+                    kept.push(g);
+                }
+                groups = kept;
+            }
+
             let total: usize = groups.iter().map(|g| g.matches).sum();
             let files = files.load(Ordering::Relaxed);
             let skipped_oversized = skipped_oversized.load(Ordering::Relaxed);
@@ -413,6 +483,13 @@ impl Tool for GrepTool {
             }
             let shown: usize = selected.iter().map(|g| g.matches).sum();
 
+            if selected.is_empty() && total > 0 {
+                // Matches exist, the requested page is past the end. Saying "no
+                // matches" here would send the model hunting for a bad pattern.
+                return format!(
+                    "offset={offset} is past the last of {total} matches for /{pattern}/{glob_note} — lower offset or drop it"
+                );
+            }
             if selected.is_empty() {
                 let mut m =
                     format!("no matches for /{pattern}/ ({files} files scanned{glob_note})");
@@ -460,6 +537,12 @@ impl Tool for GrepTool {
                 out.push_str(&format!(
                     "\n[more matches beyond this page — raise head_limit or set offset={}]",
                     offset + shown
+                ));
+            }
+            if hidden > 0 {
+                let noun = if capped_files == 1 { "file" } else { "files" };
+                out.push_str(&format!(
+                    "\n[{hidden} further matches in {capped_files} {noun} not shown — over {MAX_MATCHES_PER_FILE} per file; re-run with `path` set to one of them for the rest]"
                 ));
             }
             out
@@ -547,28 +630,64 @@ impl Tool for GlobTool {
             Err(e) => return ToolOutput::err(format!("invalid glob '{pattern}': {e}")),
         };
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
-        let mut hits: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-        let mut timed_out = false;
-        let start = Instant::now();
-        for entry in walk_builder(&base).build() {
-            if cancel.is_cancelled() {
-                break;
-            }
-            if start.elapsed() > SEARCH_DEADLINE {
-                timed_out = true;
-                break;
-            }
-            let Ok(entry) = entry else { continue };
-            let path = entry.path();
-            if path.is_file() && glob_matches(&glob, path, &base) {
-                let mtime = entry
-                    .metadata()
-                    .ok()
-                    .and_then(|m| m.modified().ok())
-                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                hits.push((mtime, path.to_path_buf()));
-            }
-        }
+
+        // Same shape as grep: a parallel walk, off the async runtime. The walk
+        // is blocking syscalls end to end, so leaving it in the async body both
+        // pinned a runtime thread and serialized any batch it was part of.
+        let walk_base = base.clone();
+        let walk_cancel = cancel.clone();
+        let (mut hits, timed_out) = match tokio::task::spawn_blocking(move || {
+            let hits: Mutex<Vec<(std::time::SystemTime, PathBuf)>> = Mutex::new(Vec::new());
+            let timed_out = AtomicBool::new(false);
+            let start = Instant::now();
+            walk_builder(&walk_base).build_parallel().run(|| {
+                let glob = &glob;
+                let base: &Path = &walk_base;
+                let hits = &hits;
+                let timed_out = &timed_out;
+                let cancel = &walk_cancel;
+                Box::new(move |result| {
+                    use ignore::WalkState;
+                    if cancel.is_cancelled() {
+                        return WalkState::Quit;
+                    }
+                    if start.elapsed() > SEARCH_DEADLINE {
+                        timed_out.store(true, Ordering::Relaxed);
+                        return WalkState::Quit;
+                    }
+                    let Ok(entry) = result else {
+                        return WalkState::Continue;
+                    };
+                    // The walk already knows the file type — `path.is_file()`
+                    // spent an extra stat on every entry in the tree.
+                    if !entry.file_type().is_some_and(|t| t.is_file()) {
+                        return WalkState::Continue;
+                    }
+                    let path = entry.path();
+                    if !glob_matches(glob, path, base) {
+                        return WalkState::Continue;
+                    }
+                    let mtime = entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                    // Locked only on a hit, not per entry walked.
+                    hits.lock().unwrap().push((mtime, path.to_path_buf()));
+                    WalkState::Continue
+                })
+            });
+            (
+                hits.into_inner().unwrap(),
+                timed_out.load(Ordering::Relaxed),
+            )
+        })
+        .await
+        {
+            Ok(out) => out,
+            Err(e) => return ToolOutput::err(format!("glob task failed: {e}")),
+        };
+
         if hits.is_empty() {
             let mut m = format!(
                 "no files match {pattern} under {}",
@@ -582,7 +701,11 @@ impl Tool for GlobTool {
             }
             return ToolOutput::ok(m);
         }
-        hits.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
+        // Newest first, ties broken by path. The tie-break is load-bearing now
+        // that the walk is parallel: mtime alone left same-second files in
+        // thread-completion order, so two identical calls could disagree and
+        // `offset` paging would skip or repeat entries.
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let total = hits.len();
         let page: Vec<String> = hits
             .into_iter()
@@ -782,6 +905,112 @@ mod tests {
         assert!(first.starts_with("a.rs:1: TARGET a1"), "{first}");
         assert!(second.starts_with("b.rs:1: TARGET b1"), "{second}");
         assert!(third.starts_with("z.rs:1: TARGET z1"), "{third}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_order_is_stable_when_mtimes_tie() {
+        let dir = scratch("glob-stable", "");
+        let stamp = std::time::SystemTime::now();
+        let mut names: Vec<String> = (0..40).map(|i| format!("f{i:02}.rs")).collect();
+        names.push("a.rs".to_string()); // written by `scratch`
+        for name in &names {
+            let path = dir.join(name);
+            std::fs::write(&path, "x\n").unwrap();
+            // Identical mtimes across all files: ordering must come from the
+            // path tie-break, not from whichever walk thread finished first.
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(stamp))
+                .unwrap();
+        }
+        names.sort();
+        let expected = names.join("\n");
+
+        for _ in 0..5 {
+            assert_eq!(glob(&dir, "*.rs").await, expected);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn lowercase_pattern_is_smart_case_and_uppercase_stays_exact() {
+        let dir = scratch("smartcase", "Target\nTARGET\ntarget\n");
+
+        let lower = grep(&dir, json!({ "pattern": "target" })).await;
+        assert_eq!(
+            lower, "a.rs:1: Target\na.rs:2: TARGET\na.rs:3: target",
+            "an all-lowercase pattern should match every casing"
+        );
+
+        let mixed = grep(&dir, json!({ "pattern": "Target" })).await;
+        assert_eq!(mixed, "a.rs:1: Target", "uppercase in the pattern is exact");
+
+        // The explicit knob still wins over smart case.
+        let forced = grep(
+            &dir,
+            json!({ "pattern": "Target", "case_insensitive": true }),
+        )
+        .await;
+        assert_eq!(forced, "a.rs:1: Target\na.rs:2: TARGET\na.rs:3: target");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn one_crowded_file_cannot_hide_matches_in_other_files() {
+        let dir = scratch("percap", "");
+        let crowded = (0..MAX_MATCHES_PER_FILE + 5)
+            .map(|i| format!("TARGET {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("a.rs"), crowded).unwrap();
+        std::fs::write(dir.join("z.rs"), "TARGET tail\n").unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("a.rs:")).count(),
+            MAX_MATCHES_PER_FILE
+        );
+        assert!(
+            out.contains("z.rs:1: TARGET tail"),
+            "the other file must survive the crowded one: {out}"
+        );
+        assert!(
+            out.contains("[5 further matches in 1 file not shown"),
+            "the cap must explain itself: {out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_single_file_result_is_exempt_from_the_per_file_cap() {
+        let dir = scratch("percap-single", "");
+        let body = (0..MAX_MATCHES_PER_FILE + 5)
+            .map(|i| format!("TARGET {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(dir.join("a.rs"), body).unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("a.rs:")).count(),
+            MAX_MATCHES_PER_FILE + 5,
+            "nothing can be crowded out when there is only one file: {out}"
+        );
+        assert!(!out.contains("not shown"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offset_past_the_end_says_so_instead_of_no_matches() {
+        let dir = scratch("overrun", BODY);
+        let out = grep(&dir, json!({ "pattern": "TARGET", "offset": 50 })).await;
+        assert!(
+            out.starts_with("offset=50 is past the last of 1 matches for /TARGET/"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
