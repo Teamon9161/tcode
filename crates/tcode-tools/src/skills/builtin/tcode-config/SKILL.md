@@ -269,6 +269,12 @@ Dictation goes wherever the text cursor is — the prompt box, an approval note
 (`tab`), a question's note, or a plan comment. The pickers have no text field
 and are left alone.
 
+The first `/voice on` downloads the backend (~21MB) for the running tcode
+version, then the chosen model on first use. Voice is available on Linux
+(x86_64, aarch64 — glibc, and needs `libasound2` installed), macOS (both
+architectures) and Windows x86_64. Windows on ARM has no speech library
+published upstream, so `/voice` says so there instead of offering a download.
+
 | Field | Type / values | Default | Meaning |
 |---|---|---|---|
 | `enabled` | bool | `false` | Whether voice comes up with the session. The `/voice` toggle is remembered in `state.toml` and **overrides this**, exactly like `/suggest` over `ui.suggest_next`. |
@@ -278,7 +284,7 @@ and are left alone.
 | `language` | `"auto"`, `"zh"`, `"en"`, `"ja"`, `"ko"`, `"yue"` | `"auto"` | Only `sense-voice` has a language switch; the other models are bilingual by construction and ignore this. |
 | `max_seconds` | integer | `60` | A hold that never ends stops here rather than filling memory. |
 | `device` | string | `""` | Input device name; empty means the system default. |
-| `command` | path | `""` | The `tcode-voiced` executable. Empty means `~/.tcode/voice/tcode-voiced[.exe]`. |
+| `command` | path | `""` | The `tcode-voiced` executable. Empty means the one downloaded for this tcode version, then a hand-built `~/.tcode/voice/tcode-voiced[.exe]`. |
 | `model_dir` | path | `""` | Where model files live. Empty means `~/.tcode/voice/models`. |
 | `download_base` | URL | `""` | Base URL for the model archive, for mirrors. Empty means the upstream release. |
 

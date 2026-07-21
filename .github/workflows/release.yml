@@ -122,9 +122,90 @@ jobs:
           path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
+  # The voice sidecar, built separately on purpose. Two reasons it must not
+  # join the matrix above: sherpa-onnx's build script downloads a prebuilt
+  # native library, so an upstream hiccup would otherwise take the whole
+  # release down with it; and it cannot be built for every target tcode
+  # supports. `fail-fast: false` plus a publish step that uploads whatever
+  # exists means a missing sidecar costs its own platform and nothing else.
+  #
+  # Targets are fewer than tcode's on purpose:
+  #   - Linux is gnu, not musl: upstream publishes no musl libraries, and the
+  #     static build still links libstdc++, libasound and glibc dynamically.
+  #     Built on the oldest runner available to keep the glibc floor low.
+  #   - windows-aarch64 has no upstream library at all, so it has no row here
+  #     and tcode says so rather than offering a download that cannot exist.
+  voiced:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: tcode-voiced
+            asset: tcode-voiced-x86_64-linux
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: tcode-voiced
+            asset: tcode-voiced-aarch64-linux
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            binary: tcode-voiced
+            asset: tcode-voiced-x86_64-macos
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            binary: tcode-voiced
+            asset: tcode-voiced-aarch64-macos
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: tcode-voiced.exe
+            asset: tcode-voiced-x86_64-windows.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # cpal records through ALSA on Linux, which needs its headers to build
+      # and libasound2 present to run.
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build sidecar
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/tcode-voiced/Cargo.toml
+          --target ${{ matrix.target }}
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "crates/tcode-voiced/target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "dist/${{ matrix.asset }}"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
-    needs: build
+    # Waits for the sidecars so their assets are in `dist`, but only `build`
+    # has to have succeeded: a sidecar that failed to build costs its own
+    # platform voice input and must never hold back a tcode release.
+    needs: [build, voiced]
+    if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Download release assets

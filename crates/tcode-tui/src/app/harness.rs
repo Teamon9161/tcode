@@ -84,6 +84,9 @@ fn config() -> crate::TuiConfig {
         show_reasoning: false,
         skills: Vec::new(),
         voice: Default::default(),
+        // Tests never reach the network. A test that wants the install path
+        // exercised scripts this itself.
+        voice_install: crate::VoiceInstall(Arc::new(|_, _, _| Err("no downloads in tests".into()))),
     }
 }
 

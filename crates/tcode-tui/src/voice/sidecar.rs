@@ -15,11 +15,47 @@ use tokio::sync::mpsc;
 
 use super::{VoiceBackend, VoiceCmd, VoiceEvent};
 
+/// A hand-built sidecar, for whoever is working on it.
 const EXECUTABLE: &str = if cfg!(windows) {
     "tcode-voiced.exe"
 } else {
     "tcode-voiced"
 };
+
+/// A downloaded sidecar, named after the tcode it belongs to.
+///
+/// The version is in the filename so that "installed but out of date" is not a
+/// state that can exist: a tcode looks for its own version and finds it or does
+/// not. There is nothing to compare, and no way to run a binary that disagrees
+/// with the flags being passed to it — which is the failure this replaces.
+fn versioned_executable() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    let suffix = if cfg!(windows) { ".exe" } else { "" };
+    format!("tcode-voiced-{version}{suffix}")
+}
+
+/// The release asset for this machine, or `None` where no sidecar can be built.
+///
+/// Fewer platforms than tcode itself: upstream publishes no musl and no
+/// Windows-on-ARM libraries. Saying so up front is the difference between "not
+/// supported here" and a download that fails for reasons nobody can act on.
+pub(crate) fn release_asset() -> Option<&'static str> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("linux", "x86_64") => Some("tcode-voiced-x86_64-linux"),
+        ("linux", "aarch64") => Some("tcode-voiced-aarch64-linux"),
+        ("macos", "x86_64") => Some("tcode-voiced-x86_64-macos"),
+        ("macos", "aarch64") => Some("tcode-voiced-aarch64-macos"),
+        ("windows", "x86_64") => Some("tcode-voiced-x86_64-windows.exe"),
+        _ => None,
+    }
+}
+
+/// Where a downloaded sidecar belongs.
+pub(crate) fn install_path() -> Result<PathBuf, String> {
+    let root = tcode_core::config::Config::global_path()
+        .map_err(|_| "no home directory to install into".to_string())?;
+    Ok(root.join("voice").join(versioned_executable()))
+}
 
 /// How a stale sidecar announces itself. Flags are only ever added, so a
 /// rejected flag means the binary predates the tcode driving it — a situation
@@ -62,17 +98,27 @@ impl From<WireEvent> for VoiceEvent {
     }
 }
 
-/// Turn a sidecar failure into something with a next step. Only the stale-binary
-/// case needs it: everything else the sidecar says already names its own cause.
+/// Turn a sidecar failure into something with a next step. Both cases here are
+/// ones whose message names a cause the user cannot act on; everything else the
+/// sidecar says already explains itself.
 fn explain(message: String) -> String {
-    if !message.contains(STALE) {
-        return message;
+    if message.contains(STALE) {
+        return format!(
+            "{message} — this tcode-voiced is older than tcode. Delete it from \
+             ~/.tcode/voice/ to fetch a matching one, or rebuild it with `cargo build \
+             -p tcode-voiced --release --manifest-path crates/tcode-voiced/Cargo.toml`"
+        );
     }
-    format!(
-        "{message} — this tcode-voiced is older than tcode. Rebuild it with `cargo build \
-         -p tcode-voiced --release --manifest-path crates/tcode-voiced/Cargo.toml` and copy \
-         it over the one in ~/.tcode/voice/"
-    )
+    // The dynamic linker's own wording, which names a file nobody has heard of
+    // rather than a package they can install. Only Linux links ALSA.
+    if cfg!(target_os = "linux") && message.contains("libasound") {
+        return format!(
+            "{message} — the voice backend records through ALSA. Install it with \
+             `apt install libasound2` (Debian/Ubuntu), `dnf install alsa-lib` (Fedora), \
+             or your distribution's equivalent."
+        );
+    }
+    message
 }
 
 pub(crate) struct SidecarBackend {
@@ -172,9 +218,13 @@ impl SidecarBackend {
                         } else {
                             detail
                         };
-                        let _ = events.send(VoiceEvent::Failed(format!(
+                        // Through `explain` as well: a sidecar that dies before
+                        // it can speak JSON — a missing shared library, a
+                        // rejected flag — is exactly the case whose raw
+                        // message names something the user cannot act on.
+                        let _ = events.send(VoiceEvent::Failed(explain(format!(
                             "voice sidecar stopped: {detail}"
-                        ))).await;
+                        )))).await;
                         return;
                     }
                 }
@@ -228,7 +278,7 @@ pub(crate) fn list_models(cfg: &VoiceConfig) -> Result<Vec<VoiceModel>, String> 
 /// Where the sidecar is: the configured path, else `~/.tcode/voice/`. A miss
 /// returns instructions rather than "not found" — nothing about where this
 /// binary comes from is guessable.
-fn resolve(cfg: &VoiceConfig) -> Result<PathBuf, String> {
+pub(crate) fn resolve(cfg: &VoiceConfig) -> Result<PathBuf, String> {
     if !cfg.command.is_empty() {
         let path = PathBuf::from(&cfg.command);
         return path.is_file().then_some(path).ok_or_else(|| {
@@ -241,21 +291,75 @@ fn resolve(cfg: &VoiceConfig) -> Result<PathBuf, String> {
     let Ok(root) = tcode_core::config::Config::global_path() else {
         return Err("no voice backend, and no home directory to look in".into());
     };
-    let path = root.join("voice").join(EXECUTABLE);
-    if path.is_file() {
-        return Ok(path);
+    // The one matching this tcode first, then a hand-built one — someone
+    // working on the sidecar wants their own build, and `[voice] command`
+    // above is the way to insist on it.
+    let downloaded = root.join("voice").join(versioned_executable());
+    if downloaded.is_file() {
+        return Ok(downloaded);
+    }
+    let built = root.join("voice").join(EXECUTABLE);
+    if built.is_file() {
+        return Ok(built);
+    }
+    if release_asset().is_none() {
+        return Err(format!(
+            "there is no voice backend for {}-{}: the speech library it needs is not published \
+             for this platform. Everything else in tcode works as usual.",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        ));
     }
     Err(format!(
-        "no voice backend yet — build it with `cargo build -p tcode-voiced --release \
-         --manifest-path crates/tcode-voiced/Cargo.toml` and copy the binary to {}, or set \
-         [voice] command in ~/.tcode/config.toml",
-        path.display()
+        "no voice backend yet — it downloads on first use, or build it with `cargo build \
+         -p tcode-voiced --release --manifest-path crates/tcode-voiced/Cargo.toml` and copy \
+         the binary to {}",
+        built.display()
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The downloaded name carries this tcode's version, and the asset it comes
+    /// from agrees about the executable suffix. Both are strings assembled by
+    /// hand in two places, which is exactly where a release goes quietly wrong.
+    #[test]
+    fn the_installed_name_is_pinned_to_this_version_and_matches_its_asset() {
+        let name = versioned_executable();
+        assert!(
+            name.contains(env!("CARGO_PKG_VERSION")),
+            "{name} does not say which tcode it belongs to"
+        );
+        assert_eq!(name.ends_with(".exe"), cfg!(windows));
+        if let Some(asset) = release_asset() {
+            assert_eq!(
+                asset.ends_with(".exe"),
+                name.ends_with(".exe"),
+                "{asset} and {name} disagree about the suffix"
+            );
+        }
+        // Unsupported platforms must say so rather than name a file to fetch.
+        assert_eq!(
+            release_asset().is_none(),
+            matches!(
+                (std::env::consts::OS, std::env::consts::ARCH),
+                ("windows", "aarch64")
+            ) || !matches!(std::env::consts::OS, "linux" | "macos" | "windows"),
+        );
+    }
+
+    /// A linker error names a file; users need a package. Only Linux links it.
+    #[test]
+    fn a_missing_audio_library_is_turned_into_something_installable() {
+        let raw = "voice sidecar stopped: error while loading shared libraries: \
+                   libasound.so.2: cannot open shared object file";
+        let explained = explain(raw.to_string());
+        assert_eq!(explained.contains("libasound2"), cfg!(target_os = "linux"));
+        // Unrelated failures are passed through untouched.
+        assert_eq!(explain("no input device".into()), "no input device");
+    }
 
     #[test]
     fn wire_events_parse_into_voice_events() {

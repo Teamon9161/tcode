@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use tcode_core::config::{VoiceConfig, VoiceKey};
 use tokio::sync::mpsc;
 
-pub(crate) use sidecar::{list_models, SidecarBackend, VoiceModel};
+pub(crate) use sidecar::{install_path, list_models, release_asset, SidecarBackend, VoiceModel};
 
 /// Shorter than this and the key was tapped, not held. Transcribing 80ms of
 /// room tone wastes a second and returns nothing useful.
@@ -122,8 +122,14 @@ impl PressTrack {
 pub(crate) enum VoiceEvent {
     /// Model loaded, microphone open, commands will be honoured.
     Ready,
-    /// Fetching the model, 0-100. The first run downloads ~228MB.
+    /// Fetching the model, 0-100. Reported by the sidecar itself.
     Downloading(u8),
+    /// Fetching the sidecar, 0-100. Reported by tcode, before there is a
+    /// sidecar to report anything.
+    Installing(u8),
+    /// The sidecar is on disk. The app starts it on seeing this; `Voice` never
+    /// sees the event, which is why it has no state of its own.
+    Installed,
     /// Input level while recording, 0.0-1.0.
     Level(f32),
     Transcript(String),
@@ -153,6 +159,8 @@ pub(crate) type BackendFactory = Box<
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum VoiceState {
     Off,
+    /// Fetching the sidecar binary itself, before any of it can run.
+    Installing(u8),
     /// Backend spawned but not usable yet; `Some` while a model downloads.
     Warming(Option<u8>),
     Ready,
@@ -402,6 +410,24 @@ impl Voice {
     pub(crate) fn set_key(&mut self, key: VoiceKey) {
         self.cfg.key = key;
         self.held = false;
+    }
+
+    /// Is there no sidecar on this machine yet? Asked before turning on, so
+    /// the first use fetches one instead of reporting its absence.
+    pub(crate) fn needs_install(&self) -> bool {
+        sidecar::resolve(&self.cfg).is_err() && sidecar::release_asset().is_some()
+    }
+
+    /// Show the download before it starts, so `/voice on` has a visible effect
+    /// even on a slow first byte.
+    pub(crate) fn begin_install(&mut self) {
+        self.state = VoiceState::Installing(0);
+    }
+
+    /// A sender for whoever is doing work on voice's behalf — currently the
+    /// sidecar download, which reports on the same channel the sidecar will.
+    pub(crate) fn events(&self) -> mpsc::Sender<VoiceEvent> {
+        self.events.clone()
     }
 
     /// What the installed sidecar says it can run. Asked fresh each time the
@@ -662,6 +688,13 @@ impl Voice {
                 self.state = VoiceState::Warming(Some(pct.min(100)));
                 VoiceOutcome::None
             }
+            VoiceEvent::Installing(pct) => {
+                self.state = VoiceState::Installing(pct.min(100));
+                VoiceOutcome::None
+            }
+            // The app starts the backend on this rather than routing it here:
+            // there is no state for "installed", only "now it can run".
+            VoiceEvent::Installed => VoiceOutcome::None,
             VoiceEvent::Level(rms) => {
                 if let VoiceState::Recording { level, .. } = &mut self.state {
                     *level = rms.clamp(0.0, 1.0);
@@ -697,6 +730,14 @@ impl Voice {
         let release = self.cfg.key.label();
         match &self.state {
             VoiceState::Off => None,
+            // Named for what it is. "Downloading" alone would leave the user
+            // wondering which of the two downloads this is, and they are very
+            // different sizes.
+            VoiceState::Installing(pct) => Some(VoiceHint {
+                lead: "  ◌ voice".into(),
+                rest: format!(" downloading the speech backend {pct}%"),
+                tone: HintTone::Busy,
+            }),
             VoiceState::Warming(None) => Some(VoiceHint {
                 lead: "  ◌ voice".into(),
                 rest: " starting up…".into(),

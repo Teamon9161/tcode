@@ -606,6 +606,13 @@ impl App {
         // need the kitty protocol, the gesture the confirmation line describes
         // depends on whether the request was honoured.
         crate::set_key_release_reporting(true);
+        // The backend is a separate download, so the first `/voice on` on a
+        // machine has nothing to start. Fetch it here rather than making the
+        // user read instructions and come back.
+        if self.voice.needs_install() {
+            self.install_voice_backend();
+            return;
+        }
         match self.voice.turn_on() {
             // Turning a mode on is not a record worth keeping: the status row
             // shows it is on and which key, so a fading notice is enough.
@@ -625,7 +632,70 @@ impl App {
         }
     }
 
+    /// Download the sidecar, then turn voice on. Runs off the UI thread and
+    /// reports through the same channel the sidecar itself uses, so the hint
+    /// row shows one continuous "getting ready" rather than two mechanisms.
+    fn install_voice_backend(&mut self) {
+        let Some(asset) = crate::voice::release_asset() else {
+            self.bake(vec![Line::styled(
+                format!(
+                    "there is no voice backend for {}-{}: the speech library it needs is not \
+                     published for this platform.",
+                    std::env::consts::ARCH,
+                    std::env::consts::OS
+                ),
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]);
+            return;
+        };
+        let path = match crate::voice::install_path() {
+            Ok(path) => path,
+            Err(reason) => {
+                self.bake(vec![Line::styled(
+                    reason,
+                    ratatui::style::Style::default().fg(theme::ERROR),
+                )]);
+                return;
+            }
+        };
+        self.voice.begin_install();
+        let tx = self.voice.events();
+        let install = self.voice_install.clone();
+        // Blocking: it is a plain synchronous download, and this keeps the
+        // injected closure free of an async signature it has no use for.
+        tokio::task::spawn_blocking(move || {
+            let progress = {
+                let tx = tx.clone();
+                Box::new(move |pct| {
+                    let _ = tx.blocking_send(VoiceEvent::Installing(pct));
+                }) as Box<dyn FnMut(u8) + Send>
+            };
+            let event = match (install.0)(asset, path, progress) {
+                Ok(()) => VoiceEvent::Installed,
+                Err(reason) => VoiceEvent::Failed(reason),
+            };
+            let _ = tx.blocking_send(event);
+        });
+    }
+
     pub(super) fn on_voice_event(&mut self, event: VoiceEvent) {
+        // The backend has just arrived, so the start that was waiting for it
+        // can happen now — and only now is there something to start.
+        if matches!(event, VoiceEvent::Installed) {
+            match self.voice.turn_on() {
+                Ok(()) => {
+                    self.notice = Some((
+                        format!("voice on — {}", self.voice.gesture_help()),
+                        Instant::now(),
+                    ))
+                }
+                Err(reason) => self.bake(vec![Line::styled(
+                    reason,
+                    ratatui::style::Style::default().fg(theme::ERROR),
+                )]),
+            }
+            return;
+        }
         let outcome = self.voice.on_event(event);
         self.apply_voice(outcome);
     }

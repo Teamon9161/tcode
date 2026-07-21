@@ -822,6 +822,18 @@ async fn main() -> anyhow::Result<()> {
                         .unwrap_or_else(|| config.voice.hotwords.clone()),
                     ..config.voice.clone()
                 },
+                // The TUI knows it needs a sidecar; only this crate knows
+                // where releases live and how to verify one. Same split as
+                // `ProviderSetup`.
+                voice_install: tcode_tui::VoiceInstall(std::sync::Arc::new(
+                    |asset, dest, mut progress| {
+                        // Called from a blocking worker, which still carries
+                        // the runtime context needed to drive the download.
+                        tokio::runtime::Handle::current()
+                            .block_on(update::install_release_asset(asset, &dest, &mut progress))
+                            .map_err(|e| format!("cannot install the voice backend: {e:#}"))
+                    },
+                )),
             },
         )
         .await;

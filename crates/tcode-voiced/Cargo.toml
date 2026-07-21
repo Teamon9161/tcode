@@ -1,6 +1,6 @@
 [package]
 name = "tcode-voiced"
-version = "0.1.15"
+version = "0.1.16"
 edition = "2021"
 description = "Push-to-talk speech recognition sidecar for tcode"
 license = "Apache-2.0"

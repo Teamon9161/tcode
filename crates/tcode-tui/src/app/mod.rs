@@ -320,6 +320,9 @@ pub struct App {
     /// `/voice keys`: echo every key event to the transcript. The only way to
     /// tell "tcode ignores this key" from "this key never reached tcode".
     voice_probe: bool,
+    /// How to fetch the sidecar on a machine that has never had it. Injected,
+    /// so the TUI holds no release URLs.
+    voice_install: crate::VoiceInstall,
     attachments: Vec<Attachment>,
     /// Monotonic id for the next attachment; keeps inline tokens unique within
     /// a draft. Reset to 1 once the draft is sent or cleared.
@@ -460,6 +463,7 @@ impl App {
             show_reasoning,
             skills,
             voice: voice_config,
+            voice_install,
         } = config;
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
@@ -539,6 +543,7 @@ impl App {
             voice,
             voice_rx,
             voice_probe: false,
+            voice_install,
             attachments: Vec::new(),
             next_attachment_id: 1,
             clipboard: arboard::Clipboard::new().ok(),

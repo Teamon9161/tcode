@@ -47,6 +47,8 @@
 - 转写只进编辑器，**永不自动提交**。录音行用 `theme::recording()`（红），这是唯一一处约定压过内部配色一致性的地方。
 - `/voice`、`/voice key`、`/voice model` 的选择都落 `state.toml`（同 `/suggest`、shift+tab 的模式），config.toml 保持手写不被程序改写。
 - **模型清单只存在于 sidecar 的 `model.rs::PRESETS`，前端一个字都不许抄。** `voice_picker` 的菜单是**问出来的**（`--list-models` 起一个短命进程，打印 JSON 就退出），不是编译进前端的常量——装着的那个 binary 才知道自己支持什么。抄一份到前端，菜单就会提供它装不上的模型，而用户发现的方式是下完 500MB 才报错。同理 `VoiceConfig::model` 默认是**空串**不是某个名字：默认由 `model::find("")` 一处决定。加一个模型 = `PRESETS` 一行 + `asr.rs` 一个 arm（若是新家族），前端、config、picker 都不动。
+- **"装了但版本不对"这个状态不允许存在**：下载的 sidecar 装成 `tcode-voiced-<version>`，tcode 只找自己版本那个名字，找不到就是没装。没有可比较的东西，也就不可能跑到一个和自己参数不一致的二进制上。下载 URL 钉在**本版本的 tag**（不是 `latest`），因为两者跨管道说的是私有协议。裸名 `tcode-voiced` 保留给手编版，排在版本名之后。
+- **sidecar 的构建是独立 job，`publish` 只 `needs` 主 job 成功**。sherpa 的 build script 在构建期从 GitHub 下预编译库——让它有权拖垮整个发布不可接受。少哪个平台就少哪个平台的语音，主程序照发。同理 `release_asset()` 对 win-arm64 返回 `None`：明说"本平台没有"，而不是让用户去下一个不存在的文件。
 - **sidecar 拒绝未知参数，前端把这个拒绝翻译成"重新编译"**（`sidecar.rs::explain`）。flag 只增不减，所以"unknown argument"必然意味着 binary 比 tcode 旧——这是有唯一解法的情形，不该让用户猜。反过来让 sidecar 静默忽略未知 flag 更糟：用户选的模型会悄悄不生效。
 - **热词的能力差异由 `Layout` 的 arm 表达，不由名字判断。** transducer（`zh-en`）走 sherpa 的 contextual biasing：必须同时给 `modified_beam_search` + `cjkchar+bpe` + `bpe_vocab`，缺一个都是静默无效；qwen3 走 prompt，逗号分隔一个字符串；CTC 家族没有入口，直接忽略。**只在热词非空时才切 beam search**——不用这个功能的人不该付解码代价。`model.rs` 的测试钉住"note 里写了 hotwords 的 preset 必须真的是有能力的那两个 layout"，否则就是对用户撒谎。
 - **`bpe.vocab` 是我们自己从 `bpe.model` 解出来的**（`bpe.rs`，五十行最小 protobuf 读取）。上游只发 `bpe.model`，官方转换脚本要 Python + sentencepiece——为了说一句 "tokio" 而要求用户装 Python 工具链不成立。解出来缓存在模型目录旁边，只做一次。那个 `#[ignore]` 的测试是唯一能证明这个解析器对的东西（拿真模型比对它从没读过的 `tokens.txt`），手搓的字节只能证明它自洽，别删。

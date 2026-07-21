@@ -1097,7 +1097,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-voiced"
-version = "0.1.15"
+version = "0.1.16"
 dependencies = [
  "bzip2",
  "cpal",

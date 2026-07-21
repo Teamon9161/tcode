@@ -70,6 +70,82 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// Fetch one asset from *this* version's release and write it to `dest`,
+/// verified against the release's published checksums.
+///
+/// Pinned to the running version rather than `latest`, which is what the rest
+/// of this module uses: tcode and the voice sidecar speak a private protocol
+/// across a pipe, so they have to come from the same build. A sidecar from a
+/// newer release would be exactly the mismatch the versioned filename exists
+/// to rule out.
+pub async fn install_release_asset(
+    asset: &str,
+    dest: &Path,
+    progress: &mut dyn FnMut(u8),
+) -> Result<()> {
+    use futures::StreamExt;
+
+    let base = format!(
+        "https://github.com/{REPOSITORY}/releases/download/v{}",
+        env!("CARGO_PKG_VERSION")
+    );
+    let client = reqwest::Client::builder()
+        .user_agent(concat!("tcode/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .context("cannot create download client")?;
+
+    let checksums = download_text(&client, &format!("{base}/checksums.txt")).await?;
+    let expected = checksum_for(&checksums, asset).with_context(|| {
+        format!("this release publishes no {asset}, so there is nothing to install")
+    })?;
+
+    let response = client
+        .get(format!("{base}/{asset}"))
+        .send()
+        .await
+        .with_context(|| format!("cannot download {asset}"))?
+        .error_for_status()
+        .with_context(|| format!("cannot download {asset}"))?;
+    // Streamed for the progress report: this is tens of megabytes, and a
+    // silent wait is indistinguishable from a hang.
+    let total = response.content_length().unwrap_or(0);
+    let mut bytes = Vec::with_capacity(total as usize);
+    let mut stream = response.bytes_stream();
+    let mut last = u8::MAX;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.context("download interrupted")?;
+        bytes.extend_from_slice(&chunk);
+        if total > 0 {
+            let pct = ((bytes.len() as u64 * 100) / total).min(100) as u8;
+            if pct != last {
+                last = pct;
+                progress(pct);
+            }
+        }
+    }
+
+    if hex::encode(Sha256::digest(&bytes)) != expected {
+        bail!("checksum mismatch for {asset}; it was not installed");
+    }
+
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    tokio::fs::write(dest, bytes)
+        .await
+        .with_context(|| format!("cannot write {}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
+            .await
+            .with_context(|| format!("cannot make {} executable", dest.display()))?;
+    }
+    Ok(())
+}
+
 fn release_asset() -> Result<&'static str> {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("linux", "x86_64") => Ok("tcode-x86_64-linux"),

@@ -32,6 +32,7 @@ mod voice_picker;
 pub mod wizard;
 
 use std::io::{stdout, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use crossterm::cursor::SetCursorStyle;
@@ -66,6 +67,25 @@ pub struct ProviderSetup {
         Box<dyn Fn(Config, ModelState) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
 }
 
+/// Fetches the voice sidecar for this platform and puts it at the given path.
+/// Injected because the TUI must not know release URLs, checksums or how this
+/// machine downloads things — the same reason `ProviderSetup` is a pair of
+/// closures rather than a filesystem path.
+///
+/// `progress` is called with 0-100. Returns the reason on failure, since a
+/// download that fails has to say what to do next.
+/// `Arc` rather than `Box`: the download runs on a worker thread, so the
+/// closure has to outlive the call that started it.
+#[allow(clippy::type_complexity)]
+#[derive(Clone)]
+pub struct VoiceInstall(
+    pub  Arc<
+        dyn Fn(&'static str, PathBuf, Box<dyn FnMut(u8) + Send>) -> Result<(), String>
+            + Send
+            + Sync,
+    >,
+);
+
 pub struct TuiConfig {
     pub menu: ModelMenu,
     pub agents: AgentMenu,
@@ -76,6 +96,8 @@ pub struct TuiConfig {
     pub skills: Vec<tcode_tools::Skill>,
     /// `[voice]`, with `enabled` already resolved against state.toml.
     pub voice: tcode_core::config::VoiceConfig,
+    /// How to fetch the voice sidecar when it is not installed yet.
+    pub voice_install: VoiceInstall,
 }
 
 /// Whether we asked the terminal to report key releases, so teardown only
