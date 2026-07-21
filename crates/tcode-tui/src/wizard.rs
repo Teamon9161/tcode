@@ -59,7 +59,11 @@ pub fn reconfigure(
     println!(
         "{BOLD}tcode setup{RESET} {DIM}— profile '{missing_profile}' is not configured; choose a provider{RESET}"
     );
-    run_setup(Setup::new(config, Some(missing_profile), ModelState::load()))
+    run_setup(Setup::new(
+        config,
+        Some(missing_profile),
+        ModelState::load(),
+    ))
 }
 
 fn run_setup(mut setup: Setup) -> anyhow::Result<Option<(Config, ModelState)>> {
