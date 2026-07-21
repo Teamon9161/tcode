@@ -31,6 +31,10 @@ members = [
     "crates/tcode-tools",
     "crates/tcode-tui",
 ]
+# The voice sidecar is built and released on its own: its native dependencies
+# (a downloaded ONNX runtime, ALSA on Linux) exist on fewer platforms than
+# tcode itself does, and `cargo build --workspace` must stay free of them.
+exclude = ["crates/tcode-voiced"]
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }

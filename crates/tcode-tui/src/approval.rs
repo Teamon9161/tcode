@@ -129,6 +129,20 @@ struct PlanComment {
     text: String,
 }
 
+/// Which text field of a dialog currently holds the cursor. Only four exist,
+/// and only one at a time — see `Dialog::text_field`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum TextField {
+    /// A plan comment being composed on a block.
+    Comment,
+    /// Free-form feedback on a plan.
+    Feedback,
+    /// The note attached to the current question page.
+    PageNote,
+    /// The note on a plain approval.
+    Note,
+}
+
 /// The active comment composer retains an optional selected-passage quote until
 /// the user saves or cancels it.
 struct PlanCommentDraft {
@@ -717,26 +731,74 @@ impl Dialog {
         q.pages[q.page].multi
     }
 
+    /// Which of the dialog's four text fields has the cursor. Named separately
+    /// from the two things that act on it so that "where does text go" is
+    /// decided exactly once: reading the field and focusing it must not be able
+    /// to disagree.
+    ///
+    /// Innermost first — an open comment composer is more specific than the
+    /// plan's own feedback box, which is more specific than the note.
+    fn text_field(&self) -> TextField {
+        match (&self.plan, &self.questions) {
+            (Some(plan), _) if plan.compose.is_some() => TextField::Comment,
+            (Some(_), _) => TextField::Feedback,
+            (None, Some(_)) => TextField::PageNote,
+            (None, None) => TextField::Note,
+        }
+    }
+
+    /// The field text arriving from outside lands in — pasted or dictated.
+    /// One answer for both, because there is one cursor: if paste and dictation
+    /// each worked it out for themselves they would eventually disagree, and
+    /// the user would watch their words go somewhere they were not looking.
+    pub fn text_target(&mut self) -> &mut Editor {
+        match self.text_field() {
+            TextField::Comment => {
+                let plan = self.plan.as_mut().expect("a comment implies a plan");
+                let draft = plan.compose.as_mut().expect("checked by text_field");
+                &mut draft.editor
+            }
+            TextField::Feedback => &mut self.plan.as_mut().expect("checked by text_field").feedback,
+            TextField::PageNote => &mut self.cur_page().note,
+            TextField::Note => &mut self.note,
+        }
+    }
+
+    /// Put the caret where `text_target` writes, so text never lands in a field
+    /// the user is not looking at. Separate from the accessor because reading
+    /// the target — to decide whether a keystroke is dictation — must not move
+    /// focus on its own.
+    pub fn focus_text_target(&mut self) {
+        match self.text_field() {
+            // A composer open on a block already holds the focus.
+            TextField::Comment => {}
+            TextField::Feedback => {
+                self.plan
+                    .as_mut()
+                    .expect("checked by text_field")
+                    .feedback_focused = true
+            }
+            TextField::PageNote | TextField::Note => self.note_focused = true,
+        }
+    }
+
+    /// What is currently in the field `text_target` writes to. Tests use it to
+    /// check that arriving text landed in the right one of the four.
+    #[cfg(test)]
+    pub fn text_target_text(&mut self) -> String {
+        self.text_target().text()
+    }
+
     pub fn paste_text(&mut self, text: String) {
         // Dialog notes are a single logical line: terminal bracketed paste can
         // contain newlines, but preserving them would make the bottom panel
-        // grow without bound and obscure the transcript. Keep every word and
-        // make the note editor the explicit paste target.
+        // grow without bound and obscure the transcript. Keep every word.
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         if text.is_empty() {
             return;
         }
-        if let Some(plan) = self.plan.as_mut() {
-            plan.feedback_focused = true;
-            plan.feedback.insert_str(&text);
-            return;
-        }
-        self.note_focused = true;
-        if self.questions.is_some() {
-            self.cur_page().note.insert_str(&text);
-        } else {
-            self.note.insert_str(&text);
-        }
+        self.focus_text_target();
+        self.text_target().insert_str(&text);
     }
 
     fn approval_options(&self) -> Vec<(&'static str, Outcome)> {

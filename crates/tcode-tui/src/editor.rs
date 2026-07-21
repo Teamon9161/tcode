@@ -59,6 +59,24 @@ impl Editor {
         &self.lines
     }
 
+    /// Is the caret at the start of a line, or just after whitespace?
+    ///
+    /// This is what makes a space key usable for push-to-talk: everywhere else
+    /// a space is a word separator being typed, but nobody types a second one
+    /// after a space or a first one at the start of a line. Holding it there is
+    /// therefore a gesture rather than a character — see `voice`.
+    pub fn at_word_boundary(&self) -> bool {
+        // `col` counts characters, not bytes — slicing by it would split a
+        // multi-byte character, and dictation is wanted most in exactly the
+        // languages that have them.
+        let line = &self.lines[self.row];
+        let byte = char_to_byte(line, self.col);
+        line[..byte]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace)
+    }
+
     pub fn insert_char(&mut self, c: char) {
         self.delete_selection();
         let byte = char_to_byte(&self.lines[self.row], self.col);

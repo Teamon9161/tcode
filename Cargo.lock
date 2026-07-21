@@ -2839,6 +2839,7 @@ dependencies = [
  "image",
  "pulldown-cmark",
  "ratatui",
+ "serde",
  "serde_json",
  "similar",
  "syntect",

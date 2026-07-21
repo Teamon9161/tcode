@@ -19,7 +19,7 @@ use tokio::sync::oneshot;
 use crate::approval::{Dialog, DialogResult};
 use crate::model_picker::{self, AgentMenu, AgentModelChoice, ModelMenu};
 use crate::view_picker::{self, ViewId};
-use crate::{folder_trust_picker, mode_picker, resume};
+use crate::{folder_trust_picker, mode_picker, resume, voice_picker};
 
 /// Shared state the overlays need but do not own. Passed in per event so the
 /// overlay never has to borrow `App`.
@@ -43,6 +43,9 @@ pub enum OverlayAction {
         effort: Option<String>,
     },
     SetMode(PermissionMode),
+    /// `/voice model`. The name is a string because the list of them lives in
+    /// the sidecar, not here.
+    SetVoiceModel(String),
     FolderTrust(folder_trust_picker::Choice),
     ApplyAgentModel {
         kind: String,
@@ -81,6 +84,7 @@ pub enum Overlay {
     Resume(resume::Picker),
     Model(model_picker::Picker),
     Mode(mode_picker::Picker),
+    VoiceModel(voice_picker::Picker),
     FolderTrust(folder_trust_picker::Picker),
     Agent(model_picker::AgentPicker),
     /// `/provider`. Boxed because it carries a whole `Config` being edited.
@@ -156,6 +160,7 @@ impl Overlay {
             Overlay::Resume(picker) => picker.render(),
             Overlay::Model(picker) => picker.render(ctx.menu),
             Overlay::Mode(picker) => picker.render(),
+            Overlay::VoiceModel(picker) => picker.render(),
             Overlay::FolderTrust(picker) => picker.render(),
             Overlay::Agent(picker) => picker.render(ctx.menu, ctx.agents),
             Overlay::Provider(setup) => crate::provider_picker::render(&setup.view()),
@@ -168,6 +173,7 @@ impl Overlay {
             Overlay::View(picker) => picker.set_hovered_row(row),
             Overlay::Model(picker) => picker.set_hovered_row(row),
             Overlay::Mode(picker) => picker.set_hovered_row(row),
+            Overlay::VoiceModel(picker) => picker.set_hovered_row(row),
             Overlay::FolderTrust(picker) => picker.set_hovered_row(row),
             Overlay::Agent(picker) => picker.set_hovered_row(row, ctx.agents),
             // Setup is a keyboard form (fields, not just rows); hover would
@@ -200,6 +206,13 @@ impl Overlay {
                 mode_picker::PickResult::Pending => Flow::Stay,
                 mode_picker::PickResult::Cancelled => Flow::Close,
                 mode_picker::PickResult::Picked(mode) => Flow::Act(OverlayAction::SetMode(mode)),
+            },
+            Overlay::VoiceModel(picker) => match picker.handle_key(key) {
+                voice_picker::PickResult::Pending => Flow::Stay,
+                voice_picker::PickResult::Cancelled => Flow::Close,
+                voice_picker::PickResult::Picked(name) => {
+                    Flow::Act(OverlayAction::SetVoiceModel(name))
+                }
             },
             Overlay::FolderTrust(picker) => match picker.handle_key(key) {
                 folder_trust_picker::PickResult::Pending => Flow::Stay,
@@ -246,6 +259,12 @@ impl Overlay {
                 mode_picker::PickResult::Picked(mode) => Flow::Act(OverlayAction::SetMode(mode)),
                 _ => Flow::Stay,
             },
+            Overlay::VoiceModel(picker) => match picker.handle_mouse_row(row) {
+                voice_picker::PickResult::Picked(name) => {
+                    Flow::Act(OverlayAction::SetVoiceModel(name))
+                }
+                _ => Flow::Stay,
+            },
             Overlay::FolderTrust(picker) => match picker.handle_mouse_row(row) {
                 folder_trust_picker::PickResult::Picked(choice) => {
                     Flow::Act(OverlayAction::FolderTrust(choice))
@@ -266,9 +285,11 @@ impl Overlay {
     /// except where dismissal needs an explicit decision.
     pub fn on_click_away(&self) -> Flow {
         match self {
-            Overlay::View(_) | Overlay::Model(_) | Overlay::Mode(_) | Overlay::Agent(_) => {
-                Flow::Close
-            }
+            Overlay::View(_)
+            | Overlay::Model(_)
+            | Overlay::Mode(_)
+            | Overlay::VoiceModel(_)
+            | Overlay::Agent(_) => Flow::Close,
             // The trust prompt and an approval must be answered, not dodged;
             // setup holds a half-typed key a stray click must not discard.
             Overlay::FolderTrust(_)

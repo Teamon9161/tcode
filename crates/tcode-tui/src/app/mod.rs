@@ -70,6 +70,7 @@ use crate::usage::{
 };
 use crate::view::{BakeCtx, SessionView};
 use crate::view_picker::{self, ViewId};
+use crate::voice::{Voice, VoiceEvent, VoiceOutcome};
 use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
 
 type Term = Terminal<Surface>;
@@ -97,7 +98,8 @@ const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " 
 /// One of these shows per launch, picked at random: a discovery channel
 /// for features nobody reads /help for. Every entry must describe real,
 /// current behaviour — stale tips are worse than none.
-const TIPS: [&str; 10] = [
+const TIPS: [&str; 11] = [
+    "/voice dictates into the prompt: hold the key, speak, let go — enter still sends it",
     "shift+tab cycles permission modes",
     "esc esc rewinds the conversation · ctrl+r also restores files",
     "ctrl+c stops the turn and sends queued prompts right away — it never exits",
@@ -113,9 +115,13 @@ const TIPS: [&str; 10] = [
 /// Commands whose substance drives frontend-owned objects (key table, model
 /// picker, provider wizard). Everything else lives in the shared
 /// `CommandRegistry` in tcode-core.
-const UI_COMMANDS: [(&str, &str); 5] = [
+const UI_COMMANDS: [(&str, &str); 6] = [
     ("/help", "show keys and commands"),
     ("/views", "switch concurrent sessions"),
+    (
+        "/voice",
+        "push-to-talk dictation · model picks a recogniser · words biases it · key <name> rebinds",
+    ),
     ("/model", "switch model · adjust reasoning effort"),
     (
         "/agents",
@@ -307,6 +313,13 @@ pub struct App {
     suggest_gen: u64,
     suggest_tx: mpsc::Sender<(u64, Option<String>)>,
     suggest_rx: mpsc::Receiver<(u64, Option<String>)>,
+    /// Push-to-talk dictation (`/voice`). Off unless asked for, and its
+    /// transcripts only ever reach the editor.
+    voice: Voice,
+    voice_rx: mpsc::Receiver<VoiceEvent>,
+    /// `/voice keys`: echo every key event to the transcript. The only way to
+    /// tell "tcode ignores this key" from "this key never reached tcode".
+    voice_probe: bool,
     attachments: Vec<Attachment>,
     /// Monotonic id for the next attachment; keeps inline tokens unique within
     /// a draft. Reset to 1 once the draft is sent or cleared.
@@ -446,10 +459,15 @@ impl App {
             environment,
             show_reasoning,
             skills,
+            voice: voice_config,
         } = config;
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
         let (reference_tx, reference_rx) = mpsc::channel(1);
+        // 16 is generous for a channel whose busiest traffic is a level meter
+        // at a few frames a second.
+        let (voice_tx, voice_rx) = mpsc::channel(16);
+        let voice = Voice::new(voice_config, voice_tx, Voice::default_factory());
         let mode_label = session.mode.label().to_string();
         let committed_mode = session.mode;
         let pending_mode = session.pending_mode.clone();
@@ -518,6 +536,9 @@ impl App {
             suggest_gen: 0,
             suggest_tx,
             suggest_rx,
+            voice,
+            voice_rx,
+            voice_probe: false,
             attachments: Vec::new(),
             next_attachment_id: 1,
             clipboard: arboard::Clipboard::new().ok(),
@@ -571,6 +592,9 @@ impl App {
         self.bake(banner);
         self.bake_transcript();
         self.refresh_reference_index();
+        if self.voice.wants_on() {
+            self.set_voice(true);
+        }
         let mut term_events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -584,6 +608,12 @@ impl App {
         // cadence only runs while a turn is actively executing.
         let mut anim_tick = tokio::time::interval(Duration::from_millis(100));
         anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Watches an open take: on terminals with no usable key-up, the end of
+        // a hold *is* the gap after the last auto-repeat, so it has to be
+        // sampled faster than that gap. Gated on recording, so it never wakes
+        // the loop otherwise.
+        let mut voice_tick = tokio::time::interval(Duration::from_millis(60));
+        voice_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         while !self.should_exit {
             self.redraw()?;
@@ -633,6 +663,9 @@ impl App {
                 Some(ask) = self.ask_rx.recv() => {
                     self.open_review(ask);
                 }
+                Some(ev) = self.voice_rx.recv() => {
+                    self.on_voice_event(ev);
+                }
                 done = join_phase(&mut self.phase) => {
                     self.on_turn_done(done);
                 }
@@ -649,6 +682,10 @@ impl App {
                     if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
                         self.spinner = (self.spinner + 1) % SPINNER.len();
                     }
+                }
+                _ = voice_tick.tick(), if self.voice.is_recording() => {
+                    let outcome = self.voice.tick();
+                    self.apply_voice(outcome);
                 }
                 _ = drag_tick.tick(), if self.drag_scroll.is_some() => {
                     self.drag_autoscroll_step();
@@ -827,6 +864,7 @@ impl App {
             OverlayAction::ApplyModel { index, effort } => self.apply_model(index, effort),
             OverlayAction::ApplySetup(done) => self.apply_setup(done),
             OverlayAction::SetMode(mode) => self.set_mode(mode),
+            OverlayAction::SetVoiceModel(name) => self.apply_voice_model(name),
             OverlayAction::FolderTrust(choice) => self.apply_folder_trust_choice(choice),
             OverlayAction::ApplyAgentModel { kind, choice } => {
                 self.apply_agent_model(&kind, choice)
@@ -1121,10 +1159,25 @@ impl App {
     }
 
     fn on_term_event(&mut self, ev: Event) {
-        match ev {
-            Event::Key(key) if key.kind != crossterm::event::KeyEventKind::Release => {
-                self.on_key(key)
+        // Before any routing, and before anything can swallow the event:
+        // the probe reports what arrived, not what we did with it.
+        if self.voice_probe {
+            if let Event::Key(key) = &ev {
+                let line = crate::voice::describe_key(key);
+                self.bake(vec![Line::styled(format!("  {line}"), theme::dim())]);
             }
+        }
+        match ev {
+            // Releases are reported on Windows always, and elsewhere only once
+            // voice asks for them (`crate::set_key_release_reporting`). Nothing
+            // but push-to-talk has any use for them.
+            Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Release => {
+                if self.voice.matches_release(key.code) {
+                    let outcome = self.voice.on_release();
+                    self.apply_voice(outcome);
+                }
+            }
+            Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
                 // An overlay owns interaction while it is on screen. In
                 // particular, multiline terminal pastes must not leak into
@@ -1265,6 +1318,22 @@ impl App {
             self.cycle_mode();
             return;
         }
+        // Push-to-talk comes before the editor *and* before the overlay: an
+        // approval note or a plan comment is a text field like any other, and
+        // dictating into it is the whole point of having the key. Overlays
+        // without a text cursor (the pickers) are left alone.
+        if self.has_voice_target() {
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            let at_boundary = self.voice_at_boundary();
+            if self.voice.matches_key(key.code, ctrl, at_boundary) {
+                // Terminals that label auto-repeat save voice from having to
+                // infer it; the rest send a plain `Press` for every repeat.
+                let auto_repeat = key.kind == crossterm::event::KeyEventKind::Repeat;
+                let outcome = self.voice.on_press(auto_repeat);
+                self.apply_voice(outcome);
+                return;
+            }
+        }
         // An overlay — any picker, or the approval dialog — owns the keyboard
         // while it is on screen.
         if self.overlay.is_some() {
@@ -1322,6 +1391,20 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        // Esc unwinds the newest thing first, and a take in progress is newer
+        // than anything else on screen.
+        if matches!(key.code, KeyCode::Esc) && self.voice.is_busy() {
+            let outcome = self.voice.cancel();
+            self.apply_voice(outcome);
+            return;
+        }
+        // A voice failure holds the hint row until it is acknowledged. Esc is
+        // how everything else on that row is dismissed, so it dismisses this
+        // too — otherwise the only way out is to know that `/voice off` clears
+        // it, which is not something the row ever said.
+        if matches!(key.code, KeyCode::Esc) && self.voice.dismiss_failure() {
+            return;
+        }
         if ctrl && key_char_eq(&key, 'a') {
             self.editor.select_all();
             return;
@@ -1929,5 +2012,249 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// The whole contract of push-to-talk in one pass: the key never types,
+    /// the hint says how to end the take, and the transcript lands in the
+    /// prompt *without* being sent.
+    #[test]
+    fn holding_the_voice_key_dictates_into_the_prompt_without_sending_it() {
+        use crate::voice::{VoiceCmd, VoiceEvent};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let sent = app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+
+        // Armed and idle looks like something: which key, before it is pressed.
+        let armed = app.frame();
+        assert!(
+            armed.contains("voice ctrl+space"),
+            "the status row says voice is on and what to press:
+{armed}"
+        );
+
+        app.press_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        // Auto-repeat while the key is held must not restart the take.
+        app.press_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        let recording = app.frame();
+        assert!(
+            recording.contains("release ctrl+space to transcribe"),
+            "the hint says how to end the take:
+{recording}"
+        );
+        assert!(
+            app.editor.is_empty(),
+            "the push-to-talk key types nothing: {:?}",
+            app.editor.text()
+        );
+
+        // Long enough to be a hold rather than a tap, then let go — with ctrl
+        // already released, which is how terminals report it.
+        app.voice.pretend_recording_started(Duration::from_secs(2));
+        app.release(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert!(app.frame().contains("transcribing"));
+
+        app.on_voice_event(VoiceEvent::Transcript("改一下 editor 的换行".into()));
+        assert_eq!(app.editor.text(), "改一下 editor 的换行");
+        assert!(
+            app.pending.queued().is_empty() && matches!(app.phase, Phase::Idle),
+            "dictation fills the prompt; only enter sends it"
+        );
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            &[VoiceCmd::Start, VoiceCmd::Stop]
+        );
+    }
+
+    /// Dictation into a half-written prompt. A space typed mid-word is still a
+    /// space; one held at a word boundary is the key. Both have to be true at
+    /// once or the space bar is broken.
+    #[test]
+    fn a_space_mid_sentence_types_and_one_held_after_it_dictates() {
+        use crate::voice::VoiceEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::Space);
+        app.editor.insert_str("把这个");
+
+        // Straight after a character: an ordinary separator, typed through.
+        app.press(KeyCode::Char(' '));
+        assert_eq!(app.editor.text(), "把这个 ");
+        assert!(app.voice.hint().is_none(), "no take from a typed space");
+
+        // Now the caret sits on a boundary, so holding claims the key.
+        app.press(KeyCode::Char(' '));
+        app.press(KeyCode::Char(' '));
+        app.press(KeyCode::Char(' '));
+        assert!(app.voice.is_recording(), "the hold was recognised");
+        assert_eq!(
+            app.editor.text(),
+            "把这个 ",
+            "every provisional space is taken back, and the typed one is not"
+        );
+
+        app.voice.pretend_recording_started(Duration::from_secs(2));
+        app.release(KeyCode::Char(' '), KeyModifiers::NONE);
+        app.on_voice_event(VoiceEvent::Transcript("改成 spawn_blocking".into()));
+        assert_eq!(app.editor.text(), "把这个 改成 spawn_blocking");
+    }
+
+    /// An approval note and a plan comment are text fields, so dictation
+    /// belongs in them too — and must land where paste would, not in the hidden
+    /// prompt box behind the dialog.
+    #[test]
+    fn dictation_reaches_an_approval_note_rather_than_the_prompt_behind_it() {
+        use crate::voice::VoiceEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::Function(3));
+        let (reply, _rx) = tokio::sync::oneshot::channel();
+        app.overlay = Some(Overlay::approval(
+            crate::approval::Dialog::new(
+                "summary".into(),
+                "tool".into(),
+                "call".into(),
+                false,
+                false,
+            ),
+            crate::overlay::ApprovalReply::One(reply),
+        ));
+
+        app.press(KeyCode::F(3));
+        assert!(app.voice.is_recording(), "the dialog does not swallow it");
+        app.voice.pretend_recording_started(Duration::from_secs(2));
+        app.release(KeyCode::F(3), KeyModifiers::NONE);
+        app.on_voice_event(VoiceEvent::Transcript("先跑测试".into()));
+
+        assert!(
+            app.editor.is_empty(),
+            "not into the prompt behind the dialog"
+        );
+        let note = app
+            .overlay
+            .as_mut()
+            .and_then(Overlay::as_dialog_mut)
+            .expect("the dialog is still up")
+            .text_target_text();
+        assert_eq!(note, "先跑测试", "dictation landed in the note");
+    }
+
+    /// The pickers have no text cursor, so the key keeps its own meaning there
+    /// rather than starting a take with nowhere to put the words.
+    #[test]
+    fn a_picker_is_not_a_dictation_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::Function(3));
+        app.open_mode_picker();
+
+        app.press(KeyCode::F(3));
+        assert!(!app.voice.is_recording(), "no target, no take");
+        assert!(
+            app.overlay.is_some(),
+            "and the picker still has the keyboard"
+        );
+    }
+
+    /// One rule for the word list: a leading `-` removes, anything else adds.
+    /// Adding a word twice must not double it — sherpa would weight it twice.
+    #[test]
+    fn voice_words_add_and_a_leading_dash_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+
+        app.edit_voice_words("tokio serde tokio");
+        assert_eq!(app.voice.words(), ["tokio", "serde"]);
+
+        app.edit_voice_words("-serde spawn_blocking");
+        assert_eq!(app.voice.words(), ["tokio", "spawn_blocking"]);
+
+        // The list is the whole point of the command, so it is always shown.
+        let frame = app.frame();
+        assert!(
+            frame.contains("tokio spawn_blocking"),
+            "the words are echoed back:
+{frame}"
+        );
+    }
+
+    /// A backend failure parks a warning on the hint row. It has to say how to
+    /// get rid of it and Esc has to actually do that, or the only way out the
+    /// user can find is restarting tcode.
+    #[test]
+    fn a_voice_failure_says_how_to_dismiss_it_and_esc_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+
+        app.on_voice_event(crate::voice::VoiceEvent::Failed(
+            "unknown argument --model".into(),
+        ));
+        let warned = app.frame();
+        assert!(
+            warned.contains("esc dismisses"),
+            "the warning states its own exit:
+{warned}"
+        );
+
+        app.press(KeyCode::Esc);
+        let after = app.frame();
+        assert!(
+            !after.contains("esc dismisses"),
+            "esc clears the warning:
+{after}"
+        );
+    }
+
+    /// The picker is built from whatever the installed sidecar reports. With no
+    /// sidecar there is nothing to offer, and the reply has to be the build
+    /// instructions rather than an empty menu.
+    #[test]
+    fn the_voice_model_picker_explains_itself_when_there_is_no_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        // Points at a path that cannot exist, so the test never depends on
+        // whether this machine happens to have a sidecar installed.
+        let absent = dir.path().join("absent");
+        app.voice.set_command(absent.display().to_string());
+
+        app.open_voice_model_picker();
+        assert!(app.overlay.is_none(), "no menu without a backend to ask");
+        let frame = app.frame();
+        assert!(
+            frame.contains("[voice] command points at"),
+            "the miss names the path it looked at:
+{frame}"
+        );
+    }
+
+    /// Esc belongs to the newest thing on screen, and a take in progress is
+    /// newer than the draft it would otherwise clear.
+    #[test]
+    fn esc_while_recording_cancels_the_take_and_keeps_the_draft() {
+        use crate::voice::VoiceCmd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let sent = app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+        app.editor.insert_str("half a thought");
+
+        app.press_with(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        app.press(KeyCode::Esc);
+
+        assert_eq!(app.editor.text(), "half a thought", "the draft survives");
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            &[VoiceCmd::Start, VoiceCmd::Cancel]
+        );
+        let after = app.frame();
+        assert!(
+            !after.contains("release ctrl+space"),
+            "recording is over:
+{after}"
+        );
     }
 }

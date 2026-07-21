@@ -244,6 +244,16 @@ impl App {
             }
             _ => {}
         }
+        // `/voice` is the one UI command with arguments, because picking a key
+        // that this terminal and this input method both leave alone is
+        // trial and error and has to be fast.
+        if let Some(rest) = cmd
+            .strip_prefix("/voice ")
+            .or_else(|| (cmd == "/voice").then_some(""))
+        {
+            self.run_voice(rest.trim());
+            return;
+        }
         if self.registry.find(cmd).is_none() && self.dispatch_skill(cmd) {
             return;
         }
@@ -425,6 +435,267 @@ impl App {
             self.reference_index.clear();
             self.refresh_reference_index();
             self.refresh_folder_trust();
+        }
+    }
+
+    /// `/voice [on|off|keys|key <name>|model [<name>]]`.
+    fn run_voice(&mut self, args: &str) {
+        match args {
+            // Bare `model` opens the picker. Remembering which models exist is
+            // the machine's job, not the user's — and the list has to come from
+            // the installed sidecar anyway.
+            "model" | "models" => self.open_voice_model_picker(),
+            "" => {
+                let on = !self.voice.is_on();
+                self.set_voice(on);
+            }
+            "on" => self.set_voice(true),
+            "off" => self.set_voice(false),
+            "keys" => {
+                self.voice_probe = !self.voice_probe;
+                self.bake(vec![Line::styled(
+                    if self.voice_probe {
+                        "key probe on — every keystroke is echoed below. Press the key you want \
+                         for voice: if nothing appears, something above tcode (an input method, \
+                         the terminal, the window manager) is taking it. /voice keys turns this \
+                         off."
+                    } else {
+                        "key probe off"
+                    },
+                    theme::dim(),
+                )]);
+            }
+            other if other.starts_with("model ") => {
+                self.apply_voice_model(other["model ".len()..].trim().to_string())
+            }
+            "words" => self.show_voice_words(),
+            other if other.starts_with("words ") => self.edit_voice_words(&other["words ".len()..]),
+            other => {
+                let Some(name) = other.strip_prefix("key ") else {
+                    self.bake(vec![Line::styled(
+                        format!(
+                            "usage: /voice [on|off|keys|key <name>|model [<name>]|words [<w>...]] \
+                             (got '{other}')"
+                        ),
+                        ratatui::style::Style::default().fg(theme::ERROR),
+                    )]);
+                    return;
+                };
+                match name.trim().parse::<tcode_core::config::VoiceKey>() {
+                    Ok(key) => {
+                        self.voice.set_key(key);
+                        // state.toml, like the permission mode Shift+Tab
+                        // lands on: a choice the program made on the user's
+                        // behalf and must remember. config.toml stays
+                        // hand-written and untouched.
+                        tcode_core::config::ModelState::update(|state| state.voice_key = Some(key));
+                        self.bake(vec![Line::styled(
+                            format!(
+                                "voice key is now {} (persists across sessions) — {}",
+                                key.label(),
+                                self.voice.gesture_help()
+                            ),
+                            theme::dim(),
+                        )]);
+                    }
+                    Err(reason) => self.bake(vec![Line::styled(
+                        reason,
+                        ratatui::style::Style::default().fg(theme::ERROR),
+                    )]),
+                }
+            }
+        }
+    }
+
+    /// `/voice words`. Shows the list, since the words are the whole point of
+    /// having it and there is nowhere else they appear.
+    pub(super) fn show_voice_words(&mut self) {
+        let line = if self.voice.words().is_empty() {
+            "no voice hotwords — `/voice words tokio serde` adds some, `-tokio` removes one"
+                .to_string()
+        } else {
+            format!(
+                "voice hotwords: {} · `-<word>` removes one",
+                self.voice.words().join(" ")
+            )
+        };
+        self.bake(vec![Line::styled(line, theme::dim())]);
+    }
+
+    /// `/voice words <w>...`. A leading `-` removes; everything else adds. One
+    /// rule rather than add/remove/clear verbs, and no real hotword begins with
+    /// a hyphen.
+    pub(super) fn edit_voice_words(&mut self, args: &str) {
+        let mut words = self.voice.words().to_vec();
+        for token in args.split_whitespace() {
+            match token.strip_prefix('-') {
+                Some(drop) => words.retain(|word| word != drop),
+                // Adding twice is not an error, but it must not double the
+                // entry: sherpa would then weight that word twice.
+                None if words.iter().any(|word| word == token) => {}
+                None => words.push(token.to_string()),
+            }
+        }
+        if words == self.voice.words() {
+            self.show_voice_words();
+            return;
+        }
+        // Seeded from the effective list, so words written by hand in
+        // config.toml survive the first edit made from in here.
+        let switched = self.voice.set_words(words.clone());
+        tcode_core::config::ModelState::update(|state| state.voice_words = Some(words));
+        match switched {
+            Ok(()) => self.show_voice_words(),
+            Err(reason) => self.bake(vec![Line::styled(
+                reason,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    /// `/voice model`. The catalogue is read from the installed sidecar, so the
+    /// menu can only ever offer what that binary can actually load.
+    pub(super) fn open_voice_model_picker(&mut self) {
+        match self.voice.catalogue() {
+            Ok(models) => {
+                let picker = crate::voice_picker::Picker::new(models, self.voice.model_name());
+                self.overlay = Some(Overlay::VoiceModel(picker));
+            }
+            // Missing or stale sidecar: the reason already carries its own fix.
+            Err(reason) => self.bake(vec![Line::styled(
+                reason,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    /// Switch models and remember it. Reached from the picker and from
+    /// `/voice model <name>`, so both routes persist identically.
+    pub(super) fn apply_voice_model(&mut self, name: String) {
+        // No list of names here on purpose: the sidecar's table is the only
+        // one, and a wrong name comes back from it as a menu.
+        let switched = self.voice.set_model(name.clone());
+        tcode_core::config::ModelState::update(|state| state.voice_model = Some(name.clone()));
+        match switched {
+            Ok(()) => {
+                self.notice = Some((
+                    format!("voice model → {name} (persists across sessions)"),
+                    Instant::now(),
+                ))
+            }
+            // First use of a model downloads it, and that is where a bad name
+            // surfaces — so this must stay on screen.
+            Err(reason) => self.bake(vec![Line::styled(
+                reason,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    /// `/voice`. The choice persists like `/suggest`: a setting you must
+    /// re-arm every morning is one you stop using.
+    pub(super) fn set_voice(&mut self, on: bool) {
+        tcode_core::config::ModelState::update(|state| state.voice = Some(on));
+        if !on {
+            self.voice.turn_off();
+            crate::set_key_release_reporting(false);
+            self.notice = Some(("voice off".into(), Instant::now()));
+            return;
+        }
+        // Ask for key-release reporting *before* starting: on terminals that
+        // need the kitty protocol, the gesture the confirmation line describes
+        // depends on whether the request was honoured.
+        crate::set_key_release_reporting(true);
+        match self.voice.turn_on() {
+            // Turning a mode on is not a record worth keeping: the status row
+            // shows it is on and which key, so a fading notice is enough.
+            // Baking it pushes the conversation up every time.
+            Ok(()) => {
+                self.notice = Some((
+                    format!("voice on — {}", self.voice.gesture_help()),
+                    Instant::now(),
+                ))
+            }
+            // A failure is the exception: it says what to do about it, so it
+            // has to survive longer than three seconds.
+            Err(reason) => self.bake(vec![Line::styled(
+                reason,
+                ratatui::style::Style::default().fg(theme::ERROR),
+            )]),
+        }
+    }
+
+    pub(super) fn on_voice_event(&mut self, event: VoiceEvent) {
+        let outcome = self.voice.on_event(event);
+        self.apply_voice(outcome);
+    }
+
+    /// Voice's only reach into the app: text goes to the editor, never to the
+    /// wire.
+    pub(super) fn apply_voice(&mut self, outcome: VoiceOutcome) {
+        match outcome {
+            VoiceOutcome::None => {}
+            VoiceOutcome::Insert(text) => {
+                self.dismissed_reference = None;
+                self.focus_voice_target();
+                if let Some(editor) = self.voice_target() {
+                    editor.insert_str(&text);
+                }
+            }
+            VoiceOutcome::Notice(text) => self.notice = Some((text, Instant::now())),
+            // Into the transcript: it wraps, it stays, and it is the kind of
+            // thing the user has to be able to re-read.
+            VoiceOutcome::Announce(text) => self.bake(vec![Line::styled(text, theme::warn())]),
+            // The key doubles as a character. It types normally and is taken
+            // back only once the hold is proven, so a space stays a space.
+            VoiceOutcome::TypeSpace => {
+                self.dismissed_reference = None;
+                if let Some(editor) = self.voice_target() {
+                    editor.insert_char(' ');
+                }
+            }
+            VoiceOutcome::RetractSpaces(count) => {
+                if let Some(editor) = self.voice_target() {
+                    for _ in 0..count {
+                        editor.backspace();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Where dictation lands: the prompt box, or the approval dialog's own text
+    /// field when one is on screen. `None` for the pickers, which have no text
+    /// cursor for it to arrive at.
+    ///
+    /// This is the same question `Dialog::paste_text` answers, and it is
+    /// answered in the same place, so pasted and dictated words can never end
+    /// up in different fields.
+    pub(super) fn voice_target(&mut self) -> Option<&mut crate::editor::Editor> {
+        match self.overlay.as_mut() {
+            None => Some(&mut self.editor),
+            Some(overlay) => overlay.as_dialog_mut().map(|dialog| dialog.text_target()),
+        }
+    }
+
+    /// True where dictation has somewhere to go. Immutable, because deciding
+    /// whether a keystroke is push-to-talk must not move the caret.
+    pub(super) fn has_voice_target(&self) -> bool {
+        self.overlay
+            .as_ref()
+            .is_none_or(|overlay| overlay.as_dialog().is_some())
+    }
+
+    /// A space key is push-to-talk only at a word boundary in the field the
+    /// text would land in — see `Editor::at_word_boundary`.
+    pub(super) fn voice_at_boundary(&mut self) -> bool {
+        self.voice_target()
+            .is_none_or(|editor| editor.at_word_boundary())
+    }
+
+    fn focus_voice_target(&mut self) {
+        if let Some(dialog) = self.overlay.as_mut().and_then(Overlay::as_dialog_mut) {
+            dialog.focus_text_target();
         }
     }
 

@@ -27,6 +27,8 @@ mod transcript;
 mod usage;
 mod view;
 mod view_picker;
+mod voice;
+mod voice_picker;
 pub mod wizard;
 
 use std::io::{stdout, Write};
@@ -72,6 +74,65 @@ pub struct TuiConfig {
     pub environment: EnvironmentFn,
     pub show_reasoning: bool,
     pub skills: Vec<tcode_tools::Skill>,
+    /// `[voice]`, with `enabled` already resolved against state.toml.
+    pub voice: tcode_core::config::VoiceConfig,
+}
+
+/// Whether we asked the terminal to report key releases, so teardown only
+/// pops what it pushed. A global because `restore_terminal` also runs from the
+/// panic hook, where no `App` is reachable.
+static KEY_RELEASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Ask for (or stop asking for) key-release events — what push-to-talk needs
+/// to know the key was let go. Both platforms need asking, for unrelated
+/// reasons, so both live here.
+///
+/// **Windows.** crossterm reads `INPUT_RECORD`s, and under a pseudoconsole
+/// (Windows Terminal, VS Code) those records are *synthesised* by ConPTY from
+/// the VT stream the terminal sends — a stream with no concept of key-up, so
+/// every press gets a release manufactured in the same instant. `^[[?9001h`
+/// (win32-input-mode) asks the terminal for full Win32 key events instead, at
+/// which point ConPTY can reproduce real key-up records. Nothing changes for
+/// us: crossterm never enables `ENABLE_VIRTUAL_TERMINAL_INPUT`, so the console
+/// still hands us records, only now faithful ones. Terminals that do not
+/// understand the request ignore it, and `Voice` detects the manufactured
+/// release and falls back to a toggle.
+///
+/// **Elsewhere.** The kitty keyboard protocol, requesting *only*
+/// `REPORT_EVENT_TYPES`: the disambiguation flags would change how every other
+/// key is encoded, which is too much to trade for dictation.
+pub(crate) fn set_key_release_reporting(on: bool) {
+    use std::sync::atomic::Ordering;
+
+    #[cfg(windows)]
+    {
+        if on == KEY_RELEASES.swap(on, Ordering::SeqCst) {
+            return;
+        }
+        let request = if on { "\x1b[?9001h" } else { "\x1b[?9001l" };
+        let mut out = stdout();
+        let _ = out.write_all(request.as_bytes());
+        let _ = out.flush();
+    }
+    #[cfg(not(windows))]
+    {
+        if !crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+            return;
+        }
+        use crossterm::event::{
+            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+        };
+        if on {
+            if !KEY_RELEASES.swap(true, Ordering::SeqCst) {
+                let _ = execute!(
+                    stdout(),
+                    PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+                );
+            }
+        } else if KEY_RELEASES.swap(false, Ordering::SeqCst) {
+            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+        }
+    }
 }
 
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
@@ -104,6 +165,9 @@ pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyh
 }
 
 fn restore_terminal() {
+    // A keyboard mode we pushed must not outlive us: it is the terminal's
+    // state, not ours, and a stale one breaks the shell we hand back to.
+    set_key_release_reporting(false);
     let mut output = stdout();
     restore_terminal_output(&mut output);
     let _ = disable_raw_mode();

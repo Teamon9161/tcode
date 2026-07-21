@@ -859,7 +859,35 @@ impl App {
     /// agent may do without asking. The active model and cache hit rate use a
     /// modest neutral lift, and a transient notice keeps the default foreground
     /// so it reads as news rather than furniture.
+    /// The transient message, while it is still worth showing. One reader for
+    /// every hint row, so no row can silently drop one.
+    fn fresh_notice(&self) -> Option<String> {
+        self.notice
+            .as_ref()
+            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
+            .map(|(text, _)| text.clone())
+    }
+
     pub(super) fn idle_hint(&self) -> Line<'static> {
+        // Recording owns the row outright: while the microphone is open, what
+        // ends the take matters more than the model name.
+        if let Some(hint) = self.voice.hint() {
+            let lead = match hint.tone {
+                crate::voice::HintTone::Busy => theme::accent(),
+                crate::voice::HintTone::Recording => theme::recording(),
+                crate::voice::HintTone::Problem => theme::warn(),
+            };
+            // Voice's own messages ("hold the key while you speak") arrive
+            // exactly while this row is showing, so without this they would go
+            // to a notice nobody can see. The message *replaces* the standing
+            // instruction rather than following it: the row is one line, and a
+            // message that gets truncated away is worse than no message.
+            let rest = self.fresh_notice().unwrap_or(hint.rest);
+            return Line::from(vec![
+                Span::styled(hint.lead, lead),
+                Span::styled(format!(" {}", rest.trim_start()), theme::dim()),
+            ]);
+        }
         if let Some(nav) = &self.rewind_nav {
             let files = if nav.candidates[nav.pos].dirty {
                 " · ctrl+r rewind + restore files"
@@ -902,17 +930,18 @@ impl App {
         if self.dogfood {
             spans.push(Span::styled(" · dogfood".to_string(), theme::warn()));
         }
+        // Same reason as dogfood: an armed mode must be visible while it is
+        // armed, not only in the line that armed it.
+        if let Some(marker) = self.voice.status_marker() {
+            spans.push(Span::styled(format!(" · {marker}"), theme::metadata()));
+        }
         if let Some(cache) = cache {
             spans.push(Span::styled(" · cache ", theme::dim()));
             spans.push(Span::styled(cache, theme::metadata()));
         }
-        if let Some((text, _)) = self
-            .notice
-            .as_ref()
-            .filter(|(_, at)| at.elapsed() < Duration::from_secs(3))
-        {
+        if let Some(text) = self.fresh_notice() {
             spans.push(Span::styled(" · ".to_string(), theme::dim()));
-            spans.push(Span::raw(text.clone()));
+            spans.push(Span::raw(text));
         }
         spans.push(Span::styled(" · /help".to_string(), theme::dim()));
         Line::from(spans)

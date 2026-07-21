@@ -62,6 +62,13 @@ pub fn warn() -> Style {
     Style::default().fg(WARN)
 }
 
+/// Red — the microphone is open. It reuses the error colour deliberately:
+/// "recording" is the one status where the universal convention beats internal
+/// consistency, and a red ● is what everyone already reads as live capture.
+pub fn recording() -> Style {
+    Style::default().fg(ERROR)
+}
+
 pub fn user_prompt() -> Style {
     Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
 }

@@ -806,6 +806,22 @@ async fn main() -> anyhow::Result<()> {
                 environment: environment.clone(),
                 show_reasoning: config.ui.show_reasoning,
                 skills: skills.clone(),
+                // Same precedence as `/suggest` and `/model`: what the user
+                // last chose at runtime beats what the file says, so both are
+                // resolved here and never read again.
+                voice: tcode_core::config::VoiceConfig {
+                    enabled: state.voice.unwrap_or(config.voice.enabled),
+                    key: state.voice_key.unwrap_or(config.voice.key),
+                    model: state
+                        .voice_model
+                        .clone()
+                        .unwrap_or_else(|| config.voice.model.clone()),
+                    hotwords: state
+                        .voice_words
+                        .clone()
+                        .unwrap_or_else(|| config.voice.hotwords.clone()),
+                    ..config.voice.clone()
+                },
             },
         )
         .await;

@@ -1,0 +1,21 @@
+[package]
+name = "tcode-voiced"
+version = "0.1.15"
+edition = "2021"
+description = "Push-to-talk speech recognition sidecar for tcode"
+license = "Apache-2.0"
+
+# Deliberately NOT a workspace member. sherpa-onnx's build script downloads a
+# prebuilt native library, and cpal links libasound on Linux; neither can be
+# part of `cargo build --workspace` without breaking CI and the musl and
+# windows-aarch64 release targets. See plan.md.
+
+[dependencies]
+cpal = "0.15"
+sherpa-onnx = "=1.13.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = "2"
+tar = "0.4"
+bzip2 = "0.4"
+dirs = "5"

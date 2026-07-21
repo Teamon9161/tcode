@@ -228,6 +228,11 @@ shell_output_filters = true
 [ui]
 suggest_next = true
 show_reasoning = false
+
+[voice]
+enabled = false
+key = "space"
+language = "auto"
 ```
 
 Rules use the descriptors shown in approval prompts, with `*` as the wildcard.
@@ -252,6 +257,88 @@ filtering you turned off.
 `ui.suggest_next` controls the post-turn next-prompt guess and costs one small
 auxiliary request per turn. `ui.show_reasoning` only displays provider reasoning
 summaries; it does not change provider behaviour.
+
+## Voice input
+
+`[voice]` configures push-to-talk dictation (`/voice`). It is TUI-only: hold the
+key, speak, release, and the transcript is inserted at the cursor. Nothing is
+ever sent automatically. Recognition runs locally in a separate process
+(`tcode-voiced`) that tcode starts on demand; no audio leaves the machine.
+
+Dictation goes wherever the text cursor is — the prompt box, an approval note
+(`tab`), a question's note, or a plan comment. The pickers have no text field
+and are left alone.
+
+| Field | Type / values | Default | Meaning |
+|---|---|---|---|
+| `enabled` | bool | `false` | Whether voice comes up with the session. The `/voice` toggle is remembered in `state.toml` and **overrides this**, exactly like `/suggest` over `ui.suggest_next`. |
+| `key` | `"space"` \| `"ctrl+space"` \| `"f1"`–`"f12"` | `"space"` | The push-to-talk key. `/voice key <name>` changes it and is remembered in `state.toml`, which **overrides this** — same precedence as the permission mode. With `"space"`, typing spaces still types spaces: only a burst of presses at key-repeat speed is read as a hold, and only at a word boundary — the start of a line, or right after a space. So dictating into a half-written prompt means typing one space and then holding the next. `"ctrl+space"` is often unavailable — Microsoft Pinyin and other IMEs take it for 中/英 and it never reaches the terminal. A function key always works and needs no telling apart from typing; use one if a slow key-repeat setting makes `"space"` unreliable. `/voice keys` echoes what actually arrives. |
+| `model` | preset name, or `""` | `""` | Which recogniser to download and run. `""` means the sidecar's own default (currently `zh-en`). **`/voice model` opens a picker** listing what the installed sidecar supports; it is remembered in `state.toml`, which **overrides this**. Each model lives in its own directory, so switching back does not download again. |
+| `hotwords` | list of strings | `[]` | Words and phrases recognition is biased towards — library names, project jargon, anything a general model has no reason to expect. `/voice words <w>...` adds, `-<word>` removes, and the result is remembered in `state.toml`, which **overrides this**. Only `zh-en` and `qwen3` can use them; see below. |
+| `language` | `"auto"`, `"zh"`, `"en"`, `"ja"`, `"ko"`, `"yue"` | `"auto"` | Only `sense-voice` has a language switch; the other models are bilingual by construction and ignore this. |
+| `max_seconds` | integer | `60` | A hold that never ends stops here rather than filling memory. |
+| `device` | string | `""` | Input device name; empty means the system default. |
+| `command` | path | `""` | The `tcode-voiced` executable. Empty means `~/.tcode/voice/tcode-voiced[.exe]`. |
+| `model_dir` | path | `""` | Where model files live. Empty means `~/.tcode/voice/models`. |
+| `download_base` | URL | `""` | Base URL for the model archive, for mirrors. Empty means the upstream release. |
+
+```toml
+[voice]
+enabled = false      # /voice turns it on; this is only the starting value
+key = "space"
+model = "zh-en"
+max_seconds = 60
+```
+
+Scope: user config. A project's `.tcode/config.toml` has no reason to bind a
+key on someone else's keyboard or point at a binary on their disk.
+
+### Choosing a model
+
+`/voice model` opens a picker; `/voice model <name>` sets one directly. The list
+comes from the installed `tcode-voiced` binary, so it always matches what that
+build can actually load — the table below is what the current one ships with.
+
+The model is downloaded on first use, into `model_dir`. Bigger models are more
+accurate and slower; because a take is transcribed while you wait, speed is a
+real cost, not a benchmark number.
+
+| `model` | Download | Languages | Hotwords | Notes |
+|---|---|---|---|---|
+| `zh-en` | 136MB | zh, en | yes | Trained for Chinese/English code-switching, with punctuation and casing. The default. |
+| `sense-voice` | 163MB | zh, en, ja, ko, yue | no | Fastest, and the only one with a `language` switch. Handles English embedded in Chinese poorly. |
+| `qwen3` | 879MB | zh, en, and more | yes | The most accurate, and by far the slowest: it decodes with a 0.6B language model on the CPU. |
+
+### Hotwords
+
+`/voice words` shows the list; `/voice words tokio serde` adds; `/voice words
+-serde` removes. The words are applied when the recogniser is built, so changing
+them restarts the sidecar — the same as changing models.
+
+Only the two models marked above can use them, and they do it differently:
+`zh-en` re-scores its search towards the given phrases (which also switches it
+to beam search, so it is a little slower while a list is set), while `qwen3`
+takes them as context for its language model. `sense-voice` has no mechanism for
+this and ignores the list; `/voice words` still records it, so it takes effect
+if you switch models.
+
+Hotwords help most with names a general model has no reason to expect — library
+names, filenames, people, internal jargon. They cannot fix speech the model
+never heard clearly in the first place.
+
+If English technical terms inside Chinese speech come out wrong, that is what
+`zh-en` and above are for; `sense-voice` will not get better by changing
+`language`.
+
+Hold-to-talk works out how the key is being held from what the terminal
+actually does, in three tiers: a real key release where one is available
+(tcode requests them — win32-input-mode on Windows, the kitty keyboard protocol
+elsewhere); otherwise the OS key *repeat*, which survives a pseudoconsole even
+when key-up does not, with the end of the hold being the gap after the last
+repeat; and if neither signal exists, the key becomes press-to-start /
+press-again-to-stop. Only the last of those changes the gesture, and it says so
+in the transcript. The hint row always states the gesture actually in effect,
+so it never has to be guessed.
 
 ## Auto Mode policy
 

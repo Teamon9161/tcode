@@ -347,6 +347,127 @@ impl Default for UiConfig {
     }
 }
 
+/// Which key holds the microphone open.
+///
+/// There are three because no single choice survives every setup: `ctrl+space`
+/// is the natural chord but input methods claim it (Microsoft Pinyin toggles
+/// 中/英 with it, and the key never reaches the terminal at all); plain `space`
+/// is unclaimed but can only work while the draft is empty; a function key is
+/// unclaimed *and* always available, at the cost of being arbitrary. Whichever
+/// is chosen, `/voice keys` shows what the terminal actually delivers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceKey {
+    CtrlSpace,
+    Space,
+    /// F1-F12. `F1` is usually help in a terminal; the rest are free.
+    Function(u8),
+}
+
+impl VoiceKey {
+    /// The label used in config, in hints, and in `/voice`'s own output — one
+    /// spelling so what the user types is what the screen says back.
+    pub fn label(self) -> String {
+        match self {
+            VoiceKey::CtrlSpace => "ctrl+space".into(),
+            VoiceKey::Space => "space".into(),
+            VoiceKey::Function(n) => format!("f{n}"),
+        }
+    }
+}
+
+impl std::str::FromStr for VoiceKey {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let text = text.trim().to_ascii_lowercase();
+        match text.as_str() {
+            "ctrl+space" => Ok(VoiceKey::CtrlSpace),
+            "space" => Ok(VoiceKey::Space),
+            _ => match text.strip_prefix('f').and_then(|n| n.parse::<u8>().ok()) {
+                Some(n @ 1..=12) => Ok(VoiceKey::Function(n)),
+                _ => Err(format!(
+                    "'{text}' is not a voice key: use ctrl+space, space, or f1-f12"
+                )),
+            },
+        }
+    }
+}
+
+impl Serialize for VoiceKey {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.label())
+    }
+}
+
+impl<'de> Deserialize<'de> for VoiceKey {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// `[voice]`: push-to-talk dictation. The recogniser itself is an external
+/// sidecar process, so everything here is either a gesture choice or a pointer
+/// to where that sidecar and its model live.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VoiceConfig {
+    /// Starting value for `/voice`; the runtime toggle in state.toml wins.
+    pub enabled: bool,
+    /// Hold this to record. `space` only triggers on an empty draft.
+    pub key: VoiceKey,
+    /// Which recognition model, by preset name. The sidecar owns the list and
+    /// the default, so this is passed through untouched and a wrong name is
+    /// answered by the sidecar with the menu — there is no second copy here to
+    /// drift out of date.
+    pub model: String,
+    /// Words and phrases to bias recognition towards — names, library names,
+    /// anything a general model has no reason to expect. Only models that
+    /// support biasing use them; `/voice words` reports when the chosen one
+    /// does not.
+    pub hotwords: Vec<String>,
+    /// `auto`, or one of `zh`, `en`, `ja`, `ko`, `yue`. Only the `sense-voice`
+    /// model has a language switch; the bilingual models ignore this. Passed
+    /// through to the sidecar untouched.
+    pub language: String,
+    /// A hold that never ends must not fill memory with audio.
+    pub max_seconds: u64,
+    /// Input device name; empty means the system default.
+    pub device: String,
+    /// Path to the sidecar executable. Empty means the standard locations
+    /// (`~/.tcode/voice/`, then PATH).
+    pub command: String,
+    /// Where model files live. Empty means `~/.tcode/voice/models`.
+    pub model_dir: String,
+    /// Base URL the sidecar fetches models from, for mirrors. Empty means its
+    /// own default.
+    pub download_base: String,
+}
+
+impl Default for VoiceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            // Space, because the alternatives are worse in practice: input
+            // methods claim ctrl+space, and a function key is something nobody
+            // reaches for. Tapping it still types a space — see the provisional
+            // take in `tcode-tui`'s voice module.
+            key: VoiceKey::Space,
+            // Empty, not a name: the sidecar's table decides which preset is
+            // the default, and duplicating that choice here would mean two
+            // places to change when it moves.
+            model: String::new(),
+            hotwords: Vec::new(),
+            language: "auto".into(),
+            max_seconds: 60,
+            device: String::new(),
+            command: String::new(),
+            model_dir: String::new(),
+            download_base: String::new(),
+        }
+    }
+}
+
 fn default_trusted_read_hosts() -> Vec<String> {
     vec!["api.github.com".into(), "raw.githubusercontent.com".into()]
 }
@@ -445,6 +566,7 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     pub auto_mode: AutoModeConfig,
     pub ui: UiConfig,
+    pub voice: VoiceConfig,
     pub profiles: BTreeMap<String, Profile>,
     /// Per-sub-agent model overrides, keyed by agent kind (`explore`,
     /// `general`). Absent = the sub-agent follows the parent's model,
@@ -486,6 +608,26 @@ pub struct ModelState {
     /// the runtime toggle is what the user last chose, so it wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suggestions: Option<bool>,
+    /// `/voice`. Absent = follow `[voice] enabled` from config.toml, same
+    /// precedence as `suggestions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice: Option<bool>,
+    /// `/voice key <name>`. Which key is free depends on the terminal and the
+    /// input method in front of it, so it is found by trying — and a choice
+    /// that has to be re-made every morning is one that gets abandoned.
+    /// Absent = follow `[voice] key` from config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_key: Option<crate::config::VoiceKey>,
+    /// `/voice model <name>`. Which model reads your voice best is found by
+    /// trying them, and the trying is only worth doing once.
+    /// Absent = follow `[voice] model` from config.toml.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_model: Option<String>,
+    /// `/voice words`. Absent = follow `[voice] hotwords` from config.toml.
+    /// Once edited from inside tcode the whole list lives here, seeded from
+    /// config so that editing never silently drops what was written by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub voice_words: Option<Vec<String>>,
     /// The permission mode last cycled to with Shift+Tab, so a session starts
     /// where the last one left off. `Unsafe` is deliberately never stored: a
     /// one-off flip to it must not silently arm every future session.
@@ -1003,6 +1145,29 @@ fn add_project_allow_blocking(project_dir: &Path, descriptor: &str) -> Result<bo
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spelling in config.toml is the spelling shown back on screen, and a
+    /// typo has to name what is allowed rather than fail with a serde message
+    /// about an unknown variant.
+    #[test]
+    fn voice_keys_round_trip_through_their_labels() {
+        for (text, key) in [
+            ("ctrl+space", VoiceKey::CtrlSpace),
+            ("space", VoiceKey::Space),
+            ("f4", VoiceKey::Function(4)),
+            ("F12", VoiceKey::Function(12)),
+        ] {
+            let parsed: VoiceKey = text.parse().expect("parses");
+            assert_eq!(parsed, key);
+            assert_eq!(parsed.label(), text.to_ascii_lowercase());
+        }
+        let error = "ctrl+enter".parse::<VoiceKey>().expect_err("rejected");
+        assert!(error.contains("f1-f12"), "{error}");
+        assert!("f13".parse::<VoiceKey>().is_err());
+
+        let config: VoiceConfig = toml::from_str("key = \"f4\"").expect("parses");
+        assert_eq!(config.key, VoiceKey::Function(4));
+    }
 
     #[tokio::test]
     async fn project_allow_update_preserves_existing_toml_and_deduplicates() {

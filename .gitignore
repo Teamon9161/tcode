@@ -1,4 +1,7 @@
 /target
+# The voice sidecar is excluded from the workspace, so it has a target/ of
+# its own.
+/crates/tcode-voiced/target
 examples/
 **/__pycache__/
 .claude/

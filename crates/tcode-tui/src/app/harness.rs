@@ -83,6 +83,7 @@ fn config() -> crate::TuiConfig {
         environment: Arc::new(environment),
         show_reasoning: false,
         skills: Vec::new(),
+        voice: Default::default(),
     }
 }
 
@@ -129,11 +130,14 @@ fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> Ap
         auto_compact: true,
         auto_compact_percent: 85,
     };
-    let session = Session::new(
+    let mut session = Session::new(
         ToolCtx::new(cwd.to_path_buf(), 2000),
         PermissionMode::Default,
         PermissionRules::default(),
     );
+    // Otherwise every app starts behind the folder-trust dialog, which owns
+    // the keyboard — no test here is about that decision.
+    session.set_folder_trust(tcode_core::FolderTrust::Trusted);
     App::on_surface(
         Arc::new(agent),
         session,
@@ -153,5 +157,54 @@ impl App {
     /// Press a key, exactly as the terminal would deliver it.
     pub(super) fn press(&mut self, code: KeyCode) {
         self.on_term_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    pub(super) fn press_with(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.on_term_event(Event::Key(KeyEvent::new(code, modifiers)));
+    }
+
+    /// Let a key go. Terminals that report this at all report whatever
+    /// modifiers are *still* held, which is why the release carries its own
+    /// modifier set.
+    pub(super) fn release(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+        self.on_term_event(Event::Key(KeyEvent::new_with_kind(
+            code,
+            modifiers,
+            crossterm::event::KeyEventKind::Release,
+        )));
+    }
+
+    /// Replace the voice backend with one the test scripts. Returns the log of
+    /// commands the app sends it.
+    pub(super) fn fake_voice(
+        &mut self,
+        key: tcode_core::config::VoiceKey,
+    ) -> Arc<std::sync::Mutex<Vec<crate::voice::VoiceCmd>>> {
+        use crate::voice::{BackendFactory, Voice, VoiceBackend, VoiceCmd};
+
+        struct Fake(Arc<std::sync::Mutex<Vec<VoiceCmd>>>);
+        impl VoiceBackend for Fake {
+            fn send(&mut self, cmd: VoiceCmd) -> Result<(), String> {
+                self.0.lock().expect("lock").push(cmd);
+                Ok(())
+            }
+        }
+
+        let log: Arc<std::sync::Mutex<Vec<VoiceCmd>>> = Arc::default();
+        let handle = log.clone();
+        let factory: BackendFactory = Box::new(move |_, _| Ok(Box::new(Fake(handle.clone()))));
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let cfg = tcode_core::config::VoiceConfig {
+            key,
+            ..Default::default()
+        };
+        self.voice = Voice::new(cfg, tx, factory);
+        self.voice.set_end_detect(crate::voice::EndDetect::Release);
+        self.voice_rx = rx;
+        // Straight past the config file: `set_voice` would persist to the real
+        // state.toml on the machine running the tests.
+        self.voice.turn_on().expect("the fake backend starts");
+        self.on_voice_event(crate::voice::VoiceEvent::Ready);
+        log
     }
 }
