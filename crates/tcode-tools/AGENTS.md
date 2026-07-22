@@ -8,6 +8,7 @@
 - `ToolCtx` 的 `std::sync::Mutex`（freshness/blobs/memory）只在短临界区内持有：跨 `await` 持锁会让 future 非 Send，还会把整批写序列化在一个文件的磁盘延迟后面。
 - 图片输入只能经 `tcode-core::images` 归一化：文件 read、`view_image` 与剪贴板入口复用同一长边/大小预算，禁止各自编码或缩放。
 - 自愈式错误的匹配回退（`edit` 的 punct/ws 归一化）跑在失败路径上，仍要控复杂度：行 key 每行只算一次，别在滑窗里重算（分配级 O(n·m)）。
+- **shell/bash 的静默非零退出要自报名字解析**（`shell.rs::resolution_hint`）：两条管道都空 + 非零退出时，模型分不出"解释器是个假货"和"命令真失败"，只能换 shell 盲试——而 harness 知道答案。三条不可省：① 解析必须**在同一 interpreter 里**跑（Git Bash 先搜 `/usr/bin`，Rust 侧走 Windows PATH 会自信地报错误的 binary）；② 名字经**环境变量**传给探针，不拼进脚本——它们出自模型写的命令，插值等于给诊断路径开注入；③ **只在有异常项（解析不到 / 落在 `Microsoft/WindowsApps` 这种 app-execution alias 假货目录）时才吐整张表**，因为 `grep -q`、`test`、`git diff --quiet` 天生静默非零且在批次里极常见，无条件标注就是纯噪音。
 
 ## read / grep 的返回内容
 

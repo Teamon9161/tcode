@@ -181,9 +181,4 @@ loop {
 2. pdf支持？skill还是原生？需要识别图片吗？
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
-5. batch edit某些情形下行号显示有问题。一行里的替换，减一行加一行，但是左边行号全是1，实际也不是第一行。这是6changes across 1file
-6. 如果已经hover在sub-agent记录上,然后按ctrl不会出现下划线,必须先移开再移回来才有,然后ctrl+鼠标点击也无法跳转到sub-agent页面,只有agent-tree可以.
-7. 每次进入都要跳voice on 什么的提示，这个能不能后台静默启动就好了， 失败才显示
-8. 为啥只有read md才有渲染，感觉代码文件也可以都渲染吧。
-9. 新目录加载的AGENTS.md内容是以Note形式插入的？但是这个在resume的时候怎么全部显示了，很影响历史记录显示，因为这个不是用户的Note，只是harness的note
-10. Tool friction — bash：我用 Git Bash 运行 Python 脚本扫描会话 JSONL，工具只返回了 (no output) 和退出码 49，没有 stderr 或失败原因；这迫使我切换到 PowerShell 才能继续定位。若 Bash 工具能在这种启动/执行失败时保留底层诊断文本，将省掉一次替代探针。
+5. Tool friction — bash：我用 Git Bash 运行 Python 脚本扫描会话 JSONL，工具只返回了 (no output) 和退出码 49，没有 stderr 或失败原因；这迫使我切换到 PowerShell 才能继续定位。若 Bash 工具能在这种启动/执行失败时保留底层诊断文本，将省掉一次替代探针。

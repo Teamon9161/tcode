@@ -149,6 +149,148 @@ pub(crate) fn shell_command(
     }
 }
 
+/// Names to resolve are handed to the probe through the environment rather
+/// than spliced into its script: they come out of a model-written command, so
+/// interpolating them would make the diagnostic path a shell injection.
+const RESOLVE_ENV: &str = "TCODE_RESOLVE_NAMES";
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RESOLVED_NAMES: usize = 6;
+
+/// Emit `name<TAB>path` for every name that resolves to a file, `name<TAB>`
+/// for one that resolves to nothing, and stay silent about builtins, keywords
+/// and aliases — dropping those here is what spares the Rust side a keyword
+/// list to keep in sync with two shells.
+fn resolve_probe(kind: ShellKind) -> &'static str {
+    match kind {
+        ShellKind::PowerShell => {
+            "foreach ($n in ($env:TCODE_RESOLVE_NAMES -split \"`n\")) { \
+               if (-not $n) { continue } \
+               $c = Get-Command -Name $n -ErrorAction SilentlyContinue | Select-Object -First 1; \
+               if ($null -eq $c) { \"$n`t\" } \
+               elseif ($c.Source -match '[\\\\/]') { \"$n`t$($c.Source)\" } \
+             }"
+        }
+        ShellKind::Bash => {
+            "printf '%s\\n' \"$TCODE_RESOLVE_NAMES\" | while IFS= read -r n; do \
+               [ -z \"$n\" ] && continue; \
+               p=$(command -v -- \"$n\" 2>/dev/null); \
+               case \"$p\" in \
+                 */*) printf '%s\\t%s\\n' \"$n\" \"$p\" ;; \
+                 ?*) ;; \
+                 *) printf '%s\\t\\n' \"$n\" ;; \
+               esac; \
+             done"
+        }
+    }
+}
+
+/// The leading token of every simple command in a script. Splitting on the
+/// separators both shells share is deliberately crude: the probe resolves
+/// whatever this hands it and silently drops what is not a program, so a
+/// sloppy extra candidate costs one dropped line, never a wrong answer.
+fn invoked_names(script: &str) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for segment in script.split([';', '\n', '|', '&', '(', ')', '{', '}']) {
+        // A `FOO=1 cmd` prefix is still a call to `cmd`, so step over
+        // assignments rather than giving up on the segment.
+        let Some(token) = segment
+            .split_whitespace()
+            .find(|token| !token.contains('='))
+        else {
+            continue;
+        };
+        // Expansions, flags, redirections and quoted words are never the name
+        // of a program.
+        if token.starts_with(['$', '-', '<', '>', '\'', '"', '#', '!']) {
+            continue;
+        }
+        if names.iter().any(|known| known == token) {
+            continue;
+        }
+        names.push(token.to_string());
+        if names.len() == MAX_RESOLVED_NAMES {
+            break;
+        }
+    }
+    names
+}
+
+/// A PATH entry that resolves, spawns, and then exits nonzero having written
+/// nothing — a decoy rather than a program. Windows' app-execution aliases are
+/// why this predicate exists: that directory holds nothing but Store stubs, so
+/// the location *is* the test, and `python3` landing there is the whole reason
+/// a command can fail with no diagnostic at all.
+fn is_decoy(path: &str) -> bool {
+    path.replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/microsoft/windowsapps/")
+}
+
+/// Turn probe output into the note appended to a silent failure, or `None`
+/// when every name resolved to an ordinary program.
+///
+/// The gate matters as much as the content: `grep -q`, `test`, `git diff
+/// --quiet` and friends fail silently by design and are common in a batch, so
+/// annotating those would be pure noise. One anomalous name — missing, or a
+/// decoy — is what opens the disclosure, and then the whole table is shown,
+/// because when resolution is already suspect the neighbours are evidence too.
+fn resolution_note(listing: &str) -> Option<String> {
+    let rows: Vec<(&str, &str)> = listing
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(name, path)| (name.trim(), path.trim()))
+        .filter(|(name, _)| !name.is_empty())
+        .collect();
+    if !rows
+        .iter()
+        .any(|(_, path)| path.is_empty() || is_decoy(path))
+    {
+        return None;
+    }
+    let mut note = String::from(
+        "\nThe command wrote nothing to either stream, so this is where its names resolved:",
+    );
+    for (name, path) in &rows {
+        if path.is_empty() {
+            note.push_str(&format!("\n  {name} -> not found"));
+        } else if is_decoy(path) {
+            note.push_str(&format!(
+                "\n  {name} -> {path}  <- Windows app-execution alias, not a real program: it \
+                 exits nonzero without printing anything when the Store app is absent. Use an \
+                 installed interpreter (for Python that is usually `python`, not `python3`), or \
+                 turn the alias off in Settings > Apps > App execution aliases."
+            ));
+        } else {
+            note.push_str(&format!("\n  {name} -> {path}"));
+        }
+    }
+    Some(note)
+}
+
+/// A command that exits nonzero while writing nothing to either pipe leaves
+/// the model with no way to tell a broken interpreter from a real failure —
+/// its only move is to probe with another call, or to blame the shell and
+/// switch. The harness can answer that question, so it answers it: resolve the
+/// names in the same interpreter and cwd, because a Rust-side PATH walk would
+/// miss that Git Bash searches `/usr/bin` first and would confidently report
+/// the wrong binary.
+async fn resolution_hint(kind: ShellKind, script: &str, cwd: &std::path::Path) -> Option<String> {
+    let names = invoked_names(script);
+    if names.is_empty() {
+        return None;
+    }
+    let mut probe = shell_command(kind, resolve_probe(kind), cwd);
+    probe
+        .env(RESOLVE_ENV, names.join("\n"))
+        .stdin(Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(RESOLVE_TIMEOUT, probe.output())
+        .await
+        .ok()?
+        .ok()?;
+    resolution_note(&String::from_utf8_lossy(&output.stdout))
+}
+
 impl ShellTool {
     /// Detach a long-running command: the process is owned by a supervisor
     /// task, its output streams into the background registry, and the model
@@ -436,13 +578,19 @@ impl Tool for ShellTool {
                     out.push_str(err.trim_end());
                 }
                 let code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
-                if out.trim().is_empty() {
+                let silent = out.trim().is_empty();
+                if silent {
                     out = "(no output)".into();
                 }
                 if code != 0 {
                     out.push_str(&format!("\n(exit code {code})"));
                 } else {
                     out.push_str("\n(exit code 0)");
+                }
+                if silent && code != 0 {
+                    if let Some(hint) = resolution_hint(self.kind, script, &cwd).await {
+                        out.push_str(&hint);
+                    }
                 }
                 if output_mode == OutputMode::Final {
                     static NEXT_FINAL_LOG: std::sync::atomic::AtomicU64 =
@@ -501,6 +649,64 @@ mod tests {
         assert!(summary.contains("/scratch/full.log"));
         assert!(!summary.contains("line 0"));
         assert!(summary.contains(&format!("line {}", FINAL_TAIL_LINES + 2)));
+    }
+
+    #[test]
+    fn invoked_names_takes_the_head_of_each_simple_command() {
+        assert_eq!(
+            invoked_names("cd /tmp && FOO=1 python3 scan.py --root $HOME | grep -q x"),
+            ["cd", "python3", "grep"]
+        );
+        assert_eq!(invoked_names("  \n ; | "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn ordinary_silent_failures_get_no_note() {
+        // `grep -q` exiting 1 with no output is the command working, not a
+        // mystery; annotating it would put noise on a very common path.
+        assert!(resolution_note("grep\t/usr/bin/grep\ntest\t/usr/bin/test\n").is_none());
+    }
+
+    #[test]
+    fn one_anomaly_discloses_the_whole_table() {
+        let note = resolution_note(
+            "python3\tC:\\Users\\x\\AppData\\Local\\Microsoft\\WindowsApps\\python3.exe\n\
+             jq\t\n\
+             grep\t/usr/bin/grep\n",
+        )
+        .expect("decoy and missing name are both anomalies");
+        assert!(note.contains("app-execution alias"));
+        assert!(note.contains("jq -> not found"));
+        assert!(note.contains("grep -> /usr/bin/grep"));
+    }
+
+    #[tokio::test]
+    async fn silent_nonzero_exit_reports_where_the_names_resolved() {
+        if !bash_available() {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 10_000);
+        let output = ShellTool::new(ShellKind::Bash)
+            .run(
+                json!({ "command": "tcode-no-such-program >/dev/null 2>&1; exit 49" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("(exit code 49)"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output
+                .content
+                .contains("tcode-no-such-program -> not found"),
+            "{}",
+            output.content
+        );
     }
 
     #[test]
