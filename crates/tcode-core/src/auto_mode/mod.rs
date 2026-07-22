@@ -224,6 +224,7 @@ impl ClassifierTranscript {
                 // assistant output are intentionally absent.
                 Entry::ToolResults(_)
                 | Entry::Note(_)
+                | Entry::Instruction(_)
                 | Entry::Summary(_)
                 | Entry::IncompleteAssistant { .. }
                 | Entry::ImportedTool { .. } => {}

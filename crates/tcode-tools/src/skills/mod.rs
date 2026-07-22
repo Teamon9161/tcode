@@ -237,7 +237,7 @@ fn unescape_attr(s: &str) -> String {
 /// the filesystem version).
 pub fn discover_skills(cwd: &Path) -> Vec<Skill> {
     let mut roots = vec![cwd.join(".tcode/skills"), cwd.join(".claude/skills")];
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = tcode_core::home_dir() {
         roots.push(home.join(".tcode/skills"));
         roots.push(home.join(".claude/skills"));
     }
@@ -356,7 +356,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_name_error_lists_valid_names() {
         let tool = SkillTool::from_skills(vec![skill("alpha", "a"), skill("beta", "b")]);
-        let ctx = ToolCtx::new(std::env::temp_dir(), 4_000);
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 4_000);
         let out = tool
             .run(json!({"name": "gamma"}), &ctx, &CancellationToken::new())
             .await;
@@ -396,6 +396,7 @@ mod tests {
         }]);
         let project = tmp.path().join("project");
         let scratch = tmp.path().join("scratch/runs/session-a");
+        tcode_core::home::testing::temp_home();
         let ctx = ToolCtx::with_scratch_dir(project.clone(), 4_000, scratch.clone());
 
         let out = tool

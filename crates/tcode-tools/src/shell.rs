@@ -516,6 +516,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("tcode-shell-final-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
+        tcode_core::home::testing::temp_home();
         let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
         let (kind, command) = if cfg!(windows) {
             (

@@ -24,7 +24,7 @@ impl SlashCommand for ExportCommand {
         } else {
             std::path::PathBuf::from(args)
         };
-        let markdown = crate::export_markdown(ctx.session.ledger.entries(), "tcode conversation");
+        let markdown = crate::export_markdown(ctx.session.ledger.history(), "tcode conversation");
         match std::fs::write(&path, markdown) {
             Ok(()) => CommandOutcome::info(format!("transcript exported → {}", path.display())),
             Err(e) => CommandOutcome::error(format!("export failed: {e}")),

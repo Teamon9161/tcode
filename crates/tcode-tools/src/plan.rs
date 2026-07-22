@@ -63,7 +63,9 @@ impl Tool for ExitPlanTool {
 }
 
 /// The plan's title: the explicit `title`, else the first markdown heading,
-/// else a generic label.
+/// else the plan's opening line. It names the file the human later goes
+/// looking for, so falling back to a bare "Plan" — which is what a directory
+/// of `…-plan.md` files comes from — is the last resort, not the second.
 fn plan_title(input: &Value) -> String {
     if let Some(title) = input["title"].as_str() {
         let title = title.trim();
@@ -71,9 +73,9 @@ fn plan_title(input: &Value) -> String {
             return title.to_string();
         }
     }
-    input["plan"]
-        .as_str()
-        .and_then(first_heading)
+    let plan = input["plan"].as_str();
+    plan.and_then(first_heading)
+        .or_else(|| plan.and_then(first_line))
         .unwrap_or_else(|| "Plan".to_string())
 }
 
@@ -82,6 +84,15 @@ fn first_heading(plan: &str) -> Option<String> {
         let heading = line.trim_start().trim_start_matches('#').trim();
         (line.trim_start().starts_with('#') && !heading.is_empty()).then(|| heading.to_string())
     })
+}
+
+/// The first line with words in it, stripped of the list/quote markers a plan
+/// often opens with. `slug` does the length limiting.
+fn first_line(plan: &str) -> Option<String> {
+    plan.lines()
+        .map(|line| line.trim().trim_start_matches(['-', '*', '>', '#', ' ']))
+        .find(|line| !line.is_empty())
+        .map(str::to_owned)
 }
 
 /// Filesystem-safe short slug from a title.
@@ -142,7 +153,11 @@ mod tests {
             plan_title(&json!({"plan": "# Refactor ledger\n\nbody"})),
             "Refactor ledger"
         );
-        assert_eq!(plan_title(&json!({"plan": "no heading"})), "Plan");
+        assert_eq!(
+            plan_title(&json!({"plan": "- Rewrite the resume path\n- then test"})),
+            "Rewrite the resume path"
+        );
+        assert_eq!(plan_title(&json!({"plan": "   "})), "Plan");
     }
 
     #[test]

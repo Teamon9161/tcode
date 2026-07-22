@@ -9,7 +9,7 @@ use tcode_core::{PermissionMode, PermissionRules, Session, ToolCtx};
 
 fn ctx() -> Session {
     Session::new(
-        ToolCtx::new(std::env::temp_dir(), 4000),
+        ToolCtx::for_test(std::env::temp_dir(), 4000),
         PermissionMode::Default,
         PermissionRules::default(),
     )

@@ -1307,7 +1307,7 @@ mod tests {
     #[tokio::test]
     async fn binary_download_is_saved_verbatim() {
         let directory = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+        let ctx = ToolCtx::for_test(directory.path().to_path_buf(), 8_000);
         let path = save_binary_download(&ctx, 3, "example.com", "pdf", b"%PDF-test")
             .await
             .unwrap();
@@ -1455,7 +1455,7 @@ mod tests {
             effort: None,
         };
         let directory = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+        let ctx = ToolCtx::for_test(directory.path().to_path_buf(), 8_000);
 
         let answer = summarize_page(
             &model,
@@ -1487,7 +1487,7 @@ mod tests {
     #[tokio::test]
     async fn pattern_and_prompt_are_mutually_exclusive() {
         let directory = tempfile::tempdir().unwrap();
-        let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+        let ctx = ToolCtx::for_test(directory.path().to_path_buf(), 8_000);
         let out = WebFetchTool::new(trusted_read_hosts(Vec::new()))
             .run(
                 serde_json::json!({

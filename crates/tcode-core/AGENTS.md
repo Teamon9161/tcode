@@ -26,6 +26,11 @@
 - 持久上下文分两类：用户/项目指令由人维护，自动记忆由模型维护，**二者禁止混写**。
 - **任何被预算砍掉的入 context 内容都必须自释**：`memory.rs::append_sources` 的项目指令超 `INSTRUCTION_CAP` 时必须说明截了多少、去哪读原文——静默砍半的 `CLAUDE.md` 比不加载更坏，模型会照残本执行且不知道有残缺。（同一条规则在 tools 侧对应 read/grep 的标记自释。）
 
+## compact 与人类记录
+
+- **compact 缩的是模型上下文，不是用户的记录**：被替换掉的条目进 `Ledger::archived`，`entries()` / `as_messages()` 完全不变（索引不偏移，checkpoint 与 rewind 的 `ledger_len` 不受影响），transcript 与 `/export` 走 `history()` = archived + entries。别让前端自己攒一份平行历史——只有 ledger 知道 compact 拿走了什么，攒平行历史必然在 resume 上漂移（这正是原来 resume 后看不到 compact 之前对话的原因）。
+- archived 里的条目**没有合法的 `truncate_tail` 索引**：replay 不给它们打 entry tag，rewind 因此进不去被压缩的历史——那本来就是 compact 的语义。反过来 `truncate_tail(0)`（`/clear`）会连 archived 一起清空：summary 一走，它代表的那段历史就不再属于这个会话，否则"清掉的对话"会在 resume 时复活。
+
 ## 磁盘回收
 
 启动时 best-effort 扫一遍，失败即忽略。
@@ -37,3 +42,5 @@
 ## 测试
 
 核心机制（ledger、freshness、blobs、权限、hooks）用内联单元测试。测试永不调真实 API。
+
+**测试也不许碰开发者的真实 home。** `ToolCtx` 一被构造就建 scratch 目录并读写自动记忆，所以任何构造 `ToolCtx`/`MemoryManager`/`Config` 的测试必须先经 `tcode_core::home::testing::temp_home()`（用 `ToolCtx::for_test` 即自动生效）把 `TCODE_HOME` 指到临时目录。忘了这一步不会让测试失败——它只是每个临时 cwd 在 `~/.tcode/projects/` 里留一个目录，攒到几万个才被发现。同理，测试的判定不得依赖真实 home 里恰好装了什么（voice sidecar 曾因此在作者机器上过、在别人机器上触发下载）。

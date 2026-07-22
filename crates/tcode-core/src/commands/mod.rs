@@ -220,7 +220,7 @@ fn split_line(line: &str) -> Option<(&str, &str)> {
 pub(crate) fn test_ctx_parts() -> (Session, OpeningContextFn, EnvironmentFn) {
     use crate::{EnvironmentSnapshot, PermissionMode, PermissionRules, StartupContext, ToolCtx};
     let session = Session::new(
-        ToolCtx::new(std::env::temp_dir(), 1_000),
+        ToolCtx::for_test(std::env::temp_dir(), 1_000),
         PermissionMode::Default,
         PermissionRules::default(),
     );

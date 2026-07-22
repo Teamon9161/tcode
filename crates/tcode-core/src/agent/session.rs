@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use crate::config::FolderTrust;
 use crate::cwd_scope::{CwdScoped, CwdScopes};
 use crate::environment::{EnvironmentSnapshot, StartupContext};
-use crate::ledger::Ledger;
+use crate::ledger::{Entry, Ledger};
 use crate::permission::{PermissionMode, PermissionRules};
 use crate::template::PromptVariables;
 use crate::tool::ToolCtx;
@@ -151,8 +151,8 @@ pub struct CwdChange {
     /// The session has no model-visible history, so its opening system context
     /// must be regenerated for the new cwd instead of appending a note.
     pub refresh_opening_context: bool,
-    /// Memory discovered for the target directory. The command combines this
-    /// with the structured environment diff into one append-only Note.
+    /// Memory discovered for the target directory. It is delivered as a
+    /// model-visible instruction entry rather than transcript history.
     pub memory_note: Option<String>,
     /// What the re-derived `CwdScoped` state has to say about the new
     /// directory. Shown to the user; never sent to the model, since it
@@ -221,10 +221,10 @@ pub struct Session {
     /// The last environment explicitly represented in the system prefix or a
     /// model-facing environment Note.
     delivered_environment: Option<EnvironmentSnapshot>,
-    /// One coalesced environment/instruction explanation awaiting a genuine
-    /// user delivery point. Repeated `/cd` replaces it rather than growing the
-    /// append-only model history with unobserved intermediate directories.
-    pending_environment_extra: Option<String>,
+    /// One coalesced directory instruction awaiting a genuine user delivery
+    /// point. Repeated `/cd` replaces it rather than growing append-only
+    /// model history with unobserved intermediate directories.
+    pending_environment_instruction: Option<String>,
     pending_environment_delivery: bool,
     /// One coalesced `/memory on|off` explanation awaiting delivery. The local
     /// setting changes immediately; only its final state reaches the model.
@@ -285,7 +285,7 @@ impl Session {
             folder_trust_known: false,
             environment: None,
             delivered_environment: None,
-            pending_environment_extra: None,
+            pending_environment_instruction: None,
             pending_environment_delivery: false,
             pending_memory_note: None,
             prompt_variables,
@@ -518,7 +518,7 @@ impl Session {
             // the Note, so its final stored snapshot is model-known.
             self.environment.clone().or(Some(startup_environment))
         });
-        self.pending_environment_extra = None;
+        self.pending_environment_instruction = None;
         self.pending_environment_delivery = false;
         self.pending_memory_note = None;
     }
@@ -552,13 +552,13 @@ impl Session {
     /// legal append boundary. The auxiliary snapshot survives a crash/resume;
     /// repeated changes replace the explanation for unobserved intermediate
     /// directories.
-    pub fn sync_environment(&mut self, current: EnvironmentSnapshot, extra_note: Option<String>) {
+    pub fn sync_environment(&mut self, current: EnvironmentSnapshot, instruction: Option<String>) {
         self.ledger
             .record_aux(&crate::store::LogEvent::EnvironmentObserved {
                 environment: current.clone(),
             });
         self.environment = Some(current);
-        self.pending_environment_extra = extra_note;
+        self.pending_environment_instruction = instruction;
         self.pending_environment_delivery = true;
     }
 
@@ -571,19 +571,24 @@ impl Session {
 
     /// Consume all coalescible context whose final state has become meaningful
     /// to the model at a user delivery point.
-    pub fn take_deferred_context_notes(&mut self) -> Vec<String> {
-        let mut notes = self.pending_memory_note.take().into_iter().collect();
+    pub fn take_deferred_context_entries(&mut self) -> Vec<Entry> {
+        let mut entries = self
+            .pending_memory_note
+            .take()
+            .map(Entry::Note)
+            .into_iter()
+            .collect::<Vec<_>>();
         if !std::mem::take(&mut self.pending_environment_delivery) {
-            return notes;
+            return entries;
         }
         let Some(current) = self.environment.clone() else {
-            return notes;
+            return entries;
         };
         let diff = self
             .delivered_environment
             .as_ref()
             .map(|previous| previous.diff_lines(&current));
-        let mut note = match diff {
+        let note = match diff {
             Some(lines) if !lines.is_empty() => format!(
                 "Runtime environment changed since the model last received an environment update:\n{}\n\nFuture relative tool paths, default shell cwd, grep/glob defaults, and cwd-relative operations resolve against {}. The startup project map is historical; inspect files or Git status when current detail matters.",
                 lines
@@ -599,21 +604,18 @@ impl Session {
             ),
             _ => String::new(),
         };
-        if let Some(extra) = self.pending_environment_extra.take() {
-            if !note.is_empty() {
-                note.push_str("\n\n");
-            }
-            note.push_str(&extra);
-        }
         if !note.is_empty() {
             self.delivered_environment = Some(current.clone());
             self.ledger
                 .record_aux(&crate::store::LogEvent::EnvironmentDelivered {
                     environment: current,
                 });
-            notes.push(note);
+            entries.push(Entry::Note(note));
         }
-        notes
+        if let Some(instruction) = self.pending_environment_instruction.take() {
+            entries.push(Entry::Instruction(instruction));
+        }
+        entries
     }
 
     /// Change the conversation working directory. Before any model-visible
@@ -810,7 +812,7 @@ mod tests {
     fn three_auto_mode_classifier_failures_pause_to_default() {
         let root = std::env::temp_dir();
         let mut session = Session::new(
-            ToolCtx::new(root, 1_000),
+            ToolCtx::for_test(root, 1_000),
             PermissionMode::Auto,
             PermissionRules::default(),
         );
@@ -828,7 +830,7 @@ mod tests {
     fn three_auto_mode_denials_pause_to_default() {
         let root = std::env::temp_dir();
         let mut session = Session::new(
-            ToolCtx::new(root, 1_000),
+            ToolCtx::for_test(root, 1_000),
             PermissionMode::Auto,
             PermissionRules::default(),
         );
@@ -843,7 +845,7 @@ mod tests {
 
     fn plan_session() -> Session {
         Session::new(
-            ToolCtx::new(std::env::temp_dir(), 1_000),
+            ToolCtx::for_test(std::env::temp_dir(), 1_000),
             PermissionMode::Default,
             PermissionRules::default(),
         )
@@ -906,7 +908,7 @@ mod tests {
     #[test]
     fn a_session_started_in_plan_mode_injects_the_opening_note() {
         let mut session = Session::new(
-            ToolCtx::new(std::env::temp_dir(), 1_000),
+            ToolCtx::for_test(std::env::temp_dir(), 1_000),
             PermissionMode::Plan,
             PermissionRules::default(),
         );
@@ -940,7 +942,7 @@ mod tests {
     fn session_replacement_changes_cache_scope_before_refreshing_variables() {
         let root = std::env::temp_dir();
         let mut session = Session::new(
-            ToolCtx::new(root, 1_000),
+            ToolCtx::for_test(root, 1_000),
             PermissionMode::Auto,
             PermissionRules::default(),
         );
@@ -979,7 +981,7 @@ mod tests {
         let child = canonicalized(root.join("child"));
 
         let mut session = Session::new(
-            ToolCtx::new(root.clone(), 1_000),
+            ToolCtx::for_test(root.clone(), 1_000),
             PermissionMode::Default,
             PermissionRules::default(),
         );
@@ -1008,7 +1010,7 @@ mod tests {
         let child = canonicalized(root.join("child"));
 
         let mut session = Session::new(
-            ToolCtx::new(root.clone(), 1_000),
+            ToolCtx::for_test(root.clone(), 1_000),
             PermissionMode::Default,
             PermissionRules::default(),
         );
@@ -1068,10 +1070,10 @@ mod tests {
             1,
             "environment is metadata until delivery"
         );
-        let notes = session.take_deferred_context_notes();
+        let entries = session.take_deferred_context_entries();
         assert!(matches!(
-            notes.as_slice(),
-            [text]
+            entries.as_slice(),
+            [Entry::Note(text)]
                 if text.contains("Runtime environment changed")
                     && text.contains("Future relative tool paths")
         ));
@@ -1087,7 +1089,7 @@ mod tests {
             },
             None,
         );
-        assert!(session.take_deferred_context_notes().is_empty());
+        assert!(session.take_deferred_context_entries().is_empty());
         assert_eq!(session.ledger.len(), entries_after_sync);
 
         let entries = session.ledger.len();

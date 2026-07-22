@@ -278,6 +278,10 @@ pub(crate) struct Voice {
     /// how many to take back if it turns out to be a hold. Every press counts,
     /// not just the first: two spaces typed in a row must leave two spaces.
     provisional_chars: u32,
+    /// The backend comes from an injected factory rather than the downloaded
+    /// sidecar, so `needs_install` has nothing to answer for. Only tests set
+    /// it; production always resolves a real sidecar.
+    backend_is_injected: bool,
 }
 
 impl Voice {
@@ -298,6 +302,7 @@ impl Voice {
             silent_takes: 0,
             provisional: false,
             provisional_chars: 0,
+            backend_is_injected: false,
         }
     }
 
@@ -422,7 +427,18 @@ impl Voice {
     /// Is there no sidecar on this machine yet? Asked before turning on, so
     /// the first use fetches one instead of reporting its absence.
     pub(crate) fn needs_install(&self) -> bool {
-        sidecar::resolve(&self.cfg).is_err() && sidecar::release_asset().is_some()
+        !self.backend_is_injected
+            && sidecar::resolve(&self.cfg).is_err()
+            && sidecar::release_asset().is_some()
+    }
+
+    /// A test's factory hands out a backend of its own, so whether this
+    /// machine happens to have a downloaded sidecar must not decide which
+    /// branch `start_voice` takes — that is how a suite passes on the author's
+    /// laptop and installs a binary on everyone else's.
+    #[cfg(test)]
+    pub(crate) fn use_injected_backend(&mut self) {
+        self.backend_is_injected = true;
     }
 
     /// Show the download before it starts, so `/voice on` has a visible effect
@@ -755,11 +771,12 @@ impl Voice {
                 rest: format!(" downloading the speech backend {pct}%"),
                 tone: HintTone::Busy,
             }),
-            VoiceState::Warming(None) => Some(VoiceHint {
-                lead: "  ◌ voice".into(),
-                rest: " starting up…".into(),
-                tone: HintTone::Busy,
-            }),
+            // Booting the backend asks nothing of the user and is over in a
+            // moment, so it takes the status line hostage for no reason —
+            // every session would open on it. A key pressed too early already
+            // answers itself with "voice is still starting up"; that is where
+            // the wait becomes worth mentioning.
+            VoiceState::Warming(None) => None,
             VoiceState::Warming(Some(pct)) => Some(VoiceHint {
                 lead: "  ◌ voice".into(),
                 rest: format!(" downloading model {pct}% · esc cancels"),
@@ -937,11 +954,10 @@ mod tests {
         voice.turn_on().expect("the fake backend starts");
 
         assert_eq!(voice.state, VoiceState::Warming(None));
-        let hint = voice.hint().expect("starting up is worth showing");
         assert!(
-            !hint.rest.contains("downloading"),
-            "the hint row leaves the download behind: {}",
-            hint.rest
+            voice.hint().is_none(),
+            "the hint row leaves the download behind: {:?}",
+            voice.hint().map(|h| h.rest)
         );
     }
 

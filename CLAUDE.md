@@ -68,5 +68,7 @@ Workspace 四个 crate（core / providers / importers / tools / tui）+ 根 bina
 - `[ui] suggest_next`：回合结束时猜下一句 prompt。它是每回合一次额外请求，所以必须能关。
 - **项目指令分层加载**：从项目根到目标目录逐层，每层按 `.tcode/AGENTS.md` > `AGENTS.md` > `CLAUDE.md` 取第一个；访问其他子目录或显式标记的外部项目时按工具目标路径懒加载（`memory.rs::discover_for_paths`，由 `preflight_memory` 在每个工具批次前触发）。**本仓库自己就用这个机制**：根文件只留通用规则，crate 专属规则放 `crates/*/AGENTS.md`。新增一类规则时先问它属于哪一层，别默认往根文件堆。
 - 自动记忆位于 `~/.tcode/projects/<project-id>/memory/`，`MEMORY.md` 只做精简索引。
-- 会话/checkpoint/blob/scratch：`~/.tcode/projects/<cwd-hash>/{sessions,checkpoints,blobs,scratchpad}/`。溢出输出与后台日志落 `scratchpad/tool-output/`。
+- 会话/checkpoint/blob/scratch：`~/.tcode/projects/<project-id>/{sessions,checkpoints,blobs,scratchpad}/`。溢出输出与后台日志落 `scratchpad/tool-output/`。
+- `<project-id>` 是路径本身（`c:\code\rust\tcode` → `c--code-rust-tcode`，非字母数字折成 `-`，超 80 字符留尾部），由 `store::project_id` 唯一产出；会话按 cwd 取键、自动记忆按项目根取键（worktree/子目录共享记忆），但命名与旧 hash 目录的迁移只有 `store::project_dir_in` 一处。
+- **所有 tcode 自己的状态路径只经 `tcode_core::home_dir()` 解析**（`TCODE_HOME` 优先，否则用户 home）：config、agents/skills、`~/.tcode/AGENTS.md`、`projects/<id>/*` 全在内。新写"某处放到 `~/.tcode/…`"的代码不得直接调 `dirs::home_dir()`。例外是别人家的目录（`~/.codex`、`~/.claude`）和 voice 模型缓存。测试必须在构造 `ToolCtx`/`MemoryManager`/`Config` **之前**调 `tcode_core::home::testing::temp_home()`（`ToolCtx::for_test` 已内含），否则每个临时 cwd 都会在开发者真实 home 里留下一个 project 目录。
 - API key 经 `api_key_env` 指环境变量，不落盘。

@@ -541,7 +541,7 @@ impl SessionView {
                     lines.extend(quote_lines(text));
                     lines.push(Line::default());
                 }
-                Entry::ImportedTool { .. } => {}
+                Entry::Instruction(_) | Entry::ImportedTool { .. } => {}
             }
         }
         self.bake(lines);
@@ -1133,6 +1133,21 @@ mod tests {
             panic!("tool diagnostics render as literal lines");
         };
         assert_eq!(lines[0].spans[1].style, Style::default().fg(theme::ERROR));
+    }
+
+    #[test]
+    fn replay_keeps_dynamic_instructions_out_of_the_transcript() {
+        let registry = RenderRegistry::from_tools(&tcode_tools::builtin_tools(Path::new(".")));
+        let mut markdown = markdown::Renderer::default();
+        let mut view = SessionView::new(100);
+        let mut bake = ctx(&registry, &mut markdown);
+        view.replay_ledger(
+            &[Entry::Instruction("private project rule".into())],
+            &[],
+            &mut bake,
+        );
+
+        assert!(!rendered_text(&mut view, 100, 10).contains("private project rule"));
     }
 
     #[test]

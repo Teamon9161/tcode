@@ -163,7 +163,7 @@ fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> Ap
         auto_compact_percent: 85,
     };
     let mut session = Session::new(
-        ToolCtx::new(cwd.to_path_buf(), 2000),
+        ToolCtx::for_test(cwd.to_path_buf(), 2000),
         PermissionMode::Default,
         PermissionRules::default(),
     );
@@ -231,6 +231,7 @@ impl App {
             ..Default::default()
         };
         self.voice = Voice::new(cfg, tx, factory);
+        self.voice.use_injected_backend();
         self.voice.set_end_detect(crate::voice::EndDetect::Release);
         self.voice_rx = rx;
         // Straight past the config file: `set_voice` would persist to the real

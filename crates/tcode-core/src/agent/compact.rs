@@ -97,7 +97,7 @@ impl Agent {
             .expect("memory lock")
             .post_compact_note();
         if let Some(note) = memory_note {
-            session.ledger.append(Entry::Note(note));
+            session.ledger.append(Entry::Instruction(note));
         }
         session.turn_usage.input_tokens += usage.input_tokens;
         session.turn_usage.output_tokens += usage.output_tokens;

@@ -348,7 +348,7 @@ impl Agent {
                         .sum()
                 }
                 // These variants grow XML-like wrappers in Ledger::as_messages.
-                Entry::Note(text) => approx_tokens(text) as u64 + 12,
+                Entry::Note(text) | Entry::Instruction(text) => approx_tokens(text) as u64 + 12,
                 Entry::UserNote { about, text, .. } => {
                     (approx_tokens(about) + approx_tokens(text)) as u64 + 24
                 }
@@ -870,7 +870,7 @@ impl Agent {
             .as_ref()
             .map(|update| self.affected_mutations(session, calls, update))
             .unwrap_or_default();
-        let memory_note = memory_update.map(|update| update.note);
+        let memory_note = memory_update.map(|update| Entry::Instruction(update.note));
         // A newly discovered instruction must stop mutations it governs, but
         // it must not discard unrelated work or read-only reconnaissance from
         // the same model batch. Blocked batches use the ordinary per-call path
@@ -912,7 +912,7 @@ impl Agent {
                 .await;
         }
         let mut results: Vec<ContentBlock> = Vec::new();
-        let mut notes: Vec<Entry> = memory_note.into_iter().map(Entry::Note).collect();
+        let mut notes: Vec<Entry> = memory_note.into_iter().collect();
         let mut executed: Vec<String> = Vec::new();
         let mut declined = false;
         let mut awaiting_user_input = false;
@@ -1192,11 +1192,11 @@ impl Agent {
         calls: &[(String, String, Value)],
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
-        memory_note: Option<String>,
+        memory_note: Option<Entry>,
     ) -> Result<ToolsOutcome, AgentError> {
         let mut prepared = Vec::new();
         let mut results = Vec::new();
-        let mut notes: Vec<String> = memory_note.into_iter().collect();
+        let mut notes: Vec<Entry> = memory_note.into_iter().collect();
         for (id, name, input) in calls {
             let Some(tool) = self.tool(name).cloned() else {
                 results.push(tool_result(id, &format!("Unknown tool '{name}'"), true));
@@ -1212,7 +1212,7 @@ impl Agent {
                     &session.tool_ctx.cwd,
                 )
                 .await;
-            notes.extend(pre.notes);
+            notes.extend(pre.notes.into_iter().map(Entry::Note));
             if let Some(reason) = pre.block {
                 results.push(tool_result(
                     id,
@@ -1283,7 +1283,7 @@ impl Agent {
         }
         session.ledger.append(Entry::ToolResults(results));
         for note in notes {
-            session.ledger.append(Entry::Note(note));
+            session.ledger.append(note);
         }
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
@@ -1893,11 +1893,11 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
         approver: &dyn Approver,
         cancel: &CancellationToken,
-        memory_note: Option<String>,
+        memory_note: Option<Entry>,
     ) -> Result<ToolsOutcome, AgentError> {
         // Pre-flight: gather tools, hooks, and build the batch label.
         let mut prepared: Vec<(String, String, Value, Arc<dyn Tool>)> = Vec::new();
-        let mut notes: Vec<Entry> = memory_note.into_iter().map(Entry::Note).collect();
+        let mut notes: Vec<Entry> = memory_note.into_iter().collect();
         for (id, name, input) in calls {
             let Some(tool) = self.tool(name).cloned() else {
                 return Ok(ToolsOutcome {
@@ -2257,8 +2257,8 @@ impl Agent {
     /// Append coalescible context only after a prompt or approval reaches a
     /// legal ledger boundary. Bare UI setting changes never call this path.
     fn deliver_deferred_context(&self, session: &mut Session) {
-        for note in session.take_deferred_context_notes() {
-            session.ledger.append(Entry::Note(note));
+        for entry in session.take_deferred_context_entries() {
+            session.ledger.append(entry);
         }
         // Every caller marks a real prompt, queued prompt, or approval before
         // reaching this boundary; bare UI setting changes never call this path.

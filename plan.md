@@ -44,6 +44,7 @@ impl Ledger {
 - Anthropic：`cache_control` 断点——system+tools 后固定一个，消息尾部滑动一个，控制在 4 断点预算内。
 - OpenAI 兼容：隐式前缀缓存，append-only 天然命中。
 - Compact 仅显式触发（`/compact` 或 token 逼近上限），子请求生成摘要。
+- **Compact 移出模型上下文的条目进 `archived`，不销毁**：`entries()` / `as_messages()` 语义一字不变（模型只见 Summary），但 transcript 与 `/export` 走 `history()` = archived + entries，resume 后仍看得到压缩前的对话。archived 没有合法 `truncate_tail` 索引（rewind 进不去被压缩的历史）；`truncate_tail(0)`（`/clear`）连它一起清空。
 
 ### 2. Stream Watchdog + 永远知情的状态行
 
@@ -164,7 +165,8 @@ loop {
 - `[agents.<kind>]`（`explore`/`plan`/`general`/`auto`/`suggest`/`vision`/`fetch`）：给 sub-agent 与辅助角色钉模型，`profile`/`model`/`effort` 三个可选字段，未写的继承父模型选择；也可写成一个字符串（`"off"` / `"inherit"` / 模型名）。`fetch` 是唯一"未钉即关"的角色（web_fetch 返回原文而非回退主模型）。Codex CLI 凭证与动态模型缓存由 `tcode-providers` 在加载配置后补全，core 只解析已规范化的 profile 模型。
 - **`[presets.<name>]` 是"整套模型编排"，与 `[profiles.*]`（怎么连到 provider）正交**：主模型 + 每个角色跑什么，整体切换。三层解析次序 `[agents.*]` → 活跃 preset → `[tcode_state]` 的临时 pick，`Config::apply_active_preset` 是唯一汇合点。**切 preset 会清空 `[tcode_state]` 里的临时 pick 与主模型**——不清就永远没有一个 preset 能完整描述"现在跑的是什么"；想留住微调就 `/model save <name>` 存成新 preset（这也是程序唯一一处写 `[tcode_state]` 之外的表，只增/替换那一张）。
 - 持久上下文两类禁止混写：**人维护指令**（项目根→cwd 分层，每层 `.tcode/AGENTS.md` > `AGENTS.md` > `CLAUDE.md` 取第一个）；**模型维护自动记忆**（`~/.tcode/projects/<id>/memory/`，`MEMORY.md` 只做精简索引）。
-- 会话/checkpoint/blob/scratch：`~/.tcode/projects/<cwd-hash>/{sessions,checkpoints,blobs,scratchpad}/`。scratch 暴露给模型（project_map 的 `scratch:` 行 + 系统 prompt 引导），溢出输出与后台日志落 `scratchpad/tool-output/`，7 天清理。
+- 会话/checkpoint/blob/scratch：`~/.tcode/projects/<project-id>/{sessions,checkpoints,blobs,scratchpad}/`。scratch 暴露给模型（project_map 的 `scratch:` 行 + 系统 prompt 引导），溢出输出与后台日志落 `scratchpad/tool-output/`，7 天清理。
+- **`<project-id>` 用路径本身而非 hash**（`c:\code\rust\tcode` → `c--code-rust-tcode`）：这个目录名是人去翻会话日志、存档 plan、项目记忆时唯一的线索，不可读的 hash 让每个目录都无法辨认。折叠分隔符不是单射（`C:\code\rust-tcode` 会撞上），代价是两个项目共用一份状态，接受。旧 hash 目录在 `store::project_dir_in` 里懒迁移（rename，目标已存在则并入），迁完即可删那段代码。
 - API key 经 `api_key_env` 指环境变量，不落盘。
 
 ## 验证方式
@@ -180,7 +182,8 @@ loop {
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. batch edit某些情形下行号显示有问题。一行里的替换，减一行加一行，但是左边行号全是1，实际也不是第一行。这是6changes across 1file
-6. ctrl+d 退出会打印乱码在终端, 35;32;42M35;32;41M35;33;41M35;33;41M35;34;40M35;34;40M35;35;40M35;35;40M35;35;39M35;36;39M35;36;39M35;36;40M35;37;40M35;37;41M35;37;41M35;37;42M6c, 有时候只出现6c
-之前应该修复过,为啥又这样了.
-7. find和search支持batch 并行吗
-8. 如果已经hover在sub-agent记录上,然后按ctrl不会出现下划线,必须先移开再移回来才有,然后ctrl+鼠标点击也无法跳转到sub-agent页面,只有agent-tree可以.
+6. 如果已经hover在sub-agent记录上,然后按ctrl不会出现下划线,必须先移开再移回来才有,然后ctrl+鼠标点击也无法跳转到sub-agent页面,只有agent-tree可以.
+7. 每次进入都要跳voice on 什么的提示，这个能不能后台静默启动就好了， 失败才显示
+8. 为啥只有read md才有渲染，感觉代码文件也可以都渲染吧。
+9. 新目录加载的AGENTS.md内容是以Note形式插入的？但是这个在resume的时候怎么全部显示了，很影响历史记录显示，因为这个不是用户的Note，只是harness的note
+10. Tool friction — bash：我用 Git Bash 运行 Python 脚本扫描会话 JSONL，工具只返回了 (no output) 和退出码 49，没有 stderr 或失败原因；这迫使我切换到 PowerShell 才能继续定位。若 Bash 工具能在这种启动/执行失败时保留底层诊断文本，将省掉一次替代探针。

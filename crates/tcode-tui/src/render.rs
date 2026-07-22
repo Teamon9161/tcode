@@ -807,13 +807,19 @@ mod tests {
         let plain = json!({ "path": "/work/a.rs" });
         assert_eq!(renderer.batch_item("read", &plain, Some(cwd)), "a.rs");
         let syntax = renderer
-            .syntax_detail(&plain, "     1\tlet answer = 42;\n")
+            .syntax_detail(&plain, "let answer = 42;\n")
             .expect("read source has syntax detail");
-        assert!(syntax[0]
+        let rendered: String = syntax[0]
             .spans
             .iter()
-            .skip(3)
-            .any(|span| span.style.fg.is_some()));
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(rendered.ends_with("let answer = 42;"));
+        assert!(
+            syntax[0].spans[1].content.trim().is_empty(),
+            "raw read output does not invent a line number"
+        );
+        assert!(syntax[0].spans.iter().any(|span| span.style.fg.is_some()));
         let ranged = json!({ "path": "/work/a.rs", "offset": 10, "limit": 5 });
         assert_eq!(
             renderer.batch_item("read", &ranged, Some(cwd)),

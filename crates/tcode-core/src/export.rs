@@ -6,7 +6,10 @@ use crate::agent::summarize_call;
 use crate::ledger::Entry;
 use crate::types::ContentBlock;
 
-pub fn export_markdown(entries: &[Entry], title: &str) -> String {
+/// Takes an iterator rather than a slice so callers can export the whole
+/// human-visible history (`Ledger::history`), which spans two slices once a
+/// compaction has moved part of it out of the model's context.
+pub fn export_markdown<'a>(entries: impl IntoIterator<Item = &'a Entry>, title: &str) -> String {
     let mut out = format!("# {title}\n");
     for entry in entries {
         match entry {
@@ -50,6 +53,7 @@ pub fn export_markdown(entries: &[Entry], title: &str) -> String {
                 }
             }
             Entry::Note(text) => out.push_str(&format!("\n> ⚑ {}\n", text.replace('\n', "\n> "))),
+            Entry::Instruction(_) => {}
             Entry::UserNote { text, .. } => {
                 out.push_str(&format!("\n> ⚑ Note: {}\n", text.replace('\n', "\n> ")))
             }

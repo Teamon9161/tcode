@@ -23,7 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    Event, EventStream, KeyCode, KeyEvent, KeyModifiers, ModifierKeyCode, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::StreamExt;
 use ratatui::layout::Rect;
@@ -333,6 +334,10 @@ pub struct App {
     /// transcripts only ever reach the editor.
     voice: Voice,
     voice_rx: mpsc::Receiver<VoiceEvent>,
+    /// Whether the in-flight backend installation should announce the eventual
+    /// successful activation. Automatic startup stays silent; `/voice on`
+    /// remains an explicit acknowledgement.
+    voice_install_announce: bool,
     /// `/voice keys`: echo every key event to the transcript. The only way to
     /// tell "tcode ignores this key" from "this key never reached tcode".
     voice_probe: bool,
@@ -364,6 +369,10 @@ pub struct App {
     /// Tree row currently under the pointer; rendered with the shared hover
     /// background so its click behavior is discoverable.
     live_panel_hover: Option<PanelTarget>,
+    /// Most recent pointer position and its Ctrl state. A terminal may omit
+    /// Ctrl from a button event even after reporting it on the preceding move.
+    pointer: Option<(u16, u16)>,
+    pointer_ctrl: bool,
     /// Which clickable status value the pointer currently rests over.
     status_hover: Option<StatusHover>,
     input_mouse_active: bool,
@@ -562,6 +571,7 @@ impl App {
             suggest_rx,
             voice,
             voice_rx,
+            voice_install_announce: true,
             voice_probe: false,
             voice_install,
             attachments: Vec::new(),
@@ -573,6 +583,8 @@ impl App {
             jump_to_bottom_hover: false,
             live_panel_hitbox: None,
             live_panel_hover: None,
+            pointer: None,
+            pointer_ctrl: false,
             status_hover: None,
             input_mouse_active: false,
             input_dragged: false,
@@ -620,7 +632,7 @@ impl App {
         self.bake_transcript();
         self.refresh_reference_index();
         if self.voice.wants_on() {
-            self.set_voice(true);
+            self.start_voice(false);
         }
         let mut term_events = EventStream::new();
         let mut tick = tokio::time::interval(Duration::from_millis(250));
@@ -706,6 +718,7 @@ impl App {
                     self.on_external_import_done(done);
                 }
                 _ = tick.tick() => {
+                    self.sync_pointer_ctrl();
                     if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
                         self.spinner = (self.spinner + 1) % SPINNER.len();
                     }
@@ -1211,6 +1224,56 @@ impl App {
         true
     }
 
+    fn update_pointer_ctrl_from_key(&mut self, key: KeyEvent) -> bool {
+        if !matches!(
+            key.code,
+            KeyCode::Modifier(ModifierKeyCode::LeftControl | ModifierKeyCode::RightControl)
+        ) {
+            return false;
+        }
+        self.pointer_ctrl = key.kind != crossterm::event::KeyEventKind::Release;
+        self.refresh_trace_hover();
+        true
+    }
+
+    fn sync_pointer_ctrl(&mut self) {
+        let Some(ctrl) = system_control_pressed() else {
+            return;
+        };
+        if ctrl != self.pointer_ctrl {
+            self.pointer_ctrl = ctrl;
+            self.refresh_trace_hover();
+        }
+    }
+
+    fn refresh_trace_hover(&mut self) {
+        let Some((column, row)) = self.pointer else {
+            return;
+        };
+        let ctrl = self.pointer_ctrl;
+        self.active_transcript_mut().mouse_moved(column, row, ctrl);
+    }
+
+    fn ctrl_for_pointer(&self, modifiers: KeyModifiers) -> bool {
+        modifiers.contains(KeyModifiers::CONTROL) || self.pointer_ctrl
+    }
+
+    fn on_trace_link_mouse_down(&mut self, mouse: MouseEvent) -> bool {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left))
+            || !self.ctrl_for_pointer(mouse.modifiers)
+        {
+            return false;
+        }
+        let Some(run) = self
+            .active_transcript()
+            .task_run_at(mouse.column, mouse.row)
+        else {
+            return false;
+        };
+        self.open_view(ViewId::TaskRun(run));
+        true
+    }
+
     fn on_term_event(&mut self, ev: Event) {
         // Before any routing, and before anything can swallow the event:
         // the probe reports what arrived, not what we did with it.
@@ -1221,6 +1284,7 @@ impl App {
             }
         }
         match ev {
+            Event::Key(key) if self.update_pointer_ctrl_from_key(key) => {}
             // Releases are reported on Windows always, and elsewhere only once
             // voice asks for them (`crate::set_key_release_reporting`). Nothing
             // but push-to-talk has any use for them.
@@ -1242,10 +1306,30 @@ impl App {
                 }
             }
             Event::Mouse(mouse) => {
+                self.pointer = Some((mouse.column, mouse.row));
+                if matches!(mouse.kind, MouseEventKind::Moved) {
+                    self.pointer_ctrl = mouse.modifiers.contains(KeyModifiers::CONTROL);
+                } else if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                    self.pointer_ctrl = true;
+                }
+                // The Windows console does not emit standalone modifier keys.
+                // Poll its state while the pointer moves (and on the regular
+                // refresh tick) so Ctrl pressed over a stationary task card is
+                // reflected before the next paint. Do not replace the last
+                // known state on the click itself: some terminals omit Ctrl
+                // from that event.
+                if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+                    self.sync_pointer_ctrl();
+                }
                 // A modal owns mouse input too. Without this guard a plan drag
                 // selects and copies the hidden transcript instead of
                 // producing a plan comment.
                 if self.on_overlay_mouse(mouse) {
+                    return;
+                }
+                // A task card is a transcript link, not a bottom-panel or input
+                // control. Resolve Ctrl+click before those overlapping hitboxes.
+                if self.on_trace_link_mouse_down(mouse) {
                     return;
                 }
                 if matches!(mouse.kind, MouseEventKind::Moved)
@@ -1272,11 +1356,11 @@ impl App {
                     return;
                 }
                 match mouse.kind {
-                    MouseEventKind::Moved => self.active_transcript_mut().mouse_moved(
-                        mouse.column,
-                        mouse.row,
-                        mouse.modifiers.contains(KeyModifiers::CONTROL),
-                    ),
+                    MouseEventKind::Moved => {
+                        let ctrl = self.pointer_ctrl;
+                        self.active_transcript_mut()
+                            .mouse_moved(mouse.column, mouse.row, ctrl);
+                    }
                     MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                         let up = mouse.kind == MouseEventKind::ScrollUp;
                         // Over the input box the wheel scrolls the prompt itself:
@@ -1309,7 +1393,7 @@ impl App {
                         self.drag_scroll = None;
                         let taken_by_input = self.input_mouse_down(mouse.column, mouse.row);
                         if !taken_by_input {
-                            if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                            if self.ctrl_for_pointer(mouse.modifiers) {
                                 if let Some(run) = self
                                     .active_transcript()
                                     .task_run_at(mouse.column, mouse.row)
@@ -1650,6 +1734,23 @@ fn key_char_eq(key: &KeyEvent, target: char) -> bool {
     matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&target))
 }
 
+/// Windows' legacy console API reports Ctrl on mouse records but suppresses
+/// standalone Ctrl key events. Reading its current state closes that gap for a
+/// stationary pointer without altering terminals that already report modifiers.
+#[cfg(windows)]
+fn system_control_pressed() -> Option<bool> {
+    unsafe extern "system" {
+        fn GetAsyncKeyState(virtual_key: i32) -> i16;
+    }
+    const VK_CONTROL: i32 = 0x11;
+    Some(unsafe { GetAsyncKeyState(VK_CONTROL) < 0 })
+}
+
+#[cfg(not(windows))]
+fn system_control_pressed() -> Option<bool> {
+    None
+}
+
 async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEvent> {
     match rx {
         Some(rx) => rx.recv().await,
@@ -1783,6 +1884,68 @@ mod tests {
             frame.contains("Read(deep.txt)"),
             "showing the calls it made:\n{frame}"
         );
+    }
+
+    #[test]
+    fn ctrl_press_over_a_task_card_underlines_and_clicks_its_trace() {
+        use ratatui::style::Modifier;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "c1".into(),
+            name: "agent".into(),
+            input: serde_json::json!({"agent": "explore", "prompt": "inspect", "summary": "inspect"}),
+            summary: String::new(),
+        });
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "r1".into(),
+            parent_call: "c1".into(),
+            kind: "explore".into(),
+            model: "m".into(),
+            prompt: "inspect".into(),
+            summary: "inspect the interaction".into(),
+        });
+        app.frame();
+        let (column, row) = (0..30)
+            .flat_map(|row| (0..90).map(move |column| (column, row)))
+            .find(|&(column, row)| app.transcript.task_run_at(column, row).as_deref() == Some("r1"))
+            .expect("the task card is visible in the transcript");
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        // Kitty-capable terminals report the modifier itself. The Windows
+        // fallback is covered by `system_control_pressed` at the same refresh
+        // and click boundaries.
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftControl),
+            KeyModifiers::NONE,
+        )));
+        app.redraw().unwrap();
+        let Surface::Test(backend) = app.terminal.backend() else {
+            unreachable!("the harness uses an in-memory test surface");
+        };
+        assert!(
+            backend.buffer()[(column, row)]
+                .modifier
+                .contains(Modifier::UNDERLINED),
+            "pressing Ctrl without moving the pointer advertises the trace link"
+        );
+
+        // Some terminal mouse protocols omit Ctrl from the button event, so
+        // this deliberately has no modifier. The pointer state still opens
+        // the trace instead of starting a text selection on the task card.
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+        assert_eq!(app.active_view, ViewId::TaskRun("r1".into()));
     }
 
     /// A command used to leave no trace of itself: its answer landed as a bare
@@ -2456,6 +2619,38 @@ mod tests {
             "the hint row says the install ended and why:
 {frame}"
         );
+    }
+
+    #[test]
+    fn automatic_voice_start_is_silent_but_interactive_start_confirms() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+        app.voice.turn_off();
+        app.notice = None;
+
+        app.start_voice(false);
+        assert!(app.voice.is_on());
+        assert!(
+            app.notice.is_none(),
+            "configured startup does not announce success"
+        );
+
+        app.voice.turn_off();
+        app.notice = None;
+        app.voice_install_announce = false;
+        app.on_voice_event(crate::voice::VoiceEvent::Installed);
+        assert!(
+            app.notice.is_none(),
+            "a startup-triggered installation stays silent when it finishes"
+        );
+
+        app.voice.turn_off();
+        app.start_voice(true);
+        assert!(app
+            .notice
+            .as_ref()
+            .is_some_and(|(text, _)| text.starts_with("voice on")));
     }
 
     /// A backend failure parks a warning on the hint row. It has to say how to

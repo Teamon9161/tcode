@@ -60,7 +60,7 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     pub fn new(cwd: &Path) -> Self {
-        Self::new_with_home(cwd, dirs::home_dir())
+        Self::new_with_home(cwd, crate::home_dir())
     }
 
     fn new_with_home(cwd: &Path, home: Option<PathBuf>) -> Self {
@@ -69,15 +69,7 @@ impl MemoryManager {
             root: cwd.clone(),
             identity: cwd.clone(),
         });
-        let auto_dir = home.as_ref().map(|home| {
-            home.join(".tcode")
-                .join("projects")
-                .join(format!(
-                    "{:016x}",
-                    fnv1a(path_key(&project.identity).as_bytes())
-                ))
-                .join("memory")
-        });
+        let auto_dir = auto_dir_in(home.as_deref(), &project);
         let maintenance = auto_dir
             .as_ref()
             .and_then(|dir| read_state(&dir.join("state.json")))
@@ -189,7 +181,7 @@ impl MemoryManager {
         self.known_projects = HashSet::from([path_key(&self.project.identity)]);
         for entry in entries {
             let text = match entry {
-                Entry::Note(text) | Entry::Summary(text) => text,
+                Entry::Note(text) | Entry::Instruction(text) | Entry::Summary(text) => text,
                 _ => continue,
             };
             for line in text.lines() {
@@ -410,15 +402,7 @@ impl MemoryManager {
     }
 
     fn auto_dir_for(&self, project: &Project) -> Option<PathBuf> {
-        self.home.as_ref().map(|home| {
-            home.join(".tcode")
-                .join("projects")
-                .join(format!(
-                    "{:016x}",
-                    fnv1a(path_key(&project.identity).as_bytes())
-                ))
-                .join("memory")
-        })
+        auto_dir_in(self.home.as_deref(), project)
     }
 
     fn auto_enabled_for(&self, project: &Project) -> bool {
@@ -712,13 +696,23 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325;
-    for byte in bytes {
-        hash ^= *byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
+/// Auto memory keys on the project's *identity* — its git directory, so that a
+/// worktree reads and writes its parent's memories — not on the cwd. The
+/// directory naming itself belongs to `store`, which owns this whole tree.
+fn auto_dir_in(home: Option<&Path>, project: &Project) -> Option<PathBuf> {
+    let home = home?;
+    let dir = crate::store::project_dir_in(home, &path_key(&project.identity)).join("memory");
+    // Identity used to be the project root, before worktrees were made to
+    // share. Adopt what that scheme left behind: a project silently losing
+    // everything it had remembered is the one failure auto memory cannot
+    // recover from — nothing in the conversation reveals that the index is
+    // missing rather than empty.
+    if !dir.join("MEMORY.md").is_file() {
+        let root_keyed =
+            crate::store::project_dir_in(home, &path_key(&project.root)).join("memory");
+        crate::store::adopt_dir(&root_keyed, &dir);
     }
-    hash
+    Some(dir)
 }
 
 #[cfg(test)]
@@ -843,8 +837,42 @@ mod tests {
             .unwrap()
             .note;
         let mut resumed = MemoryManager::new_with_home(&current, Some(home));
-        resumed.restore_from_entries(&[Entry::Note(note)]);
+        resumed.restore_from_entries(&[Entry::Instruction(note)]);
         assert!(resumed.discover_for_paths(&[target]).is_none());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    /// Memories written when the project root was the key follow the project
+    /// to its git-identity directory. Whatever the new location already has
+    /// wins — a stale copy must not overwrite current state.
+    #[test]
+    fn memories_written_under_the_old_project_key_are_adopted() {
+        let base = temp("memory-key-migration");
+        let home = base.clone();
+        let root = home.join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+
+        let root_keyed = crate::store::project_dir_in(&home, &path_key(&root)).join("memory");
+        fs::create_dir_all(&root_keyed).unwrap();
+        fs::write(root_keyed.join("MEMORY.md"), "- remembered").unwrap();
+        fs::write(root_keyed.join("state.json"), "stale").unwrap();
+        let identity_keyed =
+            crate::store::project_dir_in(&home, &path_key(&root.join(".git"))).join("memory");
+        fs::create_dir_all(&identity_keyed).unwrap();
+        fs::write(identity_keyed.join("state.json"), "current").unwrap();
+
+        let memory = MemoryManager::new_with_home(&root, Some(home.clone()));
+
+        assert_eq!(memory.auto_dir.as_deref(), Some(identity_keyed.as_path()));
+        assert_eq!(
+            fs::read_to_string(identity_keyed.join("MEMORY.md")).unwrap(),
+            "- remembered"
+        );
+        assert_eq!(
+            fs::read_to_string(identity_keyed.join("state.json")).unwrap(),
+            "current"
+        );
+        assert!(memory.startup_prompt().contains("- remembered"));
         let _ = fs::remove_dir_all(base);
     }
 

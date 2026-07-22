@@ -756,7 +756,7 @@ mod tests {
     use tcode_core::ToolCtx;
 
     async fn grep(dir: &Path, input: Value) -> String {
-        let ctx = ToolCtx::new(dir.to_path_buf(), 100_000);
+        let ctx = ToolCtx::for_test(dir.to_path_buf(), 100_000);
         GrepTool
             .run(input, &ctx, &CancellationToken::new())
             .await
@@ -764,7 +764,7 @@ mod tests {
     }
 
     async fn glob(dir: &Path, pattern: &str) -> String {
-        let ctx = ToolCtx::new(dir.to_path_buf(), 100_000);
+        let ctx = ToolCtx::for_test(dir.to_path_buf(), 100_000);
         GlobTool
             .run(
                 json!({ "pattern": pattern }),

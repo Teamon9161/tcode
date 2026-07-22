@@ -230,7 +230,7 @@ impl AgentRegistry {
         let mut registry = Self::builtin();
         let mut warnings = Vec::new();
         let mut roots = vec![cwd.join(".tcode/agents")];
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = tcode_core::home_dir() {
             roots.push(home.join(".tcode/agents"));
         }
         for root in roots {

@@ -25,6 +25,11 @@ pub enum Entry {
     /// freshness notices, background-task completions...). Machine-authored:
     /// the text is the whole fact.
     Note(String),
+    /// Project instructions discovered after the session started. They reach
+    /// the model at a legal append boundary and persist for resume/compaction,
+    /// but are context rather than conversation history and stay out of the
+    /// human transcript.
+    Instruction(String),
     /// The human's own words attached to a tool decision. The ledger keeps
     /// the fact — whose words, about which call — rather than a pre-baked
     /// sentence, because the two consumers need different things: the model
@@ -76,7 +81,7 @@ impl Entry {
     fn blocks(&self) -> Vec<ContentBlock> {
         match self {
             Entry::User(b) | Entry::Assistant(b) | Entry::ToolResults(b) => b.clone(),
-            Entry::Note(text) => vec![ContentBlock::Text {
+            Entry::Note(text) | Entry::Instruction(text) => vec![ContentBlock::Text {
                 text: format!("<harness-note>\n{text}\n</harness-note>"),
             }],
             Entry::UserNote {
@@ -121,6 +126,14 @@ pub trait LedgerSink: Send + Sync {
 #[derive(Default)]
 pub struct Ledger {
     entries: Vec<Entry>,
+    /// What compaction removed from the model's context, oldest first.
+    /// Compaction shrinks what the *model* carries; it is not an instruction
+    /// to forget what happened, and the human who scrolls back after a resume
+    /// wants the same transcript they had before the restart. Kept here rather
+    /// than rebuilt by every frontend because the ledger is the only place
+    /// that knows what compaction took. `as_messages` never reads it, so the
+    /// prompt prefix — and the cache invariant — is untouched.
+    archived: Vec<Entry>,
     sink: Option<Box<dyn LedgerSink>>,
 }
 
@@ -184,6 +197,20 @@ impl Ledger {
         &self.entries
     }
 
+    /// History compaction moved out of the model's context, oldest first.
+    /// Display-only: transcripts and `/export` show it, the model never does,
+    /// and it holds no valid `truncate_tail` index — rewinding into a
+    /// compacted prefix is exactly what compaction made impossible.
+    pub fn archived(&self) -> &[Entry] {
+        &self.archived
+    }
+
+    /// Everything that happened in this conversation, compacted-away history
+    /// included, in order. The human's view; `as_messages` is the model's.
+    pub fn history(&self) -> impl Iterator<Item = &Entry> {
+        self.archived.iter().chain(self.entries.iter())
+    }
+
     /// Rewind: drop everything after `len` entries. The retained prefix
     /// is untouched, so provider caches still hit.
     pub fn truncate_tail(&mut self, len: usize) {
@@ -194,6 +221,13 @@ impl Ledger {
             sink.record(&LogEvent::TruncateTail { len });
         }
         self.entries.truncate(len);
+        // A compaction leaves its summary at index 0, so `len == 0` (`/clear`,
+        // or a rewind past everything) drops the one entry that still stood
+        // for the compacted era. The history it summarized leaves with it:
+        // a conversation deliberately cleared must not come back on resume.
+        if len == 0 {
+            self.archived.clear();
+        }
     }
 
     /// Answer tool calls that were committed but never got a result, because
@@ -248,7 +282,9 @@ impl Ledger {
     }
 
     /// Atomically replace entries [0, upto) with a summary. The one
-    /// deliberate cache-invalidating operation.
+    /// deliberate cache-invalidating operation. The replaced entries move to
+    /// [`archived`](Self::archived) — out of the model's context, still in the
+    /// human's.
     pub fn compact(&mut self, summary: String, upto: usize) {
         let upto = upto.min(self.entries.len());
         if let Some(sink) = &mut self.sink {
@@ -258,6 +294,7 @@ impl Ledger {
             });
         }
         let tail = self.entries.split_off(upto);
+        self.archived.append(&mut self.entries);
         self.entries = Vec::with_capacity(tail.len() + 1);
         self.entries.push(Entry::Summary(summary));
         self.entries.extend(tail);
@@ -322,6 +359,18 @@ mod tests {
     }
 
     #[test]
+    fn instruction_is_prompt_context() {
+        let mut l = Ledger::new();
+        l.append(Entry::Instruction("follow the local rules".into()));
+
+        assert!(matches!(
+            &l.as_messages()[0].content[..],
+            [ContentBlock::Text { text }]
+                if text == "<harness-note>\nfollow the local rules\n</harness-note>"
+        ));
+    }
+
+    #[test]
     fn user_note_keeps_original_words_and_frames_prompt_context() {
         let mut l = Ledger::new();
         l.append(Entry::UserNote {
@@ -371,6 +420,57 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert!(matches!(&l.entries()[0], Entry::Summary(s) if s == "summary"));
         assert!(matches!(&l.entries()[1], Entry::User(_)));
+    }
+
+    /// What compaction takes from the model stays available to the human, and
+    /// stays out of every request. Repeated compactions keep accumulating in
+    /// conversation order.
+    #[test]
+    fn compact_archives_the_replaced_prefix_without_showing_it_to_the_model() {
+        let mut l = Ledger::new();
+        l.append(Entry::User(text("oldest-question")));
+        l.append(Entry::Assistant(text("oldest-answer")));
+        l.compact("first summary".into(), 2);
+        l.append(Entry::User(text("later-question")));
+        l.compact("second summary".into(), 2);
+
+        assert!(matches!(
+            l.archived(),
+            [Entry::User(_), Entry::Assistant(_), Entry::Summary(s), Entry::User(_)]
+                if s == "first summary"
+        ));
+        assert!(matches!(&l.entries()[0], Entry::Summary(s) if s == "second summary"));
+        let sent: String = l
+            .as_messages()
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(sent.contains("second summary"));
+        assert!(!sent.contains("first summary"), "{sent}");
+        assert!(
+            !sent.contains("oldest-question"),
+            "archived history never reaches a request: {sent}"
+        );
+    }
+
+    /// `/clear` drops the summary that stood for the compacted era, so the
+    /// history behind it must not survive to be replayed.
+    #[test]
+    fn clearing_the_ledger_also_forgets_the_compacted_history() {
+        let mut l = Ledger::new();
+        l.append(Entry::User(text("a")));
+        l.compact("summary".into(), 1);
+        l.append(Entry::User(text("b")));
+        assert_eq!(l.archived().len(), 1);
+
+        l.truncate_tail(1); // an ordinary rewind keeps the summary, and the history
+        assert_eq!(l.archived().len(), 1);
+        l.truncate_tail(0);
+        assert!(l.archived().is_empty());
     }
 
     #[test]

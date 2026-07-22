@@ -68,20 +68,26 @@ pub fn command_block(cmd: &str) -> Vec<Line<'static>> {
     lines
 }
 
-/// Render a numbered `read` result with syntax foregrounds but no change
-/// background. Lines which are not part of the tool's numbered file payload
-/// remain subdued metadata, such as freshness and pagination notices.
+/// Render a raw `read` result with syntax foregrounds but no change
+/// background or synthetic line numbers. Read-status and pagination lines are
+/// harness metadata; all remaining lines are verbatim source text.
 pub fn read_preview(path: &str, content: &str) -> Vec<Line<'static>> {
     content
         .lines()
-        .map(|line| match line.split_once('\t') {
-            Some((number, text)) => match number.trim().parse::<usize>() {
-                Ok(number) => code_line(path, "  ", Some(number), text, None),
-                Err(_) => Line::styled(format!("  {line}"), theme::dim()),
-            },
-            None => Line::styled(format!("  {line}"), theme::dim()),
+        .map(|line| {
+            if read_metadata_line(line) {
+                Line::styled(format!("  {line}"), theme::dim())
+            } else {
+                code_line(path, "  ", None, line, None)
+            }
         })
         .collect()
+}
+
+fn read_metadata_line(line: &str) -> bool {
+    line.starts_with("note:")
+        || line.starts_with("[showing lines ")
+        || line.starts_with("[redacted:")
 }
 
 /// Full new-content preview for a `write` call: every line is an addition.
@@ -428,24 +434,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_preview_keeps_source_line_numbers_and_syntax_foregrounds() {
+    fn read_preview_highlights_raw_source_without_line_numbers() {
         let lines = read_preview(
             "src/main.rs",
-            "note: this file changed on disk since you last read it.\n     7\tlet answer = 42;\n",
+            "note: this file changed on disk since you last read it.\nlet answer = 42;\n[showing lines 10-10 of 42]",
         );
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
         assert_eq!(lines[0].style.fg, Some(theme::DIM));
         let rendered: String = lines[1]
             .spans
             .iter()
             .map(|span| span.content.as_ref())
             .collect();
-        assert!(rendered.contains("7 │ let answer = 42;"));
-        assert!(lines[1]
-            .spans
-            .iter()
-            .skip(3)
-            .any(|span| span.style.fg.is_some()));
+        assert!(rendered.ends_with("let answer = 42;"));
+        assert!(
+            lines[1].spans[1].content.trim().is_empty(),
+            "raw read output does not invent a line number"
+        );
+        assert!(lines[1].spans.iter().any(|span| span.style.fg.is_some()));
+        assert_eq!(lines[2].style.fg, Some(theme::DIM));
     }
 
     #[test]

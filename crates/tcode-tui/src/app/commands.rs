@@ -634,6 +634,13 @@ impl App {
             self.notice = Some(("voice off".into(), Instant::now()));
             return;
         }
+        self.start_voice(true);
+    }
+
+    /// Start voice without changing its persisted preference. Startup uses this
+    /// path so a configured, ready backend does not obscure the transcript with
+    /// a repeated success notice.
+    pub(super) fn start_voice(&mut self, announce: bool) {
         // Ask for key-release reporting *before* starting: on terminals that
         // need the kitty protocol, the gesture the confirmation line describes
         // depends on whether the request was honoured.
@@ -642,6 +649,7 @@ impl App {
         // machine has nothing to start. Fetch it here rather than making the
         // user read instructions and come back.
         if self.voice.needs_install() {
+            self.voice_install_announce = announce;
             self.install_voice_backend();
             return;
         }
@@ -649,12 +657,13 @@ impl App {
             // Turning a mode on is not a record worth keeping: the status row
             // shows it is on and which key, so a fading notice is enough.
             // Baking it pushes the conversation up every time.
-            Ok(()) => {
+            Ok(()) if announce => {
                 self.notice = Some((
                     format!("voice on — {}", self.voice.gesture_help()),
                     Instant::now(),
                 ))
             }
+            Ok(()) => {}
             // A failure is the exception: it says what to do about it, so it
             // has to survive longer than three seconds.
             Err(reason) => self.reply_error(reason),
@@ -728,13 +737,15 @@ impl App {
         // The backend has just arrived, so the start that was waiting for it
         // can happen now — and only now is there something to start.
         if matches!(event, VoiceEvent::Installed) {
+            let announce = std::mem::replace(&mut self.voice_install_announce, true);
             match self.voice.turn_on() {
-                Ok(()) => {
+                Ok(()) if announce => {
                     self.notice = Some((
                         format!("voice on — {}", self.voice.gesture_help()),
                         Instant::now(),
                     ))
                 }
+                Ok(()) => {}
                 Err(reason) => self.reply_error(reason),
             }
             return;

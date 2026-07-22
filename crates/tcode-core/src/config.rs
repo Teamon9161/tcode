@@ -850,7 +850,7 @@ pub struct Selection {
 
 impl Config {
     pub fn global_path() -> Result<PathBuf, ConfigError> {
-        Ok(dirs::home_dir().ok_or(ConfigError::NoHome)?.join(".tcode"))
+        Ok(crate::home_dir().ok_or(ConfigError::NoHome)?.join(".tcode"))
     }
 
     pub fn global_file() -> Result<PathBuf, ConfigError> {

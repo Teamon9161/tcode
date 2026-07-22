@@ -73,7 +73,7 @@ async fn mcp_client_lists_and_calls_tools() {
         other => panic!("expected Ask, got {other:?}"),
     }
 
-    let ctx = ToolCtx::new(dir.path().to_path_buf(), 2000);
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 2000);
     let out = tool
         .run(json!({"text": "hi"}), &ctx, &CancellationToken::new())
         .await;

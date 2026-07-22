@@ -71,7 +71,7 @@ async fn sends_images_in_one_isolated_vision_request() {
         requests: Mutex::new(Vec::new()),
     });
     let tool = ViewImageTool::new(model(provider.clone()), AgentModels::default());
-    let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+    let ctx = ToolCtx::for_test(directory.path().to_path_buf(), 8_000);
 
     let result = tool
         .run(
@@ -109,7 +109,7 @@ async fn rejects_a_text_only_vision_model_with_a_fix() {
     });
     let tool = ViewImageTool::new(model(provider), AgentModels::default());
     let directory = tempfile::tempdir().unwrap();
-    let ctx = ToolCtx::new(directory.path().to_path_buf(), 8_000);
+    let ctx = ToolCtx::for_test(directory.path().to_path_buf(), 8_000);
 
     let result = tool
         .run(

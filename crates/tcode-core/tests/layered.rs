@@ -22,6 +22,9 @@ fn crate_rules_stay_out_of_the_startup_prefix_until_their_crate_is_touched() {
     if !repo.join("crates/tcode-tui/AGENTS.md").is_file() {
         return; // Layering not set up in this checkout; nothing to pin.
     }
+    // Auto memory writes its maintenance state on construction; keep that out
+    // of the developer's real `~/.tcode`.
+    tcode_core::home::testing::temp_home();
     let mut memory = MemoryManager::new(&repo);
 
     let startup = memory.startup_prompt();

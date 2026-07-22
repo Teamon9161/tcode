@@ -235,7 +235,7 @@ async fn edit_rejects_non_utf8_without_mutating_the_file() {
     let file = dir.join("data.bin");
     let original = b"before\xffafter";
     std::fs::write(&file, original).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -261,7 +261,7 @@ async fn edit_rejects_an_empty_old_string() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("text.txt");
     std::fs::write(&file, "unchanged").unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -360,7 +360,7 @@ async fn edit_target_line_selects_one_exact_occurrence() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("text.txt");
     std::fs::write(&file, "header\nneedle\nseparator\nneedle\n").unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -392,7 +392,7 @@ async fn edit_target_line_selects_one_normalized_occurrence() {
     std::fs::create_dir_all(&dir).unwrap();
     let file = dir.join("text.txt");
     std::fs::write(&file, "call - x;\nseparator\ncall - x;\n").unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -425,7 +425,7 @@ async fn edit_target_line_rejects_a_nonmatching_line_without_mutating() {
     let file = dir.join("text.txt");
     let original = "needle\nseparator\nneedle\n";
     std::fs::write(&file, original).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -456,7 +456,7 @@ async fn edit_target_line_rejects_replace_all_without_mutating() {
     let file = dir.join("text.txt");
     let original = "needle\nneedle\n";
     std::fs::write(&file, original).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = EditTool
         .run(
@@ -495,7 +495,7 @@ async fn edit_result_snippet_is_anchored_at_the_replacement() {
     }
     std::fs::write(&file, &body).unwrap();
 
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let out = EditTool
         .run(
             json!({
@@ -524,7 +524,7 @@ async fn edit_does_not_mark_unshown_lines_as_read() {
         .map(|line| format!("line {line}\n"))
         .collect::<String>();
     std::fs::write(&file, body).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let edited = EditTool
         .run(
@@ -574,7 +574,7 @@ async fn capped_read_does_not_mark_unemitted_tail_as_seen() {
         .map(|line| format!("line {line}: {}\n", "x".repeat(600)))
         .collect::<String>();
     std::fs::write(&file, body).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let first = ReadTool
         .run(
@@ -643,7 +643,7 @@ async fn ordinary_long_lines_are_returned_whole() {
     let _ = std::fs::create_dir_all(&dir);
     let wide = "x".repeat(2000);
     std::fs::write(dir.join("notes.md"), format!("a\nb\n{wide}\nd\ne\nf\n")).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = ReadTool
         .run(
@@ -664,7 +664,7 @@ async fn oversized_lines_are_clipped_with_a_self_healing_note() {
     let _ = std::fs::create_dir_all(&dir);
     let huge = "y".repeat(MAX_LINE_CHARS + 500);
     std::fs::write(dir.join("bundle.js"), format!("ok\n{huge}\nend\n")).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = ReadTool
         .run(
@@ -700,7 +700,7 @@ async fn read_redacts_credentials_and_write_refuses_the_placeholder() {
         "[profile.deepseek]\nmodel = \"deepseek-chat\"\napi_key = \"{secret}\"\napi_key_env = \"DEEPSEEK_API_KEY\"\n"
     );
     std::fs::write(dir.join("config.toml"), &original).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = ReadTool
         .run(
@@ -794,7 +794,7 @@ async fn text_only_models_are_routed_to_view_image_without_freshness() {
             .bytes,
     )
     .unwrap();
-    let ctx = ToolCtx::new(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
 
     for _ in 0..2 {
         let result = ReadTool
@@ -820,7 +820,7 @@ async fn read_inlines_a_png_as_an_image_block() {
         .bytes;
     std::fs::write(&png, &bytes).unwrap();
 
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let out = ReadTool
         .run(
             json!({ "path": png.to_str().unwrap() }),
@@ -881,7 +881,7 @@ async fn read_returns_content_verbatim_without_a_line_number_gutter() {
     let _ = std::fs::create_dir_all(&dir);
     let body = "alpha\n    indented\nbeta\n";
     std::fs::write(dir.join("f.txt"), body).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = run_read(&ctx, json!({ "path": "f.txt" })).await;
     assert!(!out.is_error, "{}", out.content);
@@ -898,7 +898,7 @@ async fn offset_read_reports_its_line_range_even_when_it_reaches_the_end() {
     let _ = std::fs::create_dir_all(&dir);
     let body: String = (1..=200).map(|n| format!("line {n}\n")).collect();
     std::fs::write(dir.join("f.txt"), &body).unwrap();
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = run_read(&ctx, json!({ "path": "f.txt", "offset": 150 })).await;
     assert!(!out.is_error, "{}", out.content);
@@ -908,7 +908,7 @@ async fn offset_read_reports_its_line_range_even_when_it_reaches_the_end() {
         out.content
     );
     // A whole-file read starts at line 1; saying so would be noise.
-    let ctx2 = ToolCtx::new(dir.clone(), 10_000);
+    let ctx2 = ToolCtx::for_test(dir.clone(), 10_000);
     let whole = run_read(&ctx2, json!({ "path": "f.txt" })).await;
     assert!(
         !whole.content.contains("[showing lines"),
@@ -922,7 +922,7 @@ async fn offset_read_reports_its_line_range_even_when_it_reaches_the_end() {
 #[tokio::test]
 async fn append_creates_missing_file_with_parents_and_notes_it() {
     let dir = append_test_dir("create");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = run_append(&ctx, "sub/new.txt", "one\ntwo\n").await;
     assert!(!out.is_error, "{}", out.content);
@@ -941,7 +941,7 @@ async fn append_creates_missing_file_with_parents_and_notes_it() {
 #[tokio::test]
 async fn append_adds_exact_bytes_without_auto_newline() {
     let dir = append_test_dir("bytes");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let file = dir.join("log.txt");
     std::fs::write(&file, "line\n").unwrap();
@@ -966,7 +966,7 @@ async fn append_adds_exact_bytes_without_auto_newline() {
 #[tokio::test]
 async fn append_after_partial_read_succeeds_but_write_stays_gated() {
     let dir = append_test_dir("partial");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("big.txt");
     let body = (1..=300)
         .map(|line| format!("line {line}\n"))
@@ -1009,7 +1009,7 @@ async fn append_after_partial_read_succeeds_but_write_stays_gated() {
 #[tokio::test]
 async fn append_refuses_without_prior_read() {
     let dir = append_test_dir("unread");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("seen.txt");
     std::fs::write(&file, "original\n").unwrap();
 
@@ -1027,7 +1027,7 @@ async fn append_refuses_without_prior_read() {
 #[tokio::test]
 async fn append_refuses_when_file_changed_on_disk() {
     let dir = append_test_dir("stale");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("watched.txt");
     std::fs::write(&file, "original\n").unwrap();
     run_read(&ctx, json!({ "path": "watched.txt" })).await;
@@ -1043,7 +1043,7 @@ async fn append_refuses_when_file_changed_on_disk() {
 #[tokio::test]
 async fn append_rejects_empty_content_and_non_utf8_files() {
     let dir = append_test_dir("reject");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
     let out = run_append(&ctx, "any.txt", "").await;
     assert!(out.is_error);
@@ -1062,7 +1062,7 @@ async fn append_rejects_empty_content_and_non_utf8_files() {
 #[tokio::test]
 async fn append_after_full_read_lets_write_overwrite() {
     let dir = append_test_dir("full");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("small.txt");
     std::fs::write(&file, "a\nb\n").unwrap();
     run_read(&ctx, json!({ "path": "small.txt" })).await;
@@ -1086,7 +1086,7 @@ async fn append_after_full_read_lets_write_overwrite() {
 #[tokio::test]
 async fn read_then_edit_then_append_flow_works() {
     let dir = append_test_dir("flow");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("flow.txt");
     let body = (1..=100)
         .map(|line| format!("line {line}\n"))
@@ -1125,7 +1125,7 @@ async fn read_then_edit_then_append_flow_works() {
 #[tokio::test]
 async fn append_does_not_mark_unseen_middle_as_read() {
     let dir = append_test_dir("middle");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("many.txt");
     let body = (1..=300)
         .map(|line| format!("line {line}\n"))
@@ -1166,7 +1166,7 @@ async fn append_does_not_mark_unseen_middle_as_read() {
 #[tokio::test]
 async fn append_snippet_is_anchored_at_the_append_point() {
     let dir = append_test_dir("snippet");
-    let ctx = ToolCtx::new(dir.clone(), 10_000);
+    let ctx = ToolCtx::for_test(dir.clone(), 10_000);
     let file = dir.join("anchor.txt");
     let body = (1..=50)
         .map(|line| format!("line {line}\n"))

@@ -39,6 +39,7 @@ impl SlashCommand for MemoryCommand {
 mod tests {
     use super::super::{test_ctx_parts, CommandCtx, SlashCommand};
     use super::MemoryCommand;
+    use crate::ledger::Entry;
     use crate::types::Usage;
 
     #[test]
@@ -65,10 +66,12 @@ mod tests {
         };
         let outcome = MemoryCommand.run(&mut ctx, "on");
         assert!(!outcome.messages.is_empty());
-        let notes = session.take_deferred_context_notes();
-        assert_eq!(notes.len(), 1, "the final toggle replaces the first");
-        assert!(notes[0].contains("enabled"));
-        assert!(!notes[0].contains("disabled"));
+        let entries = session.take_deferred_context_entries();
+        assert_eq!(entries.len(), 1, "the final toggle replaces the first");
+        assert!(matches!(
+            entries.as_slice(),
+            [Entry::Note(text)] if text.contains("enabled") && !text.contains("disabled")
+        ));
 
         let mut ctx = CommandCtx {
             session: &mut session,

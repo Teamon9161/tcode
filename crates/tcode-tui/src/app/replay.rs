@@ -50,7 +50,21 @@ impl App {
         let mut answered_questions: std::collections::VecDeque<serde_json::Value> =
             std::collections::VecDeque::new();
         let mut space_before_assistant_text = false;
-        for (entry_index, entry) in session.ledger.entries().iter().enumerate() {
+        // Compacted history first, then what the model still carries. Only the
+        // latter is tagged with a ledger index: an untagged echo is not a
+        // rewind target, which is precisely right — compaction is what made
+        // rewinding into that history impossible. The `── earlier conversation
+        // compacted ──` divider needs no special handling here; it is baked by
+        // the `Entry::Summary` that compaction left at index 0, which sits
+        // exactly on the seam.
+        let history = session.ledger.archived().iter().map(|entry| (None, entry));
+        let live = session
+            .ledger
+            .entries()
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (Some(index), entry));
+        for (entry_index, entry) in history.chain(live) {
             match entry {
                 tcode_core::Entry::User(blocks) => {
                     space_before_assistant_text = false;
@@ -72,7 +86,10 @@ impl App {
                     // Keep a breathing row between a highlighted human
                     // message and the following assistant/tool activity.
                     echo.push(Line::default());
-                    self.transcript.push_tagged(echo, entry_index);
+                    match entry_index {
+                        Some(entry_index) => self.transcript.push_tagged(echo, entry_index),
+                        None => self.transcript.push(echo),
+                    }
                 }
                 tcode_core::Entry::Assistant(blocks) => {
                     let mut group: Vec<(String, String, serde_json::Value)> = Vec::new();
@@ -297,6 +314,7 @@ impl App {
                     lines.extend(quote_lines(Some(NOTE_LABEL), text));
                     lines.push(Line::default());
                 }
+                tcode_core::Entry::Instruction(_) => {}
             }
         }
         lines.push(Line::styled("── resumed ──", theme::dim()));

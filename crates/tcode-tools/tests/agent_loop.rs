@@ -488,7 +488,7 @@ fn auto_agent(main: Arc<MockProvider>, classifier: Arc<MockProvider>) -> Agent {
 
 fn session(dir: &std::path::Path, mode: PermissionMode) -> Session {
     Session::new(
-        ToolCtx::new(dir.to_path_buf(), 2000),
+        ToolCtx::for_test(dir.to_path_buf(), 2000),
         mode,
         PermissionRules::default(),
     )
@@ -704,11 +704,9 @@ async fn external_read_loads_project_instructions_without_blocking() {
     let results = tool_results(&session);
     assert!(!results[0].1, "read should execute: {}", results[0].0);
     assert!(results[0].0.contains("external data"));
-    assert!(session
-        .ledger
-        .entries()
-        .iter()
-        .any(|entry| matches!(entry, Entry::Note(note) if note.contains("external read rule"))));
+    assert!(session.ledger.entries().iter().any(
+        |entry| matches!(entry, Entry::Instruction(note) if note.contains("external read rule"))
+    ));
 }
 
 #[tokio::test]
@@ -1238,7 +1236,7 @@ async fn explore_sub_agent_returns_only_the_report() {
         2000,
         dir.path().to_path_buf(),
     );
-    let ctx = ToolCtx::new(dir.path().to_path_buf(), 2000);
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 2000);
     let out = task
         .run(
             serde_json::json!({"agent": "explore", "prompt": "what is in lib.rs?"}),
@@ -1314,7 +1312,7 @@ async fn plan_sub_agent_returns_a_draft_under_the_planning_prompt() {
         2000,
         dir.path().to_path_buf(),
     );
-    let ctx = ToolCtx::new(dir.path().to_path_buf(), 2000);
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 2000);
 
     let out = task
         .run(
@@ -4105,7 +4103,7 @@ async fn resuming_an_unknown_agent_run_is_a_self_healing_error() {
         root.path().to_path_buf(),
     )
     .with_agent_defs(registry);
-    let ctx = ToolCtx::new(root.path().to_path_buf(), 2_000);
+    let ctx = ToolCtx::for_test(root.path().to_path_buf(), 2_000);
 
     let out = task
         .run(

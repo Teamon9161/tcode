@@ -286,6 +286,18 @@ impl ToolCtx {
         Self::with_scratch_dir(cwd, output_budget_tokens, scratch_dir)
     }
 
+    /// Like `new`, but with this process's harness state redirected into a
+    /// private temporary home first (see [`crate::home::testing::temp_home`]).
+    /// A `ToolCtx` creates a scratch directory and loads auto memory the
+    /// moment it exists, so a test that builds one against the real home
+    /// leaves a project directory behind for every temporary working
+    /// directory it uses. Tests in other crates need this, hence `pub`.
+    #[doc(hidden)]
+    pub fn for_test(cwd: PathBuf, output_budget_tokens: usize) -> Self {
+        crate::home::testing::temp_home();
+        Self::new(cwd, output_budget_tokens)
+    }
+
     /// Bind this context to a persistent session's private temporary workspace.
     /// Call this before any tool work begins (or immediately after `/resume`).
     pub fn with_scratch_dir(

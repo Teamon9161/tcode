@@ -38,6 +38,18 @@ with, for example:
 tcode --config C:\\path\\to\\work.toml --profile anthropic --model claude-sonnet-5
 ```
 
+`TCODE_HOME` relocates the whole of that tree. When the variable is set and
+non-empty, `~/.tcode/config.toml`, `~/.tcode/agents/`, `~/.tcode/skills/`,
+`~/.tcode/AGENTS.md` and `~/.tcode/projects/<project-id>/` (sessions,
+checkpoints, plans, task traces, scratchpad, auto memory) all resolve beneath
+it instead of the user's home directory; unset, the home directory is used.
+It is read per lookup, so it belongs in the environment before tcode starts —
+a portable install on a stick, a sandboxed or CI run, or a test suite that
+must not touch a developer's real state. Two things deliberately stay outside
+it: paths belonging to *other* tools (`~/.codex`, `~/.claude`, read when
+importing their sessions) and the voice model cache
+(`~/.tcode/voice/models`, which has its own `--model-dir`).
+
 The default config migrates a legacy `~/.tcode/state.toml` once if it has no
 `[tcode_state]`; a custom `--config` file never reads that legacy state. Before
 editing any configuration, read the applicable existing TOML. Preserve
