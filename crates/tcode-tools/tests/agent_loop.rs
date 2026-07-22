@@ -3445,8 +3445,14 @@ async fn a_failed_sub_agent_run_stays_resumable_with_its_work_intact() {
     assert_eq!(requests[2].cache_scope, requests[0].cache_scope);
     assert_eq!(requests[2].system, requests[1].system);
     assert_eq!(
-        format!("{:?}", &requests[2].messages[..requests[1].messages.len() - 1]),
-        format!("{:?}", &requests[1].messages[..requests[1].messages.len() - 1]),
+        format!(
+            "{:?}",
+            &requests[2].messages[..requests[1].messages.len() - 1]
+        ),
+        format!(
+            "{:?}",
+            &requests[1].messages[..requests[1].messages.len() - 1]
+        ),
         "a resumed turn may only append: every earlier message must be unchanged"
     );
     assert!(!results[1].1 && results[1].0.contains("the report"));

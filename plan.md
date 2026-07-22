@@ -180,9 +180,7 @@ loop {
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. batch edit某些情形下行号显示有问题。一行里的替换，减一行加一行，但是左边行号全是1，实际也不是第一行。这是6changes across 1file
-6. **（已做）** 斜杠命令现在像它本来的样子渲染：`run_slash` 一处回显 `▌ /cmd`（与 prompt 同一条用户轨），命令的每一句回复经 `App::reply` / `reply_error` / `reply_warn` 挂上 `⎿`（形状由 `bake::reply_lines` 一处决定）。此前命令连自己被打过都不留痕，回复是一行裸 dim，连打几条就糊成一坨。skill 形式的 `/name` 不走这条——它是 prompt，回显由开 turn 时的 `prompt_echo` 负责。
-7. **（已做）** trace view 此前丢弃全部 `TaskRun*` 事件：被追踪的 agent 自己委派下去时，读者只看到一行批次 header，直到整个调用结束；嵌套 run 也没有树行可进。现在 `SessionView::feed_event` 自己处理这三个事件，卡片行由 `view.rs` 一处产出（主对话与 trace 共用），嵌套 run 进 agent tree（按 `depth` 缩进）并可打开自己的 trace。跳转手势是 **ctrl+click**（tip 里写着），不做双击；批次 item 仍等自己的 ToolEnd 才 bake，那是既定设计。
-8. **（已做）** sub-agent 的 run 不再因失败而作废：API 报错、重试耗尽、用户 ESC 之后 session 都原样保活（`park_failed`，一次性 def 也给一次 salvage 追问），错误文案直接给出 `agent=…, resume=…`；`live` 只在进程内，所以内存里没有时回落到 trace 重建（`TaskTraces::restore` 按 `resume_of` 把整条追问链重放进同一个 ledger），重启与 `/resume` 之后同一对话的 run 照样能续。换回来的不是缓存前缀（早没了），是那轮已经付过钱的工具调用与结论。配套堵了两个洞：run id 加会话作用域（`AgentTool` 活得比对话长，此前换会话后 `resume="t1"` 会接上**上一个对话**的 sub-agent），以及 `resume` 的 id 只认 `t<digits>`（它要去 join 文件名，是模型可控的数据）。
-9. ctrl+d 退出会打印乱码在终端, 35;32;42M35;32;41M35;33;41M35;33;41M35;34;40M35;34;40M35;35;40M35;35;40M35;35;39M35;36;39M35;36;39M35;36;40M35;37;40M35;37;41M35;37;41M35;37;42M6c, 有时候只出现6c
+6. ctrl+d 退出会打印乱码在终端, 35;32;42M35;32;41M35;33;41M35;33;41M35;34;40M35;34;40M35;35;40M35;35;40M35;35;39M35;36;39M35;36;39M35;36;40M35;37;40M35;37;41M35;37;41M35;37;42M6c, 有时候只出现6c
 之前应该修复过,为啥又这样了.
-10. batch find和search支持吗
+7. find和search支持batch 并行吗
+8. 如果已经hover在sub-agent记录上,然后按ctrl不会出现下划线,必须先移开再移回来才有,然后ctrl+鼠标点击也无法跳转到sub-agent页面,只有agent-tree可以.

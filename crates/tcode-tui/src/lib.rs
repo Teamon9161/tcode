@@ -179,23 +179,45 @@ pub(crate) fn set_key_release_reporting(on: bool) {
     }
     #[cfg(not(windows))]
     {
-        if !crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
-            return;
-        }
-        use crossterm::event::{
-            KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-        };
         if on {
             if !KEY_RELEASES.swap(true, Ordering::SeqCst) {
-                let _ = execute!(
-                    stdout(),
-                    PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-                );
+                let _ = write_key_release_reporting(&mut stdout(), true);
             }
         } else if KEY_RELEASES.swap(false, Ordering::SeqCst) {
-            let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+            let _ = write_key_release_reporting(&mut stdout(), false);
         }
     }
+}
+
+#[cfg(not(windows))]
+fn write_key_release_reporting(output: &mut impl Write, on: bool) -> std::io::Result<()> {
+    use crossterm::event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
+
+    if on {
+        execute!(
+            output,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        )
+    } else {
+        execute!(output, PopKeyboardEnhancementFlags)
+    }
+}
+
+#[cfg(unix)]
+fn discard_terminal_input() {
+    // Mouse reports and terminal replies can already be queued when output-side
+    // modes are disabled. Drop them before restoring echo for the shell.
+    unsafe {
+        libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn discard_terminal_input() {
+    // Windows console input is record-based and the output-mode teardown above
+    // does not leave VT replies in the shell input stream.
 }
 
 /// Run the interactive TUI to completion. Owns terminal setup/teardown;
@@ -233,6 +255,7 @@ fn restore_terminal() {
     set_key_release_reporting(false);
     let mut output = stdout();
     restore_terminal_output(&mut output);
+    discard_terminal_input();
     let _ = disable_raw_mode();
 }
 
@@ -249,6 +272,8 @@ fn restore_terminal_output(output: &mut impl Write) {
 #[cfg(test)]
 mod tests {
     use super::restore_terminal_output;
+    #[cfg(not(windows))]
+    use super::write_key_release_reporting;
 
     #[cfg(not(windows))]
     #[test]
@@ -262,6 +287,16 @@ mod tests {
         let paste_end = output.find("\x1b[?2004l").unwrap();
         assert!(alternate_end < mouse_end);
         assert!(mouse_end < paste_end);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn key_release_reporting_does_not_issue_a_terminal_capability_query() {
+        let mut output = Vec::new();
+        write_key_release_reporting(&mut output, true).unwrap();
+        write_key_release_reporting(&mut output, false).unwrap();
+
+        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[>2u\x1b[<1u");
     }
 
     #[cfg(windows)]

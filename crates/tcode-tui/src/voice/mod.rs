@@ -240,16 +240,18 @@ pub(crate) fn describe_key(key: &crossterm::event::KeyEvent) -> String {
     format!("{} · {kind}", parts.join("+"))
 }
 
-/// Is a real key-up plausibly on offer, so it is worth starting there?
-///
-/// On Windows we ask for it (win32-input-mode) and find out from the first
-/// take. Elsewhere a terminal without the kitty protocol sends **no** release
-/// at all, and starting in `Release` would leave the first take running until
-/// the duration cap — so those start on repeats directly.
+/// The first take begins with the universally observable repeat signal. A
+/// non-synthetic release upgrades it to the lower-latency `Release` path.
+/// This deliberately does not probe terminal capabilities: Crossterm's probe
+/// sends a Device Attributes query whose delayed reply can leak into the shell
+/// during teardown.
 fn initial_end_detect() -> EndDetect {
-    if cfg!(windows) || crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false) {
+    #[cfg(windows)]
+    {
         EndDetect::Release
-    } else {
+    }
+    #[cfg(not(windows))]
+    {
         EndDetect::Repeat
     }
 }
@@ -299,8 +301,8 @@ impl Voice {
         }
     }
 
-    /// Override the terminal probe. Tests pin this: what the machine running
-    /// them does with key events is not part of what they check.
+    /// Override the initial detection strategy. Tests pin this so terminal
+    /// events on the machine running them are not part of what they check.
     #[cfg(test)]
     pub(crate) fn set_end_detect(&mut self, how: EndDetect) {
         self.end_detect = how;
@@ -563,22 +565,17 @@ impl Voice {
             return VoiceOutcome::None;
         };
         match self.end_detect {
-            // Already known to be a terminal that fabricates releases, or one
-            // that never sends them. Either way the repeats decide.
+            // A real release is stronger evidence than capability probing. The
+            // first one lets supported terminals stop future takes immediately.
+            EndDetect::Repeat if since.elapsed() >= SYNTHETIC_RELEASE => {
+                self.end_detect = EndDetect::Release;
+                self.finish_real_release(since)
+            }
+            // Known to fabricate releases, or lacking a release signal. The
+            // repeats decide until a real release proves otherwise.
             EndDetect::Repeat | EndDetect::Toggle => VoiceOutcome::None,
             EndDetect::Release if since.elapsed() >= SYNTHETIC_RELEASE => {
-                if since.elapsed() < MIN_HOLD {
-                    let provisional = self.provisional;
-                    self.discard_take();
-                    // A tap on a key that is also a character is not a misfire
-                    // at all — the user typed a space, and it is already there.
-                    return if provisional {
-                        VoiceOutcome::None
-                    } else {
-                        VoiceOutcome::Notice("voice: hold the key while you speak".into())
-                    };
-                }
-                self.stop_take()
+                self.finish_real_release(since)
             }
             // A release nobody's finger could have produced. The terminal is
             // manufacturing one per press, so key-up carries no information —
@@ -589,6 +586,21 @@ impl Voice {
                 VoiceOutcome::Notice("voice: reading the hold from key repeat".into())
             }
         }
+    }
+
+    fn finish_real_release(&mut self, since: Instant) -> VoiceOutcome {
+        if since.elapsed() < MIN_HOLD {
+            let provisional = self.provisional;
+            self.discard_take();
+            // A tap on a key that is also a character is not a misfire at all
+            // — the user typed a space, and it is already there.
+            return if provisional {
+                VoiceOutcome::None
+            } else {
+                VoiceOutcome::Notice("voice: hold the key while you speak".into())
+            };
+        }
+        self.stop_take()
     }
 
     /// Esc while recording or transcribing throws the take away.
@@ -988,6 +1000,24 @@ mod tests {
         };
 
         voice.tick();
+        assert_eq!(voice.state, VoiceState::Transcribing);
+        assert_eq!(
+            sent.lock().unwrap().as_slice(),
+            &[VoiceCmd::Start, VoiceCmd::Stop]
+        );
+    }
+
+    #[test]
+    fn a_real_release_promotes_repeat_detection() {
+        let (mut voice, sent) = voice();
+        voice.turn_on().expect("the fake backend starts");
+        voice.on_event(VoiceEvent::Ready);
+        voice.set_end_detect(EndDetect::Repeat);
+
+        voice.on_press(false);
+        voice.pretend_recording_started(Duration::from_millis(250));
+        assert_eq!(voice.on_release(), VoiceOutcome::None);
+        assert_eq!(voice.end_detect, EndDetect::Release);
         assert_eq!(voice.state, VoiceState::Transcribing);
         assert_eq!(
             sent.lock().unwrap().as_slice(),
