@@ -53,6 +53,10 @@ pub struct TaskRunMeta {
     /// One-line parent-authored description, with a prompt-derived fallback
     /// for traces created before task summaries existed.
     pub summary: String,
+    /// Set when this trace records a follow-up turn of an earlier run: each
+    /// turn's trace holds only its own appends, so the chain is what rebuilds
+    /// the run whole (`resume_chain`).
+    pub resume_of: Option<String>,
     pub created_unix: u64,
     pub status: TaskRunStatus,
     pub tool_calls: usize,
@@ -99,6 +103,20 @@ impl TaskTraces {
         self.root = root;
     }
 
+    /// Where this session records `id`, whether or not it exists yet. `None`
+    /// without a bound root (an ephemeral session persists nothing) and for
+    /// anything that is not an issued id shape: **run ids reach this from the
+    /// model**, so the only accepted form is `t<digits>` — a raw join would
+    /// turn `resume` into an arbitrary-file read through a tool that needs no
+    /// approval.
+    pub fn trace_path(&self, id: &str) -> Option<PathBuf> {
+        let digits = id.strip_prefix('t')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(self.root.as_ref()?.join(format!("{id}.jsonl")))
+    }
+
     /// Allocate the next run id and, when a root is bound, open its trace
     /// file with the meta line already written. Persistence is best-effort:
     /// an IO failure yields a valid id with no store, never a failed run.
@@ -109,6 +127,7 @@ impl TaskTraces {
         model: &str,
         prompt: &str,
         summary: &str,
+        resume_of: Option<&str>,
     ) -> (String, Option<TraceStore>) {
         let id = format!("t{}", self.next_seq);
         self.next_seq += 1;
@@ -129,6 +148,7 @@ impl TaskTraces {
                 model: model.to_string(),
                 prompt: prompt.to_string(),
                 summary: summary.to_string(),
+                resume_of: resume_of.map(ToOwned::to_owned),
                 created_unix: now_unix(),
             });
             Some(store)
@@ -155,11 +175,55 @@ impl TaskTraces {
             .collect()
     }
 
+    /// Rebuild a run's whole conversation from disk: its own trace plus every
+    /// follow-up turn recorded against it, replayed in id order into one
+    /// ledger. Each turn's trace holds only the events that turn produced —
+    /// and `TruncateTail`/`Compact` in it index the *session*, not the file —
+    /// so replaying the chain into a single ledger is what reproduces the
+    /// session the run had in memory. `None` when this session records no such
+    /// run, or when `id` is not a shape it could have issued.
+    pub fn restore(&self, id: &str) -> Option<(TaskRunMeta, Ledger)> {
+        let path = self.trace_path(id)?;
+        let root = self.root.as_ref()?;
+        let mut ledger = Ledger::new();
+        let mut labels = Vec::new();
+        let meta = replay_into(&path, &mut ledger, &mut labels).ok()?;
+        for follow in Self::discover(root)
+            .into_iter()
+            .filter(|meta| meta.resume_of.as_deref() == Some(id))
+        {
+            let Some(path) = follow.path else { continue };
+            // A follow-up whose file is unreadable stops the chain: replaying
+            // a later turn over a missing earlier one would silently invent a
+            // conversation that never happened.
+            if replay_into(&path, &mut ledger, &mut labels).is_err() {
+                break;
+            }
+        }
+        Some((meta, ledger))
+    }
+
     /// Load one trace for replay.
     pub fn load(path: &Path) -> Result<TaskRunLoad, StoreError> {
-        let mut meta: Option<TaskRunMeta> = None;
         let mut ledger = Ledger::new();
         let mut batch_labels = Vec::new();
+        let meta = replay_into(path, &mut ledger, &mut batch_labels)?;
+        Ok(TaskRunLoad {
+            meta,
+            ledger,
+            batch_labels,
+        })
+    }
+}
+
+/// Replay one trace file's events into `ledger`, returning its meta line.
+fn replay_into(
+    path: &Path,
+    ledger: &mut Ledger,
+    batch_labels: &mut Vec<(usize, String)>,
+) -> Result<TaskRunMeta, StoreError> {
+    let mut meta: Option<TaskRunMeta> = None;
+    {
         for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
             if line.trim().is_empty() {
@@ -173,6 +237,7 @@ impl TaskTraces {
                     model,
                     prompt,
                     summary,
+                    resume_of,
                     created_unix,
                 } => {
                     let summary = trace_summary(&summary, &prompt);
@@ -183,6 +248,7 @@ impl TaskTraces {
                         model,
                         prompt,
                         summary,
+                        resume_of,
                         created_unix,
                         status: TaskRunStatus::Interrupted,
                         tool_calls: 0,
@@ -213,13 +279,8 @@ impl TaskTraces {
                 | LogEvent::Checkpoint { .. } => {}
             }
         }
-        let meta = meta.ok_or_else(|| StoreError::External("trace has no meta line".into()))?;
-        Ok(TaskRunLoad {
-            meta,
-            ledger,
-            batch_labels,
-        })
     }
+    meta.ok_or_else(|| StoreError::External("trace has no meta line".into()))
 }
 
 /// One run's persisted trace. Cloneable so the `task` tool can hand the
@@ -300,6 +361,7 @@ fn read_meta(path: &Path) -> Option<TaskRunMeta> {
                 model,
                 prompt,
                 summary,
+                resume_of,
                 created_unix,
             }) = serde_json::from_str::<LogEvent>(&line)
             {
@@ -311,6 +373,7 @@ fn read_meta(path: &Path) -> Option<TaskRunMeta> {
                     model,
                     prompt,
                     summary,
+                    resume_of,
                     created_unix,
                     status: TaskRunStatus::Interrupted,
                     tool_calls: 0,
@@ -381,6 +444,67 @@ mod tests {
     }
 
     #[test]
+    fn a_run_id_only_ever_names_a_trace_inside_its_own_session_directory() {
+        let root = temp_root("ids");
+        let mut traces = TaskTraces::default();
+        traces.bind_root(Some(root.clone()));
+
+        assert_eq!(traces.trace_path("t12"), Some(root.join("t12.jsonl")));
+        // Ids reach this straight from the model. Anything but `t<digits>` is
+        // refused, so `resume` can never name a file outside the session dir.
+        for hostile in [
+            "../t1",
+            "t1/../../t1",
+            "../../../../etc/passwd",
+            "t",
+            "t1x",
+            "",
+            "t1 ",
+        ] {
+            assert_eq!(traces.trace_path(hostile), None, "accepted {hostile:?}");
+        }
+
+        // Without a bound root nothing is addressable at all.
+        assert_eq!(TaskTraces::default().trace_path("t1"), None);
+    }
+
+    #[test]
+    fn restore_replays_a_run_and_every_follow_up_recorded_against_it() {
+        let root = temp_root("chain");
+        let mut traces = TaskTraces::default();
+        traces.bind_root(Some(root.clone()));
+
+        let (base, store) = traces.begin("call-1", "explore", "m", "survey", "survey", None);
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store.unwrap()));
+        ledger.append(text_entry("survey"));
+        ledger.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "first pass".into(),
+        }]));
+
+        // A follow-up turn records only its own appends, against the same run.
+        let (_, store) = traces.begin("call-2", "explore", "m", "more", "more", Some(&base));
+        let mut follow = Ledger::new();
+        follow.attach_sink(Box::new(store.unwrap()));
+        follow.append(text_entry("more"));
+        follow.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "second pass".into(),
+        }]));
+
+        let (meta, restored) = traces.restore(&base).expect("restorable");
+        assert_eq!(meta.kind, "explore");
+        assert_eq!(meta.resume_of, None);
+        let transcript = format!("{:?}", restored.entries());
+        assert!(
+            transcript.contains("first pass") && transcript.contains("second pass"),
+            "the chain must replay into one conversation: {transcript}"
+        );
+        assert_eq!(restored.len(), 4);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_trace_roundtrips_ledger_meta_batches_and_finish() {
         let root = temp_root("roundtrip");
         let mut traces = TaskTraces::default();
@@ -392,6 +516,7 @@ mod tests {
             "gpt-test",
             "find the thing",
             "inspect task tracing",
+            None,
         );
         assert_eq!(id, "t1");
         let store = store.expect("trace store");
@@ -432,11 +557,11 @@ mod tests {
         let mut traces = TaskTraces::default();
         traces.bind_root(Some(root.clone()));
 
-        let (_, first) = traces.begin("call-a", "explore", "m", "a", "first task");
+        let (_, first) = traces.begin("call-a", "explore", "m", "a", "first task", None);
         first
             .expect("store")
             .finish(TaskRunStatus::Done, 1, Usage::default());
-        let (_, second) = traces.begin("call-b", "general", "m", "b", "second task");
+        let (_, second) = traces.begin("call-b", "general", "m", "b", "second task", None);
         drop(second); // no finish line: the process "died"
 
         let runs = TaskTraces::discover(&root);
@@ -454,14 +579,14 @@ mod tests {
         let root = temp_root("seq");
         let mut traces = TaskTraces::default();
         traces.bind_root(Some(root.clone()));
-        let (first, _) = traces.begin("c1", "explore", "m", "p", "first");
-        let (second, _) = traces.begin("c2", "explore", "m", "p", "second");
+        let (first, _) = traces.begin("c1", "explore", "m", "p", "first", None);
+        let (second, _) = traces.begin("c2", "explore", "m", "p", "second", None);
         assert_eq!((first.as_str(), second.as_str()), ("t1", "t2"));
 
         // A new process resumes the same session.
         let mut resumed = TaskTraces::default();
         resumed.bind_root(Some(root.clone()));
-        let (third, _) = resumed.begin("c3", "explore", "m", "p", "third");
+        let (third, _) = resumed.begin("c3", "explore", "m", "p", "third", None);
         assert_eq!(third, "t3");
 
         let _ = fs::remove_dir_all(&root);
@@ -470,7 +595,7 @@ mod tests {
     #[test]
     fn without_a_root_ids_are_issued_but_nothing_persists() {
         let mut traces = TaskTraces::default();
-        let (id, store) = traces.begin("c", "explore", "m", "p", "task");
+        let (id, store) = traces.begin("c", "explore", "m", "p", "task", None);
         assert_eq!(id, "t1");
         assert!(store.is_none());
     }

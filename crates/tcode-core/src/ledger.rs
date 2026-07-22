@@ -196,6 +196,57 @@ impl Ledger {
         self.entries.truncate(len);
     }
 
+    /// Answer tool calls that were committed but never got a result, because
+    /// the process holding them died mid-batch. Every committed `tool_use`
+    /// must have a matching `tool_result` (a provider invariant), and a log
+    /// replayed from disk is the one place a conversation can end without one:
+    /// a live turn always closes its own calls (`commit_interrupt`). Returns
+    /// the closed calls' names — tell the model, don't let it guess whether
+    /// they ran. Pure append, so it costs the retained prefix nothing.
+    pub fn close_dangling_tool_calls(&mut self, reason: &str) -> Vec<String> {
+        let Some(at) = self.entries.iter().rposition(|e| {
+            matches!(e, Entry::Assistant(blocks)
+                if blocks.iter().any(|b| matches!(b, ContentBlock::ToolUse { .. })))
+        }) else {
+            return Vec::new();
+        };
+        let answered: Vec<&str> = self.entries[at + 1..]
+            .iter()
+            .flat_map(|e| match e {
+                Entry::ToolResults(blocks) => blocks.as_slice(),
+                _ => &[],
+            })
+            .filter_map(|b| match b {
+                ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        let Entry::Assistant(blocks) = &self.entries[at] else {
+            return Vec::new();
+        };
+        let (results, names): (Vec<ContentBlock>, Vec<String>) = blocks
+            .iter()
+            .filter_map(|b| match b {
+                ContentBlock::ToolUse { id, name, .. } if !answered.contains(&id.as_str()) => {
+                    Some((
+                        ContentBlock::ToolResult {
+                            tool_use_id: id.clone(),
+                            content: reason.to_string(),
+                            is_error: true,
+                            images: Vec::new(),
+                        },
+                        name.clone(),
+                    ))
+                }
+                _ => None,
+            })
+            .unzip();
+        if !results.is_empty() {
+            self.append(Entry::ToolResults(results));
+        }
+        names
+    }
+
     /// Atomically replace entries [0, upto) with a summary. The one
     /// deliberate cache-invalidating operation.
     pub fn compact(&mut self, summary: String, upto: usize) {
@@ -320,6 +371,52 @@ mod tests {
         assert_eq!(l.len(), 2);
         assert!(matches!(&l.entries()[0], Entry::Summary(s) if s == "summary"));
         assert!(matches!(&l.entries()[1], Entry::User(_)));
+    }
+
+    #[test]
+    fn dangling_tool_calls_are_closed_only_once_and_only_when_unanswered() {
+        let mut l = Ledger::new();
+        l.append(Entry::User(text("go")));
+        l.append(Entry::Assistant(vec![
+            ContentBlock::ToolUse {
+                id: "a".into(),
+                name: "read".into(),
+                input: Value::Null,
+            },
+            ContentBlock::ToolUse {
+                id: "b".into(),
+                name: "shell".into(),
+                input: Value::Null,
+            },
+        ]));
+        l.append(Entry::ToolResults(vec![ContentBlock::ToolResult {
+            tool_use_id: "a".into(),
+            content: "ok".into(),
+            is_error: false,
+            images: vec![],
+        }]));
+
+        // Only the call without a result is closed, and it is named.
+        assert_eq!(l.close_dangling_tool_calls("process exited"), ["shell"]);
+        let closed: Vec<&str> = match l.entries().last().unwrap() {
+            Entry::ToolResults(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    ContentBlock::ToolResult { tool_use_id, .. } => Some(tool_use_id.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(closed, ["b"]);
+
+        // Idempotent: a second pass finds every call answered.
+        assert!(l.close_dangling_tool_calls("process exited").is_empty());
+        // And a conversation that never dangled is untouched.
+        let before = l.len();
+        l.append(Entry::Assistant(text("done")));
+        assert!(l.close_dangling_tool_calls("process exited").is_empty());
+        assert_eq!(l.len(), before + 1);
     }
 
     #[test]

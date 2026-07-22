@@ -516,7 +516,7 @@ fn agent_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
             "prompt": { "type": "string" },
             "resume": {
                 "type": "string",
-                "description": "Task id of a resumable previous run (given in its result line). The same sub-agent continues with its context intact — use for follow-up questions or feedback, and to pick a run that failed or was interrupted back up from where it stopped instead of paying for its work again. `agent` must match the original kind."
+                "description": "Task id of a resumable previous run (given in its result line). The same sub-agent continues with its context intact — use for follow-up questions or feedback, and to pick a run that failed or was interrupted back up from where it stopped instead of paying for its work again. Any run this conversation recorded stays resumable, including after a restart. `agent` must match the original kind."
             },
             "attach": {
                 "type": "array",
@@ -639,51 +639,7 @@ impl Tool for AgentTool {
                 .resume_run(id, def, &prompt, &summary, call_id, ctx, cancel)
                 .await;
         }
-        let system = def.system.clone();
-
-        let model = self.model_for(kind);
-        let model_name = model.provider.model().to_string();
-        let model = ModelCell::new(model);
-        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
-            ProviderSafetyClassifier::new(model.clone(), self.pinned.clone())
-                .with_config(self.auto_classifier_config),
-        );
-        let agent = Agent {
-            model: model.clone(),
-            // A sub-agent has no input box, so it never suggests; it still
-            // carries the pins so its own classifier resolves the same way.
-            models: self.pinned.clone(),
-            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
-            system,
-            watchdog: self.watchdog.clone(),
-            hooks: Default::default(),
-            safety_classifier: Some(safety_classifier),
-            auto_policy: self.auto_policy.clone(),
-            max_steps: def.max_steps.unwrap_or(tcode_core::DEFAULT_MAX_STEPS),
-            auto_compact: self.auto_compact,
-            auto_compact_percent: self.auto_compact_percent,
-        };
-        // Every sub-agent run is its own conversation on (usually) the parent's
-        // provider. Sharing the parent's cache id would interleave two
-        // unrelated prefixes on it, so each run names its own scope.
-        static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Delegated work is still the caller's work: it runs under the mode and
-        // rules the user chose for this conversation, not a stance of its own.
-        // The definition's `readonly` ceiling is the orthogonal knob — it has
-        // already removed mutating tools from `sub_tools`, so a permissive
-        // inherited mode cannot hand an explore agent something to mutate with.
-        let inherited = ctx.delegated_permissions();
-        let (mode, rules) = inherited
-            .map(|permissions| (permissions.mode, permissions.rules))
-            .unwrap_or_else(|| (PermissionMode::Auto, PermissionRules::default()));
-        let mut session = Session::new(
-            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
-                .with_model(model.clone()),
-            mode,
-            rules,
-        )
-        .with_cache_scope(format!("agent-{kind}-{run}"));
+        let (agent, mut session, model_name) = self.build_run(def, ctx);
 
         let run = match self
             .drive(
@@ -694,6 +650,7 @@ impl Tool for AgentTool {
                 &prompt,
                 &summary,
                 call_id,
+                None,
                 ctx,
                 cancel,
             )
@@ -764,6 +721,98 @@ struct TaskRunFailure {
 }
 
 impl AgentTool {
+    /// Everything one delegated run needs before its first turn: the agent, an
+    /// empty session under its own cache scope, and the resolved model's name.
+    /// A restored run is built here too, so a run recovered from a trace is
+    /// configured exactly like a fresh one instead of drifting from it.
+    fn build_run(&self, def: &AgentDef, ctx: &ToolCtx) -> (Agent, Session, String) {
+        let kind = &def.name;
+        let model = self.model_for(kind);
+        let model_name = model.provider.model().to_string();
+        let model = ModelCell::new(model);
+        let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
+            ProviderSafetyClassifier::new(model.clone(), self.pinned.clone())
+                .with_config(self.auto_classifier_config),
+        );
+        let agent = Agent {
+            model: model.clone(),
+            // A sub-agent has no input box, so it never suggests; it still
+            // carries the pins so its own classifier resolves the same way.
+            models: self.pinned.clone(),
+            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
+            system: def.system.clone(),
+            watchdog: self.watchdog.clone(),
+            hooks: Default::default(),
+            safety_classifier: Some(safety_classifier),
+            auto_policy: self.auto_policy.clone(),
+            max_steps: def.max_steps.unwrap_or(tcode_core::DEFAULT_MAX_STEPS),
+            auto_compact: self.auto_compact,
+            auto_compact_percent: self.auto_compact_percent,
+        };
+        // Every sub-agent run is its own conversation on (usually) the parent's
+        // provider. Sharing the parent's cache id would interleave two
+        // unrelated prefixes on it, so each run names its own scope.
+        static RUN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let run = RUN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Delegated work is still the caller's work: it runs under the mode and
+        // rules the user chose for this conversation, not a stance of its own.
+        // The definition's `readonly` ceiling is the orthogonal knob — it has
+        // already removed mutating tools from `sub_tools`, so a permissive
+        // inherited mode cannot hand an explore agent something to mutate with.
+        let inherited = ctx.delegated_permissions();
+        let (mode, rules) = inherited
+            .map(|permissions| (permissions.mode, permissions.rules))
+            .unwrap_or_else(|| (PermissionMode::Auto, PermissionRules::default()));
+        let session = Session::new(
+            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
+                .with_model(model),
+            mode,
+            rules,
+        )
+        .with_cache_scope(format!("agent-{kind}-{run}"));
+        (agent, session, model_name)
+    }
+
+    /// Rebuild a resumable run from its persisted trace, so a run outlives the
+    /// process that spawned it: after a restart or a `/resume`, `live` is empty
+    /// but `tasks/<session>/tN.jsonl` still holds the run's whole ledger. What
+    /// this buys is not the provider cache (that prefix is long gone) but the
+    /// work itself — every tool call and every conclusion the run already paid
+    /// for. `None` when this conversation records no such run, when the id is
+    /// not one it could have issued, or when the trace names an agent this
+    /// instance may not spawn.
+    fn restore_run(&self, id: &str, ctx: &ToolCtx) -> Option<LiveTask> {
+        let (meta, ledger) = ctx
+            .task_traces
+            .lock()
+            .expect("task traces lock")
+            .restore(id)?;
+        // The trace's own kind decides what is rebuilt; the caller's `agent`
+        // argument is then checked against it like any other parked run, so a
+        // mismatch is reported rather than silently honored.
+        let def = self.def_for(&meta.kind)?;
+        let (agent, mut session, model_name) = self.build_run(def, ctx);
+        session.ledger = ledger;
+        // A trace can stop anywhere — its process may have been killed
+        // mid-batch, which no live path can produce.
+        session.ledger.close_dangling_tool_calls(
+            "No result: the sub-agent's process exited while this call was in flight. Whether \
+             it took effect is unknown — verify before assuming either way.",
+        );
+        if session.ledger.is_empty() {
+            return None;
+        }
+        Some(LiveTask {
+            agent,
+            session,
+            exchanges_left: def.max_exchanges.max(SALVAGE_EXCHANGES),
+            def_name: def.name.clone(),
+            model_name,
+            scope: ctx.scratch_dir.clone(),
+            seq: next_park_seq(),
+        })
+    }
+
     /// Continue a parked run: same session, same cache scope, pure append —
     /// a follow-up costs only the increment on a full prefix cache hit.
     #[allow(clippy::too_many_arguments)]
@@ -787,7 +836,10 @@ impl AgentTool {
                 .then(|| live.remove(id))
                 .flatten()
         };
-        let Some(mut task) = taken else {
+        // Nothing parked in memory: this conversation may still have the run on
+        // disk, from before a restart or a `/resume`.
+        let restored = taken.is_none();
+        let Some(mut task) = taken.or_else(|| self.restore_run(id, ctx)) else {
             let mut parked: Vec<String> = {
                 let live = self.live.lock().expect("live tasks lock");
                 live.iter()
@@ -799,9 +851,9 @@ impl AgentTool {
             return ToolOutput::err(format!(
                 "no resumable agent run '{id}' — it may have expired, hit its follow-up limit, \
                  be resuming concurrently, or belong to a conversation that has since been \
-                 replaced (a restarted tcode, /resume or /clear keeps no run alive; ids from \
-                 this conversation's earlier transcript are dead). Resumable now: [{}]. Start a \
-                 fresh agent run instead.",
+                 replaced (/clear and a new conversation keep no run alive). Resumable now: \
+                 [{}], plus any run recorded earlier in this same conversation. Start a fresh \
+                 agent run instead.",
                 parked.join(", ")
             ));
         };
@@ -832,6 +884,7 @@ impl AgentTool {
                 prompt,
                 summary,
                 call_id,
+                Some(id),
                 ctx,
                 cancel,
             )
@@ -870,8 +923,12 @@ impl AgentTool {
                 } else {
                     "follow-up limit reached, agent run closed".to_string()
                 };
+                // Say when the run came back from disk: it means the model
+                // reading this may not be the one that produced the history,
+                // and that no provider cache backed this turn.
+                let how = if restored { "restored" } else { "resumed" };
                 ToolOutput::ok(format!(
-                    "[{} sub-agent {id} resumed on {model_name}: {}; {note}]\n{}",
+                    "[{} sub-agent {id} {how} on {model_name}: {}; {note}]\n{}",
                     def.name, run.stats, run.report
                 ))
             }
@@ -927,6 +984,9 @@ impl AgentTool {
         prompt: &str,
         summary: &str,
         call_id: &str,
+        // The parked run this turn continues, so the trace chain can rebuild
+        // the whole conversation from disk later.
+        resume_of: Option<&str>,
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> Result<TaskRunOutcome, TaskRunFailure> {
@@ -938,7 +998,7 @@ impl AgentTool {
             .task_traces
             .lock()
             .expect("task traces lock")
-            .begin(call_id, kind, model_name, prompt, summary);
+            .begin(call_id, kind, model_name, prompt, summary, resume_of);
         if let Some(trace) = &trace {
             session.ledger.attach_sink(Box::new(trace.clone()));
         }

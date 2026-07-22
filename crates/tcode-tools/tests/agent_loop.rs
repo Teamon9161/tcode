@@ -3438,11 +3438,122 @@ async fn a_failed_sub_agent_run_stays_resumable_with_its_work_intact() {
         format!("{:?}", requests[2].messages).contains("fn a()"),
         "the resumed turn must continue the failed run's context"
     );
-    assert!(
-        requests[2].cache_scope == requests[0].cache_scope,
-        "a resumed run keeps its cache scope, so the continuation costs the increment"
+    // The whole point of resuming in-process: the follow-up is a pure append
+    // on a byte-identical prefix, so it costs the increment and nothing else.
+    // The failed attempt left an `IncompleteAssistant` behind, which is
+    // transcript-only and must not disturb the prefix either.
+    assert_eq!(requests[2].cache_scope, requests[0].cache_scope);
+    assert_eq!(requests[2].system, requests[1].system);
+    assert_eq!(
+        format!("{:?}", &requests[2].messages[..requests[1].messages.len() - 1]),
+        format!("{:?}", &requests[1].messages[..requests[1].messages.len() - 1]),
+        "a resumed turn may only append: every earlier message must be unchanged"
     );
     assert!(!results[1].1 && results[1].0.contains("the report"));
+}
+
+/// A run must outlive the process that spawned it. After a restart `live` is
+/// empty, but the conversation still records the run on disk — so `resume`
+/// rebuilds it from its trace chain, and what comes back is the whole
+/// conversation (every earlier turn, across every earlier process), not just
+/// the first trace file.
+#[tokio::test]
+async fn a_run_resumes_across_restarts_from_its_trace_chain() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let traces = root.path().join("tasks");
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    // Process 1: the run does real work and reports.
+    let sub1 = MockProvider::named(
+        "scout-1",
+        vec![
+            tool_use("s1", "read", r#"{"path":"a.rs"}"#),
+            text_done("first pass: a.rs defines a()"),
+        ],
+    );
+    let parent1 = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "agent",
+            r#"{"agent":"explore","prompt":"survey","summary":"survey"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let mut first = session(root.path(), PermissionMode::Default);
+    first.tool_ctx.bind_task_trace_root(Some(traces.clone()));
+    run(
+        &task_agent(parent1, sub1),
+        &mut first,
+        &approver,
+        "explore this",
+    )
+    .await;
+
+    // Process 2: a brand-new tool instance — nothing is parked in memory.
+    let sub2 = MockProvider::named("scout-1", vec![text_done("second pass: a() is unused")]);
+    let parent2 = MockProvider::new(vec![
+        tool_use(
+            "call-2",
+            "agent",
+            r#"{"agent":"explore","prompt":"is a() used?","resume":"t1","summary":"follow up"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let mut second = session(root.path(), PermissionMode::Default);
+    second.tool_ctx.bind_task_trace_root(Some(traces.clone()));
+    run(
+        &task_agent(parent2, sub2.clone()),
+        &mut second,
+        &approver,
+        "keep going",
+    )
+    .await;
+
+    let results = tool_results(&second);
+    assert!(
+        !results[0].1 && results[0].0.contains("restored"),
+        "the run must come back from disk, and say so: {:?}",
+        results[0]
+    );
+    let history = format!("{:?}", sub2.requests.lock().unwrap()[0].messages);
+    assert!(
+        history.contains("fn a()") && history.contains("first pass"),
+        "the restored run must carry the previous process's work: {history}"
+    );
+
+    // Process 3: the chain must include process 2's turn, not just t1's trace.
+    let sub3 = MockProvider::named("scout-1", vec![text_done("third pass")]);
+    let parent3 = MockProvider::new(vec![
+        tool_use(
+            "call-3",
+            "agent",
+            r#"{"agent":"explore","prompt":"anything else?","resume":"t1","summary":"follow up"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let mut third = session(root.path(), PermissionMode::Default);
+    third.tool_ctx.bind_task_trace_root(Some(traces.clone()));
+    run(
+        &task_agent(parent3, sub3.clone()),
+        &mut third,
+        &approver,
+        "and more",
+    )
+    .await;
+
+    let history = format!("{:?}", sub3.requests.lock().unwrap()[0].messages);
+    assert!(
+        history.contains("first pass") && history.contains("second pass"),
+        "every earlier turn must be replayed, not only the first trace: {history}"
+    );
+    // Each follow-up turn is its own trace, linked back to the run it continues.
+    let recorded = tcode_core::TaskTraces::discover(&traces);
+    let chain: Vec<Option<&str>> = recorded
+        .iter()
+        .map(|meta| meta.resume_of.as_deref())
+        .collect();
+    assert_eq!(chain, vec![None, Some("t1"), Some("t1")], "{chain:?}");
 }
 
 /// One `AgentTool` instance outlives the conversations it serves (`/resume`

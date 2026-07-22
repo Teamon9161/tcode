@@ -74,6 +74,11 @@ pub enum LogEvent {
         /// files omit this; their loader derives a prompt-based fallback.
         #[serde(default)]
         summary: String,
+        /// The run this turn continues, when it is a follow-up. Each turn gets
+        /// its own trace holding only its own appends, so this link is what
+        /// lets a run be rebuilt whole from disk instead of amnesiac.
+        #[serde(default)]
+        resume_of: Option<String>,
         created_unix: u64,
     },
     /// Last line of a completed task trace file.
@@ -571,6 +576,20 @@ impl SessionStore {
                 | LogEvent::TaskFinished { .. }
                 | LogEvent::Batch { .. } => {}
             }
+        }
+        // A session killed mid-batch left its last tool calls unanswered, which
+        // no provider will accept. Close them, and say so: whether those calls
+        // ran is exactly the thing the model must not have to guess.
+        let cut_off = ledger.close_dangling_tool_calls(
+            "No result: tcode exited while this call was in flight. Whether it \
+             took effect is unknown — verify before assuming either way.",
+        );
+        if !cut_off.is_empty() {
+            ledger.append(Entry::Note(format!(
+                "The previous session ended while {} was still running. Its result was never \
+                 recorded; re-check the state it would have produced before continuing.",
+                cut_off.join(", ")
+            )));
         }
         // Background processes don't survive a restart. Zero-guessing: tell
         // the model which watches are gone instead of letting it discover a
