@@ -95,6 +95,25 @@ pub(super) fn app(cwd: &Path, width: u16, height: u16) -> App {
     app_with(cwd, width, height, config())
 }
 
+/// Same, with the sidecar download replaced. It is the one part of voice that
+/// runs off the UI thread, so a test has to be able to script how it ends.
+pub(super) fn app_with_voice_install(
+    cwd: &Path,
+    width: u16,
+    height: u16,
+    voice_install: crate::VoiceInstall,
+) -> App {
+    app_with(
+        cwd,
+        width,
+        height,
+        crate::TuiConfig {
+            voice_install,
+            ..config()
+        },
+    )
+}
+
 /// Same, with the `/provider` effects replaced so a test can observe what
 /// setup produced without any of it reaching the disk.
 pub(super) fn app_with_provider_setup(

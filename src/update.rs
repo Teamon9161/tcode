@@ -83,8 +83,6 @@ pub async fn install_release_asset(
     dest: &Path,
     progress: &mut dyn FnMut(u8),
 ) -> Result<()> {
-    use futures::StreamExt;
-
     let base = format!(
         "https://github.com/{REPOSITORY}/releases/download/v{}",
         env!("CARGO_PKG_VERSION")
@@ -99,51 +97,143 @@ pub async fn install_release_asset(
         format!("this release publishes no {asset}, so there is nothing to install")
     })?;
 
-    let response = client
-        .get(format!("{base}/{asset}"))
-        .send()
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("cannot create {}", parent.display()))?;
+    }
+    // Downloaded beside its destination rather than into memory: tens of
+    // megabytes over a link that drops them is exactly the case where every
+    // byte already received has to survive the drop.
+    let partial = partial_path(dest)?;
+
+    let url = format!("{base}/{asset}");
+    let mut attempt = 0;
+    loop {
+        let have = tokio::fs::metadata(&partial)
+            .await
+            .map(|meta| meta.len())
+            .unwrap_or(0);
+        match fetch_into(&client, &url, &partial, have, progress).await {
+            Ok(()) => break,
+            // Retried on the assumption the link is flaky rather than the
+            // asset missing: a resumed attempt starts where the last one
+            // stopped, so retrying costs only what was actually lost.
+            Err(error) if attempt + 1 < DOWNLOAD_ATTEMPTS && !is_fatal(&error) => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("cannot download {asset}"));
+            }
+        }
+    }
+
+    let bytes = tokio::fs::read(&partial)
         .await
-        .with_context(|| format!("cannot download {asset}"))?
-        .error_for_status()
-        .with_context(|| format!("cannot download {asset}"))?;
-    // Streamed for the progress report: this is tens of megabytes, and a
-    // silent wait is indistinguishable from a hang.
-    let total = response.content_length().unwrap_or(0);
-    let mut bytes = Vec::with_capacity(total as usize);
-    let mut stream = response.bytes_stream();
+        .with_context(|| format!("cannot read {}", partial.display()))?;
+    if hex::encode(Sha256::digest(&bytes)) != expected {
+        // The partial file is what a resumed attempt trusts, so a bad one has
+        // to go: keeping it would make every future attempt fail the same way.
+        let _ = tokio::fs::remove_file(&partial).await;
+        bail!("checksum mismatch for {asset}; it was not installed");
+    }
+    drop(bytes);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        tokio::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o755))
+            .await
+            .with_context(|| format!("cannot make {} executable", partial.display()))?;
+    }
+    // Renamed only once it is complete and verified, so the destination path
+    // never names a half-written executable.
+    tokio::fs::rename(&partial, dest)
+        .await
+        .with_context(|| format!("cannot write {}", dest.display()))?;
+    Ok(())
+}
+
+/// How many times a dropped download is resumed before giving up.
+const DOWNLOAD_ATTEMPTS: usize = 6;
+
+/// The scratch file a download accumulates into.
+///
+/// Built by hand rather than with `with_extension`, which would eat the `.16`
+/// of a name like `tcode-voiced-0.1.16`.
+fn partial_path(dest: &Path) -> Result<PathBuf> {
+    let name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("{} is not a usable file name", dest.display()))?;
+    Ok(dest.with_file_name(format!("{name}.part")))
+}
+
+/// Append one attempt's worth of `url` to `partial`, resuming after `have`
+/// bytes, and report percentage of the whole as it goes.
+async fn fetch_into(
+    client: &reqwest::Client,
+    url: &str,
+    partial: &Path,
+    have: u64,
+    progress: &mut dyn FnMut(u8),
+) -> Result<()> {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+
+    let mut request = client.get(url);
+    if have > 0 {
+        request = request.header(reqwest::header::RANGE, format!("bytes={have}-"));
+    }
+    let response = request.send().await?.error_for_status()?;
+
+    // A range request the server honours comes back as 206 and continues the
+    // file; anything else is a whole body, which means starting over.
+    let resuming = response.status() == reqwest::StatusCode::PARTIAL_CONTENT;
+    let start = if resuming { have } else { 0 };
+    let total = response.content_length().unwrap_or(0) + start;
+
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resuming)
+        .truncate(!resuming)
+        .open(partial)
+        .await
+        .with_context(|| format!("cannot write {}", partial.display()))?;
+
+    let mut written = start;
     let mut last = u8::MAX;
+    let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("download interrupted")?;
-        bytes.extend_from_slice(&chunk);
+        file.write_all(&chunk)
+            .await
+            .with_context(|| format!("cannot write {}", partial.display()))?;
+        written += chunk.len() as u64;
+        // Streamed for the progress report: this is tens of megabytes, and a
+        // silent wait is indistinguishable from a hang.
         if total > 0 {
-            let pct = ((bytes.len() as u64 * 100) / total).min(100) as u8;
+            let pct = ((written * 100) / total).min(100) as u8;
             if pct != last {
                 last = pct;
                 progress(pct);
             }
         }
     }
-
-    if hex::encode(Sha256::digest(&bytes)) != expected {
-        bail!("checksum mismatch for {asset}; it was not installed");
-    }
-
-    if let Some(parent) = dest.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("cannot create {}", parent.display()))?;
-    }
-    tokio::fs::write(dest, bytes)
+    file.flush()
         .await
-        .with_context(|| format!("cannot write {}", dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        tokio::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))
-            .await
-            .with_context(|| format!("cannot make {} executable", dest.display()))?;
-    }
+        .with_context(|| format!("cannot write {}", partial.display()))?;
     Ok(())
+}
+
+/// Whether retrying is pointless. A refusal from GitHub is about the asset, not
+/// the link, and repeating it only makes the user wait to hear the same thing.
+fn is_fatal(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<reqwest::Error>()
+        .is_some_and(|error| error.status().is_some())
 }
 
 fn release_asset() -> Result<&'static str> {
@@ -252,6 +342,14 @@ mod tests {
             Some("def456".to_string())
         );
         assert_eq!(checksum_for(checksums, "tcode-aarch64-linux"), None);
+    }
+
+    #[test]
+    fn a_resumed_download_keeps_the_whole_versioned_name() {
+        assert_eq!(
+            partial_path(Path::new("/home/u/.tcode/voice/tcode-voiced-0.1.16")).unwrap(),
+            PathBuf::from("/home/u/.tcode/voice/tcode-voiced-0.1.16.part")
+        );
     }
 
     #[test]

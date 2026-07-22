@@ -388,7 +388,11 @@ impl Voice {
     /// the reason, and hands that reason back for the caller to show properly:
     /// "your microphone is missing" deserves better than a notice that fades.
     pub(crate) fn turn_on(&mut self) -> Result<(), String> {
-        if self.is_on() {
+        // A backend already running is what makes starting a no-op — not being
+        // "on", which also covers the states that come *before* one exists.
+        // The install that just finished leaves voice in `Installing`, and
+        // that is exactly the moment there is finally something to start.
+        if self.backend.is_some() {
             return Ok(());
         }
         match (self.factory)(&self.cfg, self.events.clone()) {
@@ -905,6 +909,27 @@ mod tests {
         // take itself. The provisional path `space` takes has its own tests.
         voice.cfg.key = VoiceKey::CtrlSpace;
         (voice, sent)
+    }
+
+    /// The download ends in `Installing(100)`, which is "on" by every measure
+    /// except the one that matters — there is no backend yet. Starting one
+    /// then has to actually start it, or the finished download parks the hint
+    /// row on "downloading 100%" forever and the key does nothing.
+    #[test]
+    fn a_finished_install_starts_the_backend_it_just_fetched() {
+        let (mut voice, _sent) = voice();
+        voice.begin_install();
+        voice.on_event(VoiceEvent::Installing(100));
+
+        voice.turn_on().expect("the fake backend starts");
+
+        assert_eq!(voice.state, VoiceState::Warming(None));
+        let hint = voice.hint().expect("starting up is worth showing");
+        assert!(
+            !hint.rest.contains("downloading"),
+            "the hint row leaves the download behind: {}",
+            hint.rest
+        );
     }
 
     /// The whole point of the feature: audio in, editor text out, and the

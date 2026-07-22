@@ -635,7 +635,7 @@ impl App {
     /// Download the sidecar, then turn voice on. Runs off the UI thread and
     /// reports through the same channel the sidecar itself uses, so the hint
     /// row shows one continuous "getting ready" rather than two mechanisms.
-    fn install_voice_backend(&mut self) {
+    pub(super) fn install_voice_backend(&mut self) {
         let Some(asset) = crate::voice::release_asset() else {
             self.bake(vec![Line::styled(
                 format!(
@@ -660,14 +660,21 @@ impl App {
         };
         self.voice.begin_install();
         let tx = self.voice.events();
+        let watchdog = tx.clone();
         let install = self.voice_install.clone();
         // Blocking: it is a plain synchronous download, and this keeps the
         // injected closure free of an async signature it has no use for.
-        tokio::task::spawn_blocking(move || {
+        let installing = tokio::task::spawn_blocking(move || {
             let progress = {
                 let tx = tx.clone();
+                // `try_send`, not `blocking_send`: the installer drives its own
+                // future here, so this callback runs *inside* a runtime and a
+                // blocking send would panic. Dropping a percent when the
+                // channel is momentarily full costs nothing — the next chunk
+                // reports a fresher number, and the terminal event below is
+                // sent outside that future.
                 Box::new(move |pct| {
-                    let _ = tx.blocking_send(VoiceEvent::Installing(pct));
+                    let _ = tx.try_send(VoiceEvent::Installing(pct));
                 }) as Box<dyn FnMut(u8) + Send>
             };
             let event = match (install.0)(asset, path, progress) {
@@ -675,6 +682,22 @@ impl App {
                 Err(reason) => VoiceEvent::Failed(reason),
             };
             let _ = tx.blocking_send(event);
+        });
+        // The download is the only thing that ever ends the "downloading"
+        // state, so a task that dies without sending leaves the hint row at a
+        // percentage that will never move again — the one failure mode the
+        // user cannot tell from a slow network. Watching the handle turns it
+        // back into something with a stated cause and a way out.
+        tokio::spawn(async move {
+            if installing.await.is_err() {
+                let _ = watchdog
+                    .send(VoiceEvent::Failed(
+                        "the voice backend installer stopped before it finished; \
+                         run /voice on to try again"
+                            .into(),
+                    ))
+                    .await;
+            }
         });
     }
 

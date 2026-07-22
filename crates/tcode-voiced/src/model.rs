@@ -222,38 +222,106 @@ fn directory(archive: &str) -> &str {
     archive.strip_suffix(".tar.bz2").unwrap_or(archive)
 }
 
+/// How many times a dropped download is resumed before giving up.
+const DOWNLOAD_ATTEMPTS: usize = 6;
+
+/// Why an attempt stopped, and therefore whether another one would differ.
+enum Stopped {
+    /// The link failed part way. Everything received so far is on disk, so
+    /// the next attempt continues from there rather than from zero.
+    Dropped(String),
+    /// The answer will be the same however many times it is asked for.
+    Final(String),
+}
+
 fn download_and_unpack(
     url: &str,
     dir: &Path,
     archive: &str,
     progress: &mut dyn FnMut(u8),
 ) -> Result<(), String> {
-    let response = ureq::get(url)
-        .call()
-        .map_err(|e| format!("cannot download {url}: {e}"))?;
+    // Streamed to disk rather than held in memory: this is hundreds of
+    // megabytes, and the machine may be doing something else. It also outlives
+    // a failed attempt, which is what makes resuming possible — including
+    // across a restart, since the file is still there next time.
+    let temp = dir.join(format!("{archive}.part"));
+    let mut attempt = 0;
+    loop {
+        let have = fs::metadata(&temp).map(|meta| meta.len()).unwrap_or(0);
+        match fetch_into(url, &temp, have, progress) {
+            Ok(()) => break,
+            Err(Stopped::Dropped(_)) if attempt + 1 < DOWNLOAD_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+            Err(Stopped::Dropped(reason) | Stopped::Final(reason)) => return Err(reason),
+        }
+    }
+
+    let file = fs::File::open(&temp).map_err(|e| format!("cannot read {}: {e}", temp.display()))?;
+    let unpacked = tar::Archive::new(bzip2::read::BzDecoder::new(file))
+        .unpack(dir)
+        .map_err(|e| format!("cannot unpack {}: {e}", temp.display()));
+    // Removed either way. On success it has served its purpose; on failure it
+    // is the file a resumed attempt would trust, and trusting a corrupt one
+    // would make every future attempt fail in exactly the same place.
+    let _ = fs::remove_file(&temp);
+    unpacked
+}
+
+/// Append one attempt's worth of `url` to `temp`, resuming after `have` bytes,
+/// and report percentage of the whole as it goes.
+fn fetch_into(
+    url: &str,
+    temp: &Path,
+    have: u64,
+    progress: &mut dyn FnMut(u8),
+) -> Result<(), Stopped> {
+    let mut request = ureq::get(url);
+    if have > 0 {
+        request = request.set("Range", &format!("bytes={have}-"));
+    }
+    let response = match request.call() {
+        Ok(response) => response,
+        // Asked to resume past the end: what is on disk is already the whole
+        // archive, so there is nothing left to fetch.
+        Err(ureq::Error::Status(416, _)) if have > 0 => return Ok(()),
+        Err(error @ ureq::Error::Status(..)) => {
+            return Err(Stopped::Final(format!("cannot download {url}: {error}")))
+        }
+        Err(error) => return Err(Stopped::Dropped(format!("cannot download {url}: {error}"))),
+    };
+
+    // A range request the server honours comes back as 206 and continues the
+    // file; anything else is a whole body, which means starting over.
+    let resuming = response.status() == 206;
+    let start = if resuming { have } else { 0 };
     let total: u64 = response
         .header("Content-Length")
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0);
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0)
+        + start;
 
-    // Streamed to disk rather than held in memory: this is hundreds of
-    // megabytes, and the machine may be doing something else.
-    let temp = dir.join(format!("{archive}.part"));
-    let mut file =
-        fs::File::create(&temp).map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(resuming)
+        .truncate(!resuming)
+        .open(temp)
+        .map_err(|e| Stopped::Final(format!("cannot write {}: {e}", temp.display())))?;
     let mut reader = response.into_reader();
     let mut buffer = vec![0u8; 256 * 1024];
-    let mut done: u64 = 0;
+    let mut done = start;
     let mut last_pct = u8::MAX;
     loop {
         let read = reader
             .read(&mut buffer)
-            .map_err(|e| format!("download interrupted: {e}"))?;
+            .map_err(|e| Stopped::Dropped(format!("download interrupted: {e}")))?;
         if read == 0 {
             break;
         }
         std::io::Write::write_all(&mut file, &buffer[..read])
-            .map_err(|e| format!("cannot write {}: {e}", temp.display()))?;
+            .map_err(|e| Stopped::Final(format!("cannot write {}: {e}", temp.display())))?;
         done += read as u64;
         if total > 0 {
             let pct = ((done * 100) / total).min(100) as u8;
@@ -264,13 +332,6 @@ fn download_and_unpack(
             }
         }
     }
-    drop(file);
-
-    let file = fs::File::open(&temp).map_err(|e| format!("cannot read {}: {e}", temp.display()))?;
-    tar::Archive::new(bzip2::read::BzDecoder::new(file))
-        .unpack(dir)
-        .map_err(|e| format!("cannot unpack {}: {e}", temp.display()))?;
-    let _ = fs::remove_file(&temp);
     Ok(())
 }
 

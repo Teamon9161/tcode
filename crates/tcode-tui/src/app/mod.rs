@@ -2186,6 +2186,37 @@ mod tests {
         );
     }
 
+    /// Nothing but the download ends the "downloading" state, so an installer
+    /// that dies without reporting would leave the hint row at a percentage
+    /// that never moves — indistinguishable from a slow network, and with no
+    /// way out.
+    #[tokio::test]
+    async fn an_installer_that_dies_says_so_instead_of_freezing_at_a_percentage() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app_with_voice_install(
+            dir.path(),
+            90,
+            40,
+            crate::VoiceInstall(std::sync::Arc::new(|_, _, _| panic!("installer died"))),
+        );
+        app.fake_voice(tcode_core::config::VoiceKey::CtrlSpace);
+
+        app.install_voice_backend();
+        let event = app
+            .voice_rx
+            .recv()
+            .await
+            .expect("a dead installer still reports an end");
+        app.on_voice_event(event);
+
+        let frame = app.frame();
+        assert!(
+            frame.contains("stopped before it finished"),
+            "the hint row says the install ended and why:
+{frame}"
+        );
+    }
+
     /// A backend failure parks a warning on the hint row. It has to say how to
     /// get rid of it and Esc has to actually do that, or the only way out the
     /// user can find is restarting tcode.
