@@ -17,11 +17,18 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::config::McpServerConfig;
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const CALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Cap on how many images one result may put into context. A browser server
+/// can return a screenshot per step; the text still accounts for every one of
+/// them, but the pixels stop here.
+const MAX_RESULT_IMAGES: usize = 8;
+/// Upper bound on a single encoded payload before it is decoded. Decoding
+/// itself is separately bounded inside `normalize_image`.
+const MAX_SOURCE_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
 
@@ -176,7 +183,11 @@ impl McpClient {
         }
     }
 
-    async fn call_tool(&self, name: &str, arguments: Value) -> Result<(String, bool), String> {
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<(String, bool, Vec<ContentBlock>), String> {
         let result = self
             .request(
                 "tools/call",
@@ -188,7 +199,11 @@ impl McpClient {
             .get("isError")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        Ok((render_content(&result), is_error))
+        // Rendering decodes and rescales images; keep that off the reactor.
+        let (content, images) = tokio::task::spawn_blocking(move || render_content(&result))
+            .await
+            .map_err(|e| format!("mcp result decoding failed: {e}"))?;
+        Ok((content, is_error, images))
     }
 }
 
@@ -235,20 +250,32 @@ async fn list_tools(client: &Arc<McpClient>) -> Result<Vec<Arc<dyn Tool>>, Strin
     }
 }
 
-/// Flatten an MCP content array to model-readable text.
-fn render_content(result: &Value) -> String {
+/// Flatten an MCP content array to model-readable text plus the image blocks
+/// that ride alongside it. Images go through the same normalization budget as
+/// file reads and clipboard pastes, so a server cannot spend more context on
+/// one picture than `read` can.
+fn render_content(result: &Value) -> (String, Vec<ContentBlock>) {
     let Some(items) = result.get("content").and_then(Value::as_array) else {
-        return result.to_string();
+        return (result.to_string(), Vec::new());
     };
+    let mut images = Vec::new();
     let parts: Vec<String> = items
         .iter()
         .filter_map(|item| match item.get("type").and_then(Value::as_str) {
             Some("text") => item.get("text").and_then(Value::as_str).map(str::to_owned),
-            Some("image") => Some("(image content omitted)".into()),
+            Some("image") => Some(take_image(
+                item.get("data").and_then(Value::as_str),
+                &mut images,
+            )),
             Some("resource") => item
                 .pointer("/resource/text")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
+                .or_else(|| {
+                    item.pointer("/resource/blob")
+                        .and_then(Value::as_str)
+                        .map(|blob| take_image(Some(blob), &mut images))
+                })
                 .or_else(|| {
                     item.pointer("/resource/uri")
                         .and_then(Value::as_str)
@@ -257,10 +284,49 @@ fn render_content(result: &Value) -> String {
             _ => None,
         })
         .collect();
-    if parts.is_empty() {
+    let text = if parts.is_empty() {
         "(empty result)".to_string()
     } else {
         parts.join("\n")
+    };
+    (text, images)
+}
+
+/// Decode one base64 payload into a context-ready image block, returning the
+/// text that stands in for it. A payload that cannot become an image always
+/// leaves a trace in the text: silently dropping it would let the model reason
+/// about a screenshot it never received. The declared mime type is ignored —
+/// `normalize_image` sniffs magic bytes, and the server's claim is data.
+fn take_image(data: Option<&str>, images: &mut Vec<ContentBlock>) -> String {
+    use base64::Engine as _;
+
+    let Some(data) = data else {
+        return "(image dropped: no data)".to_string();
+    };
+    if images.len() >= MAX_RESULT_IMAGES {
+        return format!("(image dropped: over {MAX_RESULT_IMAGES} images in one result)");
+    }
+    if data.len() / 4 * 3 > MAX_SOURCE_IMAGE_BYTES {
+        return format!(
+            "(image dropped: encoded payload exceeds {} MB)",
+            MAX_SOURCE_IMAGE_BYTES / (1024 * 1024)
+        );
+    }
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(data) else {
+        return "(image dropped: payload is not valid base64)".to_string();
+    };
+    match tcode_core::images::normalize_image(&bytes) {
+        Ok(image) => {
+            let text = format!(
+                "(image {}x{}, {:.0} KB)",
+                image.width,
+                image.height,
+                image.bytes.len() as f64 / 1024.0
+            );
+            images.push(image.into_block());
+            text
+        }
+        Err(error) => format!("(image dropped: {error})"),
     }
 }
 
@@ -299,10 +365,10 @@ impl Tool for McpTool {
         let call = self.client.call_tool(&self.tool_name, input);
         tokio::select! {
             result = call => match result {
-                Ok((content, is_error)) => ToolOutput {
+                Ok((content, is_error, images)) => ToolOutput {
                     content,
                     is_error,
-                    images: Vec::new(),
+                    images,
                 },
                 Err(e) => ToolOutput::err(e),
             },
@@ -340,17 +406,66 @@ pub async fn connect_mcp_servers(
 mod tests {
     use super::*;
 
+    fn png_b64() -> String {
+        use base64::Engine as _;
+        let png = tcode_core::images::normalize_rgba(2, 2, vec![0; 16]).unwrap();
+        base64::engine::general_purpose::STANDARD.encode(png.bytes)
+    }
+
     #[test]
     fn content_rendering() {
         let result = json!({ "content": [
             { "type": "text", "text": "hello" },
-            { "type": "image", "data": "…", "mimeType": "image/png" },
+            { "type": "image", "data": png_b64(), "mimeType": "image/png" },
             { "type": "resource", "resource": { "uri": "file:///x", "text": "body" } }
         ]});
+        let (text, images) = render_content(&result);
+        assert_eq!(text, "hello\n(image 2x2, 0 KB)\nbody");
+        assert!(matches!(images.as_slice(), [ContentBlock::Image { .. }]));
         assert_eq!(
-            render_content(&result),
-            "hello\n(image content omitted)\nbody"
+            render_content(&json!({ "content": [] })).0,
+            "(empty result)"
         );
-        assert_eq!(render_content(&json!({ "content": [] })), "(empty result)");
+    }
+
+    #[test]
+    fn image_carried_by_an_embedded_resource_blob() {
+        let result = json!({ "content": [
+            { "type": "resource", "resource": { "uri": "ui://shot", "blob": png_b64() } }
+        ]});
+        let (text, images) = render_content(&result);
+        assert_eq!(text, "(image 2x2, 0 KB)");
+        assert_eq!(images.len(), 1);
+    }
+
+    /// A payload that cannot become an image must still be visible in the
+    /// text, and must never take the whole result down with it.
+    #[test]
+    fn undecodable_payloads_degrade_to_text() {
+        let result = json!({ "content": [
+            { "type": "text", "text": "before" },
+            { "type": "image", "data": "not base64 !!", "mimeType": "image/png" },
+            { "type": "image", "mimeType": "image/png" },
+            { "type": "image", "data": "aGVsbG8=", "mimeType": "image/png" },
+            { "type": "text", "text": "after" },
+        ]});
+        let (text, images) = render_content(&result);
+        assert!(images.is_empty());
+        assert_eq!(
+            text,
+            "before\n(image dropped: payload is not valid base64)\n\
+             (image dropped: no data)\n\
+             (image dropped: unsupported image format)\nafter"
+        );
+    }
+
+    #[test]
+    fn images_beyond_the_cap_are_dropped_not_rendered() {
+        let items: Vec<Value> = (0..MAX_RESULT_IMAGES + 2)
+            .map(|_| json!({ "type": "image", "data": png_b64() }))
+            .collect();
+        let (text, images) = render_content(&json!({ "content": items }));
+        assert_eq!(images.len(), MAX_RESULT_IMAGES);
+        assert_eq!(text.matches("(image dropped: over").count(), 2);
     }
 }
