@@ -179,5 +179,6 @@ loop {
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. batch edit某些情形下行号显示有问题。一行里的替换，减一行加一行，但是左边行号全是1，实际也不是第一行。这是6changes across 1file
-6. 设定的改变比如用户打了什么，可以类似prompt那样渲染用户输入以及把自动回复一样渲染。现在全部挤在一起了，尤其是/voice的切换等功能
-7. state.toml并入config.toml, 支持cli或者-p传入config地址。
+6. run长命令,审批完命令仍然留在展示窗口中,默认应该是长命令run的内容和结果支持点击展开.
+7. 设定的改变比如用户打了什么，可以类似prompt那样渲染用户输入以及把自动回复一样渲染。现在全部挤在一起了，尤其是/voice的切换等功能
+8. state.toml并入config.toml, 支持cli或者-p传入config地址。
