@@ -70,12 +70,22 @@ fn config() -> crate::TuiConfig {
             pins: Vec::new(),
             pin: Box::new(|_, _| Err("no pinning in tests".into())),
         },
+        presets: crate::PresetMenu {
+            options: Vec::new(),
+            current: None,
+            apply: Box::new(|_| Err("no presets in tests".into())),
+            save: Box::new(|_, _, _| Err("no presets in tests".into())),
+        },
         provider_setup: crate::ProviderSetup {
             // Never the real ~/.tcode/config.toml: tests must neither depend
             // on this machine's providers nor be able to overwrite them.
             load: Box::new(|| Ok(tcode_core::config::Config::default())),
-            apply: Box::new(|_, _| Err("no provider setup in tests".into())),
+            apply: Box::new(|_| Err("no provider setup in tests".into())),
         },
+        state_store: crate::StateStore::new(
+            || Ok(tcode_core::config::ModelState::default()),
+            |_| Ok(()),
+        ),
         opening_context: Arc::new(|cwd: &Path, _| tcode_core::StartupContext {
             text: String::new(),
             environment: environment(cwd),
@@ -224,7 +234,7 @@ impl App {
         self.voice.set_end_detect(crate::voice::EndDetect::Release);
         self.voice_rx = rx;
         // Straight past the config file: `set_voice` would persist to the real
-        // state.toml on the machine running the tests.
+        // [tcode_state] in the selected config on the machine running the tests.
         self.voice.turn_on().expect("the fake backend starts");
         self.on_voice_event(crate::voice::VoiceEvent::Ready);
         log

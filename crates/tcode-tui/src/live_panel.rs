@@ -87,6 +87,14 @@ pub struct UiTaskRun {
     /// The main transcript's parent task-call header, when it has a simple
     /// header block to attach the task trace link to.
     pub block: Option<usize>,
+    /// The run that delegated this one, when it was not the main conversation.
+    /// A nested run's card lives in its parent's trace, not the main
+    /// transcript, so `block` is `None` for it — but it is still a run of this
+    /// session: it belongs in the tree and its own trace must be reachable.
+    pub parent_run: Option<String>,
+    /// How many delegations deep, for the tree's indent. 0 = delegated by the
+    /// main conversation.
+    pub depth: usize,
 }
 
 impl UiTaskRun {
@@ -117,7 +125,16 @@ impl UiTaskRun {
             steps: Vec::new(),
             events: Vec::new(),
             block,
+            parent_run: None,
+            depth: 0,
         }
+    }
+
+    /// Same run, delegated by another run rather than by the main conversation.
+    pub fn nested_under(mut self, parent: &UiTaskRun) -> Self {
+        self.parent_run = Some(parent.id.clone());
+        self.depth = parent.depth + 1;
+        self
     }
 
     /// The in-flight call the status line should show right now, if any.
@@ -225,8 +242,16 @@ pub fn lines(
         for (i, run) in runs.iter().enumerate() {
             let target = PanelTarget::Task(run.id.clone());
             let highlighted = hovered == Some(&target);
-            let connector = if i + 1 == runs.len() { "└ " } else { "├ " };
-            let task_lines = task_lines(run, width, highlighted, connector, current == &target);
+            // A run delegated by another run hangs one level further in, so the
+            // tree says who spawned whom instead of flattening every depth into
+            // one list of siblings.
+            let last = runs[i + 1..].iter().all(|next| next.depth > run.depth);
+            let connector = format!(
+                "{}{}",
+                "  ".repeat(run.depth),
+                if last { "└ " } else { "├ " }
+            );
+            let task_lines = task_lines(run, width, highlighted, &connector, current == &target);
             targets.extend(std::iter::repeat_n(Some(target), task_lines.len()));
             lines.extend(task_lines);
         }

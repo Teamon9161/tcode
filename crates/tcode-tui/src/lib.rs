@@ -48,23 +48,62 @@ use tcode_core::{Agent, Session};
 
 pub use app::App;
 pub use model_picker::{
-    AgentMenu, AgentModelChoice, AgentRole, ModelMenu, ModelOption, PinFn, SwitchFn,
+    AgentMenu, AgentModelChoice, AgentRole, ApplyPresetFn, ModelMenu, ModelOption, PinFn,
+    PresetDraft, PresetMenu, PresetOption, RoleSection, SavePresetFn, SwitchFn,
 };
 pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
+
+/// Runtime-state access is injected by the binary so every frontend action
+/// writes the config file selected at startup, never a hard-coded home path.
+#[derive(Clone)]
+pub struct StateStore {
+    load: Arc<dyn Fn() -> Result<ModelState, String> + Send + Sync>,
+    update:
+        Arc<dyn Fn(Box<dyn FnOnce(&mut ModelState) + Send>) -> Result<(), String> + Send + Sync>,
+}
+
+impl StateStore {
+    pub fn new(
+        load: impl Fn() -> Result<ModelState, String> + Send + Sync + 'static,
+        update: impl Fn(Box<dyn FnOnce(&mut ModelState) + Send>) -> Result<(), String>
+            + Send
+            + Sync
+            + 'static,
+    ) -> Self {
+        Self {
+            load: Arc::new(load),
+            update: Arc::new(update),
+        }
+    }
+
+    pub fn load(&self) -> Result<ModelState, String> {
+        (self.load)()
+    }
+
+    pub fn update_checked(
+        &self,
+        edit: impl FnOnce(&mut ModelState) + Send + 'static,
+    ) -> Result<(), String> {
+        (self.update)(Box::new(edit))
+    }
+
+    pub fn update(&self, edit: impl FnOnce(&mut ModelState) + Send + 'static) {
+        let _ = self.update_checked(edit);
+    }
+}
 
 /// The two effects `/provider` needs. Both live in the binary crate, like
 /// `SwitchFn` and `PinFn`, so the TUI depends neither on the concrete
 /// providers nor on where config.toml lives.
 pub struct ProviderSetup {
-    /// The user's own global config, to seed the form. Never the merged
-    /// runtime config: a project overlay must not be copied into
-    /// `~/.tcode/config.toml` by saving.
+    /// The selected user config, to seed the form. Never the merged runtime
+    /// config: a project overlay must not be copied into the selected file by
+    /// saving.
     pub load: Box<dyn Fn() -> Result<Config, String> + Send + Sync>,
     /// Persist the result and rebuild everything derived from it: the active
     /// provider in the shared `ModelCell`, then both menus.
     #[allow(clippy::type_complexity)]
-    pub apply:
-        Box<dyn Fn(Config, ModelState) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
+    pub apply: Box<dyn Fn(Config) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
 }
 
 /// Fetches the voice sidecar for this platform and puts it at the given path.
@@ -89,12 +128,14 @@ pub struct VoiceInstall(
 pub struct TuiConfig {
     pub menu: ModelMenu,
     pub agents: AgentMenu,
+    pub presets: PresetMenu,
     pub provider_setup: ProviderSetup,
+    pub state_store: StateStore,
     pub opening_context: OpeningContextFn,
     pub environment: EnvironmentFn,
     pub show_reasoning: bool,
     pub skills: Vec<tcode_tools::Skill>,
-    /// `[voice]`, with `enabled` already resolved against state.toml.
+    /// `[voice]`, with `enabled` already resolved against [tcode_state] in the selected config.
     pub voice: tcode_core::config::VoiceConfig,
     /// How to fetch the voice sidecar when it is not installed yet.
     pub voice_install: VoiceInstall,

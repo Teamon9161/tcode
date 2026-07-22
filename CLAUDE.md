@@ -60,8 +60,9 @@ Workspace 四个 crate（core / providers / importers / tools / tui）+ 根 bina
 ## 配置与运行时路径
 
 - **配置说明必须同步**：凡是用户可配置的 `Config` / profile / model / agent frontmatter / permission / limit / watchdog / Auto Mode / UI / hook / MCP 字段发生新增、删除、重命名、默认值、优先级或安全语义变化，必须在同一改动更新 `crates/tcode-tools/src/skills/builtin/tcode-config/SKILL.md`；其中要说明字段含义、有效值或类型、默认/继承规则、作用域与一个安全的最小示例。不得让已生效的配置项在该 skill 中无说明。
-- `~/.tcode/config.toml`：profile/模型/权限规则，永远手写（首启向导生成初版）。
-- `~/.tcode/state.toml`：程序自己决定并要记住的东西——当前 profile/model/effort、`/agents` 的 sub-agent 钉选、`/dogfood` 开关。程序只写这个文件。优先级 CLI flag > state > config。多处写入必须走 `ModelState::update`（读-改-写），整 struct `save()` 会把兄弟字段悄悄清掉。
+- `~/.tcode/config.toml`（或 `tcode --config <PATH>` 选中的个人配置）：profile/模型/权限规则，主要由用户手写（首启向导生成初版）；运行态在同一文件的 `[tcode_state]`。程序只会以 `toml_edit` 读-改-写该表，保留其余用户字段、未知表和注释。
+- `[tcode_state]`：程序记住的当前 profile/model/effort、活跃 preset、`/agents` 的 sub-agent 钉选、`/dogfood`、建议、语音、模式和 folder trust。优先级 CLI flag > `[tcode_state]` > 活跃 preset > config。多处写入必须走选中配置路径的 `Config::update_tcode_state[_checked]`（读-改-写），不得整体重写用户配置。首次使用默认配置且没有 `[tcode_state]` 时，会迁移旧 `~/.tcode/state.toml`；自定义 `--config` 文件绝不吸收它。
+- `[presets.<name>]`：用户命名的整套模型编排（主模型 + 各角色），`/model` 面板或 `/model preset <name>` 整体切换，切换即清空 `[tcode_state]` 里的临时 pick。**`Config::upsert_preset` 是程序唯一一处写 `[tcode_state]` 之外的表**（`/model save`），同样只增/替换那一张、保留其余文档。
 - `.tcode/config.toml`：项目级 hooks、权限规则与 MCP server（`[mcp_servers.名字]` command/args/env，工具注册为 `mcp__名字__工具`，权限规则按该名字匹配）。
 - `[agents.*]`（explore/general/auto/suggest/vision/fetch）：给 sub-agent 与辅助角色钉模型。钉住的 kind 不跟随 `/model`；未配置的共享父 `ModelCell`。**`fetch` 是唯一"未钉即关"的角色**：web_fetch 的 `prompt` 在未钉时降级为返回原文（不回退主模型——原文本来就能进主 context，花一次整页请求换有损摘要比直接读还差）。
 - `[ui] suggest_next`：回合结束时猜下一句 prompt。它是每回合一次额外请求，所以必须能关。

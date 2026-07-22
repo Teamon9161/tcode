@@ -1,8 +1,15 @@
-//! `/model` and `/agents` share one picker: ↑↓ chooses a model across all
-//! configured profiles, ←→ adjusts its reasoning effort, Enter applies, Esc
-//! cancels. `/agents` wraps it in a first step that picks *which* sub-agent
-//! the model is for, and adds explicit `inherit` (use the main model) and,
-//! for opt-in capabilities such as `web-fetch`, `off` rows.
+//! `/model` opens one hub (`Hub`) over the whole model line-up: the main
+//! model, the named presets that switch the line-up as a unit, and every
+//! sub-agent and helper role. Drilling into any of them opens the same
+//! `Picker`: ↑↓ chooses a model across all configured profiles, ←→ adjusts
+//! its reasoning effort, Enter applies, Esc backs out one step. A role's
+//! picker also offers explicit `inherit` (use the main model) and, for opt-in
+//! capabilities such as `web-fetch`, `off`.
+//!
+//! `/agents` is the same hub, opened on the sub-agent section: pinning one
+//! role and switching the whole line-up are the same task seen at two
+//! altitudes, and splitting them across two dialogs is what made re-pinning
+//! eight roles the only way to change provider family.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
@@ -36,8 +43,9 @@ pub struct ModelMenu {
     pub switch: SwitchFn,
 }
 
-/// Apply a role's model mode, live and in state.toml. `Off` is available only
-/// for opt-in capabilities such as the `web-fetch` summarizer.
+/// Apply a role's model mode, live and in the selected config's
+/// `[tcode_state]`. `Off` is available only for opt-in capabilities such as
+/// the `web-fetch` summarizer.
 pub type PinFn = Box<dyn Fn(&str, AgentModelChoice) -> Result<String, String> + Send + Sync>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -50,14 +58,69 @@ pub enum AgentModelChoice {
     },
 }
 
+/// Which part of the hub a role belongs under. The two kinds are configured
+/// identically but are looked for at different moments: `Task` is "who do I
+/// delegate work to", `Helper` is "what runs the machinery around my turn".
+/// A single flat list of both is what made the old `/agents` list hard to scan.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RoleSection {
+    Task,
+    Helper,
+}
+
 pub struct AgentRole {
     pub key: String,
     pub label: String,
     pub allows_off: bool,
+    pub section: RoleSection,
 }
 
-/// `/agents`: auxiliary model roles (sub-agents plus Auto Mode), what each
-/// currently runs on, and how to change it.
+/// One named line-up, as the hub lists it.
+pub struct PresetOption {
+    pub key: String,
+    pub label: String,
+}
+
+/// What `save as preset` captures, in menu terms so the binary can name the
+/// profiles and models behind the indices.
+pub struct PresetDraft {
+    /// Index into `ModelMenu::options`; `None` when nothing is configured.
+    pub main: Option<usize>,
+    pub main_effort: Option<String>,
+    pub roles: Vec<(String, AgentModelChoice)>,
+}
+
+/// Switch to a named line-up: persist the choice, rebuild the provider and
+/// every pin, and hand back the menus that describe the result. Same shape as
+/// `ProviderSetup::apply` — the frontend owns neither the config path nor the
+/// concrete providers.
+#[allow(clippy::type_complexity)]
+pub type ApplyPresetFn =
+    Box<dyn Fn(&str) -> Result<(ModelMenu, AgentMenu, String), String> + Send + Sync>;
+
+/// Write the live line-up out as `[presets.<name>]` and hand back the updated
+/// list plus the index of the preset now in force. The menu travels with the
+/// draft because the draft is expressed in its indices: they mean nothing
+/// against a menu rebuilt since.
+#[allow(clippy::type_complexity)]
+pub type SavePresetFn = Box<
+    dyn Fn(&str, &PresetDraft, &ModelMenu) -> Result<(Vec<PresetOption>, usize), String>
+        + Send
+        + Sync,
+>;
+
+/// The named line-ups and the two things that can be done with them.
+pub struct PresetMenu {
+    pub options: Vec<PresetOption>,
+    /// Which one is in force; `None` = none, i.e. the line-up is whatever the
+    /// config file and the ad-hoc pins say.
+    pub current: Option<usize>,
+    pub apply: ApplyPresetFn,
+    pub save: SavePresetFn,
+}
+
+/// The pinnable roles — sub-agents plus the helper roles around a turn — what
+/// each currently runs on, and how to change it.
 pub struct AgentMenu {
     pub roles: Vec<AgentRole>,
     pub pins: Vec<AgentModelChoice>,
@@ -65,7 +128,7 @@ pub struct AgentMenu {
 }
 
 impl AgentMenu {
-    /// What a role runs on right now, for the kind list and the status line.
+    /// What a role runs on right now, for the hub's rows and the status line.
     pub fn describe(&self, index: usize, menu: &ModelMenu) -> String {
         match &self.pins[index] {
             AgentModelChoice::Off => "off".to_string(),
@@ -125,7 +188,7 @@ fn slots_for(def: &ModelDef, want: Option<&str>) -> (Vec<String>, usize) {
 }
 
 impl Picker {
-    /// `/model`: every option, starting on the active one.
+    /// The main model: every option, starting on the active one.
     pub fn new(menu: &ModelMenu, current_effort: Option<&str>) -> Option<Self> {
         if menu.options.is_empty() {
             return None;
@@ -160,9 +223,9 @@ impl Picker {
         })
     }
 
-    /// `/agents` step 2: offers the role's non-model modes first, then the
-    /// shared model grid. `inherit` always means use the live main model;
-    /// opt-in roles additionally expose `off`.
+    /// A role's picker: its non-model modes first, then the shared model grid.
+    /// `inherit` always means use the live main model; opt-in roles
+    /// additionally expose `off`.
     pub fn for_agent(menu: &ModelMenu, role: &AgentRole, pin: &AgentModelChoice) -> Self {
         let mut rows = Vec::new();
         if role.allows_off {
@@ -341,137 +404,363 @@ impl Picker {
             ));
         }
         out.push(Line::styled(
-            "  ↑↓ model · ←→ effort · enter apply · esc cancel",
+            "  ↑↓ model · ←→ effort · enter apply · esc back",
             theme::dim(),
         ));
         out
     }
 }
 
-/// `/agents`: step 1 picks the sub-agent kind, step 2 is the model picker
-/// above. Esc walks back out one step at a time.
-pub struct AgentPicker {
-    selected: usize,
-    model: Option<Picker>,
-    hovered: Option<usize>,
+/// Everything the hub lists, in display order. Headers are rendered but never
+/// selected; the arrow keys step over them.
+enum Entry {
+    Header(&'static str),
+    Main,
+    Preset(usize),
+    SavePreset,
+    Agent(usize),
 }
 
-pub enum AgentPick {
+impl Entry {
+    fn selectable(&self) -> bool {
+        !matches!(self, Entry::Header(_))
+    }
+}
+
+/// The hub's rows, rebuilt from the menus on every event rather than cached:
+/// applying a pick from inside the hub changes what the rows say, and a stale
+/// copy would show the user the state they just left.
+fn entries(agents: &AgentMenu, presets: &PresetMenu) -> Vec<Entry> {
+    let mut out = vec![Entry::Main, Entry::Header("presets")];
+    out.extend((0..presets.options.len()).map(Entry::Preset));
+    out.push(Entry::SavePreset);
+    for (header, section) in [
+        ("sub-agents", RoleSection::Task),
+        ("roles", RoleSection::Helper),
+    ] {
+        let mut members = agents
+            .roles
+            .iter()
+            .enumerate()
+            .filter(|(_, role)| role.section == section)
+            .peekable();
+        if members.peek().is_none() {
+            continue;
+        }
+        out.push(Entry::Header(header));
+        out.extend(members.map(|(i, _)| Entry::Agent(i)));
+    }
+    out
+}
+
+/// The menus a hub row reads, plus the one fact no menu can hold: the
+/// reasoning effort of the *running* provider.
+pub struct HubCtx<'a> {
+    pub menu: &'a ModelMenu,
+    pub agents: &'a AgentMenu,
+    pub presets: &'a PresetMenu,
+    pub effort: Option<&'a str>,
+}
+
+/// Where a drilled-into `Picker` sends its result.
+enum Target {
+    Main,
+    Agent(usize),
+}
+
+/// `/model`: the whole line-up on one screen. Owns the drill-down picker and
+/// the one text field in the dialog (naming a preset).
+pub struct Hub {
+    selected: usize,
+    hovered: Option<usize>,
+    open: Option<(Target, Picker)>,
+    /// Typing a name for `save as preset`. `Some("")` is a live empty field,
+    /// which is why this is not just a `String`.
+    naming: Option<String>,
+}
+
+pub enum HubPick {
     Pending,
     Cancelled,
-    Picked {
+    /// The main model changed; same payload as the standalone model pick.
+    Model {
+        option: usize,
+        effort: Option<String>,
+    },
+    Agent {
         kind: String,
         choice: AgentModelChoice,
     },
+    Preset(String),
+    SavePreset(String),
 }
 
-impl AgentPicker {
-    pub fn new(agents: &AgentMenu) -> Option<Self> {
-        (!agents.roles.is_empty()).then_some(Self {
-            selected: 0,
-            model: None,
+const WINDOW: usize = 12;
+
+impl Hub {
+    /// `focus_agents` starts on the first sub-agent instead of the main model,
+    /// which is all `/agents` still means.
+    pub fn new(agents: &AgentMenu, presets: &PresetMenu, focus_agents: bool) -> Self {
+        let rows = entries(agents, presets);
+        let selected = focus_agents
+            .then(|| {
+                rows.iter()
+                    .position(|entry| matches!(entry, Entry::Agent(_)))
+            })
+            .flatten()
+            .unwrap_or(0);
+        Self {
+            selected,
             hovered: None,
-        })
+            open: None,
+            naming: None,
+        }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, menu: &ModelMenu, agents: &AgentMenu) -> AgentPick {
-        let Some(picker) = self.model.as_mut() else {
+    fn start(&self, total: usize) -> usize {
+        self.selected
+            .saturating_sub(WINDOW / 2)
+            .min(total.saturating_sub(WINDOW))
+    }
+
+    /// Step to the next selectable row in `forward` direction, staying put at
+    /// the ends rather than landing on a header that selects nothing.
+    fn step(&mut self, rows: &[Entry], forward: bool) {
+        let mut index = self.selected;
+        loop {
+            index = match forward {
+                true if index + 1 < rows.len() => index + 1,
+                false if index > 0 => index - 1,
+                _ => return,
+            };
+            if rows[index].selectable() {
+                self.selected = index;
+                return;
+            }
+        }
+    }
+
+    /// Open the picker a row leads to, or report the choice a row *is*.
+    fn activate(&mut self, index: usize, ctx: &HubCtx) -> HubPick {
+        let HubCtx {
+            menu,
+            agents,
+            presets,
+            effort,
+        } = ctx;
+        let rows = entries(agents, presets);
+        let Some(entry) = rows.get(index).filter(|entry| entry.selectable()) else {
+            return HubPick::Pending;
+        };
+        self.selected = index;
+        match entry {
+            Entry::Header(_) => HubPick::Pending,
+            Entry::Main => {
+                if let Some(picker) = Picker::new(menu, *effort) {
+                    self.open = Some((Target::Main, picker));
+                }
+                HubPick::Pending
+            }
+            Entry::Agent(role) => {
+                let picker = Picker::for_agent(menu, &agents.roles[*role], &agents.pins[*role]);
+                self.open = Some((Target::Agent(*role), picker));
+                HubPick::Pending
+            }
+            Entry::Preset(option) => HubPick::Preset(presets.options[*option].key.clone()),
+            Entry::SavePreset => {
+                self.naming = Some(String::new());
+                HubPick::Pending
+            }
+        }
+    }
+
+    /// The drill-down picker resolved. Esc there backs out to the hub, not out
+    /// of the dialog: a wrong turn should cost one key, not the whole visit.
+    fn resolve(&mut self, result: PickResult, agents: &AgentMenu) -> HubPick {
+        let Some((target, picker)) = self.open.as_mut() else {
+            return HubPick::Pending;
+        };
+        match result {
+            PickResult::Pending => HubPick::Pending,
+            PickResult::Cancelled => {
+                self.open = None;
+                HubPick::Pending
+            }
+            PickResult::Picked { option, effort } => {
+                let pick = match target {
+                    Target::Main => match option {
+                        Some(option) => HubPick::Model { option, effort },
+                        // The main model's rows always carry an option; the
+                        // inherit and off rows only exist in a role's picker.
+                        None => HubPick::Pending,
+                    },
+                    Target::Agent(role) => HubPick::Agent {
+                        kind: agents.roles[*role].key.clone(),
+                        choice: picker.agent_choice(),
+                    },
+                };
+                self.open = None;
+                pick
+            }
+        }
+    }
+
+    pub fn handle_key(&mut self, key: KeyEvent, ctx: &HubCtx) -> HubPick {
+        if let Some(name) = self.naming.as_mut() {
             match key.code {
-                KeyCode::Esc => return AgentPick::Cancelled,
-                KeyCode::Up => self.selected = self.selected.saturating_sub(1),
-                KeyCode::Down => self.selected = (self.selected + 1).min(agents.roles.len() - 1),
-                KeyCode::Enter => {
-                    let role = &agents.roles[self.selected];
-                    self.model = Some(Picker::for_agent(menu, role, &agents.pins[self.selected]));
+                KeyCode::Esc => self.naming = None,
+                KeyCode::Backspace => {
+                    name.pop();
+                }
+                KeyCode::Char(c) => name.push(c),
+                KeyCode::Enter if !name.is_empty() => {
+                    let name = self.naming.take().unwrap_or_default();
+                    return HubPick::SavePreset(name);
                 }
                 _ => {}
             }
-            return AgentPick::Pending;
-        };
-        match picker.handle_key(key) {
-            PickResult::Pending => AgentPick::Pending,
-            // Esc in the model step backs out to the kind list, not out of
-            // the picker: a wrong turn should cost one key, not the dialog.
-            PickResult::Cancelled => {
-                self.model = None;
-                AgentPick::Pending
-            }
-            PickResult::Picked { .. } => AgentPick::Picked {
-                kind: agents.roles[self.selected].key.clone(),
-                choice: picker.agent_choice(),
-            },
+            return HubPick::Pending;
         }
-    }
-
-    pub fn handle_mouse_row(
-        &mut self,
-        row: usize,
-        menu: &ModelMenu,
-        agents: &AgentMenu,
-    ) -> AgentPick {
-        let Some(picker) = self.model.as_mut() else {
-            let Some(index) = row
-                .checked_sub(1)
-                .filter(|index| *index < agents.roles.len())
-            else {
-                return AgentPick::Pending;
+        if self.open.is_some() {
+            let result = match self.open.as_mut() {
+                Some((_, picker)) => picker.handle_key(key),
+                None => PickResult::Pending,
             };
-            self.selected = index;
-            let role = &agents.roles[index];
-            self.model = Some(Picker::for_agent(menu, role, &agents.pins[index]));
-            return AgentPick::Pending;
+            return self.resolve(result, ctx.agents);
+        }
+        let rows = entries(ctx.agents, ctx.presets);
+        match key.code {
+            KeyCode::Esc => return HubPick::Cancelled,
+            KeyCode::Up => self.step(&rows, false),
+            KeyCode::Down => self.step(&rows, true),
+            KeyCode::Enter => return self.activate(self.selected, ctx),
+            _ => {}
+        }
+        HubPick::Pending
+    }
+
+    pub fn handle_mouse_row(&mut self, row: usize, ctx: &HubCtx) -> HubPick {
+        if self.naming.is_some() {
+            return HubPick::Pending;
+        }
+        if self.open.is_some() {
+            let result = match self.open.as_mut() {
+                Some((_, picker)) => picker.handle_mouse_row(row),
+                None => PickResult::Pending,
+            };
+            return self.resolve(result, ctx.agents);
+        }
+        let rows = entries(ctx.agents, ctx.presets);
+        let start = self.start(rows.len());
+        let Some(index) = row
+            .checked_sub(1)
+            .map(|offset| start + offset)
+            .filter(|index| *index < (start + WINDOW).min(rows.len()))
+        else {
+            return HubPick::Pending;
         };
-        match picker.handle_mouse_row(row) {
-            PickResult::Pending | PickResult::Cancelled => AgentPick::Pending,
-            PickResult::Picked { .. } => AgentPick::Picked {
-                kind: agents.roles[self.selected].key.clone(),
-                choice: picker.agent_choice(),
-            },
-        }
+        self.activate(index, ctx)
     }
 
-    pub fn set_hovered_row(&mut self, row: Option<usize>, agents: &AgentMenu) {
-        if let Some(picker) = self.model.as_mut() {
+    pub fn set_hovered_row(&mut self, row: Option<usize>, ctx: &HubCtx) {
+        if let Some((_, picker)) = self.open.as_mut() {
             picker.set_hovered_row(row);
-        } else {
-            self.hovered = row
-                .and_then(|row| row.checked_sub(1))
-                .filter(|&index| index < agents.roles.len());
+            return;
+        }
+        let rows = entries(ctx.agents, ctx.presets);
+        let start = self.start(rows.len());
+        self.hovered = row
+            .and_then(|row| row.checked_sub(1))
+            .map(|offset| start + offset)
+            .filter(|&index| index < (start + WINDOW).min(rows.len()) && rows[index].selectable());
+    }
+
+    /// What the main row says, given the live reasoning effort — which the
+    /// menu cannot know, since it is a property of the running provider.
+    fn main_line(menu: &ModelMenu, effort: Option<&str>) -> String {
+        let Some(option) = menu.options.get(menu.current) else {
+            return "no models configured".to_string();
+        };
+        match effort {
+            Some(effort) => format!("{} ({effort})", option.title()),
+            None => option.title(),
         }
     }
 
-    pub fn render(&self, menu: &ModelMenu, agents: &AgentMenu) -> Vec<Line<'static>> {
-        if let Some(picker) = &self.model {
+    pub fn render(&self, ctx: &HubCtx) -> Vec<Line<'static>> {
+        let HubCtx {
+            menu,
+            agents,
+            presets,
+            effort,
+        } = ctx;
+        if let Some((_, picker)) = &self.open {
             return picker.render(menu);
         }
         let mut out = vec![Line::from(vec![Span::styled(
-            "◈ agents",
+            "◈ model",
             theme::bold().fg(theme::ACCENT),
         )])];
-        for (i, role) in agents.roles.iter().enumerate() {
-            let is_sel = i == self.selected;
+        let rows = entries(agents, presets);
+        let start = self.start(rows.len());
+        for (index, entry) in rows.iter().enumerate().skip(start).take(WINDOW) {
+            let is_sel = index == self.selected;
+            let marker = if is_sel { "▸ " } else { "  " };
             let base_style = if is_sel {
                 theme::bold().fg(theme::ACCENT)
             } else {
                 theme::dim()
             };
-            let style = if self.hovered == Some(i) {
+            let style = if self.hovered == Some(index) {
                 theme::hover_style(base_style)
             } else {
                 base_style
             };
-            out.push(Line::styled(
-                format!(
-                    "  {}{}  →  {}",
-                    if is_sel { "▸ " } else { "  " },
-                    role.label,
-                    agents.describe(i, menu)
+            out.push(match entry {
+                Entry::Header(text) => Line::styled(format!("  {text}"), theme::dim()),
+                // The main model is what most visits are about, so it stays
+                // accented even when the cursor is elsewhere.
+                Entry::Main => Line::styled(
+                    format!("  {marker}main    {}", Self::main_line(menu, *effort)),
+                    if is_sel {
+                        style
+                    } else {
+                        theme::bold().fg(theme::ACCENT)
+                    },
                 ),
-                style,
-            ));
+                Entry::Preset(option) => {
+                    let current = if presets.current == Some(*option) {
+                        " ✓"
+                    } else {
+                        ""
+                    };
+                    Line::styled(
+                        format!("    {marker}{}{current}", presets.options[*option].label),
+                        style,
+                    )
+                }
+                Entry::SavePreset => Line::styled(
+                    match &self.naming {
+                        Some(name) => format!("    {marker}name it: {name}▏"),
+                        None => format!("    {marker}save this line-up as a preset…"),
+                    },
+                    style,
+                ),
+                Entry::Agent(role) => Line::styled(
+                    format!(
+                        "    {marker}{:<12}{}",
+                        agents.roles[*role].label,
+                        agents.describe(*role, menu)
+                    ),
+                    style,
+                ),
+            });
         }
         out.push(Line::styled(
-            "  ↑↓ agent · enter choose its model · esc cancel",
+            match self.naming {
+                Some(_) => "  type a name · enter save · esc cancel",
+                None => "  ↑↓ move · enter open · esc close",
+            },
             theme::dim(),
         ));
         out
@@ -508,15 +797,41 @@ mod tests {
                     key: "explore".into(),
                     label: "explore".into(),
                     allows_off: false,
+                    section: RoleSection::Task,
                 },
                 AgentRole {
                     key: "general".into(),
                     label: "general".into(),
                     allows_off: false,
+                    section: RoleSection::Task,
                 },
             ],
             pins,
             pin: Box::new(|_, _| Err("not applied in tests".into())),
+        }
+    }
+
+    fn presets(names: &[&str], current: Option<usize>) -> PresetMenu {
+        PresetMenu {
+            options: names
+                .iter()
+                .map(|name| PresetOption {
+                    key: (*name).into(),
+                    label: (*name).into(),
+                })
+                .collect(),
+            current,
+            apply: Box::new(|_| Err("not applied in tests".into())),
+            save: Box::new(|_, _, _| Err("not saved in tests".into())),
+        }
+    }
+
+    fn ctx<'a>(menu: &'a ModelMenu, agents: &'a AgentMenu, presets: &'a PresetMenu) -> HubCtx<'a> {
+        HubCtx {
+            menu,
+            agents,
+            presets,
+            effort: None,
         }
     }
 
@@ -569,93 +884,169 @@ mod tests {
         assert_eq!(effort, None);
     }
 
+    /// The hub is the whole line-up on one screen, so every part of it must be
+    /// reachable without leaving: main model, presets, and each role.
     #[test]
-    fn agent_kind_hover_lifts_without_changing_the_selected_kind() {
+    fn the_hub_lists_the_main_model_the_presets_and_every_role() {
         let m = menu();
         let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
-        let mut p = AgentPicker::new(&a).unwrap();
-        p.set_hovered_row(Some(2), &a);
+        let p = presets(&["deepseek", "gpt"], Some(0));
+        let hub = Hub::new(&a, &p, false);
 
-        let lines = p.render(&m, &a);
-        assert_eq!(p.selected, 0);
-        assert_eq!(lines[2].style.fg, Some(theme::hover_color(theme::DIM)));
+        let text = hub
+            .render(&ctx(&m, &a, &p))
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("main    deepseek · deepseek-v4-flash[1m]"));
+        assert!(text.contains("deepseek ✓"), "the preset in force is marked");
+        assert!(text.contains("gpt"));
+        assert!(text.contains("save this line-up as a preset"));
+        assert!(text.contains("explore") && text.contains("general"));
+    }
+
+    /// Enter opens the focused role's picker, Down moves off `inherit` onto
+    /// the first model, Enter applies it.
+    fn drill_into_focused_role(
+        hub: &mut Hub,
+        m: &ModelMenu,
+        a: &AgentMenu,
+        p: &PresetMenu,
+    ) -> (String, AgentModelChoice) {
+        let ctx = ctx(m, a, p);
+        hub.handle_key(KeyEvent::from(KeyCode::Enter), &ctx);
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &ctx);
+        match hub.handle_key(KeyEvent::from(KeyCode::Enter), &ctx) {
+            HubPick::Agent { kind, choice } => (kind, choice),
+            _ => panic!("expected an agent pick"),
+        }
+    }
+
+    /// `/agents` is the same hub, only opened further down it.
+    #[test]
+    fn agents_opens_the_hub_on_the_first_sub_agent() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&["gpt"], None);
+        let mut hub = Hub::new(&a, &p, true);
+
+        let (kind, _) = drill_into_focused_role(&mut hub, &m, &a, &p);
+        assert_eq!(kind, "explore");
     }
 
     #[test]
-    fn agent_picker_mouse_walks_kind_then_model_and_inherit() {
+    fn a_role_row_drills_into_the_shared_model_picker() {
         let m = menu();
         let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
-        let mut p = AgentPicker::new(&a).unwrap();
+        let p = presets(&[], None);
+        let mut hub = Hub::new(&a, &p, true);
 
-        // Content row zero is the title; clicking row two selects `general`.
-        assert!(matches!(p.handle_mouse_row(2, &m, &a), AgentPick::Pending));
-        let AgentPick::Picked { kind, choice } = p.handle_mouse_row(1, &m, &a) else {
-            panic!("expected an inherit pick");
-        };
-        assert_eq!(kind, "general");
-        assert_eq!(choice, AgentModelChoice::Inherit);
-    }
-
-    #[test]
-    fn agent_picker_walks_kind_then_model_and_pins() {
-        let m = menu();
-        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
-        let mut p = AgentPicker::new(&a).unwrap();
-
-        assert!(matches!(
-            p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a),
-            AgentPick::Pending
-        ));
-        // The inherit row is first, so Down lands on the first model.
-        p.handle_key(KeyEvent::from(KeyCode::Down), &m, &a);
-        p.handle_key(KeyEvent::from(KeyCode::Right), &m, &a); // auto → off
-        let AgentPick::Picked { kind, choice } =
-            p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a)
-        else {
-            panic!("expected a pick");
-        };
+        let (kind, choice) = drill_into_focused_role(&mut hub, &m, &a, &p);
         assert_eq!(kind, "explore");
         assert_eq!(
             choice,
             AgentModelChoice::Model {
                 option: 0,
-                effort: Some("off".into()),
+                effort: None,
             }
         );
     }
 
+    /// Esc in the drill-down is one step back, not a dismissal: a wrong turn
+    /// must not cost the whole visit.
     #[test]
-    fn agent_picker_can_inherit_and_esc_backs_out_one_step() {
+    fn esc_backs_out_of_a_drill_down_before_it_closes_the_hub() {
         let m = menu();
-        let a = agents(vec![
-            AgentModelChoice::Model {
-                option: 1,
-                effort: None,
-            },
-            AgentModelChoice::Inherit,
-        ]);
-        let mut p = AgentPicker::new(&a).unwrap();
-        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&[], None);
+        let mut hub = Hub::new(&a, &p, true);
+        let c = ctx(&m, &a, &p);
 
+        hub.handle_key(KeyEvent::from(KeyCode::Enter), &c);
         assert!(matches!(
-            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
-            AgentPick::Pending
+            hub.handle_key(KeyEvent::from(KeyCode::Esc), &c),
+            HubPick::Pending
         ));
         assert!(matches!(
-            p.handle_key(KeyEvent::from(KeyCode::Esc), &m, &a),
-            AgentPick::Cancelled
+            hub.handle_key(KeyEvent::from(KeyCode::Esc), &c),
+            HubPick::Cancelled
         ));
+    }
 
-        p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a);
-        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
-        p.handle_key(KeyEvent::from(KeyCode::Up), &m, &a);
-        let AgentPick::Picked { kind, choice } =
-            p.handle_key(KeyEvent::from(KeyCode::Enter), &m, &a)
-        else {
-            panic!("expected a pick");
-        };
-        assert_eq!(kind, "explore");
-        assert_eq!(choice, AgentModelChoice::Inherit);
+    /// The arrows must never land on a section header — it selects nothing,
+    /// and Enter on it would be a dead key.
+    #[test]
+    fn arrows_step_over_section_headers() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&["gpt"], None);
+        let mut hub = Hub::new(&a, &p, false);
+        let c = ctx(&m, &a, &p);
+
+        let rows = entries(&a, &p);
+        for _ in 0..rows.len() + 2 {
+            assert!(rows[hub.selected].selectable());
+            hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        }
+        assert!(rows[hub.selected].selectable());
+    }
+
+    #[test]
+    fn choosing_a_preset_row_reports_it_by_name() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&["deepseek", "gpt"], Some(0));
+        let mut hub = Hub::new(&a, &p, false);
+        let c = ctx(&m, &a, &p);
+
+        // main → (presets header) → deepseek → gpt
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        assert!(matches!(
+            hub.handle_key(KeyEvent::from(KeyCode::Enter), &c),
+            HubPick::Preset(name) if name == "gpt"
+        ));
+    }
+
+    /// Naming a preset is the one text field in the dialog; while it is open
+    /// the keys that navigate the hub must all reach the field instead.
+    #[test]
+    fn saving_a_preset_takes_a_typed_name() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&[], None);
+        let mut hub = Hub::new(&a, &p, false);
+        let c = ctx(&m, &a, &p);
+
+        // main → (presets header) → save row
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        hub.handle_key(KeyEvent::from(KeyCode::Enter), &c);
+        for ch in "gptx".chars() {
+            hub.handle_key(KeyEvent::from(KeyCode::Char(ch)), &c);
+        }
+        hub.handle_key(KeyEvent::from(KeyCode::Backspace), &c);
+        assert!(hub
+            .render(&c)
+            .iter()
+            .any(|line| line.to_string().contains("name it: gpt")));
+        assert!(matches!(
+            hub.handle_key(KeyEvent::from(KeyCode::Enter), &c),
+            HubPick::SavePreset(name) if name == "gpt"
+        ));
+    }
+
+    #[test]
+    fn hub_hover_lifts_a_row_without_moving_keyboard_selection() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&["gpt"], None);
+        let mut hub = Hub::new(&a, &p, false);
+        hub.set_hovered_row(Some(3), &ctx(&m, &a, &p));
+
+        let lines = hub.render(&ctx(&m, &a, &p));
+        assert_eq!(hub.selected, 0);
+        assert_eq!(lines[3].style.fg, Some(theme::hover_color(theme::DIM)));
     }
 
     #[test]
@@ -665,6 +1056,7 @@ mod tests {
             key: "fetch".into(),
             label: "web-fetch".into(),
             allows_off: true,
+            section: RoleSection::Helper,
         };
         let mut picker = Picker::for_agent(&m, &role, &AgentModelChoice::Off);
         assert!(picker.render(&m)[1].to_string().contains("off"));
@@ -674,7 +1066,7 @@ mod tests {
     }
 
     #[test]
-    fn kind_list_shows_what_each_agent_runs_on() {
+    fn role_rows_show_what_each_agent_runs_on() {
         let m = menu();
         let a = agents(vec![
             AgentModelChoice::Model {

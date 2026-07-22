@@ -57,7 +57,7 @@ use crate::composer::{
 };
 use crate::editor::{Editor, Position};
 use crate::live_panel::{self, MainAgent, PanelTarget, ProgressPhase, UiTaskRun};
-use crate::model_picker::{self, AgentMenu, ModelMenu};
+use crate::model_picker::{self, AgentMenu, ModelMenu, PresetMenu};
 use crate::overlay::{ApprovalReply, Flow, Overlay, OverlayAction, OverlayCtx};
 use crate::render::{
     batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
@@ -68,7 +68,10 @@ use crate::transcript::Transcript;
 use crate::usage::{
     context_progress_line, rate_limit_line, token_count, turn_summary_line, TurnMeter,
 };
-use crate::view::{BakeCtx, SessionView};
+use crate::view::{
+    task_live_detail, task_plain_status, task_status_lines, task_summary_detail, BakeCtx,
+    SessionView,
+};
 use crate::view_picker::{self, ViewId};
 use crate::voice::{Voice, VoiceEvent, VoiceOutcome};
 use crate::{diff, markdown, theme, EnvironmentFn, OpeningContextFn};
@@ -105,7 +108,7 @@ const TIPS: [&str; 11] = [
     "ctrl+c stops the turn and sends queued prompts right away — it never exits",
     "type while a turn runs: the prompt queues and esc takes it back",
     "→ accepts the dim suggestion in the input box",
-    "/model switches model mid-session · /agents pins sub-agent models",
+    "/model switches the whole line-up: main model, presets, every sub-agent",
     "/resume picks up an earlier session · /export saves the transcript",
     "/compact squeezes a long conversation back into budget",
     "click a task to expand it · ctrl+click its title to open its trace",
@@ -122,13 +125,21 @@ const UI_COMMANDS: [(&str, &str); 6] = [
         "/voice",
         "push-to-talk dictation · model picks a recogniser · words biases it · key <name> rebinds",
     ),
-    ("/model", "switch model · adjust reasoning effort"),
     (
-        "/agents",
-        "choose models for sub-agents and Auto Mode safety",
+        "/model",
+        "main model, presets, and the models every sub-agent runs on",
     ),
+    ("/agents", "the same panel, opened on the sub-agent list"),
     ("/provider", "configure or switch provider"),
 ];
+
+/// Does this slash line belong to the frontend's own table? Matched on the
+/// verb alone, so `/voice key f9` counts. Skills may not shadow these, which is
+/// why the fallback in `run_slash` asks first.
+fn is_ui_command(cmd: &str) -> bool {
+    let verb = cmd.split_whitespace().next().unwrap_or(cmd);
+    UI_COMMANDS.iter().any(|(name, _)| *name == verb)
+}
 
 /// One call under review. A combined review carries several of these; every
 /// other prompt carries exactly one.
@@ -232,11 +243,16 @@ enum Phase {
     },
 }
 
+/// A change preview inserted before approval. Long shell commands retain their
+/// header block so the approved tool result can extend the same collapsed
+/// detail instead of becoming a separate transcript record.
+struct ChangePrebake {
+    mark: usize,
+    header_index: Option<usize>,
+}
+
 /// Batch items are indented under their shared header without a tree glyph.
 const BATCH_ITEM_INDENT: &str = "    ";
-/// A sub-agent's live action belongs to its task item, never to the batch
-/// header, so it has one extra visible tree level.
-const TASK_STATUS_INDENT: &str = "      └ ";
 
 pub struct App {
     agent: Arc<Agent>,
@@ -368,13 +384,15 @@ pub struct App {
     /// the dialog). Holds the block-count mark to retract to on decline or
     /// when a batch supersedes it; on approval it tells the upcoming
     /// `ToolStart` to skip re-baking the diff.
-    change_prebake: Option<usize>,
+    change_prebake: Option<ChangePrebake>,
     rewind_nav: Option<RewindNav>,
     menu: ModelMenu,
     agents: AgentMenu,
+    presets: PresetMenu,
     /// `/provider`'s two effects: read the user's config, and persist what
     /// the form produced. The binary owns both.
     provider_setup: crate::ProviderSetup,
+    state_store: crate::StateStore,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
     dogfood: bool,
@@ -457,7 +475,9 @@ impl App {
         let crate::TuiConfig {
             menu,
             agents,
+            presets,
             provider_setup,
+            state_store,
             opening_context,
             environment,
             show_reasoning,
@@ -562,7 +582,9 @@ impl App {
             rewind_nav: None,
             menu,
             agents,
+            presets,
             provider_setup,
+            state_store,
             dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
@@ -715,6 +737,8 @@ impl App {
         OverlayCtx {
             menu: &self.menu,
             agents: &self.agents,
+            presets: &self.presets,
+            effort: self.agent.model.snapshot().effort,
             width: area_width(&self.terminal),
             height: area_height(&self.terminal),
         }
@@ -782,7 +806,7 @@ impl App {
         // shell command needs the same capped preview ToolStart uses (see
         // `on_tool_start`), or its full, possibly multi-line text fills the
         // compact dialog with no way to scroll past it to the choices.
-        let rendered: Vec<(String, Vec<Line<'static>>)> = ask
+        let rendered: Vec<(String, Vec<Line<'static>>, bool)> = ask
             .calls
             .iter()
             .map(|call| {
@@ -792,25 +816,47 @@ impl App {
                     &call.input,
                     Some(&self.cwd),
                 ));
-                (summary, renderer.approval_detail(&call.input))
+                (
+                    summary,
+                    renderer.approval_detail(&call.input),
+                    renderer.folds_result(&call.input),
+                )
             })
             .collect();
 
-        if rendered.iter().any(|(_, change)| !change.is_empty()) {
+        if rendered.iter().any(|(_, change, _)| !change.is_empty()) {
             self.bake_live_text();
             self.finish_thinking();
-            self.change_prebake = Some(self.transcript.block_count());
-            for (summary, change) in &rendered {
+            let mark = self.transcript.block_count();
+            let mut header_index = None;
+            for (summary, change, folds_result) in &rendered {
                 if change.is_empty() {
                     continue;
                 }
                 let mut spans: Vec<Span> = self.colored_tool_summary(summary);
                 spans.insert(0, Span::styled("● ", theme::accent()));
-                let mut lines = vec![Line::default(), Line::from(spans)];
-                lines.extend(change.clone());
-                lines.push(Line::default());
-                self.bake(lines);
+                if *folds_result {
+                    // This is a long shell command. It remains closed after
+                    // approval, and ToolEnd appends its result to this exact
+                    // detail through the retained header index.
+                    self.bake(vec![Line::default()]);
+                    let index = self.transcript.block_count();
+                    self.transcript.push_with_detail(
+                        vec![Line::from(spans)],
+                        change.clone(),
+                        false,
+                        OUTPUT_VIEW_ROWS,
+                    );
+                    self.bake(vec![Line::default()]);
+                    header_index = Some(index);
+                } else {
+                    let mut lines = vec![Line::default(), Line::from(spans)];
+                    lines.extend(change.clone());
+                    lines.push(Line::default());
+                    self.bake(lines);
+                }
             }
+            self.change_prebake = Some(ChangePrebake { mark, header_index });
         }
 
         // The diffs live in the transcript; the dialog carries only the choices.
@@ -874,6 +920,8 @@ impl App {
             OverlayAction::ApplyAgentModel { kind, choice } => {
                 self.apply_agent_model(&kind, choice)
             }
+            OverlayAction::ApplyPreset(name) => self.apply_preset(&name),
+            OverlayAction::SavePreset(name) => self.save_preset(&name),
             // Suspends the terminal, so it cannot run inside the dialog's key
             // handler; the dialog is still open and takes the revision.
             OverlayAction::EditPlan => self.edit_plan_externally(),
@@ -887,8 +935,8 @@ impl App {
     /// the per-call flow re-proposes them one at a time — and hand the batch
     /// back to the agent loop unanswered.
     fn review_individually(&mut self, reply: ApprovalReply) {
-        if let Some(mark) = self.change_prebake.take() {
-            self.transcript.truncate_blocks(mark);
+        if let Some(prebake) = self.change_prebake.take() {
+            self.transcript.truncate_blocks(prebake.mark);
         }
         if let ApprovalReply::Batch(tx) = reply {
             let _ = tx.send(BatchApproval::Individually);
@@ -1098,7 +1146,7 @@ impl App {
         }
         if rect_contains(hitboxes.model, mouse.column, mouse.row) {
             self.status_hover = None;
-            self.open_model_picker();
+            self.open_model_hub(false);
             return true;
         }
         false
@@ -1646,6 +1694,150 @@ async fn join_external_import(
 mod tests {
     use super::*;
 
+    /// A sub-agent that delegates further used to be a black hole: the trace
+    /// view dropped every `TaskRun*` event, so its reader saw a bare batch
+    /// header until the whole call ended, and the nested run had no tree row to
+    /// reach it by. Cards belong to whichever transcript the delegating agent
+    /// is talking in — main or trace.
+    #[test]
+    fn a_trace_shows_the_runs_its_own_agent_delegates_and_lets_them_be_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "c1".into(),
+            name: "agent".into(),
+            input: serde_json::json!({"agent": "general", "prompt": "do it", "summary": "do it"}),
+            summary: String::new(),
+        });
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "r1".into(),
+            parent_call: "c1".into(),
+            kind: "general".into(),
+            model: "m".into(),
+            prompt: "do it".into(),
+            summary: "do it".into(),
+        });
+        let sub = |ev: AgentEvent| AgentEvent::TaskRunEvent {
+            run: "r1".into(),
+            event: Box::new(ev),
+        };
+        // The traced agent runs a batch that mixes a plain call with a
+        // delegation: the batch item bakes early precisely so the delegation
+        // has a header to hang its card on.
+        app.on_agent_event(sub(AgentEvent::ToolBatchStart {
+            label: "Find 1 pattern · Delegate 1 agent".into(),
+            calls: vec![
+                (
+                    "b1".into(),
+                    "grep".into(),
+                    serde_json::json!({"pattern": "foo"}),
+                ),
+                (
+                    "b2".into(),
+                    "agent".into(),
+                    serde_json::json!({"agent": "explore", "prompt": "look", "summary": "look"}),
+                ),
+            ],
+        }));
+        app.on_agent_event(sub(AgentEvent::TaskRunStarted {
+            run: "r2".into(),
+            parent_call: "b2".into(),
+            kind: "explore".into(),
+            model: "m".into(),
+            prompt: "look".into(),
+            summary: "look at the parser".into(),
+        }));
+        app.on_agent_event(sub(AgentEvent::TaskRunEvent {
+            run: "r2".into(),
+            event: Box::new(AgentEvent::ToolStart {
+                call_id: "n1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "deep.txt"}),
+                summary: String::new(),
+            }),
+        }));
+
+        app.open_view(ViewId::TaskRun("r1".into()));
+        let frame = app.frame();
+        assert!(
+            frame.contains("look at the parser"),
+            "the nested run's objective is on its card while it works:\n{frame}"
+        );
+        assert!(
+            frame.contains("read(deep.txt)"),
+            "and the card's live status follows what it is doing:\n{frame}"
+        );
+        assert!(
+            frame.contains("  └ Explore · look at the parser"),
+            "the tree hangs it under the run that delegated it:\n{frame}"
+        );
+
+        // Its own trace opens like any other run's, with its own tool records.
+        app.open_view(ViewId::TaskRun("r2".into()));
+        let frame = app.frame();
+        assert!(
+            frame.contains("r2 explore"),
+            "the nested run has a trace of its own:\n{frame}"
+        );
+        assert!(
+            frame.contains("Read(deep.txt)"),
+            "showing the calls it made:\n{frame}"
+        );
+    }
+
+    /// A command used to leave no trace of itself: its answer landed as a bare
+    /// dim line, so a run of commands read as one undifferentiated block with
+    /// nothing saying what had been typed. The command is echoed like the
+    /// prompt it is, and its answer hangs off it the way a tool result hangs
+    /// off its call.
+    #[test]
+    fn a_slash_command_echoes_what_was_typed_and_attaches_its_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.run_slash("/cost");
+        app.run_slash("/nope");
+        let frame = app.frame();
+        let echoed: Vec<&str> = frame
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .collect();
+        let cost = echoed
+            .iter()
+            .position(|line| line.contains("▌ /cost"))
+            .expect("the typed command is echoed");
+        assert!(
+            echoed[cost + 1].trim_start().starts_with("⎿ "),
+            "the answer attaches to its command: {:?}",
+            echoed[cost + 1]
+        );
+        let unknown = echoed
+            .iter()
+            .position(|line| line.contains("▌ /nope"))
+            .expect("an unknown command is echoed too");
+        assert!(unknown > cost, "commands keep the order they were typed");
+        assert!(echoed[unknown + 1].contains("unknown command /nope"));
+    }
+
+    #[test]
+    fn history_recall_of_a_slash_command_keeps_the_stashed_draft() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.editor.insert_str("/agents");
+        assert_eq!(app.editor.take(), "/agents");
+        app.editor.insert_str("the latest unsent prompt");
+
+        app.press(KeyCode::Up);
+        assert_eq!(app.editor.text(), "/agents");
+        assert!(
+            !app.popup_active(),
+            "recalled commands must not reopen completion and steal history navigation"
+        );
+
+        app.press(KeyCode::Down);
+        assert_eq!(app.editor.text(), "the latest unsent prompt");
+    }
+
     /// `/provider` used to quit the TUI, run a bare-terminal wizard and
     /// rebuild the app around the returned session. It is an overlay now:
     /// the app must stay up, and what it hands the binary to persist must
@@ -1661,7 +1853,7 @@ mod tests {
             40,
             crate::ProviderSetup {
                 load: Box::new(|| Ok(tcode_core::config::Config::default())),
-                apply: Box::new(move |config, _state| {
+                apply: Box::new(move |config| {
                     *sink.lock().unwrap() = Some(config);
                     Ok((
                         ModelMenu {
@@ -1917,6 +2109,55 @@ mod tests {
                 "new_string": new,
             }),
         }
+    }
+
+    #[tokio::test]
+    async fn approved_long_command_keeps_command_and_result_in_one_foldout() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let command = format!("echo {}", "x".repeat(100));
+        let input = serde_json::json!({ "command": command });
+        let (tx, _rx) = oneshot::channel();
+        let shell_tool = tcode_tools::primary_shell_tool_name();
+        app.open_review(AskMsg {
+            label: "Run command".into(),
+            calls: vec![AskCall {
+                tool: shell_tool.into(),
+                summary: shell_tool.into(),
+                descriptor: "run(command)".into(),
+                is_edit: false,
+                allows_project: false,
+                input: input.clone(),
+            }],
+            reply: ApprovalReply::One(tx),
+        });
+
+        let preapproved_blocks = app.transcript.block_count();
+        app.on_tool_start("call-1".into(), shell_tool.into(), "ignored".into(), input);
+        assert!(
+            app.pending_tool
+                .as_ref()
+                .and_then(|call| call.header_index)
+                .is_some(),
+            "ToolStart must retain the pre-approved long-command header"
+        );
+        app.on_tool_end(
+            "call-1".into(),
+            shell_tool.into(),
+            "done".into(),
+            "command result body".into(),
+            false,
+        );
+        assert_eq!(
+            app.transcript.block_count(),
+            preapproved_blocks,
+            "the result extends the command foldout rather than opening another record"
+        );
+        let collapsed = app.frame();
+        assert!(
+            !collapsed.contains("command result body"),
+            "command output stays collapsed until the user clicks its header"
+        );
     }
 
     /// The combined review's whole promise: every diff is on screen *before*

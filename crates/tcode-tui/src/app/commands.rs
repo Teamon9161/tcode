@@ -44,7 +44,7 @@ impl App {
     /// a one-off flip to it must not silently arm every future session, so
     /// landing there clears the stored choice instead.
     pub(super) fn persist_mode(&self, mode: tcode_core::PermissionMode) {
-        tcode_core::config::ModelState::update(|state| {
+        self.state_store.update(move |state| {
             state.mode = (mode != tcode_core::PermissionMode::Unsafe).then_some(mode);
         });
     }
@@ -56,9 +56,11 @@ impl App {
             session.set_folder_trust(trust);
         }
         let persistence = if remember {
-            match tcode_core::config::ModelState::update_checked(|state| {
-                state.set_folder_trust(&cwd, trust)
-            }) {
+            let state_cwd = cwd.clone();
+            match self
+                .state_store
+                .update_checked(move |state| state.set_folder_trust(&state_cwd, trust))
+            {
                 Ok(()) => " and remembered on this machine".to_string(),
                 Err(error) => format!(" for this session only (could not remember: {error})"),
             }
@@ -69,14 +71,15 @@ impl App {
             FolderTrust::Trusted => "trusted",
             FolderTrust::Untrusted => "not trusted",
         };
-        self.bake(vec![Line::styled(
-            format!("folder {label}{persistence}: {}", cwd.display()),
-            theme::dim(),
-        )]);
+        self.reply(format!("folder {label}{persistence}: {}", cwd.display()));
     }
 
     pub(super) fn refresh_folder_trust(&mut self) {
-        let remembered = tcode_core::config::ModelState::load().folder_trust_for(&self.cwd);
+        let remembered = self
+            .state_store
+            .load()
+            .unwrap_or_default()
+            .folder_trust_for(&self.cwd);
         let Some(session) = self.session.as_mut() else {
             return;
         };
@@ -101,20 +104,67 @@ impl App {
         self.overlay = Some(Overlay::Mode(crate::mode_picker::Picker::new(current)));
     }
 
-    pub(super) fn open_model_picker(&mut self) {
-        let effort = self.agent.model.snapshot().effort;
-        match model_picker::Picker::new(&self.menu, effort.as_deref()) {
-            Some(picker) => self.overlay = Some(Overlay::Model(picker)),
-            None => self.bake(vec![Line::styled(
-                "no models configured — edit ~/.tcode/config.toml",
-                theme::dim(),
-            )]),
+    /// `/model` and `/agents` open the same hub; the flag only decides which
+    /// row it starts on.
+    pub(super) fn open_model_hub(&mut self, focus_agents: bool) {
+        if self.menu.options.is_empty() {
+            self.reply("no models configured — edit the selected config file");
+            return;
+        }
+        self.overlay = Some(Overlay::Model(model_picker::Hub::new(
+            &self.agents,
+            &self.presets,
+            focus_agents,
+        )));
+    }
+
+    /// Switch the whole line-up. The binary rebuilds the provider and every
+    /// pin behind the closure, exactly as a finished `/provider` run does;
+    /// the TUI only takes the menus back and says what happened.
+    pub(super) fn apply_preset(&mut self, name: &str) {
+        match (self.presets.apply)(name) {
+            Ok((menu, agents, label)) => {
+                self.menu = menu;
+                self.agents = agents;
+                self.presets.current = self
+                    .presets
+                    .options
+                    .iter()
+                    .position(|option| option.key == name);
+                self.reply(format!("preset {name} → {label}"));
+            }
+            Err(e) => self.reply_error(format!("cannot switch to preset '{name}': {e}")),
+        }
+    }
+
+    /// Capture what is running as a named preset. The draft is assembled here
+    /// because only the frontend holds the live pins; naming the profiles and
+    /// models behind the indices is the binary's job.
+    pub(super) fn save_preset(&mut self, name: &str) {
+        let draft = model_picker::PresetDraft {
+            main: (!self.menu.options.is_empty()).then_some(self.menu.current),
+            main_effort: self.agent.model.snapshot().effort,
+            roles: self
+                .agents
+                .roles
+                .iter()
+                .zip(&self.agents.pins)
+                .map(|(role, pin)| (role.key.clone(), pin.clone()))
+                .collect(),
+        };
+        match (self.presets.save)(name, &draft, &self.menu) {
+            Ok((options, current)) => {
+                self.presets.options = options;
+                self.presets.current = Some(current);
+                self.reply(format!("saved preset {name} — /model switches to it"));
+            }
+            Err(e) => self.reply_error(format!("cannot save preset '{name}': {e}")),
         }
     }
 
     /// `/provider`: edit credentials without leaving the conversation. Seeded
-    /// with the user's own config only — a project overlay must never be
-    /// copied into `~/.tcode/config.toml`.
+    /// with the selected user config only — a project overlay must never be
+    /// copied into that file.
     pub(super) fn open_provider_setup(&mut self) {
         let profile = self
             .menu
@@ -123,29 +173,19 @@ impl App {
             .map(|opt| opt.profile.clone());
         match (self.provider_setup.load)() {
             Ok(global) => {
-                let setup = crate::setup::Setup::new(
-                    global,
-                    profile.as_deref(),
-                    tcode_core::config::ModelState::load(),
-                );
+                let setup = crate::setup::Setup::new(global, profile.as_deref());
                 self.overlay = Some(Overlay::Provider(Box::new(setup)));
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot read the global config: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot read the selected config: {e}")),
         }
     }
 
     /// Persist a finished setup and take the rebuilt menus. The provider swap
     /// happens inside the closure, so a running turn keeps its snapshot
     /// exactly as a `/model` switch does.
-    pub(super) fn apply_setup(
-        &mut self,
-        done: Box<(tcode_core::config::Config, tcode_core::config::ModelState)>,
-    ) {
-        let (config, state) = *done;
-        match (self.provider_setup.apply)(config, state) {
+    pub(super) fn apply_setup(&mut self, done: Box<tcode_core::config::Config>) {
+        let config = *done;
+        match (self.provider_setup.apply)(config) {
             Ok((menu, agents)) => {
                 self.menu = menu;
                 self.agents = agents;
@@ -155,15 +195,11 @@ impl App {
                     .get(self.menu.current)
                     .map(|opt| format!("{} · {}", opt.profile, opt.def.display()))
                     .unwrap_or_else(|| "no models configured".into());
-                self.bake(vec![Line::styled(
-                    format!("providers configured — {current} · /model to switch"),
-                    theme::dim(),
-                )]);
+                self.reply(format!(
+                    "providers configured — {current} · /model to switch"
+                ));
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot save provider setup: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot save provider setup: {e}")),
         }
     }
 
@@ -179,15 +215,9 @@ impl App {
                 let name = active.provider.name().to_string();
                 self.agent.model.swap(active);
                 self.menu.current = index;
-                self.bake(vec![Line::styled(
-                    format!("model → {name} · {label}"),
-                    theme::dim(),
-                )]);
+                self.reply(format!("model → {name} · {label}"));
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot switch model: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot switch model: {e}")),
         }
     }
 
@@ -205,19 +235,49 @@ impl App {
                 {
                     *slot = choice;
                 }
-                self.bake(vec![Line::styled(
-                    format!("{kind} → {label}"),
-                    theme::dim(),
-                )]);
+                self.reply(format!("{kind} → {label}"));
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot configure {kind}: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot configure {kind}: {e}")),
         }
     }
 
+    /// What the user typed, then what it answered. A `/name` that resolves to a
+    /// skill is deliberately *not* echoed here: it is a prompt, and starting its
+    /// turn bakes the same echo through `prompt_echo`.
     pub(super) fn run_slash(&mut self, cmd: &str) {
+        if !is_ui_command(cmd) && self.registry.find(cmd).is_none() && self.dispatch_skill(cmd) {
+            return;
+        }
+        self.echo_command(cmd);
+        self.dispatch_slash(cmd);
+    }
+
+    /// The command line itself, rendered exactly like a prompt: it is one.
+    fn echo_command(&mut self, cmd: &str) {
+        self.bake_live_text();
+        self.finish_thinking();
+        self.bake(crate::view::command_echo_lines(cmd));
+    }
+
+    /// A command's answer. Every status line a command prints goes through
+    /// here (or `reply_error`), so the `⎿` attachment to the echoed command is
+    /// decided in one place rather than at forty bake sites.
+    pub(super) fn reply(&mut self, text: impl AsRef<str>) {
+        self.bake(reply_lines(text.as_ref(), theme::dim()));
+    }
+
+    pub(super) fn reply_error(&mut self, text: impl AsRef<str>) {
+        self.bake(reply_lines(
+            text.as_ref(),
+            ratatui::style::Style::default().fg(theme::ERROR),
+        ));
+    }
+
+    pub(super) fn reply_warn(&mut self, text: impl AsRef<str>) {
+        self.bake(reply_lines(text.as_ref(), theme::warn()));
+    }
+
+    fn dispatch_slash(&mut self, cmd: &str) {
         // UI-only commands: their substance drives frontend-owned objects
         // (key table, model picker, provider wizard), so they never reach
         // the shared registry.
@@ -235,11 +295,11 @@ impl App {
                 return;
             }
             "/model" => {
-                self.open_model_picker();
+                self.open_model_hub(false);
                 return;
             }
             "/agents" => {
-                self.overlay = model_picker::AgentPicker::new(&self.agents).map(Overlay::Agent);
+                self.open_model_hub(true);
                 return;
             }
             _ => {}
@@ -254,14 +314,8 @@ impl App {
             self.run_voice(rest.trim());
             return;
         }
-        if self.registry.find(cmd).is_none() && self.dispatch_skill(cmd) {
-            return;
-        }
         let Some(command) = self.registry.find(cmd) else {
-            self.bake(vec![Line::styled(
-                format!("unknown command {cmd} — /help lists commands"),
-                theme::dim(),
-            )]);
+            self.reply(format!("unknown command {cmd} — /help lists commands"));
             return;
         };
         if self.session.is_none() {
@@ -269,18 +323,12 @@ impl App {
             // the UI's own tally; everything else waits.
             if command.name() == "cost" {
                 let u = self.meter.turn;
-                self.bake(vec![Line::styled(
-                    format!(
-                        "last turn: in {} | out {} | cache r {} w {}",
-                        u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
-                    ),
-                    theme::dim(),
-                )]);
+                self.reply(format!(
+                    "last turn: in {} | out {} | cache r {} w {}",
+                    u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
+                ));
             } else {
-                self.bake(vec![Line::styled(
-                    "wait for the current turn to finish",
-                    theme::dim(),
-                )]);
+                self.reply("wait for the current turn to finish");
             }
             return;
         }
@@ -324,10 +372,10 @@ impl App {
                 match std::fs::read_to_string(dir.join("SKILL.md")) {
                     Ok(body) => body,
                     Err(e) => {
-                        self.bake(vec![Line::styled(
-                            format!("cannot read {}: {e}", dir.join("SKILL.md").display()),
-                            ratatui::style::Style::default().fg(theme::ERROR),
-                        )]);
+                        self.reply_error(format!(
+                            "cannot read {}: {e}",
+                            dir.join("SKILL.md").display()
+                        ));
                         return true;
                     }
                 }
@@ -407,10 +455,11 @@ impl App {
                 }
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
                 CommandEffect::PersistDogfood(on) => {
-                    tcode_core::config::ModelState::update(|state| state.dogfood = on)
+                    self.state_store.update(move |state| state.dogfood = on)
                 }
                 CommandEffect::PersistSuggestions(on) => {
-                    tcode_core::config::ModelState::update(|state| state.suggestions = Some(on));
+                    self.state_store
+                        .update(move |state| state.suggestions = Some(on));
                     // Off means the pending guess is stale; on means the next
                     // turn's end starts one.
                     self.drop_suggestion();
@@ -453,17 +502,14 @@ impl App {
             "off" => self.set_voice(false),
             "keys" => {
                 self.voice_probe = !self.voice_probe;
-                self.bake(vec![Line::styled(
-                    if self.voice_probe {
-                        "key probe on — every keystroke is echoed below. Press the key you want \
+                self.reply(if self.voice_probe {
+                    "key probe on — every keystroke is echoed below. Press the key you want \
                          for voice: if nothing appears, something above tcode (an input method, \
                          the terminal, the window manager) is taking it. /voice keys turns this \
                          off."
-                    } else {
-                        "key probe off"
-                    },
-                    theme::dim(),
-                )]);
+                } else {
+                    "key probe off"
+                });
             }
             other if other.starts_with("model ") => {
                 self.apply_voice_model(other["model ".len()..].trim().to_string())
@@ -472,36 +518,28 @@ impl App {
             other if other.starts_with("words ") => self.edit_voice_words(&other["words ".len()..]),
             other => {
                 let Some(name) = other.strip_prefix("key ") else {
-                    self.bake(vec![Line::styled(
-                        format!(
-                            "usage: /voice [on|off|keys|key <name>|model [<name>]|words [<w>...]] \
-                             (got '{other}')"
-                        ),
-                        ratatui::style::Style::default().fg(theme::ERROR),
-                    )]);
+                    self.reply_error(format!(
+                        "usage: /voice [on|off|keys|key <name>|model [<name>]|words [<w>...]] \
+                         (got '{other}')"
+                    ));
                     return;
                 };
                 match name.trim().parse::<tcode_core::config::VoiceKey>() {
                     Ok(key) => {
                         self.voice.set_key(key);
-                        // state.toml, like the permission mode Shift+Tab
-                        // lands on: a choice the program made on the user's
-                        // behalf and must remember. config.toml stays
-                        // hand-written and untouched.
-                        tcode_core::config::ModelState::update(|state| state.voice_key = Some(key));
-                        self.bake(vec![Line::styled(
-                            format!(
-                                "voice key is now {} (persists across sessions) — {}",
-                                key.label(),
-                                self.voice.gesture_help()
-                            ),
-                            theme::dim(),
-                        )]);
+                        // The selected config's `[tcode_state]`, like the
+                        // permission mode Shift+Tab lands on: a choice the
+                        // program made on the user's behalf and must remember.
+                        // Runtime updates preserve other handwritten TOML.
+                        self.state_store
+                            .update(move |state| state.voice_key = Some(key));
+                        self.reply(format!(
+                            "voice key is now {} (persists across sessions) — {}",
+                            key.label(),
+                            self.voice.gesture_help()
+                        ));
                     }
-                    Err(reason) => self.bake(vec![Line::styled(
-                        reason,
-                        ratatui::style::Style::default().fg(theme::ERROR),
-                    )]),
+                    Err(reason) => self.reply_error(reason),
                 }
             }
         }
@@ -519,7 +557,7 @@ impl App {
                 self.voice.words().join(" ")
             )
         };
-        self.bake(vec![Line::styled(line, theme::dim())]);
+        self.reply(line);
     }
 
     /// `/voice words <w>...`. A leading `-` removes; everything else adds. One
@@ -543,13 +581,11 @@ impl App {
         // Seeded from the effective list, so words written by hand in
         // config.toml survive the first edit made from in here.
         let switched = self.voice.set_words(words.clone());
-        tcode_core::config::ModelState::update(|state| state.voice_words = Some(words));
+        self.state_store
+            .update(move |state| state.voice_words = Some(words));
         match switched {
             Ok(()) => self.show_voice_words(),
-            Err(reason) => self.bake(vec![Line::styled(
-                reason,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(reason) => self.reply_error(reason),
         }
     }
 
@@ -562,10 +598,7 @@ impl App {
                 self.overlay = Some(Overlay::VoiceModel(picker));
             }
             // Missing or stale sidecar: the reason already carries its own fix.
-            Err(reason) => self.bake(vec![Line::styled(
-                reason,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(reason) => self.reply_error(reason),
         }
     }
 
@@ -575,7 +608,9 @@ impl App {
         // No list of names here on purpose: the sidecar's table is the only
         // one, and a wrong name comes back from it as a menu.
         let switched = self.voice.set_model(name.clone());
-        tcode_core::config::ModelState::update(|state| state.voice_model = Some(name.clone()));
+        let saved_name = name.clone();
+        self.state_store
+            .update(move |state| state.voice_model = Some(saved_name));
         match switched {
             Ok(()) => {
                 self.notice = Some((
@@ -585,17 +620,14 @@ impl App {
             }
             // First use of a model downloads it, and that is where a bad name
             // surfaces — so this must stay on screen.
-            Err(reason) => self.bake(vec![Line::styled(
-                reason,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(reason) => self.reply_error(reason),
         }
     }
 
     /// `/voice`. The choice persists like `/suggest`: a setting you must
     /// re-arm every morning is one you stop using.
     pub(super) fn set_voice(&mut self, on: bool) {
-        tcode_core::config::ModelState::update(|state| state.voice = Some(on));
+        self.state_store.update(move |state| state.voice = Some(on));
         if !on {
             self.voice.turn_off();
             crate::set_key_release_reporting(false);
@@ -625,10 +657,7 @@ impl App {
             }
             // A failure is the exception: it says what to do about it, so it
             // has to survive longer than three seconds.
-            Err(reason) => self.bake(vec![Line::styled(
-                reason,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(reason) => self.reply_error(reason),
         }
     }
 
@@ -637,24 +666,18 @@ impl App {
     /// row shows one continuous "getting ready" rather than two mechanisms.
     pub(super) fn install_voice_backend(&mut self) {
         let Some(asset) = crate::voice::release_asset() else {
-            self.bake(vec![Line::styled(
-                format!(
-                    "there is no voice backend for {}-{}: the speech library it needs is not \
+            self.reply_error(format!(
+                "there is no voice backend for {}-{}: the speech library it needs is not \
                      published for this platform.",
-                    std::env::consts::ARCH,
-                    std::env::consts::OS
-                ),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]);
+                std::env::consts::ARCH,
+                std::env::consts::OS
+            ));
             return;
         };
         let path = match crate::voice::install_path() {
             Ok(path) => path,
             Err(reason) => {
-                self.bake(vec![Line::styled(
-                    reason,
-                    ratatui::style::Style::default().fg(theme::ERROR),
-                )]);
+                self.reply_error(reason);
                 return;
             }
         };
@@ -712,10 +735,7 @@ impl App {
                         Instant::now(),
                     ))
                 }
-                Err(reason) => self.bake(vec![Line::styled(
-                    reason,
-                    ratatui::style::Style::default().fg(theme::ERROR),
-                )]),
+                Err(reason) => self.reply_error(reason),
             }
             return;
         }
@@ -738,7 +758,7 @@ impl App {
             VoiceOutcome::Notice(text) => self.notice = Some((text, Instant::now())),
             // Into the transcript: it wraps, it stays, and it is the kind of
             // thing the user has to be able to re-read.
-            VoiceOutcome::Announce(text) => self.bake(vec![Line::styled(text, theme::warn())]),
+            VoiceOutcome::Announce(text) => self.reply_warn(text),
             // The key doubles as a character. It types normally and is taken
             // back only once the hold is proven, so a space stays a space.
             VoiceOutcome::TypeSpace => {
@@ -792,19 +812,17 @@ impl App {
         }
     }
 
+    /// A registry command's own message is an answer like any other, so it
+    /// takes the same `⎿` attachment the frontend's replies do. A `Note` is
+    /// not: it is text going to the model, and it keeps the user rail.
     pub(super) fn bake_command_message(&mut self, message: CommandMessage) {
-        let lines = match message.kind {
-            MessageKind::Info => message
-                .text
-                .lines()
-                .map(|line| Line::styled(line.to_string(), theme::dim()))
-                .collect(),
-            MessageKind::Error => vec![Line::styled(
-                message.text,
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )],
-            MessageKind::Note => quote_lines(Some(NOTE_LABEL), &message.text),
-        };
-        self.bake(lines);
+        match message.kind {
+            MessageKind::Info => self.reply(message.text),
+            MessageKind::Error => self.reply_error(message.text),
+            MessageKind::Note => {
+                let lines = quote_lines(Some(NOTE_LABEL), &message.text);
+                self.bake(lines);
+            }
+        }
     }
 }

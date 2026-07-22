@@ -17,7 +17,7 @@ use tcode_importers::{ExternalSessionInfo, ExternalSource};
 use tokio::sync::oneshot;
 
 use crate::approval::{Dialog, DialogResult};
-use crate::model_picker::{self, AgentMenu, AgentModelChoice, ModelMenu};
+use crate::model_picker::{self, AgentMenu, AgentModelChoice, HubCtx, ModelMenu, PresetMenu};
 use crate::view_picker::{self, ViewId};
 use crate::{folder_trust_picker, mode_picker, resume, voice_picker};
 
@@ -26,8 +26,23 @@ use crate::{folder_trust_picker, mode_picker, resume, voice_picker};
 pub struct OverlayCtx<'a> {
     pub menu: &'a ModelMenu,
     pub agents: &'a AgentMenu,
+    pub presets: &'a PresetMenu,
+    /// The running provider's reasoning effort. No menu holds it: it belongs
+    /// to the live `ModelCell`, not to the list of what could be picked.
+    pub effort: Option<String>,
     pub width: u16,
     pub height: u16,
+}
+
+impl OverlayCtx<'_> {
+    fn hub(&self) -> HubCtx<'_> {
+        HubCtx {
+            menu: self.menu,
+            agents: self.agents,
+            presets: self.presets,
+            effort: self.effort.as_deref(),
+        }
+    }
 }
 
 /// Work an overlay asks the app to perform. Every variant is something only
@@ -51,13 +66,18 @@ pub enum OverlayAction {
         kind: String,
         choice: AgentModelChoice,
     },
+    /// Switch to a named line-up. Like `ApplySetup`, only the binary can carry
+    /// it out: it rebuilds the provider and every pin behind it.
+    ApplyPreset(String),
+    /// Capture the live line-up under a new name.
+    SavePreset(String),
     /// Suspends the terminal, so it cannot run inside the dialog's own key
     /// handler. The dialog stays open and takes the revision afterwards.
     EditPlan,
     /// A finished `/provider` run: persist it and rebuild everything derived
     /// from the config. Only the binary can do that, so it arrives as an
     /// action like every other.
-    ApplySetup(Box<(tcode_core::config::Config, tcode_core::config::ModelState)>),
+    ApplySetup(Box<tcode_core::config::Config>),
     /// Only `Overlay::Approval` produces this, and the reply channel it needs
     /// lives in that variant — see `App::on_overlay_flow`.
     Approved(Approval),
@@ -82,11 +102,11 @@ pub enum Flow {
 pub enum Overlay {
     View(view_picker::Picker),
     Resume(resume::Picker),
-    Model(model_picker::Picker),
+    /// `/model` and `/agents`: one hub over the whole line-up.
+    Model(model_picker::Hub),
     Mode(mode_picker::Picker),
     VoiceModel(voice_picker::Picker),
     FolderTrust(folder_trust_picker::Picker),
-    Agent(model_picker::AgentPicker),
     /// `/provider`. Boxed because it carries a whole `Config` being edited.
     Provider(Box<crate::setup::Setup>),
     Approval(Box<Dialog>, ApprovalReply),
@@ -158,11 +178,10 @@ impl Overlay {
         match self {
             Overlay::View(picker) => picker.render(),
             Overlay::Resume(picker) => picker.render(),
-            Overlay::Model(picker) => picker.render(ctx.menu),
+            Overlay::Model(hub) => hub.render(&ctx.hub()),
             Overlay::Mode(picker) => picker.render(),
             Overlay::VoiceModel(picker) => picker.render(),
             Overlay::FolderTrust(picker) => picker.render(),
-            Overlay::Agent(picker) => picker.render(ctx.menu, ctx.agents),
             Overlay::Provider(setup) => crate::provider_picker::render(&setup.view()),
             Overlay::Approval(dialog, _) => dialog.render(ctx.width, ctx.height.saturating_sub(7)),
         }
@@ -171,11 +190,10 @@ impl Overlay {
     pub fn set_hovered_row(&mut self, row: Option<usize>, ctx: &OverlayCtx) {
         match self {
             Overlay::View(picker) => picker.set_hovered_row(row),
-            Overlay::Model(picker) => picker.set_hovered_row(row),
+            Overlay::Model(hub) => hub.set_hovered_row(row, &ctx.hub()),
             Overlay::Mode(picker) => picker.set_hovered_row(row),
             Overlay::VoiceModel(picker) => picker.set_hovered_row(row),
             Overlay::FolderTrust(picker) => picker.set_hovered_row(row),
-            Overlay::Agent(picker) => picker.set_hovered_row(row, ctx.agents),
             // Setup is a keyboard form (fields, not just rows); hover would
             // have to move a text cursor to mean anything.
             Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => {}
@@ -201,7 +219,7 @@ impl Overlay {
                     Flow::Act(OverlayAction::ImportExternal(external))
                 }
             },
-            Overlay::Model(picker) => model_flow(picker.handle_key(key)),
+            Overlay::Model(hub) => hub_flow(hub.handle_key(key, &ctx.hub())),
             Overlay::Mode(picker) => match picker.handle_key(key) {
                 mode_picker::PickResult::Pending => Flow::Stay,
                 mode_picker::PickResult::Cancelled => Flow::Close,
@@ -225,7 +243,6 @@ impl Overlay {
                     Flow::Act(OverlayAction::FolderTrust(choice))
                 }
             },
-            Overlay::Agent(picker) => agent_flow(picker.handle_key(key, ctx.menu, ctx.agents)),
             Overlay::Provider(setup) => match setup.on_key(key) {
                 crate::setup::Progress::Stay => Flow::Stay,
                 crate::setup::Progress::Done(None) => Flow::Close,
@@ -250,8 +267,9 @@ impl Overlay {
                 view_picker::PickResult::Picked(id) => Flow::Act(OverlayAction::OpenView(id)),
                 _ => Flow::Stay,
             },
-            Overlay::Model(picker) => match model_flow(picker.handle_mouse_row(row)) {
-                // A click on the inherit row of `/model` picks nothing.
+            Overlay::Model(hub) => match hub_flow(hub.handle_mouse_row(row, &ctx.hub())) {
+                // A click on a header row picks nothing; it must not be read
+                // as a dismissal.
                 Flow::Close => Flow::Stay,
                 flow => flow,
             },
@@ -271,12 +289,6 @@ impl Overlay {
                 }
                 _ => Flow::Stay,
             },
-            Overlay::Agent(picker) => {
-                match agent_flow(picker.handle_mouse_row(row, ctx.menu, ctx.agents)) {
-                    Flow::Close => Flow::Stay,
-                    flow => flow,
-                }
-            }
             Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => Flow::Stay,
         }
     }
@@ -285,11 +297,9 @@ impl Overlay {
     /// except where dismissal needs an explicit decision.
     pub fn on_click_away(&self) -> Flow {
         match self {
-            Overlay::View(_)
-            | Overlay::Model(_)
-            | Overlay::Mode(_)
-            | Overlay::VoiceModel(_)
-            | Overlay::Agent(_) => Flow::Close,
+            Overlay::View(_) | Overlay::Model(_) | Overlay::Mode(_) | Overlay::VoiceModel(_) => {
+                Flow::Close
+            }
             // The trust prompt and an approval must be answered, not dodged;
             // setup holds a half-typed key a stray click must not discard.
             Overlay::FolderTrust(_)
@@ -300,29 +310,25 @@ impl Overlay {
     }
 }
 
-fn model_flow(result: model_picker::PickResult) -> Flow {
-    match result {
-        model_picker::PickResult::Pending => Flow::Stay,
-        model_picker::PickResult::Cancelled => Flow::Close,
-        // `/model` has no inherit row, so a pick without an option only comes
-        // from the agent picker's shared rendering path.
-        model_picker::PickResult::Picked {
-            option: None,
-            effort: _,
-        } => Flow::Close,
-        model_picker::PickResult::Picked {
-            option: Some(index),
-            effort,
-        } => Flow::Act(OverlayAction::ApplyModel { index, effort }),
-    }
-}
-
-fn agent_flow(pick: model_picker::AgentPick) -> Flow {
+/// Every hub pick but the dismissal keeps the dialog open: a visit is usually
+/// about more than one row, and closing after each pick is what made
+/// configuring a line-up mean reopening the dialog eight times.
+fn hub_flow(pick: model_picker::HubPick) -> Flow {
     match pick {
-        model_picker::AgentPick::Pending => Flow::Stay,
-        model_picker::AgentPick::Cancelled => Flow::Close,
-        model_picker::AgentPick::Picked { kind, choice } => {
-            Flow::Act(OverlayAction::ApplyAgentModel { kind, choice })
+        model_picker::HubPick::Pending => Flow::Stay,
+        model_picker::HubPick::Cancelled => Flow::Close,
+        model_picker::HubPick::Model { option, effort } => {
+            Flow::ActInPlace(OverlayAction::ApplyModel {
+                index: option,
+                effort,
+            })
+        }
+        model_picker::HubPick::Agent { kind, choice } => {
+            Flow::ActInPlace(OverlayAction::ApplyAgentModel { kind, choice })
+        }
+        model_picker::HubPick::Preset(name) => Flow::ActInPlace(OverlayAction::ApplyPreset(name)),
+        model_picker::HubPick::SavePreset(name) => {
+            Flow::ActInPlace(OverlayAction::SavePreset(name))
         }
     }
 }
@@ -339,7 +345,7 @@ mod tests {
 
     /// The menus carry callbacks into `App`, so tests build empty ones rather
     /// than deriving `Default` on a struct that holds behaviour.
-    fn menus() -> (ModelMenu, AgentMenu) {
+    fn menus() -> (ModelMenu, AgentMenu, PresetMenu) {
         (
             ModelMenu {
                 options: Vec::new(),
@@ -351,13 +357,25 @@ mod tests {
                 pins: Vec::new(),
                 pin: Box::new(|_, _| Err("no pins in test".to_string())),
             },
+            PresetMenu {
+                options: Vec::new(),
+                current: None,
+                apply: Box::new(|_| Err("no presets in test".to_string())),
+                save: Box::new(|_, _, _| Err("no presets in test".to_string())),
+            },
         )
     }
 
-    fn ctx<'a>(menu: &'a ModelMenu, agents: &'a AgentMenu) -> OverlayCtx<'a> {
+    fn ctx<'a>(
+        menu: &'a ModelMenu,
+        agents: &'a AgentMenu,
+        presets: &'a PresetMenu,
+    ) -> OverlayCtx<'a> {
         OverlayCtx {
             menu,
             agents,
+            presets,
+            effort: None,
             width: 80,
             height: 24,
         }
@@ -384,19 +402,19 @@ mod tests {
 
     #[test]
     fn escape_dismisses_a_picker_without_acting() {
-        let (menu, agents) = menus();
+        let (menu, agents, presets) = menus();
         let mut overlay = mode_overlay();
         assert!(matches!(
-            overlay.handle_key(key(KeyCode::Esc), &ctx(&menu, &agents)),
+            overlay.handle_key(key(KeyCode::Esc), &ctx(&menu, &agents, &presets)),
             Flow::Close
         ));
     }
 
     #[test]
     fn picking_a_mode_closes_the_overlay_and_reports_the_choice() {
-        let (menu, agents) = menus();
+        let (menu, agents, presets) = menus();
         let mut overlay = mode_overlay();
-        let flow = overlay.handle_key(key(KeyCode::Enter), &ctx(&menu, &agents));
+        let flow = overlay.handle_key(key(KeyCode::Enter), &ctx(&menu, &agents, &presets));
         assert!(matches!(
             flow,
             Flow::Act(OverlayAction::SetMode(PermissionMode::Default))
@@ -407,9 +425,9 @@ mod tests {
     /// stays untrusted for the session rather than silently staying unknown.
     #[test]
     fn dismissing_the_folder_trust_prompt_rejects_for_the_session() {
-        let (menu, agents) = menus();
+        let (menu, agents, presets) = menus();
         let mut overlay = trust_overlay();
-        let flow = overlay.handle_key(key(KeyCode::Esc), &ctx(&menu, &agents));
+        let flow = overlay.handle_key(key(KeyCode::Esc), &ctx(&menu, &agents, &presets));
         assert!(matches!(
             flow,
             Flow::Act(OverlayAction::FolderTrust(

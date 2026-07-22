@@ -464,7 +464,7 @@ impl App {
     }
 
     pub(super) fn completion_matches(&self) -> Vec<CompletionMatch> {
-        if self.overlay.is_some() {
+        if self.overlay.is_some() || self.editor.is_recalling_history() {
             return Vec::new();
         }
         if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {

@@ -324,8 +324,8 @@ impl App {
                 self.space_before_response = false;
                 // A batch supersedes any single diff pre-baked for its
                 // (once) approval — retract it so the batch renders in full.
-                if let Some(mark) = self.change_prebake.take() {
-                    self.transcript.truncate_blocks(mark);
+                if let Some(prebake) = self.change_prebake.take() {
+                    self.transcript.truncate_blocks(prebake.mark);
                 }
                 self.bake_live_text();
                 self.finish_thinking();
@@ -460,31 +460,7 @@ impl App {
                 self.meter.on_delegated_usage(u);
                 self.state_label = "sub-agent working".into();
             }
-            AgentEvent::TaskRunEvent { run, event } => {
-                let trace_event = (*event).clone();
-                // Usage inside a run carries delegated semantics: billable,
-                // animates the counter, never the parent's context meter.
-                if let AgentEvent::Usage(u) | AgentEvent::DelegatedUsage(u) = event.as_ref() {
-                    self.meter.on_delegated_usage(*u);
-                }
-                if let Some(position) = self.task_runs.iter().position(|entry| entry.id == run) {
-                    let entry = &mut self.task_runs[position];
-                    entry.note_event(&event, &self.renderers, &self.cwd);
-                    entry.events.push(trace_event);
-                    let entry = &self.task_runs[position];
-                    if let Some(block) = entry.block {
-                        let detail = task_live_detail(&entry.summary, &entry.steps);
-                        let status = self.task_status_lines(entry);
-                        self.transcript.replace_detail_preserving_open(
-                            block,
-                            detail,
-                            OUTPUT_VIEW_ROWS,
-                        );
-                        self.transcript.set_live_status(block, Some(status));
-                    }
-                }
-                self.refresh_open_trace(&run);
-            }
+            AgentEvent::TaskRunEvent { run, event } => self.on_task_run_event(run, *event),
             AgentEvent::TaskRunStarted {
                 run,
                 parent_call,
@@ -618,10 +594,9 @@ impl App {
         // If this call's diff was already baked in full while its
         // approval dialog was open, keep that block — don't render a
         // second, capped copy.
-        let header_index = if self.change_prebake.take().is_none() {
-            self.bake_call_start(&name, &input)
-        } else {
-            None
+        let header_index = match self.change_prebake.take() {
+            Some(prebake) => prebake.header_index,
+            None => self.bake_call_start(&name, &input),
         };
         // A bare call's header shimmers while the tool runs; calls
         // whose record is a baked body (diff/preview) stay static.
@@ -728,6 +703,76 @@ impl App {
         }
         self.space_before_response = true;
         self.state_label = "responding".into();
+    }
+
+    /// One event from inside a sub-agent run. A run that delegates further
+    /// wraps its child's events in its own stream, so this recurses: every run,
+    /// however deep, gets its own registry entry, its own retained events and
+    /// therefore its own openable trace. The *card* for a nested run is baked
+    /// by the parent run's trace view (`SessionView::feed_event`), which is why
+    /// nothing here looks for a block in the main transcript.
+    pub(super) fn on_task_run_event(&mut self, run: String, event: AgentEvent) {
+        // Usage inside a run carries delegated semantics: billable,
+        // animates the counter, never the parent's context meter.
+        if let AgentEvent::Usage(u) | AgentEvent::DelegatedUsage(u) = &event {
+            self.meter.on_delegated_usage(*u);
+        }
+        match &event {
+            AgentEvent::TaskRunStarted {
+                run: nested,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+            } => {
+                if let Some(parent) = self.task_runs.iter().find(|entry| entry.id == run) {
+                    let entry = UiTaskRun::new(
+                        nested.clone(),
+                        parent_call.clone(),
+                        kind.clone(),
+                        model.clone(),
+                        prompt.clone(),
+                        summary.clone(),
+                        None,
+                    )
+                    .nested_under(parent);
+                    self.task_runs.push(entry);
+                }
+            }
+            AgentEvent::TaskRunFinished {
+                run: nested,
+                status,
+                tool_calls,
+                usage,
+            } => {
+                if let Some(entry) = self.task_runs.iter_mut().find(|entry| entry.id == *nested) {
+                    entry.status = *status;
+                    entry.tools = *tool_calls;
+                    entry.usage = *usage;
+                }
+            }
+            _ => {}
+        }
+        if let Some(position) = self.task_runs.iter().position(|entry| entry.id == run) {
+            let entry = &mut self.task_runs[position];
+            entry.note_event(&event, &self.renderers, &self.cwd);
+            entry.events.push(event.clone());
+            let entry = &self.task_runs[position];
+            if let Some(block) = entry.block {
+                let detail = task_live_detail(&entry.summary, &entry.steps);
+                let status = self.task_status_lines(entry);
+                self.transcript
+                    .replace_detail_preserving_open(block, detail, OUTPUT_VIEW_ROWS);
+                self.transcript.set_live_status(block, Some(status));
+            }
+        }
+        self.refresh_open_trace(&run);
+        // Deeper levels: the event just recorded here is the child's whole
+        // stream, and the child needs it too — for its own trace.
+        if let AgentEvent::TaskRunEvent { run, event } = event {
+            self.on_task_run_event(run, *event);
+        }
     }
 
     /// A sub-agent run began. Its live trace card hangs off the parent call's
@@ -887,8 +932,8 @@ impl App {
             ApprovalDecision::No => {
                 // Retract the diff baked while the dialog was open — a
                 // declined change leaves only its one-line record.
-                if let Some(mark) = self.change_prebake.take() {
-                    self.transcript.truncate_blocks(mark);
+                if let Some(prebake) = self.change_prebake.take() {
+                    self.transcript.truncate_blocks(prebake.mark);
                 }
                 // A declined combined review still emits its batch header and a
                 // result per call, so the record is already complete; a summary

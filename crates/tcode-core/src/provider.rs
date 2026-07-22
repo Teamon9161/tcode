@@ -212,6 +212,15 @@ impl AgentModels {
             .insert(kind.to_string(), AgentPin::Inherit);
     }
 
+    /// Swap the whole table at once. Switching a preset is one decision about
+    /// the entire line-up, so pins the previous one made for roles the new one
+    /// never mentions must go with it — merging would leave a mixture no
+    /// preset describes.
+    pub fn replace_all(&self, other: &AgentModels) {
+        let replacement = other.0.read().expect("agent models lock").clone();
+        *self.0.write().expect("agent models lock") = replacement;
+    }
+
     pub fn unpin(&self, kind: &str) {
         self.0.write().expect("agent models lock").remove(kind);
     }

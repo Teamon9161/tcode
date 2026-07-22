@@ -69,8 +69,9 @@ pub enum CommandEffect {
         focus: Option<String>,
     },
     OpenResumePicker,
-    /// The dogfood switch flipped: write it to state.toml so it survives a
-    /// restart. Persisting program state is the frontend's job here — it
+    /// The dogfood switch flipped: write it to the selected config's
+    /// `[tcode_state]` so it survives a restart. Persisting program state is
+    /// the frontend's job here — it
     /// already owns it for the `/model` choice, and core's own tests must not
     /// write the developer's home directory to exercise a command.
     PersistDogfood(bool),

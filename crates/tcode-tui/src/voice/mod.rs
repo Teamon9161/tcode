@@ -322,7 +322,8 @@ impl Voice {
     }
 
     /// Should voice come up with the session? `[voice] enabled`, already
-    /// resolved against the runtime toggle in state.toml.
+    /// resolved against the runtime toggle in the selected config's
+    /// `[tcode_state]` table.
     pub(crate) fn wants_on(&self) -> bool {
         self.cfg.enabled
     }

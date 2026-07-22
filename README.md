@@ -52,6 +52,16 @@ cargo test --workspace
 cargo clippy --workspace --all-targets
 ```
 
+## Configuration
+
+By default tcode uses `~/.tcode/config.toml`; `--config <PATH>` (or `-C`) selects a different personal configuration for a run, including setup and all remembered UI choices. Runtime selections live in that file's `[tcode_state]` table, which tcode updates without rewriting other TOML or comments. `-p` remains the one-shot prompt flag.
+
+```sh
+tcode --config ~/work/tcode.toml --profile anthropic --model claude-sonnet-5
+```
+
+Project `.tcode/config.toml` remains an overlay and cannot provide runtime state. On first use of the default config, a legacy `~/.tcode/state.toml` is migrated into `[tcode_state]`; a custom config never imports it.
+
 ## Releasing
 
 GitHub Actions validates pushes and pull requests. A release is only published when a `v*` tag is pushed, and the tag must match the root `Cargo.toml` `[workspace.package]` version. The release workflow builds these checksum-protected binaries in parallel:

@@ -13,6 +13,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use tcode_core::{AgentEvent, ContentBlock, Entry};
 
+use crate::live_panel::UiTaskRun;
 use crate::markdown;
 use crate::render::{
     batch_item_style, shorten_summary_path, CallRoute, HeaderTone, RenderRegistry,
@@ -36,6 +37,11 @@ pub struct SessionView {
     pub transcript: Transcript,
     pending_tool: Option<PendingCall>,
     pending_batch: VecDeque<PendingCall>,
+    /// Runs this view's agent delegated, by run id. A trace view has them for
+    /// the same reason the main conversation does: a delegation is a call whose
+    /// progress is worth watching, and the alternative — dropping the events —
+    /// left a nested sub-agent invisible until its parent call ended.
+    task_cards: HashMap<String, UiTaskRun>,
     live_text: String,
     space_before_response: bool,
     live_block: Option<usize>,
@@ -106,6 +112,7 @@ impl SessionView {
             transcript: Transcript::new(width),
             pending_tool: None,
             pending_batch: VecDeque::new(),
+            task_cards: HashMap::new(),
             live_text: String::new(),
             space_before_response: false,
             live_block: None,
@@ -258,9 +265,94 @@ impl SessionView {
                     ratatui::style::Style::default().fg(theme::WARN),
                 )]);
             }
+            AgentEvent::TaskRunStarted {
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+            } => {
+                let block = self.begin_task_card(run, parent_call, summary);
+                let card = UiTaskRun::new(
+                    run.clone(),
+                    parent_call.clone(),
+                    kind.clone(),
+                    model.clone(),
+                    prompt.clone(),
+                    summary.clone(),
+                    block,
+                );
+                self.task_cards.insert(run.clone(), card);
+            }
+            // One level only: an event from deeper down belongs to a card in
+            // *that* run's own trace, which renders it through this same arm.
+            AgentEvent::TaskRunEvent { run, event } => {
+                let Some(card) = self.task_cards.get_mut(run) else {
+                    return;
+                };
+                card.note_event(event, ctx.renderers, ctx.cwd);
+                let Some(block) = card.block else {
+                    return;
+                };
+                let detail = task_live_detail(&card.summary, &card.steps);
+                let status = task_status_lines(card, ctx.cwd);
+                self.transcript
+                    .replace_detail_preserving_open(block, detail, OUTPUT_VIEW_ROWS);
+                self.transcript.set_live_status(block, Some(status));
+            }
+            AgentEvent::TaskRunFinished {
+                run,
+                status,
+                tool_calls,
+                usage,
+            } => {
+                let Some(card) = self.task_cards.get_mut(run) else {
+                    return;
+                };
+                card.status = *status;
+                card.tools = *tool_calls;
+                card.usage = *usage;
+                if let Some(block) = card.block {
+                    self.transcript.set_live_status(block, None);
+                }
+            }
             AgentEvent::Interrupted | AgentEvent::TurnEnd => self.finish(ctx),
             _ => {}
         }
+    }
+
+    /// Hang a delegated run's card off the call that spawned it. A parallel
+    /// batch item normally waits for its result before baking; a live card
+    /// needs its header row now, so that one item bakes early and keeps its
+    /// index for the eventual report.
+    fn begin_task_card(&mut self, run: &str, parent_call: &str, summary: &str) -> Option<usize> {
+        let block = match self
+            .pending_tool
+            .as_ref()
+            .filter(|call| call.call_id == parent_call)
+            .map(|call| call.header_index)
+        {
+            Some(index) => index,
+            None => {
+                let position = self
+                    .pending_batch
+                    .iter()
+                    .position(|call| call.call_id == parent_call)?;
+                let mut call = self.pending_batch.remove(position)?;
+                let index = self.transcript.block_count();
+                self.bake(std::mem::take(&mut call.header));
+                call.header_index = Some(index);
+                self.pending_batch.insert(position, call);
+                Some(index)
+            }
+        }?;
+        self.transcript.link_task_run(block, run.to_string());
+        self.transcript
+            .attach_detail(block, task_summary_detail(summary), OUTPUT_VIEW_ROWS);
+        self.transcript
+            .set_live_status(block, Some(task_plain_status("starting…")));
+        Some(block)
     }
 
     /// Replay an ordinary recorded conversation verbatim. This convenience
@@ -900,6 +992,81 @@ fn attachment_line(label: &str) -> Line<'static> {
 /// single entry point for both the live prompt echo (`app.rs::prompt_echo`)
 /// and ledger replay (below), so a `/name` invocation looks identical
 /// whichever path baked it.
+/// The card lines of a delegated run. They live here rather than in the app
+/// because both transcripts bake them: the main conversation for the runs it
+/// delegates, and a trace view for the runs *it* delegates in turn. Two copies
+/// is how the trace view came to show a bare batch header and nothing else
+/// while a nested sub-agent worked.
+pub(crate) const TASK_STATUS_INDENT: &str = "      └ ";
+
+pub(crate) fn task_summary_detail(summary: &str) -> Vec<Line<'static>> {
+    summary
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| Line::styled(format!("  │ {line}"), theme::dim()))
+        .collect()
+}
+
+pub(crate) fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
+    let mut lines = task_summary_detail(summary);
+    lines.extend(
+        steps
+            .iter()
+            .map(|step| Line::styled(format!("  │ └ {step}"), theme::dim())),
+    );
+    lines
+}
+
+/// The activity is already self-describing ("thinking…", "starting…"), so
+/// task cards keep it as a quiet indented status rather than competing with
+/// the main window's animated running indicator.
+pub(crate) fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
+    vec![Line::from(vec![Span::styled(
+        format!("{TASK_STATUS_INDENT}{activity}"),
+        theme::dim(),
+    )])]
+}
+
+/// The card's live status: its parent-authored objective stays the primary
+/// label, while the changing sub-agent tool is supporting progress. A parallel
+/// batch names its current call and count.
+pub(crate) fn task_status_lines(run: &UiTaskRun, cwd: &Path) -> Vec<Line<'static>> {
+    let Some(call) = run.current_call() else {
+        return task_plain_status(&run.activity);
+    };
+    let summary = shorten_summary_path(&call.summary, Some(cwd));
+    let mut spans = vec![Span::styled(
+        format!("{TASK_STATUS_INDENT}{summary}"),
+        theme::dim(),
+    )];
+    if run.calls.len() > 1 {
+        spans.push(Span::styled(
+            format!(
+                " · task {}/{}",
+                run.rotation % run.calls.len() + 1,
+                run.calls.len()
+            ),
+            theme::dim(),
+        ));
+    }
+    vec![Line::from(spans)]
+}
+
+/// A slash command is a line the user typed, so it is echoed like one. Its
+/// answer hangs off this row through `bake::reply_lines`, giving a command the
+/// same call/result shape a tool has — without it, consecutive commands stack
+/// into one undifferentiated block of dim text with nothing saying which line
+/// answered which command.
+pub(crate) fn command_echo_lines(cmd: &str) -> Vec<Line<'static>> {
+    vec![
+        Line::default(),
+        Line::from(vec![
+            Span::styled(theme::USER_GUTTER, theme::user_gutter()),
+            Span::styled(cmd.to_string(), theme::user_message()),
+        ]),
+    ]
+}
+
 pub(crate) fn skill_echo_lines(echo: &tcode_tools::SkillEcho) -> Vec<Line<'static>> {
     let header = if echo.args.is_empty() {
         format!("/{}", echo.name)

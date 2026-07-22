@@ -58,6 +58,15 @@ pub enum ShellKind {
     Bash,
 }
 
+impl ShellKind {
+    pub const fn tool_name(self) -> &'static str {
+        match self {
+            Self::PowerShell => "shell",
+            Self::Bash => "bash",
+        }
+    }
+}
+
 pub fn bash_available() -> bool {
     which_bash().is_some()
 }

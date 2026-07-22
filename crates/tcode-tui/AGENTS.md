@@ -17,13 +17,17 @@
 - 批量渲染 item 紧跟自己的 result：批次 header 后每个 call 的 `├ 摘要`(+diff) 推迟到自己的 `ToolEnd` 再 bake（`PendingCall.header`），live 与 replay 一致。
 - 折叠输出默认：read/grep/glob 转录里默认只显示折叠摘要，不铺开首行。
 - 空行是记录的分隔：单发调用 bake 时前置一个空行（带 diff/命令块时后置一个），批次 header 同理。删掉它们记录就糊成一坨。
+- **委派出去的 run 的卡片属于委派方所在的 transcript**：主对话委派的 run，卡片在主 transcript；某个 sub-agent 再委派的 run，卡片在**它自己的 trace view** 里（`SessionView::feed_event` 的 `TaskRun*` 三臂）。卡片行（`task_summary_detail` / `task_live_detail` / `task_plain_status` / `task_status_lines`）住在 `view.rs`，两处 transcript 共用——曾经只有 `App` 有这套逻辑，于是 trace 里的嵌套委派全程只有一行批次 header。嵌套 run 照样进 `task_runs`（`parent_run` + `depth`）：卡片不在主 transcript 不代表它不是本会话的 run，树要能看见它、trace 要能打开它。
 - 批次分组的判定属于 agent loop（`BatchPolicy` + 路径冲突检查），重放要还原批次显示就调 `Agent::batch_display_label` 问 core，**禁止在 TUI 里重新推导规则**（测试 `batch_display_label_matches_the_live_batch_header` 钉住实时与重放同一标题）。
 
 ## 前端归属
 
-- `/model` 与 `/agents` 驱动的是前端自己的选择器，故留在前端；两者共用一个 `Picker`（`/agents` 只是多套一层"选哪个 agent"和一行 inherit），别为第二个选择器再写一套网格。
+- `/model` 与 `/agents` 驱动的是前端自己的选择器，故留在前端。**两者是同一个 `Hub`**（`/agents` 只是把初始光标放在 sub-agent 段），钻进去的主模型行与每个角色行又共用同一个 `Picker`（角色多一行 inherit、可关的多一行 off）。别为第二个选择器再写一套网格，也别把"配一个角色"和"整套切换"拆成两个对话框——正是那个拆法让"换一家 provider"等于重钉八个角色。
+- **preset（`[presets.*]`）是配置层的概念，前端只拿到 `PresetMenu`**：切换与保存都是"写配置 + 重建 provider 和全部 pin"，与 `ProviderSetup::apply` 同形，由 binary 的闭包完成，前端只收菜单和一行结果。前端不认识配置路径，也不认识具体 provider。
+- hub 里的每一次 pick 走 `Flow::ActInPlace`：面板不关，因为一次访问通常要改不止一行。唯一关闭它的是 Esc（且 Esc 在钻入层只退一步）。
 - **provider setup 的决策逻辑归 `setup.rs`，两个渲染器都不许自己判**：首启向导（`wizard.rs`，裸 crossterm）与 `/provider`（`Overlay::Provider`）驱动同一个 `Setup` 状态机——`App::new` 要 `Arc<Agent>`（即已建好的 provider），正是 setup 要产出的东西，所以首启那条路结构上进不了 overlay，独立渲染器必须存在。两者只在怎么画 `View` 上不同：按键语义、写进 config.toml 的内容都由状态机一处决定。它的两个副作用（读用户全局 config、落盘并重建 provider+菜单）经 `ProviderSetup` 注入，与 `SwitchFn`/`PinFn` 同形——前端不碰磁盘路径也不碰具体 provider，测试才能不依赖本机 `~/.tcode/config.toml`。
 - 前端只是 effect 解释器；`CommandEffect` 新增变体的准入标准：要么每个前端都有非平凡解释，要么有明确降级语义，否则逻辑该留在命令自己里。
+- **命令是"用户打的一行 + 它的回答"，两半都只有一个入口**：`run_slash` 一处回显 `▌ /cmd`，回复一律走 `reply` / `reply_error` / `reply_warn`（形状在 `bake::reply_lines`），不要在命令实现里直接 `bake` 一行裸 dim——那正是几条命令糊成一坨、且看不出哪句答哪条的来源。例外只有 `/help` 那种本身就是成块表格的输出，和 `MessageKind::Note`（它是发给模型的文本，留用户轨）。解析成 skill 的 `/name` **不在这条里**：它是 prompt，回显归 `prompt_echo`，所以 `run_slash` 必须先问 skill 再回显。
 
 ## 语音输入（`voice/`）
 
@@ -45,7 +49,7 @@
 
   够数但太慢时给一条指向功能键的自愈提示：那种绑定根本不需要与打字区分。
 - 转写只进编辑器，**永不自动提交**。录音行用 `theme::recording()`（红），这是唯一一处约定压过内部配色一致性的地方。
-- `/voice`、`/voice key`、`/voice model` 的选择都落 `state.toml`（同 `/suggest`、shift+tab 的模式），config.toml 保持手写不被程序改写。
+- `/voice`、`/voice key`、`/voice model` 的选择都落选中 config.toml 的 `[tcode_state]`（同 `/suggest`、shift+tab 的模式）；前端通过注入的持久化接口写入，程序只保留式修改该表。
 - **模型清单只存在于 sidecar 的 `model.rs::PRESETS`，前端一个字都不许抄。** `voice_picker` 的菜单是**问出来的**（`--list-models` 起一个短命进程，打印 JSON 就退出），不是编译进前端的常量——装着的那个 binary 才知道自己支持什么。抄一份到前端，菜单就会提供它装不上的模型，而用户发现的方式是下完 500MB 才报错。同理 `VoiceConfig::model` 默认是**空串**不是某个名字：默认由 `model::find("")` 一处决定。加一个模型 = `PRESETS` 一行 + `asr.rs` 一个 arm（若是新家族），前端、config、picker 都不动。
 - **"装了但版本不对"这个状态不允许存在**：下载的 sidecar 装成 `tcode-voiced-<version>`，tcode 只找自己版本那个名字，找不到就是没装。没有可比较的东西，也就不可能跑到一个和自己参数不一致的二进制上。下载 URL 钉在**本版本的 tag**（不是 `latest`），因为两者跨管道说的是私有协议。裸名 `tcode-voiced` 保留给手编版，排在版本名之后。
 - **sidecar 的构建是独立 job，`publish` 只 `needs` 主 job 成功**。sherpa 的 build script 在构建期从 GitHub 下预编译库——让它有权拖垮整个发布不可接受。少哪个平台就少哪个平台的语音，主程序照发。同理 `release_asset()` 对 win-arm64 返回 `None`：明说"本平台没有"，而不是让用户去下一个不存在的文件。

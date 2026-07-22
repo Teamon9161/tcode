@@ -234,6 +234,13 @@ impl Editor {
         }
     }
 
+    /// A recalled entry must keep arrow keys for history navigation. In
+    /// particular, recalling a slash command must not reopen its completion
+    /// menu and trap the draft that was stashed before history recall began.
+    pub fn is_recalling_history(&self) -> bool {
+        self.history_pos.is_some()
+    }
+
     pub fn set_cursor(&mut self, row: usize, col: usize) {
         let row = row.min(self.lines.len().saturating_sub(1));
         self.row = row;

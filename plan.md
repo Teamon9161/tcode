@@ -161,7 +161,8 @@ loop {
 - `~/.tcode/config.toml`：provider profiles、全局权限规则（手写，首启向导生成初版）。
 - `~/.tcode/state.toml`：当前 profile/model/effort 选择（程序只写这个）。优先级 CLI flag > state > config。
 - `.tcode/config.toml`：项目级 hooks、权限规则、MCP server（`[mcp_servers.名字]`，工具注册为 `mcp__名字__工具`）。
-- `[agents.<kind>]`（`explore`/`plan`/`general`/`auto`/`suggest`/`vision`/`fetch`）：给 sub-agent 与辅助角色钉模型，`profile`/`model`/`effort` 三个可选字段，未写的继承父模型选择。`fetch` 是唯一"未钉即关"的角色（web_fetch 返回原文而非回退主模型）。Codex CLI 凭证与动态模型缓存由 `tcode-providers` 在加载配置后补全，core 只解析已规范化的 profile 模型。
+- `[agents.<kind>]`（`explore`/`plan`/`general`/`auto`/`suggest`/`vision`/`fetch`）：给 sub-agent 与辅助角色钉模型，`profile`/`model`/`effort` 三个可选字段，未写的继承父模型选择；也可写成一个字符串（`"off"` / `"inherit"` / 模型名）。`fetch` 是唯一"未钉即关"的角色（web_fetch 返回原文而非回退主模型）。Codex CLI 凭证与动态模型缓存由 `tcode-providers` 在加载配置后补全，core 只解析已规范化的 profile 模型。
+- **`[presets.<name>]` 是"整套模型编排"，与 `[profiles.*]`（怎么连到 provider）正交**：主模型 + 每个角色跑什么，整体切换。三层解析次序 `[agents.*]` → 活跃 preset → `[tcode_state]` 的临时 pick，`Config::apply_active_preset` 是唯一汇合点。**切 preset 会清空 `[tcode_state]` 里的临时 pick 与主模型**——不清就永远没有一个 preset 能完整描述"现在跑的是什么"；想留住微调就 `/model save <name>` 存成新 preset（这也是程序唯一一处写 `[tcode_state]` 之外的表，只增/替换那一张）。
 - 持久上下文两类禁止混写：**人维护指令**（项目根→cwd 分层，每层 `.tcode/AGENTS.md` > `AGENTS.md` > `CLAUDE.md` 取第一个）；**模型维护自动记忆**（`~/.tcode/projects/<id>/memory/`，`MEMORY.md` 只做精简索引）。
 - 会话/checkpoint/blob/scratch：`~/.tcode/projects/<cwd-hash>/{sessions,checkpoints,blobs,scratchpad}/`。scratch 暴露给模型（project_map 的 `scratch:` 行 + 系统 prompt 引导），溢出输出与后台日志落 `scratchpad/tool-output/`，7 天清理。
 - API key 经 `api_key_env` 指环境变量，不落盘。
@@ -179,6 +180,9 @@ loop {
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. batch edit某些情形下行号显示有问题。一行里的替换，减一行加一行，但是左边行号全是1，实际也不是第一行。这是6changes across 1file
-6. run长命令,审批完命令仍然留在展示窗口中,默认应该是长命令run的内容和结果支持点击展开.
-7. 设定的改变比如用户打了什么，可以类似prompt那样渲染用户输入以及把自动回复一样渲染。现在全部挤在一起了，尤其是/voice的切换等功能
-8. state.toml并入config.toml, 支持cli或者-p传入config地址。
+6. **（已做）** 斜杠命令现在像它本来的样子渲染：`run_slash` 一处回显 `▌ /cmd`（与 prompt 同一条用户轨），命令的每一句回复经 `App::reply` / `reply_error` / `reply_warn` 挂上 `⎿`（形状由 `bake::reply_lines` 一处决定）。此前命令连自己被打过都不留痕，回复是一行裸 dim，连打几条就糊成一坨。skill 形式的 `/name` 不走这条——它是 prompt，回显由开 turn 时的 `prompt_echo` 负责。
+7. **（已做）** trace view 此前丢弃全部 `TaskRun*` 事件：被追踪的 agent 自己委派下去时，读者只看到一行批次 header，直到整个调用结束；嵌套 run 也没有树行可进。现在 `SessionView::feed_event` 自己处理这三个事件，卡片行由 `view.rs` 一处产出（主对话与 trace 共用），嵌套 run 进 agent tree（按 `depth` 缩进）并可打开自己的 trace。跳转手势是 **ctrl+click**（tip 里写着），不做双击；批次 item 仍等自己的 ToolEnd 才 bake，那是既定设计。
+8. sub-agent工作时,比如如果api报错了,在main中能否继续和之前异常中断的agent交互,这很重要,否则等于浪费了一堆token,
+9. ctrl+d 退出会打印乱码在终端, 35;32;42M35;32;41M35;33;41M35;33;41M35;34;40M35;34;40M35;35;40M35;35;40M35;35;39M35;36;39M35;36;39M35;36;40M35;37;40M35;37;41M35;37;41M35;37;42M6c, 有时候只出现6c
+之前应该修复过,为啥又这样了.
+10. batch find和search支持吗

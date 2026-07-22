@@ -37,8 +37,9 @@ impl SlashCommand for DogfoodCommand {
         }
         ctx.session.set_dogfood(on);
         // A mode you must remember to re-enable every session is a mode you
-        // will forget to enable, so it persists — but writing state.toml is
-        // the frontend's job (as it already is for the `/model` choice), not
+        // will forget to enable, so it persists — but writing the selected
+        // config's `[tcode_state]` is the frontend's job (as it already is for
+        // the `/model` choice), not
         // something a core unit test should do to the developer's home.
         CommandOutcome::info(if on {
             "dogfood on (persists across sessions) — the model will report tool friction it \

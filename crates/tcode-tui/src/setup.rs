@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use tcode_core::config::{Config, ModelDef, ModelState, Profile, ProviderKind};
+use tcode_core::config::{Config, ModelDef, Profile, ProviderKind};
 use tcode_providers::codex_auth_available;
 
 /// How a status string should read. Renderers map this to their own palette
@@ -58,7 +58,7 @@ pub enum Progress {
     Stay,
     /// Setup is over. `Some` = write these to disk; `None` = cancelled, and
     /// nothing the user had before may be touched.
-    Done(Option<Box<(Config, ModelState)>>),
+    Done(Option<Box<Config>>),
 }
 
 #[derive(Debug, Clone)]
@@ -176,9 +176,9 @@ const PROTOCOLS: [(&str, ProviderKind); 2] = [
 ];
 
 pub struct Setup {
-    /// The user's own global config — the layer that gets serialized. It
-    /// stays free of catalogue entries so `config.toml` keeps holding only
-    /// what the user actually set.
+    /// The selected user config — the layer that gets serialized. It stays
+    /// free of catalogue entries so `config.toml` holds only what the user
+    /// actually set.
     config: Config,
     /// Defaults merged with the user's config: what is offered on screen.
     catalogue: BTreeMap<String, Profile>,
@@ -189,20 +189,14 @@ pub struct Setup {
     /// credentials are being fixed, so the model selection is left alone.
     missing_profile: Option<String>,
     step: Step,
-    /// The existing `~/.tcode/state.toml` at the moment setup was opened.
-    /// The wizard only manages `profile`, `model`, and `effort` — every
-    /// other field (folder trust, agent pins, dogfood, …) must survive
-    /// the save that follows.
-    existing_state: ModelState,
 }
 
 impl Setup {
-    /// `config` is the user's global config (`Config::default()` on first
+    /// `config` is the selected user config (`Config::default()` on first
     /// run). `missing_profile` names the profile whose credentials sent us
-    /// here, if any. `existing_state` is the current `~/.tcode/state.toml`;
-    /// callers should pass `ModelState::load()` unless this is the first-run
-    /// wizard (in which case there is nothing to preserve).
-    pub fn new(config: Config, missing_profile: Option<&str>, existing_state: ModelState) -> Self {
+    /// here, if any. The selected runtime choices are carried in
+    /// `config.tcode_state` so setup keeps them with the selected config file.
+    pub fn new(config: Config, missing_profile: Option<&str>) -> Self {
         // Defaults as the base layer, the user's overrides on top — the same
         // order `Config::load` uses, so the wizard offers what would run.
         let mut catalogue = Config::defaults().profiles;
@@ -234,7 +228,6 @@ impl Setup {
             customs: Vec::new(),
             missing_profile: missing_profile.map(String::from),
             step: Step::Providers { cursor: 0 },
-            existing_state,
         }
     }
 
@@ -647,7 +640,7 @@ impl Setup {
 
         if let Some(profile) = self.missing_profile.clone() {
             self.config.default_profile = Some(profile);
-            return self.done(self.existing_state.clone());
+            return self.done();
         }
 
         // Models are offered from the *merged* view, the one the runtime will
@@ -678,7 +671,7 @@ impl Setup {
             // the default and let the user name a model in config.toml.
             0 => {
                 self.config.default_profile = configured.first().cloned();
-                self.done(self.existing_state.clone())
+                self.done()
             }
             // A single model is not a question worth asking.
             1 => self.pick_model(&options[0]),
@@ -714,15 +707,14 @@ impl Setup {
 
     fn pick_model(&mut self, choice: &ModelChoice) -> Progress {
         self.config.default_profile = Some(choice.profile.clone());
-        let mut state = self.existing_state.clone();
-        state.profile = Some(choice.profile.clone());
-        state.model = Some(choice.model.clone());
-        state.effort = choice.effort.clone();
-        self.done(state)
+        self.config.tcode_state.profile = Some(choice.profile.clone());
+        self.config.tcode_state.model = Some(choice.model.clone());
+        self.config.tcode_state.effort = choice.effort.clone();
+        self.done()
     }
 
-    fn done(&mut self, state: ModelState) -> Progress {
-        Progress::Done(Some(Box::new((self.config.clone(), state))))
+    fn done(&mut self) -> Progress {
+        Progress::Done(Some(Box::new(self.config.clone())))
     }
 }
 
@@ -810,7 +802,7 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
-    fn press(setup: &mut Setup, codes: &[KeyCode]) -> Option<Box<(Config, ModelState)>> {
+    fn press(setup: &mut Setup, codes: &[KeyCode]) -> Option<Box<Config>> {
         let mut result = None;
         for &code in codes {
             if let Progress::Done(outcome) = setup.on_key(key(code)) {
@@ -851,7 +843,7 @@ mod tests {
     /// keep coming from the catalogue and stay correct when it is updated.
     #[test]
     fn a_builtin_profile_is_saved_as_a_key_only_patch() {
-        let mut setup = Setup::new(Config::default(), None, ModelState::default());
+        let mut setup = Setup::new(Config::default(), None);
         // Which providers auto-detect depends on this machine's environment;
         // start from nothing so the walk below is the only thing under test.
         deselect_all(&mut setup);
@@ -865,7 +857,7 @@ mod tests {
         )
         .expect("setup completes");
 
-        let (config, state) = *saved;
+        let config = *saved;
         let written = &config.profiles["deepseek"];
         assert_eq!(written.api_key.as_deref(), Some("sk-typed"));
         assert_eq!(written.provider, None, "provider stays in the catalogue");
@@ -882,14 +874,14 @@ mod tests {
             merged.profiles["deepseek"].provider,
             Some(ProviderKind::Anthropic)
         );
-        assert_eq!(state.profile.as_deref(), Some("deepseek"));
+        assert_eq!(config.tcode_state.profile.as_deref(), Some("deepseek"));
     }
 
     /// A custom endpoint is the one case that must carry a provider of its
     /// own: no layer below it knows the name.
     #[test]
     fn a_custom_endpoint_is_written_whole() {
-        let mut setup = Setup::new(Config::default(), None, ModelState::default());
+        let mut setup = Setup::new(Config::default(), None);
         deselect_all(&mut setup);
         setup.on_key(key(KeyCode::Char('c')));
         type_str(&mut setup, "groq");
@@ -903,7 +895,7 @@ mod tests {
         setup.on_key(key(KeyCode::Enter)); // key → back to the list
 
         let saved = press(&mut setup, &[KeyCode::Enter, KeyCode::Enter]).expect("setup completes");
-        let profile = &saved.0.profiles["groq"];
+        let profile = &saved.profiles["groq"];
         assert_eq!(profile.provider, Some(ProviderKind::Openai));
         assert_eq!(
             profile.base_url.as_deref(),
@@ -919,7 +911,7 @@ mod tests {
     /// must survive it. Only Esc on the list itself abandons setup.
     #[test]
     fn escaping_a_field_keeps_the_selection() {
-        let mut setup = Setup::new(Config::default(), None, ModelState::default());
+        let mut setup = Setup::new(Config::default(), None);
         go_to(&mut setup, "deepseek");
         setup.on_key(key(KeyCode::Char(' ')));
         setup.on_key(key(KeyCode::Char('c')));
@@ -949,7 +941,7 @@ mod tests {
     /// silently move the user's default model.
     #[test]
     fn reconfiguring_one_profile_leaves_the_model_choice_alone() {
-        let mut setup = Setup::new(Config::default(), Some("openrouter"), ModelState::default());
+        let mut setup = Setup::new(Config::default(), Some("openrouter"));
         let row = setup
             .view()
             .rows
@@ -959,16 +951,16 @@ mod tests {
         assert_eq!(row.mark, Mark::Checked, "the named profile starts selected");
 
         let saved = press(&mut setup, &[KeyCode::Enter]).expect("setup completes");
-        let (config, state) = *saved;
+        let config = *saved;
         assert_eq!(config.default_profile.as_deref(), Some("openrouter"));
-        assert_eq!(state.model, None, "no model was chosen here");
+        assert_eq!(config.tcode_state.model, None, "no model was chosen here");
     }
 
     /// A paste is content, never commands: the API key is bracketed-pasted
     /// into the field, and on the list it must not act as keystrokes.
     #[test]
     fn paste_lands_in_the_field_and_is_inert_on_the_list() {
-        let mut setup = Setup::new(Config::default(), None, ModelState::default());
+        let mut setup = Setup::new(Config::default(), None);
         setup.on_paste("sk-pasted".into());
         assert!(setup.customs.is_empty());
         assert!(matches!(setup.step, Step::Providers { .. }));
@@ -988,7 +980,7 @@ mod tests {
     /// config that would overwrite what is already on disk.
     #[test]
     fn confirming_an_empty_selection_cancels() {
-        let mut setup = Setup::new(Config::default(), None, ModelState::default());
+        let mut setup = Setup::new(Config::default(), None);
         for entry in &mut setup.entries {
             entry.selected = false;
         }

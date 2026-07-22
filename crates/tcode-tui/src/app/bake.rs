@@ -112,34 +112,6 @@ pub(super) fn colored_batch_label(label: &str) -> Vec<Span<'static>> {
     spans
 }
 
-pub(super) fn task_summary_detail(summary: &str) -> Vec<Line<'static>> {
-    summary
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| Line::styled(format!("  │ {line}"), theme::dim()))
-        .collect()
-}
-
-pub(super) fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
-    let mut lines = task_summary_detail(summary);
-    lines.extend(
-        steps
-            .iter()
-            .map(|step| Line::styled(format!("  │ └ {step}"), theme::dim())),
-    );
-    lines
-}
-
-/// The activity is already self-describing ("thinking…", "starting…"), so
-/// task cards keep it as a quiet indented status rather than competing with
-/// the main window's animated running indicator.
-pub(super) fn task_plain_status(activity: &str) -> Vec<Line<'static>> {
-    vec![Line::from(vec![Span::styled(
-        format!("{TASK_STATUS_INDENT}{activity}"),
-        theme::dim(),
-    )])]
-}
-
 pub(super) fn task_header_summary(summary: &str) -> Vec<Span<'static>> {
     match summary.split_once(" · ") {
         Some((kind, objective)) => vec![
@@ -219,6 +191,24 @@ pub(super) fn quote_lines(label: Option<&str>, text: &str) -> Vec<Line<'static>>
             Line::from(spans)
         })
         .collect()
+}
+
+/// A slash command's answer, attached to the echoed command line the way a
+/// tool result attaches to its call: `⎿` on the first row, aligned
+/// continuation under it (the exact prefixes replay uses for a tool result).
+pub(super) fn reply_lines(text: &str, style: ratatui::style::Style) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = text
+        .lines()
+        .enumerate()
+        .map(|(index, row)| {
+            let prefix = if index == 0 { "  ⎿ " } else { "    " };
+            Line::styled(format!("{prefix}{row}"), style)
+        })
+        .collect();
+    if lines.is_empty() {
+        lines.push(Line::styled("  ⎿", style));
+    }
+    lines
 }
 
 /// Attachments hang off the message they arrived with, under the same rail.

@@ -13,7 +13,9 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event, KeyEv
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::{execute, queue};
 
-use tcode_core::config::{Config, ModelState};
+use std::path::Path;
+
+use tcode_core::config::Config;
 
 use crate::setup::{Mark, Progress, Row, Setup, Tone, View};
 
@@ -42,33 +44,33 @@ impl Drop for RawGuard {
 }
 
 /// Returns None if the user cancelled. On success the caller writes the
-/// config and state to disk.
-pub fn run() -> anyhow::Result<Option<(Config, ModelState)>> {
+/// selected config file to disk.
+pub fn run(config_file: &Path) -> anyhow::Result<Option<Config>> {
     println!(
-        "{BOLD}tcode setup{RESET} {DIM}— no config found, let's create ~/.tcode/config.toml{RESET}"
+        "{BOLD}tcode setup{RESET} {DIM}— no config found, let's create {}{RESET}",
+        config_file.display()
     );
-    run_setup(Setup::new(Config::default(), None, ModelState::default()))
+    run_setup(Setup::new(Config::default(), None), config_file)
 }
 
 /// Reconfigure a profile whose credentials are missing. Existing profiles and
-/// global settings are retained; the user can choose a different provider.
+/// selected user settings are retained; the user can choose a different
+/// provider.
 pub fn reconfigure(
     config: Config,
     missing_profile: &str,
-) -> anyhow::Result<Option<(Config, ModelState)>> {
+    config_file: &Path,
+) -> anyhow::Result<Option<Config>> {
     println!(
         "{BOLD}tcode setup{RESET} {DIM}— profile '{missing_profile}' is not configured; choose a provider{RESET}"
     );
-    run_setup(Setup::new(
-        config,
-        Some(missing_profile),
-        ModelState::load(),
-    ))
+    run_setup(Setup::new(config, Some(missing_profile)), config_file)
 }
 
-fn run_setup(mut setup: Setup) -> anyhow::Result<Option<(Config, ModelState)>> {
+fn run_setup(mut setup: Setup, config_file: &Path) -> anyhow::Result<Option<Config>> {
     println!(
-        "{DIM}keys are saved in ~/.tcode/config.toml; environment variables also work{RESET}\n"
+        "{DIM}keys are saved in {}; environment variables also work{RESET}\n",
+        config_file.display()
     );
     let _guard = RawGuard::new()?;
     let mut out = stdout();

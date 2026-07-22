@@ -33,6 +33,22 @@ pub use skills::{
 pub use view_image::ViewImageTool;
 pub use web::{trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool};
 
+/// The primary command interpreter on this platform. Windows uses PowerShell;
+/// Unix uses Bash.
+pub const fn primary_shell_kind() -> ShellKind {
+    if cfg!(windows) {
+        ShellKind::PowerShell
+    } else {
+        ShellKind::Bash
+    }
+}
+
+/// The command tool registered for [`primary_shell_kind`]. Consumers that need
+/// to address it should use this instead of duplicating target-specific names.
+pub const fn primary_shell_tool_name() -> &'static str {
+    primary_shell_kind().tool_name()
+}
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -118,11 +134,7 @@ pub fn builtin_tools_with_skills_and_web_fetch(
         Arc::new(shell::KillTaskTool),
         Arc::new(plan::ExitPlanTool),
     ];
-    let primary_shell = if cfg!(windows) {
-        ShellKind::PowerShell
-    } else {
-        ShellKind::Bash
-    };
+    let primary_shell = primary_shell_kind();
     tools.push(Arc::new(shell::ShellTool::with_filters(
         primary_shell,
         filters.clone(),
@@ -155,9 +167,13 @@ mod tests {
         for tool in ["read", "grep", "glob", "web_search"] {
             assert!(!gates[tool], "{tool} must not blob-gate its output");
         }
-        // web_fetch is always present; the shell tool is named per platform.
+        // web_fetch is always present; the shell tool name is selected once
+        // from the platform helper instead of duplicated in consumers.
         assert!(gates["web_fetch"], "web_fetch must keep the blob gate");
-        let shell = gates.get("shell").or_else(|| gates.get("bash"));
-        assert_eq!(shell, Some(&true), "the shell tool must keep the blob gate");
+        assert_eq!(
+            gates.get(primary_shell_tool_name()),
+            Some(&true),
+            "the primary shell tool must keep the blob gate"
+        );
     }
 }

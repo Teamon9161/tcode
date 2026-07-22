@@ -69,6 +69,15 @@ impl Provider for MockProvider {
             .unwrap()
             .pop_front()
             .expect("mock provider ran out of scripted responses");
+        // An empty script is how a test fails a request (`api_error`). The
+        // status is deliberately non-retryable, so the watchdog does not eat
+        // the next scripted response trying again.
+        if script.is_empty() {
+            return Err(ProviderError::Api {
+                status: 400,
+                message: "scripted failure".into(),
+            });
+        }
         Ok(Box::pin(futures::stream::iter(
             script.into_iter().map(Ok).collect::<Vec<_>>(),
         )))
@@ -220,6 +229,11 @@ fn text_done(text: &str) -> Vec<StreamEvent> {
         StreamEvent::Usage(Usage::default()),
         StreamEvent::Done(StopReason::EndTurn),
     ]
+}
+
+/// Fail the next request with a non-retryable API error.
+fn api_error() -> Vec<StreamEvent> {
+    Vec::new()
 }
 
 fn agent(provider: Arc<MockProvider>) -> Agent {
@@ -3366,6 +3380,133 @@ async fn a_task_run_streams_tagged_events_and_persists_a_trace() {
         Entry::ToolResults(blocks)
             if matches!(&blocks[0], ContentBlock::ToolResult { content, .. } if content.contains("fn a()"))
     )));
+}
+
+/// An API failure mid-run must not throw the run away. Everything the
+/// sub-agent already paid for stays parked, the error names the exact call that
+/// picks it back up, and the resumed turn continues the same conversation —
+/// even for a one-shot definition like explore, which is precisely where a
+/// discard costs the most.
+#[tokio::test]
+async fn a_failed_sub_agent_run_stays_resumable_with_its_work_intact() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "agent",
+            r#"{"agent":"explore","prompt":"survey","summary":"survey"}"#,
+        ),
+        tool_use(
+            "call-2",
+            "agent",
+            r#"{"agent":"explore","prompt":"finish the survey","resume":"t1","summary":"finish"}"#,
+        ),
+        text_done("relayed"),
+    ]);
+    let sub = MockProvider::named(
+        "scout-1",
+        vec![
+            tool_use("s1", "read", r#"{"path":"a.rs"}"#),
+            // The turn dies *after* the read has been paid for.
+            api_error(),
+            text_done("the report"),
+        ],
+    );
+    let agent = task_agent(parent, sub.clone());
+    let mut session = session(root.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "explore this").await;
+
+    assert!(events.iter().any(|e| matches!(e,
+        AgentEvent::TaskRunFinished { run, status, .. }
+            if run == "t1" && *status == tcode_core::TaskRunStatus::Failed
+    )));
+    let results = tool_results(&session);
+    let (failure, is_error) = &results[0];
+    assert!(is_error, "the failed delegation is still a tool error");
+    assert!(
+        failure.contains(r#"resume="t1""#) && failure.contains(r#"agent="explore""#),
+        "the failure must hand the caller the exact resuming call: {failure}"
+    );
+    // The follow-up landed in the same conversation: the read the first turn
+    // paid for is still in the request, not repeated.
+    let requests = sub.requests.lock().unwrap();
+    assert_eq!(requests.len(), 3);
+    assert!(
+        format!("{:?}", requests[2].messages).contains("fn a()"),
+        "the resumed turn must continue the failed run's context"
+    );
+    assert!(
+        requests[2].cache_scope == requests[0].cache_scope,
+        "a resumed run keeps its cache scope, so the continuation costs the increment"
+    );
+    assert!(!results[1].1 && results[1].0.contains("the report"));
+}
+
+/// One `AgentTool` instance outlives the conversations it serves (`/resume`
+/// and `/clear` swap the conversation in place), while run ids restart at `t1`
+/// in each of them. So a parked run and a stored report must belong to the
+/// conversation that issued the id — otherwise the *previous* conversation's
+/// sub-agent answers here, and its context leaks in with it.
+#[tokio::test]
+async fn run_ids_never_reach_across_conversations() {
+    let root = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "agent",
+            r#"{"agent":"explore","prompt":"survey","summary":"survey"}"#,
+        ),
+        text_done("first conversation done"),
+        // The replacement conversation has its own t1 in its own transcript.
+        tool_use(
+            "call-2",
+            "agent",
+            r#"{"agent":"explore","prompt":"keep going","resume":"t1","summary":"resume"}"#,
+        ),
+        tool_use(
+            "call-3",
+            "agent",
+            r#"{"agent":"explore","prompt":"build on it","attach":["t1"],"summary":"attach"}"#,
+        ),
+        text_done("second conversation done"),
+    ]);
+    let sub = MockProvider::named(
+        "scout-1",
+        vec![text_done("private findings of the first conversation")],
+    );
+    let agent = task_agent(parent, sub.clone());
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let mut first = session(root.path(), PermissionMode::Default);
+    run(&agent, &mut first, &approver, "explore this").await;
+
+    // A different conversation on the same tool instance: same ids, no access.
+    let mut second = session(root.path(), PermissionMode::Default);
+    run(&agent, &mut second, &approver, "explore something else").await;
+
+    let results = tool_results(&second);
+    assert!(
+        results[0].1 && results[0].0.contains("no resumable agent run 't1'"),
+        "a stale id must not resolve to the other conversation's session: {:?}",
+        results[0]
+    );
+    assert!(
+        results[1].1 && results[1].0.contains("no attachable report for run 't1'"),
+        "nor to its report: {:?}",
+        results[1]
+    );
+    assert!(
+        !format!("{results:?}").contains("private findings"),
+        "no trace of the other conversation may cross over: {results:?}"
+    );
+    assert_eq!(
+        sub.requests.lock().unwrap().len(),
+        1,
+        "no sub-agent request may be made on a dead id"
+    );
 }
 
 /// Two explore calls in one assistant message run through the parallel batch

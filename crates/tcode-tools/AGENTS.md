@@ -30,7 +30,10 @@
 - **保留字**：explore/plan/general/orchestrator 不许被文件覆盖（其 read-only 语义绑定在 `read_only` 上，覆盖会静默放宽——这与 skills 的"文件覆盖 builtin"刻意相反）。
 - **权限分两个正交旋钮，别合并**：模式与 allow/ask/deny **继承自父会话**（经 `ToolCtx::delegated_permissions`，`forward_delegates` 按调用装卸），因为委派出去的活仍是本会话的活——子 session 曾自建 `PermissionMode::Auto` + 空规则，等于用户的 deny 规则对子 agent 静默失效、plan mode 可被委派绕过；而 `readonly` 是 def 自己的**能力天花板**，在 `sub_tools` 里就摘掉 mutating 工具，比模式更强（模式能被用户点 yes 抬高，天花板连请求都不存在），所以 explore 在父是 unsafe 时仍动不了项目。审批桥对**所有**委派运行安装，`questionPolicy` 只管 `ask_user` 工具——把两者绑一起会让"继承一个会询问的模式"静默变成"会拒绝"（`NeverAsk`）。
 - **嵌套授权只认 def 的 spawn 策略**（`agents` allowlist / `disallowedAgents` denylist，二选一，镜像 `tools`/`disallowedTools`）：`spawn_list` 解析非空才发受限子 `TaskTool`（`allowed` 限定 spawn 集）；deny 形式对注册表全集实时求差（减名单减自身），自动覆盖后来新增的 custom def——orchestrator 用 `disallowedAgents: []` 编排所有人。`depth < MAX_TASK_DEPTH`（=3）封死递归，不做环检测。
-- **追问（resume）走同一 session 同一 cache scope 纯 append**：`max_exchanges > 0` 才进程内保活 Agent+Session（`live` map，cap 8 最旧逐出），别把它做成持久化或另起前缀——追问的全部价值就是命中已有前缀缓存、只付增量。`--agent` 顶层 run 用 `scoped_to(def)` 把进程本身当作深度 1 的该 agent。
+- **追问（resume）走同一 session 同一 cache scope 纯 append**：`max_exchanges > 0` 才进程内保活 Agent+Session（`live` map，`MAX_LIVE_TASKS` 最旧逐出），别把它做成持久化或另起前缀——追问的全部价值就是命中已有前缀缓存、只付增量。
+- **失败与中断的 run 一律保活，不许丢**（`park_failed`）：API 报错、watchdog 耗尽重试、用户 ESC，session 都还是**合法**会话（请求没落地则什么都没 append；流中断只 append `IncompleteAssistant`；中断有 `commit_interrupt` 补齐已发起调用的结果），丢掉它等于让父 agent 把整轮工具调用与思考重付一遍。所以失败路径 park 到同一 id、给 `max_exchanges.max(SALVAGE_EXCHANGES)` 次机会（一次性 def 也给），错误文案按零猜测原则直接给出 `agent=…, resume=…` 的续跑调用。resume 的失败同样**回**park 原 id——一次 API 抖动不该毁掉攒了几轮的会话。
+- **run id 只在签发它的那次对话里有意义**（`LiveTask::scope` / `StoredReport::scope` = 当时的 `ctx.scratch_dir`）：`AgentTool` 实例活得比对话长（`/resume`、`/clear` 是**同进程**换会话，`bind_scratch_session` 就地重绑），而 trace id 每个会话都从 `t1` 重新数——不带 scope 校验，换会话后模型照着自己旧 transcript 里的 `resume="t1"` 调过来，接上的是**上一个对话**的 sub-agent，那个会话的上下文就这么漏进来了（`attach` 的 reports 同理）。park/remember 时顺手 `retain` 掉非当前 scope 的条目：它们已不可达，留着只占 cap 和内存。跨进程续跑目前不支持——trace JSONL 有完整 ledger，真要做是从它重建 session，别拿 scope 校验开刀。
+- `--agent` 顶层 run 用 `scoped_to(def)` 把进程本身当作深度 1 的该 agent。
 - sub-agent 的 system prompt 就是 `def.system`（定义文件正文）原样，不拼工具清单也不拼项目地图——工具信息走 API 的 `tools` 参数，prompt 里再列一遍是重复计费。
 
 ## 合并审批

@@ -13,29 +13,36 @@ permissions or limits, connect MCP, or add a skill.
 
 Use these locations deliberately:
 
-- `~/.tcode/config.toml` is the user-level configuration. Put API-key
-  environment-variable names and personal provider profiles here.
+- `~/.tcode/config.toml` is the default user-level configuration. Pass
+  `--config <PATH>` (or `-C <PATH>`) to select a different personal config
+  file for this run; all setup and runtime choices then use that same file.
+  Put API-key environment-variable names and personal provider profiles here.
+- `[tcode_state]` in the selected user config is runtime state written by
+  `/model`, `/agents`, `/suggest`, voice controls, and other UI choices.
+  tcode changes only this table through a comment-preserving `toml_edit`
+  read-modify-write; do not use it for normal handwritten defaults. The single
+  exception is `/model save`, which adds or replaces one `[presets.<name>]`
+  table the same way.
 - `.tcode/config.toml` is the project overlay. It is appropriate for
   project-specific profiles, sub-agent pins, permissions, hooks, and MCP
   servers. Do not put credentials in a repository configuration file.
-- Built-in defaults load first, then the global file, then the project overlay.
-  Profile entries merge by name; a model entry with the same `name` replaces
-  its catalog entry.
-- `~/.tcode/state.toml` is runtime state written by `/model`, `/agents`, and
-  other UI choices. Do not hand-edit it for normal configuration: its selected
-  model and agent pins override the corresponding hand-written defaults.
+- Built-in defaults load first, then the selected user file, then the project
+  overlay. Profile entries merge by name; a model entry with the same `name`
+  replaces its catalog entry. Project configuration cannot set `[tcode_state]`.
 
-For the initial selection, CLI `--profile` / `--model` win over saved state;
-saved state wins over `config.toml` defaults. Start a one-off run with, for
-example:
+For the initial selection, CLI `--profile` / `--model` win over saved runtime
+state; `[tcode_state]` wins over `config.toml` defaults. Start a one-off run
+with, for example:
 
 ```powershell
-tcode --profile anthropic --model claude-sonnet-5
+tcode --config C:\\path\\to\\work.toml --profile anthropic --model claude-sonnet-5
 ```
 
-Before editing any configuration, read the applicable existing TOML. Preserve
+The default config migrates a legacy `~/.tcode/state.toml` once if it has no
+`[tcode_state]`; a custom `--config` file never reads that legacy state. Before
+editing any configuration, read the applicable existing TOML. Preserve
 unrelated profiles and user comments. If a saved `/model` or `/agents` choice
-appears to defeat the new default, explain that it lives in `state.toml` and
+appears to defeat the new default, explain that it lives in `[tcode_state]` and
 use the interactive picker to change it rather than deleting state blindly.
 
 ## Profiles and models
@@ -89,7 +96,7 @@ key — `provider`, `base_url` and `models` keep coming from the layer below:
 api_key_env = "DEEPSEEK_API_KEY"
 ```
 
-The three layers merge builtin catalog → `~/.tcode/config.toml` →
+The three layers merge builtin catalog → selected user config →
 `.tcode/config.toml`, scalar fields overriding and `models` merging by `name`.
 Requirements are checked on the merged result, and only for the profile actually
 selected: a profile no layer ever gave a `provider` fails with an error naming
@@ -140,14 +147,68 @@ model = "claude-sonnet-5"
 enabled = true # opt in to web_fetch(prompt = "...") using the main model
 ```
 
+A pin may also be written as a single string instead of a table: `"off"` (same
+as `enabled = false`), `"inherit"` (same as `enabled = true`), or a bare model
+name (same as `model = "..."`). This is the readable form for a long list:
+
+```toml
+[agents]
+explore = "gpt-5.6-luna"
+suggest = "inherit"
+fetch = "off"
+```
+
 `/agents` lists and changes these assignments interactively; those choices are
-persisted in `state.toml` and override `[agents.*]`. Builtin task kinds are
+persisted in `[tcode_state]` in the selected config and override both
+`[agents.*]` and the active preset. Builtin task kinds are
 `explore`, `plan`, `general`, and `orchestrator` (a tool-less coordinator that
 only delegates to the other kinds; pin it to an inexpensive model). Auxiliary
 roles include `auto`, `suggest`,
 `vision`, and opt-in `fetch` (shown as `web-fetch` in the picker). Keep `auto`
 and `suggest` on a small, inexpensive model if explicitly pinning them: they
 are convenience requests, not the main coding session.
+
+## Presets: named model line-ups
+
+`[presets.<name>]` is a whole line-up under one name — the main model plus what
+every sub-agent and role runs on — switched as a unit. `[profiles.*]` says how
+to *reach* a provider; a preset says which models to *use*. Switching provider
+family is then one choice rather than re-pinning every role.
+
+```toml
+[presets.gpt]
+label = "GPT"           # optional display name; defaults to the key
+profile = "openai"      # main model's profile (recommended when several
+model = "gpt-5.6-terra" # profiles offer the same model id)
+effort = "high"
+
+[presets.gpt.agents]    # same fields and shorthands as [agents.*]
+explore = "gpt-5.6-luna"
+plan = { profile = "anthropic", model = "claude-sonnet-5" }
+suggest = "inherit"
+fetch = "off"
+```
+
+Fields: `label`, `profile`, `model`, `effort` are all optional strings;
+`agents` is a table of role assignments. Preset names must be letters, digits,
+`-` or `_`. Presets may be defined in the user config or a project
+`.tcode/config.toml` (a project preset cannot assign `auto`, the safety
+classifier). No preset is active by default.
+
+**Resolution order**, lowest to highest: `[agents.*]` from the config files →
+the active `[presets.<name>]` → the ad-hoc picks in `[tcode_state]`. The main
+model resolves the same way, with CLI `--profile` / `--model` above all.
+
+**Switching is whole-line-up.** `/model preset <name>` (or the presets section
+of the `/model` panel) writes `preset = "<name>"` into `[tcode_state]` and
+**clears the ad-hoc pins and saved main model there**, so the preset fully
+describes what runs. Tweaks made after a switch belong to that visit; to keep
+them, save them:
+
+`/model save <name>` captures the running line-up as `[presets.<name>]` and
+switches to it. This is the one place tcode writes outside `[tcode_state]`; it
+adds or replaces that single table and leaves the rest of the document,
+including comments, untouched.
 
 ## Custom agent definitions
 
@@ -277,10 +338,10 @@ published upstream, so `/voice` says so there instead of offering a download.
 
 | Field | Type / values | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Whether voice comes up with the session. The `/voice` toggle is remembered in `state.toml` and **overrides this**, exactly like `/suggest` over `ui.suggest_next`. |
-| `key` | `"space"` \| `"ctrl+space"` \| `"f1"`–`"f12"` | `"space"` | The push-to-talk key. `/voice key <name>` changes it and is remembered in `state.toml`, which **overrides this** — same precedence as the permission mode. With `"space"`, typing spaces still types spaces: only a burst of presses at key-repeat speed is read as a hold, and only at a word boundary — the start of a line, or right after a space. So dictating into a half-written prompt means typing one space and then holding the next. `"ctrl+space"` is often unavailable — Microsoft Pinyin and other IMEs take it for 中/英 and it never reaches the terminal. A function key always works and needs no telling apart from typing; use one if a slow key-repeat setting makes `"space"` unreliable. `/voice keys` echoes what actually arrives. |
-| `model` | preset name, or `""` | `""` | Which recogniser to download and run. `""` means the sidecar's own default (currently `zh-en`). **`/voice model` opens a picker** listing what the installed sidecar supports; it is remembered in `state.toml`, which **overrides this**. Each model lives in its own directory, so switching back does not download again. |
-| `hotwords` | list of strings | `[]` | Words and phrases recognition is biased towards — library names, project jargon, anything a general model has no reason to expect. `/voice words <w>...` adds, `-<word>` removes, and the result is remembered in `state.toml`, which **overrides this**. Only `zh-en` and `qwen3` can use them; see below. |
+| `enabled` | bool | `false` | Whether voice comes up with the session. The `/voice` toggle is remembered in `[tcode_state]` in the selected config and **overrides this**, exactly like `/suggest` over `ui.suggest_next`. |
+| `key` | `"space"` \| `"ctrl+space"` \| `"f1"`–`"f12"` | `"space"` | The push-to-talk key. `/voice key <name>` changes it and is remembered in `[tcode_state]` in the selected config, which **overrides this** — same precedence as the permission mode. With `"space"`, typing spaces still types spaces: only a burst of presses at key-repeat speed is read as a hold, and only at a word boundary — the start of a line, or right after a space. So dictating into a half-written prompt means typing one space and then holding the next. `"ctrl+space"` is often unavailable — Microsoft Pinyin and other IMEs take it for 中/英 and it never reaches the terminal. A function key always works and needs no telling apart from typing; use one if a slow key-repeat setting makes `"space"` unreliable. `/voice keys` echoes what actually arrives. |
+| `model` | preset name, or `""` | `""` | Which recogniser to download and run. `""` means the sidecar's own default (currently `zh-en`). **`/voice model` opens a picker** listing what the installed sidecar supports; it is remembered in `[tcode_state]` in the selected config, which **overrides this**. Each model lives in its own directory, so switching back does not download again. |
+| `hotwords` | list of strings | `[]` | Words and phrases recognition is biased towards — library names, project jargon, anything a general model has no reason to expect. `/voice words <w>...` adds, `-<word>` removes, and the result is remembered in `[tcode_state]` in the selected config, which **overrides this**. Only `zh-en` and `qwen3` can use them; see below. |
 | `language` | `"auto"`, `"zh"`, `"en"`, `"ja"`, `"ko"`, `"yue"` | `"auto"` | Only `sense-voice` has a language switch; the other models are bilingual by construction and ignore this. |
 | `max_seconds` | integer | `60` | A hold that never ends stops here rather than filling memory. |
 | `device` | string | `""` | Input device name; empty means the system default. |

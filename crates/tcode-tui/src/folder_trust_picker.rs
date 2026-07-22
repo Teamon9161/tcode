@@ -1,5 +1,6 @@
 //! First-entry local folder-trust confirmation. This is frontend state only:
-//! the selected value is persisted by `App` in machine-local `state.toml`.
+//! the selected value is persisted by `App` in the selected config's
+//! `[tcode_state]` table.
 
 use std::path::Path;
 

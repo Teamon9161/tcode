@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
-use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Selection};
+use tcode_core::config::{AgentConfig, Config, ConfigError, Selection};
 use tcode_core::{
     ActiveModel, Agent, AgentError, AgentModels, AgentRole, ContentBlock, ModelCell,
     PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, ToolCtx,
@@ -24,9 +24,9 @@ const RESET: &str = "\x1b[0m";
 const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("prompts/interactive-agent-system.md");
 
 const CONFIG_HEADER: &str = "\
-# tcode global configuration — created by the setup wizard.
-# Add profiles/models freely; the active choice lives in state.toml
-# (written by /model). Keys: prefer api_key_env over inline api_key.
+# tcode user configuration — created by the setup wizard.
+# Add profiles/models freely; runtime choices live in [tcode_state]
+# (written by tcode without rewriting your other TOML). Keys: prefer api_key_env over inline api_key.
 
 ";
 
@@ -71,12 +71,13 @@ fn agent_models(config: &Config, parent: &Selection) -> AgentModels {
 
 /// The `/agents` menu: the pinnable kinds, what each runs on now, and the
 /// action that applies a pick — hot-swap the shared registry, then persist to
-/// state.toml (never to the hand-written config.toml).
+/// `[tcode_state]` in the selected config file.
 fn build_agent_menu(
     config: &Config,
     menu: &tcode_tui::ModelMenu,
     pinned: AgentModels,
     agent_defs: &tcode_tools::AgentRegistry,
+    config_file: PathBuf,
 ) -> tcode_tui::AgentMenu {
     let roles: Vec<tcode_tui::AgentRole> = agent_defs
         .visible_defs(None)
@@ -84,11 +85,13 @@ fn build_agent_menu(
             key: def.name.clone(),
             label: def.name.clone(),
             allows_off: false,
+            section: tcode_tui::RoleSection::Task,
         })
         .chain(AgentRole::ALL.iter().map(|role| tcode_tui::AgentRole {
             key: role.key().to_string(),
             label: role.label().to_string(),
             allows_off: role.allows_off(),
+            section: tcode_tui::RoleSection::Helper,
         }))
         .collect();
     let watchdog = config.watchdog.clone();
@@ -133,12 +136,12 @@ fn build_agent_menu(
         match choice {
             tcode_tui::AgentModelChoice::Off => {
                 pinned.unpin(kind);
-                persist_agent_pin(kind, allows_off, None, false);
+                persist_agent_pin(&config_file, kind, allows_off, None, false);
                 Ok("off".to_string())
             }
             tcode_tui::AgentModelChoice::Inherit => {
                 pinned.pin_inherit(kind);
-                persist_agent_pin(kind, allows_off, None, true);
+                persist_agent_pin(&config_file, kind, allows_off, None, true);
                 Ok("inherit (main model)".to_string())
             }
             tcode_tui::AgentModelChoice::Model { option, effort } => {
@@ -157,7 +160,7 @@ fn build_agent_menu(
                     .map_err(|e| e.to_string())?;
                 let label = active.describe();
                 pinned.pin(kind, active);
-                persist_agent_pin(kind, allows_off, Some(&selection), true);
+                persist_agent_pin(&config_file, kind, allows_off, Some(&selection), true);
                 Ok(label)
             }
         }
@@ -167,9 +170,15 @@ fn build_agent_menu(
 
 /// State entries override `[agents.*]`: an explicit `enabled` lets opt-in
 /// roles preserve the distinction between "off" and "inherit main model".
-fn persist_agent_pin(kind: &str, allows_off: bool, selection: Option<&Selection>, enabled: bool) {
+fn persist_agent_pin(
+    config_file: &std::path::Path,
+    kind: &str,
+    allows_off: bool,
+    selection: Option<&Selection>,
+    enabled: bool,
+) {
     let enabled = allows_off.then_some(enabled);
-    ModelState::update(|state| {
+    Config::update_tcode_state(config_file, |state| {
         state.agents.insert(
             kind.to_string(),
             match selection {
@@ -188,43 +197,202 @@ fn persist_agent_pin(kind: &str, allows_off: bool, selection: Option<&Selection>
     });
 }
 
-/// Persist what `/provider` produced, then rebuild everything downstream of
-/// the config: reload all three layers, swap the provider into the shared
-/// cell (so a running turn keeps its snapshot), and hand back both menus.
-/// The TUI owns none of this — it only reports the result.
+/// Front-matter `model:` hints become `[agents.<name>]` defaults for the
+/// definitions that survived capability validation — but only where nothing
+/// else claimed the kind, so hand-written config, presets and `/agents` picks
+/// all still win.
+fn apply_agent_def_hints(config: &mut Config, agent_defs: &tcode_tools::AgentRegistry) {
+    for def in agent_defs.visible_defs(None) {
+        if let Some(hint) = &def.model {
+            config
+                .agents
+                .entry(def.name.clone())
+                .or_insert_with(|| AgentConfig {
+                    profile: hint.profile.clone(),
+                    model: hint.model.clone(),
+                    effort: hint.effort.clone(),
+                    enabled: None,
+                });
+        }
+    }
+}
+
+/// Everything downstream of the selected config file, rebuilt from scratch:
+/// reload all three layers, fold in the active preset and the runtime state,
+/// swap the provider into the shared cell (so a running turn keeps its
+/// snapshot), replace every sub-agent pin, and hand back both menus.
+///
+/// One function because a `/provider` run and a preset switch change the same
+/// derived world; two copies of this would be two chances to rebuild only half
+/// of it. The TUI owns none of it and only reports the result.
+fn rebuild_from_config(
+    cwd: &std::path::Path,
+    config_file: &std::path::Path,
+    model_cell: &ModelCell,
+    pinned: &AgentModels,
+    agent_defs: &tcode_tools::AgentRegistry,
+) -> Result<(Selection, tcode_tui::ModelMenu, tcode_tui::AgentMenu), String> {
+    let mut config = Config::load_at(config_file, cwd).map_err(|e| e.to_string())?;
+    tcode_providers::hydrate_codex_models(&mut config);
+    let state = config.apply_active_preset();
+    apply_agent_def_hints(&mut config, agent_defs);
+    let selection = config
+        .select(None, None, &state)
+        .map_err(|e| e.to_string())?;
+    let profile = config
+        .profiles
+        .get(&selection.profile)
+        .ok_or_else(|| format!("profile '{}' is not configured", selection.profile))?;
+    let active = tcode_providers::build_active(profile, &selection, &config.watchdog)
+        .map_err(|e| e.to_string())?;
+    model_cell.swap(active);
+    pinned.replace_all(&agent_models(&config, &selection));
+
+    let menu = build_menu(
+        &config,
+        &selection,
+        model_cell.clone(),
+        config_file.to_path_buf(),
+    );
+    let agents = build_agent_menu(
+        &config,
+        &menu,
+        pinned.clone(),
+        agent_defs,
+        config_file.to_path_buf(),
+    );
+    Ok((selection, menu, agents))
+}
+
+/// Persist what `/provider` produced, then rebuild everything downstream.
 fn build_provider_setup(
     cwd: PathBuf,
     model_cell: ModelCell,
     pinned: AgentModels,
     agent_defs: Arc<tcode_tools::AgentRegistry>,
+    config_file: PathBuf,
 ) -> tcode_tui::ProviderSetup {
-    let apply = move |updated: Config, state: ModelState| {
-        let describe = |e: std::fmt::Arguments| e.to_string();
+    let apply_file = config_file.clone();
+    let apply = move |updated: Config| {
         updated
-            .write_global(CONFIG_HEADER)
-            .map_err(|e| describe(format_args!("{e}")))?;
-        state.save();
-
-        let mut config = Config::load(&cwd).map_err(|e| describe(format_args!("{e}")))?;
-        tcode_providers::hydrate_codex_models(&mut config);
-        let selection = config
-            .select(None, None, &state)
-            .map_err(|e| describe(format_args!("{e}")))?;
-        let profile = config
-            .profiles
-            .get(&selection.profile)
-            .ok_or_else(|| format!("profile '{}' disappeared after setup", selection.profile))?;
-        let active = tcode_providers::build_active(profile, &selection, &config.watchdog)
-            .map_err(|e| describe(format_args!("{e}")))?;
-        model_cell.swap(active);
-
-        let menu = build_menu(&config, &selection, model_cell.clone());
-        let agents = build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
+            .write_global_at(&apply_file, CONFIG_HEADER)
+            .map_err(|e| e.to_string())?;
+        let (_, menu, agents) =
+            rebuild_from_config(&cwd, &apply_file, &model_cell, &pinned, agent_defs.as_ref())?;
         Ok((menu, agents))
     };
     tcode_tui::ProviderSetup {
-        load: Box::new(|| Config::load_global().map_err(|e| e.to_string())),
+        load: Box::new(move || Config::load_global_at(&config_file).map_err(|e| e.to_string())),
         apply: Box::new(apply),
+    }
+}
+
+/// The named line-ups as the hub lists them, newest config read wins.
+fn preset_options(config: &Config) -> Vec<tcode_tui::PresetOption> {
+    config
+        .presets
+        .iter()
+        .map(|(key, preset)| tcode_tui::PresetOption {
+            key: key.clone(),
+            label: preset.display(key).to_string(),
+        })
+        .collect()
+}
+
+/// `/model`'s preset strip: switch to a line-up, or capture the live one as a
+/// new preset. Both are config writes plus a rebuild, so both live here.
+fn build_preset_menu(
+    config: &Config,
+    state: &tcode_core::config::ModelState,
+    cwd: PathBuf,
+    model_cell: ModelCell,
+    pinned: AgentModels,
+    agent_defs: Arc<tcode_tools::AgentRegistry>,
+    config_file: PathBuf,
+) -> tcode_tui::PresetMenu {
+    let options = preset_options(config);
+    let current = state
+        .preset
+        .as_deref()
+        .and_then(|name| options.iter().position(|option| option.key == name));
+
+    let apply_file = config_file.clone();
+    let (apply_cwd, apply_cell, apply_pinned, apply_defs) = (
+        cwd.clone(),
+        model_cell.clone(),
+        pinned.clone(),
+        agent_defs.clone(),
+    );
+    let apply: tcode_tui::ApplyPresetFn = Box::new(move |name| {
+        Config::switch_preset(&apply_file, name).map_err(|e| e.to_string())?;
+        let (selection, menu, agents) = rebuild_from_config(
+            &apply_cwd,
+            &apply_file,
+            &apply_cell,
+            &apply_pinned,
+            apply_defs.as_ref(),
+        )?;
+        let label = match &selection.effort {
+            Some(effort) => format!(
+                "{} · {} ({effort})",
+                selection.profile,
+                selection.model.display()
+            ),
+            None => format!("{} · {}", selection.profile, selection.model.display()),
+        };
+        Ok((menu, agents, label))
+    });
+
+    let save: tcode_tui::SavePresetFn = Box::new(move |name, draft, menu| {
+        let named = |option: usize| -> Result<&tcode_tui::ModelOption, String> {
+            menu.options
+                .get(option)
+                .ok_or_else(|| "selected model disappeared".to_string())
+        };
+        let mut preset = tcode_core::config::Preset::default();
+        if let Some(option) = draft.main {
+            let option = named(option)?;
+            preset.profile = Some(option.profile.clone());
+            preset.model = Some(option.def.name.clone());
+            preset.effort = draft.main_effort.clone();
+        }
+        // Every role is written out, including the ones merely inheriting: a
+        // preset that stayed silent about a role would let `[agents.*]` leak
+        // back in, and then switching to it would not describe what runs.
+        for (kind, choice) in &draft.roles {
+            let entry = match choice {
+                tcode_tui::AgentModelChoice::Off => AgentConfig::from_shorthand("off"),
+                tcode_tui::AgentModelChoice::Inherit => AgentConfig::from_shorthand("inherit"),
+                tcode_tui::AgentModelChoice::Model { option, effort } => {
+                    let option = named(*option)?;
+                    AgentConfig {
+                        profile: Some(option.profile.clone()),
+                        model: Some(option.def.name.clone()),
+                        effort: effort.clone(),
+                        enabled: None,
+                    }
+                }
+            };
+            preset.agents.insert(kind.clone(), entry);
+        }
+        Config::upsert_preset(&config_file, name, &preset).map_err(|e| e.to_string())?;
+        // The line-up just saved becomes the one in force, so the ad-hoc pins
+        // it was captured from can go: the preset now says the same thing.
+        Config::switch_preset(&config_file, name).map_err(|e| e.to_string())?;
+        let config = Config::load_at(&config_file, &cwd).map_err(|e| e.to_string())?;
+        let options = preset_options(&config);
+        let current = options
+            .iter()
+            .position(|option| option.key == name)
+            .ok_or_else(|| "the saved preset is not readable back".to_string())?;
+        Ok((options, current))
+    });
+
+    tcode_tui::PresetMenu {
+        options,
+        current,
+        apply,
+        save,
     }
 }
 
@@ -234,6 +402,7 @@ fn build_menu(
     config: &Config,
     selection: &Selection,
     _model_cell: ModelCell,
+    config_file: PathBuf,
 ) -> tcode_tui::ModelMenu {
     let mut options = Vec::new();
     let mut current = 0;
@@ -268,9 +437,9 @@ fn build_menu(
         };
         let active =
             tcode_providers::build_active(profile, &sel, &watchdog).map_err(|e| e.to_string())?;
-        // Read-modify-write: the state file also holds the agent pins and the
-        // dogfood switch, which a whole-struct save would silently drop.
-        ModelState::update(|state| {
+        // Read-modify-write preserves the other runtime choices and all
+        // handwritten TOML outside `[tcode_state]`.
+        Config::update_tcode_state(&config_file, |state| {
             state.profile = Some(opt.profile.clone());
             state.model = Some(opt.def.name.clone());
             state.effort = effort.map(String::from);
@@ -285,8 +454,65 @@ fn build_menu(
 }
 
 /// Plain-REPL `/model`: bare lists options, `/model <n|name> [effort]`
-/// switches.
-fn run_model_command(args: &str, menu: &tcode_tui::ModelMenu, cell: &ModelCell) {
+/// switches, `/model preset <name>` switches the whole line-up and
+/// `/model save <name>` captures the live one. The TUI puts all three on one
+/// panel; here they stay words, which is also what makes them scriptable.
+fn run_model_command(
+    args: &str,
+    menu: &mut tcode_tui::ModelMenu,
+    agents: &mut tcode_tui::AgentMenu,
+    presets: &mut tcode_tui::PresetMenu,
+    cell: &ModelCell,
+) {
+    if let Some(name) = args.strip_prefix("preset").map(str::trim) {
+        if name.is_empty() {
+            for (i, option) in presets.options.iter().enumerate() {
+                let mark = if presets.current == Some(i) {
+                    "●"
+                } else {
+                    " "
+                };
+                println!("{DIM} {mark} {}{RESET}", option.label);
+            }
+            println!("{DIM}usage: /model preset <name> · /model save <name>{RESET}");
+            return;
+        }
+        match (presets.apply)(name) {
+            Ok((new_menu, new_agents, label)) => {
+                *menu = new_menu;
+                *agents = new_agents;
+                presets.current = presets.options.iter().position(|o| o.key == name);
+                println!("{DIM}preset {name} → {label}{RESET}");
+            }
+            Err(e) => println!("{DIM}cannot switch to preset '{name}': {e}{RESET}"),
+        }
+        return;
+    }
+    if let Some(name) = args.strip_prefix("save").map(str::trim) {
+        if name.is_empty() {
+            println!("{DIM}usage: /model save <name>{RESET}");
+            return;
+        }
+        let draft = tcode_tui::PresetDraft {
+            main: (!menu.options.is_empty()).then_some(menu.current),
+            main_effort: cell.snapshot().effort,
+            roles: agents
+                .roles
+                .iter()
+                .zip(&agents.pins)
+                .map(|(role, pin)| (role.key.clone(), pin.clone()))
+                .collect(),
+        };
+        match (presets.save)(name, &draft, menu) {
+            Ok((options, current)) => {
+                presets.options = options;
+                presets.current = Some(current);
+                println!("{DIM}saved preset {name}{RESET}");
+            }
+            Err(e) => println!("{DIM}cannot save preset '{name}': {e}{RESET}"),
+        }
+        return;
+    }
     if args.is_empty() {
         let active = cell.snapshot();
         for (i, opt) in menu.options.iter().enumerate() {
@@ -305,7 +531,9 @@ fn run_model_command(args: &str, menu: &tcode_tui::ModelMenu, cell: &ModelCell) 
                 opt.profile, opt.def.name
             );
         }
-        println!("{DIM}usage: /model <number|name> [effort]{RESET}");
+        println!(
+            "{DIM}usage: /model <number|name> [effort] · /model preset [name] · /model save <name>{RESET}"
+        );
         return;
     }
     let mut parts = args.split_whitespace();
@@ -409,7 +637,10 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Config profile to use (from ~/.tcode/config.toml)
+    /// Personal config file (defaults to ~/.tcode/config.toml)
+    #[arg(short = 'C', long, value_name = "PATH")]
+    config: Option<PathBuf>,
+    /// Config profile to use
     #[arg(long)]
     profile: Option<String>,
     /// Override the profile's model
@@ -442,6 +673,11 @@ enum Command {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let default_config = cli.config.is_none();
+    let config_file = match &cli.config {
+        Some(path) => path.clone(),
+        None => Config::global_file()?,
+    };
     if matches!(cli.command, Some(Command::Update)) {
         return update::run().await;
     }
@@ -463,31 +699,36 @@ async fn main() -> anyhow::Result<()> {
     };
     let interactive = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
 
-    // First run: no global config yet. Interactive terminals get the
+    // First run: no selected user config yet. Interactive terminals get the
     // setup wizard; pipes/CI fall back to an env-key-based default.
-    if !Config::exists() {
+    if !Config::exists_at(&config_file) {
         if interactive && cli.prompt.is_none() {
-            match tcode_tui::wizard::run()? {
-                Some((config, state)) => {
-                    let path = config.write_global(CONFIG_HEADER)?;
-                    state.save();
+            match tcode_tui::wizard::run(&config_file)? {
+                Some(config) => {
+                    let path = config.write_global_at(&config_file, CONFIG_HEADER)?;
                     println!("{DIM}wrote {}{RESET}\n", path.display());
                 }
                 None => anyhow::bail!("setup cancelled — no config written"),
             }
         } else {
-            tcode_tui::wizard::default_config().write_global(CONFIG_HEADER)?;
+            tcode_tui::wizard::default_config().write_global_at(&config_file, CONFIG_HEADER)?;
         }
+    }
+    if default_config {
+        Config::migrate_legacy_state_if_needed(
+            &config_file,
+            &Config::global_path()?.join("state.toml"),
+        )?;
     }
 
     let (mut config, selection, active_model, state) = loop {
-        let mut config = Config::load(&cwd)?;
+        let mut config = Config::load_at(&config_file, &cwd)?;
         tcode_providers::hydrate_codex_models(&mut config);
-        let state = ModelState::load();
-        // `/agents` picks live in state.toml and overlay the hand-written
-        // `[agents.*]`, exactly as the saved model choice overlays the
+        // Three layers meet here: `[agents.*]` from the config files, the
+        // active `[presets.<name>]`, then the ad-hoc `/agents` picks in
+        // `[tcode_state]` — the same order the saved model choice overlays the
         // configured default.
-        config.agents.extend(state.agents.clone());
+        let state = config.apply_active_preset();
         let selection = config.select(cli.profile.as_deref(), cli.model.as_deref(), &state)?;
         let profile = config
             .profiles
@@ -499,16 +740,15 @@ async fn main() -> anyhow::Result<()> {
                 profile: missing_profile,
                 ..
             }) if interactive && cli.prompt.is_none() => {
-                // Load only global settings: project overlays must never be
-                // copied into ~/.tcode/config.toml by the setup wizard.
-                let global = Config::load_global()?;
-                let Some((updated, state)) =
-                    tcode_tui::wizard::reconfigure(global, &missing_profile)?
+                // Load only the selected user settings: project overlays must
+                // never be copied into the selected config by the setup wizard.
+                let user_config = Config::load_global_at(&config_file)?;
+                let Some(updated) =
+                    tcode_tui::wizard::reconfigure(user_config, &missing_profile, &config_file)?
                 else {
                     anyhow::bail!("setup cancelled — no usable provider configured")
                 };
-                let path = updated.write_global(CONFIG_HEADER)?;
-                state.save();
+                let path = updated.write_global_at(&config_file, CONFIG_HEADER)?;
                 println!("{DIM}updated {}{RESET}\n", path.display());
             }
             Err(error) => return Err(error.into()),
@@ -517,7 +757,7 @@ async fn main() -> anyhow::Result<()> {
     let model_cell = ModelCell::new(active_model);
 
     // Everything /model can switch to, with the swap logic attached.
-    let menu = build_menu(&config, &selection, model_cell.clone());
+    let mut menu = build_menu(&config, &selection, model_cell.clone(), config_file.clone());
     // Builtin agent kinds plus user-defined `.tcode/agents/*.md` share one
     // registry. Validate their capability policies only after MCP connections
     // have supplied the exact delegated inventory.
@@ -564,22 +804,7 @@ async fn main() -> anyhow::Result<()> {
     for warning in definition_validator.validate_definitions(&mut agent_defs, &cwd) {
         eprintln!("{DIM}warning: {warning}{RESET}");
     }
-    // Front-matter model hints become `[agents.<name>]` defaults only for
-    // definitions which survived capability validation. Hand-written config
-    // and `/agents` picks still win through ordinary resolution below.
-    for def in agent_defs.visible_defs(None) {
-        if let Some(hint) = &def.model {
-            config
-                .agents
-                .entry(def.name.clone())
-                .or_insert_with(|| AgentConfig {
-                    profile: hint.profile.clone(),
-                    model: hint.model.clone(),
-                    effort: hint.effort.clone(),
-                    enabled: None,
-                });
-        }
-    }
+    apply_agent_def_hints(&mut config, &agent_defs);
     let agent_defs = Arc::new(agent_defs);
     // `--agent <name>`: this process runs *as* that definition. Resolved
     // before anything enters the prompt prefix; everything it changes
@@ -606,12 +831,27 @@ async fn main() -> anyhow::Result<()> {
     let pinned = agent_models(&config, &selection);
     if let Some(def) = &cli_agent {
         // A pinned model for the named agent becomes the session model
-        // (process-local; never persisted to state.toml).
+        // (process-local; never persisted to [tcode_state] in the selected config).
         if let Some(model) = pinned.get(&def.name) {
             model_cell.swap(model);
         }
     }
-    let mut agent_menu = build_agent_menu(&config, &menu, pinned.clone(), agent_defs.as_ref());
+    let mut agent_menu = build_agent_menu(
+        &config,
+        &menu,
+        pinned.clone(),
+        agent_defs.as_ref(),
+        config_file.clone(),
+    );
+    let mut preset_menu = build_preset_menu(
+        &config,
+        &state,
+        cwd.clone(),
+        model_cell.clone(),
+        pinned.clone(),
+        agent_defs.clone(),
+        config_file.clone(),
+    );
 
     let system = match &cli_agent {
         Some(def) => def.system.clone(),
@@ -694,7 +934,7 @@ async fn main() -> anyhow::Result<()> {
         Some("default") => tcode_core::PermissionMode::Default,
         Some(other) => anyhow::bail!("unknown mode '{other}'"),
         // Same precedence as the model choice: CLI flag > what the user last
-        // switched to (state.toml) > the configured default.
+        // switched to ([tcode_state] in the selected config) > the configured default.
         None => state.mode.unwrap_or(config.permissions.mode),
     };
     let rules = PermissionRules {
@@ -790,18 +1030,34 @@ async fn main() -> anyhow::Result<()> {
     // Interactive: full TUI on a real terminal, plain line REPL otherwise
     // (pipes, CI, dumb terminals).
     if interactive {
+        let state_load_file = config_file.clone();
+        let state_update_file = config_file.clone();
+        let state_store = tcode_tui::StateStore::new(
+            move || {
+                Config::load_global_at(&state_load_file)
+                    .map(|config| config.tcode_state)
+                    .map_err(|error| error.to_string())
+            },
+            move |edit| {
+                Config::update_tcode_state_checked(&state_update_file, edit)
+                    .map_err(|error| error.to_string())
+            },
+        );
         return tcode_tui::run(
             agent.clone(),
             session,
             tcode_tui::TuiConfig {
                 menu,
                 agents: agent_menu,
+                presets: preset_menu,
                 provider_setup: build_provider_setup(
                     cwd.clone(),
                     model_cell.clone(),
                     pinned.clone(),
                     agent_defs.clone(),
+                    config_file.clone(),
                 ),
+                state_store,
                 opening_context: opening_context.clone(),
                 environment: environment.clone(),
                 show_reasoning: config.ui.show_reasoning,
@@ -871,17 +1127,23 @@ async fn main() -> anyhow::Result<()> {
                 continue;
             }
             if let Some(rest) = line.strip_prefix("/model") {
-                run_model_command(rest.trim(), &menu, &model_cell);
+                run_model_command(
+                    rest.trim(),
+                    &mut menu,
+                    &mut agent_menu,
+                    &mut preset_menu,
+                    &model_cell,
+                );
                 continue;
             }
             if line == "/help" {
                 println!("{DIM}commands:{RESET}");
                 println!(
-                    "{DIM}  {:<16} switch model · adjust reasoning effort{RESET}",
+                    "{DIM}  {:<16} main model · presets · sub-agent models{RESET}",
                     "/model"
                 );
                 println!(
-                    "{DIM}  {:<16} choose models for sub-agents and Auto Mode safety{RESET}",
+                    "{DIM}  {:<16} models for sub-agents and helper roles{RESET}",
                     "/agents"
                 );
                 for (name, help) in registry.entries() {
@@ -957,12 +1219,14 @@ async fn main() -> anyhow::Result<()> {
                 match effect {
                     CommandEffect::Exit => break 'repl,
                     CommandEffect::PersistDogfood(on) => {
-                        ModelState::update(|state| state.dogfood = on)
+                        Config::update_tcode_state(&config_file, |state| state.dogfood = on)
                     }
                     // The plain REPL has no input box to ghost into, so the
                     // toggle only has to be remembered, not acted on.
                     CommandEffect::PersistSuggestions(on) => {
-                        ModelState::update(|state| state.suggestions = Some(on))
+                        Config::update_tcode_state(&config_file, |state| {
+                            state.suggestions = Some(on)
+                        })
                     }
                     CommandEffect::Compact { focus } => {
                         let cancel = CancellationToken::new();
@@ -1063,4 +1327,23 @@ async fn run_turn(
         u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
     );
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_flag_uses_c_without_reassigning_prompt_p() {
+        let cli = Cli::try_parse_from(["tcode", "-C", "personal.toml", "-p", "one shot"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("personal.toml")));
+        assert_eq!(cli.prompt.as_deref(), Some("one shot"));
+    }
+
+    #[test]
+    fn config_long_flag_accepts_an_explicit_path() {
+        let cli = Cli::try_parse_from(["tcode", "--config", "work/config.toml"]).unwrap();
+        assert_eq!(cli.config, Some(PathBuf::from("work/config.toml")));
+        assert!(cli.prompt.is_none());
+    }
 }

@@ -103,10 +103,7 @@ impl App {
             return;
         };
         let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled(
-                "cannot locate tcode session storage",
-                theme::dim(),
-            )]);
+            self.reply("cannot locate tcode session storage");
             return;
         };
         match tcode_core::SessionStore::list(&data_dir) {
@@ -116,10 +113,7 @@ impl App {
             Err(tcode_core::store::StoreError::NoSession) => {
                 self.overlay = Some(Overlay::Resume(resume::Picker::new(Vec::new())))
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot list resumable sessions: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot list resumable sessions: {e}")),
         }
     }
 
@@ -129,30 +123,24 @@ impl App {
             Some(picker) => self.overlay = Some(Overlay::Resume(picker)),
             None => {
                 self.overlay = None;
-                self.bake(vec![Line::styled(
-                    format!("no {} conversations found for this project", source.label()),
-                    theme::dim(),
-                )]);
+                self.reply(format!(
+                    "no {} conversations found for this project",
+                    source.label()
+                ));
             }
         }
     }
 
     pub(super) fn import_external_session(&mut self, external: ExternalSessionInfo) {
         if matches!(self.phase, Phase::Running { .. }) || self.external_import.is_some() {
-            self.bake(vec![Line::styled(
-                "wait for the current turn before importing",
-                theme::dim(),
-            )]);
+            self.reply("wait for the current turn before importing");
             return;
         }
         let Some(session) = self.session.as_ref() else {
             return;
         };
         let Some(data_dir) = tcode_core::store::project_data_dir(&session.tool_ctx.cwd) else {
-            self.bake(vec![Line::styled(
-                "cannot locate tcode session storage",
-                theme::dim(),
-            )]);
+            self.reply("cannot locate tcode session storage");
             return;
         };
         let cwd = session.tool_ctx.cwd.clone();
@@ -197,16 +185,13 @@ impl App {
                     .expect("freshness lock")
                     .clear();
                 self.reset_conversation_ui();
-                self.bake(vec![Line::styled(
-                    format!("imported {} as tcode session {imported_id}", source.label()),
-                    theme::dim(),
-                )]);
+                self.reply(format!(
+                    "imported {} as tcode session {imported_id}",
+                    source.label()
+                ));
                 self.bake_transcript();
             }
-            Err(e) => self.bake(vec![Line::styled(
-                format!("cannot import external session: {e}"),
-                ratatui::style::Style::default().fg(theme::ERROR),
-            )]),
+            Err(e) => self.reply_error(format!("cannot import external session: {e}")),
         }
     }
 

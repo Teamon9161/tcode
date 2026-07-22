@@ -412,7 +412,7 @@ impl<'de> Deserialize<'de> for VoiceKey {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// Starting value for `/voice`; the runtime toggle in state.toml wins.
+    /// Starting value for `/voice`; `[tcode_state].voice` wins when set.
     pub enabled: bool,
     /// Hold this to record. `space` only triggers on an empty draft.
     pub key: VoiceKey,
@@ -548,13 +548,171 @@ impl Default for AutoModeConfig {
 /// the parent's active selection.
 /// `enabled` applies to opt-in roles such as `fetch`: `true` selects the parent
 /// model, while absence leaves that role off by default.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct AgentConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl AgentConfig {
+    /// The one-word forms a `[presets.*.agents]` or `[agents]` entry may use
+    /// instead of a table. A line-up is mostly "this role runs that model",
+    /// and writing eight four-key tables to say it is what makes hand-editing
+    /// the file unpleasant enough to be skipped.
+    pub fn from_shorthand(text: &str) -> Self {
+        match text.trim() {
+            "off" => Self {
+                enabled: Some(false),
+                ..Self::default()
+            },
+            "inherit" | "" => Self {
+                enabled: Some(true),
+                ..Self::default()
+            },
+            model => Self {
+                model: Some(model.to_string()),
+                ..Self::default()
+            },
+        }
+    }
+
+    /// Whether this assignment names a model at all. An entry that only says
+    /// `enabled` selects the parent's model rather than one of its own.
+    pub fn names_a_model(&self) -> bool {
+        self.profile.is_some() || self.model.is_some() || self.effort.is_some()
+    }
+}
+
+/// The shortest form that reads back as this assignment. `/model save` writes
+/// into a file people hand-edit, so a captured line-up has to look like one
+/// they would have written: eight four-key inline tables is technically the
+/// same document and practically an unreadable one.
+fn agent_value(agent: &AgentConfig) -> toml_edit::Value {
+    match (
+        agent.profile.as_deref(),
+        agent.model.as_deref(),
+        agent.effort.as_deref(),
+        agent.enabled,
+    ) {
+        (None, None, None, Some(false)) => "off".into(),
+        (None, None, None, Some(true)) => "inherit".into(),
+        (None, Some(model), None, None) => model.into(),
+        _ => {
+            let mut table = toml_edit::InlineTable::new();
+            for (key, value) in [
+                ("profile", agent.profile.as_deref()),
+                ("model", agent.model.as_deref()),
+                ("effort", agent.effort.as_deref()),
+            ] {
+                if let Some(value) = value {
+                    table.insert(key, value.into());
+                }
+            }
+            if let Some(enabled) = agent.enabled {
+                table.insert("enabled", enabled.into());
+            }
+            toml_edit::Value::InlineTable(table)
+        }
+    }
+}
+
+/// `[presets.<name>]` as a document table, with `agents` as its own sub-table
+/// rather than one long inline map.
+fn preset_table(preset: &Preset) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    for (key, value) in [
+        ("label", preset.label.as_deref()),
+        ("profile", preset.profile.as_deref()),
+        ("model", preset.model.as_deref()),
+        ("effort", preset.effort.as_deref()),
+    ] {
+        if let Some(value) = value {
+            table.insert(key, toml_edit::value(value));
+        }
+    }
+    if !preset.agents.is_empty() {
+        let mut agents = toml_edit::Table::new();
+        for (kind, agent) in &preset.agents {
+            agents.insert(kind, toml_edit::Item::Value(agent_value(agent)));
+        }
+        table.insert("agents", toml_edit::Item::Table(agents));
+    }
+    table
+}
+
+impl<'de> Deserialize<'de> for AgentConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct Table {
+            profile: Option<String>,
+            model: Option<String>,
+            effort: Option<String>,
+            enabled: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Short(String),
+            Table(Table),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Short(text) => AgentConfig::from_shorthand(&text),
+            Repr::Table(table) => AgentConfig {
+                profile: table.profile,
+                model: table.model,
+                effort: table.effort,
+                enabled: table.enabled,
+            },
+        })
+    }
+}
+
+/// A named model line-up: which model the conversation runs on, and what each
+/// sub-agent and helper role runs on. `[profiles.*]` says *how to reach* a
+/// provider; a preset says *which models to use* and is switched as one unit,
+/// so moving from one provider family to another is one choice rather than
+/// eight re-pins.
+///
+/// A preset is a layer *below* `[tcode_state]`: switching to one clears the
+/// ad-hoc pins, so what remains in the state is exactly the tweaks made since
+/// the switch. Presets themselves are declarative config — hand-written, or
+/// captured from the live line-up by `/model save`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
-pub struct AgentConfig {
+pub struct Preset {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effort: Option<String>,
-    pub enabled: Option<bool>,
+    /// Per-role assignments, same shape and shorthands as top-level `[agents]`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub agents: BTreeMap<String, AgentConfig>,
+}
+
+impl Preset {
+    pub fn display<'a>(&'a self, key: &'a str) -> &'a str {
+        self.label.as_deref().unwrap_or(key)
+    }
+
+    /// Preset names become TOML table keys and `/model preset <name>`
+    /// arguments, so they are restricted to what both read back unambiguously.
+    pub fn valid_name(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -568,15 +726,23 @@ pub struct Config {
     pub ui: UiConfig,
     pub voice: VoiceConfig,
     pub profiles: BTreeMap<String, Profile>,
+    /// Named model line-ups, switched as a unit by `/model`. See `Preset`.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub presets: BTreeMap<String, Preset>,
     /// Per-sub-agent model overrides, keyed by agent kind (`explore`,
     /// `general`). Absent = the sub-agent follows the parent's model,
-    /// including later `/model` switches.
+    /// including later `/model` switches. The active preset overlays these,
+    /// and `[tcode_state] agents` overlays both.
     pub agents: BTreeMap<String, AgentConfig>,
     /// External commands around tool calls, e.g. a formatter after edit:
     /// `[[hooks]] event = "post_tool_use", matcher = "edit|write",
     /// command = "cargo fmt"`.
     pub hooks: Vec<crate::hooks::HookDef>,
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
+    /// Runtime choices managed by tcode. This lives only in the selected
+    /// user-level config file; project overlays are never allowed to supply it.
+    #[serde(default, skip_serializing_if = "ModelState::is_empty")]
+    pub tcode_state: ModelState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -588,17 +754,23 @@ pub enum FolderTrust {
 
 /// Everything the program itself decides and must remember: the active
 /// (profile, model, effort), the sub-agent pins, and the dogfood switch.
-/// It is written here precisely so the hand-edited config.toml is never
-/// rewritten by the program.
+/// It is stored as `[tcode_state]`; runtime updates replace only that table
+/// and preserve the rest of the hand-edited config document.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelState {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub effort: Option<String>,
-    /// `/agents` picks, keyed by agent kind. Overlays `[agents.*]` from
-    /// config.toml; an entry with every field unset means "inherit", which is
-    /// how the picker un-pins a kind the config file had pinned.
+    /// The `[presets.<name>]` line-up in force. It supplies the main model and
+    /// the role pins that the fields around it do not override; switching to
+    /// one clears those overrides (`switch_preset`), so a preset always takes
+    /// effect whole. A name that no longer exists is ignored.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// `/agents` picks, keyed by agent kind. Overlays the active preset and
+    /// `[agents.*]` from config.toml; an entry with every field unset means
+    /// "inherit", which is how the picker un-pins a kind config had pinned.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub agents: BTreeMap<String, AgentConfig>,
     /// `/dogfood`, so it survives a restart instead of being re-toggled.
@@ -651,48 +823,20 @@ impl ModelState {
             .insert(folder.display().to_string(), trust);
     }
 
-    /// Read the file, apply `edit`, write it back, reporting whether the local
-    /// state was actually made durable. New interactions that promise to
-    /// remember a security-relevant decision must use this rather than silently
-    /// claiming persistence succeeded.
-    pub fn update_checked(edit: impl FnOnce(&mut Self)) -> Result<(), ConfigError> {
-        let mut state = Self::load();
-        edit(&mut state);
-        state.save_checked()
-    }
-
-    /// Legacy best-effort state updates retain their non-failing behavior.
-    pub fn update(edit: impl FnOnce(&mut Self)) {
-        let _ = Self::update_checked(edit);
-    }
-}
-
-impl ModelState {
-    fn path() -> Option<PathBuf> {
-        Config::global_path().ok().map(|d| d.join("state.toml"))
-    }
-
-    /// Missing or corrupt state is not an error; it just means defaults.
-    pub fn load() -> Self {
-        Self::path()
-            .and_then(|p| std::fs::read_to_string(p).ok())
-            .and_then(|s| toml::from_str(&s).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn save(&self) {
-        let _ = self.save_checked();
-    }
-
-    pub fn save_checked(&self) -> Result<(), ConfigError> {
-        let path = Self::path().ok_or(ConfigError::NoHome)?;
-        let dir = path.parent().expect("state.toml has a parent");
-        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
-            path: dir.to_path_buf(),
-            source,
-        })?;
-        let text = toml::to_string_pretty(self).expect("model state serializes");
-        std::fs::write(&path, text).map_err(|source| ConfigError::Io { path, source })
+    pub fn is_empty(&self) -> bool {
+        self.profile.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.preset.is_none()
+            && self.agents.is_empty()
+            && !self.dogfood
+            && self.suggestions.is_none()
+            && self.voice.is_none()
+            && self.voice_key.is_none()
+            && self.voice_model.is_none()
+            && self.voice_words.is_none()
+            && self.mode.is_none()
+            && self.folder_trust.is_empty()
     }
 }
 
@@ -713,8 +857,8 @@ impl Config {
         Ok(Self::global_path()?.join("config.toml"))
     }
 
-    pub fn exists() -> bool {
-        Self::global_file().map(|p| p.exists()).unwrap_or(false)
+    pub fn exists_at(file: &Path) -> bool {
+        file.exists()
     }
 
     /// The built-in provider/model catalog, parsed from the embedded
@@ -724,20 +868,18 @@ impl Config {
         toml::from_str(include_str!("default.toml")).expect("embedded default.toml is valid")
     }
 
-    /// Load only the hand-written user-level configuration — no built-in
-    /// defaults, no project overlay. Setup reads and writes this, so the
-    /// built-in catalog is never serialized onto the user's disk.
-    pub fn load_global() -> Result<Self, ConfigError> {
-        let global_file = Self::global_file()?;
-        Self::read_file(&global_file)
+    /// Load only the selected user-level configuration — no built-in defaults,
+    /// no project overlay. Setup reads and writes this, so the built-in catalog
+    /// is never serialized onto the user's disk.
+    pub fn load_global_at(file: &Path) -> Result<Self, ConfigError> {
+        Self::read_file(file)
     }
 
-    /// Runtime config: built-in defaults, then the user's global config,
-    /// then the project-level `.tcode/config.toml`. Errors if no global
-    /// config exists — first-run setup (the wizard or `Config::write_global`)
-    /// must run before this.
-    pub fn load(project_dir: &Path) -> Result<Self, ConfigError> {
-        let user = Self::load_global()?;
+    /// Runtime config: built-in defaults, then the selected user config, then
+    /// the project-level `.tcode/config.toml`. Runtime state remains global to
+    /// the selected user config and cannot be supplied by the project layer.
+    pub fn load_at(file: &Path, project_dir: &Path) -> Result<Self, ConfigError> {
+        let user = Self::load_global_at(file)?;
         let mut config = Self::defaults();
         config.merge_global(user);
         let project_file = project_dir.join(".tcode").join("config.toml");
@@ -754,7 +896,11 @@ impl Config {
     /// natural-language classifier policy.
     fn sanitize_project_config(mut project: Config) -> Config {
         project.agents.remove("auto");
+        for preset in project.presets.values_mut() {
+            preset.agents.remove("auto");
+        }
         project.auto_mode = AutoModeConfig::default();
+        project.tcode_state = ModelState::default();
         project
     }
 
@@ -776,20 +922,98 @@ impl Config {
             })?
     }
 
-    /// Serialize to the global config file (used by the setup wizard).
-    pub fn write_global(&self, header: &str) -> Result<PathBuf, ConfigError> {
-        let dir = Self::global_path()?;
-        std::fs::create_dir_all(&dir).map_err(|e| ConfigError::Io {
-            path: dir.clone(),
-            source: e,
+    /// Serialize a setup result to the selected user config file. Runtime
+    /// changes never use this: they go through `update_tcode_state_checked`,
+    /// which preserves the rest of the handwritten document.
+    pub fn write_global_at(&self, file: &Path, header: &str) -> Result<PathBuf, ConfigError> {
+        let dir = file
+            .parent()
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|source| ConfigError::Io {
+            path: dir.to_path_buf(),
+            source,
         })?;
-        let file = dir.join("config.toml");
         let body = toml::to_string_pretty(self).expect("config serializes");
-        std::fs::write(&file, format!("{header}{body}")).map_err(|e| ConfigError::Io {
-            path: file.clone(),
-            source: e,
+        std::fs::write(file, format!("{header}{body}")).map_err(|source| ConfigError::Io {
+            path: file.to_path_buf(),
+            source,
         })?;
-        Ok(file)
+        Ok(file.to_path_buf())
+    }
+
+    /// Read the selected config, change only `[tcode_state]`, and atomically
+    /// replace it. `toml_edit` retains all other keys, unknown tables, and
+    /// comments owned by the user.
+    pub fn update_tcode_state_checked(
+        file: &Path,
+        edit: impl FnOnce(&mut ModelState),
+    ) -> Result<(), ConfigError> {
+        use toml_edit::{DocumentMut, Item};
+
+        let source = std::fs::read_to_string(file).map_err(|source| ConfigError::Io {
+            path: file.to_path_buf(),
+            source,
+        })?;
+        let mut state = Self::read_file(file)?.tcode_state;
+        edit(&mut state);
+        let mut document = source
+            .parse::<DocumentMut>()
+            .map_err(|error| ConfigError::Update {
+                path: file.to_path_buf(),
+                message: format!("invalid TOML: {error}"),
+            })?;
+        if state.is_empty() {
+            document.remove("tcode_state");
+        } else {
+            let state_document =
+                toml_edit::ser::to_document(&state).map_err(|error| ConfigError::Update {
+                    path: file.to_path_buf(),
+                    message: format!("cannot serialize tcode_state: {error}"),
+                })?;
+            document.insert(
+                "tcode_state",
+                Item::Table(state_document.as_table().clone()),
+            );
+        }
+        write_document_atomically(file, document.to_string())
+    }
+
+    /// Best-effort updates are used for cosmetic preferences. Security-relevant
+    /// callers use the checked variant so they can report a persistence error.
+    pub fn update_tcode_state(file: &Path, edit: impl FnOnce(&mut ModelState)) {
+        let _ = Self::update_tcode_state_checked(file, edit);
+    }
+
+    /// Move a legacy standalone state file into an otherwise state-less default
+    /// config. Callers deliberately pass the legacy path only for the default
+    /// config; an explicit `--config` is independent and never absorbs it.
+    pub fn migrate_legacy_state_if_needed(
+        config_file: &Path,
+        legacy_state_file: &Path,
+    ) -> Result<(), ConfigError> {
+        let source = std::fs::read_to_string(config_file).map_err(|source| ConfigError::Io {
+            path: config_file.to_path_buf(),
+            source,
+        })?;
+        let document =
+            source
+                .parse::<toml_edit::DocumentMut>()
+                .map_err(|error| ConfigError::Update {
+                    path: config_file.to_path_buf(),
+                    message: format!("invalid TOML: {error}"),
+                })?;
+        if document.get("tcode_state").is_some() || !legacy_state_file.exists() {
+            return Ok(());
+        }
+        let legacy = std::fs::read_to_string(legacy_state_file)
+            .ok()
+            .and_then(|text| toml::from_str::<ModelState>(&text).ok())
+            .unwrap_or_default();
+        if !legacy.is_empty() {
+            Self::update_tcode_state_checked(config_file, |state| *state = legacy)?;
+        }
+        Ok(())
     }
 
     fn read_file(path: &Path) -> Result<Self, ConfigError> {
@@ -811,6 +1035,7 @@ impl Config {
         self.limits = user.limits.clone();
         self.permissions.mode = user.permissions.mode;
         self.auto_mode = user.auto_mode.clone();
+        self.tcode_state = user.tcode_state.clone();
         self.overlay(user);
     }
 
@@ -834,7 +1059,99 @@ impl Config {
         self.permissions.deny.extend(over.permissions.deny);
         self.hooks.extend(over.hooks);
         self.mcp_servers.extend(over.mcp_servers);
+        self.presets.extend(over.presets);
         self.agents.extend(over.agents);
+    }
+
+    /// Fold the active preset and the runtime state into this config, and hand
+    /// back the state the rest of startup should read.
+    ///
+    /// This is the single place the three layers meet, and their order is the
+    /// whole point: `[agents.*]` from the config files, then the active
+    /// `[presets.<name>]`, then the ad-hoc `[tcode_state] agents` picks. The
+    /// main model resolves the same way — the preset supplies it only when the
+    /// state names no model of its own, which is exactly the situation
+    /// `switch_preset` leaves behind.
+    pub fn apply_active_preset(&mut self) -> ModelState {
+        let mut state = self.tcode_state.clone();
+        if let Some(preset) = state
+            .preset
+            .as_deref()
+            .and_then(|name| self.presets.get(name))
+            .cloned()
+        {
+            if state.model.is_none() && state.profile.is_none() {
+                // A bare `model = "..."` must find the profile that offers it,
+                // for the same reason `[agents.*]` does: sending one vendor's
+                // model id to another's endpoint fails at the first request,
+                // long after the choice was made.
+                state.profile = preset.profile.clone().or_else(|| {
+                    let model = preset.model.as_deref()?;
+                    self.profile_offering(model, self.default_profile.as_deref().unwrap_or(""))
+                });
+                state.model = preset.model.clone();
+                state.effort = preset.effort.clone();
+            }
+            self.agents.extend(preset.agents);
+        }
+        self.agents.extend(state.agents.clone());
+        state
+    }
+
+    /// Switch the line-up. Clearing the ad-hoc pins *and* the saved main model
+    /// is what makes a preset apply whole: whatever was tweaked since the last
+    /// switch belonged to the line-up being left, and leaving it behind would
+    /// mean no preset ever fully described what is running.
+    pub fn switch_preset(file: &Path, name: &str) -> Result<(), ConfigError> {
+        let name = name.to_string();
+        Self::update_tcode_state_checked(file, move |state| {
+            state.preset = Some(name);
+            state.profile = None;
+            state.model = None;
+            state.effort = None;
+            state.agents.clear();
+        })
+    }
+
+    /// Add or replace one `[presets.<name>]` table, leaving the rest of the
+    /// hand-edited document alone. This is the only program write outside
+    /// `[tcode_state]`, and it is additive by construction: `/model save`
+    /// names a line-up the user just assembled.
+    pub fn upsert_preset(file: &Path, name: &str, preset: &Preset) -> Result<(), ConfigError> {
+        use toml_edit::{DocumentMut, Item, Table};
+
+        if !Preset::valid_name(name) {
+            return Err(ConfigError::Update {
+                path: file.to_path_buf(),
+                message: format!(
+                    "'{name}' is not a usable preset name — letters, digits, '-' and '_' only"
+                ),
+            });
+        }
+        let source = std::fs::read_to_string(file).map_err(|source| ConfigError::Io {
+            path: file.to_path_buf(),
+            source,
+        })?;
+        let mut document = source
+            .parse::<DocumentMut>()
+            .map_err(|error| ConfigError::Update {
+                path: file.to_path_buf(),
+                message: format!("invalid TOML: {error}"),
+            })?;
+        let presets = document
+            .entry("presets")
+            .or_insert_with(|| {
+                let mut table = Table::new();
+                table.set_implicit(true);
+                Item::Table(table)
+            })
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::Update {
+                path: file.to_path_buf(),
+                message: "[presets] exists but is not a table".to_string(),
+            })?;
+        presets.insert(name, Item::Table(preset_table(preset)));
+        write_document_atomically(file, document.to_string())
     }
 
     /// The model a sub-agent kind runs on. `None` = no override configured;
@@ -846,7 +1163,7 @@ impl Config {
         parent: &Selection,
     ) -> Option<Result<Selection, ConfigError>> {
         let over = self.agents.get(kind)?;
-        if over.profile.is_none() && over.model.is_none() && over.effort.is_none() {
+        if !over.names_a_model() {
             return None;
         }
         Some(self.resolve_agent(over, parent))
@@ -1026,10 +1343,12 @@ impl Config {
     }
 }
 
-/// Built-in profile presets used by the first-run wizard. These are just
+/// Built-in provider profiles used by the first-run wizard. These are just
 /// the entries from the embedded `default.toml` catalog with an inline API
 /// key filled in, so the wizard and the runtime default layer never drift.
-pub mod presets {
+/// Not to be confused with `[presets.*]`, which are user-named model
+/// line-ups (`Preset`).
+pub mod catalog {
     use super::{Config, Profile};
 
     fn from_catalog(id: &str) -> Profile {
@@ -1070,6 +1389,35 @@ pub mod presets {
     pub fn openrouter(api_key: Option<String>) -> Profile {
         with_key("openrouter", api_key)
     }
+}
+
+fn write_document_atomically(path: &Path, text: String) -> Result<(), ConfigError> {
+    let dir = path
+        .parent()
+        .filter(|dir| !dir.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let temporary = dir.join(format!(
+        ".{}.{}-{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("config.toml"),
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    std::fs::write(&temporary, text).map_err(|source| ConfigError::Io {
+        path: temporary.clone(),
+        source,
+    })?;
+    std::fs::rename(&temporary, path).map_err(|source| {
+        let _ = std::fs::remove_file(&temporary);
+        ConfigError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
 }
 
 fn add_project_allow_blocking(project_dir: &Path, descriptor: &str) -> Result<bool, ConfigError> {
@@ -1216,6 +1564,68 @@ mod tests {
     }
 
     #[test]
+    fn runtime_state_updates_preserve_comments_and_unrelated_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("personal.toml");
+        std::fs::write(
+            &file,
+            "# keep this comment\ndefault_profile = \"anthropic\"\n\n[custom]\nanswer = 42\n",
+        )
+        .unwrap();
+
+        Config::update_tcode_state_checked(&file, |state| {
+            state.profile = Some("work".into());
+            state.dogfood = true;
+        })
+        .unwrap();
+        Config::update_tcode_state_checked(&file, |state| {
+            state.suggestions = Some(true);
+        })
+        .unwrap();
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("# keep this comment"));
+        assert!(text.contains("[custom]"));
+        assert!(text.contains("answer = 42"));
+        assert!(text.contains("[tcode_state]"));
+        let config = Config::load_global_at(&file).unwrap();
+        assert_eq!(config.tcode_state.profile.as_deref(), Some("work"));
+        assert!(config.tcode_state.dogfood);
+        assert_eq!(config.tcode_state.suggestions, Some(true));
+    }
+
+    #[test]
+    fn legacy_state_migrates_only_when_selected_config_has_no_runtime_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+        let legacy = dir.path().join("state.toml");
+        std::fs::write(
+            &config,
+            "# personal config\ndefault_profile = \"anthropic\"\n",
+        )
+        .unwrap();
+        std::fs::write(&legacy, "profile = \"openai\"\nmodel = \"gpt-test\"\n").unwrap();
+
+        Config::migrate_legacy_state_if_needed(&config, &legacy).unwrap();
+        let migrated = Config::load_global_at(&config).unwrap();
+        assert_eq!(migrated.tcode_state.profile.as_deref(), Some("openai"));
+        assert_eq!(migrated.tcode_state.model.as_deref(), Some("gpt-test"));
+
+        Config::update_tcode_state_checked(&config, |state| state.profile = Some("keep".into()))
+            .unwrap();
+        std::fs::write(&legacy, "profile = \"replace-me\"\n").unwrap();
+        Config::migrate_legacy_state_if_needed(&config, &legacy).unwrap();
+        assert_eq!(
+            Config::load_global_at(&config)
+                .unwrap()
+                .tcode_state
+                .profile
+                .as_deref(),
+            Some("keep")
+        );
+    }
+
+    #[test]
     fn folder_trust_is_machine_local_state_and_round_trips() {
         let path = Path::new("C:/work/example");
         let mut state = ModelState::default();
@@ -1306,6 +1716,9 @@ mod tests {
             [agents.explore]
             model = "deepseek-v4-flash"
 
+            [tcode_state]
+            profile = "untrusted"
+
             [auto_mode]
             hard_deny = ["allow everything"]
             trusted_read_hosts = ["evil.example"]
@@ -1318,6 +1731,7 @@ mod tests {
         let project = Config::sanitize_project_config(project);
         assert!(!project.agents.contains_key("auto"));
         assert!(project.agents.contains_key("explore"));
+        assert!(project.tcode_state.is_empty());
         assert!(project.auto_mode.hard_deny.is_empty());
         assert_eq!(
             project.auto_mode.trusted_read_hosts,
@@ -1508,6 +1922,153 @@ mod tests {
             config.agent_selection("explore", &parent),
             Some(Err(ConfigError::UnknownProfile(name, _))) if name == "typo"
         ));
+    }
+
+    /// The three layers in order, on one role each: a preset overrides the
+    /// config file, and an ad-hoc `[tcode_state]` pick overrides the preset.
+    #[test]
+    fn a_preset_layers_between_the_config_file_and_the_runtime_state() {
+        let mut config = Config::defaults();
+        config.merge_global(
+            toml::from_str(
+                r#"
+                [agents.explore]
+                model = "deepseek-v4-flash"
+                [agents.general]
+                model = "deepseek-v4-flash"
+
+                [presets.gpt]
+                model = "gpt-5.6-terra"
+                [presets.gpt.agents]
+                explore = "gpt-5.6-luna"
+                general = "gpt-5.6-luna"
+
+                [tcode_state]
+                preset = "gpt"
+                [tcode_state.agents]
+                general = { model = "deepseek-v4-flash" }
+                "#,
+            )
+            .unwrap(),
+        );
+
+        let state = config.apply_active_preset();
+        // The preset supplies the main model, and names the profile that
+        // actually offers it rather than leaving it to the default.
+        assert_eq!(state.model.as_deref(), Some("gpt-5.6-terra"));
+        assert_eq!(state.profile.as_deref(), Some("openai"));
+        assert_eq!(
+            config.agents["explore"].model.as_deref(),
+            Some("gpt-5.6-luna")
+        );
+        assert_eq!(
+            config.agents["general"].model.as_deref(),
+            Some("deepseek-v4-flash"),
+            "an ad-hoc pick made since the switch outranks the preset"
+        );
+    }
+
+    /// Switching is the moment the whole line-up changes, so it must not leave
+    /// the previous one's tweaks behind — otherwise no preset ever fully
+    /// describes what is running.
+    #[test]
+    fn switching_preset_drops_the_pins_belonging_to_the_one_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            r#"
+# hand-written, must survive
+default_profile = "deepseek"
+
+[presets.gpt]
+model = "gpt-5.6-terra"
+
+[tcode_state]
+profile = "deepseek"
+model = "deepseek-v4-flash"
+[tcode_state.agents]
+explore = { model = "deepseek-v4-flash" }
+"#,
+        )
+        .unwrap();
+
+        Config::switch_preset(&file, "gpt").unwrap();
+
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("hand-written, must survive"));
+        let state = Config::load_global_at(&file).unwrap().tcode_state;
+        assert_eq!(state.preset.as_deref(), Some("gpt"));
+        assert!(state.agents.is_empty());
+        assert!(state.model.is_none(), "the preset supplies the main model");
+    }
+
+    /// `/model save` writes one table and touches nothing else — it is the only
+    /// program write outside `[tcode_state]`.
+    #[test]
+    fn saving_a_preset_adds_one_table_and_preserves_the_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(
+            &file,
+            "# keep me\n[profiles.deepseek]\napi_key = \"sk-x\"\n",
+        )
+        .unwrap();
+
+        let preset = Preset {
+            model: Some("gpt-5.6-terra".into()),
+            agents: BTreeMap::from([("explore".to_string(), AgentConfig::from_shorthand("off"))]),
+            ..Preset::default()
+        };
+        Config::upsert_preset(&file, "gpt", &preset).unwrap();
+
+        let written = std::fs::read_to_string(&file).unwrap();
+        assert!(written.contains("# keep me"));
+        assert!(written.contains("sk-x"));
+        let reloaded = Config::load_global_at(&file).unwrap();
+        assert_eq!(
+            reloaded.presets["gpt"].model.as_deref(),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            reloaded.presets["gpt"].agents["explore"].enabled,
+            Some(false)
+        );
+
+        assert!(Config::upsert_preset(&file, "not ok", &preset).is_err());
+    }
+
+    /// The shorthand exists so a line-up reads as one line per role; it must
+    /// mean exactly what the equivalent table means.
+    #[test]
+    fn agent_shorthand_matches_the_table_form() {
+        let config: Config = toml::from_str(
+            r#"
+            [agents]
+            explore = "deepseek-v4-flash"
+            suggest = "inherit"
+            fetch = "off"
+            general = { model = "deepseek-v4-flash" }
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.agents["explore"], config.agents["general"]);
+        assert_eq!(config.agents["suggest"].enabled, Some(true));
+        assert!(!config.agents["suggest"].names_a_model());
+        assert_eq!(config.agents["fetch"].enabled, Some(false));
+    }
+
+    /// A checked-out repository may pin task agents, but must not repoint the
+    /// safety classifier — including through a preset.
+    #[test]
+    fn a_project_preset_cannot_repoint_the_classifier() {
+        let project: Config = toml::from_str(
+            "[presets.evil.agents]\nauto = \"some-model\"\nexplore = \"some-model\"\n",
+        )
+        .unwrap();
+        let project = Config::sanitize_project_config(project);
+        assert!(!project.presets["evil"].agents.contains_key("auto"));
+        assert!(project.presets["evil"].agents.contains_key("explore"));
     }
 
     #[test]

@@ -391,29 +391,11 @@ impl App {
         self.transcript.push(lines);
     }
 
-    /// The task card's live status is intentionally muted: its parent-authored
-    /// objective is the primary label, while the changing sub-agent tool is
-    /// supporting progress. A parallel batch names its current task and count.
+    /// The main conversation's copy of a card status. A trace view bakes the
+    /// identical lines for the runs *its* agent delegates, so the shape is
+    /// decided once, in `view`.
     pub(super) fn task_status_lines(&self, run: &UiTaskRun) -> Vec<Line<'static>> {
-        let Some(call) = run.current_call() else {
-            return task_plain_status(&run.activity);
-        };
-        let summary = self.display_summary(&call.summary);
-        let mut spans = vec![Span::styled(
-            format!("{TASK_STATUS_INDENT}{summary}"),
-            theme::dim(),
-        )];
-        if run.calls.len() > 1 {
-            spans.push(Span::styled(
-                format!(
-                    " · task {}/{}",
-                    run.rotation % run.calls.len() + 1,
-                    run.calls.len()
-                ),
-                theme::dim(),
-            ));
-        }
-        vec![Line::from(spans)]
+        task_status_lines(run, &self.cwd)
     }
 
     /// Advance which call of a parallel batch each running task's status line
