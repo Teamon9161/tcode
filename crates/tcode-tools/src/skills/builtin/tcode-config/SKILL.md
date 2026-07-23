@@ -170,6 +170,14 @@ suggest = "inherit"
 fetch = "off"
 ```
 
+A pin is the standing default. For a one-off, the model can also override a
+single delegation's model and effort at spawn time — e.g. when you say "explore
+this with deepseek-v4-flash" — via optional `model`/`effort` arguments on the
+`agent` tool. That override applies to that one fresh run only (not to
+`resume`), does not persist, and resolves against the same profiles a pin would;
+an uncatalogued id is passed through verbatim. It changes nothing in config —
+the pins below remain the durable setting.
+
 `/agents` lists and changes these assignments interactively; those choices are
 persisted in `[tcode_state]` in the selected config and override both
 `[agents.*]` and the active preset. Builtin task kinds are

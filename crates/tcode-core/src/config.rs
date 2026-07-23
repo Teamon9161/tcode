@@ -1169,6 +1169,26 @@ impl Config {
         Some(self.resolve_agent(over, parent))
     }
 
+    /// Resolve a caller-supplied `model`/`effort` override — one passed to the
+    /// `agent` tool at spawn time, not a configured `[agents.<kind>]` pin —
+    /// against the profile catalogue, relative to `parent`. `model = None` keeps
+    /// the parent's model and changes only effort; an uncatalogued model id
+    /// passes through verbatim, exactly as `select` and a config pin do.
+    pub fn resolve_model_override(
+        &self,
+        model: Option<&str>,
+        effort: Option<&str>,
+        parent: &Selection,
+    ) -> Result<Selection, ConfigError> {
+        let over = AgentConfig {
+            profile: None,
+            model: model.map(str::to_string),
+            effort: effort.map(str::to_string),
+            enabled: None,
+        };
+        self.resolve_agent(&over, parent)
+    }
+
     /// The profile that offers `model`, preferring `parent` when it does. This
     /// is what makes a bare `model = "..."` pin work: without it, naming a
     /// model that lives in another profile would keep the parent's profile and

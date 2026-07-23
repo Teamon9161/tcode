@@ -24,6 +24,13 @@ use tcode_core::{
 
 use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry, QuestionPolicy};
 
+/// Resolves a caller-supplied per-call model/effort override into a ready
+/// `ActiveModel`. Injected by the composition root because it needs the profile
+/// catalogue the tool itself does not hold. `model = None` keeps the base model
+/// and changes only effort; an error string is surfaced to the model verbatim.
+pub type ModelResolver =
+    Arc<dyn Fn(Option<&str>, Option<&str>) -> Result<ActiveModel, String> + Send + Sync>;
+
 /// Fallback for a run with no parent conversation to escalate to — a direct or
 /// orphaned run. Declining is the only safe answer: there is nobody to ask.
 struct NeverAsk;
@@ -184,6 +191,9 @@ pub struct AgentTool {
     live: Arc<Mutex<HashMap<String, LiveTask>>>,
     /// Recent runs' final reports for `attach`, keyed by run id.
     reports: Arc<Mutex<HashMap<String, StoredReport>>>,
+    /// Resolves a caller's `model`/`effort` override for one delegation. `None`
+    /// leaves overrides unavailable — the run uses its pinned/inherited model.
+    resolver: Option<ModelResolver>,
 }
 
 impl AgentTool {
@@ -212,12 +222,21 @@ impl AgentTool {
             depth: 0,
             live: Arc::default(),
             reports: Arc::default(),
+            resolver: None,
         }
     }
 
     /// Share the live pin registry with the frontend that edits it.
     pub fn with_agent_models(mut self, pinned: AgentModels) -> Self {
         self.pinned = pinned;
+        self
+    }
+
+    /// Enable per-call `model`/`effort` overrides on the `agent` tool. The
+    /// resolver captures the composition root's profile catalogue; without it
+    /// an override request is refused and the run keeps its pinned model.
+    pub fn with_model_resolver(mut self, resolver: ModelResolver) -> Self {
+        self.resolver = Some(resolver);
         self
     }
 
@@ -378,6 +397,7 @@ impl AgentTool {
             // caller saw in its own earlier result lines.
             live: Arc::default(),
             reports: Arc::default(),
+            resolver: self.resolver.clone(),
         }
     }
 
@@ -485,6 +505,36 @@ impl AgentTool {
         Ok(out)
     }
 
+    /// Resolve a caller's `model`/`effort` override for a fresh delegation.
+    /// `Ok(None)` when neither is given. A refused override (no resolver, or an
+    /// unresolvable model) is a self-healing tool error, not a silent fallback:
+    /// the model asked for a specific model and must know its request was not
+    /// honored rather than believe a run happened on it.
+    fn resolve_override(&self, input: &Value) -> Result<Option<ActiveModel>, ToolOutput> {
+        let cleaned = |key: &str| {
+            input[key]
+                .as_str()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        };
+        let (model, effort) = (cleaned("model"), cleaned("effort"));
+        if model.is_none() && effort.is_none() {
+            return Ok(None);
+        }
+        let Some(resolver) = &self.resolver else {
+            return Err(ToolOutput::err(
+                "per-call model/effort override is unavailable in this session; \
+                 this run uses the agent's pinned or inherited model. Ask the user to \
+                 pin it with `/agents` or `/model` instead.",
+            ));
+        };
+        resolver(model, effort).map(Some).map_err(|error| {
+            ToolOutput::err(format!(
+                "cannot run this agent on the requested model: {error}"
+            ))
+        })
+    }
+
     /// The definition for `kind`, honoring this instance's spawn allowlist.
     fn def_for(&self, kind: &str) -> Option<&AgentDef> {
         let allowed = self
@@ -526,6 +576,14 @@ fn agent_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
             "summary": {
                 "type": "string",
                 "description": "A very short summary of the delegated objective. Use the same language as prompt; it appears in the live agent tree."
+            },
+            "model": {
+                "type": "string",
+                "description": "Optional: run this one delegation on a specific model id from the configured profiles instead of the agent's pinned or inherited model. Use only when the user names a model for the sub-agent (e.g. \"explore this with deepseek-v4-flash\"). An uncatalogued id is passed to the provider verbatim. Ignored on `resume`."
+            },
+            "effort": {
+                "type": "string",
+                "description": "Optional reasoning effort for this one delegation (e.g. low, medium, high), overriding the model's default. May be combined with `model` or used alone. Ignored on `resume`."
             }
         },
         "required": ["agent", "prompt"]
@@ -639,7 +697,13 @@ impl Tool for AgentTool {
                 .resume_run(id, def, &prompt, &summary, call_id, ctx, cancel)
                 .await;
         }
-        let (agent, mut session, model_name) = self.build_run(def, ctx);
+        // A per-call model/effort override applies to fresh runs only; a resumed
+        // run keeps the model its parked session was built on.
+        let model_override = match self.resolve_override(&input) {
+            Ok(model_override) => model_override,
+            Err(out) => return out,
+        };
+        let (agent, mut session, model_name) = self.build_run(def, ctx, model_override);
 
         let run = match self
             .drive(
@@ -725,9 +789,14 @@ impl AgentTool {
     /// empty session under its own cache scope, and the resolved model's name.
     /// A restored run is built here too, so a run recovered from a trace is
     /// configured exactly like a fresh one instead of drifting from it.
-    fn build_run(&self, def: &AgentDef, ctx: &ToolCtx) -> (Agent, Session, String) {
+    fn build_run(
+        &self,
+        def: &AgentDef,
+        ctx: &ToolCtx,
+        model_override: Option<ActiveModel>,
+    ) -> (Agent, Session, String) {
         let kind = &def.name;
-        let model = self.model_for(kind);
+        let model = model_override.unwrap_or_else(|| self.model_for(kind));
         let model_name = model.provider.model().to_string();
         let model = ModelCell::new(model);
         let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
@@ -791,7 +860,7 @@ impl AgentTool {
         // argument is then checked against it like any other parked run, so a
         // mismatch is reported rather than silently honored.
         let def = self.def_for(&meta.kind)?;
-        let (agent, mut session, model_name) = self.build_run(def, ctx);
+        let (agent, mut session, model_name) = self.build_run(def, ctx, None);
         session.ledger = ledger;
         // A trace can stop anywhere — its process may have been killed
         // mid-batch, which no live path can produce.
@@ -1314,6 +1383,133 @@ mod tests {
             context_window: 100_000,
             effort: None,
         })
+    }
+
+    /// A provider whose `model()` echoes a chosen id, so a resolver test can
+    /// prove the override — not the pin — reached `build_run`.
+    struct NamedProvider(&'static str);
+
+    #[async_trait::async_trait]
+    impl tcode_core::Provider for NamedProvider {
+        fn name(&self) -> &str {
+            "named"
+        }
+        fn model(&self) -> &str {
+            self.0
+        }
+        fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+            tcode_core::CacheStrategy::ImplicitPrefix
+        }
+        async fn stream(
+            &self,
+            _req: tcode_core::Request,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+            unreachable!("resolver tests never stream")
+        }
+    }
+
+    fn named_model(id: &'static str, effort: Option<&str>) -> tcode_core::ActiveModel {
+        tcode_core::ActiveModel {
+            provider: std::sync::Arc::new(NamedProvider(id)),
+            max_tokens: 1024,
+            context_window: 100_000,
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn resolve_override_is_none_without_model_or_effort() {
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        );
+        assert!(task
+            .resolve_override(&json!({"agent": "explore", "prompt": "x"}))
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn resolve_override_refuses_when_no_resolver_is_installed() {
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        );
+        let err = task
+            .resolve_override(&json!({"model": "deepseek-v4-flash"}))
+            .err()
+            .expect("override refused without a resolver");
+        assert!(err.is_error);
+        assert!(err.content.contains("unavailable"), "{}", err.content);
+    }
+
+    #[test]
+    fn resolve_override_passes_model_and_effort_to_the_resolver() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let captured = seen.clone();
+        let resolver: super::ModelResolver = std::sync::Arc::new(move |model, effort| {
+            *captured.lock().unwrap() =
+                Some((model.map(str::to_string), effort.map(str::to_string)));
+            Ok(named_model("resolved-model", effort))
+        });
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_model_resolver(resolver);
+        let active = task
+            .resolve_override(&json!({"model": "deepseek-v4-flash", "effort": "high"}))
+            .unwrap()
+            .expect("override resolved to a model");
+        assert_eq!(active.provider.model(), "resolved-model");
+        assert_eq!(active.effort.as_deref(), Some("high"));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some((
+                Some("deepseek-v4-flash".to_string()),
+                Some("high".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn resolver_failure_becomes_a_self_healing_tool_error() {
+        let resolver: super::ModelResolver =
+            std::sync::Arc::new(|_, _| Err("no profile offers 'nope'".to_string()));
+        let task = super::AgentTool::new(
+            null_model(),
+            Default::default(),
+            2_000,
+            std::env::temp_dir(),
+        )
+        .with_model_resolver(resolver);
+        let err = task
+            .resolve_override(&json!({"model": "nope"}))
+            .err()
+            .expect("resolver failure surfaces as a tool error");
+        assert!(err.is_error);
+        assert!(
+            err.content.contains("no profile offers 'nope'"),
+            "{}",
+            err.content
+        );
+    }
+
+    #[test]
+    fn agent_schema_advertises_the_model_and_effort_overrides() {
+        let schema = agent_schema(&AgentRegistry::builtin(), None);
+        let props = &schema["properties"];
+        assert!(props["model"].is_object());
+        assert!(props["effort"].is_object());
+        // The overrides are optional; only agent and prompt are required.
+        assert_eq!(schema["required"], json!(["agent", "prompt"]));
     }
 
     struct McpStub;

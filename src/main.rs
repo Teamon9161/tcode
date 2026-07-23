@@ -892,6 +892,25 @@ async fn main() -> anyhow::Result<()> {
     )
     .with_trusted_read_hosts(trusted_read_hosts.clone())
     .with_shell_filters(shell_filters.clone())
+    .with_model_resolver({
+        // Lets the model honor "delegate this on <model>" at spawn time. The
+        // catalogue is a startup snapshot: a `/provider` reload that adds a
+        // profile mid-session is not reflected here, which is acceptable —
+        // profiles are set up once, and named ids pass through verbatim anyway.
+        let config = config.clone();
+        let parent = selection.clone();
+        Arc::new(move |model: Option<&str>, effort: Option<&str>| {
+            let sel = config
+                .resolve_model_override(model, effort, &parent)
+                .map_err(|e| e.to_string())?;
+            let profile = config
+                .profiles
+                .get(&sel.profile)
+                .ok_or_else(|| format!("profile '{}' is not configured", sel.profile))?;
+            tcode_providers::build_active(profile, &sel, &config.watchdog)
+                .map_err(|e| e.to_string())
+        })
+    })
     .with_extension_tools(mcp_tools);
     // A named-agent run shapes the toolset last: allowlist filtering over
     // everything assembled above, then the agent tool — which is granted by
