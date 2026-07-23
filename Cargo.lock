@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "tcode"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2751,7 +2751,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-core"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64",
@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-frontend"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "tcode-core",
@@ -2784,7 +2784,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-importers"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "dirs",
  "serde_json",
@@ -2794,7 +2794,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-providers"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2815,7 +2815,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tools"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "async-trait",
  "base64",
@@ -2844,7 +2844,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tui"
-version = "0.1.21"
+version = "0.1.22"
 dependencies = [
  "anyhow",
  "arboard",
