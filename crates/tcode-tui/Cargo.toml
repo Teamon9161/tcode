@@ -11,6 +11,7 @@ tcode-core = { path = "../tcode-core" }
 tcode-importers = { path = "../tcode-importers" }
 tcode-providers = { path = "../tcode-providers" }
 tcode-tools = { path = "../tcode-tools" }
+tcode-frontend = { path = "../tcode-frontend" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

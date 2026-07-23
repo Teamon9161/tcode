@@ -14,7 +14,7 @@ use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKi
 use tcode_core::config::{AgentConfig, Config, ConfigError, Selection};
 use tcode_core::{
     ActiveModel, Agent, AgentError, AgentModels, AgentRole, ContentBlock, ModelCell,
-    PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session, ToolCtx,
+    PermissionRules, Session,
 };
 
 const CYAN: &str = "\x1b[36m";
@@ -913,88 +913,23 @@ async fn main() -> anyhow::Result<()> {
     // completion/`/name` fallback, plain REPL fallback) so they never see a
     // different skill list than the `skill` tool the model calls.
     let skills = tcode_tools::discover_skills(&cwd);
-    let mut tools = tcode_tools::builtin_tools_with_skills_and_web_fetch(
-        skills.clone(),
-        tcode_tools::WebFetchTool::new(trusted_read_hosts.clone()).with_summarizer(
-            tcode_tools::FetchSummarizer::new(model_cell.clone(), pinned.clone()),
-        ),
-        shell_filters.clone(),
-    );
-    tools.push(Arc::new(tcode_tools::ViewImageTool::new(
-        model_cell.clone(),
-        pinned.clone(),
-    )));
-    tools.push(Arc::new(tcode_tools::UpdateProgressTool));
-    tools.push(Arc::new(tcode_tools::AskUserTool));
-    tools.push(Arc::new(tcode_tools::AddNoteTool));
-    tools.extend(mcp_tools.iter().cloned());
-    let agent_tool = tcode_tools::AgentTool::new(
-        model_cell.clone(),
-        config.watchdog.clone(),
-        config.limits.tool_output_tokens,
-        cwd.clone(),
-    )
-    .with_agent_models(pinned.clone())
-    .with_agent_defs(agent_defs.clone())
-    .with_auto_policy(classifier_policy.clone())
-    .with_auto_classifier_config(classifier_config)
-    .with_auto_compact(
-        config.limits.auto_compact,
-        config.limits.auto_compact_percent,
-    )
-    .with_trusted_read_hosts(trusted_read_hosts.clone())
-    .with_shell_filters(shell_filters.clone())
-    .with_model_resolver({
-        // Lets the model honor "delegate this on <model>" at spawn time. The
-        // catalogue is a startup snapshot: a `/provider` reload that adds a
-        // profile mid-session is not reflected here, which is acceptable —
-        // profiles are set up once, and named ids pass through verbatim anyway.
-        let config = config.clone();
-        let parent = selection.clone();
-        Arc::new(move |model: Option<&str>, effort: Option<&str>| {
-            let sel = config
-                .resolve_model_override(model, effort, &parent)
-                .map_err(|e| e.to_string())?;
-            let profile = config
-                .profiles
-                .get(&sel.profile)
-                .ok_or_else(|| format!("profile '{}' is not configured", sel.profile))?;
-            tcode_providers::build_active(profile, &sel, &config.watchdog)
-                .map_err(|e| e.to_string())
-        })
-    })
-    .with_extension_tools(mcp_tools);
-    // A named-agent run shapes the toolset last: allowlist filtering over
-    // everything assembled above, then the agent tool — which is granted by
-    // the definition's spawn policy alone, outside the allowlist tiers.
-    match &cli_agent {
-        Some(def) => {
-            tools.retain(|tool| tcode_tools::keeps_tool(def, tool.as_ref()));
-            if !agent_defs.spawn_list(def).is_empty() {
-                tools.push(Arc::new(agent_tool.scoped_to(def)));
-            }
-        }
-        None => tools.push(Arc::new(agent_tool)),
-    }
-    let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
-        ProviderSafetyClassifier::new(model_cell.clone(), pinned.clone())
-            .with_config(classifier_config),
-    );
-    let agent = Arc::new(Agent {
-        model: model_cell.clone(),
-        models: pinned.clone(),
-        tools,
+    // Toolset + `agent` tool + safety classifier + `Agent` wiring is identical
+    // across frontends, so it lives in `tcode-frontend`.
+    let agent = tcode_frontend::build_agent(tcode_frontend::AgentBuild {
+        cwd: cwd.clone(),
+        config: &config,
+        selection: selection.clone(),
+        model_cell: model_cell.clone(),
+        pinned: pinned.clone(),
+        agent_defs: agent_defs.clone(),
+        cli_agent,
         system,
-        watchdog: config.watchdog.clone(),
-        hooks: tcode_core::Hooks::new(config.hooks.clone()),
-        safety_classifier: Some(safety_classifier),
-        auto_policy: classifier_policy,
-        max_steps: cli_agent
-            .as_ref()
-            .and_then(|def| def.max_steps)
-            .unwrap_or(config.limits.max_steps_per_turn),
-        auto_compact: config.limits.auto_compact,
-        auto_compact_percent: config.limits.auto_compact_percent,
+        skills: skills.clone(),
+        shell_filters: shell_filters.clone(),
+        trusted_read_hosts,
+        classifier_policy,
+        classifier_config,
+        mcp_tools,
     });
 
     let mode = match cli.mode.as_deref() {
@@ -1013,66 +948,31 @@ async fn main() -> anyhow::Result<()> {
         ask: config.permissions.ask.clone(),
         deny: config.permissions.deny.clone(),
     };
-    let mut session = Session::new(
-        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens).with_model(model_cell.clone()),
-        mode,
-        rules,
-    );
-    session.set_dogfood(state.dogfood);
-    // The chain the tools already hold; registering it is what makes `/cd`
-    // re-read the new directory's `.tcode/filters.toml`.
-    session.register_cwd_scope(shell_filters.clone());
-    if let Some(trust) = state.folder_trust_for(&cwd) {
-        session.set_folder_trust(trust);
-    }
-    // `/suggest` last, else the config default. Same precedence as the
-    // model choice: what the user last chose beats what the file says.
-    session.set_suggestions(state.suggestions.unwrap_or(config.ui.suggest_next));
-
     let opening_context: tcode_tui::OpeningContextFn =
         Arc::new(tcode_tools::startup_context_with_scratch);
     let environment: tcode_tui::EnvironmentFn = Arc::new(tcode_tools::environment_snapshot);
 
-    // Persistence: every ledger mutation is recorded to a JSONL session
-    // log; --continue / --resume replay it.
-    if let Some(data_dir) = tcode_core::store::project_data_dir(&cwd) {
-        // Before this run's log exists, so the empty log we are about to create
-        // is not mistaken for one of the abandoned ones it collects.
-        tcode_core::store::sweep_old_sessions(&data_dir);
-        if cli.r#continue || cli.resume.is_some() {
-            let resumed = tcode_core::SessionStore::resume(&data_dir, cli.resume.as_deref())
-                .context("cannot resume session")?;
-            let tcode_core::Resumed {
-                store,
-                ledger,
-                checkpoints,
-                startup,
-                environment: previous_environment,
-                delivered_environment,
-            } = resumed;
-            let session_id = store.id.clone();
-            let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
-            session.checkpoints = tcode_core::CheckpointStore::load(ckpt_dir, checkpoints);
-            session.ledger = ledger;
-            session.ledger.attach_sink(Box::new(store));
-            session.bind_scratch_session(&session_id);
-            let startup =
-                startup.unwrap_or_else(|| (opening_context)(&cwd, &session.tool_ctx.scratch_dir));
-            session.restore_startup_context(startup, previous_environment, delivered_environment);
-            session.sync_environment((environment)(&cwd), None);
-        } else {
-            let store = tcode_core::SessionStore::create(&data_dir, &cwd)
-                .context("cannot create session log")?;
-            let session_id = store.id.clone();
-            session.checkpoints =
-                tcode_core::CheckpointStore::new(data_dir.join("checkpoints").join(&session_id));
-            session.ledger.attach_sink(Box::new(store));
-            session.bind_scratch_session(&session_id);
-            session.set_startup_context((opening_context)(&cwd, &session.tool_ctx.scratch_dir));
+    // Session creation, runtime-toggle seeding and JSONL create/resume are the
+    // same across every frontend, so they live in `tcode-frontend`.
+    let resume = if cli.r#continue || cli.resume.is_some() {
+        tcode_frontend::ResumeSpec::Resume {
+            id: cli.resume.clone(),
         }
     } else {
-        session.set_startup_context((opening_context)(&cwd, &session.tool_ctx.scratch_dir));
-    }
+        tcode_frontend::ResumeSpec::New
+    };
+    let mut session = tcode_frontend::open_session(tcode_frontend::SessionSpec {
+        cwd: cwd.clone(),
+        config: &config,
+        state: &state,
+        model_cell: model_cell.clone(),
+        mode,
+        rules,
+        resume,
+        shell_filters: shell_filters.clone(),
+        opening_context: opening_context.clone(),
+        environment: environment.clone(),
+    })?;
     // Resume restores only persistent ledger events. Re-estimate from the
     // reconstructed request before the first turn so plain REPL and --prompt
     // can auto-compact a near-full compacted session just like the TUI.

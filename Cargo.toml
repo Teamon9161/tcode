@@ -10,6 +10,7 @@ version = "0.1.21"
 tcode-core = { path = "crates/tcode-core" }
 tcode-providers = { path = "crates/tcode-providers" }
 tcode-tools = { path = "crates/tcode-tools" }
+tcode-frontend = { path = "crates/tcode-frontend" }
 tcode-tui = { path = "crates/tcode-tui" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -29,6 +30,7 @@ members = [
     "crates/tcode-importers",
     "crates/tcode-providers",
     "crates/tcode-tools",
+    "crates/tcode-frontend",
     "crates/tcode-tui",
 ]
 # The voice sidecar is built and released on its own: its native dependencies

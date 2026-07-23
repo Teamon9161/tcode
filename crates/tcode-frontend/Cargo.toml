@@ -1,0 +1,21 @@
+[package]
+name = "tcode-frontend"
+version.workspace = true
+edition = "2021"
+
+# Shared, UI-independent frontend logic: session assembly/persistence and the
+# turn driver, reused by every frontend (TUI, plain REPL, the desktop app).
+# It must never depend on a UI crate — that is the whole point of the split.
+
+[dependencies]
+tcode-core = { path = "../tcode-core" }
+# tools/providers are the assembly kit: `build_agent` wires the concrete toolset
+# and provider factory. This is allowed (see AGENTS.md) — they are not UI crates.
+tcode-tools = { path = "../tcode-tools" }
+tcode-providers = { path = "../tcode-providers" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+anyhow = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

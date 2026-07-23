@@ -181,3 +181,4 @@ loop {
 2. pdf支持？skill还是原生？需要识别图片吗？
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
+5. 排除sub-agent之后，主agent仍然可以选择继续运行，每个sub-agent完成后触发一下子agent?
