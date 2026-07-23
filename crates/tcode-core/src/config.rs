@@ -47,8 +47,33 @@ pub enum ProviderKind {
     Codex,
 }
 
-/// One selectable model within a profile.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Intrinsic properties of a known model id — context window, effort dial,
+/// vision, label — independent of which provider/endpoint serves it. Held in
+/// the top-level `[models.<name>]` catalog and inherited by any profile that
+/// lists the model by name. A model reached through two endpoints has one
+/// context window; recording it per-endpoint is the duplication this removes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ModelParams {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub efforts: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_effort: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vision: Option<bool>,
+}
+
+/// One selectable model within a profile. Deserializes from either a bare
+/// string (`"claude-opus-4-8"` — take everything from the `[models.*]`
+/// catalog) or a table (`{ name = "...", context_window = ... }` — the same
+/// bare-name inheritance, plus per-profile overrides on whatever fields it
+/// sets). Fields left unset are filled from the catalog at resolution time.
+#[derive(Debug, Clone, Serialize)]
 pub struct ModelDef {
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -84,6 +109,62 @@ impl ModelDef {
 
     pub fn display(&self) -> &str {
         self.label.as_deref().unwrap_or(&self.name)
+    }
+
+    /// Fill each unset field from `base` (the `[models.<name>]` catalog entry
+    /// for this model). Explicit fields on `self` always win; this is the
+    /// inheritance a bare name relies on and a partial table overlays.
+    fn inherit(&mut self, base: &ModelParams) {
+        self.label = self.label.take().or_else(|| base.label.clone());
+        self.context_window = self.context_window.or(base.context_window);
+        self.max_tokens = self.max_tokens.or(base.max_tokens);
+        if self.efforts.is_empty() {
+            self.efforts = base.efforts.clone();
+        }
+        self.default_effort = self
+            .default_effort
+            .take()
+            .or_else(|| base.default_effort.clone());
+        self.vision = self.vision.or(base.vision);
+    }
+}
+
+impl<'de> Deserialize<'de> for ModelDef {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Table {
+            name: String,
+            #[serde(default)]
+            label: Option<String>,
+            #[serde(default)]
+            context_window: Option<u64>,
+            #[serde(default)]
+            max_tokens: Option<u32>,
+            #[serde(default)]
+            efforts: Vec<String>,
+            #[serde(default)]
+            default_effort: Option<String>,
+            #[serde(default)]
+            vision: Option<bool>,
+        }
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bare(String),
+            Full(Table),
+        }
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Bare(name) => ModelDef::bare(name),
+            Repr::Full(t) => ModelDef {
+                name: t.name,
+                label: t.label,
+                context_window: t.context_window,
+                max_tokens: t.max_tokens,
+                efforts: t.efforts,
+                default_effort: t.default_effort,
+                vision: t.vision,
+            },
+        })
     }
 }
 
@@ -726,6 +807,12 @@ pub struct Config {
     pub ui: UiConfig,
     pub voice: VoiceConfig,
     pub profiles: BTreeMap<String, Profile>,
+    /// Known-model catalog, keyed by model id. A profile that lists a model by
+    /// name inherits these intrinsic properties (context window, effort dial,
+    /// vision, label); a per-profile model entry overrides field by field. See
+    /// `ModelParams` and `resolve_model_def`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub models: BTreeMap<String, ModelParams>,
     /// Named model line-ups, switched as a unit by `/model`. See `Preset`.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub presets: BTreeMap<String, Preset>,
@@ -1059,6 +1146,10 @@ impl Config {
         self.permissions.deny.extend(over.permissions.deny);
         self.hooks.extend(over.hooks);
         self.mcp_servers.extend(over.mcp_servers);
+        // Catalog entries replace by key (a layer may redefine a known model's
+        // params whole); a project layer may add ids, same as it may add MCP
+        // servers — model metadata is not a safety boundary.
+        self.models.extend(over.models);
         self.presets.extend(over.presets);
         self.agents.extend(over.agents);
     }
@@ -1242,6 +1333,7 @@ impl Config {
                 .cloned()
                 .ok_or_else(|| ConfigError::NoModels(name.clone()))?,
         };
+        let model = self.resolve_model_def(model);
         let effort = over
             .effort
             .clone()
@@ -1339,6 +1431,29 @@ impl Config {
         Ok(self.finish(name, def, model_flag, state))
     }
 
+    /// Fill a model def's unset fields from the `[models.<name>]` catalog. A
+    /// model id not in the catalog passes through untouched (an endpoint may
+    /// serve models we have not catalogued). Idempotent: re-resolving an
+    /// already-resolved def changes nothing.
+    fn resolve_model_def(&self, mut def: ModelDef) -> ModelDef {
+        if let Some(base) = self.models.get(&def.name) {
+            def.inherit(base);
+        }
+        def
+    }
+
+    /// A profile's selectable models with catalog inheritance applied — what
+    /// the pickers and the wizard display, and what `select` would build a
+    /// provider from. Kept a `Config` method because the catalog lives here,
+    /// not on the profile.
+    pub fn resolved_model_defs(&self, profile: &Profile) -> Vec<ModelDef> {
+        profile
+            .model_defs()
+            .into_iter()
+            .map(|def| self.resolve_model_def(def))
+            .collect()
+    }
+
     fn finish(
         &self,
         profile: String,
@@ -1346,6 +1461,7 @@ impl Config {
         model_flag: Option<&str>,
         state: &ModelState,
     ) -> Selection {
+        let model = self.resolve_model_def(model);
         // Saved effort applies only if it's valid for the chosen model
         // and no CLI override changed the model out from under it.
         let effort = state
@@ -1675,10 +1791,23 @@ mod tests {
         let defaults = Config::defaults();
         let deepseek = defaults.profiles.get("deepseek").expect("deepseek default");
         let names: Vec<&str> = deepseek.models.iter().map(|m| m.name.as_str()).collect();
-        // The 1M context is a property, not a `[1m]` suffix on the id.
+        // The profile lists bare names; the 1M context is a property of the id,
+        // recorded once in the `[models.*]` catalog, not a `[1m]` suffix.
         assert!(names.contains(&"deepseek-v4-pro"));
         assert!(names.iter().all(|n| !n.contains('[')));
-        assert_eq!(deepseek.models[0].context_window, Some(1_000_000));
+        assert_eq!(
+            defaults.models["deepseek-v4-pro"].context_window,
+            Some(1_000_000)
+        );
+        // Resolving a bare profile entry fills it from the catalog.
+        let resolved = defaults.resolved_model_defs(deepseek);
+        let pro = resolved
+            .iter()
+            .find(|d| d.name == "deepseek-v4-pro")
+            .unwrap();
+        assert_eq!(pro.context_window, Some(1_000_000));
+        assert_eq!(pro.label.as_deref(), Some("DeepSeek V4 Pro"));
+        assert_eq!(pro.efforts, ["off", "low", "medium", "high"]);
     }
 
     #[test]
@@ -2089,6 +2218,107 @@ explore = { model = "deepseek-v4-flash" }
         let project = Config::sanitize_project_config(project);
         assert!(!project.presets["evil"].agents.contains_key("auto"));
         assert!(project.presets["evil"].agents.contains_key("explore"));
+    }
+
+    /// A profile lists a model by name and inherits the catalog params; a
+    /// per-profile table overrides only the fields it names, keeping the rest.
+    #[test]
+    fn a_profile_inherits_catalog_params_and_can_override_field_by_field() {
+        let config: Config = toml::from_str(
+            r#"
+            [models."known-model"]
+            label = "Known Model"
+            context_window = 1000000
+            efforts = ["low", "high"]
+            default_effort = "high"
+
+            [profiles.direct]
+            provider = "anthropic"
+            api_key = "sk-x"
+            models = ["known-model"]
+
+            [profiles.proxy]
+            provider = "anthropic"
+            api_key = "sk-y"
+            [[profiles.proxy.models]]
+            name = "known-model"
+            context_window = 500000
+            "#,
+        )
+        .unwrap();
+
+        // Bare name → everything from the catalog.
+        let direct = config.resolve_model_def(ModelDef::bare("known-model"));
+        assert_eq!(direct.context_window, Some(1_000_000));
+        assert_eq!(direct.label.as_deref(), Some("Known Model"));
+        assert_eq!(direct.efforts, ["low", "high"]);
+        assert_eq!(direct.default_effort.as_deref(), Some("high"));
+
+        // The proxy overrides only the context window; label/efforts still come
+        // from the catalog.
+        let proxy = &config.resolved_model_defs(&config.profiles["proxy"])[0];
+        assert_eq!(proxy.context_window, Some(500_000));
+        assert_eq!(proxy.label.as_deref(), Some("Known Model"));
+        assert_eq!(proxy.efforts, ["low", "high"]);
+    }
+
+    /// A `models` list may mix bare strings and full tables, and both forms
+    /// carry through selection with catalog inheritance applied.
+    #[test]
+    fn selecting_a_bare_name_model_resolves_its_context_window() {
+        let config: Config = toml::from_str(
+            r#"
+            default_profile = "p"
+
+            [models."big-model"]
+            context_window = 2000000
+            efforts = ["off", "high"]
+
+            [profiles.p]
+            provider = "anthropic"
+            api_key = "sk-x"
+            models = ["big-model", { name = "custom", context_window = 42 }]
+            "#,
+        )
+        .unwrap();
+
+        let selection = config
+            .select(None, Some("big-model"), &ModelState::default())
+            .unwrap();
+        assert_eq!(selection.model.context_window, Some(2_000_000));
+        assert_eq!(selection.model.efforts, ["off", "high"]);
+
+        // The mixed table form parsed and kept its explicit value.
+        let custom = config
+            .select(None, Some("custom"), &ModelState::default())
+            .unwrap();
+        assert_eq!(custom.model.context_window, Some(42));
+    }
+
+    /// An uncatalogued model reached through a proxy inherits nothing and keeps
+    /// its verbatim id — the endpoint may serve models we have not catalogued.
+    #[test]
+    fn an_uncatalogued_model_passes_through_untouched() {
+        let config = Config::defaults();
+        let def = config.resolve_model_def(ModelDef::bare("some-unreleased-model"));
+        assert_eq!(def.name, "some-unreleased-model");
+        assert_eq!(def.context_window, None);
+    }
+
+    /// A project layer may add a catalog entry, same as it may add an MCP
+    /// server — model metadata is not a safety boundary.
+    #[test]
+    fn a_project_layer_may_add_a_catalog_entry() {
+        let mut config = Config::defaults();
+        config.overlay(
+            toml::from_str(
+                r#"[models."team-model"]
+context_window = 300000
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(config.models["team-model"].context_window, Some(300_000));
     }
 
     #[test]

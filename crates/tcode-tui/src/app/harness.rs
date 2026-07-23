@@ -81,7 +81,10 @@ fn config() -> crate::TuiConfig {
             // on this machine's providers nor be able to overwrite them.
             load: Box::new(|| Ok(tcode_core::config::Config::default())),
             apply: Box::new(|_| Err("no provider setup in tests".into())),
+            refresh: Box::new(|| Err("no provider setup in tests".into())),
         },
+        // Tests never reach the network; a login test scripts this itself.
+        codex_login: crate::CodexLogin(Arc::new(|_| Box::pin(async {}))),
         state_store: crate::StateStore::new(
             || Ok(tcode_core::config::ModelState::default()),
             |_| Ok(()),

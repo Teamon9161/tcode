@@ -649,13 +649,19 @@ impl Setup {
         // runtime observation — needed to choose, never written back.
         let mut model_config = self.config.clone();
         model_config.profiles = self.merged_profiles();
+        // The known-model catalog lives in the defaults layer; merge the user's
+        // additions on top so bare-name models resolve to their real context
+        // window and effort dial, exactly as `Config::load` would.
+        let mut catalog = Config::defaults().models;
+        catalog.extend(std::mem::take(&mut model_config.models));
+        model_config.models = catalog;
         tcode_providers::hydrate_codex_models(&mut model_config);
         let options: Vec<ModelChoice> = configured
             .iter()
-            .filter_map(|name| Some((name, model_config.profiles.get(name)?)))
+            .filter_map(|name| Some((name, model_config.profiles.get(name)?.clone())))
             .flat_map(|(name, profile)| {
-                profile
-                    .model_defs()
+                model_config
+                    .resolved_model_defs(&profile)
                     .into_iter()
                     .map(move |def| ModelChoice {
                         label: format!("{name} · {}", def.display()),
@@ -760,7 +766,7 @@ fn candidates(profiles: &BTreeMap<String, Profile>) -> Vec<Candidate> {
                 match codex_auth_available() {
                     true => ("~/.codex/auth.json ✓".to_string(), Tone::Ok, true),
                     false => (
-                        "not logged in — run `codex login` first".to_string(),
+                        "not signed in — use /login (no Codex CLI needed)".to_string(),
                         Tone::Dim,
                         false,
                     ),

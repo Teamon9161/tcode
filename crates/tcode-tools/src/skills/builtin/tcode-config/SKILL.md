@@ -87,6 +87,50 @@ Use `models` when model metadata matters: `context_window`, `max_tokens`,
 `vision`, and valid `efforts`. Do not invent a context window or effort level;
 leave unknown metadata unset.
 
+### The known-model catalog (`[models.<id>]`)
+
+A model's intrinsic properties belong to the model id, not to the endpoint that
+serves it. Record them once in the top-level `[models.<id>]` catalog, then have
+any profile list the model **by bare name**; unset fields are filled from the
+catalog at selection time. This removes the need to re-type `context_window` /
+`efforts` when the same model is reached through a second endpoint (a proxy,
+OpenRouter).
+
+```toml
+[models."claude-opus-4-8"]
+label = "Claude Opus 4.8"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+default_effort = "high"   # optional
+# max_tokens / vision may also live here
+
+[profiles.anthropic]
+provider = "anthropic"
+api_key_env = "ANTHROPIC_API_KEY"
+models = ["claude-opus-4-8"]        # bare name → inherits the catalog
+
+[profiles.proxy]
+provider = "anthropic"
+api_key_env = "PROXY_API_KEY"
+base_url = "https://proxy.example/anthropic"
+[[profiles.proxy.models]]           # table form overrides field by field
+name = "claude-opus-4-8"
+context_window = 400000             # only this differs; label/efforts inherited
+```
+
+- Catalog fields: `label`, `context_window`, `max_tokens`, `efforts`,
+  `default_effort`, `vision` (all optional; the key is the model id).
+- A profile's `models` list may mix bare strings and full tables. An explicit
+  field on a profile's model entry always wins over the catalog; the catalog
+  wins over the profile-level `context_window` / `max_tokens` / `vision`
+  fallbacks; those win over built-in defaults (200k context, 8192 max_tokens).
+- A model id absent from the catalog passes through verbatim with no inherited
+  metadata — the endpoint may serve models tcode has not catalogued.
+- The catalog merges across layers by id (built-in → user → project); a later
+  layer redefines an entry whole. Project `.tcode/config.toml` may add ids.
+- The built-in catalog already carries the Claude / GPT / DeepSeek / Agnès ids;
+  add an entry only for a model tcode does not already know.
+
 Use `/model` during a session to list and select a model (and optional effort):
 
 ```text

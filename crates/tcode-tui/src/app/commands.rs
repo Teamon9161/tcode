@@ -180,6 +180,64 @@ impl App {
         }
     }
 
+    /// `/login`: sign in to ChatGPT (Codex) so its models become usable without
+    /// installing the Codex CLI. Runs the OAuth flow off the UI thread and
+    /// reports back over `login_rx`; the transcript shows the URL and, when it
+    /// lands, the result. A second `/login` while one is waiting is refused
+    /// rather than raced onto the same callback port.
+    pub(super) fn start_login(&mut self) {
+        if self.login_active {
+            self.reply_warn("a sign-in is already waiting for the browser");
+            return;
+        }
+        self.login_active = true;
+        self.reply("opening the browser to sign in to ChatGPT…");
+        let flow = self.codex_login.0.clone();
+        let tx = self.login_tx.clone();
+        tokio::spawn(flow(tx));
+    }
+
+    pub(super) fn on_login_update(&mut self, update: crate::LoginUpdate) {
+        match update {
+            crate::LoginUpdate::Started {
+                url,
+                browser_opened,
+            } => {
+                let lead = if browser_opened {
+                    "waiting for sign-in — if the browser did not open, visit:"
+                } else {
+                    "could not open a browser — visit this URL to sign in:"
+                };
+                self.reply(format!("{lead}\n{url}"));
+            }
+            crate::LoginUpdate::Finished(result) => {
+                self.login_active = false;
+                match result {
+                    Ok(who) => {
+                        let who = if who.is_empty() {
+                            "signed in to ChatGPT".to_string()
+                        } else {
+                            format!("signed in to ChatGPT as {who}")
+                        };
+                        match (self.provider_setup.refresh)() {
+                            Ok((menu, agents)) => {
+                                self.menu = menu;
+                                self.agents = agents;
+                                self.reply(format!("{who} · /model to pick a Codex model"));
+                            }
+                            // The credentials landed even if the rebuild failed;
+                            // a restart will pick them up.
+                            Err(e) => self.reply_warn(format!(
+                                "{who}, but could not refresh the model list ({e}); restart tcode"
+                            )),
+                        }
+                    }
+                    Err(reason) => self.reply_error(format!("sign-in failed: {reason}")),
+                }
+            }
+        }
+    }
+
     /// Persist a finished setup and take the rebuilt menus. The provider swap
     /// happens inside the closure, so a running turn keeps its snapshot
     /// exactly as a `/model` switch does.
@@ -292,6 +350,10 @@ impl App {
             }
             "/provider" => {
                 self.open_provider_setup();
+                return;
+            }
+            "/login" => {
+                self.start_login();
                 return;
             }
             "/model" => {

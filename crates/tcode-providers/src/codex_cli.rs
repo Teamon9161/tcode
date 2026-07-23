@@ -6,6 +6,16 @@ use std::path::PathBuf;
 
 use tcode_core::config::{Config, ModelDef, ProviderKind};
 
+/// OpenAI's OAuth token endpoint, shared by the login and refresh grants.
+pub(crate) const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+/// The subscription model catalogue — the same endpoint the Codex CLI polls to
+/// populate `models_cache.json`. Same auth as `/responses`.
+const MODELS_URL: &str = "https://chatgpt.com/backend-api/codex/models";
+/// Codex CLI's public OAuth client id. Both the login authorization_code grant
+/// and the refresh_token grant are tied to it, and tcode reuses it so the
+/// tokens it mints are the same ones a `codex login` would produce.
+pub(crate) const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+
 pub(crate) fn codex_home() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("CODEX_HOME") {
         return Some(PathBuf::from(dir));
@@ -42,6 +52,43 @@ pub(crate) fn load_auth() -> Option<CodexAuth> {
 
 pub fn codex_auth_available() -> bool {
     load_auth().is_some()
+}
+
+/// Write a freshly-minted credential set to `~/.codex/auth.json`, creating the
+/// file (and `~/.codex/`) if needed. Shape matches what the Codex CLI writes,
+/// so a later `codex` install reads tcode's login and vice versa: a top-level
+/// `OPENAI_API_KEY` (null for the subscription path), a `tokens` object, and a
+/// `last_refresh` stamp. Any user fields in an existing file are preserved.
+pub(crate) fn write_auth(
+    access_token: &str,
+    refresh_token: &str,
+    id_token: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    let home = codex_home().ok_or("cannot locate home directory")?;
+    std::fs::create_dir_all(&home).map_err(|e| format!("create {}: {e}", home.display()))?;
+    let path = home.join("auth.json");
+    // Preserve anything already in the file (e.g. an OPENAI_API_KEY the user set)
+    // rather than clobbering the document.
+    let mut value: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !value.is_object() {
+        value = serde_json::json!({});
+    }
+    if value.get("OPENAI_API_KEY").is_none() {
+        value["OPENAI_API_KEY"] = serde_json::Value::Null;
+    }
+    value["tokens"] = serde_json::json!({
+        "id_token": id_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "account_id": account_id,
+    });
+    value["last_refresh"] = rfc3339_now().into();
+    let text = serde_json::to_string_pretty(&value).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 /// Persist refreshed tokens without discarding fields owned by the Codex CLI.
@@ -84,6 +131,49 @@ pub fn hydrate_codex_models(config: &mut Config) {
 
 fn cached_models() -> Vec<ModelDef> {
     read_models_cache().unwrap_or_else(default_models)
+}
+
+/// Fetch the live subscription catalogue and write it to `models_cache.json`,
+/// so the next startup reads real models instead of the fallback list. Same
+/// file and shape the Codex CLI maintains. Best-effort: any failure returns an
+/// error the caller ignores, leaving the fallback in place.
+pub(crate) async fn refresh_models_cache(
+    http: &reqwest::Client,
+    access_token: &str,
+    account_id: &str,
+) -> Result<(), String> {
+    let url = format!("{MODELS_URL}?client_version={}", env!("CARGO_PKG_VERSION"));
+    let resp = http
+        .get(url)
+        .bearer_auth(access_token)
+        .header("chatgpt-account-id", account_id)
+        .header("OpenAI-Beta", "responses=experimental")
+        .header("originator", "codex_cli_rs")
+        .send()
+        .await
+        .map_err(|e| format!("model list request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("model list request failed: {}", resp.status()));
+    }
+    let value: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("model list response: {e}"))?;
+    // The endpoint may return a bare array or a `{ "models": [...] }` object;
+    // the cache file is always the object form.
+    let cache = if value.get("models").is_some() {
+        value
+    } else {
+        serde_json::json!({ "models": value })
+    };
+    if models_from_cache(&cache).is_none() {
+        return Err("model list contained no listable models".into());
+    }
+    let path = codex_home()
+        .ok_or("cannot locate home directory")?
+        .join("models_cache.json");
+    let text = serde_json::to_string_pretty(&cache).map_err(|e| e.to_string())?;
+    std::fs::write(&path, text).map_err(|e| format!("write {}: {e}", path.display()))
 }
 
 fn read_models_cache() -> Option<Vec<ModelDef>> {

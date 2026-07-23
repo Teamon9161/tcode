@@ -4,9 +4,13 @@
 //! keeps this path small: download the matching asset, verify its published
 //! SHA-256 digest, then atomically replace the installed executable.
 
-use std::path::{Path, PathBuf};
+use std::{
+    io::{IsTerminal as _, Write as _},
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Context, Result};
+use futures::StreamExt;
 use sha2::{Digest, Sha256};
 
 const REPOSITORY: &str = "Teamon9161/tcode";
@@ -34,7 +38,7 @@ pub async fn run() -> Result<()> {
     let expected = checksum_for(&checksums, asset)
         .with_context(|| format!("release checksums do not contain {asset}"))?;
 
-    let bytes = download_bytes(&client, &format!("{RELEASES_URL}/{asset}")).await?;
+    let bytes = download_asset(&client, &format!("{RELEASES_URL}/{asset}"), asset).await?;
     let actual = hex::encode(Sha256::digest(&bytes));
     if actual != expected {
         bail!("checksum mismatch for {asset}; update was not installed");
@@ -282,18 +286,126 @@ async fn download_text(client: &reqwest::Client, url: &str) -> Result<String> {
         .with_context(|| format!("cannot read {url}"))
 }
 
-async fn download_bytes(client: &reqwest::Client, url: &str) -> Result<Vec<u8>> {
-    client
+async fn download_asset(client: &reqwest::Client, url: &str, asset: &str) -> Result<Vec<u8>> {
+    let response = client
         .get(url)
         .send()
         .await
         .with_context(|| format!("cannot download {url}"))?
         .error_for_status()
-        .with_context(|| format!("GitHub returned an error for {url}"))?
-        .bytes()
-        .await
-        .with_context(|| format!("cannot read {url}"))
-        .map(|bytes| bytes.to_vec())
+        .with_context(|| format!("GitHub returned an error for {url}"))?;
+    let total = response.content_length();
+    let mut progress = DownloadProgress::new(asset, total);
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0).try_into().unwrap_or(0));
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                progress.abort();
+                return Err(error).with_context(|| format!("cannot read {url}"));
+            }
+        };
+        progress.advance(chunk.len() as u64);
+        bytes.extend_from_slice(&chunk);
+    }
+    progress.finish();
+    Ok(bytes)
+}
+
+/// One-line download feedback that stays readable in redirected output.
+struct DownloadProgress {
+    asset: String,
+    total: Option<u64>,
+    downloaded: u64,
+    interactive: bool,
+    last_percent: Option<u8>,
+}
+
+impl DownloadProgress {
+    fn new(asset: &str, total: Option<u64>) -> Self {
+        let interactive = std::io::stdout().is_terminal();
+        let mut progress = Self {
+            asset: asset.to_string(),
+            total,
+            downloaded: 0,
+            interactive,
+            last_percent: None,
+        };
+        progress.render();
+        progress
+    }
+
+    fn advance(&mut self, len: u64) {
+        self.downloaded += len;
+        self.render();
+    }
+
+    fn finish(&mut self) {
+        if !self.interactive {
+            println!(" done");
+            return;
+        }
+        self.render_final();
+    }
+
+    fn abort(&self) {
+        if self.interactive {
+            println!();
+        }
+    }
+
+    fn render(&mut self) {
+        if !self.interactive {
+            if self.last_percent.is_none() {
+                print!("Downloading {}...", self.asset);
+                let _ = std::io::stdout().flush();
+                self.last_percent = Some(0);
+            }
+            return;
+        }
+        let Some(percent) = self.percent() else {
+            if self.last_percent.is_none() {
+                print!("Downloading {}...", self.asset);
+                let _ = std::io::stdout().flush();
+                self.last_percent = Some(0);
+            }
+            return;
+        };
+        if self.last_percent == Some(percent) {
+            return;
+        }
+        self.last_percent = Some(percent);
+        print!(
+            "\rDownloading {}  [{}] {:>3}%",
+            self.asset,
+            progress_bar(percent),
+            percent
+        );
+        let _ = std::io::stdout().flush();
+    }
+
+    fn render_final(&self) {
+        let percent = self.percent().unwrap_or(100);
+        println!(
+            "\rDownloading {}  [{}] {:>3}%",
+            self.asset,
+            progress_bar(percent),
+            percent
+        );
+    }
+
+    fn percent(&self) -> Option<u8> {
+        self.total
+            .filter(|total| *total > 0)
+            .map(|total| ((self.downloaded * 100) / total).min(100) as u8)
+    }
+}
+
+fn progress_bar(percent: u8) -> String {
+    const WIDTH: usize = 24;
+    let filled = usize::from(percent) * WIDTH / 100;
+    format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled))
 }
 
 fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
@@ -350,6 +462,25 @@ mod tests {
             partial_path(Path::new("/home/u/.tcode/voice/tcode-voiced-0.1.16")).unwrap(),
             PathBuf::from("/home/u/.tcode/voice/tcode-voiced-0.1.16.part")
         );
+    }
+
+    #[test]
+    fn progress_bar_has_a_fixed_width() {
+        assert_eq!(progress_bar(0), "------------------------");
+        assert_eq!(progress_bar(50), "############------------");
+        assert_eq!(progress_bar(100), "########################");
+    }
+
+    #[test]
+    fn progress_percent_caps_at_complete() {
+        let progress = DownloadProgress {
+            asset: "tcode.exe".into(),
+            total: Some(100),
+            downloaded: 125,
+            interactive: false,
+            last_percent: None,
+        };
+        assert_eq!(progress.percent(), Some(100));
     }
 
     #[test]

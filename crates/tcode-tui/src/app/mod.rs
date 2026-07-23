@@ -119,7 +119,7 @@ const TIPS: [&str; 11] = [
 /// Commands whose substance drives frontend-owned objects (key table, model
 /// picker, provider wizard). Everything else lives in the shared
 /// `CommandRegistry` in tcode-core.
-const UI_COMMANDS: [(&str, &str); 6] = [
+const UI_COMMANDS: [(&str, &str); 7] = [
     ("/help", "show keys and commands"),
     ("/views", "switch concurrent sessions"),
     (
@@ -132,6 +132,7 @@ const UI_COMMANDS: [(&str, &str); 6] = [
     ),
     ("/agents", "the same panel, opened on the sub-agent list"),
     ("/provider", "configure or switch provider"),
+    ("/login", "sign in to ChatGPT (Codex) without the Codex CLI"),
 ];
 
 /// Does this slash line belong to the frontend's own table? Matched on the
@@ -401,6 +402,13 @@ pub struct App {
     /// `/provider`'s two effects: read the user's config, and persist what
     /// the form produced. The binary owns both.
     provider_setup: crate::ProviderSetup,
+    /// `/login`: the injected ChatGPT/Codex OAuth flow, run off the UI thread.
+    codex_login: crate::CodexLogin,
+    login_tx: mpsc::Sender<crate::LoginUpdate>,
+    login_rx: mpsc::Receiver<crate::LoginUpdate>,
+    /// True while a `/login` is waiting on the browser, so a second `/login`
+    /// does not race the first onto the same callback port.
+    login_active: bool,
     state_store: crate::StateStore,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
@@ -486,6 +494,7 @@ impl App {
             agents,
             presets,
             provider_setup,
+            codex_login,
             state_store,
             opening_context,
             environment,
@@ -497,6 +506,8 @@ impl App {
         let (ask_tx, ask_rx) = mpsc::channel(4);
         let (suggest_tx, suggest_rx) = mpsc::channel(1);
         let (reference_tx, reference_rx) = mpsc::channel(1);
+        // A login reports a URL then a result — two messages, well within 4.
+        let (login_tx, login_rx) = mpsc::channel(4);
         // 16 is generous for a channel whose busiest traffic is a level meter
         // at a few frames a second.
         let (voice_tx, voice_rx) = mpsc::channel(16);
@@ -596,6 +607,10 @@ impl App {
             agents,
             presets,
             provider_setup,
+            codex_login,
+            login_tx,
+            login_rx,
+            login_active: false,
             state_store,
             dogfood: session_dogfood,
             pending_tool: None,
@@ -704,6 +719,9 @@ impl App {
                 }
                 Some(ev) = self.voice_rx.recv() => {
                     self.on_voice_event(ev);
+                }
+                Some(update) = self.login_rx.recv() => {
+                    self.on_login_update(update);
                 }
                 done = join_phase(&mut self.phase) => {
                     self.on_turn_done(done);
@@ -2031,6 +2049,7 @@ mod tests {
                         },
                     ))
                 }),
+                refresh: Box::new(|| Err("no refresh in this test".into())),
             },
         );
 
@@ -2083,6 +2102,56 @@ mod tests {
             "the overlay closes once applied:\n{after}"
         );
         assert!(after.contains("providers configured"));
+    }
+
+    /// `/login` shows the URL while it waits, and on success reports who and
+    /// refreshes the model menu so the now-usable Codex models appear — without
+    /// the user restarting or editing config.
+    #[test]
+    fn login_shows_the_url_then_refreshes_the_menu_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app_with_provider_setup(
+            dir.path(),
+            90,
+            40,
+            crate::ProviderSetup {
+                load: Box::new(|| Ok(tcode_core::config::Config::default())),
+                apply: Box::new(|_| Err("apply is not used by /login".into())),
+                refresh: Box::new(|| {
+                    Ok((
+                        ModelMenu {
+                            options: vec![model_picker::ModelOption {
+                                profile: "codex".into(),
+                                def: tcode_core::config::ModelDef::bare("gpt-5.6"),
+                            }],
+                            current: 0,
+                            switch: Box::new(|_, _| Err("rebuilt".into())),
+                        },
+                        AgentMenu {
+                            roles: Vec::new(),
+                            pins: Vec::new(),
+                            pin: Box::new(|_, _| Err("rebuilt".into())),
+                        },
+                    ))
+                }),
+            },
+        );
+
+        app.on_login_update(crate::LoginUpdate::Started {
+            url: "https://auth.example/go".into(),
+            browser_opened: false,
+        });
+        assert!(
+            app.frame().contains("https://auth.example/go"),
+            "the sign-in URL is shown so the user can open it"
+        );
+
+        app.on_login_update(crate::LoginUpdate::Finished(Ok("dev@example.com".into())));
+        assert_eq!(app.menu.options.len(), 1, "the menu was rebuilt");
+        assert_eq!(app.menu.options[0].profile, "codex");
+        let after = app.frame();
+        assert!(after.contains("signed in to ChatGPT as dev@example.com"));
+        assert!(after.contains("/model"));
     }
 
     #[test]

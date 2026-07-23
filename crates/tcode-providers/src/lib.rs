@@ -1,6 +1,7 @@
 mod anthropic;
 mod codex;
 mod codex_cli;
+mod codex_login;
 mod http;
 mod idle;
 mod openai;
@@ -9,6 +10,9 @@ mod retry;
 pub use anthropic::AnthropicProvider;
 pub use codex::CodexProvider;
 pub use codex_cli::{codex_auth_available, hydrate_codex_models};
+pub use codex_login::{
+    open_browser as open_login_browser, start as start_codex_login, LoginHandle, LoginOutcome,
+};
 pub use openai::OpenAiProvider;
 
 use std::sync::Arc;

@@ -273,18 +273,70 @@ fn build_provider_setup(
     config_file: PathBuf,
 ) -> tcode_tui::ProviderSetup {
     let apply_file = config_file.clone();
+    let apply_cwd = cwd.clone();
+    let apply_cell = model_cell.clone();
+    let apply_pinned = pinned.clone();
+    let apply_defs = agent_defs.clone();
     let apply = move |updated: Config| {
         updated
             .write_global_at(&apply_file, CONFIG_HEADER)
             .map_err(|e| e.to_string())?;
-        let (_, menu, agents) =
-            rebuild_from_config(&cwd, &apply_file, &model_cell, &pinned, agent_defs.as_ref())?;
+        let (_, menu, agents) = rebuild_from_config(
+            &apply_cwd,
+            &apply_file,
+            &apply_cell,
+            &apply_pinned,
+            apply_defs.as_ref(),
+        )?;
+        Ok((menu, agents))
+    };
+    // Refresh rebuilds the menus from the config already on disk, persisting
+    // nothing — for after a `/login` changes provider availability.
+    let refresh_file = config_file.clone();
+    let refresh = move || {
+        let (_, menu, agents) = rebuild_from_config(
+            &cwd,
+            &refresh_file,
+            &model_cell,
+            &pinned,
+            agent_defs.as_ref(),
+        )?;
         Ok((menu, agents))
     };
     tcode_tui::ProviderSetup {
         load: Box::new(move || Config::load_global_at(&config_file).map_err(|e| e.to_string())),
         apply: Box::new(apply),
+        refresh: Box::new(refresh),
     }
+}
+
+/// The `/login` flow, injected so the TUI stays free of the provider crate.
+/// Runs the whole ChatGPT/Codex OAuth handshake and reports the URL, then the
+/// result, over the channel the app supplies.
+fn build_codex_login() -> tcode_tui::CodexLogin {
+    tcode_tui::CodexLogin(std::sync::Arc::new(|tx| {
+        Box::pin(async move {
+            let update = match tcode_providers::start_codex_login().await {
+                Err(reason) => tcode_tui::LoginUpdate::Finished(Err(reason)),
+                Ok(handle) => {
+                    let url = handle.authorize_url().to_string();
+                    let browser_opened = tcode_providers::open_login_browser(&url);
+                    let _ = tx
+                        .send(tcode_tui::LoginUpdate::Started {
+                            url,
+                            browser_opened,
+                        })
+                        .await;
+                    let result = handle
+                        .finish()
+                        .await
+                        .map(|outcome| outcome.email.unwrap_or(outcome.account_id));
+                    tcode_tui::LoginUpdate::Finished(result)
+                }
+            };
+            let _ = tx.send(update).await;
+        })
+    }))
 }
 
 /// The named line-ups as the hub lists them, newest config read wins.
@@ -413,7 +465,7 @@ fn build_menu(
         if !tcode_providers::profile_is_usable(pname, profile) && pname != &selection.profile {
             continue;
         }
-        for def in profile.model_defs() {
+        for def in config.resolved_model_defs(profile) {
             if pname == &selection.profile && def.name == selection.model.name {
                 current = options.len();
             }
@@ -1076,6 +1128,7 @@ async fn main() -> anyhow::Result<()> {
                     agent_defs.clone(),
                     config_file.clone(),
                 ),
+                codex_login: build_codex_login(),
                 state_store,
                 opening_context: opening_context.clone(),
                 environment: environment.clone(),

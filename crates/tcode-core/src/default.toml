@@ -6,6 +6,74 @@
 #
 # Model IDs, context windows, and pricing tiers verified 2026-07.
 
+# Known-model catalog: intrinsic properties of a model id, independent of which
+# provider serves it. A profile lists models by name (`models = ["id", ...]`)
+# and inherits these; an explicit field on a profile's own model entry
+# overrides field by field. Reaching the same model through a second endpoint
+# (a proxy, OpenRouter) needs only the name — the params are found here.
+[models."claude-fable-5"]
+label = "Claude Fable 5"
+# Fable 5 always thinks; no effort dial (the picker's "auto" sends nothing).
+context_window = 1000000
+
+[models."claude-opus-4-8"]
+label = "Claude Opus 4.8"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[models."claude-sonnet-5"]
+label = "Claude Sonnet 5"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[models."claude-haiku-4-5"]
+label = "Claude Haiku 4.5"
+context_window = 200000
+
+[models."gpt-5.6-sol"]
+label = "GPT-5.6 Sol"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+[models."gpt-5.6-terra"]
+label = "GPT-5.6 Terra"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+[models."gpt-5.6-luna"]
+label = "GPT-5.6 Luna"
+context_window = 1050000
+efforts = ["low", "medium", "high"]
+default_effort = "medium"
+
+# Thinks unconditionally: ignores `thinking: {type: disabled}` and answers
+# after a reasoning preamble, so no effort dial.
+[models."tencent/hy3:free"]
+label = "Tencent Hy3 (free)"
+context_window = 262144
+
+# DeepSeek's real model ids (the 1M context is a property, not a `[1m]` suffix).
+# Thinking is ON by default server-side; "off" disables it.
+[models."deepseek-v4-pro"]
+label = "DeepSeek V4 Pro"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[models."deepseek-v4-flash"]
+label = "DeepSeek V4 Flash"
+context_window = 1000000
+efforts = ["off", "low", "medium", "high"]
+
+[models."agnes-2.0-flash"]
+label = "Agnès 2.0 Flash"
+context_window = 262144
+
+[models."agnes-1.5-flash"]
+label = "Agnès 1.5 Flash"
+context_window = 262144
+
 # Anonymous, HTTPS GET-only reads that a tool has explicitly declared safe.
 # This does not apply to shell or bash, and project configuration cannot extend it.
 [limits]
@@ -30,55 +98,12 @@ trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]
 [profiles.anthropic]
 provider = "anthropic"
 api_key_env = "ANTHROPIC_API_KEY"
-
-# Fable 5 always thinks; it has no effort dial here (the picker's "auto"
-# sends nothing, which is correct).
-[[profiles.anthropic.models]]
-name = "claude-fable-5"
-label = "Claude Fable 5"
-context_window = 1000000
-
-[[profiles.anthropic.models]]
-name = "claude-opus-4-8"
-label = "Claude Opus 4.8"
-context_window = 1000000
-efforts = ["off", "low", "medium", "high"]
-
-[[profiles.anthropic.models]]
-name = "claude-sonnet-5"
-label = "Claude Sonnet 5"
-context_window = 1000000
-efforts = ["off", "low", "medium", "high"]
-
-[[profiles.anthropic.models]]
-name = "claude-haiku-4-5"
-label = "Claude Haiku 4.5"
-context_window = 200000
+models = ["claude-fable-5", "claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5"]
 
 [profiles.openai]
 provider = "openai"
 api_key_env = "OPENAI_API_KEY"
-
-[[profiles.openai.models]]
-name = "gpt-5.6-sol"
-label = "GPT-5.6 Sol"
-context_window = 1050000
-efforts = ["low", "medium", "high"]
-default_effort = "medium"
-
-[[profiles.openai.models]]
-name = "gpt-5.6-terra"
-label = "GPT-5.6 Terra"
-context_window = 1050000
-efforts = ["low", "medium", "high"]
-default_effort = "medium"
-
-[[profiles.openai.models]]
-name = "gpt-5.6-luna"
-label = "GPT-5.6 Luna"
-context_window = 1050000
-efforts = ["low", "medium", "high"]
-default_effort = "medium"
+models = ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]
 
 # ChatGPT subscription through the Codex backend. Its provider adapter fills
 # an empty model list from the local runtime catalogue before model selection.
@@ -102,35 +127,17 @@ provider = "anthropic"
 api_key_env = "OPENROUTER_API_KEY"
 base_url = "https://openrouter.ai/api"
 
-# Hy3 thinks unconditionally: it ignores `thinking: {type: disabled}` and
-# answers after a reasoning preamble, so it has no effort dial here.
 [[profiles.openrouter.models]]
 name = "tencent/hy3:free"
-label = "Tencent Hy3 (free)"
-context_window = 262144
 
-# DeepSeek's Anthropic-compatible endpoint. `deepseek-v4-pro` and
-# `deepseek-v4-flash` are the real model ids (the 1M context is a property
-# recorded here, not a suffix on the id). Thinking is ON by default
-# server-side; "off" disables it.
+# DeepSeek's Anthropic-compatible endpoint. Model params live in `[models.*]`.
 [profiles.deepseek]
 provider = "anthropic"
 api_key_env = "DEEPSEEK_API_KEY"
 base_url = "https://api.deepseek.com/anthropic"
 # Text-only: save pasted images to scratch and delegate with view_image.
 vision = false
-
-[[profiles.deepseek.models]]
-name = "deepseek-v4-pro"
-label = "DeepSeek V4 Pro"
-context_window = 1000000
-efforts = ["off", "low", "medium", "high"]
-
-[[profiles.deepseek.models]]
-name = "deepseek-v4-flash"
-label = "DeepSeek V4 Flash"
-context_window = 1000000
-efforts = ["off", "low", "medium", "high"]
+models = ["deepseek-v4-pro", "deepseek-v4-flash"]
 
 # Agnès AI — OpenAI-compatible Chat Completions endpoint.
 # https://agnes-ai.com  |  https://platform.agnes-ai.com
@@ -138,13 +145,4 @@ efforts = ["off", "low", "medium", "high"]
 provider = "openai"
 api_key_env = "AGNES_API_KEY"
 base_url = "https://apihub.agnes-ai.com/v1"
-
-[[profiles.agnes.models]]
-name = "agnes-2.0-flash"
-label = "Agnès 2.0 Flash"
-context_window = 262144
-
-[[profiles.agnes.models]]
-name = "agnes-1.5-flash"
-label = "Agnès 1.5 Flash"
-context_window = 262144
+models = ["agnes-2.0-flash", "agnes-1.5-flash"]

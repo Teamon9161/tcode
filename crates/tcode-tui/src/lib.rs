@@ -104,7 +104,39 @@ pub struct ProviderSetup {
     /// provider in the shared `ModelCell`, then both menus.
     #[allow(clippy::type_complexity)]
     pub apply: Box<dyn Fn(Config) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
+    /// Rebuild the menus from the config already on disk, persisting nothing.
+    /// Used after a `/login` changes provider availability without editing the
+    /// config file.
+    #[allow(clippy::type_complexity)]
+    pub refresh: Box<dyn Fn() -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
 }
+
+/// Progress of a `/login` run, delivered to the app loop from the injected
+/// flow. The concrete OAuth work lives in the binary crate (like `SwitchFn`),
+/// so the TUI stays free of the provider implementations.
+pub enum LoginUpdate {
+    /// The authorize URL is live; show it. `browser_opened` reports whether the
+    /// default browser was launched, so the hint can tell the user to open it
+    /// themselves when it was not.
+    Started { url: String, browser_opened: bool },
+    /// Terminal result: `Ok(summary)` (an email or account id) or `Err(reason)`.
+    Finished(Result<String, String>),
+}
+
+/// Runs the whole ChatGPT/Codex OAuth flow, reporting progress on the channel.
+/// `Arc` + boxed future so the app can spawn it on the runtime, the same shape
+/// reason `VoiceInstall` is an `Arc`.
+#[allow(clippy::type_complexity)]
+#[derive(Clone)]
+pub struct CodexLogin(
+    pub  Arc<
+        dyn Fn(
+                tokio::sync::mpsc::Sender<LoginUpdate>,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + Sync,
+    >,
+);
 
 /// Fetches the voice sidecar for this platform and puts it at the given path.
 /// Injected because the TUI must not know release URLs, checksums or how this
@@ -130,6 +162,8 @@ pub struct TuiConfig {
     pub agents: AgentMenu,
     pub presets: PresetMenu,
     pub provider_setup: ProviderSetup,
+    /// Runs the ChatGPT/Codex `/login` OAuth flow off the UI thread.
+    pub codex_login: CodexLogin,
     pub state_store: StateStore,
     pub opening_context: OpeningContextFn,
     pub environment: EnvironmentFn,

@@ -33,9 +33,7 @@ use crate::idle::{classify, idle_guard};
 use crate::retry::{short, with_connect_timeout};
 
 const BACKEND_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
-const TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
-/// Codex CLI's OAuth client id; the refresh grant is tied to it.
-const CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+use crate::codex_cli::{CLIENT_ID, TOKEN_URL};
 
 pub struct CodexProvider {
     http: reqwest::Client,
