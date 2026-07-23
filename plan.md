@@ -182,3 +182,4 @@ loop {
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. 排除sub-agent之后，主agent仍然可以选择继续运行，每个sub-agent完成后触发一下子agent?
+6. ctrl+鼠标点击无法跳转到sub-agent的转录区域。

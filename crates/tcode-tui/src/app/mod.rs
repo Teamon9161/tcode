@@ -2047,6 +2047,7 @@ mod tests {
                             pins: Vec::new(),
                             pin: Box::new(|_, _| Err("rebuilt".into())),
                         },
+                        Vec::new(),
                     ))
                 }),
                 refresh: Box::new(|| Err("no refresh in this test".into())),
@@ -2132,6 +2133,7 @@ mod tests {
                             pins: Vec::new(),
                             pin: Box::new(|_, _| Err("rebuilt".into())),
                         },
+                        Vec::new(),
                     ))
                 }),
             },

@@ -123,7 +123,7 @@ impl App {
     /// the TUI only takes the menus back and says what happened.
     pub(super) fn apply_preset(&mut self, name: &str) {
         match (self.presets.apply)(name) {
-            Ok((menu, agents, label)) => {
+            Ok((menu, agents, label, warnings)) => {
                 self.menu = menu;
                 self.agents = agents;
                 self.presets.current = self
@@ -132,6 +132,9 @@ impl App {
                     .iter()
                     .position(|option| option.key == name);
                 self.reply(format!("preset {name} → {label}"));
+                for warning in warnings {
+                    self.reply_warn(warning);
+                }
             }
             Err(e) => self.reply_error(format!("cannot switch to preset '{name}': {e}")),
         }
@@ -220,10 +223,13 @@ impl App {
                             format!("signed in to ChatGPT as {who}")
                         };
                         match (self.provider_setup.refresh)() {
-                            Ok((menu, agents)) => {
+                            Ok((menu, agents, warnings)) => {
                                 self.menu = menu;
                                 self.agents = agents;
                                 self.reply(format!("{who} · /model to pick a Codex model"));
+                                for warning in warnings {
+                                    self.reply_warn(warning);
+                                }
                             }
                             // The credentials landed even if the rebuild failed;
                             // a restart will pick them up.
@@ -244,7 +250,7 @@ impl App {
     pub(super) fn apply_setup(&mut self, done: Box<tcode_core::config::Config>) {
         let config = *done;
         match (self.provider_setup.apply)(config) {
-            Ok((menu, agents)) => {
+            Ok((menu, agents, warnings)) => {
                 self.menu = menu;
                 self.agents = agents;
                 let current = self
@@ -256,6 +262,9 @@ impl App {
                 self.reply(format!(
                     "providers configured — {current} · /model to switch"
                 ));
+                for warning in warnings {
+                    self.reply_warn(warning);
+                }
             }
             Err(e) => self.reply_error(format!("cannot save provider setup: {e}")),
         }

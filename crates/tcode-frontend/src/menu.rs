@@ -1,13 +1,13 @@
-//! Model / preset / agent menu **data** — UI-independent.
+//! Model / preset / agent menu data and construction — UI-independent.
 //!
 //! These are the structs a frontend renders and the closures it invokes to
 //! apply a choice (switch the main model, pin a role, apply/save a preset).
-//! The concrete providers and the config-file path live behind the closures,
-//! so neither this crate nor any frontend depends on them. The TUI's ratatui
-//! `Picker`/`Hub` widgets render these; the desktop app renders its own UI over
-//! the same data.
+//! The closures keep the provider swap and selected-config mutation at the
+//! composition boundary, so renderers only consume their results. The TUI's
+//! ratatui `Picker`/`Hub` widgets render these; the desktop app renders its
+//! own UI over the same data.
 
-use tcode_core::config::ModelDef;
+use tcode_core::config::{Config, ModelDef};
 use tcode_core::ActiveModel;
 
 /// One selectable (profile, model) pair.
@@ -22,9 +22,7 @@ impl ModelOption {
     }
 }
 
-/// Builds a provider for a picked option and persists the choice. The closure
-/// is supplied by the composition root so this crate never depends on the
-/// concrete provider implementations.
+/// Builds a provider for a picked option and persists the choice.
 pub type SwitchFn =
     Box<dyn Fn(&ModelOption, Option<&str>) -> Result<ActiveModel, String> + Send + Sync>;
 
@@ -73,7 +71,7 @@ pub struct PresetOption {
     pub label: String,
 }
 
-/// What `save as preset` captures, in menu terms so the binary can name the
+/// What `save as preset` captures, in menu terms so the builder can name the
 /// profiles and models behind the indices.
 pub struct PresetDraft {
     /// Index into `ModelMenu::options`; `None` when nothing is configured.
@@ -82,19 +80,21 @@ pub struct PresetDraft {
     pub roles: Vec<(String, AgentModelChoice)>,
 }
 
+/// The menus rebuilt after a config, provider, or credential change, plus
+/// non-fatal agent-pin warnings discovered while resolving that config.
+pub type MenuUpdate = (ModelMenu, AgentMenu, Vec<String>);
+
 /// Switch to a named line-up: persist the choice, rebuild the provider and
-/// every pin, and hand back the menus that describe the result. Same shape as
-/// `ProviderSetup::apply` — the frontend owns neither the config path nor the
-/// concrete providers.
-#[allow(clippy::type_complexity)]
-pub type ApplyPresetFn =
-    Box<dyn Fn(&str) -> Result<(ModelMenu, AgentMenu, String), String> + Send + Sync>;
+/// every pin, and hand back the menus that describe the result.
+pub type PresetUpdate = (ModelMenu, AgentMenu, String, Vec<String>);
+
+/// Apply a named preset.
+pub type ApplyPresetFn = Box<dyn Fn(&str) -> Result<PresetUpdate, String> + Send + Sync>;
 
 /// Write the live line-up out as `[presets.<name>]` and hand back the updated
 /// list plus the index of the preset now in force. The menu travels with the
 /// draft because the draft is expressed in its indices: they mean nothing
 /// against a menu rebuilt since.
-#[allow(clippy::type_complexity)]
 pub type SavePresetFn = Box<
     dyn Fn(&str, &PresetDraft, &ModelMenu) -> Result<(Vec<PresetOption>, usize), String>
         + Send
@@ -109,6 +109,20 @@ pub struct PresetMenu {
     pub current: Option<usize>,
     pub apply: ApplyPresetFn,
     pub save: SavePresetFn,
+}
+
+/// The two effects `/provider` needs. The selected config and concrete
+/// provider construction remain hidden behind these closures, so renderers do
+/// not need either concern.
+pub struct ProviderSetup {
+    /// The selected user config, to seed the form. Never the merged runtime
+    /// config: a project overlay must not be copied into the selected file by
+    /// saving.
+    pub load: Box<dyn Fn() -> Result<Config, String> + Send + Sync>,
+    /// Persist the result and rebuild the active provider and both menus.
+    pub apply: Box<dyn Fn(Config) -> Result<MenuUpdate, String> + Send + Sync>,
+    /// Rebuild menus from the config already on disk after a credential change.
+    pub refresh: Box<dyn Fn() -> Result<MenuUpdate, String> + Send + Sync>,
 }
 
 /// The pinnable roles — sub-agents plus the helper roles around a turn — what

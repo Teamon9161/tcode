@@ -43,7 +43,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use tcode_core::config::{Config, ModelState};
+use tcode_core::config::ModelState;
 use tcode_core::{Agent, Session};
 
 pub use app::App;
@@ -52,6 +52,7 @@ pub use model_picker::{
     PresetDraft, PresetMenu, PresetOption, RoleSection, SavePresetFn, SwitchFn,
 };
 pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
+pub use tcode_frontend::ProviderSetup;
 
 /// Runtime-state access is injected by the binary so every frontend action
 /// writes the config file selected at startup, never a hard-coded home path.
@@ -90,25 +91,6 @@ impl StateStore {
     pub fn update(&self, edit: impl FnOnce(&mut ModelState) + Send + 'static) {
         let _ = self.update_checked(edit);
     }
-}
-
-/// The two effects `/provider` needs. Both live in the binary crate, like
-/// `SwitchFn` and `PinFn`, so the TUI depends neither on the concrete
-/// providers nor on where config.toml lives.
-pub struct ProviderSetup {
-    /// The selected user config, to seed the form. Never the merged runtime
-    /// config: a project overlay must not be copied into the selected file by
-    /// saving.
-    pub load: Box<dyn Fn() -> Result<Config, String> + Send + Sync>,
-    /// Persist the result and rebuild everything derived from it: the active
-    /// provider in the shared `ModelCell`, then both menus.
-    #[allow(clippy::type_complexity)]
-    pub apply: Box<dyn Fn(Config) -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
-    /// Rebuild the menus from the config already on disk, persisting nothing.
-    /// Used after a `/login` changes provider availability without editing the
-    /// config file.
-    #[allow(clippy::type_complexity)]
-    pub refresh: Box<dyn Fn() -> Result<(ModelMenu, AgentMenu), String> + Send + Sync>,
 }
 
 /// Progress of a `/login` run, delivered to the app loop from the injected
