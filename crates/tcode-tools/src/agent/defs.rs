@@ -55,6 +55,8 @@ impl AgentModelHint {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolSelector {
     Exact(String),
+    /// The platform command tools: `shell` and, where available, `bash`.
+    Run,
     AllMcp,
     McpServer(String),
 }
@@ -64,6 +66,9 @@ impl ToolSelector {
         let raw = raw.trim();
         if raw.is_empty() {
             return Err("tool selector cannot be empty".into());
+        }
+        if raw == "run" {
+            return Ok(Self::Run);
         }
         if raw == "mcp__*" {
             return Ok(Self::AllMcp);
@@ -90,6 +95,7 @@ impl ToolSelector {
     pub fn matches(&self, tool_name: &str) -> bool {
         match self {
             Self::Exact(name) => name == tool_name,
+            Self::Run => matches!(tool_name, "shell" | "bash"),
             Self::AllMcp => tool_name.starts_with("mcp__"),
             Self::McpServer(server) => tool_name
                 .strip_prefix("mcp__")
@@ -101,6 +107,7 @@ impl ToolSelector {
     pub fn display(&self) -> String {
         match self {
             Self::Exact(name) => name.clone(),
+            Self::Run => "run".into(),
             Self::AllMcp => "mcp__*".into(),
             Self::McpServer(server) => format!("mcp__{server}__*"),
         }
@@ -921,8 +928,12 @@ mod tests {
     }
 
     #[test]
-    fn selector_matches_exact_and_mcp_groups() {
+    fn selector_matches_exact_groups_and_mcp_groups() {
         assert!(ToolSelector::parse("read").unwrap().matches("read"));
+        let run = ToolSelector::parse("run").unwrap();
+        assert!(run.matches("shell"));
+        assert!(run.matches("bash"));
+        assert!(!run.matches("read"));
         assert!(ToolSelector::parse("mcp__*")
             .unwrap()
             .matches("mcp__github__issue"));

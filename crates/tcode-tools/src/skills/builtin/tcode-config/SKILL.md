@@ -263,7 +263,7 @@ agent's system prompt:
 name: reviewer
 description: Inspect a change and return evidence-backed review notes
 readonly: true
-tools: [read, grep, glob]
+tools: [read, grep, glob] # use `run` to include both shell and bash
 agents: [explore]
 profile: openai
 model: gpt-5.6-luna
@@ -281,7 +281,9 @@ Key rules:
 
 - `description` and a non-empty Markdown body are required.
 - `tools` is an allowlist; `disallowedTools` is a denylist. They are mutually
-  exclusive. Selectors also support `mcp__*` and `mcp__<server>__*`.
+  exclusive. `run` is a command-tool group that selects both `shell` and `bash`
+  (when Bash is available), so use `tools: [read, run]` instead of naming each.
+  Selectors also support `mcp__*` and `mcp__<server>__*`.
 - `readonly: true` is a hard ceiling: mutating tools are removed even if they
   appear in `tools`. It is stronger than any permission mode, because the tool
   is absent rather than gated — there is no approval that could re-enable it.
