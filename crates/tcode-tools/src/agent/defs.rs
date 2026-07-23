@@ -16,6 +16,11 @@ const DESCRIPTION_CAP: usize = 200;
 const LISTING_CAP: usize = 2_000;
 /// Nesting bound: an agent at this depth no longer receives an `agent` tool.
 pub const MAX_TASK_DEPTH: usize = 3;
+/// How deep `discover` descends under an `agents/` root. Skills ship their
+/// agents in a subdirectory (often symlinked in, e.g. `agents/impeccable/`), so
+/// the scan is recursive; the bound only exists to stop a symlink cycle from
+/// looping forever, never to organize a real layout.
+const MAX_AGENT_DIR_DEPTH: usize = 8;
 
 // Rust cannot expand `include_str!` over a directory. The build script scans
 // `src/agent/builtin/*.md` and emits this resource manifest; it owns no agent
@@ -191,6 +196,14 @@ pub struct AgentDef {
     /// Follow-up turns a caller may send to one delegated run; 0 = one-shot.
     pub max_exchanges: u32,
     pub source: AgentSource,
+    /// The subdirectory a custom agent was discovered under, when it was not
+    /// placed directly in an `agents/` root — typically the name of the skill
+    /// that installed it (`agents/impeccable/…` → `impeccable`). Surfaced in
+    /// the model-facing catalogue as provenance so the model can connect a
+    /// skill's "spawn my bundled agent" instruction to the agent it names, and
+    /// so an installed definition reads as data from a package rather than a
+    /// name the user authored. `None` for builtins and top-level files.
+    pub source_label: Option<String>,
 }
 
 /// Should `tool` be in this agent's toolset? The same rule applies to builtin
@@ -234,19 +247,22 @@ impl AgentRegistry {
             roots.push(home.join(".tcode/agents"));
         }
         for root in roots {
-            let Ok(entries) = std::fs::read_dir(&root) else {
-                continue;
-            };
-            let mut files: Vec<PathBuf> = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-                .collect();
+            let mut files = Vec::new();
+            collect_agent_files(&root, 0, &mut files);
             files.sort();
             for file in files {
                 match parse_def(&file) {
-                    Ok((def, mut parse_warnings)) => {
+                    Ok((mut def, mut parse_warnings)) => {
                         warnings.append(&mut parse_warnings);
+                        // The top-level subdirectory under this root, if any, is
+                        // the installing group (usually a skill name).
+                        def.source_label = file
+                            .strip_prefix(&root)
+                            .ok()
+                            .and_then(|rel| rel.parent())
+                            .and_then(|dir| dir.components().next())
+                            .and_then(|first| first.as_os_str().to_str())
+                            .map(str::to_string);
                         let taken_by_builtin = registry
                             .get(&def.name)
                             .map(|existing| matches!(existing.source, AgentSource::Builtin(_)));
@@ -334,10 +350,16 @@ impl AgentRegistry {
         let mut overflow = Vec::new();
         for def in self.visible_defs(allow) {
             let readonly = if def.read_only { " [read-only]" } else { "" };
+            let from = def
+                .source_label
+                .as_deref()
+                .map(|label| format!(" (installed by {label})"))
+                .unwrap_or_default();
             let line = format!(
-                "- {}{}: {}\n",
+                "- {}{}{}: {}\n",
                 def.name,
                 readonly,
+                from,
                 clip(&def.description, DESCRIPTION_CAP)
             );
             if overflow.is_empty() && out.len() + line.len() <= LISTING_CAP {
@@ -586,20 +608,52 @@ fn selectors(meta: &Mapping, key: &str) -> Result<Option<Vec<ToolSelector>>, Str
         .transpose()
 }
 
+/// Gather every `.md`/`.toml` agent file under `root`, descending into
+/// subdirectories and following directory symlinks (`metadata` resolves them),
+/// so a skill's symlinked `agents/<skill>/` folder is discovered like a
+/// hand-placed file. Unreadable entries and paths past the depth bound are
+/// silently skipped: discovery is best-effort and must never fail the CLI.
+fn collect_agent_files(root: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > MAX_AGENT_DIR_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        // `metadata` follows symlinks, so a symlinked agents directory counts
+        // as a directory and is walked.
+        match std::fs::metadata(&path) {
+            Ok(meta) if meta.is_dir() => collect_agent_files(&path, depth + 1, out),
+            Ok(_)
+                if path
+                    .extension()
+                    .is_some_and(|ext| ext == "md" || ext == "toml") =>
+            {
+                out.push(path)
+            }
+            _ => {}
+        }
+    }
+}
+
 fn parse_def(file: &Path) -> Result<(AgentDef, Vec<String>), String> {
     let text = std::fs::read_to_string(file).map_err(|e| format!("cannot read: {e}"))?;
     let fallback_name = file.file_stem().and_then(|stem| stem.to_str());
-    parse_def_text(
-        &text,
-        fallback_name,
-        AgentSource::File(file.to_path_buf()),
-        &file.display().to_string(),
-    )
+    let source = AgentSource::File(file.to_path_buf());
+    let origin = file.display().to_string();
+    if file.extension().is_some_and(|ext| ext == "toml") {
+        parse_def_toml(&text, fallback_name, source, &origin)
+    } else {
+        parse_def_text(&text, fallback_name, source, &origin)
+    }
 }
 
-/// Shared parser for user files and compiled-in Markdown resources. `source`
-/// controls provenance only; every agent's fields and validation rules come
-/// from its YAML front matter and body.
+/// Markdown parser for user files and compiled-in resources: YAML front matter
+/// carries the fields, the body is the system prompt. `source` controls
+/// provenance only; every agent's fields and validation rules come from the
+/// shared `build_def`.
 fn parse_def_text(
     text: &str,
     fallback_name: Option<&str>,
@@ -607,6 +661,61 @@ fn parse_def_text(
     origin: &str,
 ) -> Result<(AgentDef, Vec<String>), String> {
     let meta = yaml_front_matter(text)?;
+    let system = strip_front_matter(text).trim().to_string();
+    build_def(meta, system, fallback_name, source, origin)
+}
+
+/// TOML parser for Codex/Impeccable-style agent files: the whole file is the
+/// metadata table and the body is a field. The field set is normalized onto the
+/// same `Mapping` the Markdown path produces, so both formats share `build_def`
+/// and every validation rule. Field aliases:
+/// - `developer_instructions` / `instructions` → the system prompt body.
+/// - `model_reasoning_effort` → `effort` (a native `effort` key still wins).
+///
+/// Keys with no tcode meaning (e.g. `nickname_candidates`) are ignored, exactly
+/// as unknown YAML front-matter keys are.
+fn parse_def_toml(
+    text: &str,
+    fallback_name: Option<&str>,
+    source: AgentSource,
+    origin: &str,
+) -> Result<(AgentDef, Vec<String>), String> {
+    let table: toml::Table = toml::from_str(text).map_err(|e| format!("invalid TOML: {e}"))?;
+    let value =
+        serde_yaml::to_value(&table).map_err(|e| format!("cannot read TOML fields: {e}"))?;
+    let Value::Mapping(mut meta) = value else {
+        return Err("agent definition must be a table of fields".into());
+    };
+    // The body is a field here rather than the file's trailing text.
+    let system = match meta
+        .remove("developer_instructions")
+        .or_else(|| meta.remove("instructions"))
+    {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(body)) => body.trim().to_string(),
+        Some(_) => {
+            return Err("`developer_instructions` must be a string".into());
+        }
+    };
+    // Effort alias: only fill `effort` when the native key is absent.
+    if !meta.contains_key("effort") {
+        if let Some(effort) = meta.remove("model_reasoning_effort") {
+            meta.insert(Value::String("effort".to_string()), effort);
+        }
+    }
+    build_def(meta, system, fallback_name, source, origin)
+}
+
+/// The format-agnostic core: given the parsed field map and system prompt body,
+/// validate and assemble one `AgentDef`. Both the Markdown and TOML parsers feed
+/// this, so a field means the same thing whichever file format declared it.
+fn build_def(
+    meta: Mapping,
+    system: String,
+    fallback_name: Option<&str>,
+    source: AgentSource,
+    origin: &str,
+) -> Result<(AgentDef, Vec<String>), String> {
     let name = string(&meta, "name")?
         .or_else(|| fallback_name.map(ToOwned::to_owned))
         .unwrap_or_default();
@@ -619,7 +728,6 @@ fn parse_def_text(
     if description.trim().is_empty() {
         return Err("missing description".into());
     }
-    let system = strip_front_matter(text).trim().to_string();
     if system.is_empty() {
         return Err("empty body (the body is the agent's system prompt)".into());
     }
@@ -677,6 +785,9 @@ fn parse_def_text(
             gates_output: bool_or(&meta, "gatesOutput", true)?,
             max_exchanges: u32(&meta, "max_exchanges")?.unwrap_or(0),
             source,
+            // Discovery fills this in for nested files; a builtin or a
+            // top-level definition has no installing subdirectory.
+            source_label: None,
         },
         warnings,
     ))
@@ -687,6 +798,10 @@ mod tests {
     use super::*;
 
     fn write_def(dir: &Path, file: &str, contents: &str) {
+        // `discover` also scans `home_dir().join(".tcode/agents")`; without an
+        // isolated home it reads the developer's real `~/.tcode/agents` and any
+        // agents installed there leak into exact-list assertions.
+        tcode_core::home::testing::temp_home();
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join(file), contents).unwrap();
     }
@@ -710,6 +825,99 @@ mod tests {
             assert_eq!(registered.tool_policy, parsed.tool_policy);
             assert_eq!(registered.spawn, parsed.spawn);
         }
+    }
+
+    #[test]
+    fn discover_parses_toml_codex_agents() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            &tmp.path().join(".tcode/agents"),
+            "asset-producer.toml",
+            "name = \"asset-producer\"\n\
+             description = \"Produces clean reusable raster assets.\"\n\
+             model_reasoning_effort = \"medium\"\n\
+             nickname_candidates = [\"Clean Plate\", \"Crop Cutter\"]\n\
+             developer_instructions = '''\n\
+             You are the asset production agent.\n\
+             Work only from the approved mock.\n\
+             '''\n",
+        );
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let def = registry.get("asset-producer").unwrap();
+        assert_eq!(def.description, "Produces clean reusable raster assets.");
+        // model_reasoning_effort maps onto the native effort pin.
+        assert_eq!(
+            def.model.as_ref().and_then(|m| m.effort.as_deref()),
+            Some("medium")
+        );
+        // developer_instructions is the system prompt; unknown keys are ignored.
+        assert!(def
+            .system
+            .starts_with("You are the asset production agent."));
+        assert!(def.system.contains("approved mock"));
+    }
+
+    #[test]
+    fn discover_descends_into_subdirectories() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A skill drops its agents in a nested folder under the agents root.
+        write_def(
+            &tmp.path().join(".tcode/agents/impeccable"),
+            "producer.toml",
+            "description = \"nested agent\"\ninstructions = \"Do the nested work.\"\n",
+        );
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let def = registry.get("producer").unwrap();
+        assert!(def.source_label.is_some());
+        // The installing subdirectory becomes model-facing provenance.
+        assert_eq!(def.source_label.as_deref(), Some("impeccable"));
+        assert!(registry
+            .catalogue(None)
+            .contains("producer (installed by impeccable):"));
+    }
+
+    #[test]
+    fn top_level_custom_agents_carry_no_source_label() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            &tmp.path().join(".tcode/agents"),
+            "reviewer.md",
+            "---\ndescription: d\n---\nbody",
+        );
+        let (registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(registry.get("reviewer").unwrap().source_label.is_none());
+    }
+
+    #[test]
+    fn toml_agents_share_every_native_field_and_alias_precedence() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_def(
+            &tmp.path().join(".tcode/agents"),
+            "reviewer.toml",
+            "description = \"review a change\"\n\
+             readonly = true\n\
+             tools = [\"read\", \"grep\"]\n\
+             effort = \"high\"\n\
+             model_reasoning_effort = \"low\"\n\
+             instructions = \"Review the change and cite evidence.\"\n",
+        );
+        let (mut registry, warnings) = AgentRegistry::discover(tmp.path());
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let tools = crate::builtin_tools(tmp.path());
+        let _ = registry.validate_for_tools(&tools);
+        let def = registry.get("reviewer").unwrap();
+        // Filename supplies the name; native TOML fields parse like YAML ones.
+        assert!(def.read_only);
+        assert!(matches!(def.tool_policy, ToolPolicy::Allow(_)));
+        // A native effort key wins over the model_reasoning_effort alias.
+        assert_eq!(
+            def.model.as_ref().and_then(|m| m.effort.as_deref()),
+            Some("high")
+        );
+        assert_eq!(def.system, "Review the change and cite evidence.");
     }
 
     #[test]

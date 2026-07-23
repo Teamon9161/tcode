@@ -224,11 +224,28 @@ including comments, untouched.
 
 ## Custom agent definitions
 
-Create one Markdown file per agent at `.tcode/agents/<name>.md` for a project
-or `~/.tcode/agents/<name>.md` for personal reuse. Project definitions take
-precedence. The filename supplies `name` when omitted; names must match
+Create one file per agent under `.tcode/agents/` for a project or
+`~/.tcode/agents/` for personal reuse. Project definitions take precedence.
+The directory is scanned recursively and directory symlinks are followed, so a
+skill can ship its agents in a subfolder (e.g. a symlinked
+`~/.tcode/agents/<skill>/`) and they are discovered like hand-placed files. An
+agent found under a subfolder is listed to the model as `installed by <folder>`
+so its provenance is clear; the agent is still spawned by its plain `name`. The
+filename supplies `name` when omitted; names must match
 `^[a-z0-9][a-z0-9_-]{0,47}$`. `explore`, `plan`, `general`, and `orchestrator`
 are reserved builtin names and cannot be overridden.
+
+Two file formats are supported and produce identical agents:
+
+- **Markdown `<name>.md`** — YAML frontmatter for the fields, Markdown body for
+  the system prompt (shown below).
+- **TOML `<name>.toml`** — Codex/Impeccable-style: the whole file is the field
+  table and the body is a field. Aliases map onto the native fields:
+  `developer_instructions` (or `instructions`) is the system prompt;
+  `model_reasoning_effort` fills `effort` (a native `effort` key wins). Every
+  other field below works under its native name (`tools`, `readonly`,
+  `agents`, `model`, `maxTurns`, …). Unknown keys such as `nickname_candidates`
+  are ignored.
 
 The YAML frontmatter controls capability and defaults; the Markdown body is the
 agent's system prompt:

@@ -1185,6 +1185,9 @@ mod tests {
     use serde_json::json;
 
     fn registry_with(defs: &[(&str, &str)]) -> AgentRegistry {
+        // Isolate the home root `discover` scans so real `~/.tcode/agents`
+        // installs cannot leak into exact schema/enum assertions.
+        tcode_core::home::testing::temp_home();
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(".tcode/agents");
         std::fs::create_dir_all(&dir).unwrap();

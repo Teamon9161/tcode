@@ -181,4 +181,3 @@ loop {
 2. pdf支持？skill还是原生？需要识别图片吗？
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
-5. Tool friction — bash：我用 Git Bash 运行 Python 脚本扫描会话 JSONL，工具只返回了 (no output) 和退出码 49，没有 stderr 或失败原因；这迫使我切换到 PowerShell 才能继续定位。若 Bash 工具能在这种启动/执行失败时保留底层诊断文本，将省掉一次替代探针。

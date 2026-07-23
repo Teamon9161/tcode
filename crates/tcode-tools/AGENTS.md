@@ -27,7 +27,9 @@
 
 ## agent 定义
 
-- **统一走 `AgentDef` 注册表，不在 task.rs 里按 kind 长分支**：builtin explore/plan/general/orchestrator 与 custom `.tcode/agents/*.md` 都是 `AgentDef`，system prompt / 工具过滤（`keeps_tool`）/ permission / batch policy 全从 def 字段读。新增一种内建 kind = `AgentRegistry::builtin()` 里加一个 def，不是在 `run_with_call` 里加 `match` 臂。
+- **统一走 `AgentDef` 注册表，不在 task.rs 里按 kind 长分支**：builtin explore/plan/general/orchestrator 与 custom `.tcode/agents/*.md`/`*.toml` 都是 `AgentDef`，system prompt / 工具过滤（`keeps_tool`）/ permission / batch policy 全从 def 字段读。新增一种内建 kind = `AgentRegistry::builtin()` 里加一个 def，不是在 `run_with_call` 里加 `match` 臂。
+- **两种文件格式归一到同一个 `build_def`，别各写一套字段语义**：`.md` 走 YAML frontmatter + 正文，`.toml`（Codex/Impeccable 风）整份是字段表、正文是 `developer_instructions`/`instructions` 字段。`parse_def_toml` 只做两件事——把 TOML 转成同一个 `serde_yaml::Mapping`、抽出正文、把 `model_reasoning_effort` 别名补进 `effort`（native `effort` 优先）——之后与 markdown 共用 `build_def` 做全部校验。新增别名或字段先问：能不能归一到 Mapping 让 `build_def` 统一处理，而不是在 toml 路径里另判一次。
+- **discover 递归下钻并跟随目录符号链接**（`collect_agent_files`）：skill 常把自带 agents 放在子目录并 symlink 进 `~/.tcode/agents/<skill>/`，只扫顶层就等于装了 skill 也用不上它的 agent。`MAX_AGENT_DIR_DEPTH` 只为防 symlink 成环，不承担任何布局语义；扫描 best-effort，读不动的条目静默跳过，绝不因一个坏目录让 CLI 起不来。
 - **保留字**：explore/plan/general/orchestrator 不许被文件覆盖（其 read-only 语义绑定在 `read_only` 上，覆盖会静默放宽——这与 skills 的"文件覆盖 builtin"刻意相反）。
 - **权限分两个正交旋钮，别合并**：模式与 allow/ask/deny **继承自父会话**（经 `ToolCtx::delegated_permissions`，`forward_delegates` 按调用装卸），因为委派出去的活仍是本会话的活——子 session 曾自建 `PermissionMode::Auto` + 空规则，等于用户的 deny 规则对子 agent 静默失效、plan mode 可被委派绕过；而 `readonly` 是 def 自己的**能力天花板**，在 `sub_tools` 里就摘掉 mutating 工具，比模式更强（模式能被用户点 yes 抬高，天花板连请求都不存在），所以 explore 在父是 unsafe 时仍动不了项目。审批桥对**所有**委派运行安装，`questionPolicy` 只管 `ask_user` 工具——把两者绑一起会让"继承一个会询问的模式"静默变成"会拒绝"（`NeverAsk`）。
 - **嵌套授权只认 def 的 spawn 策略**（`agents` allowlist / `disallowedAgents` denylist，二选一，镜像 `tools`/`disallowedTools`）：`spawn_list` 解析非空才发受限子 `TaskTool`（`allowed` 限定 spawn 集）；deny 形式对注册表全集实时求差（减名单减自身），自动覆盖后来新增的 custom def——orchestrator 用 `disallowedAgents: []` 编排所有人。`depth < MAX_TASK_DEPTH`（=3）封死递归，不做环检测。
