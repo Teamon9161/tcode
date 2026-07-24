@@ -28,6 +28,7 @@ tcode-tools = { path = "../tcode-tools" }
 tcode-providers = { path = "../tcode-providers" }
 tcode-frontend = { path = "../tcode-frontend" }
 tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1", features = ["derive"] }

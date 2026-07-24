@@ -1,118 +1,117 @@
-# 新前端（Tauri 桌面 app + 进程内多会话 supervisor）实施计划
+# tcode 桌面 app —— 设计与实施计划
 
-## Context
+Tauri 桌面前端：Rust core 作为库链接进后端，webview 跑 web UI，`AgentEvent`（全数据、可序列化）经 Tauri emit 到前端。目标是终端做不到的两件事——**并行管理多个项目/会话**，和**摆脱终端后更好的展示与交互**。
 
-tcode 现在只有终端前端（TUI + 非 TTY 降级的 plain REPL）。目标是做一个更好的前端，能**更好地管理项目文件夹**、并**并行管理多个 agent 任务/会话**。
+硬规则见 `crates/tcode-app/AGENTS.md`；视觉与产品判断见同目录的 `DESIGN.md` / `PRODUCT.md`。
 
-调查已确认三件事，决定了这份计划的形状：
+## 已落地
 
-1. **core 已经是 UI 无关的**（`tcode-core` 对 `tcode-tui` 零反向依赖，已验证）。事件契约完整，已被两个前端验证——TUI 和 `src/printer.rs`（~160 行的完整 plain 前端）。驱动一个完整会话只需 `Agent::user_turn` + `AgentEvent` mpsc 流 + `Approver` trait + `PendingInput`/`PendingMode` 句柄。
-2. **"app vs web" 是次要问题**：管理本地文件夹 + 跑本地会话都需要本地 FS/进程能力，纯托管网页做不到。用户已选 **Tauri**：Rust core 直接作为库链接进后端，webview 跑 web UI，`AgentEvent`（全数据、无回调，天然可序列化）经 Tauri event emit 到前端。
-3. **"一进程一会话"的硬假设只在 `src/main.rs`（启动读死 cwd）和 tui 的 `App`（单 `session` 字段）里，不在 core**。`Session`/`ToolCtx` 本就是 per-conversation 且 cwd 参数化，per-session 隔离在类型层已成立。用户已选 **进程内 supervisor**。
+端到端能用：起 app → 启动台选项目/会话 → 发消息 → 流式输出 → 文件编辑审批 → 放行写盘。多会话并行、事件按 `session_id` 隔离不串。
 
-产出：一个 Tauri 桌面 app，后端是持有 `Arc<Agent>` + 多个隔离 `Session` 的 supervisor，前端并排展示多项目多会话、并行跑任务。
+- **共享装配层 `tcode-frontend`**（不依赖任何 UI）：`boot`/`open_session`/`build_agent`，以及**已经备好但 app 还没用的** `build_menu`/`build_preset_menu`/`build_provider_setup` + `SwitchFn`/`PinFn`/`ApplyPresetFn` 和 provider setup 状态机（UI 无关的 `setup::Key`）。这些是下面"待做"直接复用的料。
+- **后端**：`bridge.rs`（事件/审批桥，一切写在 `Emit` trait 上，无窗口可测）、`state.rs`（`Supervisor` + 每会话 `SessionHandle`，一会话一 turn 靠所有权保证）、`projects.rs`（从 session log 首行 `Meta{cwd}` 还原项目清单）、`SessionFactory`（开新文件夹按其项目级 config 重载）。11 个测试，不打真 API。
+- **设计阶段（impeccable）**：token 层 + 可整套替换的主题包（porcelain 亮色默认）、几何标记（中心菱形即状态灯）、启动台、工作区（会话栏 + 对话 + 文件侧栏）、审批 diff、`npm run preview:ui` 设计预览。
 
-## 需要动的边界（core→tui 方向不搬任何东西）
+**已知限制**：多文件夹会话共用一条 `ShellFilters` 链（输出裁剪会串项目，不涉权限边界）。细节见 AGENTS.md。
 
-只有 tui→共享层的下沉，让新前端**不必链接 `tcode-tui`**：
+---
 
-- **model/preset/agents/provider 菜单类型 + 构建逻辑**：现在劈在 `src/main.rs`（`build_menu` / `build_agent_menu` / `build_preset_menu` / `rebuild_from_config` / `run_model_command`，约 `main.rs:75-540`，~600 行）和 `tcode_tui` 的公共 struct（`ModelMenu` / `AgentMenu` / `PresetMenu` / `ModelOption` / `SwitchFn` / `PinFn` / `ApplyPresetFn` / `SavePresetFn`，`crates/tcode-tui/src/model_picker.rs:33-36` 等）。这些是 UI 无关的数据 + 闭包。
-- **provider setup 状态机**：`crates/tcode-tui/src/setup.rs`（998 行，自注释 "a state machine that draws nothing"）+ `lib.rs:98-131` 的 `ProviderSetup` / `LoginUpdate` / `CodexLogin`。
+## 核心洞察：事件契约远比 webview 现在消费的丰富
 
-## Recommendation — 分阶段实施
+`AgentEvent` 已经 emit 一整套东西，`transcript.ts` 只认了 10 种，其余全丢进 default 分支。**"摆脱终端后能做得更好"的机会几乎都在这批未消费的事件里**——终端只能把它们压成一行文字或干脆不显示，webview 能给每一种一个称手的控件。
 
-### 阶段 0：抽出共享非 UI crate `tcode-frontend` — **已完成**
+| 已 emit 但前端没用 | 终端的做法 | webview 能做的 |
+|---|---|---|
+| `TaskRunStarted/Event/Finished`、`DelegatedUsage` | 交错进正文的文字 | 每个 sub-agent 一条可展开的并行泳道，带自己的迷你对话流 |
+| `Usage`/`RateLimits` + `estimate_context_tokens` | 一个数字 | 上下文占用量表，逼近 auto-compact 阈值转琥珀；成本累计 |
+| `ModeChanged` + `PermissionMode::cycle` | 循环键 + 猜当前是什么 | 分段控件，每个模式一句话说明；staged→committed 有可见的 pending 态 |
+| `Compacting`/`Compacted` | "compacting…" | 进度 + 压缩后 summary 可读可回看 |
+| `ToolBatchStart` | 五个相同的头 | 一个头收起并发调用 |
+| `QueuedInput` | 排队时看不见 | 跑turn时排的消息显示成"待发"气泡 |
+| `ReferencesExpanded`（`@path`） | 只留标记 | 附带上下文 chip，可点开看快照 |
+| `AutoClassifierUnavailable`/`AutoModePaused` | 一行 note | Auto Mode 健康状态条，说明为何回退 |
+| `UserNote`、`StepLimitReached` | 文字 | 带"继续"按钮的行内提示 |
 
-`crates/tcode-frontend/`（依赖 core/tools/providers，不依赖任何 UI）已建立，硬规则见其 `AGENTS.md`。落地情况：
+---
 
-- ✅ **菜单/preset/agents 数据类型与 builder**：数据类型在 `menu.rs`（`ModelMenu`/`AgentMenu`/`PresetMenu`/`ModelOption`/`AgentModelChoice`/`ProviderSetup`/各 `*Fn`），builder 簇在 `build.rs`（`build_menu`/`build_agent_menu`/`build_preset_menu`/`build_provider_setup`/`rebuild_from_config`）。前置的"警告改返回值"也已做：`agent_models -> (AgentModels, Vec<String>)`，warnings 沿 `RebuiltMenus` 抛给 caller 打印，库里不再有 `eprintln!`。tui `model_picker.rs` 只剩 widget + re-export，`tcode_tui::*` 路径不变。
-- ✅ **Agent 组装 helper**：`agent.rs::build_agent(AgentBuild) -> Arc<Agent>`、`session.rs::open_session(SessionSpec) -> Session`（含 `[tcode_state]` 播种与 JSONL create/resume）。
-- ✅ **provider setup 状态机**：`setup.rs` 整体下沉，连同 `/login` 的 `CodexLogin`/`LoginUpdate` 契约。原本吃 `crossterm::KeyEvent`，下沉时换成 UI 无关的 `setup::Key`（Up/Down/Enter/Tab/Backspace/Char/Cancel/Other）；`tcode-tui/src/setup.rs` 缩成映射层（crossterm → `Key`，含 release 过滤），`wizard.rs` / `/provider` overlay 经它调用。
-  - **一处刻意的语义收紧**：旧代码在 provider 列表里按 `KeyCode::Char(' ')` 匹配而不看 modifier，于是 Ctrl+Space 也会勾选；映射层现在把除 Ctrl+C（= Cancel）外的所有 Ctrl 组合键归为 `Other`。这是把终端细节挡在映射层的直接后果，已由 `tcode-tui/src/setup.rs` 的测试钉住。
-- ⏸ **turn-driver（`driver.rs`）**：**刻意推迟到阶段 1 之后**。现在只有两个差异极大的消费者（`src/main.rs::run_turn` ~40 行 vs `app/turn.rs` ~1250 行），照它们抽出的抽象很可能与桌面 app 的实际需要不符。等 app 的事件桥写完、有第三个真实消费者，再回来抽公因子。
+## 待做（按优先级）
 
-验收结果：`cargo build --workspace`、`cargo clippy --workspace --all-targets`、`cargo test --workspace` 全绿，无新增 warning。
+### 1. 会话控制条 —— 模式 / 模型 / 用量
 
-关键文件：`crates/tcode-frontend/src/{lib.rs,agent.rs,session.rs,menu.rs,build.rs,setup.rs}`；`src/main.rs`（build_* 已删，改调 `tcode-frontend`）、`crates/tcode-tui/src/{model_picker.rs,setup.rs,wizard.rs,overlay.rs,lib.rs}`（改成消费共享类型）。
+工作区顶栏现在只有路径和文件面板开关。它该承载**这个会话此刻怎么跑**的三件事。全部 per-session（每个 `SessionHandle` 各自持有），共享层的数据/闭包已就绪。
 
-### 阶段 1：单会话 Tauri app（打通端到端）— **后端与最小 UI 已完成**
+**a. 审批模式切换**（`PermissionMode`：plan / default / accept-edits / auto / unsafe）
+- 后端：`SessionHandle` 暴露 stage/commit（core 已有"安全边界提交"语义），新 command `set_mode(session, mode)`；`ModeChanged` 已会 emit。
+- 前端：分段控件或下拉，**不是终端的循环键**——每个模式并列展示，各带一句话（"plan：只读""auto：分类器把关，其余不问"）。切换在 turn 中途按下时显示 pending 标记，等 `ModeChanged` 到达再落定。危险模式（unsafe）要有视觉重量，不能和 default 长一样。
+- 复用：`permission.rs` 的 `cycle()`/label 已在；只差 command 和控件。
 
-`crates/tcode-app/`（Tauri 2 后端，**不在 workspace**，理由与 `tcode-voiced` 同构：链接 webkit2gtk/libsoup）+ `crates/tcode-app/ui/`（Vite + React + TS）。硬规则见 `crates/tcode-app/AGENTS.md`。
+**b. 模型 / preset 切换**
+- 后端：`build_menu`/`build_preset_menu` 直接给出 `ModelMenu`/`PresetMenu`（含 `switch`/`apply` 闭包）。包成 command：`model_menu()` 返回数据，`switch_model(...)`/`apply_preset(...)` 调闭包。切 preset 会整套换主/子模型编排并清临时 pick——这套语义 core 已实现，app 只转发。
+- 前端：下拉显示当前模型 + effort，点开选。**摆脱终端的增量**：把 sub-agent 各角色的模型钉法（`[agents.*]`）一眼列出，preset 切换预览会改哪些角色；effort 档位用滑杆而非文字。
+- 归属：这是"操纵前端专属菜单对象"，按 CLAUDE.md 的归属规则留前端，但数据源在 `tcode-frontend`。
 
-- ✅ **`AgentEvent` 过 IPC**：这项"最高风险"实测是一行 derive——`Usage`/`RateLimits`/`TaskRunStatus`/`PermissionMode` 早已 `Serialize`，`Value` 天然可序列化。用 **adjacently tagged**（`#[serde(tag="type", content="data")]`）而非默认外部标签，因为它是唯一同时覆盖 unit / newtype / struct 三种变体形状的表示，TS 侧才能拿到一个判别联合。信封形状由 `tcode-core` 的 `event_wire_tests` 钉住（含嵌套 `Box<AgentEvent>` 与 `ToolBatchStart` 的元组→位置数组）。
-- ✅ **事件桥 / 审批桥**：`bridge.rs`。关键决定是**一切写在 `Emit` trait 上而非 `AppHandle` 上**——跑 turn 的整条路径因此能在没有窗口时被测试驱动。`WebviewApprover` 用 `oneshot` 等前端答复，**认不出的 decision 字符串一律当拒绝**（webview 传来的是数据不是指令）。
-- ✅ **supervisor 形状先摆好**：`state.rs` 从第一天就是 `Supervisor{ agent, sessions: HashMap }` + 每会话独立 `SessionHandle{ session: Option<Session>, cancel, pending }`。阶段 2 是往表里多插一条，不是重写。"一会话一次一个 turn"由所有权（take/放回）保证而非 bool 标记。
-- ✅ **最小 UI**：`ui/src/` = `types.ts`（wire 契约）+ `transcript.ts`（事件→块的纯函数 reducer）+ `App/Transcript/ApprovalDialog`。流式增量、工具卡片（可展开完整输出）、审批弹窗（默认焦点在"no"上，误按回车不会放行）、中断按钮。视觉刻意从简，留给设计阶段。
-- ⏸ **未做**：右侧文件预览侧栏、富文档（ppt/docx）预览、plan 批注。按原计划留到设计阶段用 impeccable skill 做。
+**c. 上下文 / 用量计量**
+- 后端：`Agent::estimate_context_tokens(session)` 给占用量；`Usage`/`RateLimits`/`DelegatedUsage` 事件给每步与累计。加一个轻量 command 或随 `TurnFinished` 带出估算。
+- 前端：一个量表——上下文窗口用了百分之多少，auto-compact 阈值画一道线，逼近转琥珀；旁边成本累计。sub-agent 的 `DelegatedUsage` 记进成本但**不**记进上下文表（core 已区分，前端别混）。
 
-验收结果：`cargo test`（app 目录）6 个后端集成测试全过——事件流带 session 标签且顺序正确、审批往返后**文件真的被写入**、不可识别决定 fail-closed、双会话并发不串流、忙会话拒绝第二个 turn。`npm run build` 通过（tsc 严格模式）。**端到端已人工确认**：起 app、发消息、看到流式输出。
+### 2. Sub-agent 展示与交互
 
-端到端打通过程中踩到并已修的两个坑（细节与排查手册见 `crates/tcode-app/AGENTS.md`）：
+`task` 工具 spawn 的每个 sub-agent，其整条事件流已经以 `TaskRunEvent{ run, event: Box<AgentEvent> }` 嵌套流出，配 `TaskRunStarted`（kind/model/prompt/summary）与 `TaskRunFinished`（status/tool_calls/usage）。webview 现在**全丢弃**。
 
-1. **`devUrl` 不能配**。Tauri 在 debug 构建下只要看见它就去连 vite dev server，而主流程是 `cargo run`，于是白屏 + "Connection refused"。删掉后 debug/release 一致加载 `frontendDist`。
-2. **漏了 `capabilities/default.json`**（真正的元凶）。自定义 `#[tauri::command]` 默认放行，但 `listen()` 走 core event 插件，必须显式授权；未授权时 promise 静默 reject，一个监听器都装不上。表现为 turn 正常跑完、事件正常 emit，界面全空——**和"卡死"完全无法区分**。已同时补上：capabilities 授予 `core:default`；前端所有 `listen`/`invoke` 接 catch 显示致命错误屏；后端 emit 失败与 turn 生命周期打 stderr。这三条合起来才让这类失败下次一眼可见。
+设计：
+- **一个 sub-agent run = 对话流里一条可展开块**，比工具卡更重。收起显示 kind·model·summary·状态·用量；展开是它自己的迷你对话流（把嵌套 `event` 喂给同一个 transcript reducer，天然递归）。
+- **并行 run 用并排泳道**，不交错进正文——这正是终端做不到、而并行是这个 app 立身之本的地方。多个 run 同时在跑时，每条泳道各自有 running 脉冲。
+- **它碰的文件汇进同一个文件侧栏**，按 `run` 打标签，这样"是主 agent 还是某个子任务改了这个文件"一眼可分（`ToolStart` 的 `call_id` 与 run 有关联，core 已给）。
+- 交互（后续）：点运行中的 run 可聚焦看它的完整流；失败的 run 直接看到它的 status 和最后输出。
+- reducer 层要先扩：`transcript.ts` 现在是平的，要加 `run` 维度的分组，`files.ts` 的路径提取要能穿透嵌套事件。
 
-**UI 设计与交互细节（到设计阶段再展开，用 impeccable skill 来做）**：本计划只定后端契约与骨架；具体的视觉与交互留到设计阶段，届时用 **impeccable skill** 设计。要覆盖的交互目标（先记下，实现时再细化优化）：
-- **右侧文件预览侧栏**（对齐 Claude Code）：对话过程中创建/修改的文件，在右侧一小块区域点击即可预览。文件改动信息 core 已给足——`AgentEvent::ToolStart{ input }`（edit/write 的路径与内容）、`ToolEnd{ content }`、以及 checkpoint 里的快照——前端据此维护"本会话涉及的文件"列表。
-- 该侧栏**支持富文档预览**：不只是文本/代码 diff，还要能预览 **ppt、docx** 等（走 webview 内嵌渲染或转换预览，具体技术路线设计阶段定）。
-- **给 plan / 文档加 comment**：在预览区对内容做批注/评论的交互（如对 plan.md 逐段 comment）。
-- 这些是"交互体验"层，全部落在前端，不影响后端契约；后端只需保证文件改动事件与路径信息可被前端消费（现有 `AgentEvent` 已满足）。
+### 3. 命令面板（⌘K）替代斜杠命令
 
-剩余验收（需人工）：起 app，对一个项目发消息、看到流式输出、触发一次文件编辑审批并放行。右侧文件预览属于上面标 ⏸ 的设计阶段。
+`CommandRegistry::builtin().dispatch()` 给了 /compact /cost /resume /clear /export /note /memory /mode 等，语义作用于 `Session`/`Ledger`/FS 的那些 TUI 与 REPL 已共享。webview 一个都没接。
 
-```bash
-cd crates/tcode-app && (cd ui && npm install && npm run build) && cargo run
-```
+设计：**⌘K 命令面板**而非在输入框打斜杠——每条命令带一句说明，可搜索。其中 /mode /model 上升为控制条的控件（见 1），/compact /export /resume /clear 留面板。后端加一个 `run_command(session, line)` 薄 command 转 `dispatch`，输出走已有事件通道。这条一次性把一大批终端命令搬进桌面，投入产出比最高。
 
-### 阶段 2：进程内 supervisor（并行多会话）
+### 4. Provider setup（首启没配时）
 
-后端引入 supervisor：
+现在 `boot()` 没配 provider 就报错停。setup 状态机（`tcode-frontend::setup`，UI 无关的 `setup::Key`）与 `build_provider_setup` 已备好。
+设计：首启检测到无 config，不是画错误屏，而是在 webview 里走 provider 向导（选 provider → 填 key/登录 → 写 config）。`/login` 的 `CodexLogin`/`LoginUpdate` 契约也在里面。这让桌面 app 能独立完成冷启动，不必"先去终端跑一次 tcode"。
 
-```rust
-struct Supervisor {
-    agent: Arc<Agent>,                        // 无状态, 全会话共享
-    sessions: HashMap<SessionId, SessionHandle>,
-}
-struct SessionHandle {
-    session: Option<Session>,                 // 跑 turn 时 take 出去(对齐 App 的 take/放回)
-    events_rx / approver / cancel,            // 每会话独立
-    cwd, project_id,
-}
-```
+### 5. 并行会话的桌面级通知
 
-- 每会话独立 `ToolCtx`（独立 cwd/scratch/background 注册表——`ToolCtx::with_scratch_dir(cwd,…)` 已支持不同 cwd）。`ToolCtx` 的可变 delegate 槽是 per-ctx 的、约束是"同一 ctx 同时只一个 turn"，每会话各自的 ctx + 各自串行的 turn 天然满足，**不需要改 core**。
-- 事件多路复用：每会话的 `Receiver<AgentEvent>` 各自 emit 时带 `session_id`。
-- 审批路由：`TauriApprover` 按 `session_id` 把请求送到对应前端会话面板。
-- 并发：每会话的 `user_turn` 在独立 tokio task 上跑，互不阻塞。
+终端做不到、桌面能做、且并行会话最需要的一环：**某个后台会话卡在审批、或 turn 结束时，发 OS 通知**。现在 app 里已有"从启动台被审批拉过去"的逻辑，但你在别的窗口时完全无感。Tauri 通知插件 + 每会话状态变迁触发。这是"并行管理多任务"承诺的最后一块。
 
-验收：MockProvider 写一个后端集成测试，并发驱动两个 Session、断言两路事件不串。真机上并排跑两个项目的任务。
+### 6. 富展示细节（摆脱终端的边角）
 
-### 阶段 3：项目/会话浏览器（文件夹管理）
+按性价比排，逐个补：
+- **Markdown 补全**：现在只认代码围栏，补列表/表格/标题/链接（仍然只构 React 节点，绝不 `innerHTML`——模型输出是数据）。
+- **文件侧栏真 diff**：edit 结果做成带行号的语法高亮 diff，而非纯文本。
+- **`QueuedInput`**：跑 turn 时排的消息显示成"待发"气泡（core 已在安全边界投递，前端只差渲染）。
+- **`ReferencesExpanded`**：`@path` 展开成可点的上下文 chip。
+- **`Compacting`**：压缩进行时给进度，`Compacted` 后 summary 可展开回看。
+- **`ToolBatchStart`**：并发调用收进一个头。
+- **Auto Mode 健康**：`AutoClassifierUnavailable`/`AutoModePaused` 变成一条状态提示，说明为何回退到人工审批。
+- **图片/附件**：`ViewImageTool` 与粘贴的图，webview 可内联显示（终端只能给路径）。
 
-- Tauri command 枚举 `~/.tcode/projects/*`，对每个项目 `SessionStore::list(data_dir)`（`store.rs:509`，已按 `data_dir` 参数化）聚合出"所有项目 × 所有会话"清单（`SessionInfo{ id, last_user_preview, modified }`）。
-- "打开项目文件夹" = 选一个 cwd → `open_session(agent, cwd, …)` 新建/或 `SessionStore::resume(data_dir, id)` 恢复 → 挂进 supervisor 的 `sessions` map。
-- 项目文件夹树浏览可用 Tauri 的 fs API 或前端直接读（后端已在本地）。
+### 7. 富文档预览与 plan 批注（原计划遗留）
 
-验收：浏览器里看到多个项目及其历史会话，点开任一会话 resume 并继续对话。
+- 文件侧栏支持 **ppt/docx** 等富文档预览（webview 内嵌渲染或转换预览，技术路线待定）。
+- 对 plan/文档**逐段批注**的交互。
+两者都纯前端，不动后端契约。优先级最低，独立性最强，随时可插。
+
+---
 
 ## 复用清单（不要重造）
 
-- 驱动一个会话的完整入口：`Agent::user_turn`（`agent/mod.rs:537`）、`Agent::compact_with_focus`、`Agent::estimate_context_tokens`（`:300`，上下文表所有前端共用）。
-- 事件/审批契约：`AgentEvent`（`agent/mod.rs:49`）、`Approver`（`permission.rs:242`）、`PendingInput`/`PendingMode`（`session.rs`）。
-- 持久化：`SessionStore::{list,resume,create}`（`store.rs:509/620/576`）、`CheckpointStore`、`Ledger` sink（`main.rs:1064` 的挂法）。
-- 斜杠命令：`CommandRegistry::builtin().dispatch(...)`（`commands/mod.rs:165`）——新前端直接复用，自动拿到 /help、/compact、/resume、/model 等。
-- 参考实现：`src/printer.rs`（事件→渲染的最小映射）、`src/approver.rs`（`Approver` 的阻塞式实现）、`crates/tcode-tui/src/app/turn.rs`（spawn/own-Session/drain 的完整版）。
+- 驱动会话：`Agent::user_turn`、`compact_with_focus`、`estimate_context_tokens`。
+- 事件/审批契约：`AgentEvent`（信封形状由 `event_wire_tests` 钉住）、`Approver`、`PendingInput`/`PendingMode`。
+- 模型/preset/provider：`tcode-frontend` 的 `build_menu`/`build_preset_menu`/`build_provider_setup` + 各 `*Fn` + setup 状态机。**别在 app 里重写装配。**
+- 模式：`PermissionMode::cycle()` 与 label。
+- 斜杠命令：`CommandRegistry::builtin().dispatch()`。
+- 持久化：`SessionStore::{list,resume,create}`、`CheckpointStore`。
+- 参考实现：`src/printer.rs`（事件→渲染最小映射）、`crates/tcode-tui/src/app/turn.rs`（spawn/own-Session/drain 完整版）、`crates/tcode-tui/src/overlay.rs`（模型/provider overlay 怎么消费共享菜单）。
 
-## 风险与注意
+## 验证
 
-- **最高风险**：`AgentEvent` 加 `Serialize` 时，内含的 `Value`/`Usage`/`RateLimits`/嵌套 `Box<AgentEvent>`（`TaskRunEvent`）都要能序列化——先审一遍字段。这是 event 过 IPC 边界的前提。
-- supervisor 的 `Session` take/放回要严格对齐 tui 现有做法（`app/turn.rs:162/219`），避免一个会话跑 turn 期间被别处并发借用。
-- provider client 共享：`Arc<Agent>` 里的 model/provider 句柄多会话共用，确认底层 reqwest client 并发安全（core 现在 sub-agent 并行已在共用，风险低）。
-- 阶段 0 是纯重构，必须先让 `cargo test --workspace` 全绿再往上叠 Tauri，别把重构和新功能混进一个不可回滚的大改。
-
-## 验证方式
-
-- 阶段 0：`cargo build --workspace` + `cargo test --workspace` 全绿；手动跑 `cargo run`（TUI）与非 TTY plain REPL 确认无回归。
-- 阶段 1/2：后端加 `crates/tcode-app/tests/` 用 MockProvider 脚本化 tool_use（对齐 `plan.md` 的"测试永不打真 API"），断言事件桥输出；阶段 2 断言并发两会话事件隔离。
-- 阶段 3：`SessionStore::list` 聚合逻辑单测（临时 `~/.tcode/projects/*` fixture，注意用 `tcode_core::home::testing::temp_home()`）。
-- 端到端：起 Tauri app，两个项目并排各发一个任务、各触发一次审批，肉眼确认流式与隔离。
+- 后端：`crates/tcode-app/tests/` 用 MockProvider 脚本化 tool_use，断言事件桥输出与并发隔离，不打真 API。新加 command 各配一个往返测试。
+- 前端：`npm run build`（tsc 严格）+ `npm run preview:ui` 逐场景肉眼核对。新界面（控制条、sub-agent 泳道、命令面板）各加一个 preview 场景。
+- 端到端：起 app，两个项目并排各发任务、各触发审批，确认流式、隔离与桌面通知。

@@ -7,4 +7,5 @@
 pub mod boot;
 pub mod bridge;
 pub mod commands;
+pub mod projects;
 pub mod state;

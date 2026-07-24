@@ -1,0 +1,30 @@
+/* Chrome for the design preview only — never loaded by the app. */
+.preview {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  height: 100%;
+}
+.preview-bar {
+  display: flex;
+  gap: var(--s-1);
+  padding: var(--s-2) var(--s-3);
+  background: var(--sunken);
+  border-bottom: 1px solid var(--line-strong);
+}
+.preview-bar button {
+  padding: var(--s-1) var(--s-3);
+  border: 1px solid transparent;
+  border-radius: var(--r-pill);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.preview-bar button.is-on {
+  background: var(--bg);
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.preview-stage {
+  min-height: 0;
+}

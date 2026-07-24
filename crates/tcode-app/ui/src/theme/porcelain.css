@@ -1,0 +1,75 @@
+/* Porcelain — the default theme.
+ *
+ * An architect's white worktop: tracing paper, graphite, and one bottle of
+ * olive ink that only comes out to mark the thing that matters. The surface is
+ * literally white and contributes no mood of its own; the character is entirely
+ * in the ink color, the type and the spacing.
+ *
+ * To write another theme, copy this file, change the values, and swap the
+ * import in `main.tsx`. Token *names* are the contract and may not change; see
+ * `base.css`. Every value here was checked for contrast — the ratios in the
+ * comments are measured, not aspirational. */
+
+:root {
+  /* ---- Core (a theme must supply these) ------------------------------- */
+
+  /* Pure white. Not 0.99, not a warm tint — a tinted near-white background is
+     how a light interface announces that nobody chose it. */
+  --bg: oklch(1 0 0);
+
+  /* Near-black carrying a whisper of the brand hue. 16.4:1 on --bg. */
+  --ink: oklch(0.24 0.012 130);
+
+  /* Olive ink. Identity *and* the "running" state — the app's own color and
+     its liveliest state are the same thing on purpose. 6.5:1 on --bg, so it
+     is legible as text and holds white text when filled. */
+  --brand: oklch(0.47 0.125 132);
+
+  /* Parked on a human. Must out-rank running at a glance: a different hue
+     family, 2.05:1 apart in luminance from --brand. 3.2:1 on --bg as a dot. */
+  --amber: oklch(0.665 0.152 60);
+
+  /* Failed. */
+  --danger: oklch(0.545 0.2 27);
+
+  --font-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ---- Surfaces ------------------------------------------------------- */
+  /* Neutrals tinted toward the brand's own hue at chroma 0.004–0.008: cool
+     paper grey, deliberately clear of the cream/sand band. */
+  --chrome: oklch(0.972 0.004 130);
+  --sunken: oklch(0.955 0.006 130);
+  --line: oklch(0.905 0.005 130);
+  --line-strong: oklch(0.845 0.008 130);
+
+  /* ---- Text ----------------------------------------------------------- */
+  --body: oklch(0.38 0.01 130); /* 10.0:1 */
+  --muted: oklch(0.53 0.012 130); /* 5.3:1 on --bg, 4.6:1 on --sunken */
+  --faint: oklch(0.655 0.01 130); /* 3.2:1 — never prose */
+  --on-solid: oklch(1 0 0);
+
+  /* ---- State washes and text tones ------------------------------------ */
+  --brand-wash: oklch(0.96 0.035 132);
+  --brand-text: oklch(0.47 0.125 132); /* 5.9:1 on --brand-wash */
+  --amber-wash: oklch(0.955 0.03 72);
+  --amber-text: oklch(0.47 0.11 58); /* 6.2:1 on --amber-wash */
+  --danger-wash: oklch(0.958 0.018 28);
+  --danger-text: oklch(0.49 0.19 27); /* 6.1:1 on --danger-wash */
+
+  /* ---- Interactive ---------------------------------------------------- */
+  --hover: oklch(0.968 0.004 130);
+  --pressed: oklch(0.945 0.005 130);
+  --selected: oklch(0.965 0.03 132);
+  --focus-ring: oklch(0.47 0.125 132);
+
+  /* ---- Shape, density, motion ----------------------------------------- */
+  /* Porcelain keeps base.css's scale. A compact variant would set
+     --density: 0.85 and tighten the radii here; nothing else would change. */
+  --density: 1;
+
+  --shadow-color: oklch(0.24 0.012 130);
+
+  color-scheme: light;
+  accent-color: var(--brand);
+}

@@ -26,12 +26,17 @@ fn main() -> anyhow::Result<()> {
     );
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .manage(startup.supervisor)
         .invoke_handler(tauri::generate_handler![
             tcode_app::commands::sessions,
             tcode_app::commands::send_message,
             tcode_app::commands::respond_approval,
             tcode_app::commands::interrupt,
+            tcode_app::commands::launchpad,
+            tcode_app::commands::project_sessions,
+            tcode_app::commands::open_folder,
+            tcode_app::commands::close_session,
         ])
         .run(tauri::generate_context!())
         .context("the desktop app exited with an error")

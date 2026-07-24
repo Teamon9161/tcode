@@ -1,0 +1,213 @@
+/* The token contract, plus the structural rules that hold for every theme.
+ *
+ * Two hard rules make themes swappable (see DESIGN.md § Theme packs):
+ *
+ *   1. This file names every token and contains no literal color, size, radius
+ *      or font stack. Each fallback below is *derived* from the small core a
+ *      theme must supply, so a theme file written against an older contract
+ *      still renders — the newer tokens simply resolve to something sane.
+ *   2. Theme files (`themes/*.css`) are loaded after this one and assign the
+ *      values. Components read `var(--token)` and nothing else.
+ *
+ * A theme MUST supply: --bg, --ink, --brand, --amber, --danger, --font-ui,
+ * --font-mono. Everything else has a derivation here and is optional. */
+
+:root {
+  /* Which contract revision the tokens below belong to. A theme may read it
+     to decide whether it needs to fill in newer names. */
+  --theme-contract: 1;
+
+  /* ---- Surfaces ------------------------------------------------------- */
+  /* Second and third layers are the background walked toward the ink, so a
+     dark theme's panels come out lighter than its background without any
+     theme having to special-case the direction. */
+  --chrome: color-mix(in oklab, var(--bg) 96%, var(--ink));
+  --sunken: color-mix(in oklab, var(--bg) 93%, var(--ink));
+  --line: color-mix(in oklab, var(--bg) 88%, var(--ink));
+  --line-strong: color-mix(in oklab, var(--bg) 78%, var(--ink));
+
+  /* ---- Text ----------------------------------------------------------- */
+  --body: color-mix(in oklab, var(--ink) 88%, var(--bg));
+  --muted: color-mix(in oklab, var(--ink) 66%, var(--bg));
+  --faint: color-mix(in oklab, var(--ink) 46%, var(--bg));
+  /* Text on any filled solid (ink buttons, brand fills). */
+  --on-solid: var(--bg);
+
+  /* ---- State ---------------------------------------------------------- */
+  /* Each state is a solid (dots, bars, fills), a wash (pill backgrounds) and
+     a text tone dark enough to sit on that wash. */
+  --brand-wash: color-mix(in oklab, var(--brand) 12%, var(--bg));
+  --brand-text: color-mix(in oklab, var(--brand) 92%, var(--ink));
+  --amber-wash: color-mix(in oklab, var(--amber) 14%, var(--bg));
+  --amber-text: color-mix(in oklab, var(--amber) 70%, var(--ink));
+  --danger-wash: color-mix(in oklab, var(--danger) 12%, var(--bg));
+  --danger-text: color-mix(in oklab, var(--danger) 88%, var(--ink));
+
+  /* ---- Interactive ---------------------------------------------------- */
+  --hover: color-mix(in oklab, var(--bg) 95%, var(--ink));
+  --pressed: color-mix(in oklab, var(--bg) 90%, var(--ink));
+  --selected: var(--brand-wash);
+  --focus-ring: var(--brand);
+
+  /* ---- Shape ---------------------------------------------------------- */
+  --r-xs: 4px;
+  --r-sm: 6px;
+  --r-md: 9px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* ---- Density -------------------------------------------------------- */
+  /* One multiplier over the whole spacing rhythm. A compact theme ships 0.85,
+     a roomy one 1.15; no component changes. */
+  --density: 1;
+  --s-1: calc(4px * var(--density));
+  --s-2: calc(8px * var(--density));
+  --s-3: calc(12px * var(--density));
+  --s-4: calc(16px * var(--density));
+  --s-5: calc(24px * var(--density));
+  --s-6: calc(32px * var(--density));
+  --s-7: calc(48px * var(--density));
+  --s-8: calc(64px * var(--density));
+
+  /* ---- Type ----------------------------------------------------------- */
+  /* Fixed rem-equivalent scale, ratio ~1.15. Product UI at a stable DPI does
+     not want fluid headings (DESIGN.md § Typography). */
+  --text-2xs: 11px;
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px;
+  --text-md: 16px;
+  --text-lg: 20px;
+  --text-xl: 26px;
+
+  --lh-tight: 1.25;
+  --lh-snug: 1.4;
+  --lh-normal: 1.55;
+  --lh-prose: 1.65;
+
+  --weight-normal: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  --tracking-tight: -0.011em;
+  --tracking-normal: 0;
+  --tracking-wide: 0.02em;
+
+  /* ---- Elevation ------------------------------------------------------ */
+  /* Ink-tinted rather than pure black, so shadows belong to the theme. */
+  --shadow-color: color-mix(in oklab, var(--ink) 100%, transparent);
+  --shadow-rest: 0 1px 2px -1px color-mix(in oklab, var(--shadow-color) 10%, transparent),
+    0 2px 6px -2px color-mix(in oklab, var(--shadow-color) 7%, transparent);
+  --shadow-lift: 0 4px 12px -4px color-mix(in oklab, var(--shadow-color) 16%, transparent),
+    0 16px 40px -12px color-mix(in oklab, var(--shadow-color) 14%, transparent);
+
+  /* ---- Motion --------------------------------------------------------- */
+  --ease: cubic-bezier(0.22, 1, 0.36, 1); /* ease-out-quart */
+  --dur-fast: 120ms;
+  --dur: 180ms;
+  --dur-slow: 220ms;
+
+  /* ---- Stacking ------------------------------------------------------- */
+  /* Semantic, in the order things actually overlap. */
+  --z-base: 0;
+  --z-sticky: 10;
+  --z-rail: 20;
+  --z-dropdown: 30;
+  --z-scrim: 40;
+  --z-dialog: 50;
+  --z-toast: 60;
+}
+
+/* ---- Reset and element defaults --------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-base);
+  line-height: var(--lh-normal);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-synthesis-weight: none;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  margin: 0;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lh-tight);
+  text-wrap: balance;
+}
+
+p {
+  margin: 0;
+}
+
+code,
+pre,
+kbd,
+samp {
+  font-family: var(--font-mono);
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* A visible ring for keyboard users only; pointer users never see it. The app
+   is driven from the keyboard as much as the mouse, so this is load-bearing. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: var(--r-xs);
+}
+
+:focus:not(:focus-visible) {
+  outline: none;
+}
+
+::selection {
+  background: var(--brand-wash);
+  color: var(--ink);
+}
+
+/* The webview's own scrollbars, kept in the theme rather than reinvented as
+   custom-drawn ones (product register bans those). */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+/* Motion is state reporting, so removing it must not remove information: the
+   running pulse resolves to a solid dot rather than disappearing. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

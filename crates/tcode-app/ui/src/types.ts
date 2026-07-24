@@ -1,7 +1,7 @@
-// The wire contract. These mirror `crates/tcode-app/src/bridge.rs` and
-// `AgentEvent` in tcode-core; the Rust side pins the envelope shape with tests
-// (`event_wire_tests`), so changing either without the other is a caught error
-// rather than a silently dead UI.
+// The wire contract. These mirror `crates/tcode-app/src/bridge.rs`,
+// `commands.rs`, `projects.rs` and `AgentEvent` in tcode-core; the Rust side
+// pins the envelope shape with tests (`event_wire_tests`), so changing either
+// without the other is a caught error rather than a silently dead UI.
 
 export const AGENT_EVENT = "tcode://agent-event";
 export const APPROVAL_REQUEST = "tcode://approval-request";
@@ -59,4 +59,46 @@ export type ApprovalRequest = {
 /** Anything the backend cannot parse is treated as a denial. */
 export type Decision = "yes" | "yes-session" | "yes-project" | "no";
 
-export type SessionInfo = { id: string; cwd: string };
+/** A conversation open in this window. */
+export type SessionInfo = {
+  id: string;
+  cwd: string;
+  name: string;
+  /** Home directory, for rendering `~/…`. */
+  home: string;
+};
+
+/** A folder tcode has held a conversation in. */
+export type ProjectInfo = {
+  path: string;
+  name: string;
+  session_count: number;
+  last_active: number | null;
+  /** False when the recorded folder is gone. Shown, not hidden. */
+  exists: boolean;
+};
+
+/** A resumable conversation log inside a project. */
+export type StoredSession = {
+  id: string;
+  preview: string;
+  modified: number | null;
+};
+
+export type Launchpad = {
+  projects: ProjectInfo[];
+  /** The backend's clock, so relative times agree with the timestamps. */
+  now: number;
+  /** Home directory, for abbreviating paths to `~/…`. */
+  home: string;
+};
+
+/** What a session is doing, for every status affordance in the app. */
+export type Status = "idle" | "running" | "waiting" | "failed";
+
+export const STATUS_LABEL: Record<Status, string> = {
+  idle: "idle",
+  running: "running",
+  waiting: "needs you",
+  failed: "failed",
+};

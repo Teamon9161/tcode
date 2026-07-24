@@ -10,13 +10,14 @@
 //! flag someone has to remember to check.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::{Agent, AgentError, ContentBlock, Session};
 
+use crate::boot::SessionFactory;
 use crate::bridge::{pump_events, Emit, Pending, TurnFinished, WebviewApprover, TURN_FINISHED};
 
 /// One conversation, with everything that is private to it.
@@ -70,17 +71,23 @@ impl SessionHandle {
     }
 }
 
-/// Holds the agent and every open session.
+/// Holds the agent, every open session, and the means to open more.
 pub struct Supervisor {
     agent: Arc<Agent>,
+    factory: SessionFactory,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
+    /// Insertion order, so the session rail does not reshuffle on every read.
+    /// A `HashMap` alone would hand the UI a different order each time.
+    order: Mutex<Vec<String>>,
 }
 
 impl Supervisor {
-    pub fn new(agent: Arc<Agent>) -> Self {
+    pub fn new(agent: Arc<Agent>, factory: SessionFactory) -> Self {
         Self {
             agent,
+            factory,
             sessions: Mutex::new(HashMap::new()),
+            order: Mutex::new(Vec::new()),
         }
     }
 
@@ -89,10 +96,41 @@ impl Supervisor {
     }
 
     pub fn open(&self, handle: Arc<SessionHandle>) {
+        self.order.lock().unwrap().push(handle.id.clone());
         self.sessions
             .lock()
             .unwrap()
             .insert(handle.id.clone(), handle);
+    }
+
+    /// Open `cwd` as a new session and register it. `resume` replays an
+    /// existing log for that folder.
+    pub fn open_folder(&self, cwd: &Path, resume: Option<String>) -> anyhow::Result<Arc<SessionHandle>> {
+        let session = self.factory.open(cwd, resume)?;
+        let handle = Arc::new(SessionHandle::new(
+            uuid::Uuid::new_v4().to_string(),
+            cwd.to_path_buf(),
+            session,
+        ));
+        self.open(handle.clone());
+        Ok(handle)
+    }
+
+    /// Drop a session. Its turn, if any, is cancelled first — closing a panel
+    /// must not leave a turn running against a session nothing can display.
+    ///
+    /// Returns false when the id was already gone, which is not an error: the
+    /// webview can send this twice for one close.
+    pub fn close(&self, id: &str) -> bool {
+        let removed = self.sessions.lock().unwrap().remove(id);
+        self.order.lock().unwrap().retain(|open| open != id);
+        match removed {
+            Some(handle) => {
+                handle.interrupt();
+                true
+            }
+            None => false,
+        }
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<SessionHandle>> {
@@ -100,7 +138,7 @@ impl Supervisor {
     }
 
     pub fn ids(&self) -> Vec<String> {
-        self.sessions.lock().unwrap().keys().cloned().collect()
+        self.order.lock().unwrap().clone()
     }
 }
 

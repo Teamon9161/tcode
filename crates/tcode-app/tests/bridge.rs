@@ -192,6 +192,22 @@ fn session(cwd: PathBuf) -> Session {
     )
 }
 
+/// A factory these tests never call `open` on: they hand the supervisor
+/// sessions directly. It exists so `Supervisor` can hold one unconditionally
+/// rather than an `Option` that production code would have to branch on.
+fn factory() -> tcode_app::boot::SessionFactory {
+    tcode_app::boot::SessionFactory::new(
+        PathBuf::from("/nonexistent/config.toml"),
+        ModelCell::new(ActiveModel {
+            provider: MockProvider::new(Vec::new()),
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        }),
+        Arc::new(tcode_tools::ShellFilters::disabled()),
+    )
+}
+
 fn handle(id: &str, cwd: PathBuf) -> Arc<SessionHandle> {
     Arc::new(SessionHandle::new(
         id.to_string(),
@@ -348,7 +364,7 @@ async fn concurrent_sessions_never_cross_streams() {
 
     let agent_one = agent(MockProvider::new(vec![text_done("from one")]), one.path());
     let agent_two = agent(MockProvider::new(vec![text_done("from two")]), two.path());
-    let supervisor = Supervisor::new(agent_one.clone());
+    let supervisor = Supervisor::new(agent_one.clone(), factory());
     let handle_one = handle("s1", one.path().to_path_buf());
     let handle_two = handle("s2", two.path().to_path_buf());
     supervisor.open(handle_one.clone());
