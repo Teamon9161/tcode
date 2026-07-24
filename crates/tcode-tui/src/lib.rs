@@ -52,7 +52,7 @@ pub use model_picker::{
     PresetDraft, PresetMenu, PresetOption, RoleSection, SavePresetFn, SwitchFn,
 };
 pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
-pub use tcode_frontend::ProviderSetup;
+pub use tcode_frontend::{CodexLogin, LoginUpdate, ProviderSetup};
 
 /// Runtime-state access is injected by the binary so every frontend action
 /// writes the config file selected at startup, never a hard-coded home path.
@@ -92,33 +92,6 @@ impl StateStore {
         let _ = self.update_checked(edit);
     }
 }
-
-/// Progress of a `/login` run, delivered to the app loop from the injected
-/// flow. The concrete OAuth work lives in the binary crate (like `SwitchFn`),
-/// so the TUI stays free of the provider implementations.
-pub enum LoginUpdate {
-    /// The authorize URL is live; show it. `browser_opened` reports whether the
-    /// default browser was launched, so the hint can tell the user to open it
-    /// themselves when it was not.
-    Started { url: String, browser_opened: bool },
-    /// Terminal result: `Ok(summary)` (an email or account id) or `Err(reason)`.
-    Finished(Result<String, String>),
-}
-
-/// Runs the whole ChatGPT/Codex OAuth flow, reporting progress on the channel.
-/// `Arc` + boxed future so the app can spawn it on the runtime, the same shape
-/// reason `VoiceInstall` is an `Arc`.
-#[allow(clippy::type_complexity)]
-#[derive(Clone)]
-pub struct CodexLogin(
-    pub  Arc<
-        dyn Fn(
-                tokio::sync::mpsc::Sender<LoginUpdate>,
-            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
-            + Send
-            + Sync,
-    >,
-);
 
 /// Fetches the voice sidecar for this platform and puts it at the given path.
 /// Injected because the TUI must not know release URLs, checksums or how this

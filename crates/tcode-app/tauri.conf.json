@@ -1,0 +1,26 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "tcode",
+  "version": "0.1.22",
+  "identifier": "dev.tcode.desktop",
+  "build": {
+    "frontendDist": "ui/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "tcode",
+        "width": 1200,
+        "height": 820,
+        "minWidth": 720,
+        "minHeight": 480
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

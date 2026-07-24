@@ -243,7 +243,7 @@ impl Overlay {
                     Flow::Act(OverlayAction::FolderTrust(choice))
                 }
             },
-            Overlay::Provider(setup) => match setup.on_key(key) {
+            Overlay::Provider(setup) => match crate::setup::on_key(setup, key) {
                 crate::setup::Progress::Stay => Flow::Stay,
                 crate::setup::Progress::Done(None) => Flow::Close,
                 crate::setup::Progress::Done(Some(done)) => {

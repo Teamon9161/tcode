@@ -12,13 +12,11 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::commands::{CommandCtx, CommandEffect, CommandRegistry, MessageKind};
 use tcode_core::config::{Config, ConfigError};
-use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, PermissionRules, Session};
+use tcode_core::{Agent, AgentError, ContentBlock, ModelCell, Session};
 
 const CYAN: &str = "\x1b[36m";
 const DIM: &str = "\x1b[2m";
 const RESET: &str = "\x1b[0m";
-
-const INTERACTIVE_AGENT_SYSTEM: &str = include_str!("prompts/interactive-agent-system.md");
 
 const CONFIG_HEADER: &str = "\
 # tcode user configuration — created by the setup wizard.
@@ -362,88 +360,39 @@ async fn main() -> anyhow::Result<()> {
     };
     let model_cell = ModelCell::new(active_model);
 
+    // `--agent` fixes the system prompt at startup, so it cannot be layered
+    // onto a log recorded under a different one. Checked here rather than in
+    // `boot`, since resuming is this binary's flag.
+    if cli.agent.is_some() && (cli.r#continue || cli.resume.is_some()) {
+        anyhow::bail!(
+            "--agent cannot be combined with --continue/--resume: \
+             a resumed session was recorded under a different system prompt"
+        );
+    }
     // Everything /model can switch to, with the swap logic attached.
     let mut menu = tcode_frontend::build_menu(&config, &selection, config_file.clone());
-    // Builtin agent kinds plus user-defined `.tcode/agents/*.md` share one
-    // registry. Validate their capability policies only after MCP connections
-    // have supplied the exact delegated inventory.
-    let (mut agent_defs, agent_warnings) = tcode_tools::AgentRegistry::discover(&cwd);
-    for warning in &agent_warnings {
-        eprintln!("{DIM}warning: {warning}{RESET}");
-    }
-    // Shell output filters: built-ins plus the user's and the project's
-    // `filters.toml`. `[limits] shell_output_filters` is read from the user's
-    // own configuration only, so a checked-out repository cannot switch
-    // filtering back on for someone who turned it off.
-    let shell_filters = Arc::new(if config.limits.shell_output_filters {
-        let (filters, warnings) = tcode_tools::ShellFilters::load(&cwd);
-        for warning in warnings {
-            eprintln!("{DIM}warning: {warning}{RESET}");
-        }
-        filters
-    } else {
-        tcode_tools::ShellFilters::disabled()
-    });
-    let classifier_policy = tcode_core::classifier_policy(&config.auto_mode);
-    let classifier_config = config.auto_mode.classifier_config();
-    let trusted_read_hosts =
-        tcode_tools::trusted_read_hosts(std::mem::take(&mut config.auto_mode.trusted_read_hosts));
-    // MCP servers from config; a broken server warns instead of blocking.
-    let mcp_tools = if config.mcp_servers.is_empty() {
-        Vec::new()
-    } else {
-        let (mcp_tools, warnings) =
-            tcode_tools::connect_mcp_servers(&config.mcp_servers, &cwd).await;
-        for warning in warnings {
-            eprintln!("{DIM}warning: {warning}{RESET}");
-        }
-        mcp_tools
-    };
-    let definition_validator = tcode_tools::AgentTool::new(
-        model_cell.clone(),
-        config.watchdog.clone(),
-        config.limits.tool_output_tokens,
-        cwd.clone(),
-    )
-    .with_trusted_read_hosts(trusted_read_hosts.clone())
-    .with_extension_tools(mcp_tools.clone());
-    for warning in definition_validator.validate_definitions(&mut agent_defs, &cwd) {
-        eprintln!("{DIM}warning: {warning}{RESET}");
-    }
-    tcode_frontend::apply_agent_def_hints(&mut config, &agent_defs);
-    let agent_defs = Arc::new(agent_defs);
-    // `--agent <name>`: this process runs *as* that definition. Resolved
-    // before anything enters the prompt prefix; everything it changes
-    // (system prompt, toolset, model, max_steps) is fixed at startup.
-    let cli_agent = match cli.agent.as_deref() {
-        Some(name) => {
-            if cli.r#continue || cli.resume.is_some() {
-                anyhow::bail!(
-                    "--agent cannot be combined with --continue/--resume: \
-                     a resumed session was recorded under a different system prompt"
-                );
-            }
-            let Some(def) = agent_defs.get(name) else {
-                anyhow::bail!(
-                    "unknown agent '{name}'; available: {}",
-                    agent_defs.names_for(None).join(", ")
-                );
-            };
-            Some(def.clone())
-        }
-        None => None,
-    };
-    // Live sub-agent pins, shared by the `agent` tool and `/agents`.
-    let (pinned, warnings) = tcode_frontend::agent_models(&config, &selection);
+    // Agent definitions, shell filters, MCP servers, pins and the toolset are
+    // assembled identically for every frontend, so they live in
+    // `tcode-frontend`. Only presenting the warnings is ours.
+    let tcode_frontend::Booted {
+        agent,
+        pinned,
+        agent_defs,
+        shell_filters,
+        skills,
+        // `--agent` shaped the agent inside `boot`; nothing out here reads it.
+        cli_agent: _,
+        warnings,
+    } = tcode_frontend::boot(tcode_frontend::BootSpec {
+        cwd: cwd.clone(),
+        config: &mut config,
+        selection: selection.clone(),
+        model_cell: model_cell.clone(),
+        agent: cli.agent.clone(),
+    })
+    .await?;
     for warning in warnings {
         eprintln!("{DIM}warning: {warning}{RESET}");
-    }
-    if let Some(def) = &cli_agent {
-        // A pinned model for the named agent becomes the session model
-        // (process-local; never persisted to [tcode_state] in the selected config).
-        if let Some(model) = pinned.get(&def.name) {
-            model_cell.swap(model);
-        }
     }
     let mut agent_menu = tcode_frontend::build_agent_menu(
         &config,
@@ -462,49 +411,8 @@ async fn main() -> anyhow::Result<()> {
         config_file.clone(),
     );
 
-    let system = match &cli_agent {
-        Some(def) => def.system.clone(),
-        None => INTERACTIVE_AGENT_SYSTEM.to_string(),
-    };
-    // Discovered once and handed to both the tool and the frontends (TUI
-    // completion/`/name` fallback, plain REPL fallback) so they never see a
-    // different skill list than the `skill` tool the model calls.
-    let skills = tcode_tools::discover_skills(&cwd);
-    // Toolset + `agent` tool + safety classifier + `Agent` wiring is identical
-    // across frontends, so it lives in `tcode-frontend`.
-    let agent = tcode_frontend::build_agent(tcode_frontend::AgentBuild {
-        cwd: cwd.clone(),
-        config: &config,
-        selection: selection.clone(),
-        model_cell: model_cell.clone(),
-        pinned: pinned.clone(),
-        agent_defs: agent_defs.clone(),
-        cli_agent,
-        system,
-        skills: skills.clone(),
-        shell_filters: shell_filters.clone(),
-        trusted_read_hosts,
-        classifier_policy,
-        classifier_config,
-        mcp_tools,
-    });
-
-    let mode = match cli.mode.as_deref() {
-        Some("plan") => tcode_core::PermissionMode::Plan,
-        Some("accept-edits") => tcode_core::PermissionMode::AcceptEdits,
-        Some("auto") => tcode_core::PermissionMode::Auto,
-        Some("unsafe") => tcode_core::PermissionMode::Unsafe,
-        Some("default") => tcode_core::PermissionMode::Default,
-        Some(other) => anyhow::bail!("unknown mode '{other}'"),
-        // Same precedence as the model choice: CLI flag > what the user last
-        // switched to ([tcode_state] in the selected config) > the configured default.
-        None => state.mode.unwrap_or(config.permissions.mode),
-    };
-    let rules = PermissionRules {
-        allow: config.permissions.allow.clone(),
-        ask: config.permissions.ask.clone(),
-        deny: config.permissions.deny.clone(),
-    };
+    let mode = tcode_frontend::startup_mode(cli.mode.as_deref(), &state, &config)?;
+    let rules = tcode_frontend::startup_rules(&config);
     let opening_context: tcode_tui::OpeningContextFn =
         Arc::new(tcode_tools::startup_context_with_scratch);
     let environment: tcode_tui::EnvironmentFn = Arc::new(tcode_tools::environment_snapshot);

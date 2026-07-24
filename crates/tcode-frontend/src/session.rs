@@ -87,8 +87,8 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
     tcode_core::store::sweep_old_sessions(&data_dir);
     match resume {
         ResumeSpec::Resume { id } => {
-            let resumed = SessionStore::resume(&data_dir, id.as_deref())
-                .context("cannot resume session")?;
+            let resumed =
+                SessionStore::resume(&data_dir, id.as_deref()).context("cannot resume session")?;
             let Resumed {
                 store,
                 ledger,
@@ -103,14 +103,14 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
             session.ledger = ledger;
             session.ledger.attach_sink(Box::new(store));
             session.bind_scratch_session(&session_id);
-            let startup = startup
-                .unwrap_or_else(|| (opening_context)(&cwd, &session.tool_ctx.scratch_dir));
+            let startup =
+                startup.unwrap_or_else(|| (opening_context)(&cwd, &session.tool_ctx.scratch_dir));
             session.restore_startup_context(startup, previous_environment, delivered_environment);
             session.sync_environment((environment)(&cwd), None);
         }
         ResumeSpec::New => {
-            let store = SessionStore::create(&data_dir, &cwd)
-                .context("cannot create session log")?;
+            let store =
+                SessionStore::create(&data_dir, &cwd).context("cannot create session log")?;
             let session_id = store.id.clone();
             session.checkpoints =
                 CheckpointStore::new(data_dir.join("checkpoints").join(&session_id));

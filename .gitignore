@@ -1,7 +1,11 @@
 /target
-# The voice sidecar is excluded from the workspace, so it has a target/ of
-# its own.
+# The voice sidecar and the desktop app are excluded from the workspace, so
+# each has a target/ of its own.
 /crates/tcode-voiced/target
+/crates/tcode-app/target
+# The desktop app's webview bundle: installed and built, never committed.
+/crates/tcode-app/ui/node_modules
+/crates/tcode-app/ui/dist
 examples/
 **/__pycache__/
 .claude/

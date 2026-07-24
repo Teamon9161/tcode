@@ -9,9 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tcode_core::config::{AutoClassifierConfig, Config, Selection};
-use tcode_core::{
-    Agent, AgentModels, ModelCell, ProviderSafetyClassifier, SafetyClassifier, Tool,
-};
+use tcode_core::{Agent, AgentModels, ModelCell, ProviderSafetyClassifier, SafetyClassifier, Tool};
 use tcode_tools::{
     keeps_tool, AddNoteTool, AgentDef, AgentRegistry, AgentTool, AskUserTool, FetchSummarizer,
     ShellFilters, Skill, TrustedReadHosts, UpdateProgressTool, ViewImageTool, WebFetchTool,
@@ -70,7 +68,10 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
             .with_summarizer(FetchSummarizer::new(model_cell.clone(), pinned.clone())),
         shell_filters.clone(),
     );
-    tools.push(Arc::new(ViewImageTool::new(model_cell.clone(), pinned.clone())));
+    tools.push(Arc::new(ViewImageTool::new(
+        model_cell.clone(),
+        pinned.clone(),
+    )));
     tools.push(Arc::new(UpdateProgressTool));
     tools.push(Arc::new(AskUserTool));
     tools.push(Arc::new(AddNoteTool));
@@ -85,7 +86,10 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
     .with_agent_defs(agent_defs.clone())
     .with_auto_policy(classifier_policy.clone())
     .with_auto_classifier_config(classifier_config)
-    .with_auto_compact(config.limits.auto_compact, config.limits.auto_compact_percent)
+    .with_auto_compact(
+        config.limits.auto_compact,
+        config.limits.auto_compact_percent,
+    )
     .with_trusted_read_hosts(trusted_read_hosts.clone())
     .with_shell_filters(shell_filters.clone())
     .with_model_resolver({
@@ -103,7 +107,8 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
                 .profiles
                 .get(&sel.profile)
                 .ok_or_else(|| format!("profile '{}' is not configured", sel.profile))?;
-            tcode_providers::build_active(profile, &sel, &config.watchdog).map_err(|e| e.to_string())
+            tcode_providers::build_active(profile, &sel, &config.watchdog)
+                .map_err(|e| e.to_string())
         })
     })
     .with_extension_tools(mcp_tools);

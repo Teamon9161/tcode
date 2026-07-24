@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The webview's baseline grant. `core:default` is what makes `listen()` work at all — without it the event plugin's commands are denied, every listener registration rejects silently, and a turn runs to completion with nothing on screen.",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}

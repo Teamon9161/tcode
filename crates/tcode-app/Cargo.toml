@@ -1,0 +1,42 @@
+[package]
+name = "tcode-app"
+version = "0.1.22"
+edition = "2021"
+description = "Desktop frontend for tcode: a Tauri shell over the shared agent harness"
+
+# Deliberately NOT a workspace member, for the same reason as `tcode-voiced`:
+# Tauri links the platform webview (webkit2gtk + libsoup on Linux), which is a
+# system dependency `cargo build --workspace` must not start requiring of
+# everyone working on the terminal frontend. Build it from this directory.
+
+[lib]
+name = "tcode_app"
+# The Tauri binary and the integration tests both consume the lib; only
+# `main.rs` ever starts a webview.
+path = "src/lib.rs"
+
+[[bin]]
+name = "tcode-app"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tcode-core = { path = "../tcode-core" }
+tcode-tools = { path = "../tcode-tools" }
+tcode-providers = { path = "../tcode-providers" }
+tcode-frontend = { path = "../tcode-frontend" }
+tauri = { version = "2", features = [] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+futures = "0.3"

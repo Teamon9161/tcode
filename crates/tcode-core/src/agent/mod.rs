@@ -46,7 +46,14 @@ const FOLDER_TRUST_POLICY: &str = include_str!("../../prompts/auto_mode/folder-t
 
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
-#[derive(Debug, Clone)]
+///
+/// `Serialize` is here because a frontend may sit across an IPC boundary (the
+/// desktop app's webview) rather than in-process. Adjacent tagging is the one
+/// representation that covers every variant shape this enum has — unit,
+/// newtype, and struct — so consumers get a single discriminated union keyed on
+/// `type` instead of three different envelope shapes.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", content = "data")]
 pub enum AgentEvent {
     /// Model accepted the request and is responding.
     Started,
@@ -2663,5 +2670,86 @@ fn tool_result_with_images(
         content: content.to_string(),
         is_error,
         images,
+    }
+}
+
+#[cfg(test)]
+mod event_wire_tests {
+    use super::*;
+
+    /// The desktop app's webview reads these events as JSON, so the envelope
+    /// shape is a contract with its TypeScript side, not an implementation
+    /// detail. This pins the three variant shapes that exist: unit variants
+    /// carry no `data` key at all, newtype variants put their payload straight
+    /// under `data`, and struct variants nest their fields there.
+    #[test]
+    fn events_serialize_as_one_discriminated_union() {
+        let unit = serde_json::to_value(AgentEvent::TurnEnd).unwrap();
+        assert_eq!(unit, serde_json::json!({ "type": "TurnEnd" }));
+
+        let newtype = serde_json::to_value(AgentEvent::TextDelta("hi".into())).unwrap();
+        assert_eq!(
+            newtype,
+            serde_json::json!({ "type": "TextDelta", "data": "hi" })
+        );
+
+        let structured = serde_json::to_value(AgentEvent::StepLimitReached { max: 40 }).unwrap();
+        assert_eq!(
+            structured,
+            serde_json::json!({ "type": "StepLimitReached", "data": { "max": 40 } })
+        );
+    }
+
+    /// The two payloads that made this risky: a boxed nested event (sub-agent
+    /// traces) and a free-form `Value` (tool input). Both have to survive the
+    /// same envelope, or the app can render a parent turn but not its
+    /// delegated work.
+    #[test]
+    fn nested_events_and_tool_input_survive_the_boundary() {
+        let event = AgentEvent::TaskRunEvent {
+            run: "run-1".into(),
+            event: Box::new(AgentEvent::ToolStart {
+                call_id: "call-1".into(),
+                name: "edit".into(),
+                summary: "edit src/main.rs".into(),
+                input: serde_json::json!({ "path": "src/main.rs", "replace_all": false }),
+            }),
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        assert_eq!(wire["type"], "TaskRunEvent");
+        assert_eq!(wire["data"]["run"], "run-1");
+        let nested = &wire["data"]["event"];
+        assert_eq!(nested["type"], "ToolStart");
+        assert_eq!(nested["data"]["input"]["path"], "src/main.rs");
+        assert_eq!(nested["data"]["input"]["replace_all"], false);
+    }
+
+    /// `ToolBatchStart` is the one variant carrying tuples. They cross as JSON
+    /// arrays — positional, so the app's types must read them by index.
+    #[test]
+    fn batched_calls_cross_as_positional_arrays() {
+        let event = AgentEvent::ToolBatchStart {
+            label: "reading 2 files".into(),
+            calls: vec![
+                (
+                    "c1".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "a" }),
+                ),
+                (
+                    "c2".into(),
+                    "read".into(),
+                    serde_json::json!({ "path": "b" }),
+                ),
+            ],
+        };
+
+        let wire = serde_json::to_value(&event).unwrap();
+        let calls = wire["data"]["calls"].as_array().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0][0], "c1");
+        assert_eq!(calls[0][1], "read");
+        assert_eq!(calls[0][2]["path"], "a");
     }
 }

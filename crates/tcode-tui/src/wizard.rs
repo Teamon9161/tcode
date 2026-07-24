@@ -77,7 +77,9 @@ fn run_setup(mut setup: Setup, config_file: &Path) -> anyhow::Result<Option<Conf
     loop {
         draw(&mut out, &setup.view())?;
         let progress = match crossterm::event::read()? {
-            Event::Key(key) if key.kind != KeyEventKind::Release => setup.on_key(key),
+            Event::Key(key) if key.kind != KeyEventKind::Release => {
+                crate::setup::on_key(&mut setup, key)
+            }
             Event::Paste(text) => setup.on_paste(text),
             _ => Progress::Stay,
         };

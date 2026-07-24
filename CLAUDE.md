@@ -48,12 +48,17 @@ cargo clippy --workspace
 cargo fmt
 ```
 
+桌面 app 不在 workspace 里，命令见 `crates/tcode-app/AGENTS.md`（在该目录下 `cargo test` / `cargo build`，前端另有 `ui/` 的 npm 步骤）。
+
 **测试永不调真实 API。** 各 crate 的测试手法见其 AGENTS.md。
 
 ## 架构
 
-Workspace 四个 crate（core / providers / importers / tools / tui）+ 根 binary。
+Workspace：core / providers / importers / tools / **frontend** / tui + 根 binary。
 **依赖方向单向：core 不知道 UI 存在。** `tcode-importers` 对来源文件只读复制，绝不修改。
+
+- `tcode-frontend` 是**UI 无关的共享装配层**：从 Config 到 `Arc<Agent>`（`boot`）、开会话带持久化（`open_session`）、模型/preset/agents 菜单数据、provider setup 状态机。三个前端（TUI / plain REPL / 桌面 app）共用。它绝不依赖 UI crate（含 crossterm/ratatui）。新写"某个前端要做的装配"时先问它是不是三家都一样——是就下沉到这里。
+- **不在 workspace 里的两个 crate**（各自链接本机原生依赖，`cargo build --workspace` 必须与它们无关，在各自目录里构建）：`tcode-voiced`（语音 sidecar）、`tcode-app`（Tauri 桌面前端，Linux 需 webkit2gtk + libsoup）。
 
 各 crate 的内部结构自己读代码，硬规则在它自己的 `AGENTS.md` 里。
 
