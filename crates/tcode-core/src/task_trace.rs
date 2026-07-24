@@ -117,6 +117,32 @@ impl TaskTraces {
         Some(self.root.as_ref()?.join(format!("{id}.jsonl")))
     }
 
+    /// Where a cohort's append-only channel log lives, alongside the run
+    /// traces in this session's directory. Like `trace_path`, the id reaches
+    /// this from the model, so the only accepted shape is `c<digits>` — a raw
+    /// join would turn a cohort id into an arbitrary-file write. `None` without
+    /// a bound root (an ephemeral session persists nothing) or on a bad id.
+    pub fn cohort_channel_path(&self, id: &str) -> Option<PathBuf> {
+        let digits = id.strip_prefix('c')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(self.root.as_ref()?.join(format!("cohort-{id}.jsonl")))
+    }
+
+    /// Where a cohort's small resumable meta state lives (per-member run
+    /// ids/cursors/state, round, budget), rewritten whole at each scheduler
+    /// exit. Same `c<digits>` guard as `cohort_channel_path`: the id reaches
+    /// this from the model, so a raw join would turn a cohort id into an
+    /// arbitrary-file write. `None` without a bound root or on a bad id.
+    pub fn cohort_meta_path(&self, id: &str) -> Option<PathBuf> {
+        let digits = id.strip_prefix('c')?;
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        Some(self.root.as_ref()?.join(format!("cohort-{id}.meta.json")))
+    }
+
     /// Allocate the next run id and, when a root is bound, open its trace
     /// file with the meta line already written. Persistence is best-effort:
     /// an IO failure yields a valid id with no store, never a failed run.

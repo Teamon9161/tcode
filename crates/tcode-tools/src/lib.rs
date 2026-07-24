@@ -14,6 +14,7 @@ mod skills;
 mod view_image;
 mod web;
 
+pub use agent::cohort::CohortTool;
 pub use agent::defs::{
     keeps_tool, AgentDef, AgentModelHint, AgentRegistry, AgentSource, ToolPolicy, ToolSelector,
     MAX_TASK_DEPTH,

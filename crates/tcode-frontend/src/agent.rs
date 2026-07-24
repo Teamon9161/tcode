@@ -122,7 +122,13 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
                 tools.push(Arc::new(agent_tool.scoped_to(def)));
             }
         }
-        None => tools.push(Arc::new(agent_tool)),
+        None => {
+            // The cohort tool is a depth-0-only capability: its description
+            // enters the cached prefix, and nested cohorts are out of scope, so
+            // only the main agent carries it (COHORT-DESIGN.md §12).
+            tools.push(Arc::new(agent_tool.cohort_tool()));
+            tools.push(Arc::new(agent_tool));
+        }
     }
     let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(
         ProviderSafetyClassifier::new(model_cell.clone(), pinned.clone())

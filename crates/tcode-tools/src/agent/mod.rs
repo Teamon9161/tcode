@@ -3,6 +3,7 @@
 //! for the prompt and the final report — the sub-agent's exploration
 //! tokens never enter the parent's window.
 
+pub(crate) mod cohort;
 pub(crate) mod defs;
 
 use std::collections::HashMap;
@@ -339,7 +340,24 @@ impl AgentTool {
     /// The definition-derived toolset. Read-only agents get only
     /// side-effect-free tools; a definition that explicitly allows user
     /// questions receives `ask_user` through the parent bridge.
+    #[cfg(test)]
     fn sub_tools(&self, def: &AgentDef, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
+        self.sub_tools_with(def, cwd, model, &[])
+    }
+
+    /// Like `sub_tools`, but appends caller-injected per-run tools that a
+    /// definition cannot describe — currently the cohort `channel` tool, whose
+    /// instance holds a handle to one member's shared channel. Normal
+    /// delegation passes an empty slice. Injected tools bypass the `readonly`
+    /// ceiling and tool policy on purpose: they are granted by the cohort
+    /// scheduler, not selectable from a definition, exactly like the spawn tool.
+    fn sub_tools_with(
+        &self,
+        def: &AgentDef,
+        cwd: &Path,
+        model: ModelCell,
+        extra: &[Arc<dyn Tool>],
+    ) -> Vec<Arc<dyn Tool>> {
         let mut tools = self.base_tools(cwd, model.clone());
         // Submitting a plan for review carries a permission-mode transition on
         // the *parent* conversation, so it is structurally not a sub-agent's to
@@ -366,6 +384,7 @@ impl AgentTool {
         if !spawn.is_empty() && self.depth < crate::agent::defs::MAX_TASK_DEPTH {
             tools.push(Arc::new(self.child(spawn, model)));
         }
+        tools.extend(extra.iter().cloned());
         tools
     }
 
@@ -795,6 +814,19 @@ impl AgentTool {
         ctx: &ToolCtx,
         model_override: Option<ActiveModel>,
     ) -> (Agent, Session, String) {
+        self.build_run_with(def, ctx, model_override, &[])
+    }
+
+    /// Like `build_run`, but injects extra per-run tools into the agent's
+    /// toolset (see `sub_tools_with`). Used by the cohort scheduler to hand each
+    /// member its own `channel` tool instance.
+    fn build_run_with(
+        &self,
+        def: &AgentDef,
+        ctx: &ToolCtx,
+        model_override: Option<ActiveModel>,
+        extra: &[Arc<dyn Tool>],
+    ) -> (Agent, Session, String) {
         let kind = &def.name;
         let model = model_override.unwrap_or_else(|| self.model_for(kind));
         let model_name = model.provider.model().to_string();
@@ -808,7 +840,7 @@ impl AgentTool {
             // A sub-agent has no input box, so it never suggests; it still
             // carries the pins so its own classifier resolves the same way.
             models: self.pinned.clone(),
-            tools: self.sub_tools(def, &ctx.cwd, model.clone()),
+            tools: self.sub_tools_with(def, &ctx.cwd, model.clone(), extra),
             system: def.system.clone(),
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
