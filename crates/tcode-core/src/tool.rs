@@ -188,6 +188,51 @@ mod permission_request_tests {
     }
 }
 
+/// The lifecycle state of one member in a shared cohort. A full roster snapshot
+/// travels as a single event so frontends do not have to infer membership from
+/// tool names or human-readable task summaries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub enum CohortMemberStatus {
+    Waiting,
+    Running,
+    Left,
+    Finalizing,
+    Done,
+    Failed,
+}
+
+/// One member in a [`CohortUpdate`] roster snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CohortMember {
+    pub id: String,
+    pub kind: String,
+    pub task: String,
+    /// The member's stable first-run id. It is the trace entry point for its
+    /// whole resumed session, not the id of a later round activation.
+    pub run: Option<String>,
+    pub status: CohortMemberStatus,
+}
+
+/// A cohort scheduler's complete current roster. `parent_call` is the active
+/// parent `cohort` tool use whose transcript record owns this snapshot.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CohortUpdate {
+    pub id: String,
+    pub parent_call: String,
+    pub round: usize,
+    pub max_rounds: usize,
+    pub members: Vec<CohortMember>,
+}
+
+/// Identifies a task-run activation as one turn of a cohort member. This is
+/// separate from the stable member `run` in [`CohortMember`]: each activation
+/// has its own trace record, while the member card links to the full chain.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CohortMemberRun {
+    pub cohort_id: String,
+    pub member_id: String,
+}
+
 /// What delegated work (a `task` sub-agent, a `view_image` request) reports
 /// back to the agent loop while it runs. The loop translates each variant
 /// into the matching `AgentEvent`, so every frontend sees delegated progress
@@ -197,6 +242,9 @@ pub enum DelegateEvent {
     /// Billable usage spent by a delegated helper with no run identity of its
     /// own (e.g. `view_image`). Surfaces as `AgentEvent::DelegatedUsage`.
     Usage(Usage),
+    /// A cohort's complete member roster changed. This is display-only state:
+    /// no scheduler data enters the parent provider ledger.
+    CohortUpdated(CohortUpdate),
     /// A `task` sub-agent run began. `parent_call` is the tool_use id of the
     /// spawning `task` call, tying the run to its ledger entry.
     TaskStarted {
@@ -207,6 +255,8 @@ pub enum DelegateEvent {
         prompt: String,
         /// A one-line parent-authored description for task lists.
         summary: String,
+        /// Set only for an activation driven by a cohort scheduler.
+        cohort_member: Option<CohortMemberRun>,
     },
     /// One event from inside a running sub-agent, tagged with its run id.
     TaskEvent {

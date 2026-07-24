@@ -1,11 +1,11 @@
 # Cohort / 多 agent 辩论 设计草案
 
-> 状态：**P0 + P1 + P2 已实现**（`crates/tcode-tools/src/agent/cohort.rs`，测试 `tests/cohort.rs`）；P3 未落地。
+> 状态：**P0 + P1 + P2 + P3 已实现**（`crates/tcode-tools/src/agent/cohort.rs`，测试 `tests/cohort.rs`）。
 > 归属：主体实现落在 `tcode-tools` 的 `AgentTool`（`src/agent/`），复用 `tcode-core` 的 blob 门与 task-trace 持久化。
 >
-> 已实现：P0 骨架（顺序轮转、`channel` post/leave、围栏 delta、收尾各出报告、频道 JSONL 逐行落盘）+ P1（会 yield 的可 resume 委派：`to:"parent"` 异步发问 → AskParent yield、成员失败 → Stalled yield、`cohort(resume, answer?)` 注入续跑、`cohort(action:"channel", id)` 父按需看频道过 blob 门、cohorts map 按 scope 隔离+cap 逐出、报告写入**共享** reports map 供父 `agent(attach=[run id])`）+ P2（崩溃恢复：`cohort-<id>.meta.json` 每次 pause 整体重写、Done 时删除；重启后 `resume`/`channel` 内存无此 cohort 时从 meta + 频道 JSONL + 各成员 trace 链重建，仿 `restore_run`；单条消息过 blob 门落**专用**目录 `scratchpad/cohort/<id>/` 存预览+指针）。
+> 已实现：P0 骨架（顺序轮转、`channel` post/leave、围栏 delta、收尾各出报告、频道 JSONL 逐行落盘）+ P1（会 yield 的可 resume 委派：`to:"parent"` 异步发问 → AskParent yield、成员失败 → Stalled yield、`cohort(resume, answer?)` 注入续跑、`cohort(action:"channel", id)` 父按需看频道过 blob 门、cohorts map 按 scope 隔离+cap 逐出、报告写入**共享** reports map 供父 `agent(attach=[run id])`）+ P2（崩溃恢复：`cohort-<id>.meta.json` 每次 pause 整体重写、Done 时删除；重启后 `resume`/`channel` 内存无此 cohort 时从 meta + 频道 JSONL + 各成员 trace 链重建，仿 `restore_run`；单条消息过 blob 门落**专用**目录 `scratchpad/cohort/<id>/` 存预览+指针）+ P3（首次及 roster 变化时精确注入概览、成员离开后从轮转收缩、`detached:true` 报告只保留 attach 指针、收尾成员换掉失效 `channel` 工具后 park 进共享 `live` 供直接追问、顶层编排 prompt）。
 >
-> 与本文的偏差（有意）：① 频道身份用成员局部 id `m1..mN`（非 trace run_id），与 `to` 目标一致、且不依赖首个 activation 才产生的 run_id；trace 链内部仍用真实 run_id 的 `resume_of`。② 收尾后**未**把成员 park 进共享 `live` 供 `agent(resume=member)` 直接追问（parked Agent 的 toolset 里还挂着已失效的 channel 工具,需另解）——但报告已可 `attach`。③ meta 只在 pause 出口落盘（非每个成员 turn），故首个 activation 尚未 yield 前崩溃不可恢复（频道 JSONL 仍在，但无 meta 即不可 resume）——符合 §11「每个调度出口 persist」的契约。
+> 与本文的偏差（有意）：① 频道身份用成员局部 id `m1..mN`（非 trace run_id），与 `to` 目标一致、且不依赖首个 activation 才产生的 run_id；trace 链内部仍用真实 run_id 的 `resume_of`。② meta 只在 pause 出口落盘（非每个成员 turn），故首个 activation 尚未 yield 前崩溃不可恢复（频道 JSONL 仍在，但无 meta 即不可 resume）——符合 §11「每个调度出口 persist」的契约。
 
 ## 1. 目标与非目标
 
@@ -269,7 +269,7 @@ fn drive_cohort(cohort) -> CohortOutcome {
 - **P0（骨架）**：`build_run`/`sub_tools` 注入口子 + `cohort` 工具入口 + `Cohort`/`Channel` 结构 + 顺序轮转（完整 turn 为 activation）+ `channel` 工具（`post`/`leave`）+ 围栏注入 delta + 收尾各写报告（含失败降级）+ 频道 JSONL 逐行持久化。跑通"两个成员辩论 ≤5 轮各出报告"（此阶段无 yield，跑满即返回）。
 - **P1（yield/resume + 问父）**：调度出口改为会 yield（§5）+ `to:"parent"` 异步发问 + `cohort(resume, answer?)` 注入续跑 + `cohort { action:"channel" }` 父级按需看频道 + 定向 `to` + 成员 `ask_user` 问人 + 收尾后 park 成员进 `live` 供追问。
 - **P2（崩溃恢复 + 体量）**：meta 落盘/重建（仿 `restore_run`）+ 成员失败降级 Left→yield + `/resume` 后续跑 + §6 blob 门落盘专用目录 + 大消息 pull-on-demand + scope 逐出。
-- **P3（打磨）**：cohort 概览注入、成员早退收缩、detached report 联动、编排 prompt。
+- **P3（打磨，已实现）**：cohort 概览注入、成员早退收缩、detached report 联动、编排 prompt；收尾成员替换掉 cohort 专用 `channel` 工具后 park 进共享 `live`，可经 `agent(resume=member)` 直接追问。
 
 ## 17. 测试策略
 

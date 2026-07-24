@@ -209,11 +209,20 @@ impl TaskTraces {
     /// session the run had in memory. `None` when this session records no such
     /// run, or when `id` is not a shape it could have issued.
     pub fn restore(&self, id: &str) -> Option<(TaskRunMeta, Ledger)> {
+        let load = self.restore_load(id)?;
+        Some((load.meta, load.ledger))
+    }
+
+    /// Rebuild a run's whole conversation together with the recorded batch
+    /// labels needed to replay it exactly. This is the trace-view counterpart
+    /// to [`restore`](Self::restore); callers that render the result should use
+    /// this form rather than losing batch grouping for resumed turns.
+    pub fn restore_load(&self, id: &str) -> Option<TaskRunLoad> {
         let path = self.trace_path(id)?;
         let root = self.root.as_ref()?;
         let mut ledger = Ledger::new();
-        let mut labels = Vec::new();
-        let meta = replay_into(&path, &mut ledger, &mut labels).ok()?;
+        let mut batch_labels = Vec::new();
+        let meta = replay_into(&path, &mut ledger, &mut batch_labels).ok()?;
         for follow in Self::discover(root)
             .into_iter()
             .filter(|meta| meta.resume_of.as_deref() == Some(id))
@@ -222,11 +231,15 @@ impl TaskTraces {
             // A follow-up whose file is unreadable stops the chain: replaying
             // a later turn over a missing earlier one would silently invent a
             // conversation that never happened.
-            if replay_into(&path, &mut ledger, &mut labels).is_err() {
+            if replay_into(&path, &mut ledger, &mut batch_labels).is_err() {
                 break;
             }
         }
-        Some((meta, ledger))
+        Some(TaskRunLoad {
+            meta,
+            ledger,
+            batch_labels,
+        })
     }
 
     /// Load one trace for replay.
@@ -573,6 +586,10 @@ mod tests {
         assert_eq!(load.meta.usage.output_tokens, 20);
         assert_eq!(load.ledger.len(), 2);
         assert_eq!(load.batch_labels, vec![(1, "Read 2 files".to_string())]);
+
+        let restored = traces.restore_load(&id).expect("restorable trace");
+        assert_eq!(restored.ledger.len(), 2);
+        assert_eq!(restored.batch_labels, vec![(1, "Read 2 files".to_string())]);
 
         let _ = fs::remove_dir_all(&root);
     }

@@ -272,6 +272,7 @@ impl SessionView {
                 model,
                 prompt,
                 summary,
+                ..
             } => {
                 let block = self.begin_task_card(run, parent_call, summary);
                 let card = UiTaskRun::new(

@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::config::WatchdogConfig;
 use tcode_core::{
     ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
-    ContentBlock, DelegateEvent, DelegatedApprovalRequest, Entry, ModelCell, PermissionMode,
-    PermissionRequest, PermissionRules, ProviderSafetyClassifier, SafetyClassifier, Session,
-    TaskRunStatus, Tool, ToolCtx, ToolOutput,
+    CohortMemberRun, ContentBlock, DelegateEvent, DelegatedApprovalRequest, Entry, ModelCell,
+    PermissionMode, PermissionRequest, PermissionRules, ProviderSafetyClassifier, SafetyClassifier,
+    Session, TaskRunStatus, Tool, ToolCtx, ToolOutput,
 };
 
 use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry, QuestionPolicy};
@@ -734,6 +734,7 @@ impl Tool for AgentTool {
                 &summary,
                 call_id,
                 None,
+                None,
                 ctx,
                 cancel,
             )
@@ -986,6 +987,7 @@ impl AgentTool {
                 summary,
                 call_id,
                 Some(id),
+                None,
                 ctx,
                 cancel,
             )
@@ -1088,6 +1090,9 @@ impl AgentTool {
         // The parked run this turn continues, so the trace chain can rebuild
         // the whole conversation from disk later.
         resume_of: Option<&str>,
+        // Cohort identity for UI-only membership cards. Ordinary delegation
+        // stays `None` and keeps its existing generic task-card behavior.
+        cohort_member: Option<CohortMemberRun>,
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> Result<TaskRunOutcome, TaskRunFailure> {
@@ -1114,6 +1119,7 @@ impl AgentTool {
                 model: model_name.to_string(),
                 prompt: prompt.to_string(),
                 summary: summary.to_string(),
+                cohort_member,
             });
         }
 

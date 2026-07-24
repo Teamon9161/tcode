@@ -78,6 +78,7 @@ impl App {
         }
         self.meter.forget_cache_baseline();
         self.progress.clear();
+        self.cohorts.clear();
         self.task_trace_root = self.session.as_ref().and_then(task_trace_root);
         self.task_runs = discover_task_runs(self.task_trace_root.as_deref());
         self.active_view = ViewId::Main;
@@ -279,13 +280,15 @@ impl App {
         view.transcript.push(prompt_echo(&prompt, &[]));
         let mut consumed = 0;
         if status != tcode_core::TaskRunStatus::Running {
-            if let Some(path) = path.filter(|path| path.exists()) {
-                match tcode_core::TaskTraces::load(&path) {
-                    Ok(load) => {
+            if path.is_some_and(|path| path.exists()) {
+                let mut traces = tcode_core::TaskTraces::default();
+                traces.bind_root(self.task_trace_root.clone());
+                match traces.restore_load(&run_id) {
+                    Some(load) => {
                         view.replay_task_ledger(load.ledger.entries(), &load.batch_labels, &mut ctx)
                     }
-                    Err(error) => view.bake(vec![Line::styled(
-                        format!("could not load trace: {error}"),
+                    None => view.bake(vec![Line::styled(
+                        "could not load trace",
                         theme::error_highlight(),
                     )]),
                 }

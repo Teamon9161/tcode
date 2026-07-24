@@ -35,7 +35,10 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::blobs::BlobStore;
-use tcode_core::{Agent, PermissionRequest, Session, Tool, ToolCtx, ToolOutput};
+use tcode_core::{
+    Agent, CohortMember as CohortMemberView, CohortMemberRun, CohortMemberStatus, CohortUpdate,
+    DelegateEvent, PermissionRequest, Session, Tool, ToolCtx, ToolOutput,
+};
 
 use super::AgentTool;
 
@@ -241,6 +244,11 @@ struct Member {
     run_id: Option<String>,
     /// How far into the channel this member has read.
     cursor: usize,
+    /// The roster snapshot this member has already received. The complete
+    /// roster is sent once; later turns receive a new snapshot only when
+    /// someone left, so roster awareness does not turn into repeated prompt
+    /// overhead.
+    seen_roster_revision: usize,
     /// Still in the round-robin. Cleared by `channel_leave` or a failed turn.
     active: bool,
     /// Set by this member's `channel` tool when it calls `channel_leave`.
@@ -366,10 +374,25 @@ struct Cohort {
     /// Next member index to activate within `round`; preserved across a yield so
     /// the rest of the round runs before the next round on resume (§9).
     next_index: usize,
+    /// Increments whenever a member leaves the active roster. Members receive
+    /// an updated overview at most once per revision.
+    roster_revision: usize,
+    /// Whether completion returns full reports or only their attachable run ids.
+    detached_reports: bool,
     /// Parent `cohort` call, so member traces tie back to the spawning entry.
     call_id: String,
     /// Park order for oldest-first eviction.
     seq: u64,
+}
+
+/// Presentation-only scheduler phase for a complete cohort roster snapshot.
+/// The scheduler keeps the authoritative mechanics on `Member`; this enum
+/// only gives frontends a truthful state without parsing prompt summaries.
+enum CohortViewPhase<'a> {
+    Waiting,
+    Running(&'a str),
+    Finalizing,
+    Done,
 }
 
 /// The small resumable state persisted at each scheduler exit (§11), rewritten
@@ -385,6 +408,10 @@ struct CohortMeta {
     round: usize,
     max_rounds: usize,
     next_index: usize,
+    #[serde(default)]
+    roster_revision: usize,
+    #[serde(default)]
+    detached_reports: bool,
     members: Vec<MemberMeta>,
 }
 
@@ -398,6 +425,8 @@ struct MemberMeta {
     task: String,
     run_id: Option<String>,
     cursor: usize,
+    #[serde(default)]
+    seen_roster_revision: usize,
     active: bool,
     left: bool,
 }
@@ -512,7 +541,7 @@ impl CohortTool {
     }
 
     /// Parse and validate `members`/`tasks`/`max_rounds`.
-    fn parse(&self, input: &Value) -> Result<(Vec<(String, String)>, usize), String> {
+    fn parse(&self, input: &Value) -> Result<(Vec<(String, String)>, usize, bool), String> {
         let members = input["members"]
             .as_array()
             .ok_or("`members` must be an array of agent-kind strings")?;
@@ -550,20 +579,72 @@ impl CohortTool {
             .as_u64()
             .map(|rounds| (rounds as usize).clamp(1, MAX_ROUNDS_CAP))
             .unwrap_or(DEFAULT_MAX_ROUNDS);
-        Ok((pairs, max_rounds))
+        let detached_reports = match input.get("detached") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => return Err("`detached` must be true or false".to_string()),
+        };
+        Ok((pairs, max_rounds, detached_reports))
     }
 
-    /// A one-line overview of who is in the cohort and what each was asked,
-    /// so no member spends tokens probing what the others are doing.
+    /// A concise roster snapshot. Members receive it on their first turn and
+    /// once after each departure; ordinary turns carry only channel deltas.
     fn overview(members: &[Member], me: &str) -> String {
-        let mut out = format!("Cohort of {} members. You are `{me}`.\n", members.len());
-        for member in members {
+        let active = members.iter().filter(|member| member.active).count();
+        let finished = members.len() - active;
+        let mut out = format!(
+            "Cohort roster: {active} active, {finished} finished. You are `{me}`.\nActive members:\n"
+        );
+        for member in members.iter().filter(|member| member.active) {
             out.push_str(&format!(
                 "- {} ({}): {}\n",
                 member.id, member.kind, member.task
             ));
         }
+        if finished > 0 {
+            out.push_str("Finished members (they only return for final reports):\n");
+            for member in members.iter().filter(|member| !member.active) {
+                out.push_str(&format!("- {} ({})\n", member.id, member.kind));
+            }
+        }
         out
+    }
+
+    /// Publish one complete scheduler snapshot for frontend transcript cards.
+    /// This uses the delegate stream just like normal task progress, but carries
+    /// typed roster state instead of asking renderers to reverse-engineer it.
+    fn announce(&self, cohort: &Cohort, phase: CohortViewPhase<'_>, ctx: &ToolCtx) {
+        let Some(delegate) = ctx.delegate_reporter() else {
+            return;
+        };
+        let members = cohort
+            .members
+            .iter()
+            .map(|member| {
+                let status = match phase {
+                    CohortViewPhase::Running(id) if member.id == id => CohortMemberStatus::Running,
+                    CohortViewPhase::Finalizing => CohortMemberStatus::Finalizing,
+                    CohortViewPhase::Done => CohortMemberStatus::Done,
+                    _ if member.active => CohortMemberStatus::Waiting,
+                    _ if member.left.load(Ordering::SeqCst) => CohortMemberStatus::Left,
+                    _ => CohortMemberStatus::Failed,
+                };
+                CohortMemberView {
+                    id: member.id.clone(),
+                    kind: member.kind.clone(),
+                    task: member.task.clone(),
+                    run: member.run_id.clone(),
+                    status,
+                }
+            })
+            .collect();
+        let _ = delegate.send(DelegateEvent::CohortUpdated(CohortUpdate {
+            id: cohort.id.clone(),
+            parent_call: cohort.call_id.clone(),
+            round: cohort.round,
+            max_rounds: cohort.max_rounds,
+            members,
+        }));
     }
 }
 
@@ -594,6 +675,10 @@ impl Tool for CohortTool {
                 "max_rounds": {
                     "type": "integer",
                     "description": "Convene: debate rounds before finalizing (default 5). Each round is one turn per member."
+                },
+                "detached": {
+                    "type": "boolean",
+                    "description": "Convene: keep final reports only in the attach store and return their run ids instead of placing report text in this context (default false)."
                 },
                 "resume": {
                     "type": "string",
@@ -643,7 +728,7 @@ impl Tool for CohortTool {
             .map(str::trim)
             .is_some_and(|id| !id.is_empty())
         {
-            return self.resume(&input, ctx, cancel).await;
+            return self.resume(call_id, &input, ctx, cancel).await;
         }
         // Otherwise convene a fresh cohort.
         self.convene(&input, call_id, ctx, cancel).await
@@ -659,21 +744,29 @@ impl CohortTool {
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> ToolOutput {
-        let (pairs, max_rounds) = match self.parse(input) {
+        let (pairs, max_rounds, detached_reports) = match self.parse(input) {
             Ok(parsed) => parsed,
             Err(reason) => return ToolOutput::err(reason),
         };
-        let mut cohort = match self.build_cohort(pairs, max_rounds, call_id, ctx) {
+        let mut cohort = match self.build_cohort(pairs, max_rounds, detached_reports, call_id, ctx)
+        {
             Ok(cohort) => cohort,
             Err(out) => return out,
         };
+        self.announce(&cohort, CohortViewPhase::Waiting, ctx);
         let outcome = self.drive_to_exit(&mut cohort, ctx, cancel).await;
         self.handle_outcome(cohort, outcome, ctx)
     }
 
     /// Resume a paused cohort, injecting the parent's `answer` (if any) as a
     /// `from: parent` channel message before driving on to the next exit.
-    async fn resume(&self, input: &Value, ctx: &ToolCtx, cancel: &CancellationToken) -> ToolOutput {
+    async fn resume(
+        &self,
+        call_id: &str,
+        input: &Value,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> ToolOutput {
         let id = input["resume"].as_str().map(str::trim).unwrap_or_default();
         if !valid_cohort_id(id) {
             return ToolOutput::err(format!("'{id}' is not a valid cohort id (want c<number>)"));
@@ -697,6 +790,10 @@ impl CohortTool {
                 ids.join(", ")
             ));
         };
+        // A resumed cohort now belongs to this tool record for transcript
+        // updates and any member activations it schedules from here onward.
+        cohort.call_id = call_id.to_string();
+        self.announce(&cohort, CohortViewPhase::Waiting, ctx);
         // The reply is another agent-or-human message: still data (§10), it
         // enters the channel like any post and is fenced when members read it.
         if let Some(answer) = input["answer"]
@@ -757,6 +854,7 @@ impl CohortTool {
         &self,
         pairs: Vec<(String, String)>,
         max_rounds: usize,
+        detached_reports: bool,
         call_id: &str,
         ctx: &ToolCtx,
     ) -> Result<Cohort, ToolOutput> {
@@ -810,6 +908,7 @@ impl CohortTool {
                 model_name,
                 run_id: None,
                 cursor: 0,
+                seen_roster_revision: 0,
                 active: true,
                 left,
             });
@@ -822,6 +921,8 @@ impl CohortTool {
             round: 0,
             max_rounds,
             next_index: 0,
+            roster_revision: 1,
+            detached_reports,
             call_id: call_id.to_string(),
             seq: next_cohort_seq(),
         })
@@ -893,6 +994,7 @@ impl CohortTool {
                 model_name,
                 run_id: meta.run_id.clone(),
                 cursor,
+                seen_roster_revision: meta.seen_roster_revision,
                 active: meta.active,
                 left,
             });
@@ -905,6 +1007,8 @@ impl CohortTool {
             round: meta.round,
             max_rounds: meta.max_rounds,
             next_index: meta.next_index,
+            roster_revision: meta.roster_revision,
+            detached_reports: meta.detached_reports,
             call_id: meta.call_id,
             seq: next_cohort_seq(),
         })
@@ -928,6 +1032,8 @@ impl CohortTool {
             round: cohort.round,
             max_rounds: cohort.max_rounds,
             next_index: cohort.next_index,
+            roster_revision: cohort.roster_revision,
+            detached_reports: cohort.detached_reports,
             members: cohort
                 .members
                 .iter()
@@ -937,6 +1043,7 @@ impl CohortTool {
                     task: member.task.clone(),
                     run_id: member.run_id.clone(),
                     cursor: member.cursor,
+                    seen_roster_revision: member.seen_roster_revision,
                     active: member.active,
                     left: member.left.load(Ordering::SeqCst),
                 })
@@ -1002,15 +1109,26 @@ impl CohortTool {
                     continue;
                 }
                 let round = cohort.round;
-                let overview = Self::overview(&cohort.members, &cohort.members[index].id);
+                let roster_revision = cohort.roster_revision;
+                let overview = {
+                    let member = &cohort.members[index];
+                    (member.run_id.is_none() || member.seen_roster_revision != roster_revision)
+                        .then(|| Self::overview(&cohort.members, &member.id))
+                };
                 let (delta, before_len) = {
                     let ch = channel.lock().expect("cohort channel lock");
                     (ch.delta(cohort.members[index].cursor), ch.log.len())
                 };
-                let prompt = round_prompt(&cohort.members[index], round, &overview, &delta);
+                let prompt =
+                    round_prompt(&cohort.members[index], round, overview.as_deref(), &delta);
                 let summary = format!("cohort {cohort_id} {} r{round}", cohort.members[index].id);
 
+                let member_id = cohort.members[index].id.clone();
+                self.announce(cohort, CohortViewPhase::Running(&member_id), ctx);
                 let member = &mut cohort.members[index];
+                if overview.is_some() {
+                    member.seen_roster_revision = roster_revision;
+                }
                 let resume_of = member.run_id.clone();
                 let result = self
                     .inner
@@ -1023,6 +1141,10 @@ impl CohortTool {
                         &summary,
                         &call_id,
                         resume_of.as_deref(),
+                        Some(CohortMemberRun {
+                            cohort_id: cohort_id.clone(),
+                            member_id: member_id.clone(),
+                        }),
                         ctx,
                         cancel,
                     )
@@ -1038,10 +1160,12 @@ impl CohortTool {
                     // A failed member turn drops it from the rounds and yields
                     // so the parent knows; it still finalizes a report (§8/§9).
                     Err(fail) => {
-                        if member.run_id.is_none() {
-                            member.run_id = Some(fail.run_id);
+                        if cohort.members[index].run_id.is_none() {
+                            cohort.members[index].run_id = Some(fail.run_id);
                         }
-                        member.active = false;
+                        cohort.members[index].active = false;
+                        cohort.roster_revision += 1;
+                        self.announce(cohort, CohortViewPhase::Waiting, ctx);
                         return CohortOutcome::Stalled {
                             member: cohort.members[index].id.clone(),
                             reason: fail.reason,
@@ -1053,9 +1177,12 @@ impl CohortTool {
                     ch.log.len()
                 };
                 cohort.members[index].cursor = after_len;
-                if cohort.members[index].left.load(Ordering::SeqCst) {
+                if cohort.members[index].left.load(Ordering::SeqCst) && cohort.members[index].active
+                {
                     cohort.members[index].active = false;
+                    cohort.roster_revision += 1;
                 }
+                self.announce(cohort, CohortViewPhase::Waiting, ctx);
                 if cancel.is_cancelled() {
                     return CohortOutcome::Cancelled;
                 }
@@ -1100,6 +1227,7 @@ impl CohortTool {
         let channel = cohort.channel.clone();
         let scope = cohort.scope.clone();
         let rounds_run = cohort.round;
+        self.announce(cohort, CohortViewPhase::Finalizing, ctx);
         let mut reports = Vec::with_capacity(cohort.members.len());
         for member in &mut cohort.members {
             channel.lock().expect("cohort channel lock").round = rounds_run;
@@ -1128,6 +1256,10 @@ impl CohortTool {
                     &summary,
                     &call_id,
                     resume_of.as_deref(),
+                    Some(CohortMemberRun {
+                        cohort_id: cohort_id.clone(),
+                        member_id: member.id.clone(),
+                    }),
                     ctx,
                     cancel,
                 )
@@ -1158,6 +1290,7 @@ impl CohortTool {
                 report,
             });
         }
+        self.announce(cohort, CohortViewPhase::Done, ctx);
         reports
     }
 
@@ -1188,27 +1321,90 @@ impl CohortTool {
             .flatten()
     }
 
+    /// Move completed members with a follow-up budget into the shared `live`
+    /// store. Their debate-only `channel` tool cannot survive the cohort: it
+    /// would still write to an orphaned log no scheduler reads. Rebuild the
+    /// agent's normal toolset while preserving the completed session and its
+    /// cache scope, so `agent(resume=...)` is a real ordinary follow-up.
+    fn park_finalized_members(&self, cohort: &mut Cohort, ctx: &ToolCtx) -> Vec<String> {
+        let mut parked = Vec::new();
+        for member in &mut cohort.members {
+            let Some(run_id) = member.run_id.clone() else {
+                continue;
+            };
+            let Some(def) = self.inner.def_for(&member.kind) else {
+                continue;
+            };
+            if def.max_exchanges == 0 {
+                continue;
+            }
+            let model = member.agent.model.snapshot();
+            let (agent, replacement, _) = self.inner.build_run(def, ctx, Some(model));
+            let session = std::mem::replace(&mut member.session, replacement);
+            self.inner.park(
+                &run_id,
+                super::LiveTask {
+                    agent,
+                    session,
+                    exchanges_left: def.max_exchanges,
+                    def_name: def.name.clone(),
+                    model_name: member.model_name.clone(),
+                    scope: cohort.scope.clone(),
+                    seq: super::next_park_seq(),
+                },
+            );
+            parked.push(run_id);
+        }
+        parked
+    }
+
     /// Turn a scheduler exit into the tool result. A finished cohort returns its
     /// N reports; a yield parks the cohort and returns how to resume it.
-    fn handle_outcome(&self, cohort: Cohort, outcome: CohortOutcome, ctx: &ToolCtx) -> ToolOutput {
+    fn handle_outcome(
+        &self,
+        mut cohort: Cohort,
+        outcome: CohortOutcome,
+        ctx: &ToolCtx,
+    ) -> ToolOutput {
         match outcome {
             CohortOutcome::Done(reports) => {
                 // Finished: its reports are returned and it must not resume.
                 self.remove_cohort_meta(&cohort.id, ctx);
+                let parked = self.park_finalized_members(&mut cohort, ctx);
                 let mut out = format!(
-                    "[cohort {}: {} members debated {} round{}; {} independent reports below — \
-                     attach any by its run id]\n",
+                    "[cohort {}: {} members debated {} round{}; {} independent reports{}]\n",
                     cohort.id,
                     cohort.members.len(),
                     cohort.round,
                     if cohort.round == 1 { "" } else { "s" },
                     reports.len(),
+                    if cohort.detached_reports {
+                        " kept detached for attach"
+                    } else {
+                        " below — attach any by its run id"
+                    },
                 );
-                for report in &reports {
-                    let run = report.run_id.as_deref().unwrap_or("—");
+                if cohort.detached_reports {
+                    for report in &reports {
+                        let run = report.run_id.as_deref().unwrap_or("—");
+                        out.push_str(&format!(
+                            "- {} ({}) · run {run}\n",
+                            report.member, report.kind
+                        ));
+                    }
+                } else {
+                    for report in &reports {
+                        let run = report.run_id.as_deref().unwrap_or("—");
+                        out.push_str(&format!(
+                            "\n── {} ({}) · run {run} ──\n{}\n",
+                            report.member, report.kind, report.report
+                        ));
+                    }
+                }
+                if !parked.is_empty() {
                     out.push_str(&format!(
-                        "\n── {} ({}) · run {run} ──\n{}\n",
-                        report.member, report.kind, report.report
+                        "Follow up directly with agent(agent=<kind>, resume=<run id>): {}.\n",
+                        parked.join(", ")
                     ));
                 }
                 ToolOutput::ok(out)
@@ -1246,8 +1442,14 @@ impl CohortTool {
 /// The user-turn prompt for one debate-round activation. The first activation
 /// carries the shared discipline and the cohort overview; later ones append
 /// only the new channel delta, keeping the member's prefix cache-stable.
-fn round_prompt(member: &Member, round: usize, overview: &str, delta: &[ChannelMsg]) -> String {
+fn round_prompt(
+    member: &Member,
+    round: usize,
+    overview: Option<&str>,
+    delta: &[ChannelMsg],
+) -> String {
     if member.run_id.is_none() {
+        let overview = overview.expect("first cohort activation always includes the roster");
         let mut prompt = format!(
             "{MEMBER_PREAMBLE}\n\n{overview}\nYour assigned task:\n{}\n",
             member.task
@@ -1256,18 +1458,22 @@ fn round_prompt(member: &Member, round: usize, overview: &str, delta: &[ChannelM
             prompt.push_str("\nChannel so far:\n");
             prompt.push_str(&fence_channel(delta));
         }
-        prompt
-    } else {
-        let mut prompt = format!("Round {round}.\n");
-        if delta.is_empty() {
-            prompt.push_str(
-                "No new channel messages since your last turn. Post if you have something to add, \
-                 or use channel_leave if you are done.\n",
-            );
-        } else {
-            prompt.push_str("New channel activity:\n");
-            prompt.push_str(&fence_channel(delta));
-        }
-        prompt
+        return prompt;
     }
+
+    let mut prompt = format!("Round {round}.\n");
+    if let Some(overview) = overview {
+        prompt.push_str("Cohort roster changed:\n");
+        prompt.push_str(overview);
+    }
+    if delta.is_empty() {
+        prompt.push_str(
+            "No new channel messages since your last turn. Post if you have something to add, \
+             or use channel_leave if you are done.\n",
+        );
+    } else {
+        prompt.push_str("New channel activity:\n");
+        prompt.push_str(&fence_channel(delta));
+    }
+    prompt
 }

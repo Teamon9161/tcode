@@ -114,14 +114,22 @@ fn text_done(text: &str) -> Vec<StreamEvent> {
     ]
 }
 
-fn cohort_tool(provider: Arc<MockProvider>, cwd: &std::path::Path) -> tcode_tools::CohortTool {
-    tcode_tools::AgentTool::new(
+fn agent_and_cohort(
+    provider: Arc<MockProvider>,
+    cwd: &std::path::Path,
+) -> (tcode_tools::AgentTool, tcode_tools::CohortTool) {
+    let agent = tcode_tools::AgentTool::new(
         cell(provider),
         WatchdogConfig::default(),
         4000,
         cwd.to_path_buf(),
-    )
-    .cohort_tool()
+    );
+    let cohort = agent.cohort_tool();
+    (agent, cohort)
+}
+
+fn cohort_tool(provider: Arc<MockProvider>, cwd: &std::path::Path) -> tcode_tools::CohortTool {
+    agent_and_cohort(provider, cwd).1
 }
 
 /// A post-then-end debate turn: two scripted responses.
@@ -616,4 +624,171 @@ async fn mismatched_members_and_tasks_is_a_self_healing_error() {
         .await;
     assert!(out.is_error);
     assert!(out.content.contains("same length"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn a_departure_updates_the_remaining_members_roster_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    // Round 0: m2 leaves after both members received their initial roster.
+    scripts.extend(post("a", "m1 is still investigating"));
+    scripts.extend(leave("b"));
+    // Round 1: only m1 remains and receives the shrunken roster before leaving.
+    scripts.extend(leave("c"));
+    scripts.push(text_done("m1 report"));
+    scripts.push(text_done("m2 report"));
+
+    let provider = MockProvider::new(scripts);
+    let tool = cohort_tool(provider.clone(), dir.path());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 4000);
+
+    let out = tool
+        .run(
+            serde_json::json!({
+                "members": ["explore", "explore"],
+                "tasks": ["t", "t"],
+                "max_rounds": 3
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    let requests = provider.requests.lock().unwrap();
+    let roster_update = requests
+        .iter()
+        .map(req_text)
+        .find(|text| text.contains("Cohort roster changed:"))
+        .expect("m1 never received the shrunken roster");
+    assert!(
+        roster_update.contains("1 active, 1 finished"),
+        "{roster_update}"
+    );
+    assert!(
+        roster_update
+            .contains("Finished members (they only return for final reports):\n- m2 (explore)"),
+        "{roster_update}"
+    );
+    // m2's early leave removed it from the next round rather than merely
+    // telling m1 about it.
+    assert_eq!(
+        requests.len(),
+        8,
+        "the departed member received another debate activation"
+    );
+}
+
+#[tokio::test]
+async fn detached_reports_stay_attachable_without_entering_the_parent_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    scripts.extend(leave("a"));
+    scripts.extend(leave("b"));
+    scripts.push(text_done("REPORT ONE: private finding"));
+    scripts.push(text_done("REPORT TWO: private finding"));
+    scripts.push(text_done("consumer read the detached report"));
+
+    let provider = MockProvider::new(scripts);
+    let (agent, tool) = agent_and_cohort(provider.clone(), dir.path());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 4000);
+    let out = tool
+        .run(
+            serde_json::json!({
+                "members": ["explore", "explore"],
+                "tasks": ["t", "t"],
+                "max_rounds": 2,
+                "detached": true
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("kept detached for attach"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("run t1"), "{}", out.content);
+    assert!(out.content.contains("run t2"), "{}", out.content);
+    assert!(!out.content.contains("REPORT ONE"), "{}", out.content);
+    assert!(!out.content.contains("REPORT TWO"), "{}", out.content);
+
+    let attached = agent
+        .run(
+            serde_json::json!({
+                "agent": "general",
+                "prompt": "use the attached finding",
+                "attach": ["t1"]
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!attached.is_error, "{}", attached.content);
+    let requests = provider.requests.lock().unwrap();
+    assert!(
+        req_text(requests.last().expect("attached run missing"))
+            .contains("REPORT ONE: private finding"),
+        "the detached report was not retained for attach"
+    );
+}
+
+#[tokio::test]
+async fn a_finalized_member_resumes_without_its_defunct_channel_tool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut scripts = Vec::new();
+    scripts.extend(leave("a"));
+    scripts.extend(leave("b"));
+    scripts.push(text_done("m1 final report"));
+    scripts.push(text_done("m2 final report"));
+    scripts.push(text_done("m1 follow-up report"));
+
+    let provider = MockProvider::new(scripts);
+    let (agent, cohort) = agent_and_cohort(provider.clone(), dir.path());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 4000);
+
+    let done = cohort
+        .run(
+            serde_json::json!({
+                "members": ["explore", "explore"],
+                "tasks": ["t", "t"],
+                "max_rounds": 2
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!done.is_error, "{}", done.content);
+    assert!(
+        done.content.contains("Follow up directly"),
+        "{}",
+        done.content
+    );
+
+    let follow_up = agent
+        .run(
+            serde_json::json!({
+                "agent": "explore",
+                "resume": "t1",
+                "prompt": "reconsider the trade-off"
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(!follow_up.is_error, "{}", follow_up.content);
+    assert!(
+        follow_up.content.contains("m1 follow-up report"),
+        "{}",
+        follow_up.content
+    );
+    let requests = provider.requests.lock().unwrap();
+    let resumed = requests.last().expect("follow-up request missing");
+    assert!(
+        resumed.tools.iter().all(|tool| tool.name != "channel"),
+        "a finalized member kept its defunct cohort channel tool"
+    );
 }

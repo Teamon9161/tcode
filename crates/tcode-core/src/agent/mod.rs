@@ -141,6 +141,9 @@ pub enum AgentEvent {
     /// Usage spent inside a delegated `task` sub-agent. It contributes to
     /// cost/turn statistics, but not to the parent's context-window meter.
     DelegatedUsage(Usage),
+    /// A cohort scheduler supplied a complete member roster for a transcript
+    /// view. This is display-only and never enters the provider ledger.
+    CohortUpdated(crate::tool::CohortUpdate),
     /// A `task` sub-agent run began. Trace/display only — nothing here enters
     /// the parent's provider ledger.
     TaskRunStarted {
@@ -152,6 +155,8 @@ pub enum AgentEvent {
         prompt: String,
         /// One-line parent-authored description for task lists.
         summary: String,
+        /// Cohort membership when this is one scheduled member activation.
+        cohort_member: Option<crate::tool::CohortMemberRun>,
     },
     /// One event from inside a running sub-agent, tagged with its run id.
     /// Streaming deltas arrive coalesced; `Usage`/`DelegatedUsage` inside
@@ -2548,6 +2553,7 @@ impl Agent {
     ) -> Result<(), AgentError> {
         let ev = match ev {
             DelegateEvent::Usage(usage) => AgentEvent::DelegatedUsage(usage),
+            DelegateEvent::CohortUpdated(update) => AgentEvent::CohortUpdated(update),
             DelegateEvent::TaskStarted {
                 run,
                 parent_call,
@@ -2555,6 +2561,7 @@ impl Agent {
                 model,
                 prompt,
                 summary,
+                cohort_member,
             } => AgentEvent::TaskRunStarted {
                 run,
                 parent_call,
@@ -2562,6 +2569,7 @@ impl Agent {
                 model,
                 prompt,
                 summary,
+                cohort_member,
             },
             DelegateEvent::TaskEvent { run, event } => AgentEvent::TaskRunEvent { run, event },
             DelegateEvent::TaskFinished {

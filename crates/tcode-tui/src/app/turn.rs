@@ -460,6 +460,7 @@ impl App {
                 self.meter.on_delegated_usage(u);
                 self.state_label = "sub-agent working".into();
             }
+            AgentEvent::CohortUpdated(update) => self.on_cohort_updated(update),
             AgentEvent::TaskRunEvent { run, event } => self.on_task_run_event(run, *event),
             AgentEvent::TaskRunStarted {
                 run,
@@ -468,7 +469,16 @@ impl App {
                 model,
                 prompt,
                 summary,
-            } => self.on_task_run_started(run, parent_call, kind, model, prompt, summary),
+                cohort_member,
+            } => self.on_task_run_started(
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                summary,
+                cohort_member,
+            ),
             AgentEvent::TaskRunFinished {
                 run,
                 status,
@@ -725,6 +735,7 @@ impl App {
                 model,
                 prompt,
                 summary,
+                ..
             } => {
                 if let Some(parent) = self.task_runs.iter().find(|entry| entry.id == run) {
                     let entry = UiTaskRun::new(
@@ -775,8 +786,9 @@ impl App {
         }
     }
 
-    /// A sub-agent run began. Its live trace card hangs off the parent call's
-    /// header block, which a batch item has to bake early to obtain.
+    /// A sub-agent run began. Ordinary task cards hang off their parent call;
+    /// cohort activations instead reuse the persistent member-owned card that
+    /// the typed roster event created.
     pub(super) fn on_task_run_started(
         &mut self,
         run: String,
@@ -785,7 +797,25 @@ impl App {
         model: String,
         prompt: String,
         summary: String,
+        cohort_member: Option<CohortMemberRun>,
     ) {
+        if let Some((block, member_summary)) = cohort_member
+            .as_ref()
+            .and_then(|membership| self.cohort_member_started(membership, &run))
+        {
+            self.transcript
+                .set_live_status(block, Some(task_plain_status("starting…")));
+            self.task_runs.push(UiTaskRun::new(
+                run,
+                parent_call,
+                kind,
+                model,
+                prompt,
+                member_summary,
+                Some(block),
+            ));
+            return;
+        }
         // ToolStart always precedes a task's delegated start. Single
         // calls already have a header block; batch calls receive their
         // link when their item bakes at ToolEnd.

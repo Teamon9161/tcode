@@ -110,9 +110,11 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             } => println!("{CYAN}Note:{RESET} {text}"),
             AgentEvent::UserNote { answer: true, .. } => {}
             AgentEvent::Usage(_) | AgentEvent::DelegatedUsage(_) | AgentEvent::RateLimits(_) => {}
-            // Sub-agent trace/progress stream: plain mode already prints the
-            // final report through ToolEnd.
-            AgentEvent::TaskRunStarted { .. }
+            // Cohort roster and sub-agent trace/progress are display-only
+            // observability; plain mode already prints the final report through
+            // the parent tool result.
+            AgentEvent::CohortUpdated(_)
+            | AgentEvent::TaskRunStarted { .. }
             | AgentEvent::TaskRunEvent { .. }
             | AgentEvent::TaskRunFinished { .. } => {}
             AgentEvent::Compacting => {

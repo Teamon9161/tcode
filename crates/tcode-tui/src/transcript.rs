@@ -458,6 +458,18 @@ impl Transcript {
             .flatten()
     }
 
+    /// Replace a block header while retaining its detail, status and trace
+    /// link. Live cohort member cards update their state in place this way,
+    /// rather than accumulating one stale row per scheduler transition.
+    pub fn replace_head_preserving_state(&mut self, index: usize, lines: Vec<Line<'static>>) {
+        if lines.is_empty() || index >= self.blocks.len() {
+            return;
+        }
+        let old_height = self.blocks[index].height();
+        self.blocks[index].head = Content::Lines(lines);
+        self.remeasure(index, old_height);
+    }
+
     /// Extend the last head line of an existing block — a tool-result
     /// preview landing on the call's own header row at `ToolEnd`.
     pub fn extend_head(&mut self, index: usize, spans: Vec<Span<'static>>) {

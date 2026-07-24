@@ -2,6 +2,7 @@
 mod harness;
 
 mod bake;
+mod cohort;
 mod commands;
 mod draw;
 mod input;
@@ -11,6 +12,7 @@ mod turn;
 mod views;
 
 use bake::*;
+use cohort::CohortCard;
 use draw::*;
 use input::*;
 use rewind::*;
@@ -42,7 +44,7 @@ use tcode_core::commands::{
 };
 use tcode_core::{
     Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk,
-    ContentBlock, FolderTrust, PendingMessage, ReferenceCandidate, Session, Usage,
+    CohortMemberRun, ContentBlock, FolderTrust, PendingMessage, ReferenceCandidate, Session, Usage,
 };
 
 use tcode_importers::{
@@ -422,6 +424,9 @@ pub struct App {
     /// Running ones show live in the panel above the input; finished ones
     /// stay as the registry the trace viewer will list.
     task_runs: Vec<UiTaskRun>,
+    /// Persistent roster cards for live cohorts. Unlike the generic agent tree,
+    /// these remain in the transcript so every cohort member stays inspectable.
+    cohorts: HashMap<String, CohortCard>,
     /// Root containing `tN.jsonl` trace files for this selected session. It is
     /// retained while a turn owns `Session`, so task cards can open their
     /// trace during live work.
@@ -617,6 +622,7 @@ impl App {
             pending_batch: VecDeque::new(),
             progress: Vec::new(),
             task_runs,
+            cohorts: HashMap::new(),
             task_trace_root,
             active_view: ViewId::Main,
             trace_view: None,
@@ -1835,6 +1841,7 @@ mod tests {
             model: "m".into(),
             prompt: "do it".into(),
             summary: "do it".into(),
+            cohort_member: None,
         });
         let sub = |ev: AgentEvent| AgentEvent::TaskRunEvent {
             run: "r1".into(),
@@ -1865,6 +1872,7 @@ mod tests {
             model: "m".into(),
             prompt: "look".into(),
             summary: "look at the parser".into(),
+            cohort_member: None,
         }));
         app.on_agent_event(sub(AgentEvent::TaskRunEvent {
             run: "r2".into(),
@@ -1923,6 +1931,7 @@ mod tests {
             model: "m".into(),
             prompt: "inspect".into(),
             summary: "inspect the interaction".into(),
+            cohort_member: None,
         });
         app.frame();
         let (column, row) = (0..30)
@@ -1964,6 +1973,148 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         }));
         assert_eq!(app.active_view, ViewId::TaskRun("r1".into()));
+    }
+
+    #[test]
+    fn cohort_roster_cards_persist_member_tasks_status_and_trace_links() {
+        use tcode_core::{CohortMember, CohortMemberRun, CohortMemberStatus, CohortUpdate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 110, 40);
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "cohort-call".into(),
+            name: "cohort".into(),
+            input: serde_json::json!({"members": ["explore", "plan"]}),
+            summary: String::new(),
+        });
+        let roster = |first_status, second_status| CohortUpdate {
+            id: "c1".into(),
+            parent_call: "cohort-call".into(),
+            round: 0,
+            max_rounds: 2,
+            members: vec![
+                CohortMember {
+                    id: "m1".into(),
+                    kind: "explore".into(),
+                    task: "inspect the parser".into(),
+                    run: Some("t1".into()),
+                    status: first_status,
+                },
+                CohortMember {
+                    id: "m2".into(),
+                    kind: "plan".into(),
+                    task: "design the migration".into(),
+                    run: None,
+                    status: second_status,
+                },
+            ],
+        };
+        app.on_agent_event(AgentEvent::CohortUpdated(roster(
+            CohortMemberStatus::Waiting,
+            CohortMemberStatus::Waiting,
+        )));
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "t1".into(),
+            parent_call: "cohort-call".into(),
+            kind: "explore".into(),
+            model: "m".into(),
+            prompt: "inspect the parser".into(),
+            summary: "scheduler label".into(),
+            cohort_member: Some(CohortMemberRun {
+                cohort_id: "c1".into(),
+                member_id: "m1".into(),
+            }),
+        });
+        app.on_agent_event(AgentEvent::TaskRunEvent {
+            run: "t1".into(),
+            event: Box::new(AgentEvent::ToolStart {
+                call_id: "read-1".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "parser.rs"}),
+                summary: String::new(),
+            }),
+        });
+        let frame = app.frame();
+        for expected in [
+            "m1 · explore · inspect the parser",
+            "m2 · plan · design the migration",
+            "round 1/2 · running",
+            "round 1/2 · waiting",
+            "read(parser.rs)",
+        ] {
+            assert!(frame.contains(expected), "missing {expected:?}:\n{frame}");
+        }
+        assert!(
+            (0..40).any(|row| (0..110).any(|column| app
+                .transcript
+                .task_run_at(column, row)
+                .as_deref()
+                == Some("t1"))),
+            "the stable first member run is an openable trace link"
+        );
+
+        app.on_agent_event(AgentEvent::TaskRunFinished {
+            run: "t1".into(),
+            status: tcode_core::TaskRunStatus::Done,
+            tool_calls: 1,
+            usage: Usage::default(),
+        });
+        app.on_agent_event(AgentEvent::CohortUpdated(roster(
+            CohortMemberStatus::Done,
+            CohortMemberStatus::Waiting,
+        )));
+        let frame = app.frame();
+        assert!(frame.contains("m1 · explore · inspect the parser · round 1/2 · done"));
+        assert!(frame.contains("m2 · plan · design the migration · round 1/2 · waiting"));
+    }
+
+    #[test]
+    fn opening_a_root_trace_replays_all_resumed_member_rounds() {
+        use tcode_core::{ContentBlock, Entry, Ledger, TaskRunStatus, TaskTraces};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("task-traces");
+        let mut traces = TaskTraces::default();
+        traces.bind_root(Some(root.clone()));
+        let (run, store) = traces.begin("call-1", "explore", "m", "first", "first", None);
+        let store = store.expect("persisted root trace");
+        let finisher = store.clone();
+        let mut first = Ledger::new();
+        first.attach_sink(Box::new(store));
+        first.append(Entry::User(vec![ContentBlock::Text {
+            text: "first".into(),
+        }]));
+        first.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "first round finding".into(),
+        }]));
+        finisher.finish(TaskRunStatus::Done, 0, Usage::default());
+
+        let (_, store) = traces.begin("call-2", "explore", "m", "second", "second", Some(&run));
+        let store = store.expect("persisted follow-up trace");
+        let finisher = store.clone();
+        let mut second = Ledger::new();
+        second.attach_sink(Box::new(store));
+        second.append(Entry::User(vec![ContentBlock::Text {
+            text: "second".into(),
+        }]));
+        second.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "second round finding".into(),
+        }]));
+        finisher.finish(TaskRunStatus::Done, 0, Usage::default());
+
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.task_trace_root = Some(root.clone());
+        app.task_runs = discover_task_runs(Some(&root));
+        app.open_view(ViewId::TaskRun(run));
+        let frame = app.frame();
+        assert!(
+            frame.contains("first round finding"),
+            "root turn is visible:\n{frame}"
+        );
+        assert!(
+            frame.contains("second round finding"),
+            "follow-up round is replayed with the root trace:\n{frame}"
+        );
     }
 
     /// A command used to leave no trace of itself: its answer landed as a bare
