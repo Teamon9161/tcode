@@ -10,7 +10,7 @@
 //! frontend wakes a turn for (see `monitor_wake_deadline`). One registry, one
 //! log pipeline, one `kill_task`; only the `notify` semantics differ.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -209,14 +209,57 @@ struct Task {
     notified: bool,
 }
 
+/// A cheap, clonable handle a detached producer (currently a background
+/// sub-agent) keeps to deliver a completion note back into an idle session and
+/// wake it — the same notify+drain path a finished monitor uses, without the
+/// producer having to be a tracked child process. Held past the tool call that
+/// spawned it, so it carries only `Arc`s, never a borrow of the session.
+#[derive(Clone, Debug)]
+pub struct HarnessNoteSink {
+    inbox: Arc<Mutex<Vec<String>>>,
+    signal: Arc<Notify>,
+    /// In-flight background runs, `run id → cancel token`. The map is both the
+    /// running set (its size is the count) and how `kill_task` reaches a run.
+    runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
+}
+
+impl HarnessNoteSink {
+    /// Register one detached run as in flight, keyed by its id so `kill_task`
+    /// can cancel it. Balance every `start` with exactly one `finish`.
+    pub fn start(&self, run_id: &str, cancel: CancellationToken) {
+        self.runs
+            .lock()
+            .expect("background runs")
+            .insert(run_id.to_string(), cancel);
+    }
+
+    /// Deliver `note`, clear this run from the in-flight set, and wake an idle
+    /// session to read it. Delivery is the same append the agent loop makes for
+    /// a monitor completion: `take_notes` drains it into an `Entry::Note` at the
+    /// next boundary or idle wake.
+    pub fn finish(&self, run_id: &str, note: String) {
+        self.runs.lock().expect("background runs").remove(run_id);
+        self.inbox.lock().expect("harness note inbox").push(note);
+        self.signal.notify_one();
+    }
+}
+
 #[derive(Debug)]
 pub struct BackgroundTasks {
     tasks: Vec<Task>,
     /// Where task logs are written (`<dir>/b1.log`, …).
     dir: PathBuf,
-    /// Fired whenever any monitor produces an event or exits. The frontend
-    /// holds a clone and re-checks `monitor_wake_deadline` when it fires.
+    /// Fired whenever any monitor produces an event or exits, or a detached
+    /// producer delivers a note. The frontend holds a clone and re-checks
+    /// `monitor_wake_deadline` when it fires.
     signal: Arc<Notify>,
+    /// Completion notes from detached producers (background sub-agents),
+    /// undelivered until `take_notes` drains them. Shared with every
+    /// `HarnessNoteSink` this registry hands out.
+    inbox: Arc<Mutex<Vec<String>>>,
+    /// In-flight background sub-agent runs, `run id → cancel token`, shared with
+    /// every `HarnessNoteSink`. Both the running set and `kill_task`'s handle.
+    runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
 }
 
 impl BackgroundTasks {
@@ -225,12 +268,38 @@ impl BackgroundTasks {
             tasks: Vec::new(),
             dir,
             signal: Arc::new(Notify::new()),
+            inbox: Arc::default(),
+            runs: Arc::default(),
         }
     }
 
     /// Shared handle the frontend listens on for monitor activity.
     pub fn monitor_signal(&self) -> Arc<Notify> {
         self.signal.clone()
+    }
+
+    /// A sink a detached background sub-agent keeps to deliver its completion
+    /// note and wake this session when it finishes.
+    pub fn harness_note_sink(&self) -> HarnessNoteSink {
+        HarnessNoteSink {
+            inbox: self.inbox.clone(),
+            signal: self.signal.clone(),
+            runs: self.runs.clone(),
+        }
+    }
+
+    /// The in-flight background sub-agent run ids, sorted for a stable status
+    /// line and restart note.
+    pub fn background_agent_ids(&self) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .runs
+            .lock()
+            .expect("background runs")
+            .keys()
+            .cloned()
+            .collect();
+        ids.sort();
+        ids
     }
 
     /// Register a new task and return its id plus the shared state the
@@ -296,9 +365,16 @@ impl BackgroundTasks {
         })
     }
 
-    /// Kill a running task. Killing an already-finished task is reported,
-    /// not an error the model has to think about.
+    /// Kill a running task, monitor, or background sub-agent run. Killing an
+    /// already-finished one is reported, not an error the model has to think
+    /// about. A background sub-agent (`t<n>`) is cancelled at its token; it
+    /// still delivers its (interrupted) completion note.
     pub fn kill(&mut self, id: &str) -> Result<String, String> {
+        // Background sub-agent runs are keyed separately from `b`/`m` tasks.
+        if let Some(cancel) = self.runs.lock().expect("background runs").get(id).cloned() {
+            cancel.cancel();
+            return Ok(format!("cancel signal sent to background sub-agent {id}"));
+        }
         let task = self.find(id)?;
         match task.shared.status() {
             TaskStatus::Running => {
@@ -315,6 +391,10 @@ impl BackgroundTasks {
     /// monitor whose completion the model has not heard yet. `None` while
     /// there is nothing to deliver.
     pub fn monitor_wake_deadline(&self) -> Option<Instant> {
+        // A delivered background-agent completion wakes immediately, like a
+        // finished monitor: there is nothing to coalesce, the run is already done.
+        let inbox_now =
+            (!self.inbox.lock().expect("harness note inbox").is_empty()).then(Instant::now);
         self.tasks
             .iter()
             .filter_map(|task| {
@@ -326,14 +406,15 @@ impl BackgroundTasks {
                 (!inner.pending.is_empty() || inner.dropped > 0)
                     .then(|| inner.first_pending.unwrap_or_else(Instant::now) + monitor.quiet)
             })
+            .chain(inbox_now)
             .min()
     }
 
-    /// Undelivered notes: monitor events first, then completions the model
-    /// has not heard about. Called by the agent loop at safe append
-    /// boundaries (and by an idle wake turn).
+    /// Undelivered notes: detached background-agent completions first, then
+    /// monitor events and task completions the model has not heard about.
+    /// Called by the agent loop at safe append boundaries (and by an idle wake).
     pub fn take_notes(&mut self) -> Vec<String> {
-        let mut notes = Vec::new();
+        let mut notes = std::mem::take(&mut *self.inbox.lock().expect("harness note inbox"));
         for task in &mut self.tasks {
             if let Some(event_note) = drain_monitor_events(task) {
                 notes.push(event_note);
@@ -467,6 +548,35 @@ mod tests {
         assert!(reg.take_notes().is_empty());
         assert!(reg.running().is_empty());
         let _ = std::fs::remove_file(&shared.log_path);
+    }
+
+    #[test]
+    fn a_detached_note_wakes_now_delivers_once_and_is_killable() {
+        let mut reg = reg();
+        let sink = reg.harness_note_sink();
+        assert!(reg.monitor_wake_deadline().is_none());
+        assert!(reg.background_agent_ids().is_empty());
+
+        let cancel = CancellationToken::new();
+        sink.start("t1", cancel.clone());
+        assert_eq!(reg.background_agent_ids(), vec!["t1".to_string()]);
+        // Still running: nothing to deliver, nothing to wake for.
+        assert!(reg.monitor_wake_deadline().is_none());
+        // `kill_task` reaches the run through the shared map.
+        assert!(reg.kill("t1").unwrap().contains("cancel signal"));
+        assert!(cancel.is_cancelled());
+
+        sink.finish("t1", "background explore t1 finished".into());
+        assert!(reg.background_agent_ids().is_empty());
+        // Finished: wake immediately, no quiet window to coalesce.
+        let deadline = reg.monitor_wake_deadline().unwrap();
+        assert!(deadline <= Instant::now() + Duration::from_millis(50));
+
+        let notes = reg.take_notes();
+        assert_eq!(notes, vec!["background explore t1 finished".to_string()]);
+        // Delivered exactly once.
+        assert!(reg.take_notes().is_empty());
+        assert!(reg.monitor_wake_deadline().is_none());
     }
 
     #[test]

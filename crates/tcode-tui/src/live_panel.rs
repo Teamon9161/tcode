@@ -87,6 +87,9 @@ pub struct UiTaskRun {
     /// The main transcript's parent task-call header, when it has a simple
     /// header block to attach the task trace link to.
     pub block: Option<usize>,
+    /// The stable first run of this cohort member. Later round activations
+    /// append to that same inspectable member conversation.
+    pub cohort_root: Option<String>,
     /// The run that delegated this one, when it was not the main conversation.
     /// A nested run's card lives in its parent's trace, not the main
     /// transcript, so `block` is `None` for it — but it is still a run of this
@@ -125,6 +128,7 @@ impl UiTaskRun {
             steps: Vec::new(),
             events: Vec::new(),
             block,
+            cohort_root: None,
             parent_run: None,
             depth: 0,
         }

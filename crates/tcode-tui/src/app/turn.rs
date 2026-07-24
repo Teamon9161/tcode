@@ -461,6 +461,7 @@ impl App {
                 self.state_label = "sub-agent working".into();
             }
             AgentEvent::CohortUpdated(update) => self.on_cohort_updated(update),
+            AgentEvent::CohortChannelMessage(message) => self.on_cohort_channel_message(message),
             AgentEvent::TaskRunEvent { run, event } => self.on_task_run_event(run, *event),
             AgentEvent::TaskRunStarted {
                 run,
@@ -799,13 +800,13 @@ impl App {
         summary: String,
         cohort_member: Option<CohortMemberRun>,
     ) {
-        if let Some((block, member_summary)) = cohort_member
+        if let Some((block, member_summary, cohort_root)) = cohort_member
             .as_ref()
             .and_then(|membership| self.cohort_member_started(membership, &run))
         {
             self.transcript
                 .set_live_status(block, Some(task_plain_status("starting…")));
-            self.task_runs.push(UiTaskRun::new(
+            let mut entry = UiTaskRun::new(
                 run,
                 parent_call,
                 kind,
@@ -813,7 +814,9 @@ impl App {
                 prompt,
                 member_summary,
                 Some(block),
-            ));
+            );
+            entry.cohort_root = Some(cohort_root);
+            self.task_runs.push(entry);
             return;
         }
         // ToolStart always precedes a task's delegated start. Single
@@ -826,8 +829,11 @@ impl App {
             .and_then(|call| call.header_index);
         if let Some(index) = block {
             self.transcript.link_task_run(index, run.clone());
-            self.transcript
-                .attach_detail(index, task_summary_detail(&summary), OUTPUT_VIEW_ROWS);
+            self.transcript.attach_detail(
+                index,
+                task_summary_detail_with_model(&summary, &model),
+                OUTPUT_VIEW_ROWS,
+            );
             self.transcript
                 .set_live_status(index, Some(task_plain_status("starting…")));
         } else if let Some(position) = self
@@ -848,8 +854,11 @@ impl App {
             self.pending_batch.insert(position, call);
             block = Some(index);
             self.transcript.link_task_run(index, run.clone());
-            self.transcript
-                .attach_detail(index, task_summary_detail(&summary), OUTPUT_VIEW_ROWS);
+            self.transcript.attach_detail(
+                index,
+                task_summary_detail_with_model(&summary, &model),
+                OUTPUT_VIEW_ROWS,
+            );
             self.transcript
                 .set_live_status(index, Some(task_plain_status("starting…")));
         }

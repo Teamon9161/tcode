@@ -20,7 +20,7 @@ use tcode_core::{
     ActiveModel, Agent, AgentEvent, AgentModels, Approval, ApprovalDecision, Approver,
     CohortMemberRun, ContentBlock, DelegateEvent, DelegatedApprovalRequest, Entry, ModelCell,
     PermissionMode, PermissionRequest, PermissionRules, ProviderSafetyClassifier, SafetyClassifier,
-    Session, TaskRunStatus, Tool, ToolCtx, ToolOutput,
+    Session, TaskRunStatus, Tool, ToolCtx, ToolOutput, TraceStore,
 };
 
 use crate::agent::defs::{keeps_tool, AgentDef, AgentRegistry, QuestionPolicy};
@@ -153,6 +153,61 @@ fn next_park_seq() -> u64 {
     static PARK_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     PARK_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
+
+/// Park a finished run for follow-ups, evicting the oldest beyond cap and
+/// dropping any run from a conversation this tool has since moved off. Free of
+/// `self` so a detached background run can park into the shared `live` map.
+fn park_into(live: &Mutex<HashMap<String, LiveTask>>, id: &str, task: LiveTask) {
+    let mut live = live.lock().expect("live tasks lock");
+    live.retain(|_, parked| parked.scope == task.scope);
+    if live.len() >= MAX_LIVE_TASKS {
+        if let Some(oldest) = live
+            .iter()
+            .min_by_key(|(_, task)| task.seq)
+            .map(|(id, _)| id.clone())
+        {
+            live.remove(&oldest);
+        }
+    }
+    live.insert(id.to_string(), task);
+}
+
+/// Record a finished run's report for later `attach`, scoped to its issuing
+/// conversation. Free of `self` for the same reason as [`park_into`].
+fn remember_report_into(
+    reports: &Mutex<HashMap<String, StoredReport>>,
+    id: &str,
+    agent: &str,
+    text: &str,
+    scope: &Path,
+) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut reports = reports.lock().expect("attached reports lock");
+    // An id only ever means something inside the conversation that issued it.
+    reports.retain(|_, report| report.scope == scope);
+    if !reports.contains_key(id) && reports.len() >= MAX_STORED_REPORTS {
+        if let Some(oldest) = reports
+            .iter()
+            .min_by_key(|(_, report)| report.seq)
+            .map(|(id, _)| id.clone())
+        {
+            reports.remove(&oldest);
+        }
+    }
+    reports.insert(
+        id.to_string(),
+        StoredReport {
+            agent: agent.to_string(),
+            text: text.to_string(),
+            scope: scope.to_path_buf(),
+            seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        },
+    );
+}
+
+/// Fences a background run's report so it enters the parent as data, not an
+/// instruction — the completion note is delivered as a user-role `Entry::Note`.
+const BACKGROUND_FENCE_END: &str = "</background-report>";
 
 pub struct AgentTool {
     /// Shared with the parent agent: sub-agents follow `/model` switches.
@@ -425,46 +480,13 @@ impl AgentTool {
     /// `/clear`) go first: they are unreachable by construction, so holding
     /// their sessions only spends memory and cap on ids that must never match.
     fn park(&self, id: &str, task: LiveTask) {
-        let mut live = self.live.lock().expect("live tasks lock");
-        live.retain(|_, parked| parked.scope == task.scope);
-        if live.len() >= MAX_LIVE_TASKS {
-            if let Some(oldest) = live
-                .iter()
-                .min_by_key(|(_, task)| task.seq)
-                .map(|(id, _)| id.clone())
-            {
-                live.remove(&oldest);
-            }
-        }
-        live.insert(id.to_string(), task);
+        park_into(&self.live, id, task);
     }
 
     /// Record a finished run's report for later `attach` use. A resumed run
     /// overwrites its earlier entry: the latest report is the attachable one.
     fn remember_report(&self, id: &str, agent: &str, text: &str, scope: &Path) {
-        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut reports = self.reports.lock().expect("attached reports lock");
-        // Same scoping rule as `park`: an id only ever means something inside
-        // the conversation that issued it.
-        reports.retain(|_, report| report.scope == scope);
-        if !reports.contains_key(id) && reports.len() >= MAX_STORED_REPORTS {
-            if let Some(oldest) = reports
-                .iter()
-                .min_by_key(|(_, report)| report.seq)
-                .map(|(id, _)| id.clone())
-            {
-                reports.remove(&oldest);
-            }
-        }
-        reports.insert(
-            id.to_string(),
-            StoredReport {
-                agent: agent.to_string(),
-                text: text.to_string(),
-                scope: scope.to_path_buf(),
-                seq: SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            },
-        );
+        remember_report_into(&self.reports, id, agent, text, scope);
     }
 
     /// Splice the named runs' reports verbatim ahead of the caller's prompt,
@@ -603,6 +625,10 @@ fn agent_schema(defs: &AgentRegistry, allow: Option<&[String]>) -> Value {
             "effort": {
                 "type": "string",
                 "description": "Optional reasoning effort for this one delegation (e.g. low, medium, high), overriding the model's default. May be combined with `model` or used alone. Ignored on `resume`."
+            },
+            "background": {
+                "type": "boolean",
+                "description": "Optional: dispatch this run in the background and return immediately instead of blocking on it. Its report arrives later as a note that resumes you when it finishes, so keep working meanwhile. Use to fan out independent explorations you do not need the answer to right now. Background runs are non-interactive (they cannot ask you or prompt for approval), so a mutation under a mode that would ask is declined — prefer read-only agents, or run under an auto/accept mode. Ignored on `resume`."
             }
         },
         "required": ["agent", "prompt"]
@@ -722,6 +748,21 @@ impl Tool for AgentTool {
             Ok(model_override) => model_override,
             Err(out) => return out,
         };
+        // Fire-and-forget: dispatch, return at once, and let the completion
+        // arrive as a note that wakes the idle main agent. Only the depth-0 tool
+        // qualifies — a sub-agent's session has no idle-wake loop to deliver
+        // into, so `background` there degrades to an ordinary blocking run.
+        if self.depth == 0 && matches!(input.get("background"), Some(Value::Bool(true))) {
+            return self.dispatch_background(
+                kind,
+                def,
+                &prompt,
+                &summary,
+                model_override,
+                call_id,
+                ctx,
+            );
+        }
         let (agent, mut session, model_name) = self.build_run(def, ctx, model_override);
 
         let run = match self
@@ -805,6 +846,108 @@ struct TaskRunFailure {
 }
 
 impl AgentTool {
+    /// Dispatch a fire-and-forget background delegation. The run's session is
+    /// built now — snapshotting the parent's mode/rules into it — and its id and
+    /// trace are allocated under the parent's task-traces lock, before it leaves
+    /// this thread. The tool then returns immediately; the run drives itself on
+    /// a spawned task and, when done, delivers a fenced completion note through
+    /// the harness note sink, which wakes the idle main agent. Nothing is
+    /// written to the parent ledger here — the wake turn appends the note — so
+    /// `background` never violates append-only history.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_background(
+        &self,
+        kind: &str,
+        def: &AgentDef,
+        prompt: &str,
+        summary: &str,
+        model_override: Option<ActiveModel>,
+        call_id: &str,
+        ctx: &ToolCtx,
+    ) -> ToolOutput {
+        let (agent, mut session, model_name) = self.build_run(def, ctx, model_override);
+        let (run_id, trace) = ctx.task_traces.lock().expect("task traces lock").begin(
+            call_id,
+            kind,
+            &model_name,
+            prompt,
+            summary,
+            None,
+        );
+        let delegate = ctx.delegate_reporter();
+        let sink = ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .harness_note_sink();
+        // Register the run's cancel token now, so `kill_task(id=<run>)` can reach
+        // it the moment it is dispatched.
+        let cancel = CancellationToken::new();
+        sink.start(&run_id, cancel.clone());
+
+        // The result message names the run before it moves into the task.
+        let result = ToolOutput::ok(format!(
+            "[background {kind} sub-agent {run_id} dispatched on {model_name}: {summary}. It runs \
+             on its own — keep working; its report arrives as a note when it finishes. Do not wait \
+             for it or re-dispatch it.]"
+        ));
+
+        // Everything the detached run needs, owned. The report and (when
+        // resumable) the session file into the shared Arc-backed stores, so
+        // `agent(attach=…)` / `agent(resume=…)` work exactly as for a
+        // foreground delegation.
+        let reports = self.reports.clone();
+        let live = self.live.clone();
+        let scope = ctx.scratch_dir.clone();
+        let kind = kind.to_string();
+        let def_name = def.name.clone();
+        let prompt = prompt.to_string();
+        let summary = summary.to_string();
+        let call_id = call_id.to_string();
+        let max_exchanges = def.max_exchanges;
+        let finish_id = run_id.clone();
+
+        tokio::spawn(async move {
+            // A background run is non-interactive: it has no live approval
+            // dialog to route to, so its approver is `NeverAsk`. A mutation
+            // under a gating mode is declined rather than blocking a background
+            // task on a foreground prompt; read-only agents (and any mode that
+            // does not ask) run unimpeded.
+            let never_ask = NeverAsk;
+            let outcome = run_delegated_turn(
+                &agent,
+                &mut session,
+                run_id,
+                trace,
+                delegate,
+                &never_ask,
+                &kind,
+                &model_name,
+                &prompt,
+                &summary,
+                &call_id,
+                None,
+                &cancel,
+            )
+            .await;
+            let note = finish_background_run(
+                outcome,
+                agent,
+                session,
+                &kind,
+                &def_name,
+                &model_name,
+                max_exchanges,
+                &scope,
+                &reports,
+                &live,
+            );
+            sink.finish(&finish_id, note);
+        });
+
+        result
+    }
+
     /// Everything one delegated run needs before its first turn: the agent, an
     /// empty session under its own cache scope, and the resolved model's name.
     /// A restored run is built here too, so a run recovered from a trace is
@@ -1096,100 +1239,21 @@ impl AgentTool {
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> Result<TaskRunOutcome, TaskRunFailure> {
-        // Trace: the run gets a stable per-session id, and (when the parent
-        // session persists) its own JSONL ledger log for the trace viewer.
-        // Nothing here enters the parent's provider ledger. A resumed run
-        // swaps in the new trace's sink, so each trace records its own turn.
+        // Allocate the run's stable id and (when the session persists) its own
+        // trace log under the parent's task-traces lock. The turn itself then
+        // runs with no borrow of `ctx`, so the same routine drives a foreground
+        // call and a spawned background run.
         let (run_id, trace) = ctx
             .task_traces
             .lock()
             .expect("task traces lock")
             .begin(call_id, kind, model_name, prompt, summary, resume_of);
-        if let Some(trace) = &trace {
-            session.ledger.attach_sink(Box::new(trace.clone()));
-        }
-        let delegate = ctx.delegate_reporter();
-        if let Some(delegate) = &delegate {
-            // Best-effort visual/trace updates; losing them must never
-            // interrupt the sub-agent.
-            let _ = delegate.send(DelegateEvent::TaskStarted {
-                run: run_id.clone(),
-                parent_call: call_id.to_string(),
-                kind: kind.to_string(),
-                model: model_name.to_string(),
-                prompt: prompt.to_string(),
-                summary: summary.to_string(),
-                cohort_member,
-            });
-        }
-
-        // Drain sub-agent events: count tool calls for the stats line and
-        // forward everything, tagged with the run id, so the parent UI can
-        // show live activity and a full trace. Streaming deltas coalesce so a
-        // chatty sub-agent does not cross the channel one token at a time.
-        let (tx, mut rx) = mpsc::channel(64);
-        let tagger = {
-            let delegate = delegate.clone();
-            let run = run_id.clone();
-            tokio::spawn(async move {
-                let send = |ev: AgentEvent| {
-                    if let Some(delegate) = &delegate {
-                        let _ = delegate.send(DelegateEvent::TaskEvent {
-                            run: run.clone(),
-                            event: Box::new(ev),
-                        });
-                    }
-                };
-                let mut tools = 0usize;
-                // At most one buffered delta run (text or thinking).
-                let mut pending: Option<AgentEvent> = None;
-                while let Some(ev) = rx.recv().await {
-                    match &ev {
-                        AgentEvent::ToolStart { .. } => tools += 1,
-                        // Parallel batches emit no per-call ToolStart.
-                        AgentEvent::ToolBatchStart { calls, .. } => tools += calls.len(),
-                        _ => {}
-                    }
-                    match (&mut pending, ev) {
-                        (Some(AgentEvent::TextDelta(buf)), AgentEvent::TextDelta(t)) => {
-                            buf.push_str(&t)
-                        }
-                        (Some(AgentEvent::ThinkingDelta(buf)), AgentEvent::ThinkingDelta(t)) => {
-                            buf.push_str(&t)
-                        }
-                        (slot, ev @ (AgentEvent::TextDelta(_) | AgentEvent::ThinkingDelta(_))) => {
-                            if let Some(prev) = slot.take() {
-                                send(prev);
-                            }
-                            *slot = Some(ev);
-                        }
-                        (slot, ev) => {
-                            if let Some(prev) = slot.take() {
-                                send(prev);
-                            }
-                            send(ev);
-                        }
-                    }
-                    let full = pending.as_ref().is_some_and(|ev| match ev {
-                        AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => t.len() >= 64,
-                        _ => false,
-                    });
-                    if full {
-                        send(pending.take().expect("checked above"));
-                    }
-                }
-                if let Some(prev) = pending.take() {
-                    send(prev);
-                }
-                tools
-            })
-        };
-
-        // Permission approvals always reach the parent. `questionPolicy` gates
-        // the `ask_user` *tool* — whether this agent may ask open-ended
-        // questions — which is a different thing from whether the human gets to
-        // decide about an action it is about to take. Without this, inheriting
-        // a mode that asks would silently become a mode that refuses.
+        // Permission approvals reach the parent's live approver when this call
+        // runs inside one; a direct/orphaned run stays non-interactive.
+        // `questionPolicy` gates the `ask_user` *tool*, a different thing from
+        // whether the human decides about an action — so this bridge is always
+        // installed for a delegated run, or inheriting a mode that asks would
+        // silently become a mode that refuses.
         let bridge = ctx
             .delegated_approver()
             .map(|requests| ParentUserBridge { requests });
@@ -1198,90 +1262,286 @@ impl AgentTool {
             .as_ref()
             .map(|bridge| bridge as &dyn Approver)
             .unwrap_or(&never_ask);
-        let result = agent
-            .user_turn(
-                session,
-                vec![ContentBlock::Text {
-                    text: prompt.to_string(),
-                }],
-                &tx,
-                approver,
-                cancel.clone(),
-            )
-            .await;
-        drop(tx);
-        let tool_calls = tagger.await.unwrap_or(0);
-
-        let status = if result.is_err() {
-            TaskRunStatus::Failed
-        } else if cancel.is_cancelled() {
-            TaskRunStatus::Cancelled
-        } else {
-            TaskRunStatus::Done
-        };
-        let usage = session.turn_usage;
-        if let Some(trace) = &trace {
-            trace.finish(status, tool_calls, usage);
-        }
-        if let Some(delegate) = &delegate {
-            let _ = delegate.send(DelegateEvent::TaskFinished {
-                run: run_id.clone(),
-                status,
-                tool_calls,
-                usage,
-            });
-        }
-
-        // A failed or interrupted turn leaves the ledger a legal conversation:
-        // a request that never landed appends nothing, a mid-stream failure
-        // appends only `Entry::IncompleteAssistant`, and an interrupt commits
-        // its own note plus results for every started call. So the session is
-        // handed back to the caller to park, not dropped.
-        if let Err(e) = result {
-            return Err(TaskRunFailure {
-                run_id,
-                reason: format!("sub-agent failed: {e}"),
-            });
-        }
-        if cancel.is_cancelled() {
-            return Err(TaskRunFailure {
-                run_id,
-                reason: "sub-agent cancelled by user".to_string(),
-            });
-        }
-
-        // The report = text of the final assistant entry.
-        let report: String = session
-            .ledger
-            .entries()
-            .iter()
-            .rev()
-            .find_map(|e| match e {
-                Entry::Assistant(blocks) => {
-                    let text: String = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text } => Some(text.as_str()),
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.trim().is_empty()).then_some(text)
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "(sub-agent produced no report)".into());
-
-        let u = session.turn_usage;
-        Ok(TaskRunOutcome {
+        run_delegated_turn(
+            agent,
+            session,
             run_id,
-            stats: format!(
-                "{tool_calls} tool calls, in {} | out {} tokens",
-                u.total_input(),
-                u.output_tokens
-            ),
-            report,
+            trace,
+            ctx.delegate_reporter(),
+            approver,
+            kind,
+            model_name,
+            prompt,
+            summary,
+            call_id,
+            cohort_member,
+            cancel,
+        )
+        .await
+    }
+}
+
+/// Drive one delegated turn to its report, owning every input so it runs either
+/// inline (foreground `drive`) or inside a spawned task (background dispatch).
+/// The run id and trace are pre-allocated by the caller under the parent's
+/// task-traces lock; nothing here touches the parent `ToolCtx`, which is what
+/// lets a background run outlive the tool call that spawned it.
+#[allow(clippy::too_many_arguments)]
+async fn run_delegated_turn(
+    agent: &Agent,
+    session: &mut Session,
+    run_id: String,
+    trace: Option<TraceStore>,
+    delegate: Option<mpsc::UnboundedSender<DelegateEvent>>,
+    approver: &dyn Approver,
+    kind: &str,
+    model_name: &str,
+    prompt: &str,
+    summary: &str,
+    call_id: &str,
+    cohort_member: Option<CohortMemberRun>,
+    cancel: &CancellationToken,
+) -> Result<TaskRunOutcome, TaskRunFailure> {
+    if let Some(trace) = &trace {
+        session.ledger.attach_sink(Box::new(trace.clone()));
+    }
+    if let Some(delegate) = &delegate {
+        // Best-effort visual/trace updates; losing them must never
+        // interrupt the sub-agent.
+        let _ = delegate.send(DelegateEvent::TaskStarted {
+            run: run_id.clone(),
+            parent_call: call_id.to_string(),
+            kind: kind.to_string(),
+            model: model_name.to_string(),
+            prompt: prompt.to_string(),
+            summary: summary.to_string(),
+            cohort_member,
+        });
+    }
+
+    // Drain sub-agent events: count tool calls for the stats line and
+    // forward everything, tagged with the run id, so the parent UI can
+    // show live activity and a full trace. Streaming deltas coalesce so a
+    // chatty sub-agent does not cross the channel one token at a time.
+    let (tx, mut rx) = mpsc::channel(64);
+    let tagger = {
+        let delegate = delegate.clone();
+        let run = run_id.clone();
+        tokio::spawn(async move {
+            let send = |ev: AgentEvent| {
+                if let Some(delegate) = &delegate {
+                    let _ = delegate.send(DelegateEvent::TaskEvent {
+                        run: run.clone(),
+                        event: Box::new(ev),
+                    });
+                }
+            };
+            let mut tools = 0usize;
+            // At most one buffered delta run (text or thinking).
+            let mut pending: Option<AgentEvent> = None;
+            while let Some(ev) = rx.recv().await {
+                match &ev {
+                    AgentEvent::ToolStart { .. } => tools += 1,
+                    // Parallel batches emit no per-call ToolStart.
+                    AgentEvent::ToolBatchStart { calls, .. } => tools += calls.len(),
+                    _ => {}
+                }
+                match (&mut pending, ev) {
+                    (Some(AgentEvent::TextDelta(buf)), AgentEvent::TextDelta(t)) => {
+                        buf.push_str(&t)
+                    }
+                    (Some(AgentEvent::ThinkingDelta(buf)), AgentEvent::ThinkingDelta(t)) => {
+                        buf.push_str(&t)
+                    }
+                    (slot, ev @ (AgentEvent::TextDelta(_) | AgentEvent::ThinkingDelta(_))) => {
+                        if let Some(prev) = slot.take() {
+                            send(prev);
+                        }
+                        *slot = Some(ev);
+                    }
+                    (slot, ev) => {
+                        if let Some(prev) = slot.take() {
+                            send(prev);
+                        }
+                        send(ev);
+                    }
+                }
+                let full = pending.as_ref().is_some_and(|ev| match ev {
+                    AgentEvent::TextDelta(t) | AgentEvent::ThinkingDelta(t) => t.len() >= 64,
+                    _ => false,
+                });
+                if full {
+                    send(pending.take().expect("checked above"));
+                }
+            }
+            if let Some(prev) = pending.take() {
+                send(prev);
+            }
+            tools
         })
+    };
+
+    let result = agent
+        .user_turn(
+            session,
+            vec![ContentBlock::Text {
+                text: prompt.to_string(),
+            }],
+            &tx,
+            approver,
+            cancel.clone(),
+        )
+        .await;
+    drop(tx);
+    let tool_calls = tagger.await.unwrap_or(0);
+
+    let status = if result.is_err() {
+        TaskRunStatus::Failed
+    } else if cancel.is_cancelled() {
+        TaskRunStatus::Cancelled
+    } else {
+        TaskRunStatus::Done
+    };
+    let usage = session.turn_usage;
+    if let Some(trace) = &trace {
+        trace.finish(status, tool_calls, usage);
+    }
+    if let Some(delegate) = &delegate {
+        let _ = delegate.send(DelegateEvent::TaskFinished {
+            run: run_id.clone(),
+            status,
+            tool_calls,
+            usage,
+        });
+    }
+
+    // A failed or interrupted turn leaves the ledger a legal conversation:
+    // a request that never landed appends nothing, a mid-stream failure
+    // appends only `Entry::IncompleteAssistant`, and an interrupt commits
+    // its own note plus results for every started call. So the session is
+    // handed back to the caller to park, not dropped.
+    if let Err(e) = result {
+        return Err(TaskRunFailure {
+            run_id,
+            reason: format!("sub-agent failed: {e}"),
+        });
+    }
+    if cancel.is_cancelled() {
+        return Err(TaskRunFailure {
+            run_id,
+            reason: "sub-agent cancelled by user".to_string(),
+        });
+    }
+
+    // The report = text of the final assistant entry.
+    let report: String = session
+        .ledger
+        .entries()
+        .iter()
+        .rev()
+        .find_map(|e| match e {
+            Entry::Assistant(blocks) => {
+                let text: String = blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                (!text.trim().is_empty()).then_some(text)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| "(sub-agent produced no report)".into());
+
+    let u = session.turn_usage;
+    Ok(TaskRunOutcome {
+        run_id,
+        stats: format!(
+            "{tool_calls} tool calls, in {} | out {} tokens",
+            u.total_input(),
+            u.output_tokens
+        ),
+        report,
+    })
+}
+
+/// Turn a finished background run into the note that wakes the parent, filing
+/// its report (and, when resumable, its session) into the shared stores so the
+/// parent can `attach` or `resume` it just like a foreground run. The report is
+/// another agent's output — data — so it is fenced here at the single emitter,
+/// like `attach_reports`; the note is delivered as a user-role `Entry::Note`.
+#[allow(clippy::too_many_arguments)]
+fn finish_background_run(
+    outcome: Result<TaskRunOutcome, TaskRunFailure>,
+    agent: Agent,
+    session: Session,
+    kind: &str,
+    def_name: &str,
+    model_name: &str,
+    max_exchanges: u32,
+    scope: &Path,
+    reports: &Mutex<HashMap<String, StoredReport>>,
+    live: &Mutex<HashMap<String, LiveTask>>,
+) -> String {
+    match outcome {
+        Ok(run) => {
+            remember_report_into(reports, &run.run_id, kind, &run.report, scope);
+            let body = run
+                .report
+                .replace(BACKGROUND_FENCE_END, "<\\/background-report>");
+            let mut note = format!(
+                "[background {kind} sub-agent {id} finished on {model_name}: {stats}]\n\
+                 <background-report run=\"{id}\" agent=\"{kind}\">\n{body}\n{BACKGROUND_FENCE_END}",
+                id = run.run_id,
+                stats = run.stats,
+            );
+            if max_exchanges > 0 {
+                note.push_str(&format!(
+                    "\nResumable: agent(agent=\"{kind}\", resume=\"{}\") for up to {max_exchanges} \
+                     follow-up turns.",
+                    run.run_id
+                ));
+                park_into(
+                    live,
+                    &run.run_id,
+                    LiveTask {
+                        agent,
+                        session,
+                        exchanges_left: max_exchanges,
+                        def_name: def_name.to_string(),
+                        model_name: model_name.to_string(),
+                        scope: scope.to_path_buf(),
+                        seq: next_park_seq(),
+                    },
+                );
+            }
+            note
+        }
+        // A failed background run is still worth keeping: park it so the parent
+        // can resume from where it stopped instead of re-paying for the work.
+        Err(fail) => {
+            park_into(
+                live,
+                &fail.run_id,
+                LiveTask {
+                    agent,
+                    session,
+                    exchanges_left: max_exchanges.max(SALVAGE_EXCHANGES),
+                    def_name: def_name.to_string(),
+                    model_name: model_name.to_string(),
+                    scope: scope.to_path_buf(),
+                    seq: next_park_seq(),
+                },
+            );
+            format!(
+                "[background {kind} sub-agent {id} failed: {reason}. Kept alive — \
+                 agent(agent=\"{kind}\", resume=\"{id}\") to continue from where it stopped.]",
+                id = fail.run_id,
+                reason = fail.reason,
+            )
+        }
     }
 }
 

@@ -362,9 +362,10 @@ impl Tool for KillTaskTool {
     }
 
     fn description(&self) -> &str {
-        "Stop a background task or monitor by id (e.g. b1, m2). Killing an \
-         already-finished task is a no-op. Its captured output stays readable \
-         in the task's log file via read."
+        "Stop a background task, monitor, or background sub-agent run by id \
+         (e.g. b1, m2, or a run id like t3). Killing an already-finished one is \
+         a no-op. A task's captured output stays readable in its log file via \
+         read; a cancelled sub-agent still delivers its interrupted report note."
     }
 
     fn input_schema(&self) -> Value {

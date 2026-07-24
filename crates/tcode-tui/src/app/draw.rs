@@ -429,7 +429,7 @@ impl App {
             Phase::Idle => None,
         };
         let current = match &self.active_view {
-            ViewId::Main => PanelTarget::Main,
+            ViewId::Main | ViewId::CohortChannel(_) => PanelTarget::Main,
             ViewId::TaskRun(id) => PanelTarget::Task(id.clone()),
         };
         // The bottom status line keeps the "running:" prefix; inside the tree
@@ -548,7 +548,7 @@ impl App {
         let jump_to_bottom_hover = self.jump_to_bottom_hover;
         let transcript = match &self.active_view {
             ViewId::Main => &mut self.transcript,
-            ViewId::TaskRun(_) => {
+            ViewId::TaskRun(_) | ViewId::CohortChannel(_) => {
                 &mut self
                     .trace_view
                     .as_mut()

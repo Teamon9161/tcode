@@ -410,9 +410,21 @@ fn upgrade_legacy_entry(entry: Entry) -> Entry {
     }
 }
 
-/// Background tasks and monitors whose process was still running when the
-/// session ended: started (per the tool's stable success prefix) but never
-/// terminated by a completion note. One note lists them all.
+/// The run id in a background sub-agent's dispatch line or completion note:
+/// `[background <kind> sub-agent <id> …]`.
+fn background_agent_run_id(text: &str) -> Option<&str> {
+    text.strip_prefix("[background ")?
+        .split_once(" sub-agent ")?
+        .1
+        .split_whitespace()
+        .next()
+}
+
+/// Background tasks, monitors, and background sub-agent runs that were still in
+/// flight when the session ended: started (per the tool's stable success
+/// prefix, or a `[background … dispatched on …]` line) but never terminated by
+/// a completion note. One note lists them all — in-memory processes and
+/// spawned runs alike are gone after a restart.
 fn lost_background_note(ledger: &Ledger) -> Option<String> {
     let mut open: Vec<String> = Vec::new();
     for entry in ledger.entries() {
@@ -433,11 +445,26 @@ fn lost_background_note(ledger: &Ledger) -> Option<String> {
                     if let Some(id) = started.and_then(|rest| rest.split_whitespace().next()) {
                         open.push(id.trim_end_matches(':').to_string());
                     }
+                    // A background sub-agent's dispatch line opens a run whose
+                    // completion note (if any) closes it below.
+                    if content.contains(" dispatched on ") {
+                        if let Some(id) = background_agent_run_id(content) {
+                            open.push(id.to_string());
+                        }
+                    }
                 }
             }
             Entry::Note(note) => {
-                // Completion notes name the task and a terminal status; event
-                // notes ("Monitor m1 (...): N new event lines") do neither.
+                // A background sub-agent completion note closes its run.
+                if note.contains(" finished on ") || note.contains(" failed:") {
+                    if let Some(id) = background_agent_run_id(note) {
+                        open.retain(|o| o != id);
+                    }
+                    continue;
+                }
+                // Task/monitor completion notes name the task and a terminal
+                // status; event notes ("Monitor m1 (...): N new event lines") do
+                // neither.
                 let terminated = note.contains("exited with code")
                     || note.contains("killed after")
                     || note.contains("timeout");
@@ -457,9 +484,9 @@ fn lost_background_note(ledger: &Ledger) -> Option<String> {
     }
     (!open.is_empty()).then(|| {
         format!(
-            "Resumed session: background task(s) {} did not survive the restart \
-             — their processes are gone, though their log files remain readable. \
-             Restart any watch that is still needed.",
+            "Resumed session: background work {} did not survive the restart — the \
+             processes and runs are gone, though any log files remain readable. \
+             Re-run or re-dispatch anything still needed.",
             open.join(", ")
         )
     })
@@ -1339,5 +1366,42 @@ mod tests {
         assert!(note.contains("m2, b3"), "{note}");
         assert!(!note.contains("m1,"), "{note}");
         assert!(note.contains("did not survive"), "{note}");
+    }
+
+    /// A background sub-agent dispatched but not yet finished is lost on resume;
+    /// one whose completion note already landed is not.
+    #[test]
+    fn resume_notes_background_agents_that_did_not_finish() {
+        let tool_result = |content: &str| {
+            Entry::ToolResults(vec![ContentBlock::ToolResult {
+                tool_use_id: "t1".into(),
+                content: content.into(),
+                is_error: false,
+                images: vec![],
+            }])
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut ledger = Ledger::new();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("explore in the background"));
+        ledger.append(tool_result(
+            "[background explore sub-agent t1 dispatched on scout-1: survey. It runs on its own…]",
+        ));
+        ledger.append(tool_result(
+            "[background general sub-agent t2 dispatched on scout-1: build. It runs on its own…]",
+        ));
+        // t1 delivered its completion note; t2 never did.
+        ledger.append(Entry::Note(
+            "[background explore sub-agent t1 finished on scout-1: 2 tool calls]\n<background-report run=\"t1\" agent=\"explore\">\ndone\n</background-report>".into(),
+        ));
+        drop(ledger);
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        let Entry::Note(note) = resumed.ledger.entries().last().unwrap() else {
+            panic!("expected a lost-background note");
+        };
+        assert!(note.contains("t2"), "{note}");
+        assert!(!note.contains("t1"), "{note}");
     }
 }

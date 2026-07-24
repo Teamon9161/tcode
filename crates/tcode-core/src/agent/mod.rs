@@ -144,6 +144,9 @@ pub enum AgentEvent {
     /// A cohort scheduler supplied a complete member roster for a transcript
     /// view. This is display-only and never enters the provider ledger.
     CohortUpdated(crate::tool::CohortUpdate),
+    /// A member appended a visible post to its cohort's shared channel. This
+    /// is display-only and never enters the provider ledger.
+    CohortChannelMessage(crate::tool::CohortChannelMessage),
     /// A `task` sub-agent run began. Trace/display only — nothing here enters
     /// the parent's provider ledger.
     TaskRunStarted {
@@ -178,10 +181,11 @@ pub enum AgentEvent {
     /// summary is now the only record of everything before it — the user must
     /// be able to read what the model is standing on.
     Compacted(String),
-    /// A staged permission-mode switch was committed at a safe boundary (turn
-    /// start, batch boundary, turn end). The frontend promotes its pending
-    /// status marker and bakes a record — the transcript is the source of
-    /// truth for which boundary a mode took effect at.
+    /// A staged permission-mode switch was committed at a permission-decision
+    /// point (turn start, `run_tools` entry, before a serial call, batch
+    /// boundary, turn end). The frontend promotes its pending status marker and
+    /// bakes a record — the transcript is the source of truth for where a mode
+    /// took effect.
     ModeChanged(crate::permission::PermissionMode),
     /// The Auto Mode classifier could not return a usable verdict for this call,
     /// so the agent is asking the human instead. This is frontend-only
@@ -877,6 +881,11 @@ impl Agent {
         approver: &dyn Approver,
         cancel: &CancellationToken,
     ) -> Result<ToolsOutcome, AgentError> {
+        // A mode staged while the model streamed this batch must gate the batch
+        // it produced, not wait for the boundary after it: switch to unsafe/auto
+        // and these calls are judged under it now. Only the gate moves here; the
+        // model-facing note stays deferred to the next user interaction.
+        self.commit_mode(session, events).await?;
         let memory_update = self.preflight_memory(session, calls);
         let blocked_by_new_instructions = memory_update
             .as_ref()
@@ -969,6 +978,10 @@ impl Agent {
                 continue;
             };
 
+            // Re-commit any mode staged while an earlier call in this batch was
+            // on screen awaiting approval, so the switch reaches the remaining
+            // calls now instead of at the batch boundary.
+            self.commit_mode(session, events).await?;
             let request = tool.permission(input);
             let mut approval_note: Option<String> = None;
             // An approval may replace the artifact that actually runs (the
@@ -2251,10 +2264,13 @@ impl Agent {
         Ok(count)
     }
 
-    /// Commit a staged permission-mode switch at a safe boundary. The switch
-    /// changes the gate immediately for the next batch, but it is intentionally
-    /// not a model-facing event; `deliver_mode_note` handles that only after a
-    /// user interaction.
+    /// Commit a staged permission-mode switch (the gate only). Called at every
+    /// permission-decision point — turn start, `run_tools` entry, before each
+    /// serial call, and the batch boundary — so a switch reaches the very next
+    /// call it faces. Cheap when nothing is staged (`commit_pending_mode`
+    /// returns `None`, so no event is emitted). It is intentionally not a
+    /// model-facing event; `deliver_deferred_context` handles the note only
+    /// after a user interaction.
     async fn commit_mode(
         &self,
         session: &mut Session,
@@ -2554,6 +2570,9 @@ impl Agent {
         let ev = match ev {
             DelegateEvent::Usage(usage) => AgentEvent::DelegatedUsage(usage),
             DelegateEvent::CohortUpdated(update) => AgentEvent::CohortUpdated(update),
+            DelegateEvent::CohortChannelMessage(message) => {
+                AgentEvent::CohortChannelMessage(message)
+            }
             DelegateEvent::TaskStarted {
                 run,
                 parent_call,

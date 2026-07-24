@@ -13,6 +13,7 @@ const VISIBLE_ROWS: usize = 8;
 pub enum ViewId {
     Main,
     TaskRun(String),
+    CohortChannel(String),
 }
 
 #[derive(Clone)]

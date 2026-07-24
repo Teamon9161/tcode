@@ -110,10 +110,17 @@ impl PendingInput {
 /// A permission-mode switch the user requested while a turn was running.
 ///
 /// Like [`PendingInput`], it is a shared handle the frontend keeps while the
-/// running turn owns the `Session`. A key press never mutates the ledger and
-/// never flips the live mode mid-batch; it only writes the staged target here.
-/// The agent loop commits it at the next batch boundary (and at turn start and
-/// end), where permission for a whole batch is judged under one mode.
+/// running turn owns the `Session`. A key press never mutates the ledger; it
+/// only writes the staged target here.
+///
+/// The agent loop commits it (the gate only) at every permission-decision
+/// point — before a batch is judged and before each remaining call in a serial
+/// batch — as well as at turn start and end. Switch to unsafe/auto and the very
+/// next call it faces is judged under it, rather than waiting a whole round-trip
+/// for the next batch boundary. The model-facing note is deliberately *not*
+/// moved with the gate: it stays deferred to the next user interaction, so a
+/// bare key press cannot append transient plan guidance to the append-only
+/// ledger.
 ///
 /// Pressing shift+tab repeatedly while running leaves only the final target:
 /// the cycle reads staged-else-committed, so intermediate stops collapse.
@@ -691,11 +698,18 @@ impl Session {
         let pct = (self.last_prompt_tokens as f64 / context_window as f64 * 100.0).round();
         let background = {
             let tasks = self.tool_ctx.background.lock().expect("background lock");
-            let running = tasks.running();
+            let mut running = tasks.running().join(", ");
+            let agents = tasks.background_agent_ids();
+            if !agents.is_empty() {
+                if !running.is_empty() {
+                    running.push_str(", ");
+                }
+                running.push_str(&agents.join(", "));
+            }
             if running.is_empty() {
                 String::new()
             } else {
-                format!(" · background tasks running: {}", running.join(", "))
+                format!(" · background running: {running}")
             }
         };
         Some(ContentBlock::Text {

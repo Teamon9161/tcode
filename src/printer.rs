@@ -114,6 +114,7 @@ pub async fn print_events(mut rx: mpsc::Receiver<AgentEvent>) {
             // observability; plain mode already prints the final report through
             // the parent tool result.
             AgentEvent::CohortUpdated(_)
+            | AgentEvent::CohortChannelMessage(_)
             | AgentEvent::TaskRunStarted { .. }
             | AgentEvent::TaskRunEvent { .. }
             | AgentEvent::TaskRunFinished { .. } => {}

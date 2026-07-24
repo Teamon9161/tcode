@@ -205,6 +205,9 @@ struct Block {
     /// A task trace this record opens. This is view-only metadata: it never
     /// reaches the provider ledger and coexists with ordinary detail folding.
     task_run: Option<String>,
+    /// A cohort channel this record opens. Like `task_run`, it is view-only
+    /// metadata and never reaches the provider ledger.
+    cohort_channel: Option<String>,
 }
 
 impl Block {
@@ -332,6 +335,7 @@ impl Transcript {
             status_wrapped: Wrapped::default(),
             entry: None,
             task_run: None,
+            cohort_channel: None,
         });
     }
 
@@ -348,6 +352,7 @@ impl Transcript {
             status_wrapped: Wrapped::default(),
             entry: Some(entry),
             task_run: None,
+            cohort_channel: None,
         });
     }
 
@@ -405,6 +410,7 @@ impl Transcript {
             status_wrapped: Wrapped::default(),
             entry: None,
             task_run: None,
+            cohort_channel: None,
         });
     }
 
@@ -448,6 +454,15 @@ impl Transcript {
         }
     }
 
+    /// Associate an existing transcript block with a cohort's shared-channel
+    /// view. This remains separate from task traces because the channel is not
+    /// a tool batch or a member's private session.
+    pub fn link_cohort_channel(&mut self, index: usize, id: impl Into<String>) {
+        if let Some(block) = self.blocks.get_mut(index) {
+            block.cohort_channel = Some(id.into());
+        }
+    }
+
     /// Task trace associated with a task-card header at the given screen cell.
     /// The detail body remains a normal text-selection surface.
     pub fn task_run_at(&self, x: u16, y: u16) -> Option<String> {
@@ -455,6 +470,16 @@ impl Transcript {
         let (index, within_block) = self.block_at(row)?;
         (within_block < self.blocks[index].head_wrapped.len())
             .then(|| self.blocks[index].task_run.clone())
+            .flatten()
+    }
+
+    /// Cohort channel associated with a transcript header at the given screen
+    /// cell. Like task traces, only the header is a navigation affordance.
+    pub fn cohort_channel_at(&self, x: u16, y: u16) -> Option<String> {
+        let (row, _) = self.pos_at(x, y)?;
+        let (index, within_block) = self.block_at(row)?;
+        (within_block < self.blocks[index].head_wrapped.len())
+            .then(|| self.blocks[index].cohort_channel.clone())
             .flatten()
     }
 
