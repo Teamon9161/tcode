@@ -1919,6 +1919,151 @@ mod tests {
     }
 
     #[test]
+    fn completed_nested_runs_leave_no_live_agent_tree_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "t1".into(),
+            parent_call: "main-plan".into(),
+            kind: "plan".into(),
+            model: "m".into(),
+            prompt: "design".into(),
+            summary: "design".into(),
+            cohort_member: None,
+        });
+        for (run, summary) in [("t2", "inspect parser"), ("t3", "inspect UI")] {
+            app.on_agent_event(AgentEvent::TaskRunEvent {
+                run: "t1".into(),
+                event: Box::new(AgentEvent::TaskRunStarted {
+                    run: run.into(),
+                    parent_call: format!("call-{run}"),
+                    kind: "explore".into(),
+                    model: "m".into(),
+                    prompt: summary.into(),
+                    summary: summary.into(),
+                    cohort_member: None,
+                }),
+            });
+        }
+        for run in ["t2", "t3"] {
+            app.on_agent_event(AgentEvent::TaskRunEvent {
+                run: "t1".into(),
+                event: Box::new(AgentEvent::TaskRunFinished {
+                    run: run.into(),
+                    status: tcode_core::TaskRunStatus::Done,
+                    tool_calls: 0,
+                    usage: Usage::default(),
+                }),
+            });
+        }
+        app.on_agent_event(AgentEvent::TaskRunFinished {
+            run: "t1".into(),
+            status: tcode_core::TaskRunStatus::Done,
+            tool_calls: 2,
+            usage: Usage::default(),
+        });
+
+        assert!(
+            app.task_runs
+                .iter()
+                .all(|run| run.status != tcode_core::TaskRunStatus::Running),
+            "all completed descendants must leave the live tree"
+        );
+        assert!(
+            app.live_panel_lines().0.is_empty(),
+            "no completed plan/explore rows should remain in the running-only tree"
+        );
+    }
+
+    #[test]
+    fn every_running_agent_kind_in_the_tree_opens_its_trace() {
+        for kind in ["explore", "plan", "custom-worker"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = harness::app(dir.path(), 90, 30);
+            let run = format!("{kind}-run");
+            app.on_agent_event(AgentEvent::TaskRunStarted {
+                run: run.clone(),
+                parent_call: "delegation".into(),
+                kind: kind.into(),
+                model: "m".into(),
+                prompt: "inspect the interaction".into(),
+                summary: "inspect the interaction".into(),
+                cohort_member: None,
+            });
+            app.frame();
+
+            let hitbox = app
+                .live_panel_hitbox
+                .as_ref()
+                .expect("a running task renders the agent tree");
+            let tree_row = hitbox
+                .targets
+                .iter()
+                .position(|target| target == &Some(PanelTarget::Task(run.clone())))
+                .expect("the task owns a clickable tree row");
+            let (column, row) = (hitbox.rect.x + 1, hitbox.rect.y + 1 + tree_row as u16);
+
+            app.on_term_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+
+            assert_eq!(app.active_view, ViewId::TaskRun(run), "kind: {kind}");
+        }
+    }
+
+    #[test]
+    fn a_running_nested_agent_tree_entry_opens_its_trace_regardless_of_agent_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "parent-run".into(),
+            parent_call: "root-delegation".into(),
+            kind: "general".into(),
+            model: "m".into(),
+            prompt: "coordinate the work".into(),
+            summary: "coordinate the work".into(),
+            cohort_member: None,
+        });
+        app.on_agent_event(AgentEvent::TaskRunEvent {
+            run: "parent-run".into(),
+            event: Box::new(AgentEvent::TaskRunStarted {
+                run: "custom-run".into(),
+                parent_call: "nested-delegation".into(),
+                kind: "custom-worker".into(),
+                model: "m".into(),
+                prompt: "inspect the interaction".into(),
+                summary: "inspect the interaction".into(),
+                cohort_member: None,
+            }),
+        });
+        app.open_view(ViewId::TaskRun("parent-run".into()));
+        app.frame();
+
+        let hitbox = app
+            .live_panel_hitbox
+            .as_ref()
+            .expect("a running task renders the agent tree");
+        let tree_row = hitbox
+            .targets
+            .iter()
+            .position(|target| target == &Some(PanelTarget::Task("custom-run".into())))
+            .expect("the nested task owns a clickable tree row");
+        let (column, row) = (hitbox.rect.x + 1, hitbox.rect.y + 1 + tree_row as u16);
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert_eq!(app.active_view, ViewId::TaskRun("custom-run".into()));
+    }
+
+    #[test]
     fn ctrl_press_over_a_task_card_underlines_and_clicks_its_trace() {
         use ratatui::style::Modifier;
 

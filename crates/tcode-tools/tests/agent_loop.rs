@@ -4072,9 +4072,99 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
     assert!(!report.contains("momentum Sharpe"), "{report}");
 }
 
-/// A resumable custom agent can be re-driven with follow-up turns on the same
-/// session: the caller questions the sub-agent, the sub-agent answers with its
-/// context intact, and the follow-up is pure append under one cache scope.
+/// Every nested task shares its root session's task-run scope. Without that,
+/// plan's first explore would reuse plan's `t1`, causing the TUI to apply the
+/// explore completion to the plan row and leave the explore row running.
+#[tokio::test]
+async fn nested_parallel_agent_runs_have_unique_ids_and_persist_with_their_parent() {
+    fn collect_run_lifecycle(
+        event: &AgentEvent,
+        started: &mut Vec<String>,
+        finished: &mut Vec<String>,
+    ) {
+        match event {
+            AgentEvent::TaskRunStarted { run, .. } => started.push(run.clone()),
+            AgentEvent::TaskRunFinished { run, .. } => finished.push(run.clone()),
+            AgentEvent::TaskRunEvent { event, .. } => {
+                collect_run_lifecycle(event, started, finished)
+            }
+            _ => {}
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "parent-plan",
+            "agent",
+            r#"{"agent":"plan","prompt":"design the migration","summary":"design"}"#,
+        ),
+        text_done("parent complete"),
+    ]);
+    // The plan and both explores use this model: the plan is pinned to it and
+    // unpinned explores inherit their plan parent's model. The two explore
+    // reports are deliberately interchangeable because their requests run in
+    // parallel.
+    let delegated = MockProvider::named(
+        "planner-1",
+        vec![
+            tool_uses(&[
+                (
+                    "explore-a",
+                    "agent",
+                    r#"{"agent":"explore","prompt":"inspect the parser","summary":"parser"}"#,
+                ),
+                (
+                    "explore-b",
+                    "agent",
+                    r#"{"agent":"explore","prompt":"inspect the UI","summary":"UI"}"#,
+                ),
+            ]),
+            text_done("first report"),
+            text_done("second report"),
+            text_done("plan report"),
+        ],
+    );
+    let agent = plan_task_agent(parent, delegated);
+    let mut session = session(root.path(), PermissionMode::Default);
+    let traces_root = root.path().join("tasks");
+    session
+        .tool_ctx
+        .bind_task_trace_root(Some(traces_root.clone()));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "prepare a plan").await;
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
+    for event in &events {
+        collect_run_lifecycle(event, &mut started, &mut finished);
+    }
+
+    let unique: std::collections::HashSet<_> = started.iter().collect();
+    assert_eq!(started.len(), 3, "plan plus both explores: {started:?}");
+    assert_eq!(unique.len(), 3, "nested IDs must not collide: {started:?}");
+    assert_eq!(
+        started,
+        vec!["t1", "t2", "t3"],
+        "the shared allocator assigns one sequence to the whole task tree"
+    );
+    assert_eq!(
+        finished.iter().collect::<std::collections::HashSet<_>>(),
+        unique,
+        "every run that appeared in the tree receives its own completion: {finished:?}"
+    );
+
+    let traces = tcode_core::TaskTraces::discover(&traces_root);
+    assert_eq!(
+        traces.len(),
+        3,
+        "nested traces share the root session directory"
+    );
+    assert!(traces
+        .iter()
+        .all(|trace| trace.status == tcode_core::TaskRunStatus::Done));
+}
+
 #[tokio::test]
 async fn a_resumable_sub_agent_continues_the_same_session() {
     let root = tempfile::tempdir().unwrap();

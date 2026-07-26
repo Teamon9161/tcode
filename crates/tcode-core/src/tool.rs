@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
@@ -318,9 +318,11 @@ pub struct ToolCtx {
     /// The model active for this invocation. Tools may use its capabilities
     /// without owning model selection or provider construction.
     pub model: Option<ModelCell>,
-    /// Per-session task-run id allocator and trace persistence. Runs persist
-    /// only after `bind_task_trace_root`; ids are issued regardless.
-    pub task_traces: Mutex<TaskTraces>,
+    /// Per-session task-run id allocator and trace persistence. Descendant
+    /// agents share it so run IDs and trace files stay unique across the whole
+    /// delegation tree. Runs persist only after `bind_task_trace_root`; ids are
+    /// issued regardless.
+    pub task_traces: Arc<Mutex<TaskTraces>>,
     /// Budget reused when a resume/import binds this context to another
     /// session's scratch root.
     output_budget_tokens: usize,
@@ -392,7 +394,7 @@ impl ToolCtx {
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
             model: None,
-            task_traces: Mutex::new(TaskTraces::default()),
+            task_traces: Arc::new(Mutex::new(TaskTraces::default())),
             output_budget_tokens,
             delegate: Mutex::new(None),
             delegated_approvals: Mutex::new(None),
@@ -418,6 +420,14 @@ impl ToolCtx {
 
     pub fn with_model(mut self, model: ModelCell) -> Self {
         self.model = Some(model);
+        self
+    }
+
+    /// Join an existing delegation tree's task-run scope. A nested agent has
+    /// its own session and cache scope, but its run IDs and trace files belong
+    /// to the same user-visible task tree as its parent.
+    pub fn with_task_traces(mut self, task_traces: Arc<Mutex<TaskTraces>>) -> Self {
+        self.task_traces = task_traces;
         self
     }
 
