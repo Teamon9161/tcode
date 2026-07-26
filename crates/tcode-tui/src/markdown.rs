@@ -7,13 +7,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
-use syntect::parsing::SyntaxSet;
 use unicode_width::UnicodeWidthStr;
 
-use crate::theme;
+use crate::{syntax, theme};
 
 pub struct Renderer {
-    syntaxes: SyntaxSet,
     theme: syntect::highlighting::Theme,
 }
 
@@ -121,7 +119,6 @@ impl Default for Renderer {
     fn default() -> Self {
         let themes = ThemeSet::load_defaults();
         Self {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
             theme: themes.themes["base16-eighties.dark"].clone(),
         }
     }
@@ -420,15 +417,15 @@ impl Renderer {
     }
 
     fn highlight(&self, lang: &str, code: &str) -> Vec<Line<'static>> {
-        let syntax = self
-            .syntaxes
+        let syntaxes = syntax::syntaxes();
+        let syntax = syntaxes
             .find_syntax_by_token(lang)
-            .unwrap_or_else(|| self.syntaxes.find_syntax_plain_text());
+            .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
         let mut hl = HighlightLines::new(syntax, &self.theme);
         let mut out = Vec::new();
         for line in code.lines() {
             let mut spans = vec![Span::styled("  ", theme::dim())];
-            match hl.highlight_line(line, &self.syntaxes) {
+            match hl.highlight_line(line, syntaxes) {
                 Ok(ranges) => {
                     for (style, text) in ranges {
                         let fg = style.foreground;
@@ -986,6 +983,26 @@ mod tests {
             .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect();
         assert!(text.iter().any(|l| l.contains("let answer")));
+    }
+
+    #[test]
+    fn fenced_zig_code_uses_the_shared_syntax_set() {
+        let lines = Renderer::default().render("```zig\nconst std = @import(\"std\");\n```");
+        let code = lines
+            .iter()
+            .find(|line| {
+                line.spans
+                    .iter()
+                    .any(|span| span.content.contains("import"))
+            })
+            .expect("Zig code line");
+        assert!(
+            code.spans
+                .iter()
+                .skip(1)
+                .any(|span| span.style.fg.is_some()),
+            "Zig fence should use the same syntax definitions as source previews"
+        );
     }
 
     #[test]

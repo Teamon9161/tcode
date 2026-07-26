@@ -9,9 +9,8 @@ use similar::ChangeTag;
 use std::ops::Range;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
-use syntect::parsing::SyntaxSet;
 
-use crate::theme;
+use crate::{syntax, theme};
 
 const MAX_DIFF_LINES: usize = 80;
 /// Word-level emphasis earns its brightness only when the two sides are similar
@@ -20,7 +19,6 @@ const MAX_DIFF_LINES: usize = 80;
 const MAX_INLINE_EMPHASIS_FRACTION_DENOMINATOR: usize = 2;
 
 struct Highlighter {
-    syntaxes: SyntaxSet,
     theme: Theme,
 }
 
@@ -29,7 +27,6 @@ fn highlighter() -> &'static Highlighter {
     HIGHLIGHTER.get_or_init(|| {
         let themes = ThemeSet::load_defaults();
         Highlighter {
-            syntaxes: SyntaxSet::load_defaults_newlines(),
             theme: themes.themes["base16-eighties.dark"].clone(),
         }
     })
@@ -384,9 +381,10 @@ fn code_line_emphasized(
                 })
                 .next_back()
         });
+    let syntaxes = syntax::syntaxes();
     let syntax = extension
-        .and_then(|extension| highlighter.syntaxes.find_syntax_by_extension(extension))
-        .unwrap_or_else(|| highlighter.syntaxes.find_syntax_plain_text());
+        .and_then(|extension| syntaxes.find_syntax_by_extension(extension))
+        .unwrap_or_else(|| syntaxes.find_syntax_plain_text());
     let mut line_highlighter = HighlightLines::new(syntax, &highlighter.theme);
     let marker_style = Style::default()
         .fg(match marker {
@@ -403,7 +401,7 @@ fn code_line_emphasized(
         Span::styled(line_no, marker_style),
         Span::styled(" │ ", marker_style),
     ];
-    match line_highlighter.highlight_line(text, &highlighter.syntaxes) {
+    match line_highlighter.highlight_line(text, syntaxes) {
         Ok(ranges) => {
             let mut offset = 0;
             for (style, token) in ranges {
@@ -453,6 +451,19 @@ mod tests {
         );
         assert!(lines[1].spans.iter().any(|span| span.style.fg.is_some()));
         assert_eq!(lines[2].style.fg, Some(theme::DIM));
+    }
+
+    #[test]
+    fn read_preview_highlights_zig_source() {
+        let lines = read_preview("src/main.zig", "const std = @import(\"std\");");
+        let code = lines.first().expect("one Zig source line");
+        assert!(
+            code.spans
+                .iter()
+                .skip(2)
+                .any(|span| span.style.fg.is_some()),
+            "Zig tokens should use the shared syntax set"
+        );
     }
 
     #[test]

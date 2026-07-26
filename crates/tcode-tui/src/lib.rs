@@ -22,6 +22,7 @@ mod render;
 mod resume;
 mod setup;
 mod surface;
+mod syntax;
 mod theme;
 mod transcript;
 mod usage;
