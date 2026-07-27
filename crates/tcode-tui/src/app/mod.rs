@@ -89,6 +89,11 @@ const OUTPUT_VIEW_ROWS: usize = 12;
 /// Second Esc within this window (while idle) opens the rewind picker.
 const DOUBLE_ESC: Duration = Duration::from_millis(1200);
 
+/// Legacy Windows console input reports an unbracketed paste as individual key
+/// events. A human cannot reasonably type two keys in this interval, while a
+/// terminal injects a pasted line without a gap.
+const UNBRACKETED_PASTE_WINDOW: Duration = Duration::from_millis(10);
+
 /// Opens a note the human slipped to the model mid-turn (approval comment,
 /// `/note`), distinguishing it from a full user turn under the same rail.
 /// The note's own text already says what it is about — see
@@ -439,6 +444,13 @@ pub struct App {
     task_trace_root: Option<PathBuf>,
     active_view: ViewId,
     trace_view: Option<TraceView>,
+    /// The most recent unmodified character. It distinguishes terminal paste
+    /// bursts from an intentional bare Enter on Windows consoles that cannot
+    /// report `Event::Paste`.
+    last_plain_text_input: Option<Instant>,
+    /// A bare Enter waits briefly so the following pasted character can turn it
+    /// into an editor newline instead of submitting the partial prompt.
+    deferred_submit: Option<Instant>,
     last_esc: Option<Instant>,
     popup_index: usize,
     /// Tab accepted this exact `@` marker. Keep its completion closed until the
@@ -640,6 +652,8 @@ impl App {
             task_trace_root,
             active_view: ViewId::Main,
             trace_view: None,
+            last_plain_text_input: None,
+            deferred_submit: None,
             last_esc: None,
             popup_index: 0,
             dismissed_reference: None,
@@ -708,12 +722,20 @@ impl App {
             let monitor_deadline = self
                 .monitor_deadline
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            let deferred_submit_armed = self.deferred_submit.is_some();
+            let deferred_submit_deadline = self
+                .deferred_submit
+                .map(|at| tokio::time::Instant::from_std(at + UNBRACKETED_PASTE_WINDOW))
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 ev = term_events.next() => {
                     match ev {
                         Some(Ok(ev)) => self.on_term_event(ev),
                         _ => break,
                     }
+                }
+                _ = tokio::time::sleep_until(deferred_submit_deadline), if deferred_submit_armed => {
+                    self.flush_deferred_submit();
                 }
                 Some(ev) = recv_opt(&mut self.events_rx) => {
                     self.on_agent_event(ev);
@@ -1432,6 +1454,8 @@ impl App {
             }
             Event::Key(key) => self.on_key(key),
             Event::Paste(text) => {
+                self.deferred_submit = None;
+                self.last_plain_text_input = None;
                 // An overlay owns interaction while it is on screen. In
                 // particular, multiline terminal pastes must not leak into
                 // the hidden main editor and then make the restored panel jump.
@@ -1579,6 +1603,12 @@ impl App {
         }
     }
 
+    fn flush_deferred_submit(&mut self) {
+        if self.deferred_submit.take().is_some() {
+            self.submit(matches!(self.phase, Phase::Running { .. }));
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         // A pending approval keeps its mode status visible. Let its one global
         // shortcut through while all other keys still belong to the dialog.
@@ -1658,6 +1688,19 @@ impl App {
                 _ => {}
             }
             return;
+        }
+
+        let now = Instant::now();
+        if let Some(entered_at) = self.deferred_submit {
+            if now.duration_since(entered_at) <= UNBRACKETED_PASTE_WINDOW
+                && is_unbracketed_paste_event(&key)
+            {
+                self.deferred_submit = None;
+                self.editor.newline();
+                self.last_plain_text_input = Some(now);
+            } else {
+                self.flush_deferred_submit();
+            }
         }
 
         let running = matches!(self.phase, Phase::Running { .. });
@@ -1741,8 +1784,16 @@ impl App {
             }
             KeyCode::Char('j') if ctrl => self.editor.newline(),
             KeyCode::Enter if alt || shift || ctrl => self.editor.newline(),
+            KeyCode::Enter
+                if self
+                    .last_plain_text_input
+                    .is_some_and(|at| now.duration_since(at) <= UNBRACKETED_PASTE_WINDOW) =>
+            {
+                self.editor.newline();
+                self.last_plain_text_input = Some(now);
+            }
             KeyCode::Enter if self.accept_reference_completion() => {}
-            KeyCode::Enter => self.submit(running),
+            KeyCode::Enter => self.deferred_submit = Some(now),
             KeyCode::BackTab => self.cycle_mode(),
             KeyCode::Tab => {
                 if let Some(completion) = self.popup_selection() {
@@ -1798,6 +1849,9 @@ impl App {
                 self.dismissed_reference = None;
                 self.editor.insert_char(c);
                 self.popup_index = 0;
+                if key.modifiers.is_empty() {
+                    self.last_plain_text_input = Some(now);
+                }
             }
             _ => {}
         }
@@ -1870,6 +1924,10 @@ fn key_char_eq(key: &KeyEvent, target: char) -> bool {
     matches!(key.code, KeyCode::Char(c) if c.eq_ignore_ascii_case(&target))
 }
 
+fn is_unbracketed_paste_event(key: &KeyEvent) -> bool {
+    key.modifiers.is_empty() && matches!(key.code, KeyCode::Char(_) | KeyCode::Enter)
+}
+
 /// Windows' legacy console API reports Ctrl on mouse records but suppresses
 /// standalone Ctrl key events. Reading its current state closes that gap for a
 /// stationary pointer without altering terminals that already report modifiers.
@@ -1930,6 +1988,42 @@ async fn join_external_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unbracketed_multiline_paste_stays_in_the_editor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('a'),
+            KeyCode::Enter,
+            KeyCode::Char('b'),
+            KeyCode::Enter,
+        ] {
+            app.on_term_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+        }
+
+        assert_eq!(app.editor.text(), "\na\nb\n");
+        assert!(matches!(app.phase, Phase::Idle));
+    }
+
+    #[test]
+    fn bare_enter_submits_after_the_paste_window_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.editor.insert_str("/help");
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.deferred_submit.is_some());
+
+        app.flush_deferred_submit();
+
+        assert!(app.deferred_submit.is_none());
+        assert!(app.editor.is_empty());
+        assert!(app.frame().contains("keys and commands"));
+    }
 
     #[tokio::test]
     async fn plan_handoff_uses_the_execution_picker_and_starts_a_clean_default_session() {
