@@ -67,6 +67,17 @@ fn slots_for(def: &ModelDef, want: Option<&str>) -> (Vec<String>, usize) {
 impl Picker {
     /// The main model: every option, starting on the active one.
     pub fn new(menu: &ModelMenu, current_effort: Option<&str>) -> Option<Self> {
+        Self::with_title(menu, current_effort, "◈ model")
+    }
+
+    /// A focused main-model picker for a one-off action. It uses the same
+    /// rows and effort semantics as `/model`, differing only in its title.
+    pub fn with_title(
+        menu: &ModelMenu,
+        current_effort: Option<&str>,
+        title: impl Into<String>,
+    ) -> Option<Self> {
+        let title = title.into();
         if menu.options.is_empty() {
             return None;
         }
@@ -92,7 +103,7 @@ impl Picker {
             })
             .collect();
         Some(Self {
-            title: "◈ model".into(),
+            title,
             rows,
             selected: menu.current,
             current: menu.current,

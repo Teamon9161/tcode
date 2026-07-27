@@ -10,7 +10,7 @@
 //! stub below exists only to satisfy `Agent`'s shape.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
 use tcode_core::config::WatchdogConfig;
@@ -44,6 +44,32 @@ impl Provider for StubProvider {
         _cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
         unreachable!("harness tests never run a turn")
+    }
+}
+
+/// Keeps the fresh execution turn open while its harness test inspects the
+/// first prompt. The test runtime aborts it during teardown.
+struct PendingProvider;
+
+#[async_trait::async_trait]
+impl Provider for PendingProvider {
+    fn name(&self) -> &str {
+        "pending"
+    }
+    fn model(&self) -> &str {
+        "pending"
+    }
+    fn cache_strategy(&self) -> CacheStrategy {
+        CacheStrategy::ImplicitPrefix
+    }
+    async fn stream(
+        &self,
+        _req: Request,
+        _cancel: CancellationToken,
+    ) -> Result<EventStream, ProviderError> {
+        Ok(Box::pin(futures::stream::pending::<
+            Result<tcode_core::StreamEvent, ProviderError>,
+        >()))
     }
 }
 
@@ -89,6 +115,9 @@ fn config() -> crate::TuiConfig {
             || Ok(tcode_core::config::ModelState::default()),
             |_| Ok(()),
         ),
+        fresh_session: crate::FreshSession(Arc::new(|| {
+            Err("no fresh session factory in tests".into())
+        })),
         opening_context: Arc::new(|cwd: &Path, _| tcode_core::StartupContext {
             text: String::new(),
             environment: environment(cwd),
@@ -106,6 +135,52 @@ fn config() -> crate::TuiConfig {
 /// An app painting into a `width`x`height` buffer, rooted at `cwd`.
 pub(super) fn app(cwd: &Path, width: u16, height: u16) -> App {
     app_with(cwd, width, height, config())
+}
+
+/// A harness app configured for the Plan fresh-session handoff. It records
+/// the mode assigned to the newly created Session and uses a pending provider
+/// so the first execution prompt remains observable.
+pub(super) fn app_for_plan_handoff(
+    cwd: &Path,
+    width: u16,
+    height: u16,
+    created_modes: Arc<Mutex<Vec<PermissionMode>>>,
+) -> App {
+    let fresh_cwd = cwd.to_path_buf();
+    let recorded_modes = created_modes.clone();
+    app_with(
+        cwd,
+        width,
+        height,
+        crate::TuiConfig {
+            menu: ModelMenu {
+                options: vec![crate::model_picker::ModelOption {
+                    profile: "test".into(),
+                    def: tcode_core::config::ModelDef::bare("handoff-model"),
+                }],
+                current: 0,
+                switch: Box::new(|_, _| {
+                    Ok(ActiveModel {
+                        provider: Arc::new(PendingProvider),
+                        max_tokens: 1024,
+                        context_window: 200_000,
+                        effort: None,
+                    })
+                }),
+            },
+            fresh_session: crate::FreshSession(Arc::new(move || {
+                let mut session = Session::new(
+                    ToolCtx::for_test(fresh_cwd.clone(), 2000),
+                    PermissionMode::Default,
+                    PermissionRules::default(),
+                );
+                session.set_folder_trust(tcode_core::FolderTrust::Trusted);
+                recorded_modes.lock().expect("mode log").push(session.mode);
+                Ok(session)
+            })),
+            ..config()
+        },
+    )
 }
 
 /// Same, with the sidecar download replaced. It is the one part of voice that

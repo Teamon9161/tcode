@@ -112,6 +112,9 @@ pub struct VoiceInstall(
     >,
 );
 
+#[derive(Clone)]
+pub struct FreshSession(pub Arc<dyn Fn() -> Result<Session, String> + Send + Sync>);
+
 pub struct TuiConfig {
     pub menu: ModelMenu,
     pub agents: AgentMenu,
@@ -120,6 +123,9 @@ pub struct TuiConfig {
     /// Runs the ChatGPT/Codex `/login` OAuth flow off the UI thread.
     pub codex_login: CodexLogin,
     pub state_store: StateStore,
+    /// Creates the isolated session used by Plan review's fresh-execution handoff.
+    /// The composition root owns persistence, config selection and session policy.
+    pub fresh_session: FreshSession,
     pub opening_context: OpeningContextFn,
     pub environment: EnvironmentFn,
     pub show_reasoning: bool,

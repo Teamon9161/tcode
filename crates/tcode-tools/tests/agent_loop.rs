@@ -2907,6 +2907,7 @@ async fn edit_approval_can_switch_the_whole_file_mutation_batch_to_accept_edits(
         comment: None,
         set_mode: Some(PermissionMode::AcceptEdits),
         approved_input: None,
+        end_turn_after_execution: false,
     });
 
     run(&agent, &mut session, &approver, "make both changes").await;
@@ -3062,6 +3063,54 @@ async fn declining_a_combined_review_writes_nothing() {
 }
 
 #[tokio::test]
+async fn exit_plan_handoff_ends_the_planning_turn_after_persisting_the_plan() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "exit_plan",
+            r#"{"plan":"Execute this fresh-session handoff.","title":"Handoff"}"#,
+        ),
+        text_done("this response must stay unused"),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let approver = ScriptedApprover::with_response(Approval {
+        decision: ApprovalDecision::Yes,
+        comment: None,
+        set_mode: Some(PermissionMode::Default),
+        approved_input: None,
+        end_turn_after_execution: true,
+    });
+
+    let events = run(&agent, &mut session, &approver, "make a plan").await;
+
+    assert_eq!(provider.requests.lock().unwrap().len(), 1);
+    assert_eq!(session.mode, PermissionMode::Default);
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::ToolEnd { name, content, .. }
+            if name == "exit_plan" && content.contains("Plan approved")
+    )));
+    let plans_dir = tcode_core::store::plans_dir(dir.path());
+    let saved = std::fs::read_dir(&plans_dir)
+        .expect("approved handoff plan is mirrored")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .expect("approved handoff plan exists");
+    assert_eq!(
+        std::fs::read_to_string(&saved).unwrap(),
+        "Execute this fresh-session handoff."
+    );
+    let _ = std::fs::remove_file(saved);
+    let _ = std::fs::remove_dir(&plans_dir);
+    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
+        let _ = std::fs::remove_dir(project_data);
+    }
+}
+
+#[tokio::test]
 async fn exit_plan_approval_switches_mode_and_unblocks_edits() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "old").unwrap();
@@ -3091,6 +3140,7 @@ async fn exit_plan_approval_switches_mode_and_unblocks_edits() {
             "plan": revised_plan,
             "title": "Do it",
         })),
+        end_turn_after_execution: false,
     });
 
     let events = run(&agent, &mut session, &approver, "make a plan").await;

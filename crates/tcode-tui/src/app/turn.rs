@@ -251,6 +251,10 @@ impl App {
                 ratatui::style::Style::default().fg(theme::WARN),
             )]);
         }
+        if let Some(handoff) = self.pending_plan_execution.take() {
+            self.start_fresh_plan_execution(handoff);
+            return;
+        }
         // Whatever the loop never reached a boundary to deliver — a message
         // queued during the closing answer, or one queued right before ctrl+c —
         // becomes the next turn immediately. The user already pressed enter on
@@ -268,6 +272,49 @@ impl App {
         // Monitor events that arrived during the closing words never reached
         // a boundary; now that the session is back, re-arm the idle wake.
         self.refresh_monitor_deadline();
+    }
+
+    fn start_fresh_plan_execution(&mut self, handoff: PlanExecution) {
+        let mut session = match (self.fresh_session.0)() {
+            Ok(session) => session,
+            Err(error) => {
+                self.bake(vec![Line::styled(
+                    format!("cannot create fresh execution session: {error}"),
+                    theme::error_highlight(),
+                )]);
+                return;
+            }
+        };
+        // A fresh execution starts from the normal manual-approval default;
+        // the Plan-review choice intentionally does not carry its planning
+        // session's permission mode across this session boundary.
+        session.apply_approved_mode(tcode_core::PermissionMode::Default);
+        self.pending = session.pending.clone();
+        self.monitor_signal = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .monitor_signal();
+        self.cwd = session.tool_ctx.cwd.clone();
+        self.scratch_dir = session.tool_ctx.scratch_dir.clone();
+        self.pending_mode = session.pending_mode.clone();
+        self.committed_mode = session.mode;
+        self.mode_label = session.mode.label().to_string();
+        self.dogfood = session.dogfood();
+        self.session = Some(session);
+        self.reset_conversation_ui();
+
+        let prompt = format!(
+            "Execute the approved plan below. Do not re-plan it; inspect the repository as needed, \
+             make the changes, and verify them.\n\n{}",
+            handoff.plan.trim()
+        );
+        self.start_turn(PendingMessage {
+            text: prompt.clone(),
+            attachments: Vec::new(),
+            blocks: vec![ContentBlock::Text { text: prompt }],
+        });
     }
 
     pub(super) fn drain_agent_events(&mut self) {

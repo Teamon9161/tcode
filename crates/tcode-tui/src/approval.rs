@@ -212,28 +212,41 @@ struct PlanOption {
     label: &'static str,
     decision: ApprovalDecision,
     set_mode: Option<PermissionMode>,
+    /// This decision closes the planning turn and hands the accepted markdown
+    /// to an intentionally empty execution session.
+    fresh_session: bool,
 }
 
-const PLAN_OPTIONS: [PlanOption; 4] = [
+const PLAN_OPTIONS: [PlanOption; 5] = [
     PlanOption {
         label: "Yes, and approve edits manually",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::Default),
+        fresh_session: false,
     },
     PlanOption {
         label: "Yes, and auto-accept edits",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::AcceptEdits),
+        fresh_session: false,
     },
     PlanOption {
         label: "Yes, and use auto mode",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::Auto),
+        fresh_session: false,
+    },
+    PlanOption {
+        label: "Yes, execute in a fresh session…",
+        decision: ApprovalDecision::Yes,
+        set_mode: Some(PermissionMode::Default),
+        fresh_session: true,
     },
     PlanOption {
         label: "No, keep planning",
         decision: ApprovalDecision::No,
         set_mode: None,
+        fresh_session: false,
     },
 ];
 
@@ -391,17 +404,57 @@ const PLAN_EDITOR_ROWS: usize = 2;
 /// The plan body never shrinks below this many rows, even on a short terminal.
 const PLAN_MIN_VIEWPORT: usize = 3;
 
-fn plan_viewport(height: u16, row_count: usize) -> usize {
-    let overhead = 1 + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
+fn plan_viewport(height: u16, row_count: usize, header_rows: usize) -> usize {
+    let overhead = header_rows + PLAN_OPTIONS.len() + PLAN_EDITOR_ROWS + 1;
     (height as usize)
         .saturating_sub(overhead)
         .max(PLAN_MIN_VIEWPORT)
         .min(row_count)
 }
 
+/// Wrap a filesystem path at separators whenever the next visual row would
+/// overflow. The original string is deliberately kept elsewhere for copying;
+/// these rows are presentation only.
+fn wrap_plan_path(path: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+
+    let width = width.max(10);
+    let mut rest = path;
+    let mut rows = Vec::new();
+    while !rest.is_empty() {
+        let mut cells = 0;
+        let mut end = rest.len();
+        for (index, ch) in rest.char_indices() {
+            let next = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if cells + next > width {
+                end = index;
+                break;
+            }
+            cells += next;
+        }
+        if end == rest.len() {
+            rows.push(rest.to_string());
+            break;
+        }
+        let break_at = rest[..end]
+            .rfind(['/', '\\'])
+            .map(|index| index + 1)
+            .filter(|index| *index > 0)
+            .unwrap_or(end);
+        rows.push(rest[..break_at].to_string());
+        rest = &rest[break_at..];
+    }
+    rows
+}
+
 pub enum DialogResult {
     Pending,
     Done(Approval),
+    /// The accepted plan should execute in a new session after the user picks
+    /// its model. The dialog remains available if that picker is cancelled.
+    PlanHandoff(Approval),
+    /// Copy the durable plan path without copying visual wrap newlines.
+    CopyPlanPath,
     /// A combined review the reviewer chose to take apart. Only a batch dialog
     /// offers the option that produces this.
     Individually,
@@ -595,6 +648,19 @@ impl Dialog {
     /// The durable plan file assigned before this review opened.
     pub fn plan_path(&self) -> Option<&str> {
         self.plan.as_ref()?.input[PLAN_PATH_FIELD].as_str()
+    }
+
+    fn plan_path_rows(&self, width: u16) -> Vec<Line<'static>> {
+        let Some(path) = self.plan_path() else {
+            return Vec::new();
+        };
+        let mut rows = vec![Line::styled("  saved draft:", theme::dim())];
+        rows.extend(
+            wrap_plan_path(path, (width as usize).saturating_sub(6))
+                .into_iter()
+                .map(|row| Line::styled(format!("    {row}"), theme::dim())),
+        );
+        rows
     }
 
     /// Adopt a `$EDITOR` revision: the pane now shows the revised plan (blocks
@@ -848,6 +914,7 @@ impl Dialog {
                     comment: Some(note).filter(|s| !s.is_empty()),
                     set_mode,
                     approved_input: None,
+                    end_turn_after_execution: false,
                 });
             }
             K::Esc => {
@@ -1115,6 +1182,7 @@ impl Dialog {
             comment: None,
             set_mode,
             approved_input: None,
+            end_turn_after_execution: false,
         }))
     }
 
@@ -1270,9 +1338,10 @@ impl Dialog {
         height: u16,
     ) -> Option<(PlanMousePosition, Vec<(usize, usize)>)> {
         let (rows, spans) = self.plan_rows(width);
-        let viewport = plan_viewport(height, rows.len());
+        let header_rows = 1 + self.plan_path_rows(width).len();
+        let viewport = plan_viewport(height, rows.len(), header_rows);
         let scroll = self.plan_scroll(&spans, viewport, rows.len());
-        let body_row = row.checked_sub(1)?;
+        let body_row = row.checked_sub(header_rows)?;
         let absolute_row = scroll + body_row;
         (body_row < viewport && absolute_row < rows.len()).then_some((
             PlanMousePosition {
@@ -1415,6 +1484,7 @@ impl Dialog {
         if plan.options_focused {
             match key.code {
                 K::Enter => return self.submit_plan(),
+                K::Char('y') => return DialogResult::CopyPlanPath,
                 // Every plan decision may carry a user note. Approval notes
                 // follow the normal append-only UserNote path; the
                 // keep-planning choice sends the same text back as feedback.
@@ -1441,6 +1511,7 @@ impl Dialog {
         match key.code {
             K::Enter => return self.submit_plan(),
             K::Esc => return self.decline_plan(),
+            K::Char('y') => return DialogResult::CopyPlanPath,
             K::Tab => plan.feedback_focused = true,
             K::Up | K::Char('k') => plan.focus = plan.focus.saturating_sub(1),
             K::Down | K::Char('j') => {
@@ -1480,16 +1551,18 @@ impl Dialog {
             comment: self.assemble_feedback(),
             set_mode: None,
             approved_input: None,
+            end_turn_after_execution: false,
         })
     }
 
     fn submit_plan(&mut self) -> DialogResult {
-        let (decision, set_mode, revised, approved_input) = {
+        let (decision, set_mode, fresh_session, revised, approved_input) = {
             let plan = self.plan.as_ref().expect("plan dialog");
             let opt = &PLAN_OPTIONS[plan.cursor];
             (
                 opt.decision,
                 opt.set_mode,
+                opt.fresh_session,
                 plan.revised.clone(),
                 plan.approved_input(),
             )
@@ -1509,12 +1582,18 @@ impl Dialog {
         if let Some(feedback) = self.comments_feedback() {
             parts.push(feedback);
         }
-        DialogResult::Done(Approval {
+        let approval = Approval {
             decision,
             comment: (!parts.is_empty()).then(|| parts.join("\n\n")),
             set_mode,
             approved_input,
-        })
+            end_turn_after_execution: fresh_session,
+        };
+        if fresh_session {
+            DialogResult::PlanHandoff(approval)
+        } else {
+            DialogResult::Done(approval)
+        }
     }
 
     /// The feedback the model receives on keep-planning: each anchored comment
@@ -1617,7 +1696,7 @@ impl Dialog {
     /// activities, so the text field must not trap the reviewer at its cursor.
     pub fn plan_mouse_wheel(&self, up: bool, width: u16, height: u16) {
         let (rows, _) = self.plan_rows(width);
-        let viewport = plan_viewport(height, rows.len());
+        let viewport = plan_viewport(height, rows.len(), 1 + self.plan_path_rows(width).len());
         let plan = self.plan.as_ref().expect("plan dialog");
         let max_scroll = rows.len().saturating_sub(viewport);
         let next = if up {
@@ -1666,31 +1745,28 @@ impl Dialog {
             ));
         }
         out.push(Line::from(title));
-        if let Some(path) = plan.input[PLAN_PATH_FIELD].as_str() {
-            out.push(Line::from(Span::styled(
-                format!("  saved draft: {path}"),
-                theme::dim(),
-            )));
-        }
+        out.extend(self.plan_path_rows(width));
 
         // Plan body, scrolled to keep the focus visible. Reserve the rest of
         // the panel for the options, the editor row, and the hint.
         let (rows, spans) = self.plan_rows(width);
-        let k = plan_viewport(height, rows.len());
+        let k = plan_viewport(height, rows.len(), out.len());
         let scroll = self.plan_scroll(&spans, k, rows.len());
         plan.scroll.set(scroll);
         out.extend(rows.into_iter().skip(scroll).take(k));
 
         // Decision options. After an external edit these are deliberately
         // phrased as the two available destinations: options 1–3 approve the
-        // revised artifact under a chosen permission mode; option 4 sends its
-        // diff back for another planning pass.
+        // revised artifact under a chosen permission mode; option 4 opens a
+        // fresh execution session, while option 5 sends its diff back for
+        // another planning pass.
         for (i, opt) in PLAN_OPTIONS.iter().enumerate() {
             let label = if plan.has_revision() {
                 match i {
                     0 => "Approve revised plan, approve edits manually",
                     1 => "Approve revised plan, auto-accept edits",
                     2 => "Approve revised plan, use auto mode",
+                    3 => "Execute revised plan in a fresh session…",
                     _ => "Send revision back as feedback",
                 }
             } else {
@@ -1758,11 +1834,11 @@ impl Dialog {
         } else if plan.feedback_focused {
             "  type note or feedback · enter confirm · esc return to plan"
         } else if plan.options_focused {
-            "  ↑↓/1-4 choose · tab note · enter confirm · → return to plan · esc decline"
+            "  ↑↓/1-5 choose · y copy full path · tab note · enter confirm · → return to plan · esc decline"
         } else if plan.has_revision() {
-            "  ↑↓ blocks · c comment · e edit · ←/1-4 choose · esc = keep planning"
+            "  ↑↓ blocks · c comment · e edit · y copy full path · ←/1-5 choose · esc = keep planning"
         } else {
-            "  ↑↓ blocks · c comment · drag text to quote · ←/1-4 choose · tab feedback · esc = keep planning"
+            "  ↑↓ blocks · c comment · drag text to quote · y copy full path · ←/1-5 choose · tab feedback · esc = keep planning"
         };
         out.push(Line::styled(hint, theme::dim()));
         out
@@ -2339,7 +2415,57 @@ mod tests {
             )],
         );
         assert_eq!(plan.plan_path(), Some(path));
-        assert!(screen(&plan, 100).contains("saved draft: /tmp/tcode/plans/demo.md"));
+        let text = screen(&plan, 100);
+        assert!(text.contains("saved draft:\n    /tmp/tcode/plans/demo.md"));
+    }
+
+    #[test]
+    fn long_plan_paths_wrap_at_separators_without_changing_the_copy_source() {
+        let path = "/home/teamon/projects/tcode/plans/approved-plan.md";
+        let rows = wrap_plan_path(path, 16);
+        assert!(rows.len() > 1, "the test path must wrap");
+        assert_eq!(rows.concat(), path);
+        assert!(
+            rows[..rows.len() - 1]
+                .iter()
+                .all(|row| row.ends_with('/') || row.ends_with('\\')),
+            "all available breakpoints are filesystem separators: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn plan_review_copies_the_unwrapped_draft_path() {
+        let mut plan = Dialog::plan(
+            "Review plan".into(),
+            json!({ "plan": "# Plan", PLAN_PATH_FIELD: "/tmp/tcode/plans/demo.md" }),
+            vec![(
+                "# Plan".into(),
+                crate::markdown::Renderer::default().parse("# Plan"),
+            )],
+        );
+        assert!(matches!(
+            plan.handle_key(key(KeyCode::Char('y'))),
+            DialogResult::CopyPlanPath
+        ));
+    }
+
+    #[test]
+    fn plan_option_four_requests_fresh_session_execution_in_default_mode() {
+        let mut plan = Dialog::plan(
+            "Review plan".into(),
+            json!({ "plan": "# Plan" }),
+            vec![(
+                "# Plan".into(),
+                crate::markdown::Renderer::default().parse("# Plan"),
+            )],
+        );
+        plan.handle_key(key(KeyCode::Char('4')));
+        let DialogResult::PlanHandoff(approval) = plan.handle_key(key(KeyCode::Enter)) else {
+            panic!("option 4 should open the execution-model picker");
+        };
+        assert_eq!(approval.decision, ApprovalDecision::Yes);
+        assert_eq!(approval.set_mode, Some(PermissionMode::Default));
+        assert!(approval.end_turn_after_execution);
     }
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -3107,7 +3233,7 @@ mod tests {
     #[test]
     fn escape_from_plan_options_declines_without_feedback() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Char('5')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
             panic!("Esc from plan options must decline immediately");
         };
@@ -3118,7 +3244,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_without_feedback_pauses_the_turn() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Char('5')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter must decline without forcing a feedback editor");
         };
@@ -3129,7 +3255,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_tab_opens_its_feedback_editor() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Char('5')));
         d.handle_key(key(KeyCode::Tab));
         assert!(
             d.plan.as_ref().expect("plan dialog").feedback_focused,
@@ -3192,7 +3318,7 @@ mod tests {
             .join("\n\n");
         let mut d = plan_dialog(&src);
         let _ = render_text(&d, 60, 14); // establish the initial viewport
-        d.handle_key(key(KeyCode::Char('4')));
+        d.handle_key(key(KeyCode::Char('5')));
         d.handle_key(key(KeyCode::Tab));
         assert!(d.plan.as_ref().expect("plan dialog").feedback_focused);
 
@@ -3238,7 +3364,7 @@ mod tests {
     fn plan_editor_revision_can_be_sent_back_as_a_diff() {
         let mut d = plan_dialog("Original body.");
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
-        d.handle_key(key(KeyCode::Char('4'))); // keep planning
+        d.handle_key(key(KeyCode::Char('5'))); // keep planning
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter submits the edit as feedback");
         };

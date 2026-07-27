@@ -189,6 +189,11 @@ pub struct Approval {
     /// to turn an approved artifact (such as an edited plan) into the actual
     /// tool input and on-disk result.
     pub approved_input: Option<Value>,
+    /// End the current agent turn once this approved action finishes
+    /// successfully. This is an execution-control fact, not a permission
+    /// mode: frontends use it to hand an accepted plan to a distinct session
+    /// without allowing the planning model another request.
+    pub end_turn_after_execution: bool,
 }
 
 impl Approval {
@@ -200,6 +205,7 @@ impl Approval {
             comment,
             set_mode: None,
             approved_input: None,
+            end_turn_after_execution: false,
         }
     }
 }

@@ -120,6 +120,7 @@ impl Approver for LineApprover {
                 comment: rest,
                 set_mode,
                 approved_input: None,
+                end_turn_after_execution: false,
             };
         }
     }
@@ -235,6 +236,7 @@ async fn review_plan_plain(input: &Value) -> Approval {
             comment: rest,
             set_mode,
             approved_input: None,
+            end_turn_after_execution: false,
         };
     }
 }

@@ -699,6 +699,10 @@ impl Agent {
                 self.emit(events, AgentEvent::TurnEnd).await?;
                 return Ok(());
             }
+            if outcome.end_turn {
+                self.emit(events, AgentEvent::TurnEnd).await?;
+                return Ok(());
+            }
             // End of a tool batch is a safe append boundary for background
             // task completion notes, a staged mode switch, and anything the
             // user said meanwhile. A keypress commits the permission gate here
@@ -928,6 +932,7 @@ impl Agent {
         let mut executed: Vec<String> = Vec::new();
         let mut declined = false;
         let mut awaiting_user_input = false;
+        let mut end_turn = false;
         let mut interrupted_at: Option<usize> = None;
         let mut classified = BatchClassification::default();
 
@@ -941,6 +946,14 @@ impl Agent {
                 results.push(tool_result(
                     id,
                     "Not executed: newly discovered directory-scoped instructions apply to this mutation. Review the instruction note and retry this action only if it complies.",
+                    true,
+                ));
+                continue;
+            }
+            if end_turn {
+                results.push(tool_result(
+                    id,
+                    "Not executed: the approved plan starts execution in a fresh session.",
                     true,
                 ));
                 continue;
@@ -977,6 +990,7 @@ impl Agent {
             // A mode transition carried by an approval is applied before its
             // tool runs, so subsequent calls observe the approved mode.
             let mut applied_mode: Option<PermissionMode> = None;
+            let mut end_turn_after_execution = false;
             let is_user_question = matches!(request, PermissionRequest::UserInput { .. });
             match self
                 .permission_decision(
@@ -1042,6 +1056,8 @@ impl Agent {
                         ApprovalDecision::Yes => {
                             approval_note = approval.comment;
                             applied_mode = approval.set_mode;
+                            end_turn_after_execution = approval.end_turn_after_execution
+                                && matches!(request, PermissionRequest::PlanReview { .. });
                             approved_input = approved_plan_input(
                                 &request,
                                 approval.approved_input,
@@ -1147,6 +1163,7 @@ impl Agent {
                 .await?;
             if matches!(request, PermissionRequest::PlanReview { .. }) && !output.is_error {
                 session.plan_draft.clear();
+                end_turn |= end_turn_after_execution;
             }
             if !output.is_error {
                 if let Some(raw) = tool.touches(input) {
@@ -1225,11 +1242,13 @@ impl Agent {
             return Ok(ToolsOutcome {
                 interrupted: true,
                 awaiting_user_input: false,
+                end_turn: false,
             });
         }
         Ok(ToolsOutcome {
             interrupted: false,
             awaiting_user_input,
+            end_turn,
         })
     }
 
@@ -1340,6 +1359,7 @@ impl Agent {
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
+            end_turn: false,
         })
     }
 
@@ -1932,6 +1952,7 @@ impl Agent {
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input,
+            end_turn: false,
         })
     }
 
@@ -1955,6 +1976,7 @@ impl Agent {
                 return Ok(ToolsOutcome {
                     interrupted: false,
                     awaiting_user_input: false,
+                    end_turn: false,
                 });
             };
             let pre = self
@@ -1984,6 +2006,7 @@ impl Agent {
                 return Ok(ToolsOutcome {
                     interrupted: false,
                     awaiting_user_input: false,
+                    end_turn: false,
                 });
             }
             prepared.push((id.clone(), name.clone(), input.clone(), tool));
@@ -2029,6 +2052,7 @@ impl Agent {
                     return Ok(ToolsOutcome {
                         interrupted: false,
                         awaiting_user_input: false,
+                        end_turn: false,
                     });
                 }
                 Decision::Ask | Decision::Auto => {
@@ -2111,6 +2135,7 @@ impl Agent {
                             return Ok(ToolsOutcome {
                                 interrupted: false,
                                 awaiting_user_input,
+                                end_turn: false,
                             });
                         }
                     }
@@ -2212,6 +2237,7 @@ impl Agent {
         Ok(ToolsOutcome {
             interrupted: cancel.is_cancelled(),
             awaiting_user_input: false,
+            end_turn: false,
         })
     }
 
@@ -2225,6 +2251,7 @@ impl Agent {
         Ok(ToolsOutcome {
             interrupted,
             awaiting_user_input: false,
+            end_turn: false,
         })
     }
 
@@ -2631,6 +2658,9 @@ impl Agent {
 struct ToolsOutcome {
     interrupted: bool,
     awaiting_user_input: bool,
+    /// A successfully approved action explicitly ended this turn before the
+    /// next model request, while leaving its tool result durable in the ledger.
+    end_turn: bool,
 }
 
 /// `edit`'s match-miss error tells the model to re-read the file. Inside a

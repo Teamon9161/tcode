@@ -212,3 +212,4 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. gpt订阅有图片生成模型吗
 6. • Tool friction — glob：我在 ~/.tcode/skills 搜索 **/SKILL.md 时得到“无匹配”，但 Arbor Skills 实际都以目录符号链接存在；glob 没有跟随链接，也未提示跳过了符号链接，导致我错误尝试重复安装。增加显式 follow_symlinks 参数，或在无匹配时报告被跳过的符号链接目录，可以避免这次额外排查和失败安装。
+7. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.

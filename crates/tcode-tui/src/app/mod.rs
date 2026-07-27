@@ -412,6 +412,12 @@ pub struct App {
     /// does not race the first onto the same callback port.
     login_active: bool,
     state_store: crate::StateStore,
+    /// Created by the composition root, so this UI never chooses persistence
+    /// paths or reimplements session initialization.
+    fresh_session: crate::FreshSession,
+    /// A plan approved for fresh-session execution. It waits for the planning
+    /// turn to durably finish before the current session is replaced.
+    pending_plan_execution: Option<PlanExecution>,
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
     dogfood: bool,
@@ -471,6 +477,11 @@ pub struct App {
 }
 
 #[derive(Clone)]
+struct PlanExecution {
+    plan: String,
+}
+
+#[derive(Clone)]
 struct RetryWait {
     until: Instant,
     attempt: u32,
@@ -501,6 +512,7 @@ impl App {
             provider_setup,
             codex_login,
             state_store,
+            fresh_session,
             opening_context,
             environment,
             show_reasoning,
@@ -617,6 +629,8 @@ impl App {
             login_rx,
             login_active: false,
             state_store,
+            fresh_session,
+            pending_plan_execution: None,
             dogfood: session_dogfood,
             pending_tool: None,
             pending_batch: VecDeque::new(),
@@ -923,6 +937,18 @@ impl App {
             // The approval reply channel lives in the overlay itself, so
             // finishing an approval consumes the overlay rather than routing
             // through `apply_overlay_action`.
+            Flow::Act(OverlayAction::StartPlanExecution { index, effort }) => {
+                if let Some(Overlay::PlanExecution(dialog, reply, approval, _)) =
+                    self.overlay.take()
+                {
+                    self.start_plan_execution(*dialog, reply, approval, index, effort);
+                }
+            }
+            Flow::Act(OverlayAction::ReturnToPlanReview) => {
+                if let Some(Overlay::PlanExecution(dialog, reply, _, _)) = self.overlay.take() {
+                    self.overlay = Some(Overlay::Approval(dialog, reply));
+                }
+            }
             Flow::Act(OverlayAction::Approved(approval)) => {
                 if let Some(Overlay::Approval(dialog, reply)) = self.overlay.take() {
                     self.finish_approval(*dialog, reply, approval);
@@ -962,6 +988,13 @@ impl App {
             // Suspends the terminal, so it cannot run inside the dialog's key
             // handler; the dialog is still open and takes the revision.
             OverlayAction::EditPlan => self.edit_plan_externally(),
+            OverlayAction::CopyPlanPath => self.copy_plan_path(),
+            OverlayAction::ChoosePlanExecutionModel(approval) => {
+                self.choose_plan_execution_model(approval)
+            }
+            OverlayAction::ReturnToPlanReview | OverlayAction::StartPlanExecution { .. } => {
+                unreachable!("handled by on_overlay_flow")
+            }
             OverlayAction::Approved(_) | OverlayAction::ReviewIndividually => {
                 unreachable!("handled by on_overlay_flow")
             }
@@ -979,6 +1012,73 @@ impl App {
             let _ = tx.send(BatchApproval::Individually);
         }
         self.meter.resume_from_user();
+    }
+
+    fn copy_plan_path(&mut self) {
+        let path = self
+            .overlay
+            .as_ref()
+            .and_then(Overlay::as_dialog)
+            .and_then(Dialog::plan_path)
+            .map(str::to_owned);
+        if let Some(path) = path {
+            self.copy_text(path, "plan path".into());
+        }
+    }
+
+    fn choose_plan_execution_model(&mut self, approval: Approval) {
+        let Some(overlay) = self.overlay.take() else {
+            return;
+        };
+        let Overlay::Approval(dialog, reply) = overlay else {
+            self.overlay = Some(overlay);
+            return;
+        };
+        let effort = self.agent.model.snapshot().effort;
+        match model_picker::Picker::with_title(&self.menu, effort.as_deref(), "◈ execution model")
+        {
+            Some(picker) => {
+                self.overlay = Some(Overlay::PlanExecution(dialog, reply, approval, picker));
+            }
+            None => {
+                self.overlay = Some(Overlay::Approval(dialog, reply));
+                self.reply_error("cannot start a fresh execution session: no model is configured");
+            }
+        }
+    }
+
+    fn start_plan_execution(
+        &mut self,
+        dialog: Dialog,
+        reply: ApprovalReply,
+        approval: Approval,
+        index: usize,
+        effort: Option<String>,
+    ) {
+        let Some(opt) = self.menu.options.get(index) else {
+            self.reply_error(
+                "cannot start a fresh execution session: selected model is unavailable",
+            );
+            self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
+            return;
+        };
+        let active = match (self.menu.switch)(opt, effort.as_deref()) {
+            Ok(active) => active,
+            Err(error) => {
+                self.reply_error(format!("cannot switch execution model: {error}"));
+                self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
+                return;
+            }
+        };
+        let Some(plan) = dialog.plan_source() else {
+            self.reply_error("cannot start a fresh execution session: plan content is unavailable");
+            self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
+            return;
+        };
+        self.agent.model.swap(active);
+        self.menu.current = index;
+        self.pending_plan_execution = Some(PlanExecution { plan });
+        self.finish_approval(dialog, reply, approval);
     }
 
     fn finish_approval(&mut self, dialog: Dialog, reply: ApprovalReply, approval: Approval) {
@@ -1101,6 +1201,12 @@ impl App {
             Some(DialogResult::Individually) => {
                 self.on_overlay_flow(Flow::Act(OverlayAction::ReviewIndividually))
             }
+            Some(DialogResult::CopyPlanPath) => {
+                self.on_overlay_flow(Flow::ActInPlace(OverlayAction::CopyPlanPath))
+            }
+            Some(DialogResult::PlanHandoff(approval)) => self.on_overlay_flow(Flow::ActInPlace(
+                OverlayAction::ChoosePlanExecutionModel(approval),
+            )),
             Some(DialogResult::Pending | DialogResult::EditPlan) | None => {}
         }
     }
@@ -1818,6 +1924,68 @@ async fn join_external_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn plan_handoff_uses_the_execution_picker_and_starts_a_clean_default_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let created_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = harness::app_for_plan_handoff(dir.path(), 90, 40, created_modes.clone());
+        let plan = "# Execute\n\n1. Change the implementation.\n2. Run the focused tests.";
+        let (tx, mut rx) = oneshot::channel();
+        app.open_review(AskMsg {
+            label: "Review plan".into(),
+            calls: vec![AskCall {
+                tool: "exit_plan".into(),
+                summary: "Review plan".into(),
+                descriptor: "exit_plan".into(),
+                is_edit: false,
+                allows_project: false,
+                input: serde_json::json!({ "plan": plan }),
+            }],
+            reply: ApprovalReply::One(tx),
+        });
+
+        app.press(KeyCode::Char('4'));
+        app.press(KeyCode::Enter);
+        assert!(
+            app.frame().contains("execution model"),
+            "option 4 opens the shared execution-model picker"
+        );
+        app.press(KeyCode::Esc);
+        assert!(
+            app.frame().contains("Review plan"),
+            "Esc returns to the same plan review"
+        );
+
+        app.press(KeyCode::Char('4'));
+        app.press(KeyCode::Enter);
+        app.press(KeyCode::Enter);
+        let approval = rx.try_recv().expect("the planning turn receives approval");
+        assert!(approval.end_turn_after_execution);
+        assert_eq!(approval.set_mode, Some(tcode_core::PermissionMode::Default));
+
+        let planning_session = app
+            .session
+            .take()
+            .expect("planning session remains available");
+        app.on_turn_done((planning_session, Ok(())));
+        let frame = app.frame();
+        assert!(
+            frame.contains("Execute the approved plan below."),
+            "{frame}"
+        );
+        assert!(frame.contains("# Execute"), "{frame}");
+        assert!(frame.contains("1. Change the implementation."), "{frame}");
+        assert!(frame.contains("2. Run the focused tests."), "{frame}");
+        assert!(
+            !frame.contains("Review plan"),
+            "the prior planning transcript is not carried into the new session: {frame}"
+        );
+        assert_eq!(
+            created_modes.lock().expect("mode log").as_slice(),
+            &[tcode_core::PermissionMode::Default]
+        );
+    }
 
     /// A sub-agent that delegates further used to be a black hole: the trace
     /// view dropped every `TaskRun*` event, so its reader saw a bare batch

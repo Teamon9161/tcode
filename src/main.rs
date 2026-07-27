@@ -413,6 +413,7 @@ async fn main() -> anyhow::Result<()> {
 
     let mode = tcode_frontend::startup_mode(cli.mode.as_deref(), &state, &config)?;
     let rules = tcode_frontend::startup_rules(&config);
+    let fresh_rules = rules.clone();
     let opening_context: tcode_tui::OpeningContextFn =
         Arc::new(tcode_tools::startup_context_with_scratch);
     let environment: tcode_tui::EnvironmentFn = Arc::new(tcode_tools::environment_snapshot);
@@ -479,6 +480,28 @@ async fn main() -> anyhow::Result<()> {
                     .map_err(|error| error.to_string())
             },
         );
+        let fresh_config = config.clone();
+        let fresh_state = state.clone();
+        let fresh_cwd = cwd.clone();
+        let fresh_model_cell = model_cell.clone();
+        let fresh_shell_filters = shell_filters.clone();
+        let fresh_opening_context = opening_context.clone();
+        let fresh_environment = environment.clone();
+        let fresh_session = tcode_tui::FreshSession(Arc::new(move || {
+            tcode_frontend::open_session(tcode_frontend::SessionSpec {
+                cwd: fresh_cwd.clone(),
+                config: &fresh_config,
+                state: &fresh_state,
+                model_cell: fresh_model_cell.clone(),
+                mode: tcode_core::PermissionMode::Default,
+                rules: fresh_rules.clone(),
+                resume: tcode_frontend::ResumeSpec::New,
+                shell_filters: fresh_shell_filters.clone(),
+                opening_context: fresh_opening_context.clone(),
+                environment: fresh_environment.clone(),
+            })
+            .map_err(|error| error.to_string())
+        }));
         return tcode_tui::run(
             agent.clone(),
             session,
@@ -496,6 +519,7 @@ async fn main() -> anyhow::Result<()> {
                 ),
                 codex_login: build_codex_login(),
                 state_store,
+                fresh_session,
                 opening_context: opening_context.clone(),
                 environment: environment.clone(),
                 show_reasoning: config.ui.show_reasoning,

@@ -74,6 +74,19 @@ pub enum OverlayAction {
     /// Suspends the terminal, so it cannot run inside the dialog's own key
     /// handler. The dialog stays open and takes the revision afterwards.
     EditPlan,
+    /// Copy an unwrapped durable plan path while keeping the review open.
+    CopyPlanPath,
+    /// Opens the execution-model picker while retaining the plan review and
+    /// its reply channel. Cancelling the picker returns to that same review.
+    ChoosePlanExecutionModel(Approval),
+    /// Return from the execution-model picker to its unchanged plan review.
+    ReturnToPlanReview,
+    /// The execution-model picker has a choice ready to hand to the fresh
+    /// session launcher.
+    StartPlanExecution {
+        index: usize,
+        effort: Option<String>,
+    },
     /// A finished `/provider` run: persist it and rebuild everything derived
     /// from the config. Only the binary can do that, so it arrives as an
     /// action like every other.
@@ -110,6 +123,9 @@ pub enum Overlay {
     /// `/provider`. Boxed because it carries a whole `Config` being edited.
     Provider(Box<crate::setup::Setup>),
     Approval(Box<Dialog>, ApprovalReply),
+    /// A plan review temporarily replaced by the shared model picker. The
+    /// dialog and reply remain here so Esc restores every review detail.
+    PlanExecution(Box<Dialog>, ApprovalReply, Approval, model_picker::Picker),
 }
 
 /// Where a review's answer goes. A combined review can also be handed back for
@@ -127,7 +143,7 @@ impl Overlay {
     /// An approval keeps the mode status visible: it is still a pending turn,
     /// so `shift+tab` can stage the mode that takes effect after the decision.
     pub fn keeps_status_hint(&self) -> bool {
-        matches!(self, Overlay::Approval(..))
+        matches!(self, Overlay::Approval(..) | Overlay::PlanExecution(..))
     }
 
     /// The approval dialog is the only overlay with editable text, so it is
@@ -184,6 +200,7 @@ impl Overlay {
             Overlay::FolderTrust(picker) => picker.render(),
             Overlay::Provider(setup) => crate::provider_picker::render(&setup.view()),
             Overlay::Approval(dialog, _) => dialog.render(ctx.width, ctx.height.saturating_sub(7)),
+            Overlay::PlanExecution(_, _, _, picker) => picker.render(ctx.menu),
         }
     }
 
@@ -194,6 +211,7 @@ impl Overlay {
             Overlay::Mode(picker) => picker.set_hovered_row(row),
             Overlay::VoiceModel(picker) => picker.set_hovered_row(row),
             Overlay::FolderTrust(picker) => picker.set_hovered_row(row),
+            Overlay::PlanExecution(_, _, _, picker) => picker.set_hovered_row(row),
             // Setup is a keyboard form (fields, not just rows); hover would
             // have to move a text cursor to mean anything.
             Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => {}
@@ -253,8 +271,21 @@ impl Overlay {
             Overlay::Approval(dialog, _) => match dialog.handle_key(key) {
                 DialogResult::Pending => Flow::Stay,
                 DialogResult::EditPlan => Flow::ActInPlace(OverlayAction::EditPlan),
+                DialogResult::CopyPlanPath => Flow::ActInPlace(OverlayAction::CopyPlanPath),
+                DialogResult::PlanHandoff(approval) => {
+                    Flow::ActInPlace(OverlayAction::ChoosePlanExecutionModel(approval))
+                }
                 DialogResult::Done(approval) => Flow::Act(OverlayAction::Approved(approval)),
                 DialogResult::Individually => Flow::Act(OverlayAction::ReviewIndividually),
+            },
+            Overlay::PlanExecution(_, _, _, picker) => match picker.handle_key(key) {
+                model_picker::PickResult::Pending => Flow::Stay,
+                model_picker::PickResult::Cancelled => Flow::Act(OverlayAction::ReturnToPlanReview),
+                model_picker::PickResult::Picked {
+                    option: Some(index),
+                    effort,
+                } => Flow::Act(OverlayAction::StartPlanExecution { index, effort }),
+                model_picker::PickResult::Picked { option: None, .. } => Flow::Stay,
             },
         }
     }
@@ -289,6 +320,13 @@ impl Overlay {
                 }
                 _ => Flow::Stay,
             },
+            Overlay::PlanExecution(_, _, _, picker) => match picker.handle_mouse_row(row) {
+                model_picker::PickResult::Picked {
+                    option: Some(index),
+                    effort,
+                } => Flow::Act(OverlayAction::StartPlanExecution { index, effort }),
+                _ => Flow::Stay,
+            },
             Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => Flow::Stay,
         }
     }
@@ -304,6 +342,7 @@ impl Overlay {
             // setup holds a half-typed key a stray click must not discard.
             Overlay::FolderTrust(_)
             | Overlay::Approval(..)
+            | Overlay::PlanExecution(..)
             | Overlay::Resume(_)
             | Overlay::Provider(_) => Flow::Stay,
         }
