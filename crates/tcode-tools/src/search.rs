@@ -669,8 +669,11 @@ impl Tool for GlobTool {
                                 return WalkState::Continue;
                             };
                             if !follow_links
-                                && entry.file_type().is_some_and(|t| t.is_symlink())
-                                && entry.metadata().is_ok_and(|metadata| metadata.is_dir())
+                                && entry.path_is_symlink()
+                                // The walker exposes symlink metadata while it is not
+                                // following links. Query the path to test the link target.
+                                && std::fs::metadata(entry.path())
+                                    .is_ok_and(|metadata| metadata.is_dir())
                             {
                                 skipped_directory_links.fetch_add(1, Ordering::Relaxed);
                                 return WalkState::Continue;

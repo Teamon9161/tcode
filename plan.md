@@ -214,5 +214,4 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. gpt订阅有图片生成模型吗
 6. resume性能较差。
-7. askuser到other选项的时候不要自动进入Note部分的输入，直接没法上下选选项了，另一个问题是空的Note应该不止允许Esc返回，也要允许←返回。
-8. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.
+7. windows上ctrl+shift+v粘贴文字，然后自己发出去了，应该是把enter换行当成用户的enter了，如何修复
