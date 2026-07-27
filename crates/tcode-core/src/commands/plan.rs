@@ -12,7 +12,7 @@ impl SlashCommand for PlanCommand {
     }
 
     fn help(&self) -> &'static str {
-        "enter plan mode · /plan last shows the latest saved plan"
+        "enter plan mode · /plan last shows the latest plan draft"
     }
 
     fn run(&self, ctx: &mut CommandCtx<'_>, args: &str) -> CommandOutcome {
@@ -24,11 +24,11 @@ impl SlashCommand for PlanCommand {
             "last" => match latest_plan(&ctx.session.tool_ctx.cwd) {
                 Ok(path) => match fs::read_to_string(&path) {
                     Ok(plan) => CommandOutcome::info(format!(
-                        "latest saved plan: {}\n\n{plan}",
+                        "latest plan draft: {}\n\n{plan}",
                         path.display()
                     )),
                     Err(e) => CommandOutcome::error(format!(
-                        "cannot read latest saved plan {}: {e}",
+                        "cannot read latest plan draft {}: {e}",
                         path.display()
                     )),
                 },

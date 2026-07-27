@@ -3159,6 +3159,75 @@ async fn exit_plan_rejection_keeps_plan_mode_and_returns_feedback() {
     let results = tool_results(&session);
     assert!(results[0].1, "rejection is an error result");
     assert!(results[0].0.contains("add a rollback step"));
+
+    let plans_dir = tcode_core::store::plans_dir(dir.path());
+    let saved: Vec<_> = std::fs::read_dir(&plans_dir)
+        .expect("plan review creates the draft directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    assert_eq!(
+        saved.len(),
+        1,
+        "rejected plans remain available for revision"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&saved[0]).unwrap(),
+        "Draft plan body."
+    );
+    let _ = std::fs::remove_file(&saved[0]);
+    let _ = std::fs::remove_dir(&plans_dir);
+    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
+        let _ = std::fs::remove_dir(project_data);
+    }
+}
+
+#[tokio::test]
+async fn rejected_plan_revisions_replace_the_same_draft_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "exit_plan",
+            r#"{"plan":"Draft v1","title":"Refactor ledger"}"#,
+        ),
+        tool_use(
+            "t2",
+            "exit_plan",
+            r#"{"plan":"Draft v2","title":"Different title"}"#,
+        ),
+        text_done("revising"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Plan);
+    let approver = ScriptedApprover::new(ApprovalDecision::No, Some("revise it"));
+
+    run(&agent, &mut session, &approver, "make a plan").await;
+
+    let plans_dir = tcode_core::store::plans_dir(dir.path());
+    let saved: Vec<_> = std::fs::read_dir(&plans_dir)
+        .expect("plan reviews create the draft directory")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .collect();
+    assert_eq!(
+        saved.len(),
+        1,
+        "revisions must not create near-duplicate drafts"
+    );
+    assert!(saved[0]
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .contains("refactor-ledger"));
+    assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), "Draft v2");
+    let _ = std::fs::remove_file(&saved[0]);
+    let _ = std::fs::remove_dir(&plans_dir);
+    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
+        let _ = std::fs::remove_dir(project_data);
+    }
 }
 
 #[tokio::test]

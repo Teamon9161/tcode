@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use std::io::Write as _;
 
 use serde_json::Value;
-use tcode_core::{Approval, ApprovalDecision, Approver, PermissionMode};
+use tcode_core::{
+    plan_draft::PLAN_PATH_FIELD, Approval, ApprovalDecision, Approver, PermissionMode,
+};
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -182,6 +184,9 @@ async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
 async fn review_plan_plain(input: &Value) -> Approval {
     let plan = input["plan"].as_str().unwrap_or("").trim();
     println!("\n{YELLOW}▤{RESET} {BOLD}Review plan{RESET}");
+    if let Some(path) = input[PLAN_PATH_FIELD].as_str() {
+        println!("{DIM}  saved draft: {path}{RESET}");
+    }
     for line in plan.lines() {
         println!("{DIM}  {line}{RESET}");
     }

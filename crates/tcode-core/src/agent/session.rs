@@ -186,6 +186,10 @@ pub struct Session {
     mode_delivery_pending: bool,
     /// File snapshots for rewind; no-op unless persistence is set up.
     pub checkpoints: crate::checkpoint::CheckpointStore,
+    /// The durable file for the plan currently under review. A rejected plan's
+    /// next version updates this same artifact; approval clears it for the
+    /// next planning cycle.
+    pub plan_draft: crate::plan_draft::PlanDraft,
     /// Prompt size of the latest request (for the context status line).
     pub last_prompt_tokens: u64,
     pub turn_usage: Usage,
@@ -273,6 +277,7 @@ impl Session {
             },
             mode_delivery_pending: false,
             checkpoints: crate::checkpoint::CheckpointStore::default(),
+            plan_draft: crate::plan_draft::PlanDraft::default(),
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
             dogfood: false,

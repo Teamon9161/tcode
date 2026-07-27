@@ -998,6 +998,35 @@ impl Agent {
                     continue;
                 }
                 Decision::Ask | Decision::Auto => {
+                    // A plan is a durable review artifact, not an approved-only
+                    // side effect. Save the model's submitted version before it
+                    // crosses the frontend boundary, then pass the path only in
+                    // the review copy; the model-issued call in the ledger stays
+                    // immutable and free of harness bookkeeping.
+                    let review_input = if let PermissionRequest::PlanReview { title } = &request {
+                        let plan = input["plan"].as_str().unwrap_or("").trim();
+                        if plan.is_empty() {
+                            results.push(tool_result(
+                                id,
+                                "exit_plan needs a non-empty `plan` (markdown).",
+                                true,
+                            ));
+                            continue;
+                        }
+                        match session
+                            .plan_draft
+                            .save(&session.tool_ctx.cwd, title, plan)
+                            .await
+                        {
+                            Ok(path) => crate::plan_draft::with_plan_path(input, &path),
+                            Err(error) => {
+                                results.push(tool_result(id, &error, true));
+                                continue;
+                            }
+                        }
+                    } else {
+                        input.clone()
+                    };
                     let approval = approver
                         .ask(
                             name,
@@ -1005,7 +1034,7 @@ impl Agent {
                             &request.approval_label(),
                             request.is_edit(),
                             request.allows_rule(),
-                            input,
+                            &review_input,
                         )
                         .await;
                     session.mark_mode_delivery();
@@ -1013,7 +1042,11 @@ impl Agent {
                         ApprovalDecision::Yes => {
                             approval_note = approval.comment;
                             applied_mode = approval.set_mode;
-                            approved_input = approval.approved_input;
+                            approved_input = approved_plan_input(
+                                &request,
+                                approval.approved_input,
+                                &review_input,
+                            );
                         }
                         ApprovalDecision::YesSession | ApprovalDecision::YesProject => {
                             self.persist_approval_rule(
@@ -1025,7 +1058,11 @@ impl Agent {
                             .await;
                             approval_note = approval.comment;
                             applied_mode = approval.set_mode;
-                            approved_input = approval.approved_input;
+                            approved_input = approved_plan_input(
+                                &request,
+                                approval.approved_input,
+                                &review_input,
+                            );
                         }
                         ApprovalDecision::No => {
                             declined = true;
@@ -1108,6 +1145,9 @@ impl Agent {
                     tool.run_with_call(id, input.clone(), &session.tool_ctx, cancel),
                 )
                 .await?;
+            if matches!(request, PermissionRequest::PlanReview { .. }) && !output.is_error {
+                session.plan_draft.clear();
+            }
             if !output.is_error {
                 if let Some(raw) = tool.touches(input) {
                     let path = session.tool_ctx.resolve(&raw);
@@ -2661,6 +2701,22 @@ fn normalize_path(path: PathBuf) -> PathBuf {
         }
     }
     normalized
+}
+
+fn approved_plan_input(
+    request: &PermissionRequest,
+    approved_input: Option<Value>,
+    review_input: &Value,
+) -> Option<Value> {
+    if !matches!(request, PermissionRequest::PlanReview { .. }) {
+        return approved_input;
+    }
+    let mut input = approved_input.unwrap_or_else(|| review_input.clone());
+    if input[crate::plan_draft::PLAN_PATH_FIELD].is_null() {
+        input[crate::plan_draft::PLAN_PATH_FIELD] =
+            review_input[crate::plan_draft::PLAN_PATH_FIELD].clone();
+    }
+    Some(input)
 }
 
 fn tool_result(id: &str, content: &str, is_error: bool) -> ContentBlock {

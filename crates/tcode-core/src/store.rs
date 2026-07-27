@@ -226,9 +226,10 @@ pub fn tool_output_dir(cwd: &Path) -> PathBuf {
     scratchpad_dir(cwd).join("tool-output")
 }
 
-/// Approved plans land here as a human-readable mirror of the plan the model
-/// holds in its ledger: `<project-data>/plans/`. Runtime state, not part of the
-/// user's repository — anyone who wants a plan in the repo copies it there.
+/// Plans submitted for review land here as a human-readable mirror of the plan
+/// the model holds in its ledger: `<project-data>/plans/`. Rejected revisions
+/// update the active draft in place. Runtime state, not part of the user's
+/// repository — anyone who wants a plan in the repo copies it there.
 /// Falls back to a temp dir when there is no home directory.
 pub fn plans_dir(cwd: &Path) -> PathBuf {
     project_data_dir(cwd)

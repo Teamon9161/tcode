@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use tcode_core::{Approval, ApprovalDecision, PermissionMode};
+use tcode_core::{plan_draft::PLAN_PATH_FIELD, Approval, ApprovalDecision, PermissionMode};
 
 use crate::editor::Editor;
 use crate::markdown::Document;
@@ -116,9 +116,9 @@ struct PlanReview {
     /// Free-form feedback for keep-planning when no per-block comments were left.
     feedback: Editor,
     feedback_focused: bool,
-    /// A `$EDITOR` revision of the plan, when it differs from the original. On
-    /// approval it becomes the actual `exit_plan` input and is mirrored to disk;
-    /// on keep-planning it is sent back as a diff.
+    /// A `$EDITOR` revision of the plan, when it differs from the original. It
+    /// updates the durable draft immediately; on approval it also becomes the
+    /// actual `exit_plan` input, while keep-planning sends its diff back.
     revised: Option<String>,
 }
 
@@ -587,9 +587,14 @@ impl Dialog {
     }
 
     /// The current plan source (the `$EDITOR` revision if one was made, else the
-    /// original), for writing to the review temp file.
+    /// original), for writing to its durable draft file.
     pub fn plan_source(&self) -> Option<String> {
         self.plan.as_ref().map(|p| p.source().to_string())
+    }
+
+    /// The durable plan file assigned before this review opened.
+    pub fn plan_path(&self) -> Option<&str> {
+        self.plan.as_ref()?.input[PLAN_PATH_FIELD].as_str()
     }
 
     /// Adopt a `$EDITOR` revision: the pane now shows the revised plan (blocks
@@ -1661,6 +1666,12 @@ impl Dialog {
             ));
         }
         out.push(Line::from(title));
+        if let Some(path) = plan.input[PLAN_PATH_FIELD].as_str() {
+            out.push(Line::from(Span::styled(
+                format!("  saved draft: {path}"),
+                theme::dim(),
+            )));
+        }
 
         // Plan body, scrolled to keep the focus visible. Reserve the rest of
         // the panel for the options, the editor row, and the hint.
@@ -2314,6 +2325,21 @@ mod tests {
             )],
         );
         assert!(plan.owns_wheel());
+    }
+
+    #[test]
+    fn plan_review_shows_its_durable_draft_path() {
+        let path = "/tmp/tcode/plans/demo.md";
+        let plan = Dialog::plan(
+            "Review plan".into(),
+            json!({ "plan": "# Plan", PLAN_PATH_FIELD: path }),
+            vec![(
+                "# Plan".into(),
+                crate::markdown::Renderer::default().parse("# Plan"),
+            )],
+        );
+        assert_eq!(plan.plan_path(), Some(path));
+        assert!(screen(&plan, 100).contains("saved draft: /tmp/tcode/plans/demo.md"));
     }
 
     fn key(code: KeyCode) -> KeyEvent {

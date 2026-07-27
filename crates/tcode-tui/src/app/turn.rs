@@ -996,30 +996,21 @@ impl App {
     /// process, then restored and fully redrawn. A revision equal to the
     /// original is a no-op inside `revise_plan`.
     pub(super) fn edit_plan_externally(&mut self) {
-        let Some(source) = self
+        let Some((source, path)) = self
             .overlay
             .as_ref()
             .and_then(Overlay::as_dialog)
-            .and_then(Dialog::plan_source)
+            .and_then(|dialog| Some((dialog.plan_source()?, dialog.plan_path()?.to_string())))
         else {
             return;
         };
+        let path = std::path::PathBuf::from(path);
 
-        // Stage the plan in a unique project-scratchpad file. A fixed name
-        // would let simultaneous tcode sessions overwrite each other's review.
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or_default();
-        let path = self
-            .scratch_dir
-            .join(format!("plan-review-{}-{nonce}.md", std::process::id()));
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        // The plan has already been saved before review. Editing the same file
+        // makes an external revision durable even when the user keeps planning.
         if std::fs::write(&path, &source).is_err() {
             self.notice = Some((
-                "could not stage the plan for editing".into(),
+                "could not write the saved plan draft for editing".into(),
                 Instant::now(),
             ));
             return;
@@ -1054,15 +1045,11 @@ impl App {
         let _ = self.terminal.clear();
 
         if launched.is_err() {
-            let _ = std::fs::remove_file(&path);
             self.notice = Some(("could not launch $EDITOR".into(), Instant::now()));
             return;
         }
 
         let edited = std::fs::read_to_string(&path);
-        // This is review-only staging, never a durable plan artifact. The
-        // approved tool writes the permanent copy under `plans/`.
-        let _ = std::fs::remove_file(&path);
         let Ok(edited) = edited else {
             self.notice = Some(("could not read the edited plan".into(), Instant::now()));
             return;

@@ -18,6 +18,7 @@ pub mod import;
 pub mod ledger;
 pub mod memory;
 pub mod permission;
+pub mod plan_draft;
 pub mod provider;
 pub mod references;
 pub mod store;
