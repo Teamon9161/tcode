@@ -212,12 +212,7 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 2. pdf支持？skill还是原生？需要识别图片吗？
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
-5. ✅ 已做：**后台 sub-agent（`agent(background: true)`，opt-in）。** 语义不是"父子两个 loop 同时 step"，而是：调用**不阻塞**、立即返回 run id（dispatch 行，不含 report）→ 父回合自然结束 → sub-agent 在 `tokio::spawn` 里自驱 → 完成时 report 作为 **fenced `Entry::Note`** 落进 `BackgroundTasks` 的新 note inbox 并 `notify` 信号 → 复用 monitor 现成的 idle 回路（`monitor_wake_deadline` 见到 inbox 非空即"立刻唤醒"、`take_notes` 先排空 inbox、前端 `monitor_signal.notified()`→`monitor_turn`→`note_background`）触发主 agent，**前端零改动**。与 cohort 正交：cohort 是顺序 round-robin + 共享 channel 的辩论，这条是父子并发。三条落地约束：(a) **权限在派发瞬间快照**——`build_run` 同步跑在前台，把父的 mode+rules 灌进子 session；后台 run 非交互（approver = `NeverAsk`），gating 模式下的写会被拒而不是把后台任务卡在前台弹窗，故读工具/auto 模式畅通、`default` 下的写需要前台重派；(b) **report 走 Note 不走 tool_result**——工具调用已返回，完成态只能独立 append，反而更 append-only，并按 `attach_reports` 同款围栏中和 `</background-report>`；(c) **唤醒经 `HarnessNoteSink`**（`Arc<inbox>` + `Arc<Notify>` + `Arc<AtomicUsize>` in-flight），完成即 `sink.finish(note)`。落地做了 spawn-ownership 重构：`drive` 拆成"前台分配 id/trace/approver 的 `&self` 壳" + **不借 `self`/`ctx` 的自由函数 `run_delegated_turn`**（前台与后台共用）；`park`/`remember_report` 抽出自由版 `park_into`/`remember_report_into`，故后台 run 完成后的 `attach`/`resume` 与前台一致。**门槛 `depth==0`**：子 agent 的 session 没有 idle 回路可投递，其 `background` 降级为普通阻塞。三个边角也补齐了：(1) **可 kill**——`HarnessNoteSink` 用 `run id → CancellationToken` 的 map 兼作运行集，`kill_task(id=t<n>)` 经 `BackgroundTasks::kill` 取消（取消后仍投递一条中断 report Note）；(2) **状态行**——`status_block` 的 `background running:` 段并列 `b/m` 任务与在飞的后台 run id；(3) **重启未恢复**——`store::lost_background_note` 认得 `[background … dispatched on …]` 派发行与 `finished/failed` 完成 Note，resume 时把未闭合的 run 一并列进"未恢复"提示（零猜测）。
-6. ✅ 已做：转录里 sub-agent 卡片（cohort 成员卡 + 普通 task 卡）在**点击展开的 detail 区**（非 header，避免挤）显示归一化短名（`claude-opus-4-8`→`opus-4-8`，provider id 原样透传）。`CohortMember` 加 `model` 字段贯通，`short_model_name`/`task_summary_detail_with_model` 在 `tcode-tui/src/view.rs`。
-7. gpt订阅有图片生成模型吗
-8. ✅ 已做（比防抖方案更干净）：不引入定时器——闸门改成在**每个权限判定点**提交（`run_tools` 入口 + 串行批每个待批调用前），切到 unsafe/auto 立刻作用于下一次判定乃至同批后续调用；note 仍延迟并合并。详见上方权限节"模式切换即时生效于下一次权限判定"。原担心的"来回切多切几个 mode"只跟 note 有关，note 不变故无副作用。
-9. resume性能较差。
-10. askuser到other选项的时候不要自动进入Note部分的输入，直接没法上下选选项了，另一个问题是空的Note应该不止允许Esc返回，也要允许←返回。
-11. agent tree中plan agent怎么不能点击跳转？只适配了explore?不应该吧。
-12. • Tool friction — glob：我在 ~/.tcode/skills 搜索 **/SKILL.md 时得到“无匹配”，但 Arbor Skills 实际都以目录符号链接存在；glob 没有跟随链接，也未提示跳过了符号链接，导致我错误尝试重复安装。增加显式 follow_symlinks 参数，或在无匹配时报告被跳过的符号链接目录，可以避免这次额外排查和失败安装。
-13. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.
+5. gpt订阅有图片生成模型吗
+6. resume性能较差。
+7. askuser到other选项的时候不要自动进入Note部分的输入，直接没法上下选选项了，另一个问题是空的Note应该不止允许Esc返回，也要允许←返回。
+8. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.

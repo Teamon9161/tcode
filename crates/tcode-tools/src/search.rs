@@ -82,18 +82,20 @@ const PRUNE_DIRS: &[&str] = &[
     "AppData",
 ];
 
-fn walk_builder(base: &Path) -> ignore::WalkBuilder {
+fn walk_builder(base: &Path, follow_links: bool) -> ignore::WalkBuilder {
     let mut b = ignore::WalkBuilder::new(base);
     // Search hidden files (.github/, .config/, dotfiles are routinely wanted);
     // heavy/VCS dirs are pruned explicitly below instead of by the blunt
     // "skip everything starting with a dot" rule.
-    b.hidden(false).filter_entry(|entry| {
-        !(entry.file_type().is_some_and(|t| t.is_dir())
-            && entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| PRUNE_DIRS.contains(&n)))
-    });
+    b.follow_links(follow_links)
+        .hidden(false)
+        .filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|t| t.is_dir())
+                && entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|n| PRUNE_DIRS.contains(&n)))
+        });
     b
 }
 
@@ -349,7 +351,7 @@ impl Tool for GrepTool {
             let timed_out = AtomicBool::new(false);
             let start = Instant::now();
 
-            walk_builder(&base).build_parallel().run(|| {
+            walk_builder(&base, false).build_parallel().run(|| {
                 let mut searcher = SearcherBuilder::new()
                     .line_number(true)
                     .before_context(before)
@@ -589,8 +591,9 @@ impl Tool for GlobTool {
 
     fn description(&self) -> &str {
         "Find files by name pattern, e.g. **/*.rs or src/**/Cargo.toml. \
-         Respects .gitignore. Results sorted by modification time (newest \
-         first), capped at 200; page with offset."
+         Respects .gitignore. Directory symlinks are skipped by default; set \
+         follow_symlinks=true to search their targets. Results sorted by \
+         modification time (newest first), capped at 200; page with offset."
     }
 
     fn input_schema(&self) -> Value {
@@ -599,6 +602,7 @@ impl Tool for GlobTool {
             "properties": {
                 "pattern": { "type": "string" },
                 "path": { "type": "string", "description": "Base directory (default: cwd)" },
+                "follow_symlinks": { "type": "boolean", "description": "Follow directory symlinks while walking (default false)" },
                 "offset": { "type": "integer", "description": "Skip this many results before the 200 cap (for paging)" }
             },
             "required": ["pattern"]
@@ -630,69 +634,93 @@ impl Tool for GlobTool {
             Err(e) => return ToolOutput::err(format!("invalid glob '{pattern}': {e}")),
         };
         let offset = input["offset"].as_u64().unwrap_or(0) as usize;
+        let follow_links = input["follow_symlinks"].as_bool().unwrap_or(false);
 
         // Same shape as grep: a parallel walk, off the async runtime. The walk
         // is blocking syscalls end to end, so leaving it in the async body both
         // pinned a runtime thread and serialized any batch it was part of.
         let walk_base = base.clone();
         let walk_cancel = cancel.clone();
-        let (mut hits, timed_out) = match tokio::task::spawn_blocking(move || {
-            let hits: Mutex<Vec<(std::time::SystemTime, PathBuf)>> = Mutex::new(Vec::new());
-            let timed_out = AtomicBool::new(false);
-            let start = Instant::now();
-            walk_builder(&walk_base).build_parallel().run(|| {
-                let glob = &glob;
-                let base: &Path = &walk_base;
-                let hits = &hits;
-                let timed_out = &timed_out;
-                let cancel = &walk_cancel;
-                Box::new(move |result| {
-                    use ignore::WalkState;
-                    if cancel.is_cancelled() {
-                        return WalkState::Quit;
-                    }
-                    if start.elapsed() > SEARCH_DEADLINE {
-                        timed_out.store(true, Ordering::Relaxed);
-                        return WalkState::Quit;
-                    }
-                    let Ok(entry) = result else {
-                        return WalkState::Continue;
-                    };
-                    // The walk already knows the file type — `path.is_file()`
-                    // spent an extra stat on every entry in the tree.
-                    if !entry.file_type().is_some_and(|t| t.is_file()) {
-                        return WalkState::Continue;
-                    }
-                    let path = entry.path();
-                    if !glob_matches(glob, path, base) {
-                        return WalkState::Continue;
-                    }
-                    let mtime = entry
-                        .metadata()
-                        .ok()
-                        .and_then(|m| m.modified().ok())
-                        .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                    // Locked only on a hit, not per entry walked.
-                    hits.lock().unwrap().push((mtime, path.to_path_buf()));
-                    WalkState::Continue
-                })
-            });
-            (
-                hits.into_inner().unwrap(),
-                timed_out.load(Ordering::Relaxed),
-            )
-        })
-        .await
-        {
-            Ok(out) => out,
-            Err(e) => return ToolOutput::err(format!("glob task failed: {e}")),
-        };
+        let (mut hits, timed_out, skipped_directory_links) =
+            match tokio::task::spawn_blocking(move || {
+                let hits: Mutex<Vec<(std::time::SystemTime, PathBuf)>> = Mutex::new(Vec::new());
+                let timed_out = AtomicBool::new(false);
+                let skipped_directory_links = AtomicUsize::new(0);
+                let start = Instant::now();
+                walk_builder(&walk_base, follow_links)
+                    .build_parallel()
+                    .run(|| {
+                        let glob = &glob;
+                        let base: &Path = &walk_base;
+                        let hits = &hits;
+                        let timed_out = &timed_out;
+                        let skipped_directory_links = &skipped_directory_links;
+                        let cancel = &walk_cancel;
+                        Box::new(move |result| {
+                            use ignore::WalkState;
+                            if cancel.is_cancelled() {
+                                return WalkState::Quit;
+                            }
+                            if start.elapsed() > SEARCH_DEADLINE {
+                                timed_out.store(true, Ordering::Relaxed);
+                                return WalkState::Quit;
+                            }
+                            let Ok(entry) = result else {
+                                return WalkState::Continue;
+                            };
+                            if !follow_links
+                                && entry.file_type().is_some_and(|t| t.is_symlink())
+                                && entry.metadata().is_ok_and(|metadata| metadata.is_dir())
+                            {
+                                skipped_directory_links.fetch_add(1, Ordering::Relaxed);
+                                return WalkState::Continue;
+                            }
+                            // The walk already knows the file type — `path.is_file()`
+                            // spent an extra stat on every entry in the tree.
+                            if !entry.file_type().is_some_and(|t| t.is_file()) {
+                                return WalkState::Continue;
+                            }
+                            let path = entry.path();
+                            if !glob_matches(glob, path, base) {
+                                return WalkState::Continue;
+                            }
+                            let mtime = entry
+                                .metadata()
+                                .ok()
+                                .and_then(|m| m.modified().ok())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            // Locked only on a hit, not per entry walked.
+                            hits.lock().unwrap().push((mtime, path.to_path_buf()));
+                            WalkState::Continue
+                        })
+                    });
+                (
+                    hits.into_inner().unwrap(),
+                    timed_out.load(Ordering::Relaxed),
+                    skipped_directory_links.load(Ordering::Relaxed),
+                )
+            })
+            .await
+            {
+                Ok(out) => out,
+                Err(e) => return ToolOutput::err(format!("glob task failed: {e}")),
+            };
 
         if hits.is_empty() {
             let mut m = format!(
                 "no files match {pattern} under {}",
                 rel_display(&base, &ctx.cwd)
             );
+            if skipped_directory_links > 0 {
+                let noun = if skipped_directory_links == 1 {
+                    "directory symlink was"
+                } else {
+                    "directory symlinks were"
+                };
+                m.push_str(&format!(
+                    "\n[{skipped_directory_links} {noun} skipped — set follow_symlinks=true to search their targets]"
+                ));
+            }
             if timed_out {
                 m.push_str(&format!(
                     "\n[search timed out after {}s before finishing]",
@@ -763,16 +791,16 @@ mod tests {
             .content
     }
 
-    async fn glob(dir: &Path, pattern: &str) -> String {
+    async fn glob_input(dir: &Path, input: Value) -> String {
         let ctx = ToolCtx::for_test(dir.to_path_buf(), 100_000);
         GlobTool
-            .run(
-                json!({ "pattern": pattern }),
-                &ctx,
-                &CancellationToken::new(),
-            )
+            .run(input, &ctx, &CancellationToken::new())
             .await
             .content
+    }
+
+    async fn glob(dir: &Path, pattern: &str) -> String {
+        glob_input(dir, json!({ "pattern": pattern })).await
     }
 
     fn scratch(name: &str, body: &str) -> PathBuf {
@@ -906,6 +934,55 @@ mod tests {
         assert!(second.starts_with("b.rs:1: TARGET b1"), "{second}");
         assert!(third.starts_with("z.rs:1: TARGET z1"), "{third}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(target, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_dir(target: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_dir(target, link)
+    }
+
+    #[tokio::test]
+    async fn glob_reports_skipped_directory_symlinks_and_can_follow_them() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let skill = temp.path().join("arbor-skill");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "skill\n").unwrap();
+        let link = root.join("arbor");
+        let link_result = symlink_dir(&skill, &link);
+        #[cfg(windows)]
+        if link_result.as_ref().is_err_and(|error| {
+            error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+        }) {
+            return;
+        }
+        link_result.unwrap();
+
+        let skipped = glob(&root, "**/SKILL.md").await;
+        assert!(
+            skipped.starts_with("no files match **/SKILL.md"),
+            "{skipped}"
+        );
+        assert!(
+            skipped.contains(
+                "[1 directory symlink was skipped — set follow_symlinks=true to search their targets]"
+            ),
+            "{skipped}"
+        );
+
+        let followed = glob_input(
+            &root,
+            json!({ "pattern": "**/SKILL.md", "follow_symlinks": true }),
+        )
+        .await;
+        assert_eq!(followed, "arbor/SKILL.md");
     }
 
     #[tokio::test]

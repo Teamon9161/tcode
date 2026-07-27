@@ -624,7 +624,7 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
         let model = self.model.snapshot();
-        if session.last_prompt_tokens > model.context_window * 85 / 100 {
+        if self.should_auto_compact(session, &model) {
             self.emit(events, AgentEvent::Compacting).await?;
             self.compact(session, events, &cancel).await?;
         }

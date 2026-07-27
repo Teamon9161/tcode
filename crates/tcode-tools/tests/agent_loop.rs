@@ -1597,6 +1597,47 @@ async fn kill_task_stops_a_background_process() {
     assert!(notes[0].contains("killed"), "{}", notes[0]);
 }
 
+#[tokio::test]
+async fn monitor_wake_uses_the_configured_auto_compact_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![]);
+    let compact = MockProvider::named("compact-1", vec![text_done("monitor summary")]);
+    let mut agent = agent(main);
+    agent
+        .models
+        .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
+    agent.model.swap(ActiveModel {
+        provider: MockProvider::new(vec![]),
+        max_tokens: 1024,
+        context_window: 1_000,
+        effort: None,
+    });
+    agent.auto_compact_percent = 50;
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.last_prompt_tokens = 600;
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "history pending compaction".into(),
+    }]));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(4);
+    let ran = agent
+        .monitor_turn(
+            &mut session,
+            &tx,
+            &ScriptedApprover::new(ApprovalDecision::Yes, None),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("monitor wake must remain valid after compacting");
+
+    assert!(!ran, "no monitor notes means no model turn");
+    assert_eq!(compact.requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        session.ledger.entries(),
+        [Entry::Summary(summary)] if summary == "monitor summary"
+    ));
+}
+
 /// A monitor's output lines become events; when they arrive while the session
 /// is idle, `monitor_turn` delivers them as notes (legal because `Entry::Note`
 /// renders as a user-role message) and the model reacts. A second wake with
@@ -3975,6 +4016,60 @@ async fn a_parallel_explore_batch_forwards_each_run_distinctly() {
     assert!(metas
         .iter()
         .all(|meta| meta.status == tcode_core::TaskRunStatus::Done));
+}
+
+#[tokio::test]
+async fn compact_retries_retryable_failure_before_replacing_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![]);
+    let compact_inner = MockProvider::named("compact-1", vec![text_done("recovered summary")]);
+    let compact = Arc::new(FlakyProvider {
+        remaining_failures: Mutex::new(1),
+        inner: compact_inner.clone(),
+    });
+    let mut agent = agent(main);
+    agent.models.pin(
+        AgentRole::Compact.key(),
+        ActiveModel {
+            provider: compact,
+            max_tokens: 1024,
+            context_window: 200_000,
+            effort: None,
+        },
+    );
+    agent.watchdog = WatchdogConfig {
+        idle_timeout_secs: 5,
+        connect_timeout_secs: 20,
+        max_retries: 1,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 5,
+    };
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "history that must survive the failed attempt".into(),
+    }]));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    agent
+        .compact(&mut session, &tx, &CancellationToken::new())
+        .await
+        .expect("retryable compact failure should recover");
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::Retrying { attempt: 1, .. }, AgentEvent::Compacted(summary)]
+            if summary == "recovered summary"
+    ));
+    assert_eq!(compact_inner.requests.lock().unwrap().len(), 1);
+    assert!(matches!(
+        session.ledger.entries(),
+        [Entry::Summary(summary)] if summary == "recovered summary"
+    ));
 }
 
 #[tokio::test]

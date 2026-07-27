@@ -70,12 +70,51 @@ impl Agent {
             max_tokens: model.max_tokens,
             effort: model.effort.clone(),
         };
-        let mut stream = model.provider.stream(req, cancel.clone()).await?;
-        let mut acc = ResponseAccumulator::new();
-        while let Some(item) = stream.next().await {
-            acc.feed(&item?);
-        }
-        let (blocks, usage, _) = acc.finish();
+        // Use the same retry owner, retry budget, exponential backoff, and
+        // cancellation semantics as a normal model step. A failed attempt has
+        // no ledger side effect, so its partial summary is simply discarded.
+        let mut attempt = 0u32;
+        let (blocks, usage, _) = 'retry: loop {
+            // The provider makes one connection attempt. Retrying here keeps
+            // compact failures visible and consistent with normal turns.
+            let mut stream = match model.provider.stream(req.clone(), cancel.clone()).await {
+                Ok(stream) => stream,
+                Err(error) if error.retryable() && attempt < self.watchdog.max_retries => {
+                    attempt += 1;
+                    if self
+                        .emit_retry(events, attempt, &error.to_string(), false, cancel)
+                        .await?
+                    {
+                        continue 'retry;
+                    }
+                    return Ok(());
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let mut acc = ResponseAccumulator::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(event) => {
+                        if let crate::StreamEvent::RateLimits(limits) = &event {
+                            self.emit(events, AgentEvent::RateLimits(*limits)).await?;
+                        }
+                        acc.feed(&event);
+                    }
+                    Err(error) if error.retryable() && attempt < self.watchdog.max_retries => {
+                        attempt += 1;
+                        if self
+                            .emit_retry(events, attempt, &error.to_string(), false, cancel)
+                            .await?
+                        {
+                            continue 'retry;
+                        }
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            break acc.finish();
+        };
         let summary: String = blocks
             .iter()
             .filter_map(|b| match b {
