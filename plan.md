@@ -214,4 +214,3 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
 5. gpt订阅有图片生成模型吗
 6. resume性能较差。
-7. windows上ctrl+shift+v粘贴文字，然后自己发出去了，应该是把enter换行当成用户的enter了，如何修复

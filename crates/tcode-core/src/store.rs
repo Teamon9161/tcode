@@ -547,17 +547,13 @@ impl SessionStore {
         let mut result = Vec::new();
         for path in files {
             let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
-            let id = path
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default();
             // Reuse the normal replay path so `/clear` and rewind events
             // are respected; scanning raw append events would resurrect
             // conversations that were deliberately cleared.
             // A damaged or newer-format log must not hide every other
             // conversation in the picker. Directly selecting it still reports
             // the replay error to make recovery actionable.
-            let Ok(resumed) = Self::resume(data_dir, Some(&id)) else {
+            let Ok(resumed) = Self::resume_path(&path) else {
                 continue;
             };
             let last_user_preview = resumed
@@ -660,7 +656,12 @@ impl SessionStore {
             .collect();
         files.sort();
         let path = files.pop().ok_or(StoreError::NoSession)?;
+        Self::resume_path(&path)
+    }
 
+    /// Replay an already-selected JSONL log. Keeping selection separate lets
+    /// the session picker reuse its directory scan for every candidate.
+    fn resume_path(path: &Path) -> Result<Resumed, StoreError> {
         let mut ledger = Ledger::new();
         let mut checkpoints = Vec::new();
         let mut startup = None;

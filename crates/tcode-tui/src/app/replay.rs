@@ -36,7 +36,9 @@ impl App {
             return;
         };
         if !session.ledger.is_empty() {
+            self.transcript.begin_replay();
             self.replay_ledger(&session);
+            self.transcript.finish_replay();
         }
         self.session = Some(session);
     }

@@ -64,6 +64,9 @@ pub struct Transcript {
     /// Block whose head rows shimmer because its call (or batch) is still in
     /// flight. Paint-only, like the frame: content and wrapping never change.
     live_head: Option<usize>,
+    /// A persisted transcript is rebuilt synchronously before it can render.
+    /// Defer cumulative-height maintenance until its final block shape is known.
+    replay_in_progress: bool,
 }
 
 /// Lines wrapped at a width. `starts` is aligned with `lines`: true where
@@ -309,6 +312,7 @@ impl Transcript {
             trace_hovered: None,
             animation_frame: 0,
             live_head: None,
+            replay_in_progress: false,
         }
     }
 
@@ -495,6 +499,21 @@ impl Transcript {
         self.remeasure(index, old_height);
     }
 
+    /// Defer prefix-height maintenance while rebuilding a whole persisted
+    /// transcript. Replay mutates previously baked call headers as results
+    /// arrive, so rebuilding `cum` after each mutation becomes quadratic.
+    pub(crate) fn begin_replay(&mut self) {
+        debug_assert!(!self.replay_in_progress);
+        self.replay_in_progress = true;
+    }
+
+    /// Publish the prefix-height index after [`begin_replay`](Self::begin_replay).
+    pub(crate) fn finish_replay(&mut self) {
+        debug_assert!(self.replay_in_progress);
+        self.replay_in_progress = false;
+        self.rebuild_cum();
+    }
+
     /// Extend the last head line of an existing block — a tool-result
     /// preview landing on the call's own header row at `ToolEnd`.
     pub fn extend_head(&mut self, index: usize, spans: Vec<Span<'static>>) {
@@ -629,13 +648,17 @@ impl Transcript {
                 self.scroll = self.scroll.saturating_sub(old_height - new_height);
             }
         }
-        self.rebuild_cum();
+        if !self.replay_in_progress {
+            self.rebuild_cum();
+        }
     }
 
     fn push_block(&mut self, mut block: Block) {
         block.rewrap(self.width);
         let height = block.height();
-        self.cum.push(self.total() + height);
+        if !self.replay_in_progress {
+            self.cum.push(self.total() + height);
+        }
         self.blocks.push(block);
         // A reader who scrolled up keeps their place while output grows
         // below; only scroll 0 follows the tail.
@@ -1880,6 +1903,32 @@ mod tests {
         let mut buf = Buffer::empty(area);
         t.render(&mut buf, area);
         assert_eq!(t.total(), 3);
+    }
+
+    #[test]
+    fn replay_defers_prefix_heights_until_the_final_block_shape() {
+        let mut t = Transcript::new(20);
+        t.push(vec![Line::raw("before replay")]);
+        t.begin_replay();
+        t.push(vec![Line::raw("● Read source")]);
+        let call = t.last_block_index().unwrap();
+        t.extend_head(call, vec![Span::raw(" — 3 lines")]);
+        t.attach_detail(
+            call,
+            vec![Line::raw("first"), Line::raw("second"), Line::raw("third")],
+            5,
+        );
+        t.push(vec![Line::raw("after replay")]);
+        t.finish_replay();
+
+        let mut expected = Vec::new();
+        let mut total = 0;
+        for block in &t.blocks {
+            total += block.height();
+            expected.push(total);
+        }
+        assert_eq!(t.cum, expected);
+        assert_eq!(t.cum.len(), t.block_count());
     }
 
     #[test]
