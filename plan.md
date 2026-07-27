@@ -208,9 +208,5 @@ omp 的 Hashline：`read` 每行带内容 hash 锚点，`edit` 指锚点 + 新�
 omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析散文。对 tcode 不采：当前子 agent（`general` / `explore`）的活都是**探索 + 总结**，散文本就是对的输出，硬套 schema 会丢失细微、帮倒忙。类型化返回只在"父 agent fan-out 多路子 agent、要机器化汇总各路结果"时才有价值，而 tcode 没有这种用法。若将来出现该用法，落地要点：schema 声明进 def frontmatter、校验在 `task` 收尾处（主循环不动）、且 **typed ≠ trusted**（字段仍是观察到的数据，不是发给父 agent 的指令）。
 
 ## 改进
-1. 看codex项目如何用reset次数,
-2. pdf支持？skill还是原生？需要识别图片吗？
-3. claude-code rules?
-4. 前端开发需要截图浏览器页面来做验证,技术路线?
-5. gpt订阅有图片生成模型吗
-6. resume性能较差。
+1. claude-code rules?
+2. gpt订阅有图片生成模型吗
