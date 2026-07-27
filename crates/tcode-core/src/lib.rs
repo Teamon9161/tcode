@@ -36,7 +36,7 @@ pub use auto_mode::{
     classifier_policy, AutoModePolicy, AutoRoute, AutoSafety, ClassifierDecision,
     ClassifierRequest, ClassifierTranscript, ProviderSafetyClassifier, SafetyClassifier,
 };
-pub use background::{BackgroundTasks, TaskShared, TaskStatus};
+pub use background::{BackgroundTasks, HarnessNoteSink, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
 pub use config::FolderTrust;
 pub use cwd_scope::{CwdScoped, CwdScopes};
@@ -59,7 +59,8 @@ pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use task_trace::{TaskRunLoad, TaskRunMeta, TaskRunStatus, TaskTraces, TraceStore};
 pub use template::PromptVariables;
 pub use tool::{
-    BatchPolicy, CohortMember, CohortMemberRun, CohortMemberStatus, CohortUpdate, Compacted,
-    DelegateEvent, DelegatedApprovalRequest, PermissionRequest, Tool, ToolCtx, ToolOutput,
+    BatchPolicy, CohortChannelMessage, CohortMember, CohortMemberRun, CohortMemberStatus,
+    CohortUpdate, Compacted, DelegateEvent, DelegatedApprovalRequest, PermissionRequest, Tool,
+    ToolCtx, ToolOutput,
 };
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

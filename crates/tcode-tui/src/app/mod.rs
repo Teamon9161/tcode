@@ -72,8 +72,8 @@ use crate::usage::{
     context_progress_line, rate_limit_line, token_count, turn_summary_line, TurnMeter,
 };
 use crate::view::{
-    task_live_detail, task_plain_status, task_status_lines, task_summary_detail, BakeCtx,
-    SessionView,
+    task_live_detail, task_plain_status, task_status_lines, task_summary_detail_with_model,
+    BakeCtx, SessionView,
 };
 use crate::view_picker::{self, ViewId};
 use crate::voice::{Voice, VoiceEvent, VoiceOutcome};
@@ -1397,10 +1397,16 @@ impl App {
         let Some(run) = self
             .active_transcript()
             .task_run_at(mouse.column, mouse.row)
+            .map(ViewId::TaskRun)
+            .or_else(|| {
+                self.active_transcript()
+                    .cohort_channel_at(mouse.column, mouse.row)
+                    .map(ViewId::CohortChannel)
+            })
         else {
             return false;
         };
-        self.open_view(ViewId::TaskRun(run));
+        self.open_view(run);
         true
     }
 
@@ -2081,6 +2087,151 @@ mod tests {
     }
 
     #[test]
+    fn completed_nested_runs_leave_no_live_agent_tree_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "t1".into(),
+            parent_call: "main-plan".into(),
+            kind: "plan".into(),
+            model: "m".into(),
+            prompt: "design".into(),
+            summary: "design".into(),
+            cohort_member: None,
+        });
+        for (run, summary) in [("t2", "inspect parser"), ("t3", "inspect UI")] {
+            app.on_agent_event(AgentEvent::TaskRunEvent {
+                run: "t1".into(),
+                event: Box::new(AgentEvent::TaskRunStarted {
+                    run: run.into(),
+                    parent_call: format!("call-{run}"),
+                    kind: "explore".into(),
+                    model: "m".into(),
+                    prompt: summary.into(),
+                    summary: summary.into(),
+                    cohort_member: None,
+                }),
+            });
+        }
+        for run in ["t2", "t3"] {
+            app.on_agent_event(AgentEvent::TaskRunEvent {
+                run: "t1".into(),
+                event: Box::new(AgentEvent::TaskRunFinished {
+                    run: run.into(),
+                    status: tcode_core::TaskRunStatus::Done,
+                    tool_calls: 0,
+                    usage: Usage::default(),
+                }),
+            });
+        }
+        app.on_agent_event(AgentEvent::TaskRunFinished {
+            run: "t1".into(),
+            status: tcode_core::TaskRunStatus::Done,
+            tool_calls: 2,
+            usage: Usage::default(),
+        });
+
+        assert!(
+            app.task_runs
+                .iter()
+                .all(|run| run.status != tcode_core::TaskRunStatus::Running),
+            "all completed descendants must leave the live tree"
+        );
+        assert!(
+            app.live_panel_lines().0.is_empty(),
+            "no completed plan/explore rows should remain in the running-only tree"
+        );
+    }
+
+    #[test]
+    fn every_running_agent_kind_in_the_tree_opens_its_trace() {
+        for kind in ["explore", "plan", "custom-worker"] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = harness::app(dir.path(), 90, 30);
+            let run = format!("{kind}-run");
+            app.on_agent_event(AgentEvent::TaskRunStarted {
+                run: run.clone(),
+                parent_call: "delegation".into(),
+                kind: kind.into(),
+                model: "m".into(),
+                prompt: "inspect the interaction".into(),
+                summary: "inspect the interaction".into(),
+                cohort_member: None,
+            });
+            app.frame();
+
+            let hitbox = app
+                .live_panel_hitbox
+                .as_ref()
+                .expect("a running task renders the agent tree");
+            let tree_row = hitbox
+                .targets
+                .iter()
+                .position(|target| target == &Some(PanelTarget::Task(run.clone())))
+                .expect("the task owns a clickable tree row");
+            let (column, row) = (hitbox.rect.x + 1, hitbox.rect.y + 1 + tree_row as u16);
+
+            app.on_term_event(Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            }));
+
+            assert_eq!(app.active_view, ViewId::TaskRun(run), "kind: {kind}");
+        }
+    }
+
+    #[test]
+    fn a_running_nested_agent_tree_entry_opens_its_trace_regardless_of_agent_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 30);
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "parent-run".into(),
+            parent_call: "root-delegation".into(),
+            kind: "general".into(),
+            model: "m".into(),
+            prompt: "coordinate the work".into(),
+            summary: "coordinate the work".into(),
+            cohort_member: None,
+        });
+        app.on_agent_event(AgentEvent::TaskRunEvent {
+            run: "parent-run".into(),
+            event: Box::new(AgentEvent::TaskRunStarted {
+                run: "custom-run".into(),
+                parent_call: "nested-delegation".into(),
+                kind: "custom-worker".into(),
+                model: "m".into(),
+                prompt: "inspect the interaction".into(),
+                summary: "inspect the interaction".into(),
+                cohort_member: None,
+            }),
+        });
+        app.open_view(ViewId::TaskRun("parent-run".into()));
+        app.frame();
+
+        let hitbox = app
+            .live_panel_hitbox
+            .as_ref()
+            .expect("a running task renders the agent tree");
+        let tree_row = hitbox
+            .targets
+            .iter()
+            .position(|target| target == &Some(PanelTarget::Task("custom-run".into())))
+            .expect("the nested task owns a clickable tree row");
+        let (column, row) = (hitbox.rect.x + 1, hitbox.rect.y + 1 + tree_row as u16);
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }));
+
+        assert_eq!(app.active_view, ViewId::TaskRun("custom-run".into()));
+    }
+
+    #[test]
     fn ctrl_press_over_a_task_card_underlines_and_clicks_its_trace() {
         use ratatui::style::Modifier;
 
@@ -2164,14 +2315,18 @@ mod tests {
                 CohortMember {
                     id: "m1".into(),
                     kind: "explore".into(),
-                    task: "inspect the parser".into(),
+                    task: "inspect the parser in depth and explain every branch".into(),
+                    summary: "inspect parser".into(),
+                    model: "claude-opus-4-8".into(),
                     run: Some("t1".into()),
                     status: first_status,
                 },
                 CohortMember {
                     id: "m2".into(),
                     kind: "plan".into(),
-                    task: "design the migration".into(),
+                    task: "design the migration across every component".into(),
+                    summary: "design migration".into(),
+                    model: "gpt-5.6".into(),
                     run: None,
                     status: second_status,
                 },
@@ -2204,14 +2359,18 @@ mod tests {
         });
         let frame = app.frame();
         for expected in [
-            "m1 · explore · inspect the parser",
-            "m2 · plan · design the migration",
+            "m1 · explore · inspect parser",
+            "m2 · plan · design migration",
             "round 1/2 · running",
             "round 1/2 · waiting",
             "read(parser.rs)",
         ] {
             assert!(frame.contains(expected), "missing {expected:?}:\n{frame}");
         }
+        assert!(
+            !frame.contains("inspect the parser in depth"),
+            "the full task belongs in the expandable detail, not the compact card:\n{frame}"
+        );
         assert!(
             (0..40).any(|row| (0..110).any(|column| app
                 .transcript
@@ -2232,8 +2391,68 @@ mod tests {
             CohortMemberStatus::Waiting,
         )));
         let frame = app.frame();
-        assert!(frame.contains("m1 · explore · inspect the parser · round 1/2 · done"));
-        assert!(frame.contains("m2 · plan · design the migration · round 1/2 · waiting"));
+        assert!(frame.contains("m1 · explore · inspect parser · round 1/2 · done"));
+        assert!(frame.contains("m2 · plan · design migration · round 1/2 · waiting"));
+    }
+
+    #[test]
+    fn cohort_channel_ctrl_click_opens_a_live_discussion_view() {
+        use tcode_core::{CohortChannelMessage, CohortUpdate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 110, 40);
+        app.on_agent_event(AgentEvent::CohortUpdated(CohortUpdate {
+            id: "c1".into(),
+            parent_call: "cohort-call".into(),
+            round: 0,
+            max_rounds: 2,
+            members: Vec::new(),
+        }));
+        app.on_agent_event(AgentEvent::CohortChannelMessage(CohortChannelMessage {
+            cohort_id: "c1".into(),
+            seq: 1,
+            from: "m1".into(),
+            to: Some("m2".into()),
+            body: "parser evidence is decisive".into(),
+            round: 0,
+        }));
+        app.frame();
+        let (column, row) = (0..40)
+            .flat_map(|row| (0..110).map(move |column| (column, row)))
+            .find(|&(column, row)| {
+                app.transcript.cohort_channel_at(column, row).as_deref() == Some("c1")
+            })
+            .expect("the cohort channel link is visible in the transcript");
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::CONTROL,
+        }));
+        assert_eq!(app.active_view, ViewId::CohortChannel("c1".into()));
+        let frame = app.frame();
+        for expected in [
+            "cohort c1 · shared channel",
+            "1 · round 1 · m1 → m2",
+            "parser evidence is decisive",
+        ] {
+            assert!(frame.contains(expected), "missing {expected:?}:\n{frame}");
+        }
+
+        app.on_agent_event(AgentEvent::CohortChannelMessage(CohortChannelMessage {
+            cohort_id: "c1".into(),
+            seq: 2,
+            from: "m2".into(),
+            to: None,
+            body: "I agree; checking allocations next".into(),
+            round: 1,
+        }));
+        let frame = app.frame();
+        assert!(
+            frame.contains("I agree; checking allocations next"),
+            "a live post appends without reopening the view:\n{frame}"
+        );
     }
 
     #[test]
@@ -2282,6 +2501,129 @@ mod tests {
         assert!(
             frame.contains("second round finding"),
             "follow-up round is replayed with the root trace:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn an_open_cohort_member_trace_receives_later_round_events() {
+        use tcode_core::{CohortMember, CohortMemberRun, CohortMemberStatus, CohortUpdate};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.on_agent_event(AgentEvent::CohortUpdated(CohortUpdate {
+            id: "c1".into(),
+            parent_call: "cohort-call".into(),
+            round: 0,
+            max_rounds: 2,
+            members: vec![CohortMember {
+                id: "m1".into(),
+                kind: "explore".into(),
+                task: "inspect both implementations in depth".into(),
+                summary: "inspect implementations".into(),
+                model: "claude-opus-4-8".into(),
+                run: None,
+                status: CohortMemberStatus::Waiting,
+            }],
+        }));
+        let membership = CohortMemberRun {
+            cohort_id: "c1".into(),
+            member_id: "m1".into(),
+        };
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "r1".into(),
+            parent_call: "cohort-call".into(),
+            kind: "explore".into(),
+            model: "m".into(),
+            prompt: "first round".into(),
+            summary: "ignored scheduler label".into(),
+            cohort_member: Some(membership.clone()),
+        });
+        app.on_agent_event(AgentEvent::TaskRunEvent {
+            run: "r1".into(),
+            event: Box::new(AgentEvent::ToolStart {
+                call_id: "read-first".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "first.rs"}),
+                summary: String::new(),
+            }),
+        });
+        app.open_view(ViewId::TaskRun("r1".into()));
+
+        app.on_agent_event(AgentEvent::TaskRunFinished {
+            run: "r1".into(),
+            status: tcode_core::TaskRunStatus::Done,
+            tool_calls: 1,
+            usage: Usage::default(),
+        });
+        app.on_agent_event(AgentEvent::TaskRunStarted {
+            run: "r2".into(),
+            parent_call: "cohort-call".into(),
+            kind: "explore".into(),
+            model: "m".into(),
+            prompt: "second round".into(),
+            summary: "ignored scheduler label".into(),
+            cohort_member: Some(membership),
+        });
+        app.on_agent_event(AgentEvent::TaskRunEvent {
+            run: "r2".into(),
+            event: Box::new(AgentEvent::ToolStart {
+                call_id: "read-second".into(),
+                name: "read".into(),
+                input: serde_json::json!({"path": "second.rs"}),
+                summary: String::new(),
+            }),
+        });
+
+        let frame = app.frame();
+        assert!(frame.contains("Read(first.rs)"), "{frame}");
+        assert!(
+            frame.contains("Read(second.rs)"),
+            "later-round activity appends to the stable root trace:\n{frame}"
+        );
+    }
+
+    #[test]
+    fn opening_a_live_trace_uses_cached_events_before_disk_replay() {
+        use tcode_core::{ContentBlock, Entry, Ledger, TaskRunStatus, TaskTraces};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("task-traces");
+        let mut traces = TaskTraces::default();
+        traces.bind_root(Some(root.clone()));
+        let (run, store) = traces.begin("call", "explore", "m", "prompt", "summary", None);
+        let store = store.expect("persisted trace");
+        let finisher = store.clone();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "stale disk replay".into(),
+        }]));
+        finisher.finish(TaskRunStatus::Done, 0, Usage::default());
+
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.task_trace_root = Some(root);
+        let mut live = UiTaskRun::new(
+            run.clone(),
+            "call".into(),
+            "explore".into(),
+            "m".into(),
+            "prompt".into(),
+            "summary".into(),
+            None,
+        );
+        live.status = TaskRunStatus::Done;
+        live.events = vec![
+            AgentEvent::TextDelta("cached live event".into()),
+            AgentEvent::TurnEnd,
+        ];
+        app.task_runs.push(live);
+
+        app.open_view(ViewId::TaskRun(run));
+        let frame = app.frame();
+        assert!(frame.contains("cached live event"), "{frame}");
+        assert!(
+            !frame.contains("stale disk replay"),
+            "a trace with retained events must not synchronously replay disk:\n{frame}"
         );
     }
 

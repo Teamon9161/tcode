@@ -188,6 +188,7 @@ async fn two_members_debate_and_each_produce_a_report() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["find the bottleneck", "find the bottleneck"],
+                "summaries": ["find the bottleneck", "find the bottleneck"],
                 "max_rounds": 1
             }),
             &ctx,
@@ -246,6 +247,7 @@ async fn channel_fence_is_escaped_in_the_injected_delta() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 1
             }),
             &ctx,
@@ -299,6 +301,7 @@ async fn leaving_winds_the_cohort_down_before_max_rounds() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 // Three rounds allowed, but both leave in round 0.
                 "max_rounds": 3
             }),
@@ -344,6 +347,7 @@ async fn asking_the_parent_yields_and_resume_injects_the_answer() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 2
             }),
             &ctx,
@@ -403,6 +407,7 @@ async fn a_failed_member_stalls_the_cohort_and_resume_continues() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 1
             }),
             &ctx,
@@ -450,6 +455,7 @@ async fn the_parent_can_read_a_paused_cohorts_channel() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 2
             }),
             &ctx,
@@ -504,6 +510,7 @@ async fn a_paused_cohort_is_rebuilt_from_disk_after_a_restart() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 2
             }),
             &ctx1,
@@ -578,6 +585,7 @@ async fn an_oversized_channel_post_spills_to_the_cohort_blob_dir() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 1
             }),
             &ctx,
@@ -617,13 +625,38 @@ async fn mismatched_members_and_tasks_is_a_self_healing_error() {
 
     let out = tool
         .run(
-            serde_json::json!({ "members": ["explore", "explore"], "tasks": ["only one"] }),
+            serde_json::json!({
+                "members": ["explore", "explore"],
+                "tasks": ["only one"],
+                "summaries": ["first", "second"]
+            }),
             &ctx,
             &CancellationToken::new(),
         )
         .await;
     assert!(out.is_error);
     assert!(out.content.contains("same length"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn summaries_are_required_for_cohort_member_cards() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(Vec::new());
+    let tool = cohort_tool(provider, dir.path());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 4000);
+
+    let out = tool
+        .run(
+            serde_json::json!({
+                "members": ["explore", "explore"],
+                "tasks": ["inspect deeply", "inspect independently"]
+            }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(out.is_error);
+    assert!(out.content.contains("`summaries`"), "{}", out.content);
 }
 
 #[tokio::test]
@@ -647,6 +680,7 @@ async fn a_departure_updates_the_remaining_members_roster_once() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 3
             }),
             &ctx,
@@ -697,6 +731,7 @@ async fn detached_reports_stay_attachable_without_entering_the_parent_output() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 2,
                 "detached": true
             }),
@@ -755,6 +790,7 @@ async fn a_finalized_member_resumes_without_its_defunct_channel_tool() {
             serde_json::json!({
                 "members": ["explore", "explore"],
                 "tasks": ["t", "t"],
+                "summaries": ["investigate", "investigate"],
                 "max_rounds": 2
             }),
             &ctx,

@@ -114,6 +114,8 @@ loop {
 
 **Tab 补充意见**：确认对话任意选项上按 Tab 展开内联输入框。"Yes + 意见" → 批准并把意见作为 user message 追加在 tool result 后；"No + 理由" → 拒绝原因进上下文。纯 append，缓存安全。
 
+**模式切换即时生效于下一次权限判定**：shift+tab 切的模式只改闸门、不入 ledger。闸门在每个权限判定点提交（回合始、`run_tools` 入口、串行批每个待批调用前、批边界、回合末），所以切到 unsafe/auto 后，模型这一步吐出的调用、乃至同批后续调用立刻按新模式判定，不必等一整个来回到下一批边界。**只有闸门即时——模型可见的 plan enter/exit note 仍延迟到下一次用户交互**并按净变化合并（`take_mode_note` 比对 last_notified↔当前）：裸切键永远不能把瞬时 plan 指令写进 append-only 历史，来回多切几次也只落一条净变化的 note。这条不变量把"闸门"与"note"两件事彻底解耦，二者曾错误地一起绑在批边界上。
+
 **读工具永不询问**：read/grep/glob 的 `permission()` 返回 `None`，任何模式（含 plan）直接放行；外部路径门控只拦 mutating 工具。
 
 **plan mode 是协调信号，不是能力边界**：它在 `decide()` 里**没有自己的臂**，和 default 走同一段（deny → ask 规则 → allow 规则 → 否则 Ask）。理由是原来的硬 Deny 制造了一个站不住的不对称——系统里每条边界最终都通向人，唯独 plan mode 剥夺了**在场用户说 yes 的权利**。而 plan mode 的威胁模型自己就写着"防的是过于积极的合作模型，不是对抗性沙箱"，对这个威胁模型来说，替用户拒绝是过度设计："把计划写进 plan.md" 这种用户明确要求的事，不该逼他先切模式。**代价是 allow 规则在 plan mode 下同样生效**，理论上手写一条 `write(src/**)` 就能让 plan mode 静默失效；实际风险低是因为 `YesProject` 持久化的是 `request.descriptor()` **逐字原样**、从不生成通配，攒出来的都是精确 `run(...)` 串，要出现 write 通配必须是人刻意手写。**因此约束力转移到了 prompt 上**（`plan-mode-enter.md`）：它现在是唯一的实际控制，改它等于改 plan mode 的语义，别当成措辞润色。UI 描述同理不能再说 "read-only tools only"。
@@ -151,7 +153,7 @@ loop {
 | `shell` | Windows: PowerShell 为主 + 检测到 Git Bash 时提供 `bash`；`run_in_background` 进后台注册表，日志流到文件，`kill_task` 停 |
 | `monitor` | 后台监视（对齐 claude-code 的 Monitor）：跑平台主 shell 脚本，stdout 每行即一个事件（512B 截断），安全边界作为 `Entry::Note` 注入、空闲时前端按 quiet 合流窗口唤醒 `monitor_turn`（每次空闲唤醒 = 一次完整前缀 cache read，合流即省钱）；事件是 Note 不是 User，Auto Mode 授权判定天然不把事件当用户授权（claude-code 靠 prompt 纪律，这里靠类型）；洪水自动停（120 事件/60s，附"收紧过滤器"自愈提示）；与 shell 共用注册表、日志管道、`kill_task` 与权限规则域（`run(...)`）；默认 5min 超时，`persistent` 免超时；resume 时未终结的任务/监视注入一条"未恢复"Note（零猜测） |
 | `grep` / `glob` | 内嵌 grep-searcher/ignore/globset；每行截 512B、`max_filesize` 上限、并行 + 按 (path,line) 排序、deadline 兜底给 partial 标记、剪 VCS/缓存目录、搜 dotfiles + offset 分页 |
-| `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集 |
+| `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced Note 唤醒主 agent（见改进 5），非交互 |
 | `web_fetch` / `web_search` | 见下 Web 节 |
 | `update_progress` | 前端可见的多阶段执行状态；按真实依赖与里程碑更新，避免与只读 `plan` 权限模式混淆。不可代替方案、结论或交接记录。 |
 | `ask_user` | 必须由用户选择才能继续的阻塞分歧；支持多问题分页。不可用于可由代码、项目上下文或现有用户要求确定的细节。 |
@@ -210,6 +212,12 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 2. pdf支持？skill还是原生？需要识别图片吗？
 3. claude-code rules?
 4. 前端开发需要截图浏览器页面来做验证,技术路线?
-5. gpt订阅有图片生成模型吗
-6. • Tool friction — glob：我在 ~/.tcode/skills 搜索 **/SKILL.md 时得到“无匹配”，但 Arbor Skills 实际都以目录符号链接存在；glob 没有跟随链接，也未提示跳过了符号链接，导致我错误尝试重复安装。增加显式 follow_symlinks 参数，或在无匹配时报告被跳过的符号链接目录，可以避免这次额外排查和失败安装。
-7. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.
+5. ✅ 已做：**后台 sub-agent（`agent(background: true)`，opt-in）。** 语义不是"父子两个 loop 同时 step"，而是：调用**不阻塞**、立即返回 run id（dispatch 行，不含 report）→ 父回合自然结束 → sub-agent 在 `tokio::spawn` 里自驱 → 完成时 report 作为 **fenced `Entry::Note`** 落进 `BackgroundTasks` 的新 note inbox 并 `notify` 信号 → 复用 monitor 现成的 idle 回路（`monitor_wake_deadline` 见到 inbox 非空即"立刻唤醒"、`take_notes` 先排空 inbox、前端 `monitor_signal.notified()`→`monitor_turn`→`note_background`）触发主 agent，**前端零改动**。与 cohort 正交：cohort 是顺序 round-robin + 共享 channel 的辩论，这条是父子并发。三条落地约束：(a) **权限在派发瞬间快照**——`build_run` 同步跑在前台，把父的 mode+rules 灌进子 session；后台 run 非交互（approver = `NeverAsk`），gating 模式下的写会被拒而不是把后台任务卡在前台弹窗，故读工具/auto 模式畅通、`default` 下的写需要前台重派；(b) **report 走 Note 不走 tool_result**——工具调用已返回，完成态只能独立 append，反而更 append-only，并按 `attach_reports` 同款围栏中和 `</background-report>`；(c) **唤醒经 `HarnessNoteSink`**（`Arc<inbox>` + `Arc<Notify>` + `Arc<AtomicUsize>` in-flight），完成即 `sink.finish(note)`。落地做了 spawn-ownership 重构：`drive` 拆成"前台分配 id/trace/approver 的 `&self` 壳" + **不借 `self`/`ctx` 的自由函数 `run_delegated_turn`**（前台与后台共用）；`park`/`remember_report` 抽出自由版 `park_into`/`remember_report_into`，故后台 run 完成后的 `attach`/`resume` 与前台一致。**门槛 `depth==0`**：子 agent 的 session 没有 idle 回路可投递，其 `background` 降级为普通阻塞。三个边角也补齐了：(1) **可 kill**——`HarnessNoteSink` 用 `run id → CancellationToken` 的 map 兼作运行集，`kill_task(id=t<n>)` 经 `BackgroundTasks::kill` 取消（取消后仍投递一条中断 report Note）；(2) **状态行**——`status_block` 的 `background running:` 段并列 `b/m` 任务与在飞的后台 run id；(3) **重启未恢复**——`store::lost_background_note` 认得 `[background … dispatched on …]` 派发行与 `finished/failed` 完成 Note，resume 时把未闭合的 run 一并列进"未恢复"提示（零猜测）。
+6. ✅ 已做：转录里 sub-agent 卡片（cohort 成员卡 + 普通 task 卡）在**点击展开的 detail 区**（非 header，避免挤）显示归一化短名（`claude-opus-4-8`→`opus-4-8`，provider id 原样透传）。`CohortMember` 加 `model` 字段贯通，`short_model_name`/`task_summary_detail_with_model` 在 `tcode-tui/src/view.rs`。
+7. gpt订阅有图片生成模型吗
+8. ✅ 已做（比防抖方案更干净）：不引入定时器——闸门改成在**每个权限判定点**提交（`run_tools` 入口 + 串行批每个待批调用前），切到 unsafe/auto 立刻作用于下一次判定乃至同批后续调用；note 仍延迟并合并。详见上方权限节"模式切换即时生效于下一次权限判定"。原担心的"来回切多切几个 mode"只跟 note 有关，note 不变故无副作用。
+9. resume性能较差。
+10. askuser到other选项的时候不要自动进入Note部分的输入，直接没法上下选选项了，另一个问题是空的Note应该不止允许Esc返回，也要允许←返回。
+11. agent tree中plan agent怎么不能点击跳转？只适配了explore?不应该吧。
+12. • Tool friction — glob：我在 ~/.tcode/skills 搜索 **/SKILL.md 时得到“无匹配”，但 Arbor Skills 实际都以目录符号链接存在；glob 没有跟随链接，也未提示跳过了符号链接，导致我错误尝试重复安装。增加显式 follow_symlinks 参数，或在无匹配时报告被跳过的符号链接目录，可以避免这次额外排查和失败安装。
+13. codex compact是按照真实的来算的吗? 感觉compact有点太快了,有时候下面context才55%又开始compact了,多次compact的情况下会计算错误吗,然后就是compact应该和主要prompt做一样的retry重试,现在compact失败一次就失败了.

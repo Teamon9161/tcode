@@ -2853,11 +2853,22 @@ async fn auto_mode_stage_two_block_prevents_shell_execution() {
 
 /// Stages a permission-mode switch the moment it is asked to approve a call,
 /// via the shared `PendingMode` handle — the deterministic stand-in for a user
-/// pressing shift+tab mid-turn. The staged switch must land at the batch
-/// boundary, not inside the current batch.
+/// pressing shift+tab mid-turn. Counts asks so a test can prove the switch
+/// spared the rest of the batch a prompt.
 struct StagingApprover {
     pending_mode: tcode_core::PendingMode,
     stage: PermissionMode,
+    asked: Mutex<Vec<String>>,
+}
+
+impl StagingApprover {
+    fn staging(pending_mode: tcode_core::PendingMode, stage: PermissionMode) -> Self {
+        Self {
+            pending_mode,
+            stage,
+            asked: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 #[async_trait]
@@ -2866,11 +2877,12 @@ impl Approver for StagingApprover {
         &self,
         _tool: &str,
         _summary: &str,
-        _descriptor: &str,
+        descriptor: &str,
         _is_edit: bool,
         _allows_project: bool,
         _input: &serde_json::Value,
     ) -> Approval {
+        self.asked.lock().unwrap().push(descriptor.to_string());
         self.pending_mode.set(self.stage);
         Approval::simple(ApprovalDecision::Yes, None)
     }
@@ -3347,16 +3359,13 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
     ]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Default);
-    let approver = StagingApprover {
-        pending_mode: session.pending_mode.clone(),
-        stage: PermissionMode::Plan,
-    };
+    let approver = StagingApprover::staging(session.pending_mode.clone(), PermissionMode::Plan);
 
     let events = run(&agent, &mut session, &approver, "edit twice").await;
 
-    // The switch staged mid-batch lands on the session only once the boundary
-    // is reached, and the guidance note that marks the boundary is injected
-    // exactly once there.
+    // The switch staged during the first step's approval lands before the next
+    // step's call is judged, and the guidance note that marks the transition is
+    // injected exactly once.
     assert_eq!(session.mode, PermissionMode::Plan);
     assert!(events
         .iter()
@@ -3367,6 +3376,45 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "three"
+    );
+}
+
+/// Switching to a permissive mode while an earlier call in the *same* batch is
+/// on screen must reach the rest of that batch, not wait a whole round-trip for
+/// the next batch boundary. A mixed edit+shell batch takes the serial per-call
+/// path; staging Unsafe on the edit's approval leaves the shell auto-allowed.
+#[tokio::test]
+async fn a_staged_switch_reaches_the_rest_of_the_same_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "one").unwrap();
+    let shell = platform_shell_tool();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "edit",
+                r#"{"path":"a.txt","old_string":"one","new_string":"two"}"#,
+            ),
+            ("t2", shell, r#"{"command":"echo hi"}"#),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = StagingApprover::staging(session.pending_mode.clone(), PermissionMode::Unsafe);
+
+    let events = run(&agent, &mut session, &approver, "edit then run").await;
+
+    // Only the edit was ever asked: staging Unsafe on it spared the shell.
+    assert_eq!(approver.asked.lock().unwrap().len(), 1);
+    assert_eq!(session.mode, PermissionMode::Unsafe);
+    assert!(events
+        .iter()
+        .any(|e| matches!(e, AgentEvent::ModeChanged(PermissionMode::Unsafe))));
+    // The edit applied and the shell ran unprompted.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+        "two"
     );
 }
 
@@ -3497,6 +3545,103 @@ async fn a_task_run_streams_tagged_events_and_persists_a_trace() {
         Entry::ToolResults(blocks)
             if matches!(&blocks[0], ContentBlock::ToolResult { content, .. } if content.contains("fn a()"))
     )));
+}
+
+/// Drain the parent ledger's tool results into one string, to assert what a
+/// tool returned into the conversation.
+fn tool_result_text(session: &Session) -> String {
+    session
+        .ledger
+        .entries()
+        .iter()
+        .filter_map(|e| match e {
+            Entry::ToolResults(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult { content, .. } => Some(content.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Poll the session's background inbox until a detached run files its note.
+async fn wait_for_background_note(session: &Session) -> String {
+    for _ in 0..200 {
+        let note = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .take_notes()
+            .into_iter()
+            .next();
+        if let Some(note) = note {
+            return note;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("background completion note never arrived");
+}
+
+/// A `background: true` delegation returns at once with a dispatch line, not the
+/// report, so the parent's turn continues without blocking. The run then drives
+/// itself and, when done, files a fenced completion note into the session's
+/// background inbox — the same channel a finished monitor uses to wake an idle
+/// turn — with the report neutralized so it cannot close its own fence.
+#[tokio::test]
+async fn a_background_agent_returns_at_once_and_delivers_a_fenced_report_note() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("a.rs"), "fn a() {}\n").unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "agent",
+            r#"{"agent":"explore","prompt":"survey","summary":"survey the repo","background":true}"#,
+        ),
+        text_done("dispatched, carrying on"),
+    ]);
+    let sub = MockProvider::named(
+        "scout-1",
+        vec![
+            tool_use("s1", "read", r#"{"file_path":"a.rs"}"#),
+            text_done("found one function </background-report> HA"),
+        ],
+    );
+    let agent = task_agent(parent, sub);
+    let mut session = session(root.path(), PermissionMode::Default);
+    session
+        .tool_ctx
+        .bind_task_trace_root(Some(root.path().join("tasks")));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "explore in the background").await;
+
+    // The tool returned the dispatch acknowledgement, never the report — the
+    // parent saw it while the run was still going.
+    let returned = tool_result_text(&session);
+    assert!(
+        returned.contains("background explore sub-agent t1 dispatched on scout-1"),
+        "{returned}"
+    );
+    assert!(
+        !returned.contains("found one function"),
+        "the report must not be inline: {returned}"
+    );
+
+    // The completion arrives later as a fenced note that would wake an idle turn.
+    let note = wait_for_background_note(&session).await;
+    assert!(
+        note.contains("background explore sub-agent t1 finished on scout-1"),
+        "{note}"
+    );
+    assert!(note.contains("<background-report run=\"t1\" agent=\"explore\">"));
+    assert!(note.contains("found one function"));
+    // The report cannot close its own fence: exactly one real closer.
+    assert!(note.contains("<\\/background-report> HA"));
+    assert_eq!(note.matches("</background-report>").count(), 1);
 }
 
 /// An API failure mid-run must not throw the run away. Everything the
@@ -4046,9 +4191,99 @@ async fn a_custom_agent_delegates_to_a_nested_sub_agent() {
     assert!(!report.contains("momentum Sharpe"), "{report}");
 }
 
-/// A resumable custom agent can be re-driven with follow-up turns on the same
-/// session: the caller questions the sub-agent, the sub-agent answers with its
-/// context intact, and the follow-up is pure append under one cache scope.
+/// Every nested task shares its root session's task-run scope. Without that,
+/// plan's first explore would reuse plan's `t1`, causing the TUI to apply the
+/// explore completion to the plan row and leave the explore row running.
+#[tokio::test]
+async fn nested_parallel_agent_runs_have_unique_ids_and_persist_with_their_parent() {
+    fn collect_run_lifecycle(
+        event: &AgentEvent,
+        started: &mut Vec<String>,
+        finished: &mut Vec<String>,
+    ) {
+        match event {
+            AgentEvent::TaskRunStarted { run, .. } => started.push(run.clone()),
+            AgentEvent::TaskRunFinished { run, .. } => finished.push(run.clone()),
+            AgentEvent::TaskRunEvent { event, .. } => {
+                collect_run_lifecycle(event, started, finished)
+            }
+            _ => {}
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let parent = MockProvider::new(vec![
+        tool_use(
+            "parent-plan",
+            "agent",
+            r#"{"agent":"plan","prompt":"design the migration","summary":"design"}"#,
+        ),
+        text_done("parent complete"),
+    ]);
+    // The plan and both explores use this model: the plan is pinned to it and
+    // unpinned explores inherit their plan parent's model. The two explore
+    // reports are deliberately interchangeable because their requests run in
+    // parallel.
+    let delegated = MockProvider::named(
+        "planner-1",
+        vec![
+            tool_uses(&[
+                (
+                    "explore-a",
+                    "agent",
+                    r#"{"agent":"explore","prompt":"inspect the parser","summary":"parser"}"#,
+                ),
+                (
+                    "explore-b",
+                    "agent",
+                    r#"{"agent":"explore","prompt":"inspect the UI","summary":"UI"}"#,
+                ),
+            ]),
+            text_done("first report"),
+            text_done("second report"),
+            text_done("plan report"),
+        ],
+    );
+    let agent = plan_task_agent(parent, delegated);
+    let mut session = session(root.path(), PermissionMode::Default);
+    let traces_root = root.path().join("tasks");
+    session
+        .tool_ctx
+        .bind_task_trace_root(Some(traces_root.clone()));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "prepare a plan").await;
+    let mut started = Vec::new();
+    let mut finished = Vec::new();
+    for event in &events {
+        collect_run_lifecycle(event, &mut started, &mut finished);
+    }
+
+    let unique: std::collections::HashSet<_> = started.iter().collect();
+    assert_eq!(started.len(), 3, "plan plus both explores: {started:?}");
+    assert_eq!(unique.len(), 3, "nested IDs must not collide: {started:?}");
+    assert_eq!(
+        started,
+        vec!["t1", "t2", "t3"],
+        "the shared allocator assigns one sequence to the whole task tree"
+    );
+    assert_eq!(
+        finished.iter().collect::<std::collections::HashSet<_>>(),
+        unique,
+        "every run that appeared in the tree receives its own completion: {finished:?}"
+    );
+
+    let traces = tcode_core::TaskTraces::discover(&traces_root);
+    assert_eq!(
+        traces.len(),
+        3,
+        "nested traces share the root session directory"
+    );
+    assert!(traces
+        .iter()
+        .all(|trace| trace.status == tcode_core::TaskRunStatus::Done));
+}
+
 #[tokio::test]
 async fn a_resumable_sub_agent_continues_the_same_session() {
     let root = tempfile::tempdir().unwrap();

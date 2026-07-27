@@ -1008,6 +1008,33 @@ pub(crate) fn task_summary_detail(summary: &str) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// A sub-agent card's detail: its objective plus, on its own line, the model it
+/// runs on. Shown in the click-to-expand block so the model is visible in the
+/// transcript without crowding the header.
+pub(crate) fn task_summary_detail_with_model(summary: &str, model: &str) -> Vec<Line<'static>> {
+    let mut lines = task_summary_detail(summary);
+    if !model.trim().is_empty() {
+        lines.push(Line::styled(
+            format!("  │ model: {}", short_model_name(model)),
+            theme::metadata(),
+        ));
+    }
+    lines
+}
+
+/// A compact, honest model label: strip the noisy `claude-` prefix and a
+/// trailing snapshot date (`-20251001`), and pass anything else through
+/// untouched so provider ids are never mangled. `claude-opus-4-8` → `opus-4-8`.
+pub(crate) fn short_model_name(model: &str) -> String {
+    let trimmed = model.strip_prefix("claude-").unwrap_or(model);
+    match trimmed.rsplit_once('-') {
+        Some((head, date)) if date.len() == 8 && date.bytes().all(|b| b.is_ascii_digit()) => {
+            head.to_string()
+        }
+        _ => trimmed.to_string(),
+    }
+}
+
 pub(crate) fn task_live_detail(summary: &str, steps: &[String]) -> Vec<Line<'static>> {
     let mut lines = task_summary_detail(summary);
     lines.extend(
@@ -1098,6 +1125,27 @@ mod tests {
             cwd: Path::new("."),
             show_reasoning: true,
         }
+    }
+
+    #[test]
+    fn short_model_name_strips_claude_noise_and_leaves_provider_ids_intact() {
+        assert_eq!(short_model_name("claude-opus-4-8"), "opus-4-8");
+        assert_eq!(short_model_name("claude-haiku-4-5-20251001"), "haiku-4-5");
+        assert_eq!(short_model_name("claude-sonnet-5"), "sonnet-5");
+        // No claude prefix, no 8-digit date: pass through untouched.
+        assert_eq!(short_model_name("gpt-5.6"), "gpt-5.6");
+        assert_eq!(short_model_name("deepseek-chat"), "deepseek-chat");
+    }
+
+    #[test]
+    fn a_sub_agent_detail_names_its_model_on_its_own_line() {
+        let lines = task_summary_detail_with_model("survey the repo", "claude-opus-4-8");
+        let text: String = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().map(|span| span.content.clone()))
+            .collect();
+        assert!(text.contains("survey the repo"));
+        assert!(text.contains("model: opus-4-8"), "{text}");
     }
 
     #[test]

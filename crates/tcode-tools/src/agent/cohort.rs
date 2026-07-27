@@ -36,8 +36,9 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::blobs::BlobStore;
 use tcode_core::{
-    Agent, CohortMember as CohortMemberView, CohortMemberRun, CohortMemberStatus, CohortUpdate,
-    DelegateEvent, PermissionRequest, Session, Tool, ToolCtx, ToolOutput,
+    Agent, CohortChannelMessage, CohortMember as CohortMemberView, CohortMemberRun,
+    CohortMemberStatus, CohortUpdate, DelegateEvent, PermissionRequest, Session, Tool, ToolCtx,
+    ToolOutput,
 };
 
 use super::AgentTool;
@@ -235,6 +236,7 @@ struct Member {
     id: String,
     kind: String,
     task: String,
+    summary: String,
     agent: Agent,
     session: Session,
     model_name: String,
@@ -261,13 +263,19 @@ struct Member {
 /// ceiling and tool policy on purpose — the cohort grants it, not a definition.
 struct ChannelTool {
     channel: Arc<Mutex<Channel>>,
+    cohort_id: String,
     from: String,
     left: Arc<AtomicBool>,
     description: String,
 }
 
 impl ChannelTool {
-    fn new(channel: Arc<Mutex<Channel>>, from: String, left: Arc<AtomicBool>) -> Self {
+    fn new(
+        channel: Arc<Mutex<Channel>>,
+        cohort_id: String,
+        from: String,
+        left: Arc<AtomicBool>,
+    ) -> Self {
         let description = format!(
             "Speak on your cohort's shared channel. Other members see what you post here; your \
              private tool calls and reasoning stay yours alone. IMPORTANT: the text at the end of \
@@ -280,6 +288,7 @@ impl ChannelTool {
         );
         Self {
             channel,
+            cohort_id,
             from,
             left,
             description,
@@ -326,7 +335,7 @@ impl Tool for ChannelTool {
         false
     }
 
-    async fn run(&self, input: Value, _ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
+    async fn run(&self, input: Value, ctx: &ToolCtx, _cancel: &CancellationToken) -> ToolOutput {
         match input["action"].as_str() {
             Some("leave") => {
                 self.left.store(true, Ordering::SeqCst);
@@ -344,11 +353,23 @@ impl Tool for ChannelTool {
                     .map(str::trim)
                     .filter(|to| !to.is_empty())
                     .map(ToOwned::to_owned);
-                let seq = self.channel.lock().expect("cohort channel lock").post(
-                    self.from.clone(),
-                    to,
-                    body.to_string(),
-                );
+                let message = {
+                    let mut channel = self.channel.lock().expect("cohort channel lock");
+                    let seq = channel.post(self.from.clone(), to, body.to_string());
+                    let posted = channel.log.last().expect("post just appended");
+                    CohortChannelMessage {
+                        cohort_id: self.cohort_id.clone(),
+                        seq,
+                        from: posted.from.clone(),
+                        to: posted.to.clone(),
+                        body: posted.body.clone(),
+                        round: posted.round,
+                    }
+                };
+                let seq = message.seq;
+                if let Some(delegate) = ctx.delegate_reporter() {
+                    let _ = delegate.send(DelegateEvent::CohortChannelMessage(message));
+                }
                 ToolOutput::ok(format!("posted to the channel (seq {seq})"))
             }
             _ => ToolOutput::err("`action` must be \"post\" or \"leave\""),
@@ -423,6 +444,8 @@ struct MemberMeta {
     id: String,
     kind: String,
     task: String,
+    #[serde(default)]
+    summary: String,
     run_id: Option<String>,
     cursor: usize,
     #[serde(default)]
@@ -522,8 +545,9 @@ impl CohortTool {
         let description = format!(
             "Convene a cohort of sub-agents that work in private contexts while sharing one \
              append-only channel, then each returns its own independent report (disagreements \
-             preserved, not synthesized). Give `members` (agent kinds, {MIN_MEMBERS}–{MAX_MEMBERS}) and `tasks` \
-             (one per member, same length — same or different tasks). Members run read-only for up \
+             preserved, not synthesized). Give `members` (agent kinds, {MIN_MEMBERS}–{MAX_MEMBERS}), `tasks` \
+             (one complete task per member) and `summaries` (one short UI label per member); all three arrays \
+             must have the same length. Members run read-only for up \
              to `max_rounds` rounds (default {DEFAULT_MAX_ROUNDS}); each round every member takes one turn and \
              may speak on the channel. This is a resumable delegation, not a blocking call: if a \
              member addresses you (`to: \"parent\"`) or a member fails, it returns paused with the \
@@ -540,19 +564,23 @@ impl CohortTool {
         }
     }
 
-    /// Parse and validate `members`/`tasks`/`max_rounds`.
-    fn parse(&self, input: &Value) -> Result<(Vec<(String, String)>, usize, bool), String> {
+    /// Parse and validate `members`/`tasks`/`summaries`/`max_rounds`.
+    fn parse(&self, input: &Value) -> Result<(Vec<(String, String, String)>, usize, bool), String> {
         let members = input["members"]
             .as_array()
             .ok_or("`members` must be an array of agent-kind strings")?;
         let tasks = input["tasks"]
             .as_array()
             .ok_or("`tasks` must be an array of task strings")?;
-        if members.len() != tasks.len() {
+        let summaries = input["summaries"]
+            .as_array()
+            .ok_or("`summaries` must be an array of short task summaries")?;
+        if members.len() != tasks.len() || tasks.len() != summaries.len() {
             return Err(format!(
-                "`members` ({}) and `tasks` ({}) must be the same length",
+                "`members` ({}), `tasks` ({}) and `summaries` ({}) must be the same length",
                 members.len(),
-                tasks.len()
+                tasks.len(),
+                summaries.len()
             ));
         }
         if !(MIN_MEMBERS..=MAX_MEMBERS).contains(&members.len()) {
@@ -562,7 +590,7 @@ impl CohortTool {
             ));
         }
         let mut pairs = Vec::with_capacity(members.len());
-        for (member, task) in members.iter().zip(tasks) {
+        for ((member, task), summary) in members.iter().zip(tasks).zip(summaries) {
             let kind = member
                 .as_str()
                 .map(str::trim)
@@ -573,7 +601,12 @@ impl CohortTool {
                 .map(str::trim)
                 .filter(|task| !task.is_empty())
                 .ok_or("every `tasks` entry must be a non-empty string")?;
-            pairs.push((kind.to_string(), task.to_string()));
+            let summary = summary
+                .as_str()
+                .map(str::trim)
+                .filter(|summary| !summary.is_empty())
+                .ok_or("every `summaries` entry must be a non-empty short task label")?;
+            pairs.push((kind.to_string(), task.to_string(), summary.to_string()));
         }
         let max_rounds = input["max_rounds"]
             .as_u64()
@@ -610,6 +643,14 @@ impl CohortTool {
         out
     }
 
+    /// Forward a channel post through the same frontend-only delegate stream
+    /// whether it came from a member tool or from the parent resuming a pause.
+    fn announce_channel_message(message: &CohortChannelMessage, ctx: &ToolCtx) {
+        if let Some(delegate) = ctx.delegate_reporter() {
+            let _ = delegate.send(DelegateEvent::CohortChannelMessage(message.clone()));
+        }
+    }
+
     /// Publish one complete scheduler snapshot for frontend transcript cards.
     /// This uses the delegate stream just like normal task progress, but carries
     /// typed roster state instead of asking renderers to reverse-engineer it.
@@ -633,6 +674,8 @@ impl CohortTool {
                     id: member.id.clone(),
                     kind: member.kind.clone(),
                     task: member.task.clone(),
+                    summary: member.summary.clone(),
+                    model: member.model_name.clone(),
                     run: member.run_id.clone(),
                     status,
                 }
@@ -670,7 +713,12 @@ impl Tool for CohortTool {
                 "tasks": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Convene: one self-contained task per member, same length as `members`. May be the same task for all or different tasks."
+                    "description": "Convene: one complete self-contained task per member, same length as `members`. May be the same task for all or different tasks."
+                },
+                "summaries": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Convene: one concise task label per member, same length as `members` and `tasks`. Required so cohort cards stay readable."
                 },
                 "max_rounds": {
                     "type": "integer",
@@ -801,9 +849,21 @@ impl CohortTool {
             .map(str::trim)
             .filter(|answer| !answer.is_empty())
         {
-            let mut channel = cohort.channel.lock().expect("cohort channel lock");
-            channel.round = cohort.round;
-            channel.post("parent".to_string(), None, answer.to_string());
+            let message = {
+                let mut channel = cohort.channel.lock().expect("cohort channel lock");
+                channel.round = cohort.round;
+                let seq = channel.post("parent".to_string(), None, answer.to_string());
+                let posted = channel.log.last().expect("parent post just appended");
+                CohortChannelMessage {
+                    cohort_id: cohort.id.clone(),
+                    seq,
+                    from: posted.from.clone(),
+                    to: posted.to.clone(),
+                    body: posted.body.clone(),
+                    round: posted.round,
+                }
+            };
+            Self::announce_channel_message(&message, ctx);
         }
         let outcome = self.drive_to_exit(&mut cohort, ctx, cancel).await;
         self.handle_outcome(cohort, outcome, ctx)
@@ -852,7 +912,7 @@ impl CohortTool {
     /// session, and an injected `channel` tool bound to its identity.
     fn build_cohort(
         &self,
-        pairs: Vec<(String, String)>,
+        pairs: Vec<(String, String, String)>,
         max_rounds: usize,
         detached_reports: bool,
         call_id: &str,
@@ -874,7 +934,7 @@ impl CohortTool {
         )));
 
         let mut members: Vec<Member> = Vec::with_capacity(pairs.len());
-        for (index, (kind, task)) in pairs.into_iter().enumerate() {
+        for (index, (kind, task, summary)) in pairs.into_iter().enumerate() {
             let Some(def) = self.inner.def_for(&kind) else {
                 return Err(ToolOutput::err(format!(
                     "unknown agent '{kind}'; available: {}",
@@ -893,6 +953,7 @@ impl CohortTool {
             let left = Arc::new(AtomicBool::new(false));
             let channel_tool: Arc<dyn Tool> = Arc::new(ChannelTool::new(
                 channel.clone(),
+                id.clone(),
                 member_id.clone(),
                 left.clone(),
             ));
@@ -903,6 +964,7 @@ impl CohortTool {
                 id: member_id,
                 kind,
                 task,
+                summary,
                 agent,
                 session,
                 model_name,
@@ -955,6 +1017,7 @@ impl CohortTool {
             let left = Arc::new(AtomicBool::new(meta.left));
             let channel_tool: Arc<dyn Tool> = Arc::new(ChannelTool::new(
                 channel.clone(),
+                id.to_string(),
                 meta.id.clone(),
                 left.clone(),
             ));
@@ -989,6 +1052,9 @@ impl CohortTool {
                 id: meta.id.clone(),
                 kind: meta.kind.clone(),
                 task: meta.task.clone(),
+                summary: (!meta.summary.is_empty())
+                    .then(|| meta.summary.clone())
+                    .unwrap_or_else(|| meta.task.clone()),
                 agent,
                 session,
                 model_name,
@@ -1041,6 +1107,7 @@ impl CohortTool {
                     id: member.id.clone(),
                     kind: member.kind.clone(),
                     task: member.task.clone(),
+                    summary: member.summary.clone(),
                     run_id: member.run_id.clone(),
                     cursor: member.cursor,
                     seen_roster_revision: member.seen_roster_revision,
@@ -1121,7 +1188,7 @@ impl CohortTool {
                 };
                 let prompt =
                     round_prompt(&cohort.members[index], round, overview.as_deref(), &delta);
-                let summary = format!("cohort {cohort_id} {} r{round}", cohort.members[index].id);
+                let summary = cohort.members[index].summary.clone();
 
                 let member_id = cohort.members[index].id.clone();
                 self.announce(cohort, CohortViewPhase::Running(&member_id), ctx);
@@ -1242,7 +1309,7 @@ impl CohortTool {
                 prompt.push('\n');
             }
             prompt.push_str(FINALIZE_PROMPT);
-            let summary = format!("cohort {cohort_id} {} report", member.id);
+            let summary = member.summary.clone();
 
             let resume_of = member.run_id.clone();
             let result = self

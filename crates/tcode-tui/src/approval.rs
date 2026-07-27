@@ -977,6 +977,11 @@ impl Dialog {
                     return DialogResult::Done(Approval::simple(ApprovalDecision::No, None));
                 }
             }
+            // An empty note is a transient focus state, not a one-way trap:
+            // Left returns to the option list without also paging away.
+            K::Left if focused && self.cur_page().note.is_empty() => {
+                self.note_focused = false;
+            }
             K::Left if focused => self.cur_page().note.left(),
             K::Right if focused => self.cur_page().note.right(),
             K::Home if focused => self.cur_page().note.home(),
@@ -995,12 +1000,10 @@ impl Dialog {
             K::Up => {
                 let p = self.cur_page();
                 p.cursor = p.cursor.checked_sub(1).unwrap_or(p.options.len() - 1);
-                self.focus_note_on_other();
             }
             K::Down => {
                 let p = self.cur_page();
                 p.cursor = (p.cursor + 1) % p.options.len();
-                self.focus_note_on_other();
             }
             // Only a space aimed at the list toggles: while the note has focus
             // a space is a space, or a multi-select note could hold no words.
@@ -1017,7 +1020,6 @@ impl Dialog {
                     if p.multi {
                         p.chosen[index] = !p.chosen[index];
                     }
-                    self.focus_note_on_other();
                 } else {
                     self.note_focused = true;
                     self.cur_page().note.insert_char(c);
@@ -1031,16 +1033,6 @@ impl Dialog {
             _ => {}
         }
         DialogResult::Pending
-    }
-
-    /// On "Other" the note editor *is* the answer field, so landing there
-    /// aims the keyboard at it. Moving off leaves the focus alone: the text
-    /// stays a note on whatever the user settles on.
-    fn focus_note_on_other(&mut self) {
-        let p = self.cur_page();
-        if p.options[p.cursor].other {
-            self.note_focused = true;
-        }
     }
 
     /// Move to an adjacent question (clamped); paging always leaves the note
@@ -1104,7 +1096,6 @@ impl Dialog {
             return false;
         }
         page.cursor = hit.index;
-        self.focus_note_on_other();
         true
     }
 
@@ -2548,15 +2539,28 @@ mod tests {
     }
 
     #[test]
-    fn landing_on_other_aims_the_keyboard_at_the_note() {
+    fn landing_on_other_keeps_option_navigation_available() {
         let mut d = menu();
         to_other(&mut d);
-        // No Tab needed: typing goes straight into the answer field.
-        type_str(&mut d, "mine");
-        let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
-            panic!("enter should answer");
-        };
-        assert_eq!(a.comment.as_deref(), Some("mine"));
+        assert!(
+            !d.note_focused,
+            "Other must not steal focus from the options"
+        );
+
+        d.handle_key(key(KeyCode::Up));
+        assert_eq!(d.cur_page().cursor, 1, "Up still moves through options");
+    }
+
+    #[test]
+    fn left_from_an_empty_question_note_returns_to_options() {
+        let mut d = menu();
+        d.handle_key(key(KeyCode::Tab));
+        assert!(d.note_focused, "Tab enters the empty note");
+
+        d.handle_key(key(KeyCode::Left));
+        assert!(!d.note_focused, "Left leaves an empty note");
+        d.handle_key(key(KeyCode::Down));
+        assert_eq!(d.cur_page().cursor, 1, "option navigation resumes");
     }
 
     #[test]
@@ -2584,8 +2588,7 @@ mod tests {
         );
         d.handle_key(key(KeyCode::Char('1'))); // tick A
         to_other(&mut d);
-        d.handle_key(key(KeyCode::Tab)); // leave the note to tick the row
-        d.handle_key(key(KeyCode::Char(' ')));
+        d.handle_key(key(KeyCode::Char(' '))); // tick Other while the list owns focus
         d.handle_key(key(KeyCode::Tab));
         type_str(&mut d, "and Z");
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {

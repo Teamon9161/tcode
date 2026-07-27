@@ -16,7 +16,10 @@ use super::*;
 pub(super) struct TraceView {
     pub(super) run: String,
     pub(super) view: SessionView,
-    pub(super) consumed: usize,
+    /// Each cohort activation has its own event stream, while the member card
+    /// opens the stable first run. Track every stream independently so later
+    /// rounds append once to that already-open member trace.
+    pub(super) seen_runs: HashMap<String, usize>,
 }
 
 pub(super) fn task_trace_root(session: &Session) -> Option<PathBuf> {
@@ -198,16 +201,24 @@ impl App {
 
     pub(super) fn active_transcript(&self) -> &Transcript {
         match (&self.active_view, &self.trace_view) {
-            (ViewId::TaskRun(id), Some(trace)) if trace.run == *id => &trace.view.transcript,
+            (ViewId::TaskRun(id), Some(trace)) | (ViewId::CohortChannel(id), Some(trace))
+                if trace.run == *id =>
+            {
+                &trace.view.transcript
+            }
             _ => &self.transcript,
         }
     }
 
     pub(super) fn active_transcript_mut(&mut self) -> &mut Transcript {
-        match (&self.active_view, &mut self.trace_view) {
-            (ViewId::TaskRun(id), Some(trace)) if trace.run == *id => &mut trace.view.transcript,
-            _ => &mut self.transcript,
+        let id = match &self.active_view {
+            ViewId::TaskRun(id) | ViewId::CohortChannel(id) => id.clone(),
+            ViewId::Main => return &mut self.transcript,
+        };
+        if let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == id) {
+            return &mut trace.view.transcript;
         }
+        &mut self.transcript
     }
 
     pub(super) fn view_entries(&self) -> Vec<view_picker::ViewEntry> {
@@ -244,6 +255,10 @@ impl App {
         }
         let run_id = match &id {
             ViewId::TaskRun(run_id) => run_id.clone(),
+            ViewId::CohortChannel(cohort_id) => {
+                self.open_cohort_channel(cohort_id);
+                return;
+            }
             ViewId::Main => return,
         };
         let Some(run) = self.task_runs.iter().find(|run| run.id == run_id) else {
@@ -278,8 +293,13 @@ impl App {
         };
         view.bake(header);
         view.transcript.push(prompt_echo(&prompt, &[]));
-        let mut consumed = 0;
-        if status != tcode_core::TaskRunStatus::Running {
+        let mut seen_runs = HashMap::new();
+        if !events.is_empty() {
+            for event in &events {
+                view.feed_event(event, &mut ctx);
+            }
+            seen_runs.insert(run_id.clone(), events.len());
+        } else if status != tcode_core::TaskRunStatus::Running {
             if path.is_some_and(|path| path.exists()) {
                 let mut traces = tcode_core::TaskTraces::default();
                 traces.bind_root(self.task_trace_root.clone());
@@ -292,38 +312,43 @@ impl App {
                         theme::error_highlight(),
                     )]),
                 }
-            } else {
-                for event in &events {
-                    view.feed_event(event, &mut ctx);
-                }
-                consumed = events.len();
             }
-        } else {
-            for event in &events {
-                view.feed_event(event, &mut ctx);
-            }
-            consumed = events.len();
         }
         self.active_view = id;
         self.trace_view = Some(TraceView {
             run: run_id.clone(),
             view,
-            consumed,
+            seen_runs,
         });
         self.drag_scroll = None;
     }
 
+    /// Append the just-arrived stream to the trace rooted at this run. Cohort
+    /// members receive a fresh run id each round, but their card opens the
+    /// first id, so all of those streams belong in one visible conversation.
     pub(super) fn refresh_open_trace(&mut self, run: &str) {
-        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == run) else {
-            return;
-        };
+        let root = self
+            .task_runs
+            .iter()
+            .find(|task| task.id == run)
+            .and_then(|task| task.cohort_root.clone())
+            .unwrap_or_else(|| run.to_string());
         let Some(task) = self.task_runs.iter().find(|task| task.id == run) else {
             return;
         };
-        let events: Vec<AgentEvent> = task.events.iter().skip(trace.consumed).cloned().collect();
+        let consumed = self
+            .trace_view
+            .as_ref()
+            .filter(|trace| trace.run == root)
+            .and_then(|trace| trace.seen_runs.get(run).copied())
+            .unwrap_or(0);
+        let events: Vec<AgentEvent> = task.events.iter().skip(consumed).cloned().collect();
         if events.is_empty() {
             return;
         }
+        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == root) else {
+            return;
+        };
         let mut ctx = BakeCtx {
             renderers: &self.renderers,
             markdown: &mut self.md,
@@ -333,11 +358,73 @@ impl App {
         for event in &events {
             trace.view.feed_event(event, &mut ctx);
         }
-        trace.consumed += events.len();
+        trace
+            .seen_runs
+            .insert(run.to_string(), consumed + events.len());
+    }
+
+    /// Materialize the shared channel independently of any member trace. The
+    /// parent transcript holds only its compact link, keeping discussion posts
+    /// out of tool batches and private member sessions.
+    pub(super) fn open_cohort_channel(&mut self, id: &str) {
+        let Some(messages) = self.cohort_channel_messages(id).map(<[_]>::to_vec) else {
+            self.notice = Some((
+                "cohort channel is no longer available".into(),
+                Instant::now(),
+            ));
+            return;
+        };
+        let mut view = SessionView::new(area_width(&self.terminal));
+        view.bake(vec![Line::from(vec![
+            Span::styled(format!("◈ cohort {id} · shared channel"), theme::bold()),
+            Span::styled(format!(" · {} messages", messages.len()), theme::dim()),
+        ])]);
+        if messages.is_empty() {
+            view.bake(vec![Line::styled(
+                "  waiting for the first member message…",
+                theme::dim(),
+            )]);
+        } else {
+            for message in &messages {
+                view.bake(Self::cohort_channel_message_lines(message));
+            }
+        }
+        self.active_view = ViewId::CohortChannel(id.to_owned());
+        self.trace_view = Some(TraceView {
+            run: id.to_owned(),
+            view,
+            seen_runs: HashMap::new(),
+        });
+        self.drag_scroll = None;
+    }
+
+    /// A live channel post reaches an open channel transcript immediately,
+    /// without rebuilding the view or injecting it into a tool record.
+    pub(super) fn append_open_cohort_channel(
+        &mut self,
+        message: &tcode_core::CohortChannelMessage,
+    ) {
+        if self.active_view != ViewId::CohortChannel(message.cohort_id.clone()) {
+            return;
+        }
+        let Some(trace) = self
+            .trace_view
+            .as_mut()
+            .filter(|trace| trace.run == message.cohort_id)
+        else {
+            return;
+        };
+        trace.view.bake(Self::cohort_channel_message_lines(message));
     }
 
     pub(super) fn finish_open_trace(&mut self, run: &str) {
-        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == run) else {
+        let root = self
+            .task_runs
+            .iter()
+            .find(|task| task.id == run)
+            .and_then(|task| task.cohort_root.clone())
+            .unwrap_or_else(|| run.to_string());
+        let Some(trace) = self.trace_view.as_mut().filter(|trace| trace.run == root) else {
             return;
         };
         let mut ctx = BakeCtx {
