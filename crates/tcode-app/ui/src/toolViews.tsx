@@ -57,6 +57,8 @@ export function useToolMeta(name: string): ToolMeta {
   return table.get(name) ?? { name, ...DEFAULT_META };
 }
 
+export type TranscriptGroup = "exploration" | "changes" | "commands";
+
 export type ToolView = {
   /** Change preview under the header, shown at the call site. */
   body?(input: unknown): ReactNode;
@@ -68,6 +70,10 @@ export type ToolView = {
   preferInputSummary?: boolean;
   /** Detail that is useful before a result exists, such as a multi-line command. */
   detail?(input: unknown): string | null;
+  /** Normalize output for this tool before any transcript or inspector renders it. */
+  output?(content: string): string;
+  /** Adjacent calls in the same group become one collapsed transcript step. */
+  transcriptGroup?: TranscriptGroup;
 };
 
 const targetPath = (input: unknown): string | null => {
@@ -84,6 +90,7 @@ const targetPath = (input: unknown): string | null => {
 const editing: ToolView = {
   body: (input) => (isEditShape(input) ? <Diff input={input} dense /> : null),
   inspect: (input, callId) => (isEditShape(input) ? { kind: "diff", callId } : null),
+  transcriptGroup: "changes",
 };
 
 /** A read opens the snapshot it returned — what the model saw, not what is on
@@ -96,17 +103,21 @@ const reading: ToolView = {
   },
   summary: readTarget,
   preferInputSummary: true,
+  transcriptGroup: "exploration",
 };
 
 const shell: ToolView = {
   summary: commandPreview,
   preferInputSummary: true,
   detail: commandOf,
+  output: stripTerminalEscapes,
+  transcriptGroup: "commands",
 };
 
 const pattern: ToolView = {
   summary: patternTarget,
   preferInputSummary: true,
+  transcriptGroup: "exploration",
 };
 
 const VIEWS: Record<string, ToolView> = {
@@ -164,6 +175,36 @@ function commandPreview(input: unknown): string | null {
   return firstLine.length > limit ? `${firstLine.slice(0, limit)}…` : firstLine;
 }
 
+/** Colored process output is terminal presentation data, not transcript text.
+ * This mirrors the shell filter's CSI/OSC handling so live output and replay
+ * stay readable even when no project filter is configured. */
+export function stripTerminalEscapes(output: string): string {
+  let clean = "";
+  for (let index = 0; index < output.length; index += 1) {
+    if (output[index] !== "\x1b") {
+      clean += output[index];
+      continue;
+    }
+
+    const kind = output[++index];
+    if (kind === "[") {
+      while (++index < output.length) {
+        const code = output.charCodeAt(index);
+        if (code >= 0x40 && code <= 0x7e) break;
+      }
+    } else if (kind === "]") {
+      while (++index < output.length) {
+        if (output[index] === "\x07") break;
+        if (output[index] === "\x1b" && output[index + 1] === "\\") {
+          index += 1;
+          break;
+        }
+      }
+    }
+  }
+  return clean;
+}
+
 /**
  * The live stream already carries core's concise call summary. Ledger replay
  * cannot: it has the tool name and input but no ephemeral `ToolStart` event,
@@ -178,6 +219,12 @@ export function displayToolSummary(name: string, supplied: string, input: unknow
   const generic = normalized === name || normalized === `${name}()` || normalized.startsWith(`${name}(`);
   if ((view.preferInputSummary || generic) && fromInput) return fromInput;
   return normalized || fromInput;
+}
+
+/** Applies a tool's presentation-only output normalization everywhere it is
+ * shown, without altering the recorded result or model-visible ledger. */
+export function displayToolOutput(name: string, content: string): string {
+  return viewFor(name).output?.(content) ?? content;
 }
 
 /**
@@ -200,6 +247,10 @@ export function viewFor(name: string): ToolView {
   const view = VIEWS[name];
   if (!view) return FALLBACK;
   return { ...FALLBACK, ...view };
+}
+
+export function transcriptGroupFor(name: string): ToolView["transcriptGroup"] {
+  return viewFor(name).transcriptGroup;
 }
 
 /**

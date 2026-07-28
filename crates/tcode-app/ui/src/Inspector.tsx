@@ -11,6 +11,7 @@ import { FilesView } from "./FilePanel";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
 import { BlockList } from "./Transcript";
+import { displayToolOutput } from "./toolViews";
 
 /**
  * The panel that shows one thing.
@@ -199,7 +200,7 @@ function OutputView({ callId, blocks }: { callId: string; blocks: Block[] }) {
       <p className="inspect-path">
         {call.name} · {call.summary}
       </p>
-      <Code source={call.result.content || call.result.preview} language="" />
+      <Code source={displayToolOutput(call.name, call.result.content || call.result.preview)} language="" />
     </div>
   );
 }

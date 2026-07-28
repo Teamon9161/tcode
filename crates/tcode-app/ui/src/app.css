@@ -30,6 +30,7 @@
   grid-template-columns: 196px minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
+  overflow: hidden;
 }
 
 /* The panel sizes itself: its width is dragged, so the track follows it. */
@@ -51,6 +52,8 @@
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
+  min-height: 0;
+  overflow: hidden;
   background: var(--bg);
 }
 
@@ -633,6 +636,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--s-1);
+  min-height: 0;
   padding: var(--s-2);
   background: var(--chrome);
   overflow-y: auto;
@@ -725,7 +729,9 @@
 /* ============================================================ transcript */
 
 .transcript {
+  min-height: 0;
   overflow-y: auto;
+  overscroll-behavior: contain;
   scroll-behavior: smooth;
 }
 
@@ -952,6 +958,175 @@
 }
 
 /* ============================================================ tool calls */
+
+/* Read and search are a single exploration step until someone asks for its
+   particulars. The container earns a card because it is a meaningful group,
+   not because each tiny operation needs its own chrome. */
+.exploration {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+.exploration.is-failed {
+  border-color: var(--danger-wash);
+}
+
+.exploration-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.exploration-head:hover,
+.exploration-head:focus-visible,
+.exploration.is-open .exploration-head {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.exploration-label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.exploration-body {
+  display: grid;
+  gap: var(--s-1);
+  padding: var(--s-2);
+  border-top: 1px solid var(--line);
+  background: var(--sunken);
+}
+
+.exploration-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+  padding: var(--s-1) var(--s-2);
+  border-radius: var(--r-xs);
+  color: var(--muted);
+  transition: background var(--dur-fast) var(--ease);
+}
+.exploration-item:hover,
+.exploration-item:focus-within {
+  background: var(--hover);
+}
+.exploration-item.is-failed {
+  background: var(--danger-wash);
+}
+
+.exploration-tool {
+  flex: none;
+  min-width: calc(var(--s-6) + var(--s-2));
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+.exploration-summary,
+.exploration-target {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+.exploration-target {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--body);
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-color: transparent;
+  text-underline-offset: 3px;
+  transition: color var(--dur-fast) var(--ease), text-decoration-color var(--dur-fast) var(--ease);
+}
+.exploration-target:hover {
+  color: var(--brand-text);
+  text-decoration-color: currentColor;
+}
+
+/* Consecutive writes and commands each receive one reviewable boundary. Writes
+   remain open because their diff is the result; commands stay quiet until their
+   full invocation or output is needed. Neither repeats card chrome per call. */
+.change-set,
+.command-set {
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  overflow: hidden;
+}
+.change-set.is-failed,
+.command-set.is-failed {
+  border-color: var(--danger-wash);
+}
+
+.change-set-head,
+.command-set-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  padding: var(--s-2) var(--s-3);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  text-align: left;
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.change-set-head:hover,
+.change-set-head:focus-visible,
+.change-set.is-open .change-set-head,
+.command-set-head:hover,
+.command-set-head:focus-visible,
+.command-set.is-open .command-set-head {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.change-set-label,
+.command-set-label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+.change-set-body,
+.command-set-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-2) var(--s-3) var(--s-3);
+  border-top: 1px solid var(--line);
+  background: var(--sunken);
+}
+.change-set-body .tool,
+.command-set-body .tool {
+  border-top: 0;
+}
 
 .tool {
   border-top: 1px solid var(--line);
@@ -1218,6 +1393,7 @@
   display: grid;
   grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
+  min-height: 0;
   background: var(--chrome);
   overflow: hidden;
 }

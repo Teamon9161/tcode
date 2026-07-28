@@ -3,7 +3,8 @@ import { useLayoutEffect, useRef, useState } from "react";
 import type { Block } from "./blocks";
 import type { Inspect } from "./inspect";
 import { rich } from "./rich";
-import { useToolMeta, viewFor, displayToolSummary } from "./toolViews";
+import { readChanges } from "./diff";
+import { useToolMeta, viewFor, displayToolOutput, displayToolSummary, transcriptGroupFor } from "./toolViews";
 import { ChevronDown, ChevronRight } from "./components/Icons";
 import { StatusDot } from "./components/Status";
 
@@ -66,17 +67,92 @@ export function Transcript({
 export function BlockList({
   blocks,
   onOpen,
+  groupExploration = true,
 }: {
   blocks: Block[];
   onOpen: (value: Inspect) => void;
+  /** Batches are already a deliberate grouping boundary. */
+  groupExploration?: boolean;
 }) {
+  const items = groupExploration ? groupTranscriptBlocks(blocks) : blocks.map((block) => ({ kind: "block" as const, block }));
   return (
     <>
-      {blocks.map((block, index) => (
-        <BlockView key={index} block={block} onOpen={onOpen} />
-      ))}
+      {items.map((item, index) =>
+        item.kind === "exploration" ? (
+          <ExplorationGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+        ) : item.kind === "changes" ? (
+          <ChangesGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+        ) : item.kind === "commands" ? (
+          <CommandsGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+        ) : (
+          <BlockView key={index} block={item.block} onOpen={onOpen} />
+        ),
+      )}
     </>
   );
+}
+
+type ToolBlock = Extract<Block, { kind: "tool" }>;
+type ExplorationBlock = ToolBlock | Extract<Block, { kind: "thinking" }>;
+export type TranscriptItem =
+  | { kind: "block"; block: Block }
+  | { kind: "exploration"; blocks: ExplorationBlock[] }
+  | { kind: "changes"; blocks: ToolBlock[] }
+  | { kind: "commands"; blocks: ToolBlock[] };
+
+/** Consecutive low-risk inspection calls are one trace step, not a stack of
+ * cards. Thinking stays with the surrounding inspection so the live trace
+ * keeps one coherent boundary; it has its own disclosure inside the group.
+ *
+ * Consecutive edits and commands receive their own boundaries, but only when
+ * there are at least two: one call is already a complete, useful trace row. */
+export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
+  const grouped: TranscriptItem[] = [];
+  let exploration: ExplorationBlock[] = [];
+  let changes: ToolBlock[] = [];
+  let commands: ToolBlock[] = [];
+  const flushExploration = () => {
+    if (exploration.length > 0) grouped.push({ kind: "exploration", blocks: exploration });
+    exploration = [];
+  };
+  const flushChanges = () => {
+    if (changes.length === 1) grouped.push({ kind: "block", block: changes[0] });
+    else if (changes.length > 1) grouped.push({ kind: "changes", blocks: changes });
+    changes = [];
+  };
+  const flushCommands = () => {
+    if (commands.length === 1) grouped.push({ kind: "block", block: commands[0] });
+    else if (commands.length > 1) grouped.push({ kind: "commands", blocks: commands });
+    commands = [];
+  };
+
+  for (const block of blocks) {
+    const group = block.kind === "tool" ? transcriptGroupFor(block.name) : undefined;
+    if (block.kind === "tool" && group === "exploration") {
+      flushChanges();
+      flushCommands();
+      exploration.push(block);
+    } else if (block.kind === "thinking" && exploration.length > 0) {
+      exploration.push(block);
+    } else if (block.kind === "tool" && group === "changes") {
+      flushExploration();
+      flushCommands();
+      changes.push(block);
+    } else if (block.kind === "tool" && group === "commands") {
+      flushExploration();
+      flushChanges();
+      commands.push(block);
+    } else {
+      flushExploration();
+      flushChanges();
+      flushCommands();
+      grouped.push({ kind: "block", block });
+    }
+  }
+  flushExploration();
+  flushChanges();
+  flushCommands();
+  return grouped;
 }
 
 function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) => void }) {
@@ -136,6 +212,151 @@ function Thinking({ text }: { text: string }) {
   );
 }
 
+function ExplorationGroup({
+  blocks,
+  onOpen,
+}: {
+  blocks: ExplorationBlock[];
+  onOpen: (value: Inspect) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const tools = blocks.filter((block): block is ToolBlock => block.kind === "tool");
+  const done = tools.every((block) => block.result !== undefined);
+  const failed = tools.some((block) => block.result?.isError);
+
+  return (
+    <section className={`exploration${open ? " is-open" : ""}${failed ? " is-failed" : ""}`}>
+      <button
+        className="exploration-head"
+        onClick={() => setOpen((was) => !was)}
+        aria-expanded={open}
+      >
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="exploration-label">{explorationSummary(tools)}</span>
+        {!done && <span className="tool-spinner" aria-label="running" />}
+        {failed && <span className="tool-failed">failed</span>}
+      </button>
+      {open && (
+        <div className="exploration-body">
+          {blocks.map((block, index) =>
+            block.kind === "thinking" ? (
+              <div className="exploration-thinking" key={`thinking-${index}`}>
+                <Thinking text={block.text} />
+              </div>
+            ) : (
+              <ExplorationItem key={block.callId} block={block} onOpen={onOpen} />
+            ),
+          )}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ChangesGroup({
+  blocks,
+  onOpen,
+}: {
+  blocks: ToolBlock[];
+  onOpen: (value: Inspect) => void;
+}) {
+  const [open, setOpen] = useState(true);
+  const done = blocks.every((block) => block.result !== undefined);
+  const failed = blocks.some((block) => block.result?.isError);
+
+  return (
+    <section className={`change-set${open ? " is-open" : ""}${failed ? " is-failed" : ""}`}>
+      <button className="change-set-head" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="change-set-label">{changeSetLabel(blocks)}</span>
+        {!done && <span className="tool-spinner" aria-label="running" />}
+        {failed && <span className="tool-failed">failed</span>}
+      </button>
+      {open && (
+        <div className="change-set-body">
+          {blocks.map((block) => (
+            <ToolCall key={block.callId} block={block} onOpen={onOpen} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+export function changeSetLabel(blocks: ToolBlock[]): string {
+  const paths = new Set<string>();
+  for (const block of blocks) {
+    for (const change of readChanges(block.input)) {
+      if (change.path) paths.add(change.path);
+    }
+  }
+  const files = paths.size || blocks.length;
+  return `edit ${files} ${files === 1 ? "file" : "files"}`;
+}
+
+function CommandsGroup({
+  blocks,
+  onOpen,
+}: {
+  blocks: ToolBlock[];
+  onOpen: (value: Inspect) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const done = blocks.every((block) => block.result !== undefined);
+  const failed = blocks.some((block) => block.result?.isError);
+  const commandCount = blocks.length;
+
+  return (
+    <section className={`command-set${open ? " is-open" : ""}${failed ? " is-failed" : ""}`}>
+      <button className="command-set-head" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="command-set-label">
+          run {commandCount} {commandCount === 1 ? "command" : "commands"}
+        </span>
+        {!done && <span className="tool-spinner" aria-label="running" />}
+        {failed && <span className="tool-failed">failed</span>}
+      </button>
+      {open && (
+        <div className="command-set-body">
+          {blocks.map((block) => (
+            <ToolCall key={block.callId} block={block} onOpen={onOpen} />
+          ))}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: Inspect) => void }) {
+  const view = viewFor(block.name);
+  const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
+  const summary = displayToolSummary(block.name, block.summary, block.input);
+  const failed = block.result?.isError ?? false;
+
+  return (
+    <div className={`exploration-item${failed ? " is-failed" : ""}`}>
+      <span className="exploration-tool">{block.name}</span>
+      {target ? (
+        <button className="exploration-target" onClick={() => onOpen(target)} title="Open in the panel">
+          {summary || "details"}
+        </button>
+      ) : (
+        <span className="exploration-summary">{summary || "details"}</span>
+      )}
+      {failed && <span className="tool-failed">failed</span>}
+    </div>
+  );
+}
+
+function explorationSummary(blocks: ToolBlock[]): string {
+  const reads = blocks.filter((block) => block.name === "read").length;
+  const searches = blocks.length - reads;
+  const labels: string[] = [];
+  if (reads > 0) labels.push(`read ${reads} ${reads === 1 ? "file" : "files"}`);
+  if (searches > 0) labels.push(`search ${searches} ${searches === 1 ? "pattern" : "patterns"}`);
+  return labels.join(" · ");
+}
+
 function ToolCall({
   block,
   onOpen,
@@ -157,7 +378,9 @@ function ToolCall({
   const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
   const summary = displayToolSummary(block.name, block.summary, block.input);
   const detail = view.detail?.(block.input) ?? null;
-  const canExpand = Boolean(detail || block.result?.content);
+  const preview = block.result ? displayToolOutput(block.name, block.result.preview) : "";
+  const output = block.result ? displayToolOutput(block.name, block.result.content) : "";
+  const canExpand = Boolean(detail || output);
 
   // The transcript is an execution trace, not an output log. A successful call
   // already has a stable destination in the inspector; only failures need a
@@ -197,12 +420,12 @@ function ToolCall({
 
       {body && <div className="tool-body">{body}</div>}
 
-      {showResult && block.result?.preview && <p className="tool-preview">{block.result.preview}</p>}
+      {showResult && preview && <p className="tool-preview">{preview}</p>}
 
-      {open && (detail || block.result?.content) && (
+      {open && (detail || output) && (
         <div className="tool-details">
           {detail && <pre className="tool-command">{detail}</pre>}
-          {block.result?.content && <pre className="tool-output">{block.result.content}</pre>}
+          {output && <pre className="tool-output">{output}</pre>}
         </div>
       )}
     </div>
@@ -231,7 +454,7 @@ function BatchCall({
       </button>
       {open && (
         <div className="batch-body">
-          <BlockList blocks={block.blocks} onOpen={onOpen} />
+          <BlockList blocks={block.blocks} onOpen={onOpen} groupExploration={false} />
         </div>
       )}
     </div>
