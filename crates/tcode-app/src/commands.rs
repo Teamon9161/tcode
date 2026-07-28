@@ -43,6 +43,23 @@ impl SessionInfo {
     }
 }
 
+/// The initial state of a just-opened session. A resumed ledger has no live
+/// event stream to replay, so its display history travels with this response.
+#[derive(Serialize)]
+pub struct OpenedSession {
+    pub session: SessionInfo,
+    pub history: Vec<tcode_core::Entry>,
+}
+
+impl OpenedSession {
+    fn of(handle: &crate::state::SessionHandle) -> Self {
+        Self {
+            session: SessionInfo::of(handle),
+            history: handle.history(),
+        }
+    }
+}
+
 fn folder_name(cwd: &Path) -> String {
     cwd.file_name()
         .map(|name| name.to_string_lossy().into_owned())
@@ -161,7 +178,7 @@ pub fn open_folder(
     supervisor: State<'_, Arc<Supervisor>>,
     path: String,
     resume: Option<String>,
-) -> Result<SessionInfo, String> {
+) -> Result<OpenedSession, String> {
     // Canonicalize before anything else: the session id, the project data
     // directory and the launchpad's grouping all key on the path, and two
     // spellings of one folder would otherwise become two projects.
@@ -175,7 +192,7 @@ pub fn open_folder(
         handle.id,
         handle.cwd.display()
     );
-    Ok(SessionInfo::of(&handle))
+    Ok(OpenedSession::of(&handle))
 }
 
 /// Close a session, cancelling its turn if one is running.
@@ -206,7 +223,12 @@ pub fn send_message(
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     let agent = supervisor.agent();
     let vision = agent.model.snapshot().provider.supports_vision();
-    let input = compose(text, images.unwrap_or_default(), vision, &handle.scratch_dir());
+    let input = compose(
+        text,
+        images.unwrap_or_default(),
+        vision,
+        &handle.scratch_dir(),
+    );
     let emit: Arc<dyn Emit> = Arc::new(app);
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input).await {
@@ -258,7 +280,9 @@ pub fn compose(
             text: match save_pasted(&image, index, scratch) {
                 Ok(path) => format!("[pasted image saved to {}]", path.display()),
                 Err(reason) => {
-                    format!("[pasted image could not be saved ({reason}); this model cannot view it]")
+                    format!(
+                        "[pasted image could not be saved ({reason}); this model cannot view it]"
+                    )
                 }
             },
         });
@@ -379,5 +403,29 @@ mod tests {
     #[test]
     fn an_empty_message_adds_no_empty_text_block() {
         assert!(compose("   ".into(), vec![], true, &None).is_empty());
+    }
+
+    #[test]
+    fn opened_session_exports_display_history_but_not_project_instructions() {
+        use tcode_core::{Entry, PermissionMode, PermissionRules, Session, ToolCtx};
+
+        tcode_core::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            ToolCtx::new(cwd.path().to_path_buf(), 25_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        session.ledger.append(Entry::User(vec![ContentBlock::Text {
+            text: "restore this conversation".into(),
+        }]));
+        session
+            .ledger
+            .append(Entry::Instruction("private project rule".into()));
+        let handle = crate::state::SessionHandle::new("session".into(), cwd.path().into(), session);
+
+        let opened = OpenedSession::of(&handle);
+        assert_eq!(opened.history.len(), 1);
+        assert!(matches!(opened.history.as_slice(), [Entry::User(_)]));
     }
 }

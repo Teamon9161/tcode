@@ -54,6 +54,24 @@ impl SessionHandle {
         self.pending.clone()
     }
 
+    /// A display-only copy of the durable conversation. Project instructions
+    /// remain model context and never cross into the webview transcript.
+    pub fn history(&self) -> Vec<tcode_core::Entry> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| {
+                session
+                    .ledger
+                    .history()
+                    .filter(|entry| !matches!(entry, tcode_core::Entry::Instruction(_)))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     /// Where this session may drop files that are not the user's to keep —
     /// pasted images the current model cannot see, for one. `None` while a turn
     /// holds the session, which is also when nothing can be sent to it.
@@ -116,7 +134,11 @@ impl Supervisor {
 
     /// Open `cwd` as a new session and register it. `resume` replays an
     /// existing log for that folder.
-    pub fn open_folder(&self, cwd: &Path, resume: Option<String>) -> anyhow::Result<Arc<SessionHandle>> {
+    pub fn open_folder(
+        &self,
+        cwd: &Path,
+        resume: Option<String>,
+    ) -> anyhow::Result<Arc<SessionHandle>> {
         let session = self.factory.open(cwd, resume)?;
         let handle = Arc::new(SessionHandle::new(
             uuid::Uuid::new_v4().to_string(),

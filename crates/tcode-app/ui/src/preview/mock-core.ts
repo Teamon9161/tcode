@@ -5,7 +5,7 @@
  * browser, without a provider or a running turn. It is aliased in only when
  * `PREVIEW=1`, so the shipped bundle never contains it.
  */
-import type { Launchpad, SessionInfo, StoredSession } from "../types";
+import type { Launchpad, OpenedSession, SessionInfo, StoredSession } from "../types";
 
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -62,11 +62,14 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return OPEN as T;
     case "open_folder":
       return {
-        id: "preview",
-        cwd: String(args?.path ?? "/home/teamon/code/rust/tcode"),
-        name: "tcode",
-        home: "/home/teamon",
-      } as T;
+        session: {
+          id: "preview",
+          cwd: String(args?.path ?? "/home/teamon/code/rust/tcode"),
+          name: "tcode",
+          home: "/home/teamon",
+        },
+        history: [],
+      } satisfies OpenedSession as T;
     default:
       return undefined as T;
   }

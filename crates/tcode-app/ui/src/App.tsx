@@ -10,6 +10,7 @@ import {
   type ApprovalRequest,
   type Decision,
   type SessionEvent,
+  type OpenedSession,
   type SessionInfo,
   type Status,
   type TurnFinished,
@@ -17,6 +18,7 @@ import {
 import { applyEvent, errorBlock, userBlock, type Block } from "./blocks";
 import { applyFileEvent, type TouchedFile } from "./files";
 import type { Pasted } from "./paste";
+import { replayLedger } from "./replay";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
@@ -139,14 +141,20 @@ export function App() {
   );
 
   const openFolder = useCallback(async (path: string, resume?: string) => {
-    const info = await invoke<SessionInfo>("open_folder", {
+    const opened = await invoke<OpenedSession>("open_folder", {
       path,
       resume: resume ?? null,
     });
+    const { session, history } = opened;
+    const replayed = replayLedger(history);
     setSessions((current) =>
-      current.some((open) => open.id === info.id) ? current : [...current, info],
+      current.some((open) => open.id === session.id) ? current : [...current, session],
     );
-    setView(info.id);
+    setStates((current) => ({
+      ...current,
+      [session.id]: { ...BLANK, ...replayed, activity: history.length > 0 ? "resumed" : BLANK.activity },
+    }));
+    setView(session.id);
   }, []);
 
   const closeSession = useCallback(

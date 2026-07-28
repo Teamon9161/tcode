@@ -98,6 +98,12 @@ export type SessionInfo = {
   home: string;
 };
 
+/** A durable ledger entry serialized by `tcode_core::Entry`. */
+export type LedgerEntry = { kind: string; data: unknown };
+
+/** The session identity plus its persisted display history, if any. */
+export type OpenedSession = { session: SessionInfo; history: LedgerEntry[] };
+
 /** A folder tcode has held a conversation in. */
 export type ProjectInfo = {
   path: string;

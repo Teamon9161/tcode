@@ -181,7 +181,12 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         let cwd = home.path().join("code").join("tcode");
         fs::create_dir_all(&cwd).unwrap();
-        log(home.path(), "proj-a", "0000000000001", &cwd.to_string_lossy());
+        log(
+            home.path(),
+            "proj-a",
+            "0000000000001",
+            &cwd.to_string_lossy(),
+        );
 
         let found = list(home.path());
         assert_eq!(found.len(), 1);
@@ -197,7 +202,10 @@ mod tests {
 
         let found = list(home.path());
         assert_eq!(found.len(), 1);
-        assert!(!found[0].exists, "a missing folder must be reported, not hidden");
+        assert!(
+            !found[0].exists,
+            "a missing folder must be reported, not hidden"
+        );
     }
 
     #[test]
