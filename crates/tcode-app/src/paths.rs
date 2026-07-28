@@ -21,7 +21,7 @@ pub fn canonical_dir(path: &Path) -> std::io::Result<PathBuf> {
 /// Drop Windows' verbatim `\\?\` prefix. A no-op everywhere else, and on paths
 /// long enough to genuinely need it the prefix stays — dropping it there would
 /// hand out a path Windows cannot open.
-fn simplify(path: PathBuf) -> PathBuf {
+pub fn simplify(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
         const MAX_PATH: usize = 260;

@@ -41,11 +41,17 @@
   grid-column: 1 / -1;
 }
 
+/* One surface, not three stacked panels. The transcript, the approval dock and
+   the composer all sit on `--bg`, and the only thing separating this column
+   from the rail and the panel beside it is the tonal step to `--chrome`. Rules
+   between regions that already differ in tone are the seams that make a window
+   look assembled out of parts (PRODUCT.md: earn density with alignment and
+   rhythm, not with borders and boxes). */
 .stage {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
-  border-inline: 1px solid var(--line);
+  background: var(--bg);
 }
 
 /* Structural, not fluid: the rail loses its labels before the panel goes,
@@ -75,17 +81,24 @@
 
 /* ============================================================ top bar */
 
-/* Also the title bar. It is a drag region, so nothing in it may be selectable:
-   a text selection started on the bar is a drag the window did not get. */
+/* Also the title bar: the thinnest band in the window, holding only what the
+   window itself needs. No bottom rule — it is `--chrome` above `--bg`, and one
+   tonal step is already a boundary. It is a drag region, so nothing in it may
+   be selectable: a text selection started on the bar is a drag the window did
+   not get. */
 .topbar {
   display: flex;
   align-items: center;
-  gap: var(--s-3);
-  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-2);
   background: var(--chrome);
-  border-bottom: 1px solid var(--line);
   user-select: none;
   -webkit-user-select: none;
+}
+
+/* Pushes the window buttons to the corner and stays draggable between them. */
+.topbar-gap {
+  flex: 1;
 }
 
 /* ------------------------------------------------------------ window controls */
@@ -93,16 +106,13 @@
 .window-controls {
   display: flex;
   align-items: center;
-  gap: var(--s-1);
   margin-inline-start: var(--s-2);
-  padding-inline-start: var(--s-2);
-  border-inline-start: 1px solid var(--line);
 }
 
 .window-btn {
   display: grid;
   place-items: center;
-  width: 30px;
+  width: 32px;
   height: 26px;
   border: none;
   border-radius: var(--r-sm);
@@ -127,15 +137,12 @@
   color: var(--danger-text);
 }
 
-.wordmark {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-2);
-  color: var(--ink);
-}
-
+/* Title-bar weight, not heading weight: the product's name is the least urgent
+   thing on this screen and only has to be legible. */
 .wordmark-text {
-  font-size: var(--text-md);
+  padding-inline-start: var(--s-1);
+  color: var(--ink);
+  font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
 }
@@ -159,10 +166,6 @@
   50% {
     opacity: 0.35;
   }
-}
-
-.topbar .btn {
-  margin-left: auto;
 }
 
 .stage-title {
@@ -351,6 +354,13 @@
 /* Sentence case, ink, at reading size. An uppercase tracked micro-label above
    every section is the reflex; it also makes the two sections here look like
    the same block twice. */
+.section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+
 .section-title {
   font-size: var(--text-md);
   font-weight: var(--weight-semibold);
@@ -628,23 +638,6 @@
   overflow-y: auto;
 }
 
-.rail-home {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 34px;
-  height: 34px;
-  margin-bottom: var(--s-2);
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--ink);
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease);
-}
-.rail-home:hover {
-  background: var(--hover);
-}
 
 .rail-list {
   list-style: none;
@@ -736,9 +729,16 @@
   scroll-behavior: smooth;
 }
 
+/* The first thing in the conversation, so it starts where the conversation
+   starts: same measure, same left edge as every message and as the composer
+   below it. Centring it instead put the one paragraph on this screen on an
+   axis nothing else in the window shares. */
 .transcript.is-empty {
   display: grid;
-  place-items: center;
+  align-items: center;
+  max-width: 760px;
+  width: 100%;
+  margin: 0 auto;
   padding: var(--s-5);
 }
 
@@ -1060,13 +1060,18 @@
 
 /* ============================================================ composer */
 
+/* Continuous with the transcript above it — same surface, no rule, and the
+   same 760px measure so the field lines up with the conversation rather than
+   spanning a wider band beneath it. */
 .composer {
   display: flex;
   flex-direction: column;
   gap: var(--s-2);
-  padding: var(--s-3) var(--s-4);
-  border-top: 1px solid var(--line);
-  background: var(--chrome);
+  width: 100%;
+  max-width: 760px;
+  margin: 0 auto;
+  padding: 0 var(--s-5) var(--s-4);
+  background: var(--bg);
 }
 
 .composer-row {
@@ -1094,6 +1099,9 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--s-2);
+  margin: 0;
+  padding: 0;
+  list-style: none;
 }
 
 .attachment {
@@ -1138,25 +1146,32 @@
   color: var(--ink);
 }
 
+/* Resting on the page rather than cut into it: a hairline and the inset tone
+   say "field", and focus lifts it to the content surface instead of adding a
+   ring on top of a ring. */
 .composer textarea {
   flex: 1;
   min-width: 0;
   resize: none;
+  overflow-y: hidden;
   padding: var(--s-2) var(--s-3);
-  border: 1px solid var(--line-strong);
+  border: 1px solid var(--line);
   border-radius: var(--r-md);
-  background: var(--bg);
+  background: var(--sunken);
   color: var(--ink);
-  font-size: var(--text-sm);
+  font-size: var(--text-base);
   line-height: var(--lh-normal);
-  transition: border-color var(--dur-fast) var(--ease);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
 }
 .composer textarea::placeholder {
   color: var(--muted);
 }
 .composer textarea:focus {
   outline: none;
-  border-color: var(--brand);
+  border-color: var(--line-strong);
+  background: var(--bg);
 }
 
 /* ============================================================ inspector */
@@ -1394,15 +1409,26 @@
 /* ============================================================ approval dock */
 
 /* Docked above the composer rather than floating over the window: the whole
-   app stays reachable while one session waits (see `Approval.tsx`). The amber
-   edge is the "needs you" state colour, the same one the rail's dot uses. */
+   app stays reachable while one session waits (see `Approval.tsx`).
+
+   It stays on the content surface and lifts off it with a shadow — a coloured
+   edge along the top would be a stripe standing in for the status dot the
+   header already carries, and the dock would read as one more stitched-on
+   panel. Same measure as the transcript, a little wider where an option and
+   its artifact sit side by side. */
 .approval {
   display: flex;
   flex-direction: column;
-  gap: var(--s-2);
+  gap: var(--s-3);
+  width: 100%;
+  /* Grid items floor at their min-content width unless told otherwise, and a
+     diff's longest line is wider than any column — without this the dock grows
+     under the side panel instead of scrolling inside itself. */
+  min-width: 0;
+  max-width: 980px;
+  margin: 0 auto;
   max-height: 52vh;
-  padding: var(--s-4);
-  border-top: 2px solid var(--amber);
+  padding: var(--s-4) var(--s-5);
   background: var(--bg);
   box-shadow: var(--shadow-lift);
   animation: rise var(--dur-slow) var(--ease);
@@ -1410,8 +1436,8 @@
 
 .approval-head {
   display: flex;
-  align-items: baseline;
-  gap: var(--s-3);
+  align-items: center;
+  gap: var(--s-2);
 }
 .approval-head h2 {
   font-size: var(--text-md);
@@ -1531,6 +1557,8 @@
   flex-direction: column;
   gap: var(--s-1);
   min-width: 0;
+  margin: 0;
+  padding: 0;
   list-style: none;
 }
 

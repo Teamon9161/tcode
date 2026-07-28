@@ -13,6 +13,10 @@ import { ArrowUp, CloseIcon, StopIcon } from "./components/Icons";
  * terminal cannot show a thumbnail); removing one is the chip's own ×, and what
  * is on screen is exactly what will be sent.
  */
+/** Roughly ten lines: past that, scrolling the draft beats losing the
+ *  conversation behind it. */
+const MAX_HEIGHT = 220;
+
 export function Composer({
   value,
   running,
@@ -46,11 +50,19 @@ export function Composer({
 
   // Grow with the content up to a ceiling, then scroll. Set before paint so a
   // pasted block never flashes at one row first.
+  //
+  // The overflow is switched with the height rather than left on `auto`: a
+  // field sized to exactly its content still renders a scrollbar under `auto`
+  // in this webview, and a one-line prompt box with a scroll track down its
+  // side is the kind of detail that makes an app look assembled rather than
+  // built.
   useEffect(() => {
     const node = field.current;
     if (!node) return;
     node.style.height = "auto";
-    node.style.height = `${Math.min(node.scrollHeight, 220)}px`;
+    const wanted = node.scrollHeight;
+    node.style.height = `${Math.min(wanted, MAX_HEIGHT)}px`;
+    node.style.overflowY = wanted > MAX_HEIGHT ? "auto" : "hidden";
   }, [value]);
 
   const take = (transfer: DataTransfer | null) => {

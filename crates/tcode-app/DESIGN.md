@@ -36,6 +36,19 @@ The neutrals carry `chroma 0.004–0.008` at the brand's own hue, not a default
 warm tint. Hue 130 at that chroma reads as cool paper grey and stays clear of
 the cream/sand band that light AI interfaces settle into.
 
+**Two surfaces, and the step between them is the boundary.** The window frame —
+title bar, rail, side panel — is `--chrome`. The conversation column is `--bg`,
+and it runs unbroken from under the title bar to the bottom edge: transcript,
+approval dock and composer are the same surface, not three panels stacked with
+rules between them. A hairline is only drawn where two regions share a tone
+(rows within a list, a tool call against the transcript). Adding one where the
+tone already changed is what makes a window look assembled out of parts, and it
+is the thing this app was most often accused of.
+
+`--sunken` marks what is inset into a surface: the composer's field, code
+wells, tool output. The composer's field returns to `--bg` on focus, so the
+control opens up rather than gaining a second ring.
+
 ### Text
 
 | Token | Value | Contrast on `--bg` | Use |
@@ -146,7 +159,17 @@ One shape per job, used everywhere:
 - **Tool call** — a collapsed hairline block, expandable to full output. Header
   is mono; body is mono in a `--sunken` well.
 - **Empty state** — teaches the surface (what this panel will hold and how to
-  put something in it), never "nothing here".
+  put something in it), never "nothing here". It sits on the column's own left
+  edge, not centred: it is the first thing in the conversation, and the
+  conversation has one axis.
+- **Title bar** — the app draws it (`decorations: false`). The thinnest band in
+  the window: back, the session's name and path, the panel toggle, the window
+  buttons. No product mark — the window is already named by the OS and by the
+  word beside it — and no page-level actions; an action that belongs to content
+  goes on the content.
+- **Scrollbars** — the platform's own, thin, and invisible until the pointer is
+  over the region that scrolls. A permanent track beside the side panel reads as
+  a divider nobody drew.
 
 ## Theme packs
 

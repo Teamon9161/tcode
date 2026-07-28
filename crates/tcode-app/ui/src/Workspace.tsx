@@ -5,7 +5,6 @@ import type { Block } from "./blocks";
 import type { TouchedFile } from "./files";
 import type { Pasted } from "./paste";
 import { useInspector } from "./inspect";
-import { Mark } from "./components/Mark";
 import { Path } from "./components/Path";
 import { StatusDot } from "./components/Status";
 import { BackIcon, CloseIcon, PanelIcon, PlusIcon } from "./components/Icons";
@@ -125,10 +124,9 @@ export function Workspace({
       </header>
 
       <nav className="rail">
-        <button className="rail-home" onClick={onHome} title="All projects">
-          <Mark size={17} state={statusOf(session.id)} />
-        </button>
-
+        {/* No home button here: the title bar's back arrow already goes there,
+            and the mark that used to sit in this corner was a second status
+            light for the session the rail is already showing. */}
         <ul className="rail-list">
           {sessions.map((entry) => (
             <li key={entry.id}>

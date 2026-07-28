@@ -132,6 +132,12 @@ pub fn project_dir_in(home: &Path, key: &str) -> PathBuf {
     // A project whose state is split across both spellings is exactly how a
     // conversation goes missing from `/resume`, so fold them together.
     adopt_dir(&hashed(&format!(r"\\?\{key}")), &dir);
+    // And the readable form of that same spelling: `\\?\c:\code\rust\tcode`
+    // folds to `----c--code-rust-tcode`, which is a real directory on any
+    // machine where the desktop app opened a folder before it learned to strip
+    // the prefix. Same split, same cost — the terminal and the app looking at
+    // one folder through two separate histories.
+    adopt_dir(&projects.join(project_id(&format!(r"\\?\{key}"))), &dir);
     dir
 }
 
@@ -937,6 +943,25 @@ mod tests {
         let dir = project_dir_in(home.path(), key);
 
         assert!(dir.join("sessions").join("lost.jsonl").exists());
+        assert!(!extended.exists());
+    }
+
+    /// The desktop app keyed on the extended-path spelling directly, so the
+    /// split also exists under the *readable* id — four leading dashes where
+    /// the prefix folded.
+    #[test]
+    fn the_readable_extended_path_directory_is_the_same_project() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".tcode").join("projects");
+        let key = "c:\\code\\rust\\tcode";
+        let extended = projects.join("----c--code-rust-tcode");
+        fs::create_dir_all(extended.join("sessions")).unwrap();
+        fs::write(extended.join("sessions").join("desktop.jsonl"), "{}").unwrap();
+        assert_eq!(project_id(&format!(r"\\?\{key}")), "----c--code-rust-tcode");
+
+        let dir = project_dir_in(home.path(), key);
+
+        assert!(dir.join("sessions").join("desktop.jsonl").exists());
         assert!(!extended.exists());
     }
 

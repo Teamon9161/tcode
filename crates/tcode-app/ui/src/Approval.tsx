@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import type { ApprovalRequest, Decision } from "./types";
 import { Diff, isEditShape } from "./components/Diff";
+import { StatusDot } from "./components/Status";
 
 /**
  * What the agent is parked on, docked above the composer.
@@ -41,6 +42,13 @@ export function Approval({
       role="region"
       aria-label={questions ? "A question for you" : "Approval needed"}
     >
+      {/* The dot is the same "needs you" amber the rail uses for this session,
+          so the two surfaces agree at a glance about which state this is. */}
+      <header className="approval-head">
+        <StatusDot status="waiting" />
+        <h2>{title(request, questions)}</h2>
+        {!questions && <span className="approval-tool">{request.tool}</span>}
+      </header>
       {questions ? (
         <QuestionForm key={request.id} questions={questions} onAnswer={onAnswer} />
       ) : (
@@ -48,6 +56,11 @@ export function Approval({
       )}
     </section>
   );
+}
+
+function title(request: ApprovalRequest, questions: Question[] | null): string {
+  if (!questions) return request.is_edit ? "Change a file?" : "Run this?";
+  return questions.length === 1 ? questions[0].question : "A few questions";
 }
 
 /** The consent surface: the exact call, then the four answers. It shows tool,
@@ -66,11 +79,6 @@ function Consent({
 
   return (
     <>
-      <header className="approval-head">
-        <h2>{request.is_edit ? "Change a file?" : "Run this?"}</h2>
-        <span className="approval-tool">{request.tool}</span>
-      </header>
-
       <div className="approval-body">
         <p className="approval-target">{request.descriptor}</p>
         {request.summary && <p className="approval-summary">{request.summary}</p>}
@@ -183,10 +191,6 @@ function QuestionForm({
 
   return (
     <>
-      <header className="approval-head">
-        <h2>{questions.length === 1 ? questions[0].question : "A few questions"}</h2>
-      </header>
-
       <div className="approval-body">
         {questions.map((question, index) => (
           <fieldset className="question" key={index}>

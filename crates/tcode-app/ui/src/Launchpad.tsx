@@ -65,12 +65,12 @@ export function Launchpad({
 
   return (
     <div className="launchpad">
+      {/* Chrome only. "Open folder" used to live here as an outlined button and
+          out-shouted the project list, which is the actual content of this
+          screen; it now sits on the list it adds to. */}
       <header className="topbar" {...DRAG}>
         <Wordmark />
-        <button className="btn btn-secondary" onClick={pick}>
-          <FolderIcon />
-          Open folder
-        </button>
+        <span className="topbar-gap" {...DRAG} />
         <WindowControls />
       </header>
 
@@ -110,7 +110,13 @@ export function Launchpad({
           )}
 
           <section className="section">
-            <h2 className="section-title">Projects</h2>
+            <div className="section-head">
+              <h2 className="section-title">Projects</h2>
+              <button className="btn btn-ghost" onClick={pick}>
+                <FolderIcon size={15} />
+                Open folder
+              </button>
+            </div>
             {!data && !failure && <ProjectSkeleton />}
             {data && data.projects.length === 0 && <NoProjects onPick={pick} />}
             {data && data.projects.length > 0 && (

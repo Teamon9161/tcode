@@ -102,12 +102,22 @@ fn describe(dir: &Path) -> Option<ProjectInfo> {
 }
 
 /// The `cwd` from a log's opening `Meta` record.
+///
+/// Simplified on the way out: logs written before the app stripped the verbatim
+/// prefix recorded `\\?\C:\…`, and a launchpad row is the one place that string
+/// would still be read by a person. The folder it names is the same one either
+/// way — `store::project_dir_in` folds the two spellings' state together — so
+/// this is display, not identity.
 fn recorded_cwd(log: &Path) -> Option<String> {
     let file = fs::File::open(log).ok()?;
     let mut first = String::new();
     BufReader::new(file).read_line(&mut first).ok()?;
     match serde_json::from_str::<LogEvent>(&first).ok()? {
-        LogEvent::Meta { cwd, .. } => Some(cwd),
+        LogEvent::Meta { cwd, .. } => Some(
+            crate::paths::simplify(PathBuf::from(cwd))
+                .to_string_lossy()
+                .into_owned(),
+        ),
         // Every log opens with `Meta`. Anything else is a log from a format
         // this build does not know; it is not this function's job to guess.
         _ => None,

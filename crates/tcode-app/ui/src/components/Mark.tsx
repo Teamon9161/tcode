@@ -49,12 +49,16 @@ export function Mark({
   );
 }
 
-/** The mark plus the wordmark, for the title bar and the launchpad header. */
-export function Wordmark({ state }: { state?: "idle" | "running" | "waiting" | "failed" }) {
-  return (
-    <span className="wordmark">
-      <Mark size={18} state={state} />
-      <span className="wordmark-text">tcode</span>
-    </span>
-  );
+/**
+ * The product's name in the title bar.
+ *
+ * Word only. The mark sat here until it was looked at in place: at 18px in a
+ * bar that is already the thinnest band in the window, the crop frame reads as
+ * four detached ticks around a dot, and it was the third thing in a row saying
+ * "tcode" — after the window itself and the word beside it. The mark still has
+ * a job at larger sizes (the failure screen), and the status it used to carry
+ * is the rail's, where it sits next to the session it describes.
+ */
+export function Wordmark() {
+  return <span className="wordmark-text">tcode</span>;
 }

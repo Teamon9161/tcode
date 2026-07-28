@@ -218,9 +218,21 @@ select {
 }
 
 /* The webview's own scrollbars, kept in the theme rather than reinvented as
-   custom-drawn ones (product register bans those). */
+   custom-drawn ones (product register bans those).
+
+   Invisible until the pointer is over the region that scrolls. A permanent
+   track runs a grey line down the edge of every panel, and next to a real
+   boundary — the conversation against the side panel — it reads as a second
+   divider nobody drew. The thumb appears on hover and on scroll, which is when
+   position is the thing being asked about. */
 * {
   scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+  transition: scrollbar-color var(--dur) var(--ease);
+}
+
+*:hover,
+*:focus-within {
   scrollbar-color: var(--line-strong) transparent;
 }
 
