@@ -22,9 +22,13 @@
   gap: var(--s-7);
 }
 
+/* The top row spans every column because it is also the window's title bar
+   (`decorations: false`): window buttons belong at the window's corner, not at
+   the middle column's. */
 .workspace {
   display: grid;
   grid-template-columns: 196px minmax(0, 1fr);
+  grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
 }
 
@@ -33,9 +37,13 @@
   grid-template-columns: 196px minmax(0, 1fr) auto;
 }
 
+.workspace > .topbar {
+  grid-column: 1 / -1;
+}
+
 .stage {
   display: grid;
-  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-rows: minmax(0, 1fr) auto;
   min-width: 0;
   border-inline: 1px solid var(--line);
 }
@@ -67,13 +75,56 @@
 
 /* ============================================================ top bar */
 
+/* Also the title bar. It is a drag region, so nothing in it may be selectable:
+   a text selection started on the bar is a drag the window did not get. */
 .topbar {
   display: flex;
   align-items: center;
   gap: var(--s-3);
-  padding: var(--s-3) var(--s-4);
+  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
   background: var(--chrome);
   border-bottom: 1px solid var(--line);
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+/* ------------------------------------------------------------ window controls */
+
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  margin-inline-start: var(--s-2);
+  padding-inline-start: var(--s-2);
+  border-inline-start: 1px solid var(--line);
+}
+
+.window-btn {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 26px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+  cursor: default;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.window-btn:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.window-btn:active {
+  background: var(--pressed);
+}
+/* Close is the one that cannot be taken back, so it is the one that changes
+   colour — the same rule the status palette follows: chroma means something. */
+.window-btn.is-close:hover {
+  background: var(--danger-wash);
+  color: var(--danger-text);
 }
 
 .wordmark {
@@ -711,6 +762,21 @@
   overflow-wrap: anywhere;
 }
 
+/* Pasted images ride with the prompt they were pasted into, at a size that says
+   which image it was without taking the conversation over. */
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  margin-bottom: var(--s-2);
+}
+.msg-images img {
+  max-width: 220px;
+  max-height: 160px;
+  border-radius: var(--r-sm);
+  object-fit: contain;
+}
+
 .msg-assistant {
   display: flex;
   flex-direction: column;
@@ -996,11 +1062,80 @@
 
 .composer {
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: var(--s-2);
   padding: var(--s-3) var(--s-4);
   border-top: 1px solid var(--line);
   background: var(--chrome);
+}
+
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s-2);
+}
+
+/* A drop target has to say so before the file is let go of. */
+.composer.is-dropping {
+  background: var(--brand-wash);
+}
+
+.composer-note {
+  color: var(--danger-text);
+  font-size: var(--text-xs);
+}
+
+/* ------------------------------------------------------------ attachments */
+
+/* Pasted images sit above the text as chips rather than as a token inside it:
+   the terminal writes `[Image #1]` because it cannot show the picture, and this
+   can. What is on screen is exactly what will be sent. */
+.attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+
+.attachment {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  max-width: 240px;
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--bg);
+}
+
+.attachment-thumb {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--r-sm);
+  object-fit: cover;
+}
+
+.attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.attachment-remove {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+}
+.attachment-remove:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 
 .composer textarea {
@@ -1256,67 +1391,68 @@
   font-size: var(--text-2xs);
 }
 
-/* ============================================================ dialog */
+/* ============================================================ approval dock */
 
-.scrim {
-  position: fixed;
-  inset: 0;
-  z-index: var(--z-scrim);
-  display: grid;
-  place-items: center;
-  padding: var(--s-5);
-  background: color-mix(in oklab, var(--ink) 34%, transparent);
-  animation: fade var(--dur) var(--ease);
-}
-
-.dialog {
-  z-index: var(--z-dialog);
+/* Docked above the composer rather than floating over the window: the whole
+   app stays reachable while one session waits (see `Approval.tsx`). The amber
+   edge is the "needs you" state colour, the same one the rail's dot uses. */
+.approval {
   display: flex;
   flex-direction: column;
   gap: var(--s-2);
-  width: min(620px, 100%);
-  max-height: 100%;
-  overflow-y: auto;
-  padding: var(--s-5);
-  border-radius: var(--r-lg);
+  max-height: 52vh;
+  padding: var(--s-4);
+  border-top: 2px solid var(--amber);
   background: var(--bg);
   box-shadow: var(--shadow-lift);
   animation: rise var(--dur-slow) var(--ease);
 }
 
-.dialog-head {
+.approval-head {
   display: flex;
   align-items: baseline;
   gap: var(--s-3);
 }
-.dialog-head h2 {
+.approval-head h2 {
   font-size: var(--text-md);
+  text-wrap: pretty;
 }
-.dialog-tool {
+.approval-tool {
   color: var(--muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
 }
 
-.dialog-target {
+/* The body is what scrolls, so the answer buttons stay on screen no matter how
+   long the diff or the question list is. A decision you have to scroll to is a
+   decision that gets made by whichever button happened to be visible. */
+.approval-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.approval-target {
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: var(--text-sm);
   overflow-wrap: anywhere;
 }
 
-.dialog-summary {
+.approval-summary {
   color: var(--muted);
   font-size: var(--text-sm);
   text-wrap: pretty;
 }
 
-.dialog-toggle {
+.approval-toggle {
   align-self: flex-start;
-  margin-top: var(--s-1);
 }
 
-.dialog-input {
+.approval-input {
   margin: 0;
   padding: var(--s-3);
   max-height: 240px;
@@ -1329,8 +1465,7 @@
   overflow-wrap: anywhere;
 }
 
-.dialog-comment {
-  margin-top: var(--s-2);
+.approval-comment {
   padding: var(--s-2) var(--s-3);
   border: 1px solid var(--line-strong);
   border-radius: var(--r-sm);
@@ -1338,26 +1473,115 @@
   color: var(--ink);
   font-size: var(--text-sm);
 }
-.dialog-comment::placeholder {
+.approval-comment::placeholder {
   color: var(--muted);
 }
-.dialog-comment:focus {
+.approval-comment:focus {
   outline: none;
   border-color: var(--brand);
 }
 
-.dialog-actions {
+.approval-actions {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  margin-top: var(--s-3);
 }
-.dialog-yes {
+.approval-yes {
   display: flex;
   flex-wrap: wrap;
   gap: var(--s-2);
   margin-left: auto;
   justify-content: flex-end;
+}
+
+/* ------------------------------------------------------------------ questions */
+
+.question {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: none;
+}
+
+.question legend {
+  padding: 0 0 var(--s-1);
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+
+/* Options on the left, the focused option's artifact on the right. The preview
+   is the reason this tool has a `preview` field at all — a choice between two
+   concrete things is made by looking at them. */
+/* Flex rather than grid so the artifact drops below the options when the
+   conversation column is narrow, instead of squeezing both into slivers. */
+.question-split {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-3);
+  align-items: flex-start;
+}
+
+.options {
+  display: flex;
+  flex: 1 1 260px;
+  flex-direction: column;
+  gap: var(--s-1);
+  min-width: 0;
+  list-style: none;
+}
+
+.option {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  width: 100%;
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  text-align: start;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+.option:hover,
+.option.is-focused {
+  background: var(--hover);
+}
+.option.is-picked {
+  border-color: var(--brand);
+  background: var(--selected);
+}
+
+.option-label {
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+}
+.option-description {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+
+.option-preview {
+  margin: 0;
+  flex: 1 1 320px;
+  min-width: 0;
+  max-height: 280px;
+  overflow: auto;
+  padding: var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--body);
+  font-size: var(--text-xs);
+  line-height: var(--lh-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 @keyframes fade {

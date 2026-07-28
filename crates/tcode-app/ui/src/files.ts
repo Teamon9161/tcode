@@ -117,10 +117,20 @@ function touch(
   );
 }
 
-/** `/home/me/code/tcode/src/main.rs` → `src/main.rs`, given the session cwd. */
+/**
+ * `/home/me/code/tcode/src/main.rs` → `src/main.rs`, given the session cwd.
+ *
+ * Separator- and case-agnostic on both sides: a Windows session's cwd is
+ * `C:\code\tcode` while a tool's own input may spell the same path with forward
+ * slashes or a different drive-letter case, and a panel that fails to match
+ * shows every row as a full absolute path. Only the *prefix* is compared that
+ * loosely; what is displayed is the original text, untouched.
+ */
 export function relativeTo(cwd: string, path: string): string {
-  const root = cwd.endsWith("/") ? cwd : `${cwd}/`;
-  return path.startsWith(root) ? path.slice(root.length) : path;
+  const root = cwd.replace(/[/\\]+$/, "");
+  const flat = (text: string) => text.replace(/\\/g, "/").toLowerCase();
+  const prefix = `${flat(root)}/`;
+  return flat(path).startsWith(prefix) ? path.slice(root.length + 1) : path;
 }
 
 export function basename(path: string): string {

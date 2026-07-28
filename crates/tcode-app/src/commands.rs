@@ -165,8 +165,7 @@ pub fn open_folder(
     // Canonicalize before anything else: the session id, the project data
     // directory and the launchpad's grouping all key on the path, and two
     // spellings of one folder would otherwise become two projects.
-    let cwd = PathBuf::from(&path)
-        .canonicalize()
+    let cwd = crate::paths::canonical_dir(Path::new(&path))
         .map_err(|error| format!("cannot open {path}: {error}"))?;
     let handle = supervisor
         .open_folder(&cwd, resume)
@@ -200,14 +199,16 @@ pub fn send_message(
     supervisor: State<'_, Arc<Supervisor>>,
     session: String,
     text: String,
+    images: Option<Vec<ImageInput>>,
 ) -> Result<(), String> {
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     let agent = supervisor.agent();
+    let vision = agent.model.snapshot().provider.supports_vision();
+    let input = compose(text, images.unwrap_or_default(), vision, &handle.scratch_dir());
     let emit: Arc<dyn Emit> = Arc::new(app);
     tauri::async_runtime::spawn(async move {
-        let input = vec![ContentBlock::Text { text }];
         if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input).await {
             // `Busy` is the only way here, and it is a frontend bug (two sends
             // for one session). The command already returned, so the only way
@@ -219,6 +220,83 @@ pub fn send_message(
         }
     });
     Ok(())
+}
+
+/// One image pasted or dropped into the composer. Base64 because that is what
+/// the provider wire wants and what the webview can produce without a file.
+#[derive(serde::Deserialize)]
+pub struct ImageInput {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// The blocks one prompt turns into.
+///
+/// Images lead, then the text: a picture followed by "why is this wrong?" reads
+/// in that order, and it is the order the TUI already composes.
+///
+/// When the model cannot see, the image is **saved and named** rather than
+/// dropped. The user pasted a thing; telling the model where that thing is
+/// leaves them a way forward (switch models, or have a tool read it), while a
+/// silent drop leaves a question about a picture nobody has.
+pub fn compose(
+    text: String,
+    images: Vec<ImageInput>,
+    vision: bool,
+    scratch: &Option<PathBuf>,
+) -> Vec<ContentBlock> {
+    let mut blocks = Vec::with_capacity(images.len() + 1);
+    for (index, image) in images.into_iter().enumerate() {
+        if vision {
+            blocks.push(ContentBlock::Image {
+                media_type: image.media_type,
+                data: image.data,
+            });
+            continue;
+        }
+        blocks.push(ContentBlock::Text {
+            text: match save_pasted(&image, index, scratch) {
+                Ok(path) => format!("[pasted image saved to {}]", path.display()),
+                Err(reason) => {
+                    format!("[pasted image could not be saved ({reason}); this model cannot view it]")
+                }
+            },
+        });
+    }
+    if !text.trim().is_empty() {
+        blocks.push(ContentBlock::Text { text });
+    }
+    blocks
+}
+
+fn save_pasted(
+    image: &ImageInput,
+    index: usize,
+    scratch: &Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    use base64::Engine as _;
+    let dir = scratch
+        .as_ref()
+        .ok_or("this session has no scratch directory")?
+        .join("pasted");
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image.data)
+        .map_err(|error| error.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let extension = match image.media_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    };
+    let path = dir.join(format!("paste-{stamp}-{index}.{extension}"));
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&path, bytes))
+        .map_err(|error| error.to_string())?;
+    Ok(path)
 }
 
 /// Answer an approval the agent is parked on.
@@ -247,4 +325,59 @@ pub fn interrupt(supervisor: State<'_, Arc<Supervisor>>, session: String) -> Res
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     handle.interrupt();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image() -> ImageInput {
+        ImageInput {
+            media_type: "image/png".into(),
+            // "hi" — enough to prove the bytes reach the file.
+            data: "aGk=".into(),
+        }
+    }
+
+    #[test]
+    fn a_seeing_model_gets_the_image_before_the_question() {
+        let blocks = compose("why is this wrong?".into(), vec![image()], true, &None);
+        assert!(matches!(blocks[0], ContentBlock::Image { .. }));
+        assert!(matches!(&blocks[1], ContentBlock::Text { text } if text.contains("wrong")));
+    }
+
+    #[test]
+    fn a_blind_model_is_told_where_the_image_went() {
+        let scratch = tempfile::tempdir().unwrap();
+        let blocks = compose(
+            String::new(),
+            vec![image()],
+            false,
+            &Some(scratch.path().to_path_buf()),
+        );
+        let ContentBlock::Text { text } = &blocks[0] else {
+            panic!("expected the fallback note, got {:?}", blocks[0]);
+        };
+        assert!(text.starts_with("[pasted image saved to "), "{text}");
+        let written: Vec<_> = std::fs::read_dir(scratch.path().join("pasted"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        assert_eq!(written.len(), 1);
+        assert_eq!(std::fs::read(&written[0]).unwrap(), b"hi");
+    }
+
+    #[test]
+    fn an_unsaveable_image_still_says_so_rather_than_vanishing() {
+        let blocks = compose(String::new(), vec![image()], false, &None);
+        let ContentBlock::Text { text } = &blocks[0] else {
+            panic!("expected a note");
+        };
+        assert!(text.contains("could not be saved"), "{text}");
+    }
+
+    #[test]
+    fn an_empty_message_adds_no_empty_text_block() {
+        assert!(compose("   ".into(), vec![], true, &None).is_empty());
+    }
 }

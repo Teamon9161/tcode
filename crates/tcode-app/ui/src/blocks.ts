@@ -38,7 +38,9 @@ export type RunMeta = {
 };
 
 export type Block =
-  | { kind: "user"; text: string; entryIndex?: number }
+  /** `images` are `data:` URLs of what was pasted into the prompt — kept for
+   *  display only; what the model got is the base64 in the request. */
+  | { kind: "user"; text: string; entryIndex?: number; images?: string[] }
   | { kind: "assistant"; text: string }
   | { kind: "thinking"; text: string }
   | { kind: "note"; text: string }
@@ -314,8 +316,8 @@ export function runningRuns(blocks: Block[]): Extract<Block, { kind: "run" }>[] 
   return out;
 }
 
-export function userBlock(text: string): Block {
-  return { kind: "user", text };
+export function userBlock(text: string, images: string[] = []): Block {
+  return { kind: "user", text, images: images.length > 0 ? images : undefined };
 }
 
 export function errorBlock(text: string): Block {

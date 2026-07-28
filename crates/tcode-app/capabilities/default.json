@@ -1,7 +1,14 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The webview's baseline grant. `core:default` is what makes `listen()` work at all — without it the event plugin's commands are denied, every listener registration rejects silently, and a turn runs to completion with nothing on screen.",
+  "description": "The webview's baseline grant. `core:default` is what makes `listen()` work at all — without it the event plugin's commands are denied, every listener registration rejects silently, and a turn runs to completion with nothing on screen. The four window grants exist because the app draws its own title bar (`decorations: false`): `core:window:default` is read-only, so without them the bar cannot be dragged and the window cannot be minimized, maximized or closed.",
   "windows": ["main"],
-  "permissions": ["core:default", "dialog:allow-open"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-toggle-maximize",
+    "core:window:allow-close",
+    "dialog:allow-open"
+  ]
 }

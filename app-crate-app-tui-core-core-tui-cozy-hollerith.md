@@ -8,6 +8,15 @@ Tauri 桌面前端：Rust core 作为库链接进后端，webview 跑 web UI，`
 
 端到端能用：起 app → 启动台选项目/会话 → 发消息 → 流式输出 → 文件编辑审批 → 放行写盘。多会话并行、事件按 `session_id` 隔离不串。
 
+**外壳与基本可用性（本轮，第 1–4 步之后补的一批"不做就没法用"）**：
+
+- **自绘标题栏**（`decorations: false` + `components/WindowControls.tsx`）。原来是原生 caption bar 顶着我们自己的 toolbar，两条横带干一件事，还带一个我们无话可说的图标和标题。现在 `.topbar` 横跨窗口宽度、是拖拽区，右端三个窗口按钮。
+- **审批不再是模态**（`Approval.tsx`）。scrim + 抢焦点的弹窗把"并行管理多个会话"直接废掉：不答就动不了任何东西。改成停在 composer 上方的常驻面板，不抢焦点、不可关闭。
+- **`ask_user` 有了真正的问题表单**：选项、多选、`preview` 侧栏、"Something else" + 自由文本，答案聚合格式与 TUI 的 `QuestionPage::answer` 逐字一致。此前它被当成 yes/no 审批渲染——模型问"选 A 还是 B"，界面只给"同意/拒绝"。
+- **粘贴与拖入图片**（`paste.ts` + `compose`）：长边 1568 重采样，chips 显示在输入框上方，无 vision 的模型改为存盘并告知路径。
+- **`\\?\` 前缀不再泄漏**（`paths.rs`）。它不只是难看：`store::project_id` 把它折成另一个 project 目录，桌面端与终端对同一个文件夹各存各的会话和记忆。
+- **批次里的调用有了标识**：core 的并发路径不发 per-call `ToolStart`，批次展开后原本是五行光秃秃的 `read`。
+
 - **共享装配层 `tcode-frontend`**（不依赖任何 UI）：`boot`/`open_session`/`build_agent`，以及**已经备好但 app 还没用的** `build_menu`/`build_preset_menu`/`build_provider_setup` + `SwitchFn`/`PinFn`/`ApplyPresetFn` 和 provider setup 状态机（UI 无关的 `setup::Key`）。这些是下面"待做"直接复用的料。
 - **后端**：`bridge.rs`（事件/审批桥，一切写在 `Emit` trait 上，无窗口可测）、`state.rs`（`Supervisor` + 每会话 `SessionHandle`，一会话一 turn 靠所有权保证）、`projects.rs`（从 session log 首行 `Meta{cwd}` 还原项目清单）、`SessionFactory`（开新文件夹按其项目级 config 重载）。11 个测试，不打真 API。
 - **设计阶段（impeccable）**：token 层 + 可整套替换的主题包（porcelain 亮色默认）、几何标记（中心菱形即状态灯）、启动台、工作区（会话栏 + 对话 + 文件侧栏）、审批 diff、`npm run preview:ui` 设计预览。
@@ -367,6 +376,16 @@ TUI 的 `live_panel.rs` 已经把这件事想清楚了：**它是持续状态，
 6. **顶栏控制条 + ⌘K**（3.9 / 3.10）。
 7. **历史改动与 rewind**（3.3）、**plan 批注**（3.7）、**通知与首启向导**（3.12）。
 8. 富文档预览、cohort 视图。
+
+### 仍然缺的基本盘（比第 5–8 步更早该做）
+
+按"不做就不像个能用的桌面 app"排：
+
+1. **turn 进行中不能发消息**。core 有 `PendingInput`（排队 + `QueuedInput` 事件），app 的 composer 在跑 turn 时 Enter 直接不响应。TUI 早就能边跑边排队。
+2. **没有模式/模型的任何入口**。`/model`、审批模式全在终端里，桌面端只能用 config 里那一套（第 6 步的顶栏控制条）。
+3. **`@path` 引用与文件补全**：composer 只是一个 textarea。
+4. **窗口状态不持久**：大小、位置、面板宽度每次重来（面板宽度已在内存里，只差落盘）。
+5. **没有系统通知**：后台会话卡在审批时，人在别的窗口完全无感（3.12）。
 
 ### 1–4 落地后的遗留
 

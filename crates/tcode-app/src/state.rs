@@ -54,6 +54,17 @@ impl SessionHandle {
         self.pending.clone()
     }
 
+    /// Where this session may drop files that are not the user's to keep —
+    /// pasted images the current model cannot see, for one. `None` while a turn
+    /// holds the session, which is also when nothing can be sent to it.
+    pub fn scratch_dir(&self) -> Option<PathBuf> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.tool_ctx.scratch_dir.clone())
+    }
+
     /// Stop the running turn, if any. Also fails any open approval closed:
     /// an interrupted turn must not be authorized by an answer that arrives
     /// afterwards.

@@ -16,6 +16,7 @@ import {
 } from "./types";
 import { applyEvent, errorBlock, userBlock, type Block } from "./blocks";
 import { applyFileEvent, type TouchedFile } from "./files";
+import type { Pasted } from "./paste";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
@@ -29,6 +30,8 @@ type SessionState = {
   approval: ApprovalRequest | null;
   failed: boolean;
   draft: string;
+  /** Images pasted into the draft, not yet sent. */
+  attachments: Pasted[];
   /** One line for the launchpad card: the last thing that happened. */
   activity: string;
 };
@@ -40,6 +43,7 @@ const BLANK: SessionState = {
   approval: null,
   failed: false,
   draft: "",
+  attachments: [],
   activity: "not started",
 };
 
@@ -166,17 +170,32 @@ export function App() {
   const send = useCallback(
     async (id: string) => {
       const text = (states[id]?.draft ?? "").trim();
-      if (!text || states[id]?.running) return;
+      const attachments = states[id]?.attachments ?? [];
+      if ((!text && attachments.length === 0) || states[id]?.running) return;
       patch(id, (state) => ({
         ...state,
         draft: "",
+        attachments: [],
         running: true,
         failed: false,
-        blocks: [...state.blocks, userBlock(text)],
-        activity: text,
+        blocks: [
+          ...state.blocks,
+          userBlock(
+            text,
+            attachments.map((item) => item.url),
+          ),
+        ],
+        activity: text || `${attachments.length} image(s)`,
       }));
       try {
-        await invoke("send_message", { session: id, text });
+        await invoke("send_message", {
+          session: id,
+          text,
+          images: attachments.map((item) => ({
+            media_type: item.mediaType,
+            data: item.data,
+          })),
+        });
       } catch (error) {
         patch(id, (state) => ({
           ...state,
@@ -256,7 +275,17 @@ export function App() {
         approval={state.approval}
         statusOf={statusOf}
         draft={state.draft}
+        attachments={state.attachments}
         onDraft={(draft) => patch(current.id, (was) => ({ ...was, draft }))}
+        onAttach={(items) =>
+          patch(current.id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
+        }
+        onDetach={(id) =>
+          patch(current.id, (was) => ({
+            ...was,
+            attachments: was.attachments.filter((item) => item.id !== id),
+          }))
+        }
         onSend={() => send(current.id)}
         onInterrupt={() => {
           invoke("interrupt", { session: current.id }).catch(() => {});

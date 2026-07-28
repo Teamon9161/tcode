@@ -23,6 +23,7 @@ export default defineConfig({
       ? {
           "@tauri-apps/api/core": "/src/preview/mock-core.ts",
           "@tauri-apps/api/event": "/src/preview/mock-event.ts",
+          "@tauri-apps/api/window": "/src/preview/mock-window.ts",
           "@tauri-apps/plugin-dialog": "/src/preview/mock-dialog.ts",
         }
       : {},

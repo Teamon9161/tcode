@@ -32,7 +32,15 @@ cargo build && cargo test                 # 后端 + 集成测试
 6. **用到新的 Tauri 内建能力，先改 `capabilities/default.json`**。自定义 `#[tauri::command]` 默认放行，但 core 插件的命令（event 的 `listen`/`emit`、window、fs、dialog…）必须显式授权，**未授权时前端那侧只是 promise reject，没有任何报错会自己冒出来**。这条是踩出来的：漏了 `core:default` 时，turn 正常跑完、事件正常 emit，界面却全空，看起来和"卡死"一模一样。
 7. **前端不许有静默 reject 的 promise**。`listen()` / `invoke()` 一律接 `catch`，把原因显示成致命错误屏。第 6 条那个 bug 之所以难查，就是因为它当时是个 unhandled rejection。
 8. **组件里不许出现字面量颜色/圆角/字号/字体栈，一律 `var(--token)`**。`ui/src/theme/base.css` 是 token 契约（含由 `--bg`/`--ink`/`--brand` 推导的兜底值，本身不含任何字面色），`themes/porcelain.css` 是默认主题包，两者的加载顺序就是覆盖顺序。**换主题 = 换 `main.tsx` 里的一行 import**，包括排版、密度、圆角、阴影，不只是配色。token 的**名字**是契约，主题可以改值不能改名。为什么这么严：写死一个 `#1d201b` 不会报错，只会在换主题那天变成一个找不着的污点。设计依据见 `DESIGN.md`，产品判断见 `PRODUCT.md`。
-9. **路径不许用 `direction: rtl` 做前截断**。bidi 重排会把开头的 `/` 挪到结尾——`/home/me/code` 渲染成 `home/me/code/`。这不是外观问题：审批弹窗里给人看的是一条错的路径。用 `components/Path.tsx`，它按整段省略，一个字符都不改写。
+9. **路径不许用 `direction: rtl` 做前截断**。bidi 重排会把开头的 `/` 挪到结尾——`/home/me/code` 渲染成 `home/me/code/`。这不是外观问题：审批面板里给人看的是一条错的路径。用 `components/Path.tsx`，它按整段省略，一个字符都不改写。
+
+    **进 app 的文件夹路径一律经 `paths::canonical_dir`**，不许直接 `canonicalize()`。Windows 上后者返回 `\\?\C:\…`，而 `store::project_id` 把非字母数字折成 `-`，于是同一个文件夹在桌面端落到 `----c--code-rust-tcode`、在终端落到 `c--code-rust-tcode`：会话与自动记忆分成两份互不知情。这条是踩出来的，`~/.tcode/projects/` 里那个四横线目录就是证据。
+
+9b. **审批不是模态**。`Approval.tsx` 停在 composer 上方，不铺 scrim、不抢焦点、不能被关掉。理由是这个 app 的立身之本：一个会话在等审批时，另外三个必须还能读、还能开、还能看谁在等——模态把并行管理直接废掉。安全性由别处保证：没有任何按键能回答它（旧的模态靠"焦点停在拒绝键上"防误触，一个抢焦点的常驻面板反而会和输入框抢每一次击键）；而"不可关闭"保留了模态真正买到的东西——未答的审批是一个停着的 turn，能被关掉的卡片等于没有回去的路。
+
+    `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
+
+9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在 stage 里：窗口按钮属于窗口的角，不属于中间那一栏的角。
 
 10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
 
@@ -41,7 +49,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 11. **artifact 沙箱的三条不变量**（`src/sandbox/`，图表/图示/模型自写 HTML 都在里面渲染）：
 
     - **iframe 永远只有 `sandbox="allow-scripts"`，绝不加 `allow-same-origin`**。没有它，frame 是不透明源：`parent.document`、`parent.__TAURI__`、`localStorage` 全部抛 DOMException（实测），于是里面爱怎么 `innerHTML` 都只能毁掉它自己。加上它，这一整套设计当场归零。`rich.test.tsx` 钉住了这个属性。
-    - **`tauri.conf.json` 的 `script-src` 永远不许出现 `unsafe-inline` / `unsafe-eval`**。它是规则 10 的第二道防线。
+    - **`tauri.conf.json` 的 `script-src` 永远不许出现 `unsafe-inline` / `unsafe-eval`**。它是规则 10 的第二道防线。（`img-src` 里的 `data:` 是给粘贴图片的缩略图开的，与规则 10 不冲突：`rich.tsx` 把模型输出里的 image token 渲染成文本 chip，模型根本没有产出 `<img>` 的路径。）
     - **沙箱里的脚本必须是经典脚本，不能是 module**。实测：不透明源下 `<script type="module">` 走 CORS，请求带 `Origin: null`，除非服务端显式放行否则**根本不执行**；经典 `<script src>` 是 no-cors，无条件可用。所以 `src/sandbox/*` 由 `vite.sandbox.config.ts` 单独构建成 IIFE 进 `public/`，不走主 module graph。改成 module 会在开发机上"看起来能跑"（若 dev server 恰好发了 ACAO）而在装出来的 app 里静默失效。
 
 12. **沙箱拿到的主题值必须是 sRGB**。主题用 OKLCH 写，而沙箱里的第三方库自己解析颜色（mermaid 的 khroma 直接拒绝 `oklch(...)`）。`Sandbox.tsx` 的 `readTheme()` 负责光栅化转换后再发过去——注意只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回。
@@ -59,8 +67,11 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。
   - **右侧面板是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。
   - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿；其中 `quiet_output` 真的由 `Tool::batch_policy()` 派生，而 `route` 目前仍是 `commands.rs` 里的名字表，因为 `CallRoute` 住在 `tcode-tui` 而本 crate 不能依赖它——该文件写明了把 `route()` 提升为 core 的 trait 方法才是终局。
+  - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
+  - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
   - **语法高亮是自己写的**（`syntax.ts`），因为 Shiki/highlight.js 自带调色板是字面值，主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色。它输出语义 class，颜色由 `base.css` 的 `--syn-*` 契约决定。
-- `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + `dialog:allow-open`（"打开文件夹"要它）。
+- `src/paths.rs`：`canonical_dir`——app 里唯一一处把用户选的文件夹变成键的地方（见硬规则 9）。
+- `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + 四条 window 授权（自绘标题栏，见 9c）+ `dialog:allow-open`（"打开文件夹"要它）。
 - `icons/`：由 `icons/mark.svg` 用 `rsvg-convert` 生成，改标记要重新导出全部尺寸。
 
 ## 已知限制

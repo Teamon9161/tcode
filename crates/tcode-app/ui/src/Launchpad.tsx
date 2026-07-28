@@ -8,6 +8,8 @@ import { Wordmark } from "./components/Mark";
 import { Path } from "./components/Path";
 import { StatusPill } from "./components/Status";
 import { ChevronDown, ChevronRight, FolderIcon, PlusIcon } from "./components/Icons";
+import { WindowControls } from "./components/WindowControls";
+import { DRAG } from "./components/drag";
 
 /**
  * The first screen: what is open, and every folder tcode has worked in.
@@ -63,12 +65,13 @@ export function Launchpad({
 
   return (
     <div className="launchpad">
-      <header className="topbar">
+      <header className="topbar" {...DRAG}>
         <Wordmark />
         <button className="btn btn-secondary" onClick={pick}>
           <FolderIcon />
           Open folder
         </button>
+        <WindowControls />
       </header>
 
       <div className="launchpad-scroll">

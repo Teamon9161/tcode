@@ -7,10 +7,10 @@
 use anyhow::Context;
 
 fn main() -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()
-        .context("cannot determine working directory")?
-        .canonicalize()
-        .context("cannot canonicalize working directory")?;
+    let cwd = tcode_app::paths::canonical_dir(
+        &std::env::current_dir().context("cannot determine working directory")?,
+    )
+    .context("cannot canonicalize working directory")?;
 
     // `tauri::async_runtime` rather than `#[tokio::main]`: it is the runtime
     // Tauri spawns command tasks on, and having a second one only invites the

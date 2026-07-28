@@ -82,7 +82,18 @@ export function BlockList({
 function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) => void }) {
   switch (block.kind) {
     case "user":
-      return <div className="msg msg-user">{block.text}</div>;
+      return (
+        <div className="msg msg-user">
+          {block.images && block.images.length > 0 && (
+            <div className="msg-images">
+              {block.images.map((url, at) => (
+                <img key={at} src={url} alt="pasted image" />
+              ))}
+            </div>
+          )}
+          {block.text}
+        </div>
+      );
     case "queued":
       return (
         <div className="msg msg-user is-queued">
@@ -144,6 +155,8 @@ function ToolCall({
   const failed = block.result?.isError ?? false;
   const body = view.body?.(block.input) ?? null;
   const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
+  // Batched calls arrive without one (see `describe` in toolViews).
+  const summary = block.summary || view.summary?.(block.input) || "";
 
   // A successful edit already showed its whole change as the body; repeating
   // "ok, 3 hunks" underneath is noise. Errors always surface.
@@ -166,10 +179,10 @@ function ToolCall({
 
         {target ? (
           <button className="tool-target" onClick={() => onOpen(target)} title="Open in the panel">
-            {block.summary}
+            {summary}
           </button>
         ) : (
-          <span className="tool-summary">{block.summary}</span>
+          <span className="tool-summary">{summary}</span>
         )}
 
         {!done && <span className="tool-spinner" aria-label="running" />}

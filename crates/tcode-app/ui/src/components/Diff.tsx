@@ -16,7 +16,7 @@ export { isEditShape } from "../diff";
 /**
  * The change, wherever it is being read.
  *
- * One component serves all four places a diff appears — the approval dialog,
+ * One component serves all four places a diff appears — the approval dock,
  * the transcript, the inspector, and a ```diff fence — because they are the
  * same question asked at different sizes, and two implementations would drift
  * on the detail that matters (which lines are actually going to be written).

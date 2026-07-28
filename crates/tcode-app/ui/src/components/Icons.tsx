@@ -105,6 +105,35 @@ export const CopyIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/* Window controls. Squarer than the rest on purpose: they are the caption bar's
+   glyphs, and the platform's own vocabulary is what makes them read as such. */
+
+export const MinimizeIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M5.5 12h13" />
+  </Glyph>
+);
+
+export const MaximizeIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="5.5" y="5.5" width="13" height="13" rx="1.5" />
+  </Glyph>
+);
+
+export const RestoreIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="4.5" y="7.5" width="11" height="11" rx="1.5" />
+    <path d="M8.5 5.5h9a2 2 0 0 1 2 2v9" />
+  </Glyph>
+);
+
+export const ImageIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+    <path d="m4 16 4.5-4.5 4 4 3-2.5 4 3.5" />
+  </Glyph>
+);
+
 export const CheckIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="m5 12.5 4.5 4.5L19 7" />

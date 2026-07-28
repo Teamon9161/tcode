@@ -3,15 +3,18 @@ import { useEffect, useState } from "react";
 import type { ApprovalRequest, Decision, SessionInfo, Status } from "./types";
 import type { Block } from "./blocks";
 import type { TouchedFile } from "./files";
+import type { Pasted } from "./paste";
 import { useInspector } from "./inspect";
 import { Mark } from "./components/Mark";
 import { Path } from "./components/Path";
 import { StatusDot } from "./components/Status";
 import { BackIcon, CloseIcon, PanelIcon, PlusIcon } from "./components/Icons";
+import { WindowControls } from "./components/WindowControls";
+import { DRAG } from "./components/drag";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { Inspector } from "./Inspector";
-import { ApprovalDialog } from "./ApprovalDialog";
+import { Approval } from "./Approval";
 
 /** Wide enough for a split diff without crowding the conversation. */
 const DEFAULT_WIDTH = 380;
@@ -29,6 +32,11 @@ const MAX_WIDTH = 900;
  * The right region is a single slot (see `inspect.ts`). Its root is the file
  * index, and anything opened from the conversation — a diff, a snapshot, a
  * sub-agent's own turn — pushes onto a stack whose back button returns there.
+ *
+ * The top row spans the whole window rather than sitting inside the stage,
+ * because it is also the title bar (`decorations: false`, see
+ * `components/WindowControls.tsx`): window buttons belong at the window's
+ * corner, not at the conversation column's.
  */
 export function Workspace({
   session,
@@ -39,7 +47,10 @@ export function Workspace({
   approval,
   statusOf,
   draft,
+  attachments,
   onDraft,
+  onAttach,
+  onDetach,
   onSend,
   onInterrupt,
   onAnswer,
@@ -55,7 +66,10 @@ export function Workspace({
   approval: ApprovalRequest | null;
   statusOf: (id: string) => Status;
   draft: string;
+  attachments: Pasted[];
   onDraft: (value: string) => void;
+  onAttach: (items: Pasted[]) => void;
+  onDetach: (id: string) => void;
   onSend: () => void;
   onInterrupt: () => void;
   onAnswer: (decision: Decision, comment: string) => void;
@@ -91,6 +105,25 @@ export function Workspace({
 
   return (
     <div className={`workspace${open ? " has-panel" : ""}`}>
+      <header className="topbar" {...DRAG}>
+        <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
+          <BackIcon size={15} />
+        </button>
+        <span className="stage-title" {...DRAG}>
+          {session.name}
+        </span>
+        <Path className="stage-path" path={session.cwd} home={session.home} keep={4} drag />
+        <button
+          className={`icon-btn${open ? " is-on" : ""}`}
+          onClick={() => (open ? closePanel() : openPanel({ kind: "files" }))}
+          aria-pressed={open}
+          aria-label={open ? "Hide the panel" : "Show the panel"}
+        >
+          <PanelIcon size={15} />
+        </button>
+        <WindowControls />
+      </header>
+
       <nav className="rail">
         <button className="rail-home" onClick={onHome} title="All projects">
           <Mark size={17} state={statusOf(session.id)} />
@@ -125,29 +158,20 @@ export function Workspace({
       </nav>
 
       <div className="stage">
-        <header className="topbar">
-          <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
-            <BackIcon size={15} />
-          </button>
-          <span className="stage-title">{session.name}</span>
-          <Path className="stage-path" path={session.cwd} home={session.home} keep={4} />
-          <button
-            className={`icon-btn${open ? " is-on" : ""}`}
-            onClick={() => (open ? closePanel() : openPanel({ kind: "files" }))}
-            aria-pressed={open}
-            aria-label={open ? "Hide the panel" : "Show the panel"}
-          >
-            <PanelIcon size={15} />
-          </button>
-        </header>
-
         <Transcript blocks={blocks} running={running} onOpen={openPanel} />
+
+        {/* Docked, not modal: the other sessions stay reachable while this one
+            waits. See `Approval.tsx`. */}
+        {approval && <Approval request={approval} onAnswer={onAnswer} />}
 
         <Composer
           value={draft}
           running={running}
           disabled={false}
+          attachments={attachments}
           onChange={onDraft}
+          onAttach={onAttach}
+          onDetach={onDetach}
           onSubmit={onSend}
           onInterrupt={onInterrupt}
         />
@@ -161,8 +185,6 @@ export function Workspace({
         width={width}
         onWidth={(next) => setWidth(Math.min(Math.max(next, MIN_WIDTH), MAX_WIDTH))}
       />
-
-      {approval && <ApprovalDialog request={approval} onAnswer={onAnswer} />}
     </div>
   );
 }

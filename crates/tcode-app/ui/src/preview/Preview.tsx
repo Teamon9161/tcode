@@ -3,6 +3,7 @@ import { useState } from "react";
 import type { ApprovalRequest, SessionInfo, Status } from "../types";
 import type { Block } from "../blocks";
 import type { TouchedFile } from "../files";
+import type { Pasted } from "../paste";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
@@ -287,12 +288,52 @@ const APPROVAL: ApprovalRequest = {
   },
 };
 
-const SCENES = ["launchpad", "session", "approval", "empty"] as const;
+/** The other approval shape: a question, which is not a yes/no at all. */
+const QUESTION: ApprovalRequest = {
+  session: "a",
+  id: "ap2",
+  tool: "ask_user",
+  summary: "How should the clock be injected?",
+  descriptor: "ask_user",
+  is_edit: false,
+  allows_project: false,
+  input: {
+    questions: [
+      {
+        question: "How should the clock be injected?",
+        options: [
+          {
+            label: "Trait object",
+            description: "A `dyn Sleeper` on the agent — swappable at runtime.",
+            preview: "pub struct Agent {\n    sleeper: Arc<dyn Sleeper>,\n}",
+          },
+          {
+            label: "Generic parameter",
+            description: "Monomorphized, no dynamic dispatch, but it spreads through the type.",
+            preview: "pub struct Agent<S: Sleeper> {\n    sleeper: S,\n}",
+          },
+        ],
+      },
+      {
+        question: "What should the tests cover?",
+        multiSelect: true,
+        options: [
+          { label: "The backoff curve", description: "Delays grow and then cap." },
+          { label: "The cancel path", description: "A cancelled retry stops sleeping." },
+          { label: "The error passthrough", description: "The last error survives the retries." },
+        ],
+      },
+    ],
+  },
+};
+
+const SCENES = ["launchpad", "session", "approval", "question", "empty"] as const;
 type Scene = (typeof SCENES)[number];
 
 export function Preview() {
   const [scene, setScene] = useState<Scene>("launchpad");
   const [draft, setDraft] = useState("");
+  const [attachments, setAttachments] = useState<Pasted[]>([]);
 
   return (
     <ToolMetaProvider meta={TOOL_META}>
@@ -332,10 +373,15 @@ export function Preview() {
               blocks={scene === "empty" ? [] : BLOCKS}
               files={scene === "empty" ? [] : FILES}
               running={scene === "session"}
-              approval={scene === "approval" ? APPROVAL : null}
+              approval={
+                scene === "approval" ? APPROVAL : scene === "question" ? QUESTION : null
+              }
               statusOf={(id) => STATUS[id] ?? "idle"}
               draft={draft}
+              attachments={attachments}
               onDraft={setDraft}
+              onAttach={(items) => setAttachments((was) => [...was, ...items])}
+              onDetach={(id) => setAttachments((was) => was.filter((item) => item.id !== id))}
               onSend={() => {}}
               onInterrupt={() => {}}
               onAnswer={() => setScene("session")}

@@ -62,6 +62,9 @@ export type ToolView = {
   body?(input: unknown): ReactNode;
   /** What opening this call shows in the inspector. */
   inspect?(input: unknown, callId: string, result?: ToolResult): Inspect | null;
+  /** What this call is *about*, when the event stream did not say.
+   *  See `describe` below for why that happens. */
+  summary?(input: unknown): string | null;
 };
 
 const targetPath = (input: unknown): string | null => {
@@ -103,7 +106,33 @@ const VIEWS: Record<string, ToolView> = {
  *  tool has. */
 const FALLBACK: ToolView = {
   inspect: (_input, callId, result) => (result?.content ? { kind: "output", callId } : null),
+  summary: describe,
 };
+
+/**
+ * A one-line "what this call is about", derived from its input.
+ *
+ * Needed because `ToolBatchStart` carries `(call_id, name, input)` and nothing
+ * else: core emits no per-call `ToolStart` for the concurrent paths (parallel
+ * reads, file-mutation lanes), so batched calls arrive with no summary at all.
+ * Without this, expanding a batch of five reads shows five rows saying `read`
+ * and nothing about *what* was read — the batch header collapses them, and then
+ * opening it tells you nothing.
+ *
+ * This is presentation, not routing: it names the argument the tool's own
+ * schema calls the target. The durable fix is core carrying the same summary in
+ * `ToolBatchStart` that it already computes for `ToolStart` (`summarize_call`),
+ * which would also give the TUI one definition instead of two.
+ */
+function describe(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const record = input as Record<string, unknown>;
+  for (const key of ["file_path", "path", "notebook_path", "filePath", "command", "pattern", "url", "query"]) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return null;
+}
 
 export function viewFor(name: string): ToolView {
   const view = VIEWS[name];
