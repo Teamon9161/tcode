@@ -1,8 +1,11 @@
 import { useLayoutEffect, useRef, useState } from "react";
 
-import type { Block } from "./transcript";
+import type { Block } from "./blocks";
+import type { Inspect } from "./inspect";
 import { rich } from "./rich";
+import { useToolMeta, viewFor } from "./toolViews";
 import { ChevronDown, ChevronRight } from "./components/Icons";
+import { StatusDot } from "./components/Status";
 
 /**
  * The conversation.
@@ -11,15 +14,19 @@ import { ChevronDown, ChevronRight } from "./components/Icons";
  * Scrolling up to read something is a deliberate act, and yanking the view back
  * down on the next delta is the single most irritating thing a streaming
  * transcript can do.
+ *
+ * Blocks nest (a sub-agent run holds its own), so the renderer recurses. The
+ * same list component draws a run's contents inside the panel, which is what
+ * keeps a delegated turn from needing a second, subtly different transcript.
  */
 export function Transcript({
   blocks,
   running,
-  onPickFile,
+  onOpen,
 }: {
   blocks: Block[];
   running: boolean;
-  onPickFile: (path: string) => void;
+  onOpen: (value: Inspect) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -49,25 +56,40 @@ export function Transcript({
       }}
     >
       <div className="transcript-inner">
-        {blocks.map((block, index) => (
-          <BlockView key={index} block={block} onPickFile={onPickFile} />
-        ))}
+        <BlockList blocks={blocks} onOpen={onOpen} />
         {running && <Working />}
       </div>
     </div>
   );
 }
 
-function BlockView({
-  block,
-  onPickFile,
+export function BlockList({
+  blocks,
+  onOpen,
 }: {
-  block: Block;
-  onPickFile: (path: string) => void;
+  blocks: Block[];
+  onOpen: (value: Inspect) => void;
 }) {
+  return (
+    <>
+      {blocks.map((block, index) => (
+        <BlockView key={index} block={block} onOpen={onOpen} />
+      ))}
+    </>
+  );
+}
+
+function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) => void }) {
   switch (block.kind) {
     case "user":
       return <div className="msg msg-user">{block.text}</div>;
+    case "queued":
+      return (
+        <div className="msg msg-user is-queued">
+          <span className="queued-tag">queued</span>
+          {block.text}
+        </div>
+      );
     case "assistant":
       return <div className="msg msg-assistant">{rich(block.text)}</div>;
     case "thinking":
@@ -81,7 +103,11 @@ function BlockView({
         </p>
       );
     case "tool":
-      return <ToolCall block={block} onPickFile={onPickFile} />;
+      return <ToolCall block={block} onOpen={onOpen} />;
+    case "batch":
+      return <BatchCall block={block} onOpen={onOpen} />;
+    case "run":
+      return <RunCall block={block} onOpen={onOpen} />;
   }
 }
 
@@ -99,22 +125,30 @@ function Thinking({ text }: { text: string }) {
   );
 }
 
-/** A path-shaped summary, which the file tools always produce. */
-function looksLikePath(summary: string): boolean {
-  return /^[~/.]/.test(summary) || /\.[A-Za-z0-9]{1,6}$/.test(summary);
-}
-
 function ToolCall({
   block,
-  onPickFile,
+  onOpen,
 }: {
   block: Extract<Block, { kind: "tool" }>;
-  onPickFile: (path: string) => void;
+  onOpen: (value: Inspect) => void;
 }) {
+  const meta = useToolMeta(block.name);
+  const view = viewFor(block.name);
   const [open, setOpen] = useState(false);
+
+  // Core decides where a call belongs; `silent` means another surface already
+  // told its story (an `ask_user` question is baked by its approval).
+  if (meta.route === "silent") return null;
+
   const done = block.result !== undefined;
   const failed = block.result?.isError ?? false;
-  const target = looksLikePath(block.summary) ? block.summary : null;
+  const body = view.body?.(block.input) ?? null;
+  const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
+
+  // A successful edit already showed its whole change as the body; repeating
+  // "ok, 3 hunks" underneath is noise. Errors always surface.
+  const showResult =
+    done && !(meta.hide_success_result && !failed) && !(body && !failed && meta.quiet_output);
 
   return (
     <div className={`tool${failed ? " is-failed" : ""}${open ? " is-open" : ""}`}>
@@ -123,30 +157,110 @@ function ToolCall({
           className="tool-expand"
           onClick={() => setOpen((was) => !was)}
           aria-expanded={open}
-          disabled={!done}
+          disabled={!done || !block.result?.content}
           title={done ? "Show the full result" : undefined}
         >
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
           <span className="tool-name">{block.name}</span>
         </button>
+
         {target ? (
-          <button
-            className="tool-target"
-            onClick={() => onPickFile(target)}
-            title="Show this file in the side panel"
-          >
+          <button className="tool-target" onClick={() => onOpen(target)} title="Open in the panel">
             {block.summary}
           </button>
         ) : (
           <span className="tool-summary">{block.summary}</span>
         )}
+
         {!done && <span className="tool-spinner" aria-label="running" />}
         {failed && <span className="tool-failed">failed</span>}
       </div>
-      {open && block.result && (
-        <pre className="tool-output">
-          {block.result.content || block.result.preview || "(no output)"}
-        </pre>
+
+      {body && <div className="tool-body">{body}</div>}
+
+      {showResult && block.result?.preview && (
+        <p className="tool-preview">{block.result.preview}</p>
+      )}
+
+      {open && block.result?.content && <pre className="tool-output">{block.result.content}</pre>}
+    </div>
+  );
+}
+
+/** Concurrent calls under one header, which is the whole reason core announces
+ *  them as a group instead of letting five identical rows stack up. */
+function BatchCall({
+  block,
+  onOpen,
+}: {
+  block: Extract<Block, { kind: "batch" }>;
+  onOpen: (value: Inspect) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const done = block.blocks.every((child) => child.kind !== "tool" || child.result !== undefined);
+
+  return (
+    <div className={`batch${open ? " is-open" : ""}`}>
+      <button className="batch-head" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
+        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        <span className="batch-label">{block.label}</span>
+        <span className="batch-count">{block.blocks.length}</span>
+        {!done && <span className="tool-spinner" aria-label="running" />}
+      </button>
+      {open && (
+        <div className="batch-body">
+          <BlockList blocks={block.blocks} onOpen={onOpen} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A delegated run.
+ *
+ * Heavier than a tool card because it is a whole conversation, and headed by
+ * the objective a human wrote rather than by the tool's name — when several are
+ * in flight, "what was this one for" is the only question worth answering at a
+ * glance.
+ */
+function RunCall({
+  block,
+  onOpen,
+}: {
+  block: Extract<Block, { kind: "run" }>;
+  onOpen: (value: Inspect) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const status = block.meta.status;
+  const state = !status ? "running" : status === "ok" ? "idle" : "failed";
+
+  return (
+    <div className={`run is-${state}${open ? " is-open" : ""}`}>
+      <div className="run-head">
+        <button className="tool-expand" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
+          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </button>
+        <StatusDot status={state} />
+        <button
+          className="run-title"
+          onClick={() => onOpen({ kind: "run", run: block.run })}
+          title="Open this run in the panel"
+        >
+          {block.meta.summary || block.meta.kind}
+        </button>
+        <span className="run-meta">
+          {block.meta.kind}
+          {block.meta.model && ` · ${block.meta.model}`}
+          {block.meta.toolCalls !== undefined &&
+            ` · ${block.meta.toolCalls} call${block.meta.toolCalls === 1 ? "" : "s"}`}
+        </span>
+      </div>
+      {open && (
+        <div className="run-body">
+          <BlockList blocks={block.blocks} onOpen={onOpen} />
+          {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
+        </div>
       )}
     </div>
   );
@@ -168,8 +282,8 @@ function FirstRun() {
     <div className="first-run">
       <h3>Ready</h3>
       <p>
-        Describe what you want done in this folder. The agent reads and edits
-        files here, and asks before anything that changes them.
+        Describe what you want done in this folder. The agent reads and edits files here, and asks
+        before anything that changes them.
       </p>
       <dl className="shortcuts">
         <div>

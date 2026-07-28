@@ -49,6 +49,73 @@ fn folder_name(cwd: &Path) -> String {
         .unwrap_or_else(|| cwd.display().to_string())
 }
 
+/// How the webview should treat one tool's calls.
+///
+/// The webview owns *presentation*; this owns *routing*, so `Transcript.tsx`
+/// never grows a chain of `if (name === …)`.
+///
+/// Only `quiet_output` is genuinely derived: it comes from the live
+/// `Tool::batch_policy()`, exactly as `RenderRegistry::from_tools` does, so it
+/// cannot drift from core's parallel-read-only set.
+///
+/// `route` and `hide_success_result` are **not** derivable today, because
+/// `CallRoute` lives in `tcode-tui` rather than in core — and this crate must
+/// not depend on the TUI. They are therefore a name list, kept here in one
+/// place rather than duplicated in TypeScript. That is a real drift risk: a new
+/// progress-style or silent tool will render as an ordinary call until this
+/// list learns about it.
+///
+/// The fix is to promote `CallRoute` to a `Tool` trait method in core (a
+/// default of `Transcript`, `Progress` on `UpdateProgressTool`, `Silent` on
+/// `AskUserTool`) and have both the TUI registry and this function read it.
+/// That is the shape CLAUDE.md asks for — a capability expressed by a trait
+/// method instead of a match on names — and it is deliberately left out of this
+/// change because it touches core, tools and the TUI together.
+#[derive(Serialize)]
+pub struct ToolViewMeta {
+    pub name: String,
+    pub route: &'static str,
+    pub quiet_output: bool,
+    pub hide_success_result: bool,
+}
+
+/// Tools whose story is told somewhere other than the transcript.
+const PROGRESS_TOOLS: &[&str] = &["update_progress"];
+const SILENT_TOOLS: &[&str] = &["ask_user"];
+/// Tools whose call body already showed the change, so a success line under it
+/// only repeats what the diff said.
+const BODY_IS_THE_RESULT: &[&str] = &["edit", "write", "multi_edit", "notebook_edit"];
+
+#[tauri::command]
+pub fn tool_views(supervisor: State<'_, Arc<Supervisor>>) -> Vec<ToolViewMeta> {
+    tool_view_metas(&supervisor.agent().tools)
+}
+
+/// The command's whole body, reachable without a window (AGENTS.md rule 2).
+pub fn tool_view_metas(tools: &[Arc<dyn tcode_core::Tool>]) -> Vec<ToolViewMeta> {
+    tools
+        .iter()
+        .map(|tool| {
+            let name = tool.name().to_string();
+            ToolViewMeta {
+                route: if PROGRESS_TOOLS.contains(&name.as_str()) {
+                    "progress"
+                } else if SILENT_TOOLS.contains(&name.as_str()) {
+                    "silent"
+                } else {
+                    "transcript"
+                },
+                quiet_output: matches!(
+                    tool.batch_policy(),
+                    tcode_core::BatchPolicy::ParallelReadOnly
+                ),
+                hide_success_result: BODY_IS_THE_RESULT.contains(&name.as_str()),
+                name,
+            }
+        })
+        .collect()
+}
+
 #[tauri::command]
 pub fn sessions(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SessionInfo> {
     supervisor

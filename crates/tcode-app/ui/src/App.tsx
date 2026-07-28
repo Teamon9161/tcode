@@ -14,8 +14,9 @@ import {
   type Status,
   type TurnFinished,
 } from "./types";
-import { applyEvent, errorBlock, userBlock, type Block } from "./transcript";
+import { applyEvent, errorBlock, userBlock, type Block } from "./blocks";
 import { applyFileEvent, type TouchedFile } from "./files";
+import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
 import { Mark } from "./components/Mark";
@@ -47,6 +48,7 @@ export function App() {
   const [states, setStates] = useState<Record<string, SessionState>>({});
   const [view, setView] = useState<string | null>(null);
   const [fault, setFault] = useState<string | null>(null);
+  const [toolMeta, setToolMeta] = useState<Map<string, ToolMeta>>(new Map());
 
   // Sessions that are not on screen still receive events — that is the whole
   // point of the app — so the reducers are keyed by session id and run
@@ -105,6 +107,13 @@ export function App() {
     invoke<SessionInfo[]>("sessions")
       .then(setSessions)
       .catch((error) => setFault(String(error)));
+
+    // Tool routing is static for the process, so it is fetched once. Failing to
+    // get it is not fatal: every tool then falls back to the ordinary transcript
+    // treatment, which is a duller conversation rather than a broken one.
+    invoke<ToolMeta[]>("tool_views")
+      .then((list) => setToolMeta(new Map(list.map((meta) => [meta.name, meta]))))
+      .catch((error) => console.warn("tool_views unavailable:", error));
 
     return () => {
       subscriptions.forEach((pending) =>
@@ -233,25 +242,31 @@ export function App() {
 
   const state = states[current.id] ?? BLANK;
   return (
-    <Workspace
-      session={current}
-      sessions={sessions}
-      blocks={state.blocks}
-      files={state.files}
-      running={state.running}
-      approval={state.approval}
-      statusOf={statusOf}
-      draft={state.draft}
-      onDraft={(draft) => patch(current.id, (was) => ({ ...was, draft }))}
-      onSend={() => send(current.id)}
-      onInterrupt={() => {
-        invoke("interrupt", { session: current.id }).catch(() => {});
-      }}
-      onAnswer={(decision, comment) => answer(current.id, decision, comment)}
-      onSelect={setView}
-      onClose={closeSession}
-      onHome={() => setView(null)}
-    />
+    <ToolMetaProvider meta={toolMeta}>
+      <Workspace
+        // Remounting per session keeps each conversation's panel history and
+        // scroll position its own; carrying them across a switch would show one
+        // session's open diff under another session's name.
+        key={current.id}
+        session={current}
+        sessions={sessions}
+        blocks={state.blocks}
+        files={state.files}
+        running={state.running}
+        approval={state.approval}
+        statusOf={statusOf}
+        draft={state.draft}
+        onDraft={(draft) => patch(current.id, (was) => ({ ...was, draft }))}
+        onSend={() => send(current.id)}
+        onInterrupt={() => {
+          invoke("interrupt", { session: current.id }).catch(() => {});
+        }}
+        onAnswer={(decision, comment) => answer(current.id, decision, comment)}
+        onSelect={setView}
+        onClose={closeSession}
+        onHome={() => setView(null)}
+      />
+    </ToolMetaProvider>
   );
 }
 

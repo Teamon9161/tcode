@@ -9,11 +9,14 @@ Tauri 桌面前端：Rust 后端（本 crate）+ webview 前端（`ui/`，Vite +
 ```bash
 cd crates/tcode-app
 (cd ui && npm install && npm run build)   # 首次 / 改过前端
+(cd ui && npm test)                       # 渲染边界测试（规则 10/11），不碰网络
 cargo build && cargo test                 # 后端 + 集成测试
 ./target/debug/tcode-app                  # 起 app（把 cwd 作为第一个会话）
 
 (cd ui && npm run preview:ui)             # 设计预览：浏览器里看全部界面状态
 ```
+
+`npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
 **改界面先开 `npm run preview:ui`。** 它用 `PREVIEW=1` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / empty 四个场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在 `PREVIEW=1` 下生效，发布产物里没有它们。
 
@@ -31,6 +34,18 @@ cargo build && cargo test                 # 后端 + 集成测试
 8. **组件里不许出现字面量颜色/圆角/字号/字体栈，一律 `var(--token)`**。`ui/src/theme/base.css` 是 token 契约（含由 `--bg`/`--ink`/`--brand` 推导的兜底值，本身不含任何字面色），`themes/porcelain.css` 是默认主题包，两者的加载顺序就是覆盖顺序。**换主题 = 换 `main.tsx` 里的一行 import**，包括排版、密度、圆角、阴影，不只是配色。token 的**名字**是契约，主题可以改值不能改名。为什么这么严：写死一个 `#1d201b` 不会报错，只会在换主题那天变成一个找不着的污点。设计依据见 `DESIGN.md`，产品判断见 `PRODUCT.md`。
 9. **路径不许用 `direction: rtl` 做前截断**。bidi 重排会把开头的 `/` 挪到结尾——`/home/me/code` 渲染成 `home/me/code/`。这不是外观问题：审批弹窗里给人看的是一条错的路径。用 `components/Path.tsx`，它按整段省略，一个字符都不改写。
 
+10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
+
+    只有两处豁免，各自在文件里写明理由：`math.tsx`（KaTeX 的产物本身就是 markup 字符串，边界改画在 KaTeX 的 options 上，`trust: false` 是承重的那一条，且 options 被 freeze 且不接受参数）和 `src/sandbox/`（见规则 11）。`src/boundary.test.ts` 机械地扫描 `src/`，除这两处外出现 `dangerouslySetInnerHTML` / `innerHTML =` / `eval` / `new Function` 即失败；`src/rich.test.tsx` 用敌意 markdown 断言输出是文本。**新增第三处豁免之前，先确认它不能改成构造节点。**
+
+11. **artifact 沙箱的三条不变量**（`src/sandbox/`，图表/图示/模型自写 HTML 都在里面渲染）：
+
+    - **iframe 永远只有 `sandbox="allow-scripts"`，绝不加 `allow-same-origin`**。没有它，frame 是不透明源：`parent.document`、`parent.__TAURI__`、`localStorage` 全部抛 DOMException（实测），于是里面爱怎么 `innerHTML` 都只能毁掉它自己。加上它，这一整套设计当场归零。`rich.test.tsx` 钉住了这个属性。
+    - **`tauri.conf.json` 的 `script-src` 永远不许出现 `unsafe-inline` / `unsafe-eval`**。它是规则 10 的第二道防线。
+    - **沙箱里的脚本必须是经典脚本，不能是 module**。实测：不透明源下 `<script type="module">` 走 CORS，请求带 `Origin: null`，除非服务端显式放行否则**根本不执行**；经典 `<script src>` 是 no-cors，无条件可用。所以 `src/sandbox/*` 由 `vite.sandbox.config.ts` 单独构建成 IIFE 进 `public/`，不走主 module graph。改成 module 会在开发机上"看起来能跑"（若 dev server 恰好发了 ACAO）而在装出来的 app 里静默失效。
+
+12. **沙箱拿到的主题值必须是 sRGB**。主题用 OKLCH 写，而沙箱里的第三方库自己解析颜色（mermaid 的 khroma 直接拒绝 `oklch(...)`）。`Sandbox.tsx` 的 `readTheme()` 负责光栅化转换后再发过去——注意只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。
@@ -39,7 +54,12 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-- `ui/src/`：`types.ts`（wire 契约）、`transcript.ts` 与 `files.ts`（事件→块 / 事件→文件清单，都是纯函数 reducer）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（会话栏 + 对话 + 文件侧栏）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture）。
+- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（会话栏 + 对话 + 单值检视面板）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture）。
+  - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
+  - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。
+  - **右侧面板是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。
+  - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿；其中 `quiet_output` 真的由 `Tool::batch_policy()` 派生，而 `route` 目前仍是 `commands.rs` 里的名字表，因为 `CallRoute` 住在 `tcode-tui` 而本 crate 不能依赖它——该文件写明了把 `route()` 提升为 core 的 trait 方法才是终局。
+  - **语法高亮是自己写的**（`syntax.ts`），因为 Shiki/highlight.js 自带调色板是字面值，主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色。它输出语义 class，颜色由 `base.css` 的 `--syn-*` 契约决定。
 - `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + `dialog:allow-open`（"打开文件夹"要它）。
 - `icons/`：由 `icons/mark.svg` 用 `rsvg-convert` 生成，改标记要重新导出全部尺寸。
 

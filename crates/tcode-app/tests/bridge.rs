@@ -438,3 +438,65 @@ async fn a_second_turn_on_a_busy_session_is_refused() {
     });
     turn.await.unwrap().unwrap();
 }
+
+// ------------------------------------------------------------- tool routing
+
+/// The webview asks the backend where each tool's calls belong, rather than
+/// keeping its own copy of the table. What matters is that the answer is
+/// derived from the live tool set, not that any particular tool is in it.
+#[test]
+fn tool_views_report_routing_derived_from_the_live_tools() {
+    use tcode_core::{BatchPolicy, PermissionRequest, Tool, ToolOutput};
+
+    struct Fake(&'static str, BatchPolicy);
+
+    #[async_trait]
+    impl Tool for Fake {
+        fn name(&self) -> &str {
+            self.0
+        }
+        fn description(&self) -> &str {
+            "test double"
+        }
+        fn input_schema(&self) -> Value {
+            serde_json::json!({ "type": "object" })
+        }
+        fn permission(&self, _: &Value) -> PermissionRequest {
+            PermissionRequest::None
+        }
+        fn batch_policy(&self) -> BatchPolicy {
+            self.1
+        }
+        async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
+            ToolOutput::ok("ok")
+        }
+    }
+
+    let tools: Vec<Arc<dyn Tool>> = vec![
+        Arc::new(Fake("read", BatchPolicy::ParallelReadOnly)),
+        Arc::new(Fake("edit", BatchPolicy::ParallelPerFile)),
+        Arc::new(Fake("update_progress", BatchPolicy::Isolated)),
+        Arc::new(Fake("ask_user", BatchPolicy::Isolated)),
+    ];
+
+    let metas = tcode_app::commands::tool_view_metas(&tools);
+    let find = |name: &str| {
+        metas
+            .iter()
+            .find(|meta| meta.name == name)
+            .unwrap_or_else(|| panic!("{name} missing from tool_views"))
+    };
+
+    // Quiet output is the one field core can actually derive, and it must track
+    // `batch_policy` rather than a name list.
+    assert!(find("read").quiet_output);
+    assert!(!find("edit").quiet_output);
+
+    // An edit's diff already told the story at the call site.
+    assert!(find("edit").hide_success_result);
+    assert!(!find("read").hide_success_result);
+
+    assert_eq!(find("read").route, "transcript");
+    assert_eq!(find("update_progress").route, "progress");
+    assert_eq!(find("ask_user").route, "silent");
+}

@@ -43,6 +43,31 @@
   --danger-wash: color-mix(in oklab, var(--danger) 12%, var(--bg));
   --danger-text: color-mix(in oklab, var(--danger) 88%, var(--ink));
 
+  /* ---- Syntax --------------------------------------------------------- */
+  /* Code colouring is part of the theme, not of a highlighting library. A
+     library ships its own palette as literal values, which no theme could then
+     reassign — and it would put a second palette inside a surface whose rule is
+     that chroma means state.
+     The derivation below is achromatic on purpose: four steps of the text
+     ramp, plus the brand for keywords, which is identity ink rather than a new
+     hue. A theme that wants a coloured scheme overrides these seven names. */
+  --syn-comment: var(--faint);
+  --syn-punct: var(--muted);
+  --syn-plain: var(--body);
+  --syn-string: var(--ink);
+  --syn-number: var(--ink);
+  --syn-keyword: var(--brand-text);
+  --syn-type: var(--ink);
+
+  /* ---- Diff ----------------------------------------------------------- */
+  /* Additions and removals are the one place a review surface must be
+     unambiguous, so they get their own washes rather than borrowing a state
+     colour. Both are also marked with a glyph, never colour alone. */
+  --diff-add-wash: color-mix(in oklab, var(--brand) 8%, var(--bg));
+  --diff-del-wash: color-mix(in oklab, var(--danger) 7%, var(--bg));
+  --diff-add-ink: var(--brand-text);
+  --diff-del-ink: var(--danger-text);
+
   /* ---- Interactive ---------------------------------------------------- */
   --hover: color-mix(in oklab, var(--bg) 95%, var(--ink));
   --pressed: color-mix(in oklab, var(--bg) 90%, var(--ink));

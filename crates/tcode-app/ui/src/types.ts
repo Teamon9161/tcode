@@ -38,6 +38,36 @@ export type AgentEvent =
       data: { attempt: number; max: number; error: string; delay_ms: number };
     }
   | { type: "StepLimitReached"; data: { max: number } }
+  /** A concurrently-dispatched group: `[call_id, name, input]` in model order. */
+  | {
+      type: "ToolBatchStart";
+      data: { label: string; calls: [string, string, unknown][] };
+    }
+  /** Typed while the turn ran, delivered into the ledger at a safe boundary. */
+  | {
+      type: "QueuedInput";
+      data: { text: string; attachments: string[]; entry_index: number };
+    }
+  | { type: "UserNote"; data: { text: string; answer: boolean } }
+  /** A `task` sub-agent run. Its whole event stream arrives nested inside
+   *  `TaskRunEvent`, which is why the transcript reducer can recurse. */
+  | {
+      type: "TaskRunStarted";
+      data: {
+        run: string;
+        parent_call: string;
+        kind: string;
+        model: string;
+        prompt: string;
+        summary: string;
+      };
+    }
+  | { type: "TaskRunEvent"; data: { run: string; event: AgentEvent } }
+  | {
+      type: "TaskRunFinished";
+      data: { run: string; status: string; tool_calls: number };
+    }
+  | { type: "AutoModePaused"; data: string }
   // Everything not spelled out above still arrives; the transcript ignores it
   // rather than crashing on a variant added since this file was written.
   | { type: string; data?: unknown };

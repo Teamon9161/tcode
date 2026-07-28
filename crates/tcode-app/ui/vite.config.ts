@@ -12,6 +12,11 @@ export default defineConfig({
   plugins: [react()],
   clearScreen: false,
   server: { port: preview ? 5174 : 5173, strictPort: true },
+  // The artifact sandbox lives in `public/` and is built separately
+  // (`vite.sandbox.config.ts`), so it is copied verbatim and never enters this
+  // module graph. It has to be a real document rather than a `srcdoc` string —
+  // a srcdoc frame inherits this page's CSP and, being an opaque origin, then
+  // cannot run any script at all (see `src/sandbox/protocol.ts`).
   build: { outDir: "dist", emptyOutDir: true },
   resolve: {
     alias: preview

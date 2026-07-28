@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!-- This document is framed without `allow-same-origin`, so it already
+         cannot reach the app: `parent.*`, storage and cookies all throw for it.
+         The policy below is about the other direction — nothing it renders may
+         call home. `connect-src 'none'` is the load-bearing line.
+
+         Note the script below is a *classic* script, not a module. A module
+         script is fetched in CORS mode, and this document's origin is opaque,
+         so the request would carry `Origin: null` and be refused unless the
+         server opts in. See `vite.sandbox.config.ts` for the measurements. -->
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'"
+    />
+    <title>tcode artifact</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        background: transparent;
+        color: var(--body, #333);
+        font-family: var(--font-ui, system-ui, sans-serif);
+        font-size: var(--text-sm, 13px);
+        overflow: hidden;
+      }
+      /* The frame is sized by what this element measures, so it must wrap its
+         content exactly — no padding, no min-height, no margin collapse. */
+      #stage {
+        display: flow-root;
+      }
+      #stage img,
+      #stage svg,
+      #stage table {
+        max-width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="stage"></div>
+    <script src="./sandbox.js"></script>
+  </body>
+</html>

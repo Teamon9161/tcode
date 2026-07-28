@@ -28,8 +28,9 @@
   height: 100%;
 }
 
+/* The panel sizes itself: its width is dragged, so the track follows it. */
 .workspace.has-panel {
-  grid-template-columns: 196px minmax(0, 1fr) 340px;
+  grid-template-columns: 196px minmax(0, 1fr) auto;
 }
 
 .stage {
@@ -39,11 +40,11 @@
   border-inline: 1px solid var(--line);
 }
 
-/* Structural, not fluid: the rail loses its labels before the file panel goes,
+/* Structural, not fluid: the rail loses its labels before the panel goes,
    because knowing which sessions exist matters more than reading their names. */
 @media (max-width: 1080px) {
-  .workspace.has-panel {
-    grid-template-columns: 196px minmax(0, 1fr) 280px;
+  .workspace.has-panel .inspector {
+    max-width: 46vw;
   }
 }
 
@@ -52,7 +53,7 @@
   .workspace.has-panel {
     grid-template-columns: 52px minmax(0, 1fr);
   }
-  .workspace.has-panel .files {
+  .workspace.has-panel .inspector {
     display: none;
   }
   .rail-name,
@@ -740,24 +741,62 @@
 }
 
 .code-block {
-  margin: 0;
-  padding: var(--s-3);
   border-radius: var(--r-sm);
   background: var(--sunken);
+  overflow: hidden;
+}
+
+/* The bar holds the language and the copy control. It stays quiet until the
+   block is hovered, because a snippet is read far more often than it is
+   copied. */
+.code-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-1) 0 var(--s-3);
+  min-height: 22px;
+}
+
+.code-lang {
+  flex: 1;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+}
+
+.code-copy {
+  display: inline-flex;
+  padding: var(--s-1);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--faint);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.code-block:hover .code-copy,
+.code-copy:focus-visible,
+.code-copy.is-done {
+  opacity: 1;
+}
+.code-copy:hover {
+  color: var(--ink);
+}
+.code-copy.is-done {
+  color: var(--brand-text);
+}
+
+.code-body {
+  margin: 0;
+  padding: var(--s-2) var(--s-3) var(--s-3);
   font-size: var(--text-xs);
   line-height: var(--lh-normal);
   overflow-x: auto;
   white-space: pre;
-  position: relative;
-}
-
-.code-lang {
-  position: absolute;
-  top: var(--s-1);
-  right: var(--s-2);
-  color: var(--faint);
-  font-size: var(--text-2xs);
-  letter-spacing: var(--tracking-wide);
 }
 
 .code-inline {
@@ -985,35 +1024,131 @@
   border-color: var(--brand);
 }
 
-/* ============================================================ file panel */
+/* ============================================================ inspector */
 
-.files {
-  display: flex;
-  flex-direction: column;
+/* One region, one thing in it. The width is set inline from the drag handle,
+   so the column tracks whatever the user pulled it to. */
+.inspector {
+  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
   min-width: 0;
   background: var(--chrome);
   overflow: hidden;
 }
 
-.files-head {
+.inspector-grip {
+  position: absolute;
+  inset-block: 0;
+  inset-inline-start: -3px;
+  width: 7px;
+  z-index: var(--z-sticky);
+  cursor: col-resize;
+  /* The hairline it sits on belongs to the layout; the grip only tints on
+     contact so the seam does not read as a third border. */
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease);
+}
+.inspector-grip:hover,
+.inspector-grip:focus-visible {
+  background: var(--brand-wash);
+}
+
+.inspector-head {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  padding: var(--s-3) var(--s-3) var(--s-3) var(--s-4);
+  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
   border-bottom: 1px solid var(--line);
 }
 
-.panel-title {
-  font-size: var(--text-sm);
-  font-weight: var(--weight-semibold);
-  color: var(--ink);
+.inspector-nav {
+  display: flex;
+  gap: 2px;
 }
 
-.panel-count {
+.inspector-head .panel-title {
   flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inspector-body {
+  overflow: auto;
+  padding: var(--s-3);
+}
+
+/* The file index is the panel's root view, so it spans the body's padding. */
+.inspector-body > .file-list,
+.inspector-body > .files-empty {
+  margin: calc(var(--s-3) * -1);
+}
+
+.inspect-path {
+  margin-bottom: var(--s-2);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  overflow-wrap: anywhere;
+}
+
+.inspect-empty {
+  padding: var(--s-4) 0;
   color: var(--faint);
   font-size: var(--text-xs);
 }
+
+/* A snapshot that something has changed since must say so where it is read,
+   not somewhere else. */
+.inspect-stale {
+  margin-bottom: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--amber-wash);
+  color: var(--amber-text);
+  font-size: var(--text-xs);
+}
+
+.inspect-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--s-1) var(--s-4);
+  margin: 0 0 var(--s-3);
+}
+.inspect-facts div {
+  display: flex;
+  gap: var(--s-2);
+  font-size: var(--text-xs);
+}
+.inspect-facts dt {
+  color: var(--faint);
+}
+.inspect-facts dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+}
+
+.inspect-prompt {
+  margin-bottom: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--body);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+
+.inspect-transcript,
+.doc {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+/* ============================================================ file index */
 
 .files-empty {
   display: flex;
@@ -1026,6 +1161,18 @@
   color: var(--muted);
   font-size: var(--text-xs);
   text-wrap: pretty;
+}
+
+.panel-title {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--ink);
+}
+
+.panel-count {
+  flex: 1;
+  color: var(--faint);
+  font-size: var(--text-xs);
 }
 
 .file-list {
@@ -1051,9 +1198,6 @@
 }
 .file-item:hover {
   background: var(--hover);
-}
-.file-item.is-selected {
-  background: var(--selected);
 }
 
 .file-name {
@@ -1100,52 +1244,16 @@
   color: var(--danger-text);
 }
 
-.file-detail {
-  display: flex;
-  flex-direction: column;
-  min-height: 0;
-  flex: 1;
-  border-top: 1px solid var(--line);
-}
-
-.file-detail-head {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-2) var(--s-3);
-}
-
-.file-detail-path {
-  flex: 1;
-  min-width: 0;
-  color: var(--ink);
-  font-family: var(--font-mono);
+/* Which agent touched a file is the question a parallel run raises, so it is
+   on the row. Achromatic on purpose: it is a fact, not a state. */
+.file-run {
+  grid-column: 1;
+  justify-self: start;
+  padding: 0 var(--s-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  color: var(--muted);
   font-size: var(--text-2xs);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.file-body {
-  flex: 1;
-  margin: 0;
-  padding: var(--s-3);
-  overflow: auto;
-  background: var(--bg);
-  color: var(--body);
-  font-size: var(--text-2xs);
-  line-height: var(--lh-normal);
-  white-space: pre;
-}
-.file-body.is-wrapped {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-
-.file-pending {
-  padding: var(--s-3);
-  color: var(--faint);
-  font-size: var(--text-xs);
 }
 
 /* ============================================================ dialog */
@@ -1331,4 +1439,607 @@
 
 .diff-text {
   min-width: 0;
+}
+
+/* ============================================================ syntax */
+
+/* Semantic classes only; the values are the theme's (base.css § Syntax). */
+.tok-comment {
+  color: var(--syn-comment);
+  font-style: italic;
+}
+.tok-punct {
+  color: var(--syn-punct);
+}
+.tok-string {
+  color: var(--syn-string);
+}
+.tok-number {
+  color: var(--syn-number);
+}
+.tok-keyword {
+  color: var(--syn-keyword);
+  font-weight: var(--weight-medium);
+}
+.tok-type {
+  color: var(--syn-type);
+}
+.tok-call {
+  color: var(--syn-type);
+  font-weight: var(--weight-medium);
+}
+
+/* ============================================================ prose */
+
+.prose-h {
+  margin: var(--s-2) 0 0;
+  color: var(--ink);
+}
+.prose-h3 {
+  font-size: var(--text-md);
+}
+.prose-h4,
+.prose-h5,
+.prose-h6 {
+  font-size: var(--text-base);
+}
+
+.prose-list {
+  margin: 0;
+  padding-left: var(--s-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+.prose-list li::marker {
+  color: var(--faint);
+}
+.prose-list li.is-task {
+  list-style: none;
+  margin-left: calc(var(--s-4) * -1);
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+}
+.prose-check {
+  accent-color: var(--brand);
+  translate: 0 2px;
+}
+
+.prose-quote {
+  margin: 0;
+  padding-left: var(--s-3);
+  border-left: 1px solid var(--line-strong);
+  color: var(--muted);
+}
+
+.prose-rule {
+  width: 100%;
+  height: 1px;
+  margin: var(--s-2) 0;
+  border: 0;
+  background: var(--line);
+}
+
+.prose-link {
+  color: var(--brand-text);
+  text-underline-offset: 3px;
+  text-decoration-thickness: 1px;
+}
+
+/* A refused scheme keeps its words and loses its affordance. Dotted, so it is
+   visibly *not* the link it claimed to be rather than silently inert. */
+.link-refused {
+  color: var(--muted);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+  cursor: not-allowed;
+}
+
+.prose-image {
+  padding: 1px var(--s-2);
+  border: 1px dashed var(--line-strong);
+  border-radius: var(--r-xs);
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+.prose-table-scroll {
+  overflow-x: auto;
+}
+
+.prose-table {
+  border-collapse: collapse;
+  font-size: var(--text-xs);
+}
+.prose-table th,
+.prose-table td {
+  padding: var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+.prose-table th {
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+}
+.prose-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+/* ============================================================ math */
+
+.math-block {
+  padding: var(--s-2) 0;
+  overflow-x: auto;
+}
+/* KaTeX sizes itself from the surrounding text, and the transcript body is the
+   right anchor, so nothing here rescales it. */
+.math .katex {
+  color: var(--ink);
+}
+
+/* ============================================================ artifacts */
+
+.previewable {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.previewable-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--chrome);
+}
+
+.previewable .code-block {
+  border-radius: 0;
+}
+.previewable .artifact {
+  border: 0;
+}
+
+.artifact {
+  margin: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.artifact-label {
+  display: block;
+  padding: var(--s-1) var(--s-3);
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+}
+.previewable .artifact-label {
+  display: none;
+}
+
+/* Height arrives by message once the frame has measured itself, so it settles
+   exactly once. That settle is deliberately not animated: transitioning height
+   thrashes layout for the whole page, and the loading bar below already says
+   the frame is still working. */
+.artifact-frame {
+  display: block;
+  width: 100%;
+  height: 120px;
+  border: 0;
+  background: transparent;
+}
+
+.artifact-loading {
+  height: 2px;
+  background: linear-gradient(90deg, transparent, var(--brand-wash), transparent);
+  animation: sweep 1.2s var(--ease) infinite;
+}
+
+@keyframes sweep {
+  from {
+    opacity: 0.3;
+  }
+  50% {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.3;
+  }
+}
+
+.artifact.is-failed {
+  border-color: var(--danger-wash);
+  background: var(--danger-wash);
+  padding-bottom: var(--s-2);
+}
+.artifact-error {
+  padding: 0 var(--s-3) var(--s-2);
+  color: var(--danger-text);
+  font-size: var(--text-xs);
+}
+.artifact-source {
+  margin: 0 var(--s-2);
+  padding: var(--s-2);
+  max-height: 200px;
+  overflow: auto;
+  border-radius: var(--r-xs);
+  background: var(--bg);
+  color: var(--body);
+  font-size: var(--text-2xs);
+  white-space: pre-wrap;
+}
+
+/* ============================================================ segmented */
+
+/* Two mutually exclusive views shown side by side rather than cycled — the
+   terminal cycles because it has one key, which is not a reason here. */
+.segmented {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+.segmented button {
+  padding: 2px var(--s-2);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.segmented button:hover {
+  color: var(--ink);
+}
+.segmented button.is-on {
+  background: var(--sunken);
+  color: var(--ink);
+  font-weight: var(--weight-medium);
+}
+.segmented-xs button {
+  font-size: var(--text-2xs);
+}
+
+/* ============================================================ diff */
+
+.diff-set {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.diff {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.diff.is-dense {
+  border-color: transparent;
+  border-radius: 0;
+}
+
+.diff-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-3);
+  border-bottom: 1px solid var(--line);
+  background: var(--chrome);
+}
+
+.diff-path {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.diff-tally {
+  display: inline-flex;
+  gap: var(--s-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.diff-added {
+  color: var(--diff-add-ink);
+}
+.diff-removed {
+  color: var(--diff-del-ink);
+}
+
+.diff-body {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  line-height: 1.6;
+  overflow-x: auto;
+}
+.diff.is-dense .diff-body {
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.diff-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  padding-right: var(--s-2);
+  white-space: pre;
+}
+.diff-add {
+  background: var(--diff-add-wash);
+}
+.diff-del {
+  background: var(--diff-del-wash);
+}
+.diff-meta {
+  color: var(--faint);
+  background: var(--sunken);
+}
+
+/* Numbers appear only where they are actually known: an edit tool matches a
+   fragment, so its absolute position in the file is not in the call, and a
+   plausible wrong number in a review surface is worse than none. */
+.diff-num {
+  flex: none;
+  width: 3.2em;
+  padding-left: var(--s-2);
+  color: var(--faint);
+  text-align: right;
+  user-select: none;
+}
+
+.diff-sign {
+  flex: none;
+  width: 1ch;
+  color: var(--faint);
+  user-select: none;
+}
+.diff-add .diff-sign {
+  color: var(--diff-add-ink);
+}
+.diff-del .diff-sign {
+  color: var(--diff-del-ink);
+}
+.diff-body:not(.is-numbered) .diff-sign {
+  padding-left: var(--s-2);
+}
+
+.diff-text {
+  color: var(--syn-plain);
+}
+
+.diff-gap {
+  padding: 2px var(--s-3) 2px 4.6em;
+  background: var(--sunken);
+  color: var(--faint);
+  font-size: var(--text-2xs);
+}
+
+.diff-split .diff-pair {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+}
+.diff-split .diff-pair > * {
+  min-width: 0;
+  overflow: hidden;
+}
+.diff-split .diff-pair > *:first-child {
+  border-right: 1px solid var(--line);
+}
+.diff-blank {
+  background: var(--sunken);
+  min-height: 1.6em;
+}
+
+/* ============================================================ tool extras */
+
+.tool-body {
+  border-top: 1px solid var(--line);
+}
+
+.tool-preview {
+  padding: var(--s-1) var(--s-3) var(--s-2);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+/* ---- batch ---- */
+
+.batch {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+
+.batch-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  text-align: left;
+}
+.batch-head:hover {
+  background: var(--hover);
+}
+.batch-label {
+  flex: 1;
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.batch-count {
+  padding: 0 var(--s-2);
+  border-radius: var(--r-pill);
+  background: var(--sunken);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+.batch-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  border-top: 1px solid var(--line);
+  background: var(--sunken);
+}
+
+/* ---- sub-agent run ---- */
+
+/* Heavier than a tool card because it is a whole conversation. The edge is a
+   hairline, not a colour bar: status is already carried by the dot. */
+.run {
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  overflow: hidden;
+}
+.run.is-running {
+  border-color: var(--brand-wash);
+}
+.run.is-failed {
+  border-color: var(--danger-wash);
+}
+
+.run-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2);
+}
+
+.run-title {
+  flex: none;
+  max-width: 60%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+  text-decoration-color: transparent;
+  transition:
+    color var(--dur-fast) var(--ease),
+    text-decoration-color var(--dur-fast) var(--ease);
+}
+.run-title:hover {
+  color: var(--brand-text);
+  text-decoration-color: currentColor;
+}
+
+.run-meta {
+  flex: 1;
+  min-width: 0;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.run-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3);
+  border-top: 1px solid var(--line);
+  background: var(--sunken);
+}
+
+.run-waiting {
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+/* ---- progress phases ---- */
+
+.phases {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+}
+
+.phase {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-size: var(--text-xs);
+}
+.phase-mark {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: var(--r-pill);
+  border: 1.5px solid var(--line-strong);
+  translate: 0 -1px;
+}
+.phase.is-completed .phase-mark {
+  background: var(--line-strong);
+}
+.phase.is-in_progress .phase-mark {
+  border-color: var(--brand);
+  background: var(--brand);
+  animation: breathe 1.8s var(--ease) infinite;
+}
+.phase-text {
+  color: var(--body);
+}
+.phase.is-completed .phase-text {
+  color: var(--faint);
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong);
+}
+.phase.is-in_progress .phase-text {
+  color: var(--ink);
+}
+
+.phases-cleared {
+  padding: var(--s-2) var(--s-3);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+/* ---- queued input ---- */
+
+/* Typed while the turn ran and delivered at a safe boundary: a real message,
+   marked as one that arrived out of order. */
+.msg-user.is-queued {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  border: 1px dashed var(--line-strong);
+  background: transparent;
+}
+.queued-tag {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
 }

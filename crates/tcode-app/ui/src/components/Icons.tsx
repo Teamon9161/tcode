@@ -90,3 +90,23 @@ export const BackIcon = (props: IconProps) => (
     <path d="m12 5.5-6.5 6.5 6.5 6.5" />
   </Glyph>
 );
+
+export const ForwardIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M5 12h13.5" />
+    <path d="m12 5.5 6.5 6.5-6.5 6.5" />
+  </Glyph>
+);
+
+export const CopyIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="9" y="9" width="11" height="11" rx="2" />
+    <path d="M15 5.5H6a1.5 1.5 0 0 0-1.5 1.5v9" />
+  </Glyph>
+);
+
+export const CheckIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="m5 12.5 4.5 4.5L19 7" />
+  </Glyph>
+);

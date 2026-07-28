@@ -4130,7 +4130,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-core"
-version = "0.1.22"
+version = "0.1.27"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -4149,7 +4149,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-frontend"
-version = "0.1.22"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "tcode-core",
@@ -4161,7 +4161,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-providers"
-version = "0.1.22"
+version = "0.1.27"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -4182,7 +4182,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tools"
-version = "0.1.22"
+version = "0.1.27"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
