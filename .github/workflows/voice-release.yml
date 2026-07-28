@@ -1,0 +1,115 @@
+name: Voice Release
+
+on:
+  push:
+    tags: ["voice-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  voiced:
+    name: Build ${{ matrix.asset }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # sherpa-onnx distributes GNU/Linux libraries only; use the oldest
+          # supported runner to keep the glibc floor low.
+          - runner: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            binary: tcode-voiced
+            asset: tcode-voiced-x86_64-linux
+          - runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: tcode-voiced
+            asset: tcode-voiced-aarch64-linux
+          - runner: macos-14
+            target: x86_64-apple-darwin
+            binary: tcode-voiced
+            asset: tcode-voiced-x86_64-macos
+          - runner: macos-14
+            target: aarch64-apple-darwin
+            binary: tcode-voiced
+            asset: tcode-voiced-aarch64-macos
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: tcode-voiced.exe
+            asset: tcode-voiced-x86_64-windows.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify tag version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#voice-v}"
+          for manifest in crates/tcode-voice-protocol/Cargo.toml crates/tcode-voiced/Cargo.toml; do
+            manifest_version="$(awk -F '"' '/^version = "/ { print $2; exit }' "$manifest")"
+            test "$version" = "$manifest_version" || {
+              echo "$GITHUB_REF_NAME does not match $manifest ($manifest_version)" >&2
+              exit 1
+            }
+          done
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install ALSA headers
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+
+      - name: Build sidecar
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/tcode-voiced/Cargo.toml
+          --target ${{ matrix.target }}
+
+      - name: Package release asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp "crates/tcode-voiced/target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            "dist/${{ matrix.asset }}"
+
+      - name: Upload release asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish Voice Release
+    needs: voiced
+    # A voice release needs every supported asset; it is independent from the
+    # main tcode workflow, so a failed voice build never blocks tcode itself.
+    if: always() && needs.voiced.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum tcode-voiced-* > checksums.txt
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/tcode-voiced-*
+            dist/checksums.txt
+          generate_release_notes: true

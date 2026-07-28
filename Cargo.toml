@@ -4,7 +4,7 @@ version.workspace = true
 edition = "2021"
 
 [workspace.package]
-version = "0.1.26"
+version = "0.1.27"
 
 [dependencies]
 tcode-core = { path = "crates/tcode-core" }
@@ -12,6 +12,7 @@ tcode-providers = { path = "crates/tcode-providers" }
 tcode-tools = { path = "crates/tcode-tools" }
 tcode-frontend = { path = "crates/tcode-frontend" }
 tcode-tui = { path = "crates/tcode-tui" }
+tcode-voice-protocol = { path = "crates/tcode-voice-protocol" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }
@@ -32,6 +33,7 @@ members = [
     "crates/tcode-tools",
     "crates/tcode-frontend",
     "crates/tcode-tui",
+    "crates/tcode-voice-protocol",
 ]
 # Built and released on their own, because each links a native dependency that
 # exists on fewer platforms than tcode itself does and `cargo build

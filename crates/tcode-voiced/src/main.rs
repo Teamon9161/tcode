@@ -198,6 +198,14 @@ mod tests {
     use super::Args;
 
     #[test]
+    fn package_version_matches_the_shared_sidecar_release_version() {
+        assert_eq!(
+            env!("CARGO_PKG_VERSION"),
+            tcode_voice_protocol::SIDECAR_VERSION
+        );
+    }
+
+    #[test]
     fn arguments_parse_in_any_order_and_default_sanely() {
         let args = Args::parse(
             [

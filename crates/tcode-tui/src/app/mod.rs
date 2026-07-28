@@ -2025,6 +2025,68 @@ mod tests {
         assert!(app.frame().contains("keys and commands"));
     }
 
+    #[test]
+    fn replay_restores_progress_compacted_into_archived_history() {
+        use tcode_core::{ContentBlock, Entry};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        let input = serde_json::json!({
+            "phases": [
+                {"phase": "inspect the compact boundary", "status": "completed"},
+                {"phase": "restore active work", "status": "in_progress"},
+            ]
+        });
+
+        // Drive the live tool route first, then replace the conversation with
+        // the compacted persisted form that resume must replay.
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "progress-1".into(),
+            name: "update_progress".into(),
+            input: input.clone(),
+            summary: String::new(),
+        });
+        assert_eq!(app.progress.len(), 2);
+        let session = app.session.as_mut().expect("harness app has a session");
+        session
+            .ledger
+            .append(Entry::Assistant(vec![ContentBlock::ToolUse {
+                id: "progress-1".into(),
+                name: "update_progress".into(),
+                input,
+            }]));
+        session
+            .ledger
+            .append(Entry::ToolResults(vec![ContentBlock::ToolResult {
+                tool_use_id: "progress-1".into(),
+                content: "progress updated".into(),
+                is_error: false,
+                images: Vec::new(),
+            }]));
+        session
+            .ledger
+            .compact("The earlier work was summarized.".into(), 2);
+        assert_eq!(session.ledger.archived().len(), 2);
+
+        app.reset_conversation_ui();
+        assert!(app.progress.is_empty(), "reset clears the live snapshot");
+        app.bake_transcript();
+
+        let restored = app
+            .progress
+            .iter()
+            .map(|phase| (phase.phase.as_str(), phase.status.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restored,
+            [
+                ("inspect the compact boundary", "completed"),
+                ("restore active work", "in_progress"),
+            ]
+        );
+        assert!(app.frame().contains("restore active work"));
+    }
+
     #[tokio::test]
     async fn plan_handoff_uses_the_execution_picker_and_starts_a_clean_default_session() {
         let dir = tempfile::tempdir().unwrap();

@@ -74,23 +74,18 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
-/// Fetch one asset from *this* version's release and write it to `dest`,
-/// verified against the release's published checksums.
+/// Fetch a voice-sidecar asset from the independent voice release and write it
+/// to `dest`, verified against that release's published checksums.
 ///
-/// Pinned to the running version rather than `latest`, which is what the rest
-/// of this module uses: tcode and the voice sidecar speak a private protocol
-/// across a pipe, so they have to come from the same build. A sidecar from a
-/// newer release would be exactly the mismatch the versioned filename exists
-/// to rule out.
-pub async fn install_release_asset(
+/// The sidecar version is intentionally independent from tcode's version: a
+/// normal tcode update reuses a compatible installed binary. Bump
+/// `tcode-voice-protocol` whenever a new sidecar build must be published.
+pub async fn install_voice_release_asset(
     asset: &str,
     dest: &Path,
     progress: &mut dyn FnMut(u8),
 ) -> Result<()> {
-    let base = format!(
-        "https://github.com/{REPOSITORY}/releases/download/v{}",
-        env!("CARGO_PKG_VERSION")
-    );
+    let base = voice_release_base();
     let client = reqwest::Client::builder()
         .user_agent(concat!("tcode/", env!("CARGO_PKG_VERSION")))
         .build()
@@ -157,6 +152,13 @@ pub async fn install_release_asset(
         .await
         .with_context(|| format!("cannot write {}", dest.display()))?;
     Ok(())
+}
+
+fn voice_release_base() -> String {
+    format!(
+        "https://github.com/{REPOSITORY}/releases/download/{}",
+        tcode_voice_protocol::RELEASE_TAG
+    )
 }
 
 /// How many times a dropped download is resumed before giving up.
@@ -454,6 +456,17 @@ mod tests {
             Some("def456".to_string())
         );
         assert_eq!(checksum_for(checksums, "tcode-aarch64-linux"), None);
+    }
+
+    #[test]
+    fn voice_download_uses_the_independent_sidecar_release() {
+        assert_eq!(
+            voice_release_base(),
+            format!(
+                "https://github.com/{REPOSITORY}/releases/download/{}",
+                tcode_voice_protocol::RELEASE_TAG
+            )
+        );
     }
 
     #[test]

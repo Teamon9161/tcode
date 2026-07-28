@@ -12,6 +12,7 @@ tcode-importers = { path = "../tcode-importers" }
 tcode-providers = { path = "../tcode-providers" }
 tcode-tools = { path = "../tcode-tools" }
 tcode-frontend = { path = "../tcode-frontend" }
+tcode-voice-protocol = { path = "../tcode-voice-protocol" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 futures = { workspace = true }

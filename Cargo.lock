@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "tcode"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2745,13 +2745,14 @@ dependencies = [
  "tcode-providers",
  "tcode-tools",
  "tcode-tui",
+ "tcode-voice-protocol",
  "tokio",
  "tokio-util",
 ]
 
 [[package]]
 name = "tcode-core"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "async-trait",
  "base64",
@@ -2771,7 +2772,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-frontend"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "tcode-core",
@@ -2784,7 +2785,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-importers"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "dirs",
  "serde_json",
@@ -2794,7 +2795,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-providers"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "async-stream",
  "async-trait",
@@ -2815,7 +2816,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tools"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "async-trait",
  "base64",
@@ -2844,7 +2845,7 @@ dependencies = [
 
 [[package]]
 name = "tcode-tui"
-version = "0.1.26"
+version = "0.1.27"
 dependencies = [
  "anyhow",
  "arboard",
@@ -2865,12 +2866,17 @@ dependencies = [
  "tcode-importers",
  "tcode-providers",
  "tcode-tools",
+ "tcode-voice-protocol",
  "tempfile",
  "tokio",
  "tokio-util",
  "unicode-width 0.2.0",
  "url",
 ]
+
+[[package]]
+name = "tcode-voice-protocol"
+version = "0.1.16"
 
 [[package]]
 name = "tempfile"

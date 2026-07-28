@@ -178,6 +178,7 @@ mod tests {
         let prompt = compact_prompt(Some("prioritize API decisions and migration risks"));
         assert!(prompt.contains("**Current state**"));
         assert!(prompt.contains("**Next steps**"));
+        assert!(prompt.contains("**Active progress**"));
         assert!(prompt.contains("prioritize API decisions and migration risks"));
         assert!(prompt.contains("supplements, not replaces"));
         assert!(!prompt.contains("{{USER_FOCUS}}"));

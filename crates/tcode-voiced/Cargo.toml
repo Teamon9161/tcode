@@ -8,7 +8,8 @@ license = "Apache-2.0"
 # Deliberately NOT a workspace member. sherpa-onnx's build script downloads a
 # prebuilt native library, and cpal links libasound on Linux; neither can be
 # part of `cargo build --workspace` without breaking CI and the musl and
-# windows-aarch64 release targets. See plan.md.
+# windows-aarch64 release targets. Its version must match tcode-voice-protocol,
+# which names the independent sidecar release. See plan.md.
 
 [dependencies]
 cpal = "0.15"
@@ -19,3 +20,4 @@ ureq = "2"
 tar = "0.4"
 bzip2 = "0.4"
 dirs = "5"
+tcode-voice-protocol = { path = "../tcode-voice-protocol" }

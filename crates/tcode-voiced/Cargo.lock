@@ -1096,6 +1096,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "tcode-voice-protocol"
+version = "0.1.16"
+
+[[package]]
 name = "tcode-voiced"
 version = "0.1.16"
 dependencies = [
@@ -1106,6 +1110,7 @@ dependencies = [
  "serde_json",
  "sherpa-onnx",
  "tar",
+ "tcode-voice-protocol",
  "ureq",
 ]
 

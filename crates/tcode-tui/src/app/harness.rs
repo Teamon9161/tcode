@@ -222,6 +222,10 @@ pub(super) fn app_with_provider_setup(
 }
 
 fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> App {
+    let mut tools = tcode_tools::builtin_tools(cwd);
+    // `update_progress` is a main-agent-only frontend addition, not part of
+    // the delegated base toolset. Keep the harness aligned with that assembly.
+    tools.push(Arc::new(tcode_tools::UpdateProgressTool));
     let agent = Agent {
         model: ModelCell::new(ActiveModel {
             provider: Arc::new(StubProvider),
@@ -230,7 +234,7 @@ fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> Ap
             effort: None,
         }),
         models: AgentModels::default(),
-        tools: tcode_tools::builtin_tools(cwd),
+        tools,
         system: "test".into(),
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),

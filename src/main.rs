@@ -548,7 +548,11 @@ async fn main() -> anyhow::Result<()> {
                         // Called from a blocking worker, which still carries
                         // the runtime context needed to drive the download.
                         tokio::runtime::Handle::current()
-                            .block_on(update::install_release_asset(asset, &dest, &mut progress))
+                            .block_on(update::install_voice_release_asset(
+                                asset,
+                                &dest,
+                                &mut progress,
+                            ))
                             .map_err(|e| format!("cannot install the voice backend: {e:#}"))
                     },
                 )),

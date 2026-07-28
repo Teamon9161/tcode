@@ -22,16 +22,17 @@ const EXECUTABLE: &str = if cfg!(windows) {
     "tcode-voiced"
 };
 
-/// A downloaded sidecar, named after the tcode it belongs to.
+/// A downloaded sidecar, named after its own release version.
 ///
-/// The version is in the filename so that "installed but out of date" is not a
-/// state that can exist: a tcode looks for its own version and finds it or does
-/// not. There is nothing to compare, and no way to run a binary that disagrees
-/// with the flags being passed to it — which is the failure this replaces.
+/// Ordinary tcode releases reuse this binary. A voice release only changes the
+/// name when its private pipe protocol needs a new sidecar build.
 fn versioned_executable() -> String {
-    let version = env!("CARGO_PKG_VERSION");
     let suffix = if cfg!(windows) { ".exe" } else { "" };
-    format!("tcode-voiced-{version}{suffix}")
+    format!(
+        "tcode-voiced-{}{}",
+        tcode_voice_protocol::SIDECAR_VERSION,
+        suffix
+    )
 }
 
 /// The release asset for this machine, or `None` where no sidecar can be built.
@@ -322,15 +323,15 @@ pub(crate) fn resolve(cfg: &VoiceConfig) -> Result<PathBuf, String> {
 mod tests {
     use super::*;
 
-    /// The downloaded name carries this tcode's version, and the asset it comes
-    /// from agrees about the executable suffix. Both are strings assembled by
-    /// hand in two places, which is exactly where a release goes quietly wrong.
+    /// The downloaded name carries the shared sidecar version, and the asset it
+    /// comes from agrees about the executable suffix. Both are strings assembled
+    /// by hand in two places, which is exactly where a release goes quietly wrong.
     #[test]
-    fn the_installed_name_is_pinned_to_this_version_and_matches_its_asset() {
+    fn the_installed_name_uses_the_shared_sidecar_version_and_matches_its_asset() {
         let name = versioned_executable();
         assert!(
-            name.contains(env!("CARGO_PKG_VERSION")),
-            "{name} does not say which tcode it belongs to"
+            name.contains(tcode_voice_protocol::SIDECAR_VERSION),
+            "{name} does not say which sidecar release it belongs to"
         );
         assert_eq!(name.ends_with(".exe"), cfg!(windows));
         if let Some(asset) = release_asset() {

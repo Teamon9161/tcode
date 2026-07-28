@@ -169,6 +169,7 @@ loop {
 - 持久上下文两类禁止混写：**人维护指令**（项目根→cwd 分层，每层 `.tcode/AGENTS.md` > `AGENTS.md` > `CLAUDE.md` 取第一个）；**模型维护自动记忆**（`~/.tcode/projects/<id>/memory/`，`MEMORY.md` 只做精简索引）。
 - 会话/checkpoint/blob/scratch：`~/.tcode/projects/<project-id>/{sessions,checkpoints,blobs,scratchpad}/`。scratch 暴露给模型（project_map 的 `scratch:` 行 + 系统 prompt 引导），溢出输出与后台日志落 `scratchpad/tool-output/`，7 天清理。
 - **`<project-id>` 用路径本身而非 hash**（`c:\code\rust\tcode` → `c--code-rust-tcode`）：这个目录名是人去翻会话日志、存档 plan、项目记忆时唯一的线索，不可读的 hash 让每个目录都无法辨认。折叠分隔符不是单射（`C:\code\rust-tcode` 会撞上），代价是两个项目共用一份状态，接受。旧 hash 目录在 `store::project_dir_in` 里懒迁移（rename，目标已存在则并入），迁完即可删那段代码。
+- **voice sidecar has an independent release version**: `tcode-voice-protocol` is the shared source of `SIDECAR_VERSION` and the `voice-v<version>` release tag. Normal tcode releases reuse `~/.tcode/voice/tcode-voiced-<sidecar-version>`; bump and publish this version only when the sidecar itself changes. The sidecar’s `Cargo.toml` version is tested against the shared version, while the `voice-v*` workflow validates both manifests before building platform assets.
 - API key 经 `api_key_env` 指环境变量，不落盘。
 
 ## 验证方式
@@ -210,3 +211,6 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 ## 改进
 1. claude-code rules?
 2. gpt订阅有图片生成模型吗
+3. voice另外开版本?不然每次tcode升级都要重下不合理,因为voice其实没更新.
+4. update_progress如果之前中断后(比如compact了)后面还会记得吗.sub-agent是不是也默认不应该用update_progress, 这个tool是不是也要默认排除
+5. acp支持

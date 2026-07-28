@@ -15,7 +15,7 @@ curl -fsSL https://raw.githubusercontent.com/Teamon9161/tcode/main/install.sh | 
 The default destination is `~/.local/bin`. To choose a version or install directory:
 
 ```sh
-TCODE_VERSION=0.1.9 TCODE_INSTALL_DIR=/usr/local/bin \
+TCODE_VERSION=0.1.27 TCODE_INSTALL_DIR=/usr/local/bin \
   sh -c "$(curl -fsSL https://raw.githubusercontent.com/Teamon9161/tcode/main/install.sh)"
 ```
 
@@ -37,8 +37,9 @@ tcode update
 
 The command selects the current platform's release binary, verifies `checksums.txt`, and replaces the executable. On Windows the replacement completes immediately after `tcode` exits.
 
-## Build from source
+The sidecar is released independently at `voice-v<version>` only when its code or model support changes. Ordinary `v<version>` tcode releases reuse the installed sidecar.
 
+## Build from source
 ```sh
 cargo build --release
 cargo run
