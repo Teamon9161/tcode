@@ -1,0 +1,16 @@
+[package]
+name = "tcode-acp"
+version.workspace = true
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+uuid = { workspace = true }
+tcode-core = { path = "../tcode-core" }
+tcode-frontend = { path = "../tcode-frontend" }
+tcode-providers = { path = "../tcode-providers" }
+tcode-tools = { path = "../tcode-tools" }

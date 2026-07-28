@@ -1055,7 +1055,8 @@ impl Agent {
                         input.clone()
                     };
                     let approval = approver
-                        .ask(
+                        .ask_with_call(
+                            id,
                             name,
                             request.summary(),
                             &request.approval_label(),
@@ -1686,7 +1687,8 @@ impl Agent {
                         unreachable!("file mutation needs an edit approval")
                     };
                     let approval = approver
-                        .ask(
+                        .ask_with_call(
+                            id,
                             name,
                             &summary,
                             &request.approval_label(),
@@ -2082,7 +2084,8 @@ impl Agent {
                         unreachable!()
                     };
                     let approval = approver
-                        .ask(
+                        .ask_with_call(
+                            id,
                             name,
                             summary,
                             &request.approval_label(),

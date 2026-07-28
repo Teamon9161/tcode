@@ -266,6 +266,9 @@ struct Cli {
     /// system prompt, toolset, and model pin replace the interactive defaults
     #[arg(long)]
     agent: Option<String>,
+    /// Serve as an ACP v1 stdio agent for editor integrations.
+    #[arg(long)]
+    acp: bool,
 }
 
 #[derive(Subcommand)]
@@ -284,6 +287,19 @@ async fn main() -> anyhow::Result<()> {
     };
     if matches!(cli.command, Some(Command::Update)) {
         return update::run().await;
+    }
+    if cli.acp {
+        if cli.prompt.is_some() || cli.r#continue || cli.resume.is_some() {
+            anyhow::bail!("--acp cannot be combined with --prompt/--continue/--resume");
+        }
+        return tcode_acp::serve_stdio(tcode_acp::ServeSpec {
+            config_file,
+            profile: cli.profile,
+            model: cli.model,
+            mode: cli.mode,
+            agent: cli.agent,
+        })
+        .await;
     }
     let cwd = std::env::current_dir()
         .context("cannot determine working directory")?

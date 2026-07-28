@@ -258,6 +258,24 @@ pub trait Approver: Send + Sync {
         input: &Value,
     ) -> Approval;
 
+    /// Like [`Self::ask`], but supplies the provider-issued tool call id when
+    /// the caller has one. Existing frontends retain the simpler method;
+    /// protocol adapters can use this stable identity to correlate an approval
+    /// with an external tool-call lifecycle.
+    async fn ask_with_call(
+        &self,
+        _call_id: &str,
+        tool: &str,
+        summary: &str,
+        descriptor: &str,
+        is_edit: bool,
+        allows_project: bool,
+        input: &Value,
+    ) -> Approval {
+        self.ask(tool, summary, descriptor, is_edit, allows_project, input)
+            .await
+    }
+
     /// Review several pending calls at once. Only calls the harness would
     /// otherwise prompt for individually are offered here, so answering `All`
     /// can never authorize more than the per-call flow would have asked about.

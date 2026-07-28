@@ -2740,6 +2740,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tcode-acp",
  "tcode-core",
  "tcode-frontend",
  "tcode-providers",
@@ -2748,6 +2749,22 @@ dependencies = [
  "tcode-voice-protocol",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "tcode-acp"
+version = "0.1.27"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde_json",
+ "tcode-core",
+ "tcode-frontend",
+ "tcode-providers",
+ "tcode-tools",
+ "tokio",
+ "tokio-util",
+ "uuid",
 ]
 
 [[package]]

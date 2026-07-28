@@ -11,6 +11,7 @@ tcode-core = { path = "crates/tcode-core" }
 tcode-providers = { path = "crates/tcode-providers" }
 tcode-tools = { path = "crates/tcode-tools" }
 tcode-frontend = { path = "crates/tcode-frontend" }
+tcode-acp = { path = "crates/tcode-acp" }
 tcode-tui = { path = "crates/tcode-tui" }
 tcode-voice-protocol = { path = "crates/tcode-voice-protocol" }
 tokio = { workspace = true }
@@ -32,6 +33,7 @@ members = [
     "crates/tcode-providers",
     "crates/tcode-tools",
     "crates/tcode-frontend",
+    "crates/tcode-acp",
     "crates/tcode-tui",
     "crates/tcode-voice-protocol",
 ]
