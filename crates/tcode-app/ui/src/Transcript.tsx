@@ -3,7 +3,7 @@ import { useLayoutEffect, useRef, useState } from "react";
 import type { Block } from "./blocks";
 import type { Inspect } from "./inspect";
 import { rich } from "./rich";
-import { useToolMeta, viewFor } from "./toolViews";
+import { useToolMeta, viewFor, displayToolSummary } from "./toolViews";
 import { ChevronDown, ChevronRight } from "./components/Icons";
 import { StatusDot } from "./components/Status";
 
@@ -155,47 +155,56 @@ function ToolCall({
   const failed = block.result?.isError ?? false;
   const body = view.body?.(block.input) ?? null;
   const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
-  // Batched calls arrive without one (see `describe` in toolViews).
-  const summary = block.summary || view.summary?.(block.input) || "";
+  const summary = displayToolSummary(block.name, block.summary, block.input);
+  const detail = view.detail?.(block.input) ?? null;
+  const canExpand = Boolean(detail || block.result?.content);
 
-  // A successful edit already showed its whole change as the body; repeating
-  // "ok, 3 hunks" underneath is noise. Errors always surface.
-  const showResult =
-    done && !(meta.hide_success_result && !failed) && !(body && !failed && meta.quiet_output);
+  // The transcript is an execution trace, not an output log. A successful call
+  // already has a stable destination in the inspector; only failures need a
+  // diagnostic in the main reading flow.
+  const showResult = done && failed;
 
   return (
     <div className={`tool${failed ? " is-failed" : ""}${open ? " is-open" : ""}`}>
       <div className="tool-head">
-        <button
-          className="tool-expand"
-          onClick={() => setOpen((was) => !was)}
-          aria-expanded={open}
-          disabled={!done || !block.result?.content}
-          title={done ? "Show the full result" : undefined}
-        >
-          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-          <span className="tool-name">{block.name}</span>
-        </button>
+        <span className="tool-name">{block.name}</span>
+        <span className="tool-separator" aria-hidden>
+          ·
+        </span>
 
         {target ? (
           <button className="tool-target" onClick={() => onOpen(target)} title="Open in the panel">
-            {summary}
+            {summary || "details"}
           </button>
         ) : (
-          <span className="tool-summary">{summary}</span>
+          <span className="tool-summary">{summary || "details"}</span>
         )}
 
         {!done && <span className="tool-spinner" aria-label="running" />}
         {failed && <span className="tool-failed">failed</span>}
+        {canExpand && (
+          <button
+            className="tool-expand"
+            onClick={() => setOpen((was) => !was)}
+            aria-expanded={open}
+            title={open ? "Hide details" : "Show full details"}
+          >
+            {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+            <span className="tool-expand-label">details</span>
+          </button>
+        )}
       </div>
 
       {body && <div className="tool-body">{body}</div>}
 
-      {showResult && block.result?.preview && (
-        <p className="tool-preview">{block.result.preview}</p>
-      )}
+      {showResult && block.result?.preview && <p className="tool-preview">{block.result.preview}</p>}
 
-      {open && block.result?.content && <pre className="tool-output">{block.result.content}</pre>}
+      {open && (detail || block.result?.content) && (
+        <div className="tool-details">
+          {detail && <pre className="tool-command">{detail}</pre>}
+          {block.result?.content && <pre className="tool-output">{block.result.content}</pre>}
+        </div>
+      )}
     </div>
   );
 }

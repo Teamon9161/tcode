@@ -62,9 +62,12 @@ export type ToolView = {
   body?(input: unknown): ReactNode;
   /** What opening this call shows in the inspector. */
   inspect?(input: unknown, callId: string, result?: ToolResult): Inspect | null;
-  /** What this call is *about*, when the event stream did not say.
-   *  See `describe` below for why that happens. */
+  /** What this call is *about*, derived from its input. */
   summary?(input: unknown): string | null;
+  /** Prefer the input-derived summary over core's generic `tool(argument)` label. */
+  preferInputSummary?: boolean;
+  /** Detail that is useful before a result exists, such as a multi-line command. */
+  detail?(input: unknown): string | null;
 };
 
 const targetPath = (input: unknown): string | null => {
@@ -91,6 +94,19 @@ const reading: ToolView = {
     const path = targetPath(input);
     return path ? { kind: "file", path, at: callId } : null;
   },
+  summary: readTarget,
+  preferInputSummary: true,
+};
+
+const shell: ToolView = {
+  summary: commandPreview,
+  preferInputSummary: true,
+  detail: commandOf,
+};
+
+const pattern: ToolView = {
+  summary: patternTarget,
+  preferInputSummary: true,
 };
 
 const VIEWS: Record<string, ToolView> = {
@@ -99,6 +115,10 @@ const VIEWS: Record<string, ToolView> = {
   multi_edit: editing,
   notebook_edit: editing,
   read: reading,
+  shell,
+  bash: shell,
+  grep: pattern,
+  glob: pattern,
   update_progress: { body: (input) => <Phases input={input} /> },
 };
 
@@ -109,20 +129,62 @@ const FALLBACK: ToolView = {
   summary: describe,
 };
 
+function readTarget(input: unknown): string | null {
+  const path = targetPath(input);
+  if (!path || typeof input !== "object" || input === null) return path;
+  const record = input as Record<string, unknown>;
+  const offset = typeof record.offset === "number" && record.offset > 1 ? record.offset : 1;
+  const limit = typeof record.limit === "number" && record.limit > 0 ? record.limit : null;
+  if (limit) return `${path}:${offset}-${offset + limit - 1}`;
+  return offset > 1 ? `${path}:${offset}-` : path;
+}
+
+function patternTarget(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const record = input as Record<string, unknown>;
+  const pattern = typeof record.pattern === "string" ? record.pattern.trim() : "";
+  if (!pattern) return null;
+  const path = typeof record.path === "string" ? record.path.trim() : "";
+  return path && path !== "." ? `${pattern} in ${path}` : pattern;
+}
+
+function commandOf(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const command = (input as Record<string, unknown>).command;
+  return typeof command === "string" && command.trim() ? command : null;
+}
+
+/** Matches the TUI's capped first-line command label; the complete command
+ * remains available from the disclosure beside it. */
+function commandPreview(input: unknown): string | null {
+  const command = commandOf(input);
+  if (!command) return null;
+  const firstLine = command.trim().split("\n", 1)[0];
+  const limit = 56;
+  return firstLine.length > limit ? `${firstLine.slice(0, limit)}…` : firstLine;
+}
+
+/**
+ * The live stream already carries core's concise call summary. Ledger replay
+ * cannot: it has the tool name and input but no ephemeral `ToolStart` event,
+ * so it supplies the bare name. The header always owns the verb, therefore a
+ * bare or generic `tool(argument)` summary is replaced with the registry's
+ * input-derived target instead of becoming `read read` on resume.
+ */
+export function displayToolSummary(name: string, supplied: string, input: unknown): string {
+  const view = viewFor(name);
+  const fromInput = view.summary?.(input) ?? "";
+  const normalized = supplied.trim();
+  const generic = normalized === name || normalized === `${name}()` || normalized.startsWith(`${name}(`);
+  if ((view.preferInputSummary || generic) && fromInput) return fromInput;
+  return normalized || fromInput;
+}
+
 /**
  * A one-line "what this call is about", derived from its input.
  *
- * Needed because `ToolBatchStart` carries `(call_id, name, input)` and nothing
- * else: core emits no per-call `ToolStart` for the concurrent paths (parallel
- * reads, file-mutation lanes), so batched calls arrive with no summary at all.
- * Without this, expanding a batch of five reads shows five rows saying `read`
- * and nothing about *what* was read — the batch header collapses them, and then
- * opening it tells you nothing.
- *
- * This is presentation, not routing: it names the argument the tool's own
- * schema calls the target. The durable fix is core carrying the same summary in
- * `ToolBatchStart` that it already computes for `ToolStart` (`summarize_call`),
- * which would also give the TUI one definition instead of two.
+ * Batch calls arrive without a `ToolStart` summary, so this preserves their
+ * target rather than leaving a list of indistinguishable tool names.
  */
 function describe(input: unknown): string | null {
   if (typeof input !== "object" || input === null) return null;
