@@ -182,21 +182,18 @@ pub struct Session {
     /// A permission-mode switch staged while the turn was running, committed
     /// at the next batch boundary. The frontend holds a clone of this handle.
     pub pending_mode: PendingMode,
-    /// The mode the model was last told about. A mode key press only changes
-    /// the permission gate; a user delivery point compares this with `mode` to
-    /// decide whether the model needs an enter/leave-plan explanation.
-    last_notified_mode: PermissionMode,
-    /// A completed approval or queued user prompt authorizes the next safe
-    /// boundary to tell the model about the final selected mode. Bare mode-key
-    /// changes never set this, so they cannot leak transient plan guidance into
-    /// the append-only ledger.
-    mode_delivery_pending: bool,
+    /// The one durable multi-phase task this conversation is currently working
+    /// through. Other progress files can exist on disk, but must be explicitly
+    /// resumed before replacing this one.
+    pub current: Option<crate::progress::Progress>,
     /// File snapshots for rewind; no-op unless persistence is set up.
     pub checkpoints: crate::checkpoint::CheckpointStore,
-    /// The durable file for the plan currently under review. A rejected plan's
-    /// next version updates this same artifact; approval clears it for the
-    /// next planning cycle.
-    pub plan_draft: crate::plan_draft::PlanDraft,
+    /// The current progress file needs re-describing to the model at the next
+    /// user delivery point. Set when the model cannot already have it: a fresh
+    /// session or `/resume`, and after a `compact` dropped the tool calls that
+    /// carried it. Never set by the model's own updates — those are in the
+    /// ledger, and re-sending them is pure waste.
+    progress_injection_pending: bool,
     /// Prompt size of the latest request (for the context status line).
     pub last_prompt_tokens: u64,
     pub turn_usage: Usage,
@@ -274,17 +271,9 @@ impl Session {
             tool_ctx,
             pending: PendingInput::default(),
             pending_mode: PendingMode::default(),
-            // Seed as "not yet explained" when starting in plan mode so the
-            // first user prompt receives plan guidance. The model never needs a
-            // note for a non-plan starting mode.
-            last_notified_mode: if mode == PermissionMode::Plan {
-                PermissionMode::Default
-            } else {
-                mode
-            },
-            mode_delivery_pending: false,
+            current: None,
             checkpoints: crate::checkpoint::CheckpointStore::default(),
-            plan_draft: crate::plan_draft::PlanDraft::default(),
+            progress_injection_pending: false,
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
             dogfood: false,

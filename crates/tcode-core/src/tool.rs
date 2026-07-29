@@ -105,11 +105,13 @@ pub enum PermissionRequest {
     /// unsafe mode. It is not an authorization request and can never become a
     /// persistent allow rule.
     UserInput { descriptor: String, summary: String },
-    /// A completed plan submitted from plan mode for review. The human either
-    /// approves it — carrying a permission-mode transition back in the
-    /// `Approval` — or returns feedback to keep planning. Only reachable in
-    /// plan mode (see `PermissionRules::decide`); it never becomes an allow
-    /// rule. The plan body travels in the tool input, not here.
+    /// A draft progress file submitted for review. The human either approves
+    /// it — carrying the permission-mode transition they chose for execution
+    /// back in the `Approval` — or returns feedback and the file stays a draft.
+    /// It never becomes an allow rule, and it is never delegated: sub-agents
+    /// filter their toolset on this request type, so only the conversation the
+    /// user is watching can ask them to approve a plan. The plan body travels
+    /// in the review copy of the tool input, not here.
     PlanReview { title: String },
 }
 
@@ -130,7 +132,7 @@ impl PermissionRequest {
         match self {
             PermissionRequest::Ask { descriptor, .. }
             | PermissionRequest::UserInput { descriptor, .. } => descriptor,
-            PermissionRequest::PlanReview { .. } => "exit_plan",
+            PermissionRequest::PlanReview { .. } => "progress",
             PermissionRequest::None => "",
         }
     }
@@ -315,6 +317,13 @@ pub struct ToolCtx {
     pub blobs: Mutex<BlobStore>,
     pub background: Mutex<BackgroundTasks>,
     pub memory: Mutex<crate::memory::MemoryManager>,
+    /// The progress file this conversation is working through, if any. It lives
+    /// here rather than on `Session` because the `progress` tool is the file's
+    /// only writer and a tool is handed a `ToolCtx`, never a `Session`; the
+    /// session, `/plan` and the frontends read it through this same cell. A
+    /// sub-agent gets a fresh context and no `progress` tool, so delegation
+    /// cannot touch the parent's plan.
+    pub progress: Mutex<Option<crate::progress::Progress>>,
     /// Session-stable instruction discovery policy reused by `/cd` and
     /// delegated agents.
     pub instruction_discovery: crate::memory::InstructionDiscovery,
@@ -428,6 +437,7 @@ impl ToolCtx {
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
+            progress: Mutex::new(None),
             instruction_discovery,
             model: None,
             task_traces: Arc::new(Mutex::new(TaskTraces::default())),

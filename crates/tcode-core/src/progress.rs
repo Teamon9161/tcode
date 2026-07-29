@@ -1,0 +1,999 @@
+//! Progress: one durable file per multi-phase task.
+//!
+//! A progress file is the same object a session used to split between an
+//! in-memory `update_progress` list and a reviewed plan draft: an ordered work
+//! breakdown. The only differences were durability and whether a human had
+//! nodded, so both are properties of one object here — `state` says whether the
+//! breakdown has been approved, and the file says it survives the session.
+//!
+//! Two invariants make this cheap rather than a verbose markdown edit loop, and
+//! both are structural rather than prompt discipline:
+//!
+//! 1. **The tool is the file's only writer.** The model never `edit`s this
+//!    markdown, so a phase flip costs one call instead of two round trips of
+//!    full text. [`Progress::reconcile`] is what makes that safe when the user
+//!    edits the file by hand.
+//! 2. **Phase detail is delivered on demand.** A twelve-phase plan keeps
+//!    exactly one phase's prose in context — the one just entered, handed back
+//!    by [`Progress::set_phases`].
+//!
+//! A progress file is externally mutable state, not history. The ledger records
+//! the tool calls the model made; this file records what is true now. Nothing
+//! here touches the append-only invariant.
+
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::store;
+
+/// Nesting bound. Deeper than this means the plan wants splitting into two
+/// progress files; without a hard cap models generate tree-shaped monsters.
+pub const MAX_DEPTH: usize = 2;
+
+/// An unfinished progress file older than this stops appearing in the opening
+/// inventory. Nothing is deleted — a stale draft is still the user's.
+const STALE_AFTER: Duration = Duration::from_secs(14 * 24 * 3600);
+
+/// How many unfinished progress files the opening inventory lists.
+pub const INVENTORY_LIMIT: usize = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ProgressState {
+    /// Written, not yet approved. The model must not start executing it.
+    #[default]
+    Draft,
+    /// Approved (or model-authored for work that needs no approval).
+    Active,
+    /// Every phase landed. Archived: kept on disk, dropped from the inventory.
+    Done,
+}
+
+impl ProgressState {
+    pub fn label(self) -> &'static str {
+        match self {
+            ProgressState::Draft => "draft",
+            ProgressState::Active => "active",
+            ProgressState::Done => "done",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "draft" => Some(ProgressState::Draft),
+            "active" => Some(ProgressState::Active),
+            "done" => Some(ProgressState::Done),
+            _ => None,
+        }
+    }
+
+    /// Legal transitions are the lifecycle's own arrows: a draft is approved
+    /// into `active`, an active plan is either finished or sent back for
+    /// revision. Everything else — reviving an archived plan, skipping the
+    /// approval that `active` means — is rejected rather than silently applied.
+    fn may_become(self, next: Self) -> bool {
+        use ProgressState::*;
+        self == next
+            || matches!(
+                (self, next),
+                (Draft, Active) | (Active, Done) | (Active, Draft)
+            )
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PhaseStatus {
+    #[default]
+    Pending,
+    InProgress,
+    Completed,
+}
+
+impl PhaseStatus {
+    /// The box a human reads and can type by hand. Chosen over any richer
+    /// encoding precisely because all three parties — user, model, parser —
+    /// agree on it at a glance.
+    fn box_mark(self) -> &'static str {
+        match self {
+            PhaseStatus::Pending => "[ ]",
+            PhaseStatus::InProgress => "[>]",
+            PhaseStatus::Completed => "[x]",
+        }
+    }
+
+    fn from_box(mark: &str) -> Option<Self> {
+        match mark {
+            "[ ]" | "[]" => Some(PhaseStatus::Pending),
+            "[>]" => Some(PhaseStatus::InProgress),
+            "[x]" | "[X]" => Some(PhaseStatus::Completed),
+            _ => None,
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw.trim() {
+            "pending" => Some(PhaseStatus::Pending),
+            "in_progress" => Some(PhaseStatus::InProgress),
+            "completed" => Some(PhaseStatus::Completed),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            PhaseStatus::Pending => "pending",
+            PhaseStatus::InProgress => "in_progress",
+            PhaseStatus::Completed => "completed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Phase {
+    pub phase: String,
+    pub status: PhaseStatus,
+    /// Why, which files, what risk. The most valuable text in the file and the
+    /// one that must not sit in context permanently.
+    pub detail: String,
+    pub phases: Vec<Phase>,
+}
+
+impl Phase {
+    pub fn new(phase: impl Into<String>, status: PhaseStatus) -> Self {
+        Self {
+            phase: phase.into(),
+            status,
+            detail: String::new(),
+            phases: Vec::new(),
+        }
+    }
+
+    /// Read one phase out of model-authored tool input. `depth` is 1 for a
+    /// top-level phase; the cap is enforced here so no caller can bypass it.
+    fn from_json(value: &Value, depth: usize) -> Result<Self, String> {
+        let phase = value["phase"]
+            .as_str()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| "every phase needs a non-empty `phase` title".to_string())?
+            .to_string();
+        let status = value["status"]
+            .as_str()
+            .map_or(Some(PhaseStatus::Pending), PhaseStatus::parse)
+            .ok_or_else(|| {
+                format!(
+                    "phase '{phase}' has an unknown `status`; use pending, in_progress or completed"
+                )
+            })?;
+        let detail = value["detail"].as_str().unwrap_or("").trim().to_string();
+        let nested = value["phases"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+        if !nested.is_empty() && depth >= MAX_DEPTH {
+            return Err(format!(
+                "phase '{phase}' nests deeper than {MAX_DEPTH} levels; a plan that needs a third level should be split into two progress files"
+            ));
+        }
+        let phases = nested
+            .iter()
+            .map(|child| Phase::from_json(child, depth + 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            phase,
+            status,
+            detail,
+            phases,
+        })
+    }
+
+    fn walk<'a>(&'a self, out: &mut Vec<&'a Phase>) {
+        out.push(self);
+        for child in &self.phases {
+            child.walk(out);
+        }
+    }
+}
+
+/// Read a whole `phases` array out of tool input.
+pub fn phases_from_json(value: &Value) -> Result<Vec<Phase>, String> {
+    let Some(items) = value.as_array() else {
+        return Err("`phases` must be an array".to_string());
+    };
+    items.iter().map(|item| Phase::from_json(item, 1)).collect()
+}
+
+/// The file rejected a write because the bytes on disk are no longer the ones
+/// the harness last wrote. The user edited the plan; their version wins.
+#[derive(Debug, Clone)]
+pub struct Conflict {
+    pub path: PathBuf,
+    pub contents: String,
+}
+
+impl Conflict {
+    /// A self-healing message: it carries the user's current text, so the model
+    /// never has to spend a `read` to find out what changed.
+    pub fn message(&self) -> String {
+        format!(
+            "The user edited this progress file since tcode last wrote it, so the update was not applied. Their version is authoritative — here it is in full. Re-send `phases` based on it.\n\n<tcode-progress-file path=\"{}\">\n{}\n</tcode-progress-file>",
+            self.path.display(),
+            self.contents.trim_end()
+        )
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Progress {
+    path: PathBuf,
+    pub title: String,
+    state: ProgressState,
+    created: String,
+    phases: Vec<Phase>,
+    /// Hash of the bytes last read from or written to `path`. A mismatch means
+    /// a human edited the file.
+    disk_hash: u64,
+}
+
+impl Progress {
+    /// Start a new progress file for this project. The path is allocated now
+    /// (timestamped, so files sort and never collide) but nothing is written
+    /// until [`Progress::save`].
+    pub fn create(cwd: &Path, title: &str) -> Result<Self, String> {
+        let dir = store::progress_dir(cwd);
+        std::fs::create_dir_all(&dir)
+            .map_err(|e| format!("could not create progress directory {}: {e}", dir.display()))?;
+        let path = next_path(&dir, title)?;
+        Ok(Self {
+            path,
+            title: title.trim().to_string(),
+            state: ProgressState::Draft,
+            created: timestamp_rfc3339(SystemTime::now()),
+            phases: Vec::new(),
+            // No file yet: any hash that cannot match an existing file's would
+            // do, but 0 also means "never written", which `reconcile` needs.
+            disk_hash: 0,
+        })
+    }
+
+    pub fn load(path: &Path) -> Result<Self, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("could not read progress file {}: {e}", path.display()))?;
+        Self::parse(path, &text)
+    }
+
+    pub fn parse(path: &Path, text: &str) -> Result<Self, String> {
+        let (front, body) = split_front_matter(text);
+        let front: FrontMatter = serde_yaml::from_str(front)
+            .map_err(|e| format!("invalid progress front matter in {}: {e}", path.display()))?;
+        let title = match front.title.trim() {
+            "" => file_title(path),
+            title => title.to_string(),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            title,
+            state: ProgressState::parse(&front.state).unwrap_or_default(),
+            created: front.created,
+            phases: parse_phases(body),
+            disk_hash: fnv1a(text.as_bytes()),
+        })
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn state(&self) -> ProgressState {
+        self.state
+    }
+
+    pub fn phases(&self) -> &[Phase] {
+        &self.phases
+    }
+
+    /// Move to another lifecycle state. Rejects the transitions the lifecycle
+    /// has no arrow for rather than quietly reinterpreting them.
+    pub fn set_state(&mut self, next: ProgressState) -> Result<(), String> {
+        if !self.state.may_become(next) {
+            return Err(format!(
+                "a progress file cannot go from {} to {}",
+                self.state.label(),
+                next.label()
+            ));
+        }
+        if next == ProgressState::Done && !self.all_complete() {
+            return Err(
+                "a progress file can become done only after every phase is completed".into(),
+            );
+        }
+        self.state = next;
+        Ok(())
+    }
+
+    pub fn set_title(&mut self, title: &str) {
+        let title = title.trim();
+        if !title.is_empty() {
+            self.title = title.to_string();
+        }
+    }
+
+    /// Replace the whole breakdown (the tool resends it in full — idempotent,
+    /// no diffing). Returns the detail of the phase that just became
+    /// `in_progress`, which is the one piece of prose worth spending context
+    /// on right now.
+    pub fn set_phases(&mut self, phases: Vec<Phase>) -> Option<String> {
+        let was_running = self.running_titles();
+        self.phases = phases;
+        let entered = self
+            .flatten()
+            .into_iter()
+            .find(|phase| {
+                phase.status == PhaseStatus::InProgress && !was_running.contains(&phase.phase)
+            })
+            .filter(|phase| !phase.detail.is_empty())
+            .map(|phase| format!("{}\n{}", phase.phase, phase.detail));
+        entered
+    }
+
+    fn running_titles(&self) -> Vec<String> {
+        self.flatten()
+            .into_iter()
+            .filter(|phase| phase.status == PhaseStatus::InProgress)
+            .map(|phase| phase.phase.clone())
+            .collect()
+    }
+
+    fn flatten(&self) -> Vec<&Phase> {
+        let mut out = Vec::new();
+        for phase in &self.phases {
+            phase.walk(&mut out);
+        }
+        out
+    }
+
+    /// `(completed, total)` over every phase at every level.
+    pub fn counts(&self) -> (usize, usize) {
+        let all = self.flatten();
+        let done = all
+            .iter()
+            .filter(|phase| phase.status == PhaseStatus::Completed)
+            .count();
+        (done, all.len())
+    }
+
+    /// Whether every phase landed, so the file can be archived.
+    pub fn all_complete(&self) -> bool {
+        let (done, total) = self.counts();
+        total > 0 && done == total
+    }
+
+    /// Refuse to overwrite a file the user has edited since tcode wrote it.
+    /// Called before every write; the returned conflict carries their text so
+    /// the caller never has to read the file back.
+    pub fn reconcile(&self) -> Result<(), Conflict> {
+        // Never written: there is nothing of the user's to protect. A file that
+        // appeared under this path in the meantime is still theirs, though.
+        let Ok(text) = std::fs::read_to_string(&self.path) else {
+            return Ok(());
+        };
+        if fnv1a(text.as_bytes()) == self.disk_hash {
+            return Ok(());
+        }
+        Err(Conflict {
+            path: self.path.clone(),
+            contents: text,
+        })
+    }
+
+    pub fn save(&mut self) -> Result<(), String> {
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                format!(
+                    "could not create progress directory {}: {e}",
+                    parent.display()
+                )
+            })?;
+        }
+        let text = self.render();
+        std::fs::write(&self.path, &text)
+            .map_err(|e| format!("could not write progress file {}: {e}", self.path.display()))?;
+        self.disk_hash = fnv1a(text.as_bytes());
+        Ok(())
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = format!(
+            "---\ntitle: {}\nstate: {}\ncreated: {}\n---\n",
+            yaml_scalar(&self.title),
+            self.state.label(),
+            self.created
+        );
+        for (i, phase) in self.phases.iter().enumerate() {
+            render_phase(&mut out, phase, &format!("{}", i + 1), 2);
+        }
+        out
+    }
+
+    /// The model-facing summary: title lines and boxes, never the detail
+    /// prose. Detail reaches the model one phase at a time, through the tool
+    /// result that entered it.
+    pub fn summary(&self) -> String {
+        let name = self
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let mut out = format!(
+            "<tcode-progress file=\"{}\" title=\"{}\" state=\"{}\">\n",
+            name,
+            escape_attr(&self.title),
+            self.state.label()
+        );
+        for (i, phase) in self.phases.iter().enumerate() {
+            summarize_phase(&mut out, phase, &format!("{}", i + 1), 0);
+        }
+        out.push_str("</tcode-progress>");
+        out
+    }
+}
+
+fn render_phase(out: &mut String, phase: &Phase, number: &str, level: usize) {
+    out.push('\n');
+    out.push_str(&"#".repeat(level));
+    out.push_str(&format!(
+        " {} {number}. {}\n",
+        phase.status.box_mark(),
+        phase.phase
+    ));
+    if !phase.detail.is_empty() {
+        out.push_str(phase.detail.trim_end());
+        out.push('\n');
+    }
+    for (i, child) in phase.phases.iter().enumerate() {
+        render_phase(out, child, &format!("{number}.{}", i + 1), level + 1);
+    }
+}
+
+fn summarize_phase(out: &mut String, phase: &Phase, number: &str, indent: usize) {
+    out.push_str(&"  ".repeat(indent));
+    out.push_str(&format!(
+        "{} {number}. {}",
+        phase.status.box_mark(),
+        phase.phase
+    ));
+    if phase.status == PhaseStatus::InProgress {
+        out.push_str("  ← current");
+    }
+    out.push('\n');
+    for (i, child) in phase.phases.iter().enumerate() {
+        summarize_phase(out, child, &format!("{number}.{}", i + 1), indent + 1);
+    }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct FrontMatter {
+    title: String,
+    state: String,
+    created: String,
+}
+
+/// Split `---\n…\n---\n` off the front. A file without front matter is still
+/// readable: a user can hand-write one and the defaults apply.
+fn split_front_matter(text: &str) -> (&str, &str) {
+    let rest = match text.strip_prefix("---\n") {
+        Some(rest) => rest,
+        None => match text.strip_prefix("---\r\n") {
+            Some(rest) => rest,
+            None => return ("", text),
+        },
+    };
+    for marker in ["\n---\n", "\n---\r\n"] {
+        if let Some(end) = rest.find(marker) {
+            return (&rest[..end], &rest[end + marker.len()..]);
+        }
+    }
+    // A closing `---` on the last line, with no trailing newline.
+    match rest
+        .strip_suffix("\n---")
+        .or_else(|| rest.strip_suffix("\n---\n"))
+    {
+        Some(front) => (front, ""),
+        None => ("", text),
+    }
+}
+
+/// Body → phases. Headings carry the box and an optional `1.` / `1.2` number
+/// (rendered by us, ignored on the way back in so a user may renumber freely);
+/// everything between headings is the previous phase's detail.
+fn parse_phases(body: &str) -> Vec<Phase> {
+    let mut top: Vec<Phase> = Vec::new();
+    // Which phase the detail lines currently belong to.
+    let mut detail_of: Option<(usize, Option<usize>)> = None;
+    for line in body.lines() {
+        if let Some((level, status, title)) = parse_heading(line) {
+            let phase = Phase {
+                phase: title,
+                status,
+                detail: String::new(),
+                phases: Vec::new(),
+            };
+            match level {
+                2 => {
+                    top.push(phase);
+                    detail_of = Some((top.len() - 1, None));
+                    continue;
+                }
+                3 if !top.is_empty() => {
+                    let parent = top.len() - 1;
+                    top[parent].phases.push(phase);
+                    let child = top[parent].phases.len() - 1;
+                    detail_of = Some((parent, Some(child)));
+                    continue;
+                }
+                // A marked heading beyond the supported two levels remains
+                // ordinary prose. Silently flattening it into a child would
+                // make a hand-edited plan mean something different.
+                _ => {}
+            }
+        }
+        let Some((parent, child)) = detail_of else {
+            continue;
+        };
+        let target = match child {
+            Some(child) => &mut top[parent].phases[child].detail,
+            None => &mut top[parent].detail,
+        };
+        target.push_str(line);
+        target.push('\n');
+    }
+    for phase in &mut top {
+        phase.detail = phase.detail.trim().to_string();
+        for child in &mut phase.phases {
+            child.detail = child.detail.trim().to_string();
+        }
+    }
+    top
+}
+
+/// `## [>] 2. Title` → `(2, InProgress, "Title")`. A heading without a box is
+/// not a phase; it is prose the user wrote.
+fn parse_heading(line: &str) -> Option<(usize, PhaseStatus, String)> {
+    let level = line.chars().take_while(|c| *c == '#').count();
+    if level < 2 || !line[level..].starts_with(' ') {
+        return None;
+    }
+    let rest = line[level..].trim_start();
+    let (mark, rest) = rest.split_at(rest.find(']')? + 1);
+    let status = PhaseStatus::from_box(mark)?;
+    let rest = rest.trim_start();
+    // Drop a leading `2.` / `2.1` numbering, ours or the user's.
+    let title = match rest.split_once(' ') {
+        Some((head, tail))
+            if head.ends_with('.')
+                && head
+                    .trim_end_matches('.')
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || c == '.') =>
+        {
+            tail
+        }
+        _ => rest,
+    };
+    let title = title.trim();
+    (!title.is_empty()).then(|| (level, status, title.to_string()))
+}
+
+/// One line per unfinished progress file, newest first.
+#[derive(Debug, Clone)]
+pub struct InventoryEntry {
+    pub path: PathBuf,
+    pub title: String,
+    pub state: ProgressState,
+    pub done: usize,
+    pub total: usize,
+    pub modified: SystemTime,
+}
+
+impl InventoryEntry {
+    pub fn file_name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    }
+}
+
+/// Unfinished progress files for this project, most recently touched first.
+/// `done` files and files nobody has touched in two weeks are left on disk but
+/// dropped here — an inventory that lists every abandoned draft lists nothing.
+///
+/// **This is a listing, not an instruction.** A draft found here was written by
+/// whoever wrote it, possibly a different task three days ago; seeing it is not
+/// a request to continue it.
+pub fn inventory(cwd: &Path, limit: usize) -> Vec<InventoryEntry> {
+    let mut entries = inventory_at(&store::progress_dir(cwd), SystemTime::now());
+    entries.truncate(limit);
+    entries
+}
+
+/// `now` is a parameter so staleness is testable without touching file mtimes.
+fn inventory_at(dir: &Path, now: SystemTime) -> Vec<InventoryEntry> {
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut entries: Vec<InventoryEntry> = read
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
+        .filter_map(|path| {
+            let modified = std::fs::metadata(&path)
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH);
+            let progress = Progress::load(&path).ok()?;
+            if progress.state() == ProgressState::Done {
+                return None;
+            }
+            if now
+                .duration_since(modified)
+                .is_ok_and(|age| age > STALE_AFTER)
+            {
+                return None;
+            }
+            let (done, total) = progress.counts();
+            Some(InventoryEntry {
+                path,
+                title: progress.title,
+                state: progress.state,
+                done,
+                total,
+                modified,
+            })
+        })
+        .collect();
+    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries
+}
+
+/// The opening-context listing. Stable across a session (the model's own
+/// updates are in the ledger), so it is safe in the cached prefix.
+pub fn inventory_note(entries: &[InventoryEntry]) -> Option<String> {
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("<tcode-progress-inventory>\nUnfinished progress files on disk. This is a listing of past work, not a request: do not resume one unless the user asks.\n");
+    for entry in entries {
+        out.push_str(&format!(
+            "- {} [{}] {}/{} phases · {}\n",
+            entry.title,
+            entry.state.label(),
+            entry.done,
+            entry.total,
+            entry.file_name()
+        ));
+    }
+    out.push_str("</tcode-progress-inventory>");
+    Some(out)
+}
+
+fn next_path(dir: &Path, title: &str) -> Result<PathBuf, String> {
+    let stem = format!("{}-{}", timestamp_stamp(), slug(title));
+    for suffix in 0..10_000 {
+        let name = match suffix {
+            0 => format!("{stem}.md"),
+            n => format!("{stem}-{n}.md"),
+        };
+        let path = dir.join(name);
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(format!(
+        "could not allocate a progress filename in {}",
+        dir.display()
+    ))
+}
+
+/// A title for a file whose front matter has none: the slug, minus the
+/// timestamp we prefixed it with.
+fn file_title(path: &Path) -> String {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    stem.split_once('-')
+        .and_then(|(_, rest)| rest.split_once('-'))
+        .map(|(_, rest)| rest.replace('-', " "))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(stem)
+}
+
+fn yaml_scalar(value: &str) -> String {
+    // A title is free text; quoting it keeps `:` and `#` from turning the front
+    // matter into something else.
+    format!("{:?}", value)
+}
+
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+}
+
+fn fnv1a(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash
+}
+
+/// `yyyymmdd-HHMMSS` in UTC, for filename ordering.
+fn timestamp_stamp() -> String {
+    let (y, mo, d, h, m, s) = civil_now(SystemTime::now());
+    format!("{y:04}{mo:02}{d:02}-{h:02}{m:02}{s:02}")
+}
+
+fn timestamp_rfc3339(at: SystemTime) -> String {
+    let (y, mo, d, h, m, s) = civil_now(at);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}Z")
+}
+
+/// civil-from-days, so neither the filename nor the front matter pulls in a
+/// date crate.
+fn civil_now(at: SystemTime) -> (i64, i64, i64, u64, u64, u64) {
+    let secs = at
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    let (h, m, s) = ((secs / 3600) % 24, (secs / 60) % 60, secs % 60);
+    let z = days as i64 + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if mo <= 2 { y + 1 } else { y };
+    (y, mo, d, h, m, s)
+}
+
+/// Filesystem-safe short slug from the title.
+fn slug(title: &str) -> String {
+    let mut slug: String = title
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while slug.contains("--") {
+        slug = slug.replace("--", "-");
+    }
+    let slug = slug.trim_matches('-');
+    let slug: String = slug.chars().take(40).collect();
+    if slug.is_empty() {
+        "progress".to_string()
+    } else {
+        slug
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample() -> Progress {
+        let mut progress = Progress {
+            path: PathBuf::from("/tmp/x/20260729-101200-demo.md"),
+            title: "重写 ledger rewind 路径".into(),
+            state: ProgressState::Active,
+            created: "2026-07-29T10:12:00Z".into(),
+            phases: Vec::new(),
+            disk_hash: 0,
+        };
+        progress.set_phases(vec![
+            Phase {
+                phase: "勘查调用面".into(),
+                status: PhaseStatus::Completed,
+                detail: "只读。确认 rewind 之后 aux 事件的重放顺序。".into(),
+                phases: Vec::new(),
+            },
+            Phase {
+                phase: "改 truncate_tail 的归档语义".into(),
+                status: PhaseStatus::InProgress,
+                detail: "风险：compact 之后再 rewind 会跨越 Summary 边界。".into(),
+                phases: vec![
+                    Phase::new("先补一个跨 Summary 的回归测试", PhaseStatus::Completed),
+                    Phase::new("再改实现", PhaseStatus::InProgress),
+                ],
+            },
+            Phase::new("迁移调用方", PhaseStatus::Pending),
+        ]);
+        progress
+    }
+
+    #[test]
+    fn render_and_parse_round_trip() {
+        let original = sample();
+        let text = original.render();
+        let parsed = Progress::parse(original.path(), &text).unwrap();
+        assert_eq!(parsed.title, original.title);
+        assert_eq!(parsed.state(), original.state());
+        assert_eq!(parsed.phases(), original.phases());
+        assert_eq!(parsed.render(), text);
+    }
+
+    #[test]
+    fn headings_carry_the_box_and_drop_our_numbering() {
+        let text = "---\ntitle: t\nstate: active\ncreated: c\n---\n\n## [x] 1. First\nwhy\n\n### [>] 1.1 Nested\n\n## [ ] 2. Second\n";
+        let parsed = Progress::parse(Path::new("/tmp/p.md"), text).unwrap();
+        assert_eq!(parsed.phases().len(), 2);
+        assert_eq!(parsed.phases()[0].phase, "First");
+        assert_eq!(parsed.phases()[0].detail, "why");
+        assert_eq!(parsed.phases()[0].phases[0].phase, "Nested");
+        assert_eq!(parsed.phases()[0].phases[0].status, PhaseStatus::InProgress);
+        assert_eq!(parsed.phases()[1].phase, "Second");
+    }
+
+    #[test]
+    fn a_heading_without_a_box_is_prose_not_a_phase() {
+        let text = "---\ntitle: t\nstate: draft\ncreated: c\n---\n\n## Background\nnot a phase\n\n## [ ] 1. Real\n";
+        let parsed = Progress::parse(Path::new("/tmp/p.md"), text).unwrap();
+        assert_eq!(parsed.phases().len(), 1);
+        assert_eq!(parsed.phases()[0].phase, "Real");
+    }
+
+    #[test]
+    fn deeply_nested_handwritten_heading_is_not_flattened_into_a_phase() {
+        let text = "---\ntitle: t\nstate: draft\ncreated: c\n---\n\n## [ ] 1. Top\n\n### [ ] 1.1 Child\n\n#### [ ] 1.1.1 Too deep\n";
+        let parsed = Progress::parse(Path::new("/tmp/p.md"), text).unwrap();
+        assert_eq!(parsed.phases().len(), 1);
+        assert_eq!(parsed.phases()[0].phases.len(), 1);
+        assert!(parsed.phases()[0].phases[0].detail.contains("Too deep"));
+    }
+
+    #[test]
+    fn nesting_is_capped_at_two_levels() {
+        let deep = json!([{ "phase": "a", "status": "pending",
+            "phases": [{ "phase": "b", "status": "pending",
+                "phases": [{ "phase": "c", "status": "pending" }] }] }]);
+        let error = phases_from_json(&deep).unwrap_err();
+        assert!(error.contains("split into two progress files"), "{error}");
+
+        let ok = json!([{ "phase": "a", "status": "pending",
+            "phases": [{ "phase": "b", "status": "in_progress" }] }]);
+        assert_eq!(phases_from_json(&ok).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn entering_a_phase_returns_its_detail_once() {
+        let mut progress = sample();
+        // Re-sending the same list enters nothing new.
+        let phases = progress.phases().to_vec();
+        assert!(progress.set_phases(phases).is_none());
+
+        let entered = progress
+            .set_phases(vec![
+                Phase::new("勘查调用面", PhaseStatus::Completed),
+                Phase {
+                    phase: "迁移调用方".into(),
+                    status: PhaseStatus::InProgress,
+                    detail: "动 crates/tcode-core/src/ledger.rs 附近。".into(),
+                    phases: Vec::new(),
+                },
+            ])
+            .expect("newly entered phase carries its detail");
+        assert!(entered.contains("迁移调用方"));
+        assert!(entered.contains("ledger.rs"));
+    }
+
+    #[test]
+    fn summary_carries_boxes_but_never_detail() {
+        let summary = sample().summary();
+        assert!(summary.contains("[x] 1. 勘查调用面"));
+        assert!(summary.contains("← current"));
+        assert!(summary.contains("state=\"active\""));
+        assert!(
+            !summary.contains("aux 事件"),
+            "detail prose must stay out of the summary: {summary}"
+        );
+    }
+
+    #[test]
+    fn state_transitions_follow_the_lifecycle() {
+        let mut progress = sample();
+        progress.state = ProgressState::Draft;
+        assert!(progress.set_state(ProgressState::Done).is_err());
+        progress.set_state(ProgressState::Active).unwrap();
+        assert!(progress.set_state(ProgressState::Done).is_err());
+        progress.set_state(ProgressState::Draft).unwrap();
+        progress.set_state(ProgressState::Active).unwrap();
+        progress.set_phases(
+            progress
+                .phases()
+                .iter()
+                .cloned()
+                .map(complete_phase)
+                .collect(),
+        );
+        progress.set_state(ProgressState::Done).unwrap();
+        assert!(progress.set_state(ProgressState::Active).is_err());
+    }
+
+    fn complete_phase(mut phase: Phase) -> Phase {
+        phase.status = PhaseStatus::Completed;
+        phase.phases = phase.phases.into_iter().map(complete_phase).collect();
+        phase
+    }
+
+    #[test]
+    fn a_user_edit_blocks_the_next_write_and_hands_back_their_text() {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut progress = Progress::create(cwd.path(), "Rewrite the resume path").unwrap();
+        progress.set_phases(vec![Phase::new("one", PhaseStatus::InProgress)]);
+        progress.save().unwrap();
+        assert!(progress.reconcile().is_ok());
+
+        std::fs::write(
+            progress.path(),
+            "---\ntitle: mine\nstate: draft\ncreated: c\n---\n\n## [ ] 1. I disagree\n",
+        )
+        .unwrap();
+        let conflict = progress.reconcile().unwrap_err();
+        assert!(conflict.message().contains("I disagree"));
+        assert!(conflict.message().contains("authoritative"));
+    }
+
+    #[test]
+    fn create_uses_a_timestamped_slug_under_the_project_directory() {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let progress = Progress::create(cwd.path(), "Rewrite the resume path").unwrap();
+        let name = progress.path().file_name().unwrap().to_string_lossy();
+        assert!(name.contains("rewrite-the-resume-path"), "{name}");
+        assert!(progress.path().starts_with(store::progress_dir(cwd.path())));
+    }
+
+    #[test]
+    fn inventory_skips_done_and_stale_files_newest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, state: &str, body: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(
+                &path,
+                format!("---\ntitle: {name}\nstate: {state}\ncreated: c\n---\n{body}"),
+            )
+            .unwrap();
+            path
+        };
+        write("a.md", "active", "\n## [x] 1. one\n\n## [ ] 2. two\n");
+        write("b.md", "draft", "\n## [ ] 1. one\n");
+        let done = write("c.md", "done", "\n## [x] 1. one\n");
+        let stale = write("d.md", "active", "\n## [ ] 1. one\n");
+        // Everything is stale seen from far enough ahead; re-dating the files
+        // themselves would need a filetime dependency for no extra coverage.
+        let entries = inventory_at(dir.path(), SystemTime::now() + STALE_AFTER * 2);
+        assert!(entries.is_empty(), "two weeks on, nothing is listed");
+
+        let entries = inventory_at(dir.path(), SystemTime::now());
+        let names: Vec<String> = entries.iter().map(|e| e.file_name()).collect();
+        assert!(!names.contains(&"c.md".to_string()), "done is archived");
+        assert!(!names.contains(&"d.md".to_string()), "stale is archived");
+        assert!(done.exists() && stale.exists(), "archiving never deletes");
+        let a = entries.iter().find(|e| e.file_name() == "a.md").unwrap();
+        assert_eq!((a.done, a.total), (1, 2));
+    }
+}

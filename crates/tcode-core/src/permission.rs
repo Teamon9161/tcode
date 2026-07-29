@@ -7,8 +7,6 @@ use crate::tool::PermissionRequest;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
-    /// Read-only tools run; anything mutating is blocked.
-    Plan,
     /// Rules decide; unmatched actions prompt the user.
     #[default]
     Default,
@@ -25,7 +23,6 @@ pub enum PermissionMode {
 impl PermissionMode {
     pub fn label(&self) -> &'static str {
         match self {
-            PermissionMode::Plan => "plan",
             PermissionMode::Default => "default",
             PermissionMode::AcceptEdits => "accept-edits",
             PermissionMode::Auto => "auto",
@@ -54,8 +51,7 @@ impl PermissionMode {
     pub fn cycle(&self) -> Self {
         match self {
             PermissionMode::Default => PermissionMode::AcceptEdits,
-            PermissionMode::AcceptEdits => PermissionMode::Plan,
-            PermissionMode::Plan => PermissionMode::Auto,
+            PermissionMode::AcceptEdits => PermissionMode::Auto,
             PermissionMode::Auto => PermissionMode::Unsafe,
             PermissionMode::Unsafe => PermissionMode::Default,
         }
@@ -89,17 +85,13 @@ impl PermissionRules {
         if matches!(request, PermissionRequest::UserInput { .. }) {
             return Decision::Ask;
         }
-        // Plan review is the one gate that turns plan mode *off*: it must reach
-        // the human in plan mode (never auto-approved), and outside plan mode
-        // it is a no-op the model is nudged to correct rather than a prompt.
+        // Submitting a draft plan for approval always reaches the human,
+        // including in unsafe mode. It is not an authorization request that a
+        // permissive stance could reasonably waive: the user asked to see the
+        // plan, and the mode says how much risk they will take once it starts,
+        // which is a separate question with a separate answer in this dialog.
         if matches!(request, PermissionRequest::PlanReview { .. }) {
-            return if mode == PermissionMode::Plan {
-                Decision::Ask
-            } else {
-                Decision::Deny(
-                    "not in plan mode; nothing to exit. If you want to record a plan, just write it in your reply.".into(),
-                )
-            };
+            return Decision::Ask;
         }
         let PermissionRequest::Ask { is_edit, .. } = request else {
             return Decision::Allow;
@@ -123,13 +115,6 @@ impl PermissionRules {
             return Decision::Ask;
         }
         match mode {
-            // Plan mode deliberately has no arm of its own: it is a coordination
-            // signal ("finish the plan before you start changing things"), not a
-            // capability boundary, so it routes to the human exactly like
-            // Default rather than refusing on the user's behalf. Asking the
-            // model to hold off is the prompt's job; deciding to make an
-            // exception — saving the plan to a file, running a build — is the
-            // user's, and they have to be able to say yes.
             PermissionMode::Unsafe => Decision::Allow,
             PermissionMode::AcceptEdits if *is_edit => Decision::Allow,
             PermissionMode::Auto => {
@@ -411,9 +396,6 @@ mod tests {
             rules.decide(PermissionMode::AcceptEdits, &shell),
             Decision::Ask
         );
-        // Plan mode reaches the human rather than refusing on their behalf.
-        assert_eq!(rules.decide(PermissionMode::Plan, &edit), Decision::Ask);
-        assert_eq!(rules.decide(PermissionMode::Plan, &shell), Decision::Ask);
         assert_eq!(
             rules.decide(PermissionMode::Unsafe, &shell),
             Decision::Allow
@@ -423,11 +405,7 @@ mod tests {
 
     #[test]
     fn modes_that_route_to_a_human_are_derived_from_decide() {
-        for mode in [
-            PermissionMode::Plan,
-            PermissionMode::Default,
-            PermissionMode::AcceptEdits,
-        ] {
+        for mode in [PermissionMode::Default, PermissionMode::AcceptEdits] {
             assert!(mode.expects_a_human(), "{mode:?} routes to a human");
         }
         // Auto only reaches a human when its classifier is unavailable, which
@@ -437,22 +415,26 @@ mod tests {
         }
     }
 
+    /// Planning is orthogonal to risk appetite, which is the whole reason it
+    /// stopped being a permission mode: a plan under review must still reach
+    /// the user in the modes that otherwise never prompt.
     #[test]
-    fn plan_mode_honours_the_same_rules_default_mode_does() {
+    fn plan_review_reaches_the_human_in_every_mode() {
         let rules = PermissionRules {
-            allow: vec!["shell(cargo test)".into()],
+            allow: vec!["progress".into()],
             ask: vec![],
-            deny: vec!["edit(secrets.rs)".into()],
+            deny: vec![],
         };
-        // An allow rule is a standing user decision; plan mode is about when to
-        // start work, not about re-litigating rules the user already wrote.
-        assert_eq!(
-            rules.decide(PermissionMode::Plan, &ask("shell(cargo test)", false)),
-            Decision::Allow
-        );
-        assert!(matches!(
-            rules.decide(PermissionMode::Plan, &ask("edit(secrets.rs)", true)),
-            Decision::Deny(_)
-        ));
+        let review = PermissionRequest::PlanReview {
+            title: "Rewrite the resume path".into(),
+        };
+        for mode in [
+            PermissionMode::Default,
+            PermissionMode::AcceptEdits,
+            PermissionMode::Auto,
+            PermissionMode::Unsafe,
+        ] {
+            assert_eq!(rules.decide(mode, &review), Decision::Ask, "{mode:?}");
+        }
     }
 }

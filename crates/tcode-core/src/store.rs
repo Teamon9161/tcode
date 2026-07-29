@@ -232,15 +232,19 @@ pub fn tool_output_dir(cwd: &Path) -> PathBuf {
     scratchpad_dir(cwd).join("tool-output")
 }
 
-/// Plans submitted for review land here as a human-readable mirror of the plan
-/// the model holds in its ledger: `<project-data>/plans/`. Rejected revisions
-/// update the active draft in place. Runtime state, not part of the user's
-/// repository — anyone who wants a plan in the repo copies it there.
-/// Falls back to a temp dir when there is no home directory.
-pub fn plans_dir(cwd: &Path) -> PathBuf {
-    project_data_dir(cwd)
-        .unwrap_or_else(|| std::env::temp_dir().join("tcode"))
-        .join("plans")
+/// Where this project's progress files live: `<project-data>/progress/`.
+/// Runtime state, not part of the user's repository — an agent writing into a
+/// repo is git noise and accidental commits; anyone who wants a plan tracked
+/// exports it there explicitly. Falls back to a temp dir when there is no home
+/// directory.
+///
+/// Adopts the superseded `plans/` directory on first use, so drafts written
+/// before progress files existed keep showing up in `/plan list`.
+pub fn progress_dir(cwd: &Path) -> PathBuf {
+    let root = project_data_dir(cwd).unwrap_or_else(|| std::env::temp_dir().join("tcode"));
+    let dir = root.join("progress");
+    adopt_dir(&root.join("plans"), &dir);
+    dir
 }
 
 /// Nothing in the scratchpad is meant to survive this long.

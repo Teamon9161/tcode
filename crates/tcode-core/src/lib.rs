@@ -18,7 +18,7 @@ pub mod import;
 pub mod ledger;
 pub mod memory;
 pub mod permission;
-pub mod plan_draft;
+pub mod progress;
 pub mod provider;
 pub mod references;
 pub mod store;
@@ -50,6 +50,7 @@ pub use memory::{InstructionDiscovery, MemoryManager, MemoryUpdate};
 pub use permission::{
     Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk, PermissionMode, PermissionRules,
 };
+pub use progress::{Phase, PhaseStatus, Progress, ProgressState};
 pub use provider::{
     ActiveModel, AgentModels, AgentPin, CacheStrategy, EventStream, ModelCell, Provider,
     ProviderError, Request, StreamEvent,
