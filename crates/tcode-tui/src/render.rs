@@ -18,8 +18,9 @@ use crate::diff;
 use crate::theme;
 
 /// Where a tool call's rendering goes. `Progress` feeds the execution-progress
-/// pane instead of the transcript (`update_progress`); `Silent` renders nothing
-/// because another mechanism already told the story (ask_user's approval record).
+/// pane instead of the transcript (an ordinary `progress` update); `Silent`
+/// renders nothing because another mechanism already told the story (ask_user's
+/// approval record).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallRoute {
     Transcript,
@@ -51,6 +52,13 @@ pub trait ToolRenderer: Send + Sync {
 
     fn route(&self) -> CallRoute {
         CallRoute::Transcript
+    }
+
+    /// Where *this* call goes. Only `progress` overrides it: a plan under
+    /// review and a phase flip are the same tool, and only the input says which
+    /// one happened.
+    fn route_for(&self, _input: &Value) -> CallRoute {
+        self.route()
     }
 
     /// One-line header text (uncolored; the App applies display-name
@@ -173,33 +181,6 @@ impl ToolRenderer for AgentRenderer {
 
     fn markdown_detail(&self, _input: Option<&Value>) -> bool {
         true
-    }
-}
-
-/// The plan a model submits with `exit_plan`: a heading plus the plan body as
-/// rendered markdown. The same block appears live (baked while the review
-/// dialog is open) and on replay (from the ledgered call), so both paths must
-/// go through here.
-struct ExitPlanRenderer;
-
-impl ToolRenderer for ExitPlanRenderer {
-    fn header(&self, _name: &str, input: &Value, _cwd: Option<&Path>) -> String {
-        match input["title"]
-            .as_str()
-            .map(str::trim)
-            .filter(|t| !t.is_empty())
-        {
-            Some(title) => format!("Proposed plan: {title}"),
-            None => "Proposed plan".to_string(),
-        }
-    }
-
-    fn body(&self, input: &Value) -> Vec<Line<'static>> {
-        let plan = input["plan"].as_str().unwrap_or("").trim();
-        if plan.is_empty() {
-            return Vec::new();
-        }
-        crate::markdown::Renderer::default().render(plan)
     }
 }
 
@@ -421,11 +402,63 @@ impl ToolRenderer for ViewImageRenderer {
     }
 }
 
+/// `progress` wears two faces, and which one shows is a property of the call
+/// rather than of the tool: an ordinary update feeds the live phase pane, while
+/// a plan submitted for the user's approval is a document they need to read, so
+/// it renders into the transcript as markdown. The same block appears live
+/// (baked while the review dialog is open) and on replay (from the ledgered
+/// call), so both paths go through here.
 struct ProgressRenderer;
+
+/// The markdown of a plan submitted for approval, or `None` for an ordinary
+/// progress update. Live calls carry their phases and are rendered from them;
+/// the review copy and the retired `exit_plan` calls in older sessions carry a
+/// ready-made body, which wins because it is the text the human actually saw.
+fn submitted_plan(input: &Value) -> Option<String> {
+    if let Some(body) = input[tcode_core::progress::REVIEW_BODY_FIELD].as_str() {
+        if !body.trim().is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    if !tcode_core::progress::is_submission(input) {
+        return None;
+    }
+    let phases = tcode_core::progress::phases_from_json(&input["phases"]).ok()?;
+    Some(tcode_core::progress::render_phases(&phases)).filter(|body| !body.trim().is_empty())
+}
 
 impl ToolRenderer for ProgressRenderer {
     fn route(&self) -> CallRoute {
         CallRoute::Progress
+    }
+
+    fn route_for(&self, input: &Value) -> CallRoute {
+        match submitted_plan(input) {
+            Some(_) => CallRoute::Transcript,
+            None => CallRoute::Progress,
+        }
+    }
+
+    fn header(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        if submitted_plan(input).is_none() {
+            return tcode_core::agent::summarize_call(name, input);
+        }
+        let _ = cwd;
+        match input["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+        {
+            Some(title) => format!("Proposed plan: {title}"),
+            None => "Proposed plan".to_string(),
+        }
+    }
+
+    fn body(&self, input: &Value) -> Vec<Line<'static>> {
+        match submitted_plan(input) {
+            Some(plan) => crate::markdown::Renderer::default().render(plan.trim()),
+            None => Vec::new(),
+        }
     }
 }
 
@@ -463,9 +496,8 @@ impl RenderRegistry {
                 "web_fetch" => Box::new(WebFetchRenderer),
                 "view_image" => Box::new(ViewImageRenderer),
                 "agent" => Box::new(AgentRenderer),
-                "update_progress" => Box::new(ProgressRenderer),
+                "progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),
-                "exit_plan" => Box::new(ExitPlanRenderer),
                 _ => Box::new(DefaultRenderer { quiet }),
             };
             renderers.insert(name.to_string(), renderer);
@@ -477,13 +509,29 @@ impl RenderRegistry {
             renderers.insert("task".into(), Box::new(AgentRenderer));
             display_names.insert("task".into(), "Agent".into());
         }
-        if renderers.contains_key("update_progress") {
-            renderers.insert("update_plan".into(), Box::new(ProgressRenderer));
+        // `update_plan`/`update_progress` are this tool's earlier names and
+        // `exit_plan` its earlier plan-submission half; all three route by
+        // input exactly like the current one does.
+        if renderers.contains_key("progress") {
+            for retired in ["update_plan", "update_progress", "exit_plan"] {
+                renderers.insert(retired.into(), Box::new(ProgressRenderer));
+            }
         }
         Self {
             renderers,
             display_names,
             fallback: DefaultRenderer { quiet: false },
+        }
+    }
+
+    /// Where a call goes. `progress` decides from its input, so pass it when
+    /// it is still at hand; a call whose input has already been consumed falls
+    /// back to the tool's default route, which is what the header path chose
+    /// for it in the first place.
+    pub fn route_of(&self, name: &str, input: Option<&Value>) -> CallRoute {
+        match input {
+            Some(input) => self.get(name).route_for(input),
+            None => self.get(name).route(),
         }
     }
 
@@ -673,10 +721,40 @@ mod tests {
         assert_eq!(ProgressRenderer.route(), CallRoute::Progress);
         assert_eq!(SilentRenderer.route(), CallRoute::Silent);
 
-        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tcode_tools::UpdateProgressTool)];
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tcode_tools::ProgressTool)];
         let registry = RenderRegistry::from_tools(&tools);
-        assert_eq!(registry.get("update_progress").route(), CallRoute::Progress);
-        assert_eq!(registry.get("update_plan").route(), CallRoute::Progress);
+        // Retired names keep their renderer so resumed sessions still read.
+        for name in ["progress", "update_progress", "update_plan", "exit_plan"] {
+            assert_eq!(registry.get(name).route(), CallRoute::Progress, "{name}");
+        }
+    }
+
+    /// One tool, two renderings: a phase flip belongs in the live pane, a plan
+    /// submitted for approval is a document the user reads in the transcript.
+    #[test]
+    fn a_submitted_plan_routes_to_the_transcript_and_an_update_does_not() {
+        let update = json!({ "phases": [{ "phase": "one", "status": "in_progress" }] });
+        assert_eq!(ProgressRenderer.route_for(&update), CallRoute::Progress);
+
+        let submission = json!({
+            "title": "Rewrite the resume path",
+            "state": "active",
+            "phases": [{ "phase": "one", "status": "pending" }]
+        });
+        assert_eq!(
+            ProgressRenderer.route_for(&submission),
+            CallRoute::Transcript
+        );
+        assert!(ProgressRenderer
+            .header("progress", &submission, None)
+            .contains("Rewrite the resume path"));
+        assert!(!ProgressRenderer.body(&submission).is_empty());
+
+        // Retired `exit_plan` calls carry the body itself, not phases.
+        let legacy = json!({ "plan": "# Do it
+
+body" });
+        assert_eq!(ProgressRenderer.route_for(&legacy), CallRoute::Transcript);
     }
 
     #[test]

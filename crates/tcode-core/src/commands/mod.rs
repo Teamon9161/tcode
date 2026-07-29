@@ -71,6 +71,10 @@ pub enum CommandEffect {
         focus: Option<String>,
     },
     OpenResumePicker,
+    /// Start a turn from this text as if the user had typed it. `/plan` is the
+    /// one command whose substance is "spend this turn differently" rather than
+    /// changing a setting, so it hands the frontend words instead of state.
+    SubmitPrompt(String),
     /// The dogfood switch flipped: write it to the selected config's
     /// `[tcode_state]` so it survives a restart. Persisting program state is
     /// the frontend's job here — it

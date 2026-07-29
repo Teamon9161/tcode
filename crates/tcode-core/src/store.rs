@@ -87,6 +87,12 @@ pub enum LogEvent {
         tool_calls: usize,
         usage: crate::types::Usage,
     },
+    /// The progress file this conversation took over. Recorded so a resumed
+    /// session finds its way back to the same plan — the file itself is the
+    /// truth and is re-read on resume, since the user may have edited it.
+    ProgressAdopted {
+        path: String,
+    },
     /// Display label of a concurrent tool batch, recorded at execution time.
     /// `after` is the ledger length when the batch started (its assistant
     /// entry sits at `after - 1`). Only opt-in sinks receive it.
@@ -521,6 +527,9 @@ pub struct Resumed {
     /// append-only context. Sessions with a startup snapshot always have this
     /// baseline; older logs without one may omit it.
     pub delivered_environment: Option<EnvironmentSnapshot>,
+    /// The progress file this conversation was last working through. Only the
+    /// path survives; the plan is re-read from disk on resume.
+    pub progress: Option<PathBuf>,
 }
 
 /// A resumable conversation in one project, suitable for a UI picker.
@@ -677,6 +686,7 @@ impl SessionStore {
         let mut startup = None;
         let mut environment = None;
         let mut delivered_environment = None;
+        let mut progress = None;
         let mut id = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -724,6 +734,13 @@ impl SessionStore {
                     path,
                     saved,
                 } => checkpoints.push((ledger_len, path, saved)),
+                // The empty path is how a finished plan is recorded: the
+                // conversation moved on, and resume must not reopen it.
+                LogEvent::ProgressAdopted { path } => {
+                    progress = Some(path)
+                        .filter(|path| !path.is_empty())
+                        .map(PathBuf::from)
+                }
                 // Trace-file lines; a session log never contains them.
                 LogEvent::TaskMeta { .. }
                 | LogEvent::TaskFinished { .. }
@@ -762,6 +779,7 @@ impl SessionStore {
             startup,
             environment,
             delivered_environment,
+            progress,
         })
     }
 

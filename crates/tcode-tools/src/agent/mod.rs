@@ -419,9 +419,9 @@ impl AgentTool {
         // make — no delegated run gets one, whatever its definition says. The
         // discriminator is the request type rather than the tool's name: a tool
         // that asks for plan review is exactly the tool that cannot be
-        // delegated. (The main agent keeps it in every mode on purpose: the
-        // toolset is part of the cached prefix, so it stays put and
-        // `PermissionRules::decide` self-heals the out-of-plan-mode call.)
+        // delegated. `progress` never reaches here in the first place (it is a
+        // main-agent-only frontend addition, not part of `base_tools`); this
+        // stays as the backstop for anything an extension adds later.
         tools.retain(|tool| {
             !matches!(
                 tool.permission(&json!({})),

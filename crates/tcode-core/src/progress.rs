@@ -319,6 +319,33 @@ impl Progress {
         }
     }
 
+    /// Apply the parts of a `progress` call a review does not decide: the
+    /// title and the breakdown. Split out from [`Progress::apply`] because a
+    /// draft submitted for approval is saved *before* the human answers —
+    /// their decision is about `state`, and applying it up front would make
+    /// declining silently promote the plan.
+    pub fn apply_content(&mut self, input: &Value) -> Result<Option<String>, String> {
+        if let Some(title) = input["title"].as_str() {
+            self.set_title(title);
+        }
+        match input.get("phases") {
+            Some(phases) if !phases.is_null() => Ok(self.set_phases(phases_from_json(phases)?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Apply one whole `progress` tool input. Phases land before `state` so a
+    /// `done` transition is judged against the breakdown the same call sent.
+    pub fn apply(&mut self, input: &Value) -> Result<Option<String>, String> {
+        let entered = self.apply_content(input)?;
+        if let Some(raw) = input["state"].as_str() {
+            let next = ProgressState::parse(raw)
+                .ok_or_else(|| format!("unknown state '{raw}'; use draft, active or done"))?;
+            self.set_state(next)?;
+        }
+        Ok(entered)
+    }
+
     /// Replace the whole breakdown (the tool resends it in full — idempotent,
     /// no diffing). Returns the detail of the phase that just became
     /// `in_progress`, which is the one piece of prose worth spending context
@@ -410,10 +437,21 @@ impl Progress {
             self.state.label(),
             self.created
         );
-        for (i, phase) in self.phases.iter().enumerate() {
-            render_phase(&mut out, phase, &format!("{}", i + 1), 2);
-        }
+        out.push_str(&self.body());
         out
+    }
+
+    /// The phases as markdown, without the front matter. This is what a review
+    /// pane shows and what `$EDITOR` round-trips: the lifecycle belongs to the
+    /// approval buttons, so it is not put in front of the reviewer's cursor.
+    pub fn body(&self) -> String {
+        render_phases(&self.phases)
+    }
+
+    /// Adopt a human-authored body verbatim. The inverse of [`Progress::body`],
+    /// used for the version a reviewer approved after rewriting it.
+    pub fn set_body(&mut self, markdown: &str) {
+        self.phases = parse_phases(markdown);
     }
 
     /// The model-facing summary: title lines and boxes, never the detail
@@ -437,6 +475,16 @@ impl Progress {
         out.push_str("</tcode-progress>");
         out
     }
+}
+
+/// A breakdown as the markdown a reader sees. Free-standing so a frontend can
+/// render a plan straight out of a tool call, before any file exists for it.
+pub fn render_phases(phases: &[Phase]) -> String {
+    let mut out = String::new();
+    for (i, phase) in phases.iter().enumerate() {
+        render_phase(&mut out, phase, &format!("{}", i + 1), 2);
+    }
+    out
 }
 
 fn render_phase(out: &mut String, phase: &Phase, number: &str, level: usize) {
@@ -470,6 +518,134 @@ fn summarize_phase(out: &mut String, phase: &Phase, number: &str, indent: usize)
     for (i, child) in phase.phases.iter().enumerate() {
         summarize_phase(out, child, &format!("{number}.{}", i + 1), indent + 1);
     }
+}
+
+/// The rendered body attached to the *review* copy of a `progress` call, and
+/// the field an approved rewrite comes back through. The model never sends it:
+/// its schema has no `plan` property, and [`ProgressTool`-side handling] only
+/// honours it on the one call the human just approved, which by construction
+/// went through the dialog.
+///
+/// [`ProgressTool`-side handling]: crate::progress::is_submission
+pub const REVIEW_BODY_FIELD: &str = "plan";
+
+/// The draft's path, attached to the review copy so the pane can show it, copy
+/// it, and open it in `$EDITOR`. Display only: nothing writes through it — the
+/// tool reaches its file through the session's own handle — so unlike the
+/// mechanism it replaces it needs no anti-escalation check, because it grants
+/// no capability to check.
+pub const REVIEW_PATH_FIELD: &str = "_progress_path";
+
+/// Whether this call asks the user to approve a plan. `state: "active"` is the
+/// approval request itself: a progress file the model opens for its own
+/// tracking is active from birth and says nothing about `state`, so the two
+/// intents never collide.
+pub fn is_submission(input: &Value) -> bool {
+    input["state"].as_str() == Some(ProgressState::Active.label())
+}
+
+/// The session's current progress, opening a new file if there is none. The
+/// first call for a task must name it — the title is what every later listing
+/// shows, and a directory of files named after their timestamp is a directory
+/// nobody reads.
+fn current_or_create<'a>(
+    slot: &'a mut Option<Progress>,
+    cwd: &Path,
+    input: &Value,
+    fresh: ProgressState,
+) -> Result<&'a mut Progress, String> {
+    if slot.is_none() {
+        let title = input["title"]
+            .as_str()
+            .map(str::trim)
+            .filter(|title| !title.is_empty())
+            .ok_or_else(|| {
+                "there is no progress file open yet, so this call needs a `title`".to_string()
+            })?;
+        let mut created = Progress::create(cwd, title)?;
+        created.state = fresh;
+        *slot = Some(created);
+    }
+    Ok(slot.as_mut().expect("progress just created"))
+}
+
+/// Persist a submitted plan and return the review copy of its input.
+///
+/// The draft is written before the review reaches the user, so a declined plan
+/// keeps its file and the next revision replaces it in place rather than
+/// leaving a trail of near-duplicates. Only `state` is withheld — that is the
+/// question being asked.
+pub fn review_copy(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<Value, String> {
+    let mut slot = ctx.progress.lock().expect("progress lock");
+    // What is under review is by definition a draft, even the first time.
+    let progress = current_or_create(&mut slot, &ctx.cwd, input, ProgressState::Draft)?;
+    progress
+        .reconcile()
+        .map_err(|conflict| conflict.message())?;
+    progress.apply_content(input)?;
+    progress.save()?;
+    let mut review = input.clone();
+    review[REVIEW_BODY_FIELD] = Value::String(progress.body());
+    review[REVIEW_PATH_FIELD] = Value::String(progress.path().display().to_string());
+    Ok(review)
+}
+
+/// Apply an ordinary (or approved) `progress` call to the session's file.
+/// Returns the tool's own result text.
+pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, String> {
+    let mut slot = ctx.progress.lock().expect("progress lock");
+    // `draft` is the only thing that opens a draft. A file the model opens to
+    // track its own work needs nobody's approval, so it is active from birth —
+    // which is what lets `state: "active"` mean one thing only: submit the
+    // draft I already have.
+    let fresh = match input["state"].as_str() == Some(ProgressState::Draft.label()) {
+        true => ProgressState::Draft,
+        false => ProgressState::Active,
+    };
+    let progress = current_or_create(&mut slot, &ctx.cwd, input, fresh)?;
+    let entered = if is_submission(input) {
+        // The approved call: whatever the reviewer left in the pane is the
+        // authority, including a rewrite, so `reconcile` is deliberately not
+        // consulted — this write *is* the human's answer about this file.
+        match input[REVIEW_BODY_FIELD].as_str() {
+            Some(body) => progress.set_body(body),
+            // No review copy reached the tool, so nothing overrode the model's
+            // own breakdown — take it as sent.
+            None => {
+                progress.apply_content(input)?;
+            }
+        }
+        progress.set_state(ProgressState::Active)?;
+        None
+    } else {
+        progress
+            .reconcile()
+            .map_err(|conflict| conflict.message())?;
+        progress.apply(input)?
+    };
+    progress.save()?;
+    let (done, total) = progress.counts();
+    let state = progress.state();
+    let mut result = format!("{} · {done}/{total} phases done", state.label());
+    if let Some(entered) = entered {
+        result.push_str("\n\nNow starting — ");
+        result.push_str(&entered);
+    }
+    // A finished plan stops being this conversation's current one, so the next
+    // task opens its own file instead of appending to a completed one.
+    if state == ProgressState::Done {
+        *slot = None;
+    }
+    Ok(result)
+}
+
+/// This conversation's current progress summary, if it has one.
+pub fn current_summary(ctx: &crate::tool::ToolCtx) -> Option<String> {
+    ctx.progress
+        .lock()
+        .expect("progress lock")
+        .as_ref()
+        .map(Progress::summary)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -569,21 +745,25 @@ fn parse_heading(line: &str) -> Option<(usize, PhaseStatus, String)> {
     let (mark, rest) = rest.split_at(rest.find(']')? + 1);
     let status = PhaseStatus::from_box(mark)?;
     let rest = rest.trim_start();
-    // Drop a leading `2.` / `2.1` numbering, ours or the user's.
     let title = match rest.split_once(' ') {
-        Some((head, tail))
-            if head.ends_with('.')
-                && head
-                    .trim_end_matches('.')
-                    .chars()
-                    .all(|c| c.is_ascii_digit() || c == '.') =>
-        {
-            tail
-        }
+        Some((head, tail)) if is_numbering(head) => tail,
         _ => rest,
     };
     let title = title.trim();
     (!title.is_empty()).then(|| (level, status, title.to_string()))
+}
+
+/// A leading `2.` / `2.1` / `2.1.` — the numbering we render, or whatever the
+/// user renumbered it to — which is dropped on the way back in so a renumbered
+/// plan does not grow its numbers into its phase titles. A dot is required, so
+/// a phase that genuinely opens with a number ("2024 migration") keeps it.
+fn is_numbering(head: &str) -> bool {
+    head.contains('.')
+        && !head.trim_end_matches('.').is_empty()
+        && head
+            .trim_end_matches('.')
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.')
 }
 
 /// One line per unfinished progress file, newest first.
@@ -766,12 +946,20 @@ fn civil_now(at: SystemTime) -> (i64, i64, i64, u64, u64, u64) {
 }
 
 /// Filesystem-safe short slug from the title.
+///
+/// Alphanumeric is judged by Unicode, not ASCII: a title written in Chinese,
+/// Japanese or Cyrillic must still name its own file. Restricting this to ASCII
+/// folds every such title to nothing and lands them all on the `progress`
+/// fallback — which is exactly the directory of interchangeable names the
+/// timestamped-title scheme exists to avoid. Everything `is_alphanumeric`
+/// rejects is punctuation or whitespace, so the path separators and the Windows
+/// reserved set are all still excluded.
 fn slug(title: &str) -> String {
     let mut slug: String = title
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
+            if c.is_alphanumeric() {
+                c.to_lowercase().next().unwrap_or(c)
             } else {
                 '-'
             }
@@ -957,6 +1145,20 @@ mod tests {
         assert!(conflict.message().contains("authoritative"));
     }
 
+    /// A title nobody wrote in ASCII must still name its own file. Folding the
+    /// whole thing away lands every such plan on the `progress` fallback, which
+    /// is the directory of interchangeable names this scheme exists to avoid.
+    #[test]
+    fn a_non_ascii_title_still_names_its_file() {
+        assert_eq!(slug("修复工作区测试"), "修复工作区测试");
+        assert_eq!(slug("Rewrite the resume path"), "rewrite-the-resume-path");
+        assert_eq!(slug("修复 ledger rewind"), "修复-ledger-rewind");
+        // Separators and the Windows reserved set are punctuation, so they are
+        // still folded out.
+        assert_eq!(slug("a/b\\c:d*e?f\"g<h>i|j"), "a-b-c-d-e-f-g-h-i-j");
+        assert_eq!(slug("!!!"), "progress");
+    }
+
     #[test]
     fn create_uses_a_timestamped_slug_under_the_project_directory() {
         crate::home::testing::temp_home();
@@ -965,6 +1167,172 @@ mod tests {
         let name = progress.path().file_name().unwrap().to_string_lossy();
         assert!(name.contains("rewrite-the-resume-path"), "{name}");
         assert!(progress.path().starts_with(store::progress_dir(cwd.path())));
+    }
+
+    fn test_ctx() -> crate::tool::ToolCtx {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap().keep();
+        crate::tool::ToolCtx::for_test(cwd, 2_000)
+    }
+
+    /// The model tracking its own work needs nobody's approval, so a file it
+    /// opens without mentioning `state` is active from birth; only naming
+    /// `state` puts the lifecycle up for decision.
+    #[test]
+    fn an_unstated_state_opens_an_active_file_and_draft_opens_a_draft() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Track it", "phases": [{ "phase": "one", "status": "in_progress" }] }),
+        )
+        .unwrap();
+        assert_eq!(
+            ctx.progress.lock().unwrap().as_ref().unwrap().state(),
+            ProgressState::Active
+        );
+
+        let drafted = test_ctx();
+        apply_call(
+            &drafted,
+            &json!({ "title": "Plan it", "state": "draft", "phases": [] }),
+        )
+        .unwrap();
+        assert_eq!(
+            drafted.progress.lock().unwrap().as_ref().unwrap().state(),
+            ProgressState::Draft
+        );
+    }
+
+    #[test]
+    fn the_first_call_must_name_the_task() {
+        let ctx = test_ctx();
+        let error = apply_call(&ctx, &json!({ "phases": [] })).unwrap_err();
+        assert!(error.contains("`title`"), "{error}");
+    }
+
+    /// `state: "active"` is the approval request itself, which is what keeps
+    /// `permission()` a pure function of the input.
+    #[test]
+    fn only_an_active_transition_asks_for_review() {
+        assert!(is_submission(&json!({ "state": "active" })));
+        assert!(!is_submission(&json!({ "state": "draft" })));
+        assert!(!is_submission(&json!({ "phases": [] })));
+    }
+
+    /// A submitted draft is written before the human answers, so declining
+    /// keeps the file and the next revision replaces it in place. The state
+    /// transition is the one thing withheld — it is the question being asked.
+    #[test]
+    fn review_saves_the_draft_without_promoting_it() {
+        let ctx = test_ctx();
+        let submit = json!({
+            "title": "Rewrite the resume path",
+            "state": "active",
+            "phases": [{ "phase": "survey the callers", "status": "in_progress",
+                         "detail": "read only" }]
+        });
+        let review = review_copy(&ctx, &submit).unwrap();
+        assert!(review[REVIEW_BODY_FIELD]
+            .as_str()
+            .unwrap()
+            .contains("survey the callers"));
+
+        let path = {
+            let slot = ctx.progress.lock().unwrap();
+            let progress = slot.as_ref().unwrap();
+            assert_eq!(progress.state(), ProgressState::Draft, "not yet approved");
+            progress.path().to_path_buf()
+        };
+        assert!(path.exists(), "the draft is durable before it is reviewed");
+        let first = path.clone();
+
+        // A revision while still in review replaces the same file.
+        review_copy(
+            &ctx,
+            &json!({ "title": "Rewrite the resume path", "state": "active",
+                     "phases": [{ "phase": "survey the callers again", "status": "pending" }] }),
+        )
+        .unwrap();
+        assert_eq!(ctx.progress.lock().unwrap().as_ref().unwrap().path(), first);
+
+        // Approval carries the body the human accepted, rewritten or not.
+        let mut approved = review;
+        approved[REVIEW_BODY_FIELD] = Value::String("## [ ] 1. what the user wants\n".into());
+        apply_call(&ctx, &approved).unwrap();
+        let slot = ctx.progress.lock().unwrap();
+        let progress = slot.as_ref().unwrap();
+        assert_eq!(progress.state(), ProgressState::Active);
+        assert_eq!(progress.phases()[0].phase, "what the user wants");
+    }
+
+    /// Rule (2) of the design: a twelve-phase plan keeps one phase's prose in
+    /// context, handed over exactly when that phase starts.
+    #[test]
+    fn the_result_carries_the_entered_phase_detail_and_nothing_else() {
+        let ctx = test_ctx();
+        let result = apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "completed", "detail": "old news" },
+                { "phase": "change it", "status": "in_progress", "detail": "touch ledger.rs" }
+            ] }),
+        )
+        .unwrap();
+        assert!(result.contains("touch ledger.rs"), "{result}");
+        assert!(!result.contains("old news"), "{result}");
+        assert!(result.contains("1/2"), "{result}");
+    }
+
+    /// A finished plan stops being the conversation's current one, so the next
+    /// task opens its own file instead of appending to a completed one.
+    #[test]
+    fn done_closes_the_file_and_needs_every_phase_landed() {
+        let ctx = test_ctx();
+        let unfinished = json!({ "title": "Ship it", "state": "done",
+            "phases": [{ "phase": "one", "status": "in_progress" }] });
+        assert!(apply_call(&ctx, &unfinished)
+            .unwrap_err()
+            .contains("every phase is completed"));
+
+        apply_call(
+            &ctx,
+            &json!({ "state": "done", "phases": [{ "phase": "one", "status": "completed" }] }),
+        )
+        .unwrap();
+        assert!(ctx.progress.lock().unwrap().is_none());
+    }
+
+    /// The user's edit wins, and the error hands their text straight back so
+    /// the model never spends a `read` finding out what changed.
+    #[test]
+    fn a_hand_edited_file_blocks_the_next_update_with_its_own_contents() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [{ "phase": "one", "status": "pending" }] }),
+        )
+        .unwrap();
+        let path = ctx
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        std::fs::write(
+            &path,
+            "---\ntitle: mine\nstate: active\ncreated: c\n---\n\n## [ ] 1. I disagree\n",
+        )
+        .unwrap();
+
+        let error = apply_call(
+            &ctx,
+            &json!({ "phases": [{ "phase": "one", "status": "completed" }] }),
+        )
+        .unwrap_err();
+        assert!(error.contains("I disagree"), "{error}");
+        assert!(error.contains("authoritative"), "{error}");
     }
 
     #[test]
@@ -982,7 +1350,6 @@ mod tests {
         write("a.md", "active", "\n## [x] 1. one\n\n## [ ] 2. two\n");
         write("b.md", "draft", "\n## [ ] 1. one\n");
         let done = write("c.md", "done", "\n## [x] 1. one\n");
-        let stale = write("d.md", "active", "\n## [ ] 1. one\n");
         // Everything is stale seen from far enough ahead; re-dating the files
         // themselves would need a filetime dependency for no extra coverage.
         let entries = inventory_at(dir.path(), SystemTime::now() + STALE_AFTER * 2);
@@ -990,9 +1357,9 @@ mod tests {
 
         let entries = inventory_at(dir.path(), SystemTime::now());
         let names: Vec<String> = entries.iter().map(|e| e.file_name()).collect();
+        assert_eq!(names.len(), 2, "only the unfinished ones: {names:?}");
         assert!(!names.contains(&"c.md".to_string()), "done is archived");
-        assert!(!names.contains(&"d.md".to_string()), "stale is archived");
-        assert!(done.exists() && stale.exists(), "archiving never deletes");
+        assert!(done.exists(), "archiving never deletes");
         let a = entries.iter().find(|e| e.file_name() == "a.md").unwrap();
         assert_eq!((a.done, a.total), (1, 2));
     }

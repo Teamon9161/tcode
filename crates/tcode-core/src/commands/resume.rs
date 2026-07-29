@@ -27,6 +27,7 @@ impl SlashCommand for ResumeCommand {
                     startup,
                     environment: previous_environment,
                     delivered_environment,
+                    progress,
                 } = resumed;
                 let session_id = store.id.clone();
                 let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
@@ -50,6 +51,9 @@ impl SlashCommand for ResumeCommand {
                 );
                 let current = (ctx.environment)(&ctx.session.tool_ctx.cwd);
                 ctx.session.sync_environment(current, None);
+                // The resumed conversation's plan is re-read from disk, not
+                // trusted from the log: the user may have edited it since.
+                ctx.session.restore_progress(progress.as_deref());
                 // Unknown until the next usage event; the TUI re-estimates in
                 // its ConversationReplaced handler.
                 ctx.session.last_prompt_tokens = 0;

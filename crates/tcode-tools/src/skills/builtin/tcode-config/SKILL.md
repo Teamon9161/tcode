@@ -41,7 +41,7 @@ tcode --config C:\\path\\to\\work.toml --profile anthropic --model claude-sonnet
 `TCODE_HOME` relocates the whole of that tree. When the variable is set and
 non-empty, `~/.tcode/config.toml`, `~/.tcode/agents/`, `~/.tcode/skills/`,
 `~/.tcode/AGENTS.md` and `~/.tcode/projects/<project-id>/` (sessions,
-checkpoints, plans, task traces, scratchpad, auto memory) all resolve beneath
+checkpoints, progress, task traces, scratchpad, auto memory) all resolve beneath
 it instead of the user's home directory; unset, the home directory is used.
 It is read per lookup, so it belongs in the environment before tcode starts —
 a portable install on a stick, a sandboxed or CI run, or a test suite that
@@ -49,6 +49,32 @@ must not touch a developer's real state. Two things deliberately stay outside
 it: paths belonging to *other* tools (`~/.codex`, `~/.claude`, read when
 importing their sessions) and the voice model cache
 (`~/.tcode/voice/models`, which has its own `--model-dir`).
+
+## Progress tracking and `/plan`
+
+A project's durable progress files are runtime state, not repository files:
+`<TCODE_HOME>/projects/<project-id>/progress/` (or
+`~/.tcode/projects/<project-id>/progress/` when `TCODE_HOME` is unset). tcode
+adopts the legacy sibling `plans/` directory on first use, but new files always
+belong in `progress/`. Use `/plan export <path>` only when the user explicitly
+wants a copy tracked elsewhere, such as in the repository.
+
+At the start of a conversation, tcode supplies an inventory of up to three
+recent unfinished progress files. It includes their title, lifecycle state,
+phase count, and filename, but not their full text or absolute path. `done`
+files and files untouched for more than 14 days remain on disk but are omitted
+from that inventory. The inventory is context, not an instruction to resume
+old work.
+
+`/plan list` is the authoritative interactive listing: it returns up to 20
+unfinished progress files for the current project. `/plan resume <n>` adopts a
+listed file, `/plan last` displays the most recently timestamped progress file,
+and `/plan export <path>` exports the currently open file. A user asking in
+natural language which progress files exist may be answered from the startup
+inventory when it suffices; for a complete or current listing, tell them to run
+`/plan list`. The `progress` tool maintains the active work breakdown only; it
+is not a general file-listing tool. Skills do not auto-load from words such as
+“progress”; invoke a skill explicitly when its full instructions are needed.
 
 The default config migrates a legacy `~/.tcode/state.toml` once if it has no
 `[tcode_state]`; a custom `--config` file never reads that legacy state. Before
@@ -402,7 +428,7 @@ Frontmatter `profile` / `model` / `effort` supplies a default pin. Explicit
 
 ```toml
 [permissions]
-mode = "default" # plan | default | accept-edits | auto | unsafe
+mode = "default" # default | accept-edits | auto | unsafe
 allow = ["run(cargo test *)"]
 ask = ["shell(rm *)"]
 deny = ["shell(rm -rf *)"]

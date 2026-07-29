@@ -181,7 +181,6 @@ pub fn startup_mode(
     config: &Config,
 ) -> anyhow::Result<PermissionMode> {
     Ok(match requested {
-        Some("plan") => PermissionMode::Plan,
         Some("accept-edits") => PermissionMode::AcceptEdits,
         Some("auto") => PermissionMode::Auto,
         Some("unsafe") => PermissionMode::Unsafe,

@@ -176,7 +176,10 @@ impl SessionView {
                 input,
                 ..
             } => {
-                if !matches!(ctx.renderers.get(name).route(), CallRoute::Transcript) {
+                if !matches!(
+                    ctx.renderers.route_of(name, Some(input)),
+                    CallRoute::Transcript
+                ) {
                     return;
                 }
                 self.space_before_response = false;
@@ -200,7 +203,23 @@ impl SessionView {
                 content,
                 is_error,
             } => {
-                if !matches!(ctx.renderers.get(name).route(), CallRoute::Transcript) {
+                // Peek before consuming: a `progress` submission belongs in the
+                // transcript while a phase flip does not, and only the call's
+                // input tells them apart.
+                let pending_input = self
+                    .pending_tool
+                    .as_ref()
+                    .filter(|call| call.call_id == *call_id)
+                    .or_else(|| {
+                        self.pending_batch
+                            .iter()
+                            .find(|call| call.call_id == *call_id)
+                    })
+                    .map(|call| call.input.clone());
+                if !matches!(
+                    ctx.renderers.route_of(name, pending_input.as_ref()),
+                    CallRoute::Transcript
+                ) {
                     return;
                 }
                 let entry = self
@@ -492,7 +511,10 @@ impl SessionView {
                         };
                         let call = calls.get(tool_use_id);
                         let name = call.map(|call| call.name.as_str()).unwrap_or("tool");
-                        if !matches!(ctx.renderers.get(name).route(), CallRoute::Transcript) {
+                        if !matches!(
+                            ctx.renderers.route_of(name, call.map(|call| &call.input)),
+                            CallRoute::Transcript
+                        ) {
                             continue;
                         }
                         self.transcript.push(std::mem::take(&mut lines));

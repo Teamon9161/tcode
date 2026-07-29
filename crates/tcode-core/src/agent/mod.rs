@@ -567,9 +567,8 @@ impl Agent {
         self.note_background(session, events).await?;
         // Commit a mode staged before this turn. The user prompt below is the
         // delivery point that may append deferred environment, memory, and
-        // plan-mode context.
+        // progress context.
         self.commit_mode(session, events).await?;
-        session.mark_mode_delivery();
         self.deliver_deferred_context(session);
         let expanded = crate::references::expand_references(
             session.tool_ctx.cwd.clone(),
@@ -1026,26 +1025,13 @@ impl Agent {
                 }
                 Decision::Ask | Decision::Auto => {
                     // A plan is a durable review artifact, not an approved-only
-                    // side effect. Save the model's submitted version before it
-                    // crosses the frontend boundary, then pass the path only in
-                    // the review copy; the model-issued call in the ledger stays
+                    // side effect. Persist the model's submitted version before
+                    // it crosses the frontend boundary, and hand the review its
+                    // rendered body; the model-issued call in the ledger stays
                     // immutable and free of harness bookkeeping.
-                    let review_input = if let PermissionRequest::PlanReview { title } = &request {
-                        let plan = input["plan"].as_str().unwrap_or("").trim();
-                        if plan.is_empty() {
-                            results.push(tool_result(
-                                id,
-                                "exit_plan needs a non-empty `plan` (markdown).",
-                                true,
-                            ));
-                            continue;
-                        }
-                        match session
-                            .plan_draft
-                            .save(&session.tool_ctx.cwd, title, plan)
-                            .await
-                        {
-                            Ok(path) => crate::plan_draft::with_plan_path(input, &path),
+                    let review_input = if matches!(request, PermissionRequest::PlanReview { .. }) {
+                        match crate::progress::review_copy(&session.tool_ctx, input) {
+                            Ok(review) => review,
                             Err(error) => {
                                 results.push(tool_result(id, &error, true));
                                 continue;
@@ -1065,7 +1051,6 @@ impl Agent {
                             &review_input,
                         )
                         .await;
-                    session.mark_mode_delivery();
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             approval_note = approval.comment;
@@ -1176,7 +1161,6 @@ impl Agent {
                 )
                 .await?;
             if matches!(request, PermissionRequest::PlanReview { .. }) && !output.is_error {
-                session.plan_draft.clear();
                 end_turn |= end_turn_after_execution;
             }
             if !output.is_error {
@@ -1253,12 +1237,18 @@ impl Agent {
             self.commit_interrupt(session, &[], &cancelled, false);
             // Executed calls before the cut already have real results.
             let _ = executed;
+            session.record_progress_file();
             return Ok(ToolsOutcome {
                 interrupted: true,
                 awaiting_user_input: false,
                 end_turn: false,
             });
         }
+        // A batch is the only thing that can open or close a progress file, so
+        // this is where the session log learns which one it is working through.
+        // Recording it here rather than at a turn boundary means an interrupted
+        // turn still resumes onto its plan.
+        session.record_progress_file();
         Ok(ToolsOutcome {
             interrupted: false,
             awaiting_user_input,
@@ -1546,7 +1536,6 @@ impl Agent {
         };
         drop(asks);
 
-        session.mark_mode_delivery();
         if matches!(
             approval.decision,
             ApprovalDecision::YesSession | ApprovalDecision::YesProject
@@ -1697,7 +1686,6 @@ impl Agent {
                             input,
                         )
                         .await;
-                    session.mark_mode_delivery();
                     let applied_mode = approval.set_mode;
                     match approval.decision {
                         ApprovalDecision::Yes => {
@@ -2094,7 +2082,6 @@ impl Agent {
                             input,
                         )
                         .await;
-                    session.mark_mode_delivery();
                     let applied_mode = approval.set_mode;
                     match approval.decision {
                         ApprovalDecision::Yes => {
@@ -2358,11 +2345,6 @@ impl Agent {
         for entry in session.take_deferred_context_entries() {
             session.ledger.append(entry);
         }
-        // Every caller marks a real prompt, queued prompt, or approval before
-        // reaching this boundary; bare UI setting changes never call this path.
-        if let Some(note) = session.take_pending_mode_note() {
-            session.ledger.append(Entry::Note(note));
-        }
     }
 
     /// Hand the model whatever the user said while it was working.
@@ -2377,7 +2359,6 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
         for message in session.pending.take_at_safe_boundary() {
-            session.mark_mode_delivery();
             let expanded =
                 crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)
                     .await;
@@ -2755,6 +2736,9 @@ fn normalize_path(path: PathBuf) -> PathBuf {
     normalized
 }
 
+/// The input an approved plan actually executes: the reviewer's rewrite when
+/// they made one, else the body they saw and accepted. Either way the tool
+/// receives a body the human signed off on rather than re-deriving one.
 fn approved_plan_input(
     request: &PermissionRequest,
     approved_input: Option<Value>,
@@ -2764,9 +2748,9 @@ fn approved_plan_input(
         return approved_input;
     }
     let mut input = approved_input.unwrap_or_else(|| review_input.clone());
-    if input[crate::plan_draft::PLAN_PATH_FIELD].is_null() {
-        input[crate::plan_draft::PLAN_PATH_FIELD] =
-            review_input[crate::plan_draft::PLAN_PATH_FIELD].clone();
+    if input[crate::progress::REVIEW_BODY_FIELD].is_null() {
+        input[crate::progress::REVIEW_BODY_FIELD] =
+            review_input[crate::progress::REVIEW_BODY_FIELD].clone();
     }
     Some(input)
 }

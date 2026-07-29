@@ -129,6 +129,10 @@ impl Agent {
         }
         let upto = session.ledger.len();
         session.ledger.compact(summary.clone(), upto);
+        // The `progress` calls that carried the plan just left the history, so
+        // the model no longer has it. This is one of the three moments the
+        // harness re-describes the file rather than assuming the model kept it.
+        session.mark_progress_injection();
         let memory_note = session
             .tool_ctx
             .memory
@@ -182,6 +186,6 @@ mod tests {
         assert!(prompt.contains("prioritize API decisions and migration risks"));
         assert!(prompt.contains("supplements, not replaces"));
         assert!(!prompt.contains("{{USER_FOCUS}}"));
-        assert!(prompt.ends_with("Output only the summary text.\n"));
+        assert!(prompt.trim_end().ends_with("Output only the summary text."));
     }
 }

@@ -27,6 +27,32 @@ pub(super) fn merge(queued: Vec<PendingMessage>) -> Option<PendingMessage> {
     Some(merged)
 }
 
+/// Read a `phases` array, sub-phases and all. Two levels is the cap core
+/// enforces, so recursion here bottoms out on its own.
+fn parse_progress_phases(items: &[serde_json::Value]) -> Vec<ProgressPhase> {
+    items
+        .iter()
+        .filter_map(|item| {
+            // `step` keeps sessions created before the rename readable.
+            let phase = item["phase"]
+                .as_str()
+                .or_else(|| item["step"].as_str())?
+                .trim();
+            let status = item["status"].as_str()?;
+            (!phase.is_empty() && matches!(status, "pending" | "in_progress" | "completed")).then(
+                || ProgressPhase {
+                    phase: phase.to_string(),
+                    status: status.to_string(),
+                    phases: item["phases"]
+                        .as_array()
+                        .map(|nested| parse_progress_phases(nested))
+                        .unwrap_or_default(),
+                },
+            )
+        })
+        .collect()
+}
+
 impl App {
     pub(super) fn start_turn(&mut self, message: PendingMessage) {
         let Some(mut session) = self.session.take() else {
@@ -623,7 +649,7 @@ impl App {
         input: serde_json::Value,
     ) {
         self.space_before_response = false;
-        match self.renderers.get(&name).route() {
+        match self.renderers.route_of(&name, Some(&input)) {
             CallRoute::Progress => {
                 self.update_progress(&input);
                 self.state_label = "updating progress".into();
@@ -687,7 +713,23 @@ impl App {
         {
             self.refresh_reference_index();
         }
-        if !matches!(self.renderers.get(&name).route(), CallRoute::Transcript) {
+        // Peek at the stashed input without consuming the pending entry: a
+        // `progress` submission routes to the transcript while a phase flip
+        // does not, and only its input tells them apart.
+        let pending_input = self
+            .pending_tool
+            .as_ref()
+            .filter(|entry| entry.call_id == call_id)
+            .or_else(|| {
+                self.pending_batch
+                    .iter()
+                    .find(|entry| entry.call_id == call_id)
+            })
+            .and_then(|entry| serde_json::from_str::<serde_json::Value>(&entry.detail).ok());
+        if !matches!(
+            self.renderers.route_of(&name, pending_input.as_ref()),
+            CallRoute::Transcript
+        ) {
             self.state_label = "responding".into();
             return;
         }
@@ -987,10 +1029,10 @@ impl App {
                 | ApprovalDecision::YesProject => {}
                 ApprovalDecision::No => {
                     // Keep-planning: no ToolStart/ToolEnd will fire, so bake the
-                    // plan here (through the same ExitPlanRenderer path replay
-                    // uses) followed by the decision + feedback.
+                    // plan here (through the same renderer path replay uses)
+                    // followed by the decision + feedback.
                     if let Some(input) = dialog.plan_input() {
-                        self.bake_call_start("exit_plan", &input);
+                        self.bake_call_start("progress", &input);
                     }
                     let reason = approval
                         .comment
@@ -1060,13 +1102,24 @@ impl App {
         else {
             return;
         };
-        let path = std::path::PathBuf::from(path);
-
-        // The plan has already been saved before review. Editing the same file
-        // makes an external revision durable even when the user keeps planning.
+        // A scratch copy, not the durable draft: what the pane holds is the
+        // phase body, while the file also carries front matter the approval
+        // buttons own, so editing the real file here would strip it. A revision
+        // becomes durable when the user approves it; keep-planning sends its
+        // diff back instead. It also must not land in the progress directory,
+        // where the inventory would list it as a plan of its own.
+        let scratch = tcode_core::store::scratchpad_dir(&self.cwd);
+        let _ = std::fs::create_dir_all(&scratch);
+        let path = scratch.join(format!(
+            "plan-review-{}",
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "draft.md".into())
+        ));
         if std::fs::write(&path, &source).is_err() {
             self.notice = Some((
-                "could not write the saved plan draft for editing".into(),
+                "could not write the plan draft for editing".into(),
                 Instant::now(),
             ));
             return;
@@ -1106,6 +1159,7 @@ impl App {
         }
 
         let edited = std::fs::read_to_string(&path);
+        let _ = std::fs::remove_file(&path);
         let Ok(edited) = edited else {
             self.notice = Some(("could not read the edited plan".into(), Instant::now()));
             return;
@@ -1228,21 +1282,7 @@ impl App {
         else {
             return;
         };
-        let parsed: Vec<ProgressPhase> = items
-            .iter()
-            .filter_map(|item| {
-                let phase = item["phase"]
-                    .as_str()
-                    .or_else(|| item["step"].as_str())?
-                    .trim();
-                let status = item["status"].as_str()?;
-                (!phase.is_empty() && matches!(status, "pending" | "in_progress" | "completed"))
-                    .then(|| ProgressPhase {
-                        phase: phase.to_string(),
-                        status: status.to_string(),
-                    })
-            })
-            .collect();
+        let parsed = parse_progress_phases(items);
         // `[]` deliberately clears progress. A non-empty malformed payload is
         // not a meaningful update and must not erase the existing snapshot.
         if items.is_empty() || !parsed.is_empty() {

@@ -109,6 +109,7 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
                 startup,
                 environment: previous_environment,
                 delivered_environment,
+                progress,
             } = resumed;
             let session_id = store.id.clone();
             let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
@@ -125,6 +126,10 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
             });
             session.restore_startup_context(startup, previous_environment, delivered_environment);
             session.sync_environment((environment)(&cwd), None);
+            // Re-read the plan rather than trusting the log: the record says
+            // what was true when tcode stopped, and the file is the one piece
+            // of this conversation the user can edit while it is not running.
+            session.restore_progress(progress.as_deref());
         }
         ResumeSpec::New => {
             let store =

@@ -5,7 +5,7 @@ mod grounding;
 mod interaction;
 mod mcp;
 mod monitor;
-mod plan;
+mod progress;
 mod redact;
 mod search;
 mod shell;
@@ -23,8 +23,9 @@ pub use agent::AgentTool;
 pub use grounding::{
     environment_snapshot, project_map, project_map_with_scratch, startup_context_with_scratch,
 };
-pub use interaction::{AddNoteTool, AskUserTool, UpdateProgressTool};
+pub use interaction::{AddNoteTool, AskUserTool};
 pub use mcp::connect_mcp_servers;
+pub use progress::ProgressTool;
 pub use shell::ShellKind;
 pub use shell_filter::{OutputFilter, ShellFilters};
 pub use skills::{
@@ -133,7 +134,6 @@ pub fn builtin_tools_with_skills_and_web_fetch(
         Arc::new(web_fetch),
         Arc::new(web::WebSearchTool),
         Arc::new(shell::KillTaskTool),
-        Arc::new(plan::ExitPlanTool),
     ];
     let primary_shell = primary_shell_kind();
     tools.push(Arc::new(shell::ShellTool::with_filters(
@@ -176,5 +176,48 @@ mod tests {
             Some(&true),
             "the primary shell tool must keep the blob gate"
         );
+    }
+
+    /// A malformed schema is not a degraded tool — the provider rejects the
+    /// whole request, so one bad tool takes the session down before the first
+    /// token. `null` is the way to write one by accident (a recursive schema
+    /// builder bottoming out), and no schema position accepts it.
+    #[test]
+    fn every_tool_schema_is_a_legal_json_schema() {
+        fn no_nulls(value: &serde_json::Value, path: &str, tool: &str) {
+            match value {
+                serde_json::Value::Null => {
+                    panic!("{tool}'s schema has a null at {path}; JSON Schema has no null nodes")
+                }
+                serde_json::Value::Object(map) => {
+                    for (key, child) in map {
+                        no_nulls(child, &format!("{path}.{key}"), tool);
+                    }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, child) in items.iter().enumerate() {
+                        no_nulls(child, &format!("{path}[{index}]"), tool);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // Every tool the harness can hand a model, including the main-agent
+        // additions that are not part of `builtin_tools`.
+        let mut tools = builtin_tools(&std::env::temp_dir());
+        tools.push(Arc::new(crate::ProgressTool));
+        tools.push(Arc::new(crate::AskUserTool));
+        tools.push(Arc::new(crate::AddNoteTool));
+        for tool in &tools {
+            let schema = tool.input_schema();
+            assert_eq!(
+                schema["type"],
+                "object",
+                "{}'s schema must be an object",
+                tool.name()
+            );
+            no_nulls(&schema, "", tool.name());
+        }
     }
 }

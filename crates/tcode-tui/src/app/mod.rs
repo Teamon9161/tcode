@@ -838,18 +838,21 @@ impl App {
         self.meter.pause_for_user();
         let dialog = if ask.only().tool == "ask_user" {
             Dialog::questions(ask.only().summary.clone(), &ask.only().input)
-        } else if ask.only().tool == "exit_plan" {
+        } else if ask.only().descriptor == "progress" {
             // The plan is the review surface, but it lives inside the
             // pane now (block-navigable, commentable) rather than in
             // the transcript. Split it into blocks and pre-render each
             // so the hot key path never re-parses markdown. On
             // approval the tool runs and its ToolStart bakes the plan
             // into the transcript; on decline `bake_approval_record`
-            // bakes it — either way the transcript record matches
-            // replay's ExitPlanRenderer output.
+            // bakes it — either way the transcript record matches what
+            // replay renders for the same call.
             self.bake_live_text();
             self.finish_thinking();
-            let source = ask.only().input["plan"].as_str().unwrap_or("").trim();
+            let source = ask.only().input[tcode_core::progress::REVIEW_BODY_FIELD]
+                .as_str()
+                .unwrap_or("")
+                .trim();
             let blocks = markdown::split_blocks(source)
                 .into_iter()
                 .map(|block| {
@@ -2042,7 +2045,7 @@ mod tests {
         // the compacted persisted form that resume must replay.
         app.on_agent_event(AgentEvent::ToolStart {
             call_id: "progress-1".into(),
-            name: "update_progress".into(),
+            name: "progress".into(),
             input: input.clone(),
             summary: String::new(),
         });
@@ -2052,7 +2055,7 @@ mod tests {
             .ledger
             .append(Entry::Assistant(vec![ContentBlock::ToolUse {
                 id: "progress-1".into(),
-                name: "update_progress".into(),
+                name: "progress".into(),
                 input,
             }]));
         session
@@ -2097,9 +2100,9 @@ mod tests {
         app.open_review(AskMsg {
             label: "Review plan".into(),
             calls: vec![AskCall {
-                tool: "exit_plan".into(),
+                tool: "progress".into(),
                 summary: "Review plan".into(),
-                descriptor: "exit_plan".into(),
+                descriptor: "progress".into(),
                 is_edit: false,
                 allows_project: false,
                 input: serde_json::json!({ "plan": plan }),
@@ -2107,11 +2110,11 @@ mod tests {
             reply: ApprovalReply::One(tx),
         });
 
-        app.press(KeyCode::Char('4'));
+        app.press(KeyCode::Char('5'));
         app.press(KeyCode::Enter);
         assert!(
             app.frame().contains("execution model"),
-            "option 4 opens the shared execution-model picker"
+            "the fresh-session option opens the shared execution-model picker"
         );
         app.press(KeyCode::Esc);
         assert!(
@@ -2119,7 +2122,7 @@ mod tests {
             "Esc returns to the same plan review"
         );
 
-        app.press(KeyCode::Char('4'));
+        app.press(KeyCode::Char('5'));
         app.press(KeyCode::Enter);
         app.press(KeyCode::Enter);
         let approval = rx.try_recv().expect("the planning turn receives approval");

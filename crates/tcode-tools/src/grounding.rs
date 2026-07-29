@@ -28,6 +28,17 @@ pub fn startup_context_with_scratch(
     );
     out.push_str(&render_environment(&environment));
     out.push_str(&render_git(&environment.git));
+    // Unfinished plans from earlier sessions. Stable for the whole session, so
+    // it belongs in the cached prefix — unlike the live progress state, which
+    // changes every turn and must never come near it. It is a listing, not a
+    // request: see `progress::inventory_note`.
+    if let Some(note) = tcode_core::progress::inventory_note(&tcode_core::progress::inventory(
+        cwd,
+        tcode_core::progress::INVENTORY_LIMIT,
+    )) {
+        out.push_str("\n\n");
+        out.push_str(&note);
+    }
     StartupContext {
         text: out,
         environment,

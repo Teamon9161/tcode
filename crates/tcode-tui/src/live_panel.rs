@@ -1,4 +1,4 @@
-//! Persistent agent tree above the editor. It unifies `update_progress` with
+//! Persistent agent tree above the editor. It unifies the `progress` tool with
 //! sub-agent status and navigation, and is visible from both the main
 //! conversation and task traces. Everything here is pure line construction so
 //! interaction state and presentation stay unit-testable.
@@ -25,12 +25,26 @@ const STEP_HISTORY: usize = 3;
 pub struct ProgressPhase {
     pub phase: String,
     pub status: String,
+    /// Sub-phases. Two levels is the hard cap (see `tcode_core::progress`), so
+    /// this is always a leaf list.
+    pub phases: Vec<ProgressPhase>,
 }
 
 impl ProgressPhase {
     pub fn is_completed(&self) -> bool {
         self.status == "completed"
     }
+}
+
+/// One rendered row: the two-level tree flattened with sub-phases shown only
+/// under the phase actually running. What a finished or not-yet-started phase
+/// breaks down into is detail the reader has no use for, and the panel has five
+/// rows to spend.
+#[derive(Clone)]
+struct PhaseRow {
+    phase: String,
+    status: String,
+    depth: usize,
 }
 
 /// An actionable tree row. The app maps it to navigation behavior, while this
@@ -327,10 +341,7 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
         return Vec::new();
     }
     let complete = progress.iter().filter(|item| item.is_completed()).count();
-    // Preserve the model's order within each group, but keep finished work out
-    // of the way of the task the user is still following.
-    let mut ordered = progress.to_vec();
-    ordered.sort_by_key(|item| item.is_completed());
+    let ordered = phase_rows(progress);
     let (start, end) = visible_phase_range(&ordered, VISIBLE_PHASES);
     let hidden_before = start;
     let hidden_after = ordered.len().saturating_sub(end);
@@ -359,7 +370,7 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
             _ => ("○ ", theme::dim()),
         };
         Line::from(vec![
-            Span::styled(format!("    {marker}"), style),
+            Span::styled(format!("    {}{marker}", "  ".repeat(item.depth)), style),
             Span::styled(
                 item.phase.clone(),
                 if item.status == "completed" {
@@ -381,7 +392,33 @@ fn progress_lines(progress: &[ProgressPhase]) -> Vec<Line<'static>> {
     lines
 }
 
-fn visible_phase_range(phases: &[ProgressPhase], max_visible: usize) -> (usize, usize) {
+/// Flatten the tree into rows. Finished top-level phases sink to the bottom
+/// (stable, so the model's order survives within each group) to keep completed
+/// work out of the way of the task the user is still following; the running
+/// phase — and only it — brings its sub-phases along.
+fn phase_rows(progress: &[ProgressPhase]) -> Vec<PhaseRow> {
+    let mut ordered: Vec<&ProgressPhase> = progress.iter().collect();
+    ordered.sort_by_key(|item| item.is_completed());
+    let mut rows = Vec::new();
+    for item in ordered {
+        rows.push(PhaseRow {
+            phase: item.phase.clone(),
+            status: item.status.clone(),
+            depth: 0,
+        });
+        if item.status != "in_progress" {
+            continue;
+        }
+        rows.extend(item.phases.iter().map(|child| PhaseRow {
+            phase: child.phase.clone(),
+            status: child.status.clone(),
+            depth: 1,
+        }));
+    }
+    rows
+}
+
+fn visible_phase_range(phases: &[PhaseRow], max_visible: usize) -> (usize, usize) {
     if phases.len() <= max_visible || max_visible == 0 {
         return (0, phases.len());
     }
@@ -433,6 +470,7 @@ mod tests {
             .map(|(i, status)| ProgressPhase {
                 phase: format!("Phase {i}"),
                 status: status.to_string(),
+                phases: Vec::new(),
             })
             .collect()
     }
@@ -467,23 +505,16 @@ mod tests {
 
     #[test]
     fn completed_phases_follow_active_work_and_use_dim_style() {
+        let leaf = |phase: &str, status: &str| ProgressPhase {
+            phase: phase.into(),
+            status: status.into(),
+            phases: Vec::new(),
+        };
         let items = vec![
-            ProgressPhase {
-                phase: "done first".into(),
-                status: "completed".into(),
-            },
-            ProgressPhase {
-                phase: "next".into(),
-                status: "pending".into(),
-            },
-            ProgressPhase {
-                phase: "now".into(),
-                status: "in_progress".into(),
-            },
-            ProgressPhase {
-                phase: "done last".into(),
-                status: "completed".into(),
-            },
+            leaf("done first", "completed"),
+            leaf("next", "pending"),
+            leaf("now", "in_progress"),
+            leaf("done last", "completed"),
         ];
         let lines = progress_lines(&items);
         let rendered = lines.iter().map(text).collect::<Vec<_>>();
@@ -507,7 +538,44 @@ mod tests {
     fn visible_phase_range_focuses_in_progress_item() {
         let mut items = phases(&["pending"; 8]);
         items[5].status = "in_progress".into();
-        assert_eq!(visible_phase_range(&items, 5), (3, 8));
+        assert_eq!(visible_phase_range(&phase_rows(&items), 5), (3, 8));
+    }
+
+    /// Only the running phase shows its internals: what a finished or
+    /// not-yet-started phase breaks down into is detail nobody is reading, and
+    /// the panel has five rows.
+    #[test]
+    fn sub_phases_expand_under_the_running_phase_only() {
+        let leaf = |phase: &str, status: &str| ProgressPhase {
+            phase: phase.into(),
+            status: status.into(),
+            phases: Vec::new(),
+        };
+        let items = vec![
+            ProgressPhase {
+                phase: "now".into(),
+                status: "in_progress".into(),
+                phases: vec![
+                    leaf("write the test", "completed"),
+                    leaf("fix it", "in_progress"),
+                ],
+            },
+            ProgressPhase {
+                phase: "later".into(),
+                status: "pending".into(),
+                phases: vec![leaf("hidden", "pending")],
+            },
+        ];
+        let rendered = progress_lines(&items).iter().map(text).collect::<Vec<_>>();
+        assert_eq!(
+            rendered[1..],
+            [
+                "    ● now",
+                "      ✓ write the test",
+                "      ● fix it",
+                "    ○ later",
+            ]
+        );
     }
 
     #[test]

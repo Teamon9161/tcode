@@ -121,7 +121,10 @@ impl App {
                                 // entry so each call renders directly above its
                                 // own result, not all headers then all results.
                                 group.push((id.clone(), name.clone(), input.clone()));
-                                if matches!(self.renderers.get(name).route(), CallRoute::Progress) {
+                                if matches!(
+                                    self.renderers.route_of(name, Some(input)),
+                                    CallRoute::Progress
+                                ) {
                                     resumed_progress = Some(input.clone());
                                 }
                             }
@@ -228,7 +231,10 @@ impl App {
                         // Plan/Silent calls render via their dedicated approval
                         // record. `ask_user` carries the raw form until its
                         // following UserNote reconstructs that same record.
-                        if !matches!(self.renderers.get(name).route(), CallRoute::Transcript) {
+                        if !matches!(
+                            self.renderers.route_of(name, call.map(|call| &call.input)),
+                            CallRoute::Transcript
+                        ) {
                             if name == "ask_user" && !*is_error {
                                 if let Some(call) = call {
                                     answered_questions.push_back(call.input.clone());

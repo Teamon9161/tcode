@@ -83,7 +83,7 @@ fn folder_name(cwd: &Path) -> String {
 /// list learns about it.
 ///
 /// The fix is to promote `CallRoute` to a `Tool` trait method in core (a
-/// default of `Transcript`, `Progress` on `UpdateProgressTool`, `Silent` on
+/// default of `Transcript`, `Progress` on `ProgressTool`, `Silent` on
 /// `AskUserTool`) and have both the TUI registry and this function read it.
 /// That is the shape CLAUDE.md asks for — a capability expressed by a trait
 /// method instead of a match on names — and it is deliberately left out of this
@@ -97,7 +97,7 @@ pub struct ToolViewMeta {
 }
 
 /// Tools whose story is told somewhere other than the transcript.
-const PROGRESS_TOOLS: &[&str] = &["update_progress"];
+const PROGRESS_TOOLS: &[&str] = &["progress", "update_progress"];
 const SILENT_TOOLS: &[&str] = &["ask_user"];
 /// Tools whose call body already showed the change, so a success line under it
 /// only repeats what the diff said.

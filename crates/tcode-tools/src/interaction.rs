@@ -7,36 +7,6 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
 
-/// Records the model's visible execution progress. This is deliberately
-/// distinct from the read-only `plan` permission mode.
-pub struct UpdateProgressTool;
-
-#[async_trait]
-impl Tool for UpdateProgressTool {
-    fn name(&self) -> &str {
-        "update_progress"
-    }
-    fn description(&self) -> &str {
-        "Record and maintain visible execution progress for genuinely multi-phase work; skip it for simple or localized tasks. This is a progress tracker, not a proposal or a generic inspect/edit/test checklist. Use a short ordered `phases` list only when it reflects the work's real dependencies, risks, or user-visible milestones. Name each item as a concrete phase, for example `Phase 1 — inspect the migration boundary`. Update incrementally as work advances: keep exactly one phase in_progress, mark a phase completed the moment it lands, and immediately move the next real phase to in_progress when continuing. Never leave every phase pending and then flip them all to completed at the end — progress that is only accurate once the work is over told the user nothing. To complete a phase, resend the full current list with that phase marked completed (and the next phase in_progress if work continues). If the work is done or no longer needs tracking, send an empty phases array to clear the progress display."
-    }
-    fn input_schema(&self) -> Value {
-        json!({
-            "type": "object",
-            "properties": { "phases": { "type": "array", "items": { "type": "object", "properties": {
-                "phase": { "type": "string" },
-                "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] }
-            }, "required": ["phase", "status"] } } },
-            "required": ["phases"]
-        })
-    }
-    fn permission(&self, _: &Value) -> PermissionRequest {
-        PermissionRequest::None
-    }
-    async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
-        ToolOutput::ok("progress updated")
-    }
-}
-
 pub struct AskUserTool;
 
 #[async_trait]

@@ -2,9 +2,8 @@ use async_trait::async_trait;
 use std::io::Write as _;
 
 use serde_json::Value;
-use tcode_core::{
-    plan_draft::PLAN_PATH_FIELD, Approval, ApprovalDecision, Approver, PermissionMode,
-};
+use tcode_core::progress::{REVIEW_BODY_FIELD, REVIEW_PATH_FIELD};
+use tcode_core::{Approval, ApprovalDecision, Approver, PermissionMode};
 
 const BOLD: &str = "\x1b[1m";
 const DIM: &str = "\x1b[2m";
@@ -54,7 +53,7 @@ impl Approver for LineApprover {
         if tool == "ask_user" {
             return ask_user_plain(summary, input).await;
         }
-        if tool == "exit_plan" {
+        if descriptor == "progress" {
             return review_plan_plain(input).await;
         }
         println!("\n{YELLOW}●{RESET} {BOLD}{summary}{RESET}");
@@ -180,18 +179,18 @@ async fn ask_user_plain(summary: &str, input: &Value) -> Approval {
     Approval::simple(ApprovalDecision::Yes, Some(comment))
 }
 
-/// Line-mode plan review: print the plan, offer the four decisions, and read
-/// one. Feedback is optional when keeping the plan in review, mirroring the TUI.
+/// Line-mode plan review: print the plan, offer the decisions, and read one.
+/// Feedback is optional when keeping the plan in review, mirroring the TUI.
 async fn review_plan_plain(input: &Value) -> Approval {
-    let plan = input["plan"].as_str().unwrap_or("").trim();
+    let plan = input[REVIEW_BODY_FIELD].as_str().unwrap_or("").trim();
     println!("\n{YELLOW}▤{RESET} {BOLD}Review plan{RESET}");
-    if let Some(path) = input[PLAN_PATH_FIELD].as_str() {
+    if let Some(path) = input[REVIEW_PATH_FIELD].as_str() {
         println!("{DIM}  saved draft: {path}{RESET}");
     }
     for line in plan.lines() {
         println!("{DIM}  {line}{RESET}");
     }
-    let options: [(&str, ApprovalDecision, Option<PermissionMode>); 4] = [
+    let options: [(&str, ApprovalDecision, Option<PermissionMode>); 5] = [
         (
             "Yes, and approve edits manually",
             ApprovalDecision::Yes,
@@ -206,6 +205,14 @@ async fn review_plan_plain(input: &Value) -> Approval {
             "Yes, and use auto mode",
             ApprovalDecision::Yes,
             Some(PermissionMode::Auto),
+        ),
+        // Planning stopped being a permission mode so this row could exist:
+        // how much risk execution takes is the user's call, and approving the
+        // plan is where they are best placed to make it.
+        (
+            "Yes, and run unsafe",
+            ApprovalDecision::Yes,
+            Some(PermissionMode::Unsafe),
         ),
         ("No, keep planning", ApprovalDecision::No, None),
     ];

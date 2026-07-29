@@ -12,7 +12,7 @@ use tcode_core::config::{AutoClassifierConfig, Config, Selection};
 use tcode_core::{Agent, AgentModels, ModelCell, ProviderSafetyClassifier, SafetyClassifier, Tool};
 use tcode_tools::{
     keeps_tool, AddNoteTool, AgentDef, AgentRegistry, AgentTool, AskUserTool, FetchSummarizer,
-    ShellFilters, Skill, TrustedReadHosts, UpdateProgressTool, ViewImageTool, WebFetchTool,
+    ProgressTool, ShellFilters, Skill, TrustedReadHosts, ViewImageTool, WebFetchTool,
 };
 
 /// Resolved inputs for [`build_agent`]. The caller resolves models, agent
@@ -72,7 +72,7 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
         model_cell.clone(),
         pinned.clone(),
     )));
-    tools.push(Arc::new(UpdateProgressTool));
+    tools.push(Arc::new(ProgressTool));
     tools.push(Arc::new(AskUserTool));
     tools.push(Arc::new(AddNoteTool));
     tools.extend(mcp_tools.iter().cloned());

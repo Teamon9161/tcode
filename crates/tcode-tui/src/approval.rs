@@ -12,7 +12,8 @@ use std::cell::{Cell, RefCell};
 
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use tcode_core::{plan_draft::PLAN_PATH_FIELD, Approval, ApprovalDecision, PermissionMode};
+use tcode_core::progress::{REVIEW_BODY_FIELD, REVIEW_PATH_FIELD};
+use tcode_core::{Approval, ApprovalDecision, PermissionMode};
 
 use crate::editor::Editor;
 use crate::markdown::Document;
@@ -86,9 +87,10 @@ struct OptionRows {
 /// the model keeps planning. The plan the model relies on lives in the ledger;
 /// this pane is the human's review of it.
 struct PlanReview {
-    /// The verbatim `exit_plan` tool input (ledger truth). Kept so the pane can
-    /// bake the plan through the same renderer replay uses, and so `$EDITOR`
-    /// round-trips the exact plan source.
+    /// The review copy of the `progress` call: the model's own input plus the
+    /// rendered body the harness saved. Kept so the pane can bake the plan
+    /// through the same renderer replay uses, and so `$EDITOR` round-trips the
+    /// exact plan source.
     input: Value,
     blocks: Vec<PlanBlock>,
     /// The block the keyboard is on (comment / navigation target).
@@ -118,7 +120,7 @@ struct PlanReview {
     feedback_focused: bool,
     /// A `$EDITOR` revision of the plan, when it differs from the original. It
     /// updates the durable draft immediately; on approval it also becomes the
-    /// actual `exit_plan` input, while keep-planning sends its diff back.
+    /// body the `progress` tool writes, while keep-planning sends its diff back.
     revised: Option<String>,
 }
 
@@ -168,7 +170,7 @@ struct PlanBlock {
 impl PlanReview {
     /// The plan the model submitted (ledger truth).
     fn original(&self) -> &str {
-        self.input["plan"].as_str().unwrap_or("")
+        self.input[REVIEW_BODY_FIELD].as_str().unwrap_or("")
     }
 
     /// The plan currently under review: the `$EDITOR` revision if any, else the
@@ -183,7 +185,7 @@ impl PlanReview {
     fn approved_input(&self) -> Option<Value> {
         self.revised.as_ref().map(|revised| {
             let mut input = self.input.clone();
-            input["plan"] = Value::String(revised.clone());
+            input[REVIEW_BODY_FIELD] = Value::String(revised.clone());
             input
         })
     }
@@ -217,7 +219,7 @@ struct PlanOption {
     fresh_session: bool,
 }
 
-const PLAN_OPTIONS: [PlanOption; 5] = [
+const PLAN_OPTIONS: [PlanOption; 6] = [
     PlanOption {
         label: "Yes, and approve edits manually",
         decision: ApprovalDecision::Yes,
@@ -234,6 +236,15 @@ const PLAN_OPTIONS: [PlanOption; 5] = [
         label: "Yes, and use auto mode",
         decision: ApprovalDecision::Yes,
         set_mode: Some(PermissionMode::Auto),
+        fresh_session: false,
+    },
+    // Planning stopped being a permission mode precisely so this row could
+    // exist: how much risk to take during execution is the user's call, and
+    // approving a plan is where they are best placed to make it.
+    PlanOption {
+        label: "Yes, and run unsafe",
+        decision: ApprovalDecision::Yes,
+        set_mode: Some(PermissionMode::Unsafe),
         fresh_session: false,
     },
     PlanOption {
@@ -588,7 +599,7 @@ impl Dialog {
 
     /// A plan-review prompt. The plan itself is the review surface: it renders
     /// inside this pane, navigable block by block. `title` names the plan;
-    /// `input` is the verbatim `exit_plan` tool input; `blocks` pairs each
+    /// `input` is the review copy of the `progress` call; `blocks` pairs each
     /// block's verbatim source with its parsed Markdown.
     pub fn plan(title: String, input: Value, blocks: Vec<(String, Document)>) -> Self {
         let blocks: Vec<PlanBlock> = blocks
@@ -601,7 +612,7 @@ impl Dialog {
             .collect();
         Self {
             summary: title,
-            descriptor: "exit_plan".into(),
+            descriptor: "progress".into(),
             is_edit: false,
             project_option: false,
             batch: 1,
@@ -633,7 +644,7 @@ impl Dialog {
         }
     }
 
-    /// The verbatim `exit_plan` input, for baking the plan into the transcript
+    /// The review copy of the `progress` call, for baking the plan into the transcript
     /// on decline through the same renderer replay uses.
     pub fn plan_input(&self) -> Option<Value> {
         self.plan.as_ref().map(|p| p.input.clone())
@@ -647,7 +658,7 @@ impl Dialog {
 
     /// The durable plan file assigned before this review opened.
     pub fn plan_path(&self) -> Option<&str> {
-        self.plan.as_ref()?.input[PLAN_PATH_FIELD].as_str()
+        self.plan.as_ref()?.input[REVIEW_PATH_FIELD].as_str()
     }
 
     fn plan_path_rows(&self, width: u16) -> Vec<Line<'static>> {
@@ -1747,9 +1758,9 @@ impl Dialog {
         out.extend(rows.into_iter().skip(scroll).take(k));
 
         // Decision options. After an external edit these are deliberately
-        // phrased as the two available destinations: options 1–3 approve the
-        // revised artifact under a chosen permission mode; option 4 opens a
-        // fresh execution session, while option 5 sends its diff back for
+        // phrased as the available destinations: options 1–4 approve the
+        // revised artifact under a chosen permission mode; option 5 opens a
+        // fresh execution session, while option 6 sends its diff back for
         // another planning pass.
         for (i, opt) in PLAN_OPTIONS.iter().enumerate() {
             let label = if plan.has_revision() {
@@ -1757,7 +1768,8 @@ impl Dialog {
                     0 => "Approve revised plan, approve edits manually",
                     1 => "Approve revised plan, auto-accept edits",
                     2 => "Approve revised plan, use auto mode",
-                    3 => "Execute revised plan in a fresh session…",
+                    3 => "Approve revised plan, run unsafe",
+                    4 => "Execute revised plan in a fresh session…",
                     _ => "Send revision back as feedback",
                 }
             } else {
@@ -2399,7 +2411,7 @@ mod tests {
         let path = "/tmp/tcode/plans/demo.md";
         let plan = Dialog::plan(
             "Review plan".into(),
-            json!({ "plan": "# Plan", PLAN_PATH_FIELD: path }),
+            json!({ REVIEW_BODY_FIELD: "# Plan", REVIEW_PATH_FIELD: path }),
             vec![(
                 "# Plan".into(),
                 crate::markdown::Renderer::default().parse("# Plan"),
@@ -2428,7 +2440,7 @@ mod tests {
     fn plan_review_copies_the_unwrapped_draft_path() {
         let mut plan = Dialog::plan(
             "Review plan".into(),
-            json!({ "plan": "# Plan", PLAN_PATH_FIELD: "/tmp/tcode/plans/demo.md" }),
+            json!({ REVIEW_BODY_FIELD: "# Plan", REVIEW_PATH_FIELD: "/tmp/tcode/progress/demo.md" }),
             vec![(
                 "# Plan".into(),
                 crate::markdown::Renderer::default().parse("# Plan"),
@@ -2441,7 +2453,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_option_four_requests_fresh_session_execution_in_default_mode() {
+    fn the_fresh_session_option_requests_execution_in_default_mode() {
         let mut plan = Dialog::plan(
             "Review plan".into(),
             json!({ "plan": "# Plan" }),
@@ -2450,9 +2462,9 @@ mod tests {
                 crate::markdown::Renderer::default().parse("# Plan"),
             )],
         );
-        plan.handle_key(key(KeyCode::Char('4')));
+        plan.handle_key(key(KeyCode::Char('5')));
         let DialogResult::PlanHandoff(approval) = plan.handle_key(key(KeyCode::Enter)) else {
-            panic!("option 4 should open the execution-model picker");
+            panic!("the fresh-session option should open the execution-model picker");
         };
         assert_eq!(approval.decision, ApprovalDecision::Yes);
         assert_eq!(approval.set_mode, Some(PermissionMode::Default));
@@ -3236,7 +3248,7 @@ mod tests {
     #[test]
     fn escape_from_plan_options_declines_without_feedback() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('5')));
+        d.handle_key(key(KeyCode::Char('6')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
             panic!("Esc from plan options must decline immediately");
         };
@@ -3247,7 +3259,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_without_feedback_pauses_the_turn() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('5')));
+        d.handle_key(key(KeyCode::Char('6')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter must decline without forcing a feedback editor");
         };
@@ -3258,7 +3270,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_tab_opens_its_feedback_editor() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('5')));
+        d.handle_key(key(KeyCode::Char('6')));
         d.handle_key(key(KeyCode::Tab));
         assert!(
             d.plan.as_ref().expect("plan dialog").feedback_focused,
@@ -3321,7 +3333,7 @@ mod tests {
             .join("\n\n");
         let mut d = plan_dialog(&src);
         let _ = render_text(&d, 60, 14); // establish the initial viewport
-        d.handle_key(key(KeyCode::Char('5')));
+        d.handle_key(key(KeyCode::Char('6')));
         d.handle_key(key(KeyCode::Tab));
         assert!(d.plan.as_ref().expect("plan dialog").feedback_focused);
 
@@ -3367,7 +3379,7 @@ mod tests {
     fn plan_editor_revision_can_be_sent_back_as_a_diff() {
         let mut d = plan_dialog("Original body.");
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
-        d.handle_key(key(KeyCode::Char('5'))); // keep planning
+        d.handle_key(key(KeyCode::Char('6'))); // keep planning
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter submits the edit as feedback");
         };

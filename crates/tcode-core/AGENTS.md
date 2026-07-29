@@ -20,6 +20,15 @@
 - **`SKILL_ECHO_OPEN` 归 core（`ledger.rs`）而非 tools**：`/name` 触发的 skill 正文以 `Entry::User` 进 ledger（省一轮），但正文是仓库文件、不是用户的话。`ClassifierTranscript` 必须能在不反向依赖 tools 的前提下认出它并打成 `<skill-body>` 而非 `<user>`；Auto Mode 的授权判定只认 `<user>`。这条链断一环，clone 来的仓库就能靠一个诱人的命令名（`/test`、`/build`）拿到用户授权。格式本身仍只有 `wrap_skill_echo` / `parse_skill_echo` 知道。
 - **Auto Mode 分类器判决按批缓存，不按调用**：`ClassifierRequest` 只有 policy / cache_scope / 整份转录，而承载这一批全部 tool_use 的 assistant 条目在第一次权限检查前就已在 ledger 里——逐个调用发的是字节相同的请求。`BatchClassification` 缓存的是**已解析的 `Decision`** 而非原始判决，这样暂停计数与 mode 变更事件每批恰好发生一次（缓存原始判决会让一批 N 个调用把连续 block 计数放大 N 倍）。
 
+## Progress（规划与执行进度）
+
+- **`progress.rs` 的文件是外部可变状态，不是历史**：ledger 只记模型发过的工具调用，这份 md 记的是"现在为真"。所以它可以被用户随手改，与 append-only 不变量不冲突——**别据此以为"文件可改"等于"历史可改"**。
+- **工具是这份文件的唯一写入者**（`apply_call` / `review_copy`）。模型不得用 `edit` 改它：edit 要先 read 回来再精确匹配 `old_string`，翻一个阶段的成本从"一次 no-op 调用"涨到"整段文本进两遍上下文"；而且用户一旦手改过，模型记的 `old_string` 必然对不上。写盘前一律 `reconcile()`，hash 变了就**不覆盖**，返回带用户原文的自愈错误（零猜测：模型不必花一次 read 去查发生了什么）。
+- **进度状态绝不进 system prompt 或开局前缀**。每回合变化的东西挂 `status_block`（user turn 的 tail），违反这条就是每翻一个阶段废一次前缀，且正好发生在上下文最大的时候。开局 inventory（哪些 progress 没做完）是会话内稳定的，才可以进前缀——而且它是**清单不是指令**：躺在磁盘上的旧 draft 是三天前的自己写的，不是正在对话的人的请求，恢复必须显式（用户开口，或 `/plan resume <n>`）。
+- **只在三个时刻注入摘要**：新会话/resume、compact 之后、用户手改文件之后（后者就是 reconcile 的错误返回）。会话内模型自己发过的 `progress` 调用就在 ledger 里，重发是纯浪费。摘要只给标题行与状态框，**不给 `detail` 正文**——正文按需在"刚翻成 `[>]`"的那次工具返回里下发。
+- **`state: "active"` 就是"提交审批"这个动作本身**，这是 `permission()` 能保持为输入纯函数的原因；模型自建的跟踪文件从不提 `state`，因此不会弹框。`PlanReview` 在任何模式下都 Ask（含 unsafe），且结构上不发给子 agent（`progress` 根本不在 `builtin_tools()` 里）。
+- 两级封顶（`##` / `###`）是硬约束，在 `Phase::from_json` 里拒绝；放开它模型会生成树状怪物。
+
 ## 记忆与截断
 
 - **自动记忆是注入的持久化通道**：写进去的东西下次以开局前缀身份回来，比任何一次性注入都值钱。故 `memory/system.md` 限定来源——第三方内容只能作带出处的观察，"以后总是……"形状的常驻指令只有用户能授权。

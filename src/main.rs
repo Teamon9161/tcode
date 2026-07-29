@@ -253,7 +253,7 @@ struct Cli {
     /// One-shot prompt: run the full agent loop, print, exit
     #[arg(short = 'p', long)]
     prompt: Option<String>,
-    /// Start in a specific permission mode (plan/default/accept-edits/auto/unsafe)
+    /// Start in a specific permission mode (default/accept-edits/auto/unsafe)
     #[arg(long)]
     mode: Option<String>,
     /// Continue the most recent session in this project
@@ -754,6 +754,12 @@ async fn main() -> anyhow::Result<()> {
                         println!(
                             "{DIM}interactive resume picker needs the full TUI — use /resume <id>{RESET}"
                         );
+                    }
+                    CommandEffect::SubmitPrompt(prompt) => {
+                        if let Err(e) = run_turn(&agent, &mut session, prompt, &line_approver).await
+                        {
+                            eprintln!("{DIM}error: {e}{RESET}");
+                        }
                     }
                 }
             }

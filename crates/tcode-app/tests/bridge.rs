@@ -475,7 +475,7 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(Fake("read", BatchPolicy::ParallelReadOnly)),
         Arc::new(Fake("edit", BatchPolicy::ParallelPerFile)),
-        Arc::new(Fake("update_progress", BatchPolicy::Isolated)),
+        Arc::new(Fake("progress", BatchPolicy::Isolated)),
         Arc::new(Fake("ask_user", BatchPolicy::Isolated)),
     ];
 
@@ -497,6 +497,6 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
     assert!(!find("read").hide_success_result);
 
     assert_eq!(find("read").route, "transcript");
-    assert_eq!(find("update_progress").route, "progress");
+    assert_eq!(find("progress").route, "progress");
     assert_eq!(find("ask_user").route, "silent");
 }

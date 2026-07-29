@@ -38,6 +38,7 @@ pub fn import_entries(
         startup: None,
         environment: None,
         delivered_environment: None,
+        progress: None,
     })
 }
 

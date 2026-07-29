@@ -8,8 +8,7 @@ use tcode_core::PermissionMode;
 
 use crate::theme;
 
-const MODES: [PermissionMode; 5] = [
-    PermissionMode::Plan,
+const MODES: [PermissionMode; 4] = [
     PermissionMode::Default,
     PermissionMode::AcceptEdits,
     PermissionMode::Auto,
@@ -55,7 +54,7 @@ impl Picker {
     }
 
     /// `row` is the border-free rendered content row. Row zero is the title;
-    /// the following five rows correspond to `MODES`.
+    /// the following rows correspond to `MODES`.
     pub fn handle_mouse_row(&mut self, row: usize) -> PickResult {
         let Some(index) = row.checked_sub(1).filter(|index| *index < MODES.len()) else {
             return PickResult::Pending;
@@ -81,7 +80,6 @@ impl Picker {
             let marker = if selected { "▸ " } else { "  " };
             let current = if current { " ✓" } else { "" };
             let description = match mode {
-                PermissionMode::Plan => "plan first; changes need your approval",
                 PermissionMode::Default => "ask when rules require it",
                 PermissionMode::AcceptEdits => "approve file edits automatically",
                 PermissionMode::Auto => "classifier reviews routine actions",
@@ -122,7 +120,7 @@ mod tests {
     fn picker_starts_on_the_current_mode_and_applies_keyboard_selection() {
         let mut picker = Picker::new(PermissionMode::AcceptEdits);
         let lines = picker.render();
-        assert!(lines[3].spans.iter().any(|span| span.content.contains('✓')));
+        assert!(lines[2].spans.iter().any(|span| span.content.contains('✓')));
 
         picker.handle_key(KeyEvent::from(KeyCode::Down));
         assert!(matches!(
@@ -134,11 +132,11 @@ mod tests {
     #[test]
     fn hover_lifts_a_mode_row_without_moving_keyboard_selection() {
         let mut picker = Picker::new(PermissionMode::Default);
-        picker.set_hovered_row(Some(1));
+        picker.set_hovered_row(Some(2));
 
         let lines = picker.render();
-        assert_eq!(picker.selected, 1);
-        assert_eq!(lines[1].style.fg, Some(theme::hover_color(theme::DIM)));
+        assert_eq!(picker.selected, 0, "hover never moves the keyboard cursor");
+        assert_eq!(lines[2].style.fg, Some(theme::hover_color(theme::DIM)));
     }
 
     #[test]
@@ -146,7 +144,7 @@ mod tests {
         let mut picker = Picker::new(PermissionMode::Default);
         assert!(matches!(picker.handle_mouse_row(0), PickResult::Pending));
         assert!(matches!(
-            picker.handle_mouse_row(5),
+            picker.handle_mouse_row(4),
             PickResult::Picked(PermissionMode::Unsafe)
         ));
     }

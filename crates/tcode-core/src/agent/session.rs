@@ -117,10 +117,9 @@ impl PendingInput {
 /// point — before a batch is judged and before each remaining call in a serial
 /// batch — as well as at turn start and end. Switch to unsafe/auto and the very
 /// next call it faces is judged under it, rather than waiting a whole round-trip
-/// for the next batch boundary. The model-facing note is deliberately *not*
-/// moved with the gate: it stays deferred to the next user interaction, so a
-/// bare key press cannot append transient plan guidance to the append-only
-/// ledger.
+/// for the next batch boundary. A key press is UI input, not model context: the
+/// mode the model reads is re-derived into every turn's tail by `status_block`,
+/// so nothing has to be appended — and nothing has to be retracted.
 ///
 /// Pressing shift+tab repeatedly while running leaves only the final target:
 /// the cycle reads staged-else-committed, so intermediate stops collapse.
@@ -182,10 +181,6 @@ pub struct Session {
     /// A permission-mode switch staged while the turn was running, committed
     /// at the next batch boundary. The frontend holds a clone of this handle.
     pub pending_mode: PendingMode,
-    /// The one durable multi-phase task this conversation is currently working
-    /// through. Other progress files can exist on disk, but must be explicitly
-    /// resumed before replacing this one.
-    pub current: Option<crate::progress::Progress>,
     /// File snapshots for rewind; no-op unless persistence is set up.
     pub checkpoints: crate::checkpoint::CheckpointStore,
     /// The current progress file needs re-describing to the model at the next
@@ -194,6 +189,9 @@ pub struct Session {
     /// carried it. Never set by the model's own updates — those are in the
     /// ledger, and re-sending them is pure waste.
     progress_injection_pending: bool,
+    /// The progress path the session log already names, so `record_progress_file`
+    /// writes only on a real change.
+    recorded_progress: Option<String>,
     /// Prompt size of the latest request (for the context status line).
     pub last_prompt_tokens: u64,
     pub turn_usage: Usage,
@@ -271,9 +269,9 @@ impl Session {
             tool_ctx,
             pending: PendingInput::default(),
             pending_mode: PendingMode::default(),
-            current: None,
             checkpoints: crate::checkpoint::CheckpointStore::default(),
             progress_injection_pending: false,
+            recorded_progress: None,
             last_prompt_tokens: 0,
             turn_usage: Usage::default(),
             dogfood: false,
@@ -419,11 +417,6 @@ impl Session {
         )
     }
 
-    /// Guidance injected when the model next receives a user interaction. Raw
-    /// text; the ledger wraps it as a note.
-    const PLAN_ENTER_NOTE: &'static str = include_str!("../../prompts/agent/plan-mode-enter.md");
-    const PLAN_EXIT_NOTE: &'static str = include_str!("../../prompts/agent/plan-mode-exit.md");
-
     /// Commit a staged permission-mode switch, if one is pending. Returns the
     /// new mode only when it differs from the current one, so a net-zero cycle
     /// (staging that flipped back to the live mode) reports no change. Called
@@ -437,49 +430,89 @@ impl Session {
         Some(staged)
     }
 
-    /// Apply a mode transition an approval dialog chose (e.g. `exit_plan`
-    /// approved with "auto-accept edits"). The tool result itself states the
-    /// new mode, so no additional explanation is owed; drop any staged switch
-    /// so a stale earlier keypress cannot override it.
+    /// Apply a mode transition an approval dialog chose (e.g. a plan approved
+    /// with "auto-accept edits"). The tool result itself states the new mode,
+    /// so no additional explanation is owed; drop any staged switch so a stale
+    /// earlier keypress cannot override it.
     pub fn apply_approved_mode(&mut self, mode: PermissionMode) {
         self.mode = mode;
-        self.last_notified_mode = mode;
         self.pending_mode.clear();
     }
 
-    /// Mark that the user interacted through an approval dialog or submitted a
-    /// prompt while the turn ran. The next safe boundary may then explain the
-    /// final mode to the model.
-    pub fn mark_mode_delivery(&mut self) {
-        self.mode_delivery_pending = true;
+    /// This conversation's current progress file, if it has one.
+    pub fn progress(&self) -> std::sync::MutexGuard<'_, Option<crate::progress::Progress>> {
+        self.tool_ctx.progress.lock().expect("progress lock")
     }
 
-    /// The mode explanation owed by a direct user prompt. This is deliberately
-    /// separate from committing a pending mode: mode-key presses are UI input,
-    /// not model context, and append-only history cannot retract a transient
-    /// plan instruction.
-    pub fn take_mode_note(&mut self) -> Option<String> {
-        let note = match (self.last_notified_mode, self.mode) {
-            (PermissionMode::Plan, mode) if mode != PermissionMode::Plan => {
-                Some(Self::PLAN_EXIT_NOTE.trim().to_string())
-            }
-            (mode, PermissionMode::Plan) if mode != PermissionMode::Plan => {
-                Some(Self::PLAN_ENTER_NOTE.trim().to_string())
-            }
-            _ => None,
-        };
-        self.last_notified_mode = self.mode;
-        note
+    /// Take over a progress file found on disk (`/plan resume`, or a resumed
+    /// session's own file). The file is re-read rather than trusted from the
+    /// session record: the record is a snapshot of what was true then, and the
+    /// user may have edited the plan since — including finishing it by hand,
+    /// which is why a `done` file is refused rather than revived.
+    pub fn adopt_progress(&mut self, path: &Path) -> Result<String, String> {
+        let progress = crate::progress::Progress::load(path)?;
+        if progress.state() == crate::progress::ProgressState::Done {
+            return Err(format!("'{}' is already finished", progress.title));
+        }
+        let title = progress.title.clone();
+        *self.progress() = Some(progress);
+        self.progress_injection_pending = true;
+        self.record_progress_file();
+        Ok(title)
     }
 
-    /// The mode explanation owed by an interaction that occurred during a
-    /// running turn. A mode switch alone leaves this false and cannot append a
-    /// model-facing note.
-    pub fn take_pending_mode_note(&mut self) -> Option<String> {
-        if !std::mem::take(&mut self.mode_delivery_pending) {
+    /// Adopt whatever a resumed session log named, or nothing. Also resets the
+    /// baseline, so the first `record_progress_file` after a resume compares
+    /// against that log rather than against the conversation just replaced. A
+    /// plan that has since been deleted or finished simply leaves none.
+    pub fn restore_progress(&mut self, recorded: Option<&Path>) -> Option<String> {
+        *self.progress() = None;
+        self.recorded_progress = recorded.map(|path| path.display().to_string());
+        let title = recorded.and_then(|path| self.adopt_progress(path).ok());
+        if title.is_none() {
+            self.recorded_progress = None;
+        }
+        title
+    }
+
+    /// Note in the session log which progress file this conversation is working
+    /// through, so a resume finds its way back to it. Only the path is
+    /// recorded — the plan itself is re-read, since the file outlives the
+    /// session and the user may have changed it meanwhile.
+    ///
+    /// Cheap and idempotent: it writes only when the answer changed, which is
+    /// why callers can put it on a per-batch path without thinking about it.
+    pub fn record_progress_file(&mut self) {
+        let current = self
+            .progress()
+            .as_ref()
+            .map(|progress| progress.path().display().to_string());
+        if current == self.recorded_progress {
+            return;
+        }
+        self.recorded_progress = current.clone();
+        // A finished (or dropped) plan records the empty path: resume must know
+        // the conversation moved on, not silently reopen the last plan it saw.
+        self.ledger
+            .record_aux(&crate::store::LogEvent::ProgressAdopted {
+                path: current.unwrap_or_default(),
+            });
+    }
+
+    /// Owe the model a fresh description of the current progress file. Called
+    /// where the model provably cannot still have one: a resumed session, and
+    /// a `compact` that dropped the calls carrying it. The model's own updates
+    /// are in the ledger and are never re-sent.
+    pub fn mark_progress_injection(&mut self) {
+        self.progress_injection_pending = true;
+    }
+
+    /// The progress summary owed at the next user delivery point, if any.
+    fn take_progress_note(&mut self) -> Option<String> {
+        if !std::mem::take(&mut self.progress_injection_pending) {
             return None;
         }
-        self.take_mode_note()
+        crate::progress::current_summary(&self.tool_ctx)
     }
 
     /// Set the complete persisted startup context before the first request.
@@ -579,6 +612,7 @@ impl Session {
             .map(Entry::Note)
             .into_iter()
             .collect::<Vec<_>>();
+        entries.extend(self.take_progress_note().map(Entry::Note));
         if !std::mem::take(&mut self.pending_environment_delivery) {
             return entries;
         }
@@ -709,9 +743,28 @@ impl Session {
                 format!(" · background running: {running}")
             }
         };
+        // A draft is "do not start yet" as a fact about the file rather than a
+        // one-off instruction the model has to remember: it is re-derived every
+        // turn, and it stops appearing the moment the user approves the plan.
+        // The status block is the turn's tail, never the cached prefix.
+        let draft = match self
+            .tool_ctx
+            .progress
+            .lock()
+            .expect("progress lock")
+            .as_ref()
+        {
+            Some(progress) if progress.state() == crate::progress::ProgressState::Draft => {
+                format!(
+                    " · plan \"{}\" is an unapproved draft: keep refining it, do not start executing",
+                    progress.title
+                )
+            }
+            _ => String::new(),
+        };
         Some(ContentBlock::Text {
             text: format!(
-                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}</tcode-status>",
+                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}{draft}</tcode-status>",
                 context_window / 1000,
                 self.mode.label()
             ),
@@ -867,10 +920,10 @@ mod tests {
         let mut session = plan_session();
         // Repeated presses while running leave only the last staged target.
         session.pending_mode.set(PermissionMode::AcceptEdits);
-        session.pending_mode.set(PermissionMode::Plan);
-        assert_eq!(session.pending_mode.get(), Some(PermissionMode::Plan));
-        assert_eq!(session.commit_pending_mode(), Some(PermissionMode::Plan));
-        assert_eq!(session.mode, PermissionMode::Plan);
+        session.pending_mode.set(PermissionMode::Auto);
+        assert_eq!(session.pending_mode.get(), Some(PermissionMode::Auto));
+        assert_eq!(session.commit_pending_mode(), Some(PermissionMode::Auto));
+        assert_eq!(session.mode, PermissionMode::Auto);
         // The staging is consumed.
         assert_eq!(session.commit_pending_mode(), None);
     }
@@ -884,69 +937,102 @@ mod tests {
         assert_eq!(session.mode, PermissionMode::Default);
     }
 
+    /// "Do not start yet" is re-derived from the file every turn instead of
+    /// being injected once and trusted to memory — and it rides in the turn's
+    /// tail, never the cached prefix, because a phase flip must not cost the
+    /// whole prefix at the moment the context is largest.
     #[test]
-    fn mode_explanations_cover_plan_entry_and_exit_once() {
-        let mut session = plan_session();
-        // default → no note.
-        assert!(session.take_mode_note().is_none());
-        // enter plan → one note.
-        session.mode = PermissionMode::Plan;
-        assert!(session.take_mode_note().is_some());
-        // still plan, already notified → no restacking.
-        assert!(session.take_mode_note().is_none());
-        // Leaving plan must explicitly override the earlier plan instruction.
-        session.mode = PermissionMode::AcceptEdits;
-        assert!(session
-            .take_mode_note()
-            .is_some_and(|note| note.contains("left plan mode")));
-        assert!(session.take_mode_note().is_none());
-    }
-
-    #[test]
-    fn transient_plan_switch_waits_for_interaction_and_uses_final_mode() {
-        let mut session = plan_session();
-        // A running turn may commit plan at a batch boundary, but shift+tab
-        // itself is not model context. Before the next interaction the user
-        // switches on to auto, so no unretractable plan note is ever appended.
-        session.mode = PermissionMode::Plan;
-        assert!(session.take_pending_mode_note().is_none());
-        session.mode = PermissionMode::Auto;
-        session.mark_mode_delivery();
-        assert!(session.take_pending_mode_note().is_none());
-        assert_eq!(session.mode, PermissionMode::Auto);
-    }
-
-    #[test]
-    fn a_session_started_in_plan_mode_injects_the_opening_note() {
+    fn an_unapproved_draft_is_re_stated_in_every_turn_tail() {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            ToolCtx::for_test(std::env::temp_dir(), 1_000),
-            PermissionMode::Plan,
+            ToolCtx::for_test(cwd.path().to_path_buf(), 1_000),
+            PermissionMode::Default,
             PermissionRules::default(),
         );
-        assert!(session.take_mode_note().is_some());
-        assert!(session.take_mode_note().is_none());
+        session.last_prompt_tokens = 100;
+        let text = |session: &Session| match session.status_block(100_000) {
+            Some(crate::ContentBlock::Text { text }) => text,
+            other => panic!("expected a status block, got {other:?}"),
+        };
+        assert!(!text(&session).contains("draft"));
+
+        crate::progress::apply_call(
+            &session.tool_ctx,
+            &serde_json::json!({ "title": "Rewrite the resume path", "state": "draft",
+                                 "phases": [{ "phase": "one", "status": "pending" }] }),
+        )
+        .unwrap();
+        let drafting = text(&session);
+        assert!(drafting.contains("Rewrite the resume path"), "{drafting}");
+        assert!(drafting.contains("do not start executing"), "{drafting}");
+
+        // Approval is what makes it stop appearing; nothing has to retract it.
+        session
+            .progress()
+            .as_mut()
+            .unwrap()
+            .set_state(crate::progress::ProgressState::Active)
+            .unwrap();
+        assert!(!text(&session).contains("do not start executing"));
     }
 
+    /// Cross-session continuation is one of the three things this design buys,
+    /// and it rests entirely on the log naming the file. A finished plan must
+    /// record the *absence* just as explicitly: resume reopening a completed
+    /// plan is worse than resume opening nothing.
     #[test]
-    fn back_and_forth_between_notes_yields_no_note() {
-        let mut session = plan_session();
-        session.mode = PermissionMode::AcceptEdits;
-        session.mode = PermissionMode::Default;
-        // Never landed on plan between delivery points → nothing owed.
-        assert!(session.take_mode_note().is_none());
-    }
+    fn the_log_names_the_open_plan_and_records_when_there_is_none() {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            ToolCtx::for_test(cwd.path().to_path_buf(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        let data = cwd.path().join("data");
+        let store = crate::store::SessionStore::create(&data, cwd.path()).unwrap();
+        session.ledger.attach_sink(Box::new(store));
+        // Read back what a resume would: the real log, not an in-memory mirror.
+        let recorded = || {
+            crate::store::SessionStore::resume(&data, None)
+                .expect("the log exists")
+                .progress
+        };
 
-    #[test]
-    fn an_approved_transition_owes_no_note() {
-        let mut session = plan_session();
-        session.mode = PermissionMode::Plan;
-        // Simulate the plan-enter note already delivered.
-        assert!(session.take_mode_note().is_some());
-        // exit_plan approved into accept-edits: result already states the mode.
-        session.apply_approved_mode(PermissionMode::AcceptEdits);
-        assert!(session.take_mode_note().is_none());
-        // A stale staged switch cannot override the approved mode.
-        assert_eq!(session.pending_mode.get(), None);
+        // Nothing open, nothing to say — and repeating the check is free.
+        session.record_progress_file();
+        session.record_progress_file();
+        assert_eq!(recorded(), None);
+
+        crate::progress::apply_call(
+            &session.tool_ctx,
+            &serde_json::json!({ "title": "Ship it",
+                                 "phases": [{ "phase": "one", "status": "in_progress" }] }),
+        )
+        .unwrap();
+        session.record_progress_file();
+        session.record_progress_file();
+        let path = recorded().expect("a resume finds the open plan");
+        assert!(path.to_string_lossy().ends_with("ship-it.md"), "{path:?}");
+
+        // Finishing it clears the current plan, and the log says so — resume
+        // must not silently reopen the last plan it ever saw.
+        crate::progress::apply_call(
+            &session.tool_ctx,
+            &serde_json::json!({ "state": "done",
+                                 "phases": [{ "phase": "one", "status": "completed" }] }),
+        )
+        .unwrap();
+        session.record_progress_file();
+        assert_eq!(recorded(), None);
+
+        // Even handed the finished file directly, a resume opens nothing.
+        assert_eq!(
+            session.restore_progress(Some(&path)),
+            None,
+            "a finished plan is not revived"
+        );
     }
 
     #[test]

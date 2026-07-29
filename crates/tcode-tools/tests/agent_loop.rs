@@ -896,46 +896,6 @@ async fn decline_reason_reaches_the_model_and_blocks_the_write() {
 }
 
 #[tokio::test]
-async fn plan_mode_routes_project_edits_to_the_user() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use("t1", "write", r#"{"path":"a.txt","content":"hi"}"#),
-        text_done("ok"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    // Plan mode says "not yet", not "never": the user is present and may want
-    // the plan itself written to a project file.
-    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
-
-    run(&agent, &mut session, &approver, "create a.txt").await;
-
-    assert_eq!(approver.asked.lock().unwrap().len(), 1);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "hi"
-    );
-}
-
-#[tokio::test]
-async fn plan_mode_project_edit_declined_leaves_the_project_untouched() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use("t1", "write", r#"{"path":"a.txt","content":"hi"}"#),
-        text_done("ok"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
-
-    run(&agent, &mut session, &approver, "create a.txt").await;
-
-    assert_eq!(approver.asked.lock().unwrap().len(), 1);
-    assert!(!dir.path().join("a.txt").exists());
-    assert!(tool_results(&session)[0].1);
-}
-
-#[tokio::test]
 async fn repeated_read_of_unchanged_file_is_deduped() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f.txt"), "content here\n").unwrap();
@@ -2973,15 +2933,6 @@ impl Approver for StagingApprover {
     }
 }
 
-fn plan_enter_notes(session: &Session) -> usize {
-    session
-        .ledger
-        .entries()
-        .iter()
-        .filter(|e| matches!(e, Entry::Note(text) if text.contains("Finish the plan before you start changing anything")))
-        .count()
-}
-
 #[tokio::test]
 async fn edit_approval_can_switch_the_whole_file_mutation_batch_to_accept_edits() {
     let dir = tempfile::tempdir().unwrap();
@@ -3160,275 +3111,12 @@ async fn declining_a_combined_review_writes_nothing() {
 }
 
 #[tokio::test]
-async fn exit_plan_handoff_ends_the_planning_turn_after_persisting_the_plan() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use(
-            "t1",
-            "exit_plan",
-            r#"{"plan":"Execute this fresh-session handoff.","title":"Handoff"}"#,
-        ),
-        text_done("this response must stay unused"),
-    ]);
-    let agent = agent(provider.clone());
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let approver = ScriptedApprover::with_response(Approval {
-        decision: ApprovalDecision::Yes,
-        comment: None,
-        set_mode: Some(PermissionMode::Default),
-        approved_input: None,
-        end_turn_after_execution: true,
-    });
-
-    let events = run(&agent, &mut session, &approver, "make a plan").await;
-
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
-    assert_eq!(session.mode, PermissionMode::Default);
-    assert!(events.iter().any(|event| matches!(
-        event,
-        AgentEvent::ToolEnd { name, content, .. }
-            if name == "exit_plan" && content.contains("Plan approved")
-    )));
-    let plans_dir = tcode_core::store::plans_dir(dir.path());
-    let saved = std::fs::read_dir(&plans_dir)
-        .expect("approved handoff plan is mirrored")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .expect("approved handoff plan exists");
-    assert_eq!(
-        std::fs::read_to_string(&saved).unwrap(),
-        "Execute this fresh-session handoff."
-    );
-    let _ = std::fs::remove_file(saved);
-    let _ = std::fs::remove_dir(&plans_dir);
-    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
-        let _ = std::fs::remove_dir(project_data);
-    }
-}
-
-#[tokio::test]
-async fn exit_plan_approval_switches_mode_and_unblocks_edits() {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("a.txt"), "old").unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use(
-            "t1",
-            "exit_plan",
-            r#"{"plan":"Do the thing, carefully.","title":"Do it"}"#,
-        ),
-        tool_use(
-            "t2",
-            "edit",
-            r#"{"path":"a.txt","old_string":"old","new_string":"new"}"#,
-        ),
-        text_done("done"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let revised_plan = "Do the thing, carefully, with the user revision.";
-    let approver = ScriptedApprover::with_response(Approval {
-        decision: ApprovalDecision::Yes,
-        comment: Some(format!(
-            "The user edited the plan before approving. Use this revised plan as the source of truth for execution, not the earlier draft:\n\n{revised_plan}"
-        )),
-        set_mode: Some(PermissionMode::AcceptEdits),
-        approved_input: Some(serde_json::json!({
-            "plan": revised_plan,
-            "title": "Do it",
-        })),
-        end_turn_after_execution: false,
-    });
-
-    let events = run(&agent, &mut session, &approver, "make a plan").await;
-
-    assert_eq!(session.mode, PermissionMode::AcceptEdits);
-    // The follow-up edit ran without a prompt because accept-edits auto-allows.
-    assert_eq!(approver.asked.lock().unwrap().len(), 1);
-    assert_eq!(
-        std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
-        "new"
-    );
-    let plan_result = events
-        .iter()
-        .find_map(|e| match e {
-            AgentEvent::ToolEnd { name, content, .. } if name == "exit_plan" => Some(content),
-            _ => None,
-        })
-        .expect("exit_plan result");
-    assert!(plan_result.contains("Permission mode is now accept-edits"));
-    let plans_dir = tcode_core::store::plans_dir(dir.path());
-    let saved = std::fs::read_dir(&plans_dir)
-        .expect("exit_plan creates the mirror directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .expect("approved plan is mirrored");
-    assert_eq!(std::fs::read_to_string(&saved).unwrap(), revised_plan);
-    assert!(
-        session.ledger.entries().iter().any(|entry| matches!(
-            entry,
-            Entry::UserNote { about, text, .. }
-                if about == "exit_plan" && text.contains(revised_plan)
-        )),
-        "an approved plan comment must survive as a user note"
-    );
-    assert!(
-        events.iter().any(|event| matches!(
-            event,
-            AgentEvent::UserNote { text, .. } if text.contains(revised_plan)
-        )),
-        "the TUI must receive the approved plan comment"
-    );
-    // The test owns this runtime mirror; avoid leaving project-state files in
-    // the developer's home directory after the temporary workspace is gone.
-    let _ = std::fs::remove_file(saved);
-    let _ = std::fs::remove_dir(&plans_dir);
-    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
-        let _ = std::fs::remove_dir(project_data);
-    }
-}
-
-#[tokio::test]
-async fn exit_plan_rejection_keeps_plan_mode_and_returns_feedback() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use("t1", "exit_plan", r#"{"plan":"Draft plan body."}"#),
-        text_done("revising"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, Some("add a rollback step"));
-
-    run(&agent, &mut session, &approver, "make a plan").await;
-
-    assert_eq!(session.mode, PermissionMode::Plan);
-    let results = tool_results(&session);
-    assert!(results[0].1, "rejection is an error result");
-    assert!(results[0].0.contains("add a rollback step"));
-
-    let plans_dir = tcode_core::store::plans_dir(dir.path());
-    let saved: Vec<_> = std::fs::read_dir(&plans_dir)
-        .expect("plan review creates the draft directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    assert_eq!(
-        saved.len(),
-        1,
-        "rejected plans remain available for revision"
-    );
-    assert_eq!(
-        std::fs::read_to_string(&saved[0]).unwrap(),
-        "Draft plan body."
-    );
-    let _ = std::fs::remove_file(&saved[0]);
-    let _ = std::fs::remove_dir(&plans_dir);
-    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
-        let _ = std::fs::remove_dir(project_data);
-    }
-}
-
-#[tokio::test]
-async fn rejected_plan_revisions_replace_the_same_draft_file() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use(
-            "t1",
-            "exit_plan",
-            r#"{"plan":"Draft v1","title":"Refactor ledger"}"#,
-        ),
-        tool_use(
-            "t2",
-            "exit_plan",
-            r#"{"plan":"Draft v2","title":"Different title"}"#,
-        ),
-        text_done("revising"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, Some("revise it"));
-
-    run(&agent, &mut session, &approver, "make a plan").await;
-
-    let plans_dir = tcode_core::store::plans_dir(dir.path());
-    let saved: Vec<_> = std::fs::read_dir(&plans_dir)
-        .expect("plan reviews create the draft directory")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext == "md"))
-        .collect();
-    assert_eq!(
-        saved.len(),
-        1,
-        "revisions must not create near-duplicate drafts"
-    );
-    assert!(saved[0]
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .contains("refactor-ledger"));
-    assert_eq!(std::fs::read_to_string(&saved[0]).unwrap(), "Draft v2");
-    let _ = std::fs::remove_file(&saved[0]);
-    let _ = std::fs::remove_dir(&plans_dir);
-    if let Some(project_data) = tcode_core::store::project_data_dir(dir.path()) {
-        let _ = std::fs::remove_dir(project_data);
-    }
-}
-
-#[tokio::test]
-async fn exit_plan_rejection_without_feedback_pauses_for_user_input() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![tool_use(
-        "t1",
-        "exit_plan",
-        r#"{"plan":"Draft plan body."}"#,
-    )]);
-    let agent = agent(provider.clone());
-    let mut session = session(dir.path(), PermissionMode::Plan);
-    let approver = ScriptedApprover::new(ApprovalDecision::No, None);
-
-    let events = run(&agent, &mut session, &approver, "make a plan").await;
-
-    assert_eq!(session.mode, PermissionMode::Plan);
-    assert!(events
-        .iter()
-        .any(|event| matches!(event, AgentEvent::AwaitingUserInput)));
-    assert_eq!(provider.requests.lock().unwrap().len(), 1);
-    let results = tool_results(&session);
-    assert!(results[0].1);
-    assert!(results[0].0.contains("Stop now and wait"));
-}
-
-#[tokio::test]
-async fn exit_plan_outside_plan_mode_is_a_self_healing_error() {
-    let dir = tempfile::tempdir().unwrap();
-    let provider = MockProvider::new(vec![
-        tool_use("t1", "exit_plan", r#"{"plan":"Draft plan body."}"#),
-        text_done("ok"),
-    ]);
-    let agent = agent(provider);
-    let mut session = session(dir.path(), PermissionMode::Default);
-    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
-
-    run(&agent, &mut session, &approver, "exit plan").await;
-
-    assert!(
-        approver.asked.lock().unwrap().is_empty(),
-        "no prompt outside plan mode"
-    );
-    let results = tool_results(&session);
-    assert!(results[0].1);
-    assert!(results[0].0.contains("not in plan mode"));
-}
-
-#[tokio::test]
 async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.txt"), "one").unwrap();
     // Two edits in separate steps: the first runs under the old (default) mode
-    // after the approval stages plan; the second, past the boundary, is blocked.
+    // after the approval stages accept-edits; the second, past the boundary, is
+    // judged under the new one.
     let provider = MockProvider::new(vec![
         tool_use(
             "t1",
@@ -3444,20 +3132,19 @@ async fn a_staged_switch_takes_effect_at_the_next_batch_boundary() {
     ]);
     let agent = agent(provider);
     let mut session = session(dir.path(), PermissionMode::Default);
-    let approver = StagingApprover::staging(session.pending_mode.clone(), PermissionMode::Plan);
+    let approver =
+        StagingApprover::staging(session.pending_mode.clone(), PermissionMode::AcceptEdits);
 
     let events = run(&agent, &mut session, &approver, "edit twice").await;
 
     // The switch staged during the first step's approval lands before the next
-    // step's call is judged, and the guidance note that marks the transition is
-    // injected exactly once.
-    assert_eq!(session.mode, PermissionMode::Plan);
+    // step's call is judged.
+    assert_eq!(session.mode, PermissionMode::AcceptEdits);
     assert!(events
         .iter()
-        .any(|e| matches!(e, AgentEvent::ModeChanged(PermissionMode::Plan))));
-    assert_eq!(plan_enter_notes(&session), 1);
-    // Both edits applied: this approver says yes, and plan mode asks rather
-    // than refusing. What the mode changes is who decides, not whether it ran.
+        .any(|e| matches!(e, AgentEvent::ModeChanged(PermissionMode::AcceptEdits))));
+    // Both edits applied: the first because this approver says yes, the second
+    // because accept-edits auto-allows it.
     assert_eq!(
         std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
         "three"
@@ -4769,7 +4456,11 @@ async fn a_read_only_agent_stays_read_only_under_a_permissive_parent() {
 async fn a_sub_agent_cannot_submit_a_plan_for_review() {
     let dir = tempfile::tempdir().unwrap();
     let sub = MockProvider::new(vec![
-        tool_use("s1", "exit_plan", r#"{"plan":"Do the thing."}"#),
+        tool_use(
+            "s1",
+            "progress",
+            r#"{"title":"Do the thing","state":"active","phases":[{"phase":"do it","status":"pending"}]}"#,
+        ),
         text_done("## Draft\n\nthe draft"),
     ]);
     let parent = MockProvider::new(vec![
@@ -4778,17 +4469,129 @@ async fn a_sub_agent_cannot_submit_a_plan_for_review() {
     ]);
     let classifier = MockProvider::new(vec![text_done("ALLOW"), text_done("ALLOW")]);
     let agent = inheritance_agent(parent, sub, classifier);
-    let mut session = session(dir.path(), PermissionMode::Plan);
+    let mut session = session(dir.path(), PermissionMode::Default);
     let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
 
     run(&agent, &mut session, &approver, "delegate a plan").await;
 
     // Approving a plan carries a permission-mode transition on this
     // conversation; a delegated run must not be able to reach for it.
-    assert_eq!(session.mode, PermissionMode::Plan);
+    assert_eq!(session.mode, PermissionMode::Default);
     let asked = approver.asked.lock().unwrap().clone();
     assert!(
-        !asked.iter().any(|descriptor| descriptor == "exit_plan"),
+        !asked.iter().any(|descriptor| descriptor == "progress"),
         "no plan review should have been raised: {asked:?}"
     );
+}
+
+/// An agent with the `progress` tool, which the frontends add to the main
+/// conversation only — it is deliberately absent from `builtin_tools`.
+fn progress_agent(provider: Arc<MockProvider>) -> Agent {
+    let base = agent(provider);
+    let mut tools = base.tools.clone();
+    tools.push(Arc::new(tcode_tools::ProgressTool));
+    Agent { tools, ..base }
+}
+
+/// Design rule (2): the detail of a twelve-phase plan does not live in the
+/// context. The harness hands back exactly the phase just entered, so each
+/// phase's reasoning arrives when it is needed and never sooner.
+#[tokio::test]
+async fn entering_a_phase_hands_back_that_phase_detail_and_no_other() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "progress",
+            r#"{"title":"Rewrite the resume path","phases":[
+                {"phase":"survey the callers","status":"in_progress","detail":"read only; no writes yet"},
+                {"phase":"change truncate_tail","status":"pending","detail":"risk: compact then rewind crosses a Summary"}
+            ]}"#,
+        ),
+        tool_use(
+            "t2",
+            "progress",
+            r#"{"phases":[
+                {"phase":"survey the callers","status":"completed","detail":"read only; no writes yet"},
+                {"phase":"change truncate_tail","status":"in_progress","detail":"risk: compact then rewind crosses a Summary"}
+            ]}"#,
+        ),
+        text_done("done"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "track this").await;
+
+    assert!(
+        approver.asked.lock().unwrap().is_empty(),
+        "tracking your own work needs nobody's approval"
+    );
+    let results = tool_results(&session);
+    assert!(
+        results[0].0.contains("read only; no writes yet"),
+        "{results:?}"
+    );
+    assert!(
+        !results[0].0.contains("crosses a Summary"),
+        "a phase that has not started must not spend context: {results:?}"
+    );
+    assert!(results[1].0.contains("crosses a Summary"), "{results:?}");
+    assert!(
+        !results[1].0.contains("read only"),
+        "a finished phase's detail is spent: {results:?}"
+    );
+
+    // The file is durable, and the tool is its only writer.
+    let progress = session.progress();
+    let path = progress.as_ref().expect("a progress file is open").path();
+    let text = std::fs::read_to_string(path).unwrap();
+    assert!(text.contains("## [x] 1. survey the callers"), "{text}");
+    assert!(text.contains("## [>] 2. change truncate_tail"), "{text}");
+}
+
+/// Every turn's progress state rides in the tail of the user message, never in
+/// the cached prefix. Breaking this wastes the whole prefix on every phase
+/// flip, precisely when the context is largest.
+#[tokio::test]
+async fn progress_state_never_reaches_the_cached_prefix() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "progress",
+            r#"{"title":"Ship it","state":"draft","phases":[{"phase":"one","status":"pending"}]}"#,
+        ),
+        text_done("drafted"),
+        text_done("still drafting"),
+    ]);
+    let agent = progress_agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.set_opening_context("project map".into());
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "plan it").await;
+    run(&agent, &mut session, &approver, "keep going").await;
+
+    let requests = provider.requests.lock().unwrap().clone();
+    let systems: Vec<&str> = requests.iter().map(|r| r.system.as_str()).collect();
+    assert!(
+        systems.windows(2).all(|pair| pair[0] == pair[1]),
+        "the system prefix must be byte-identical across turns"
+    );
+    assert!(
+        !systems[0].contains("Ship it"),
+        "progress state must never enter the prefix: {}",
+        systems[0]
+    );
+    // The draft itself is real, and it is what the per-turn tail is derived
+    // from. (That the tail carries it is `status_block`'s own unit test: a mock
+    // provider reports no usage, which is what suppresses the block here.)
+    let progress = session.progress();
+    let progress = progress.as_ref().expect("the draft is open");
+    assert_eq!(progress.state(), tcode_core::ProgressState::Draft);
+    assert!(progress.summary().contains("Ship it"));
 }

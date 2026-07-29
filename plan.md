@@ -44,6 +44,7 @@ impl Ledger {
 - Anthropic：`cache_control` 断点——system+tools 后固定一个，消息尾部滑动一个，控制在 4 断点预算内。
 - OpenAI 兼容：隐式前缀缓存，append-only 天然命中。
 - Compact 仅显式触发（`/compact` 或 token 逼近上限），子请求生成摘要。
+- **Progress 文件是外部可变状态，不是历史**：`~/.tcode/projects/<id>/progress/*.md` 可以被用户随手改，ledger 里只记模型发过的 `progress` 工具调用。二者不冲突——"文件可改"不等于"历史可改"，这份文件记的是**现在为真**的东西，ledger 记的是**当时发生过**的事。用户改过之后下一次工具调用返回自愈冲突（附他们的原文），而不是悄悄覆盖。
 - **Compact 移出模型上下文的条目进 `archived`，不销毁**：`entries()` / `as_messages()` 语义一字不变（模型只见 Summary），但 transcript 与 `/export` 走 `history()` = archived + entries，resume 后仍看得到压缩前的对话。archived 没有合法 `truncate_tail` 索引（rewind 进不去被压缩的历史）；`truncate_tail(0)`（`/clear`）连它一起清空。
 
 ### 2. Stream Watchdog + 永远知情的状态行
@@ -105,7 +106,6 @@ loop {
 
 | 模式 | 行为 |
 |---|---|
-| `plan` | 读工具照常；写/执行一律询问用户（规则匹配与 default 完全一致） |
 | `default` | 按规则匹配，未命中则逐个询问 |
 | `accept-edits` | 文件编辑自动放行，shell 等仍询问 |
 | `auto` | 全部放行（deny 规则仍生效） |
@@ -114,22 +114,22 @@ loop {
 
 **Tab 补充意见**：确认对话任意选项上按 Tab 展开内联输入框。"Yes + 意见" → 批准并把意见作为 user message 追加在 tool result 后；"No + 理由" → 拒绝原因进上下文。纯 append，缓存安全。
 
-**模式切换即时生效于下一次权限判定**：shift+tab 切的模式只改闸门、不入 ledger。闸门在每个权限判定点提交（回合始、`run_tools` 入口、串行批每个待批调用前、批边界、回合末），所以切到 unsafe/auto 后，模型这一步吐出的调用、乃至同批后续调用立刻按新模式判定，不必等一整个来回到下一批边界。**只有闸门即时——模型可见的 plan enter/exit note 仍延迟到下一次用户交互**并按净变化合并（`take_mode_note` 比对 last_notified↔当前）：裸切键永远不能把瞬时 plan 指令写进 append-only 历史，来回多切几次也只落一条净变化的 note。这条不变量把"闸门"与"note"两件事彻底解耦，二者曾错误地一起绑在批边界上。
+**模式切换即时生效于下一次权限判定**：shift+tab 切的模式只改闸门、不入 ledger。闸门在每个权限判定点提交（回合始、`run_tools` 入口、串行批每个待批调用前、批边界、回合末），所以切到 unsafe/auto 后，模型这一步吐出的调用、乃至同批后续调用立刻按新模式判定，不必等一整个来回到下一批边界。**模式从不作为 note 写进 ledger**：模型看到的当前模式由 `status_block` 每回合重新导出到 user turn 的 tail，所以裸切键既不用追加什么、也没有什么需要撤回。曾经的 plan enter/exit note 是唯一的例外，随 plan mode 一起删除。
 
-**读工具永不询问**：read/grep/glob 的 `permission()` 返回 `None`，任何模式（含 plan）直接放行；外部路径门控只拦 mutating 工具。
+**读工具永不询问**：read/grep/glob 的 `permission()` 返回 `None`，任何模式直接放行；外部路径门控只拦 mutating 工具。
 
-**plan mode 是协调信号，不是能力边界**：它在 `decide()` 里**没有自己的臂**，和 default 走同一段（deny → ask 规则 → allow 规则 → 否则 Ask）。理由是原来的硬 Deny 制造了一个站不住的不对称——系统里每条边界最终都通向人，唯独 plan mode 剥夺了**在场用户说 yes 的权利**。而 plan mode 的威胁模型自己就写着"防的是过于积极的合作模型，不是对抗性沙箱"，对这个威胁模型来说，替用户拒绝是过度设计："把计划写进 plan.md" 这种用户明确要求的事，不该逼他先切模式。**代价是 allow 规则在 plan mode 下同样生效**，理论上手写一条 `write(src/**)` 就能让 plan mode 静默失效；实际风险低是因为 `YesProject` 持久化的是 `request.descriptor()` **逐字原样**、从不生成通配，攒出来的都是精确 `run(...)` 串，要出现 write 通配必须是人刻意手写。**因此约束力转移到了 prompt 上**（`plan-mode-enter.md`）：它现在是唯一的实际控制，改它等于改 plan mode 的语义，别当成措辞润色。UI 描述同理不能再说 "read-only tools only"。
+**plan mode 已删除，规划改由 Progress 文件承载**。它曾占着 `PermissionMode` 的一格，但"我还在决定做什么"和"我愿意承担多大风险"是正交的两件事，合并的代价是规划期选不了 auto/unsafe——而探索恰恰是最该放开的阶段。它在 `decide()` 里也从来没有自己的臂（与 default 同一段代码），即**在权限表里本来就没有语义，却霸占着权限表的一格**。现在"先别动手"这个约束来自**文件处于 `draft`** 这一事实：`status_block` 每回合从文件重新导出，不是一次性注入后靠模型自觉记住的指令，批准后自动消失。唯一保留的权限语义是 `PermissionRequest::PlanReview` **在任何模式下都 Ask**（含 unsafe）：用户要求看计划，与他执行时愿担多大风险是两个问题、两个答案，正好在同一个对话框里分别回答。
 
-**plan mode 不再有自己的 scratch 例外**（曾经有，已删）。它是针对硬 Deny 设计的：那时 scratch 免审是规划期唯一能做事的口子。plan mode 改成询问式之后这个例外反而制造了**倒挂**——同一条 `shell(cwd=scratch)` 在 default 下要审批，在 plan 下反而不用，规划期比正常干活更宽松，说不通。删掉后不变量干净了：**scratch/memory 的本地放行只发生在 auto mode**，别的模式一律照常审批。
+**`scratch` 没有任何模式例外**：scratch/memory 的本地放行只发生在 auto mode，别的模式一律照常审批。
 
 **子 agent 继承父会话的模式与规则，能力天花板由 def 自己声明**。两个正交旋钮，别混：
 
-- **继承（`ToolCtx::delegated_permissions`，由 `forward_delegates` 在每次委派调用期间安装并在结束时清除）**：委派出去的活仍是本会话的活，用户为它选的模式、写的 allow/ask/deny 一并适用。读的是**调用时**的状态，所以 turn 中途切模式对下一次委派立刻生效；resume 追问同样重新取，不重放当初 park 时的旧姿态。修掉的是一个真 bug：子 session 曾用 `PermissionRules::default()`，**用户的 deny 规则对子 agent 完全不生效**（`deny=["run(*)"]` 实测拦不住），而权限表明写着 deny 连 unsafe 都能穿透——委派曾是它唯一的静默缺口。同理，父在 default/plan 时子 agent 不再靠分类器自我批准，plan mode 也不再能靠委派绕过。
+- **继承（`ToolCtx::delegated_permissions`，由 `forward_delegates` 在每次委派调用期间安装并在结束时清除）**：委派出去的活仍是本会话的活，用户为它选的模式、写的 allow/ask/deny 一并适用。读的是**调用时**的状态，所以 turn 中途切模式对下一次委派立刻生效；resume 追问同样重新取，不重放当初 park 时的旧姿态。修掉的是一个真 bug：子 session 曾用 `PermissionRules::default()`，**用户的 deny 规则对子 agent 完全不生效**（`deny=["run(*)"]` 实测拦不住），而权限表明写着 deny 连 unsafe 都能穿透——委派曾是它唯一的静默缺口。同理，父在 default 时子 agent 不再靠分类器自我批准。
 - **天花板（def 的 `readonly`）**：mutating 工具在 `sub_tools` 里就被摘掉。它比模式更强，因为模式可以被用户点 yes 抬高，而这里连请求都不存在——所以 `explore` 在父是 `unsafe` 时依然动不了项目（有测试钉住）。
 
 `plan` 据此**去掉了 `readonly`**：它的职责本来就包含"先 clone 参考仓库再出计划"，而 def 正文一直在教它这么做、工具集里却没有 shell——承诺了一个结构上不存在的能力。现在它拿到 write/append/edit/shell，全部经继承来的模式把关。**注意 `readonly` 仍重载着另外两件事**，所以摘掉它连带两个可观察变化（各有测试钉住）：`agent(agent='plan')` 的派生本身现在要审批一次（`permission()` 只对 read-only def 返回 `None`），且不再走 `ParallelReadOnly` 批次而是 `Isolated`（对一个能写的 agent 反而更合适）。真嫌派生那次审批多余，就得把 `readonly` 拆成"能力天花板 / 派生免审 / 可并行"三个字段——继承落地后派生审批已是双重把关，但那是独立的一次改动。
 
-**`exit_plan` 结构性地不发给任何子 agent**（`sub_tools` 里按 `PermissionRequest::PlanReview` 过滤，不是按工具名）：提交计划意味着**父会话**的权限模式迁移，这不是被委派方能做的决定。判别用请求类型而非名字——"会请求 plan review 的工具"恰好就是"不能被委派的工具"，新增同类工具自动继承该语义。此前 `explore`/`general` 都带着 `exit_plan`，唯独 `plan` 靠 `disallowedTools` 挡掉，正好是反的；结构化之后那行 `disallowedTools` 已删（留着会让人以为约束住在 def 里）。注意**主 agent 任何模式下都保留它**：工具集属于缓存前缀，跟着模式增删会每次切换都废掉前缀，所以它常驻、由 `PermissionRules::decide` 对非 plan 模式的调用自愈。
+**提交计划结构性地不发给任何子 agent**：`progress` 根本不在 `builtin_tools()` 里，它由三个前端在主会话装配点单独 push（`tcode-frontend/src/agent.rs`、TUI harness）。提交计划意味着**父会话**的权限模式迁移，这不是被委派方能做的决定。`sub_tools` 里那条按 `PermissionRequest::PlanReview` 过滤的 retain 留作兜底，防的是以后有扩展工具带上同一请求类型。
 
 **审批桥对所有委派运行安装**，不再由 `questionPolicy` 把关。`questionPolicy` 管的是 `ask_user` 这个**工具**（能不能问开放式问题），与"它要动手时人有没有权决定"是两件事；绑在一个字段上，继承一个会询问的模式就会静默变成一个会拒绝的模式（`NeverAsk`）。
 
@@ -155,7 +155,7 @@ loop {
 | `grep` / `glob` | 内嵌 grep-searcher/ignore/globset；每行截 512B、`max_filesize` 上限、并行 + 按 (path,line) 排序、deadline 兜底给 partial 标记、剪 VCS/缓存目录、搜 dotfiles + offset 分页 |
 | `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced Note 唤醒主 agent（见改进 5），非交互 |
 | `web_fetch` / `web_search` | 见下 Web 节 |
-| `update_progress` | 前端可见的多阶段执行状态；按真实依赖与里程碑更新，避免与只读 `plan` 权限模式混淆。不可代替方案、结论或交接记录。 |
+| `progress` | 一个任务一份耐久的工作分解文件（`~/.tcode/projects/<id>/progress/`，`draft`/`active`/`done`），也是前端进度面板的数据源。**它是该文件唯一的写入者**——模型不得用 `edit` 改它。返回值只回显刚翻成 `[>]` 的那一阶段的 `detail`，所以十二阶段的计划任何时刻只有一个阶段的正文在上下文里。`state: "active"` 就是"提交给用户审批"这一动作本身，因此 `permission()` 是输入的纯函数；用户手改文件后下次更新返回自愈冲突（附他们的原文）。不可代替方案、结论或交接记录。 |
 | `ask_user` | 必须由用户选择才能继续的阻塞分歧；支持多问题分页。不可用于可由代码、项目上下文或现有用户要求确定的细节。 |
 | `add_note` | 当前 Ledger 的一条高价值交接记录：仅记录用户决策、已验证约束或未完成工作的边界，供后续步骤延续。不是进度跟踪，不写入跨会话自动记忆；compact 后是否保留由摘要决定。 |
 
