@@ -525,9 +525,14 @@ impl App {
                     self.bake_transcript();
                 }
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
-                CommandEffect::SubmitPrompt(prompt) => {
-                    let message = self.compose_draft(prompt);
-                    // A turn already holds the Session, so the prompt queues at
+                CommandEffect::SubmitInstruction(instruction) => {
+                    let message = PendingMessage {
+                        text: String::new(),
+                        attachments: Vec::new(),
+                        blocks: Vec::new(),
+                        instructions: vec![instruction],
+                    };
+                    // A turn already holds the Session, so the instruction queues at
                     // the loop's next boundary exactly as typed input does.
                     match self.session.is_some() {
                         true => self.start_turn(message),

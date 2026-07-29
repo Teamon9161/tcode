@@ -491,6 +491,7 @@ pub struct App {
 #[derive(Clone)]
 struct PlanExecution {
     plan: String,
+    progress_path: PathBuf,
 }
 
 #[derive(Clone)]
@@ -1100,9 +1101,19 @@ impl App {
             self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
             return;
         };
+        let Some(progress_path) = dialog.plan_path().map(PathBuf::from) else {
+            self.reply_error(
+                "cannot start a fresh execution session: approved plan path is unavailable",
+            );
+            self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
+            return;
+        };
         self.agent.model.swap(active);
         self.menu.current = index;
-        self.pending_plan_execution = Some(PlanExecution { plan });
+        self.pending_plan_execution = Some(PlanExecution {
+            plan,
+            progress_path,
+        });
         self.finish_approval(dialog, reply, approval);
     }
 
@@ -2091,10 +2102,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn plan_handoff_uses_the_execution_picker_and_starts_a_clean_default_session() {
+    async fn plan_guidance_reaches_the_model_without_entering_the_transcript() {
         let dir = tempfile::tempdir().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = harness::app_for_instruction_turn(dir.path(), 90, 40, requests.clone());
+
+        app.run_slash("/plan revise the resume path");
+        tokio::task::yield_now().await;
+
+        let frame = app.frame();
+        assert!(frame.contains("▌ /plan revise the resume path"), "{frame}");
+        assert!(
+            !frame.contains("Plan this before doing it."),
+            "planning guidance must not enter the transcript: {frame}"
+        );
+        assert!(
+            !frame.contains("state: \"draft\""),
+            "planning guidance must not enter the transcript: {frame}"
+        );
+
+        let requests = requests.lock().expect("request log");
+        let request = requests
+            .first()
+            .expect("/plan starts an instruction-only model turn");
+        let prompt = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt.contains("<harness-note>"), "{prompt}");
+        assert!(prompt.contains("Plan this before doing it."), "{prompt}");
+        assert!(prompt.contains("Task: revise the resume path"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn plan_handoff_adopts_the_active_plan_without_exposing_internal_guidance() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress_path = dir.path().join("approved-plan.md");
+        std::fs::write(
+            &progress_path,
+            "---\ntitle: Execute\nstate: active\ncreated: c\n---\n\n## [>] 1. Change the implementation\n",
+        )
+        .unwrap();
         let created_modes = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut app = harness::app_for_plan_handoff(dir.path(), 90, 40, created_modes.clone());
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut app = harness::app_for_plan_handoff(
+            dir.path(),
+            90,
+            40,
+            created_modes.clone(),
+            requests.clone(),
+        );
         let plan = "# Execute\n\n1. Change the implementation.\n2. Run the focused tests.";
         let (tx, mut rx) = oneshot::channel();
         app.open_review(AskMsg {
@@ -2105,16 +2168,18 @@ mod tests {
                 descriptor: "progress".into(),
                 is_edit: false,
                 allows_project: false,
-                input: serde_json::json!({ "plan": plan }),
+                input: serde_json::json!({
+                    "plan": plan,
+                    tcode_core::progress::REVIEW_PATH_FIELD: progress_path.display().to_string(),
+                }),
             }],
             reply: ApprovalReply::One(tx),
         });
 
-        app.press(KeyCode::Char('5'));
         app.press(KeyCode::Enter);
         assert!(
             app.frame().contains("execution model"),
-            "the fresh-session option opens the shared execution-model picker"
+            "the fresh-session choice opens the shared execution-model picker"
         );
         app.press(KeyCode::Esc);
         assert!(
@@ -2122,26 +2187,28 @@ mod tests {
             "Esc returns to the same plan review"
         );
 
-        app.press(KeyCode::Char('5'));
         app.press(KeyCode::Enter);
         app.press(KeyCode::Enter);
         let approval = rx.try_recv().expect("the planning turn receives approval");
         assert!(approval.end_turn_after_execution);
-        assert_eq!(approval.set_mode, Some(tcode_core::PermissionMode::Default));
+        assert_eq!(approval.set_mode, None);
 
         let planning_session = app
             .session
             .take()
             .expect("planning session remains available");
         app.on_turn_done((planning_session, Ok(())));
+        tokio::task::yield_now().await;
+
         let frame = app.frame();
         assert!(
-            frame.contains("Execute the approved plan below."),
-            "{frame}"
+            !frame.contains("Execute the approved plan below."),
+            "harness guidance must not enter the transcript: {frame}"
         );
-        assert!(frame.contains("# Execute"), "{frame}");
-        assert!(frame.contains("1. Change the implementation."), "{frame}");
-        assert!(frame.contains("2. Run the focused tests."), "{frame}");
+        assert!(
+            !frame.contains("# Execute"),
+            "plan body must remain internal: {frame}"
+        );
         assert!(
             !frame.contains("Review plan"),
             "the prior planning transcript is not carried into the new session: {frame}"
@@ -2149,6 +2216,30 @@ mod tests {
         assert_eq!(
             created_modes.lock().expect("mode log").as_slice(),
             &[tcode_core::PermissionMode::Default]
+        );
+
+        let requests = requests.lock().expect("request log");
+        let request = requests
+            .first()
+            .expect("fresh execution starts a model turn");
+        let prompt = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .filter_map(|block| match block {
+                ContentBlock::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            prompt.contains("Execute the approved plan below."),
+            "{prompt}"
+        );
+        assert!(prompt.contains("state=\"active\""), "{prompt}");
+        assert!(
+            prompt.contains("Change the implementation  ← current"),
+            "{prompt}"
         );
     }
 

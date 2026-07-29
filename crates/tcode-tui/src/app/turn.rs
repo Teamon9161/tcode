@@ -12,6 +12,8 @@
 
 use super::*;
 
+const PLAN_EXECUTION_REQUEST: &str = include_str!("../../prompts/plan-execution.md");
+
 /// Several prompts queued behind one turn become one prompt when that turn ends
 /// — starting a turn per queued line would make the model answer the first one
 /// with the rest still unsaid.
@@ -23,6 +25,7 @@ pub(super) fn merge(queued: Vec<PendingMessage>) -> Option<PendingMessage> {
         merged.text.push_str(&next.text);
         merged.attachments.extend(next.attachments);
         merged.blocks.extend(next.blocks);
+        merged.instructions.extend(next.instructions);
     }
     Some(merged)
 }
@@ -83,10 +86,15 @@ impl App {
         // Echo the user input into the transcript, tagged with the ledger
         // index its User entry is about to occupy (rewind jumps to it).
         let entry_index = session.ledger.entries().len();
-        self.transcript.push_tagged(
-            prompt_echo(&message.text, &message.attachments),
-            entry_index,
-        );
+        let instructions = message.instructions;
+        // Echo only actual user text. Command guidance is an Instruction entry
+        // and must never occupy the user transcript.
+        if !message.text.is_empty() || !message.attachments.is_empty() {
+            self.transcript.push_tagged(
+                prompt_echo(&message.text, &message.attachments),
+                entry_index,
+            );
+        }
         let blocks = message.blocks;
 
         let (tx, rx) = mpsc::channel(64);
@@ -100,9 +108,25 @@ impl App {
         let approver = self.approver.clone();
         let cancel2 = cancel.clone();
         let handle = tokio::spawn(async move {
-            let result = agent
-                .user_turn(&mut session, blocks, &tx, &*approver, cancel2)
-                .await;
+            let result = match instructions.is_empty() {
+                true => {
+                    agent
+                        .user_turn(&mut session, blocks, &tx, &*approver, cancel2)
+                        .await
+                }
+                false => {
+                    agent
+                        .instruction_turn(
+                            &mut session,
+                            instructions,
+                            blocks,
+                            &tx,
+                            &*approver,
+                            cancel2,
+                        )
+                        .await
+                }
+            };
             (session, result)
         });
         self.phase = Phase::Running {
@@ -311,6 +335,13 @@ impl App {
                 return;
             }
         };
+        if let Err(error) = session.adopt_progress(&handoff.progress_path) {
+            self.bake(vec![Line::styled(
+                format!("cannot resume approved plan in fresh session: {error}"),
+                theme::error_highlight(),
+            )]);
+            return;
+        }
         // A fresh execution starts from the normal manual-approval default;
         // the Plan-review choice intentionally does not carry its planning
         // session's permission mode across this session boundary.
@@ -331,15 +362,12 @@ impl App {
         self.session = Some(session);
         self.reset_conversation_ui();
 
-        let prompt = format!(
-            "Execute the approved plan below. Do not re-plan it; inspect the repository as needed, \
-             make the changes, and verify them.\n\n{}",
-            handoff.plan.trim()
-        );
+        let instruction = format!("{PLAN_EXECUTION_REQUEST}\n{}", handoff.plan.trim());
         self.start_turn(PendingMessage {
-            text: prompt.clone(),
+            text: String::new(),
             attachments: Vec::new(),
-            blocks: vec![ContentBlock::Text { text: prompt }],
+            blocks: Vec::new(),
+            instructions: vec![instruction],
         });
     }
 

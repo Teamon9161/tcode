@@ -610,6 +610,63 @@ impl Agent {
             .await
     }
 
+    /// Drive one model turn with harness-authored guidance. The instruction is
+    /// model context rather than a human utterance, so it stays out of replay,
+    /// export, and the transcript while retaining normal turn behavior.
+    pub async fn instruction_turn(
+        &self,
+        session: &mut Session,
+        instructions: Vec<String>,
+        input: Vec<ContentBlock>,
+        events: &mpsc::Sender<AgentEvent>,
+        approver: &dyn Approver,
+        cancel: CancellationToken,
+    ) -> Result<(), AgentError> {
+        let model = self.model.snapshot();
+        self.auto_compact_if_needed(session, &model, events, &cancel)
+            .await?;
+        self.note_background(session, events).await?;
+        self.commit_mode(session, events).await?;
+        self.deliver_deferred_context(session);
+        for instruction in instructions {
+            session.ledger.append(Entry::Instruction(instruction));
+        }
+        let expanded =
+            crate::references::expand_references(session.tool_ctx.cwd.clone(), input).await;
+        let mut input = expanded.blocks;
+        if !expanded.labels.is_empty() {
+            self.emit(
+                events,
+                AgentEvent::ReferencesExpanded {
+                    labels: expanded.labels,
+                    added_tokens: expanded.added_tokens,
+                },
+            )
+            .await?;
+        }
+        if let Some(reminder) = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .maintenance_reminder()
+        {
+            input.push(ContentBlock::Text { text: reminder });
+        }
+        if let Some(status) = session.status_block(model.context_window) {
+            input.push(status);
+        }
+        if !input.is_empty() {
+            session.ledger.append(Entry::User(input));
+        }
+        session.last_prompt_tokens = self.estimate_context_tokens(session);
+        self.auto_compact_if_needed(session, &model, events, &cancel)
+            .await?;
+        session.turn_usage = Usage::default();
+        self.run_steps(&model, session, events, approver, &cancel)
+            .await
+    }
+
     /// A turn started by the harness because monitor events (or a monitor's
     /// exit) arrived while the session was idle. There is no user input: the
     /// injected notes are the whole prompt — legal because `Entry::Note`
@@ -2359,6 +2416,9 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
         for message in session.pending.take_at_safe_boundary() {
+            for instruction in message.instructions {
+                session.ledger.append(Entry::Instruction(instruction));
+            }
             let expanded =
                 crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)
                     .await;

@@ -82,7 +82,7 @@ struct OptionRows {
 }
 
 /// The plan-review surface: the plan itself rendered inside the panel,
-/// navigable block by block, plus the four decisions. A comment can anchor to
+/// navigable block by block, plus three clear outcomes. A comment can anchor to
 /// the focused block; a decline sends the comments (or free feedback) back so
 /// the model keeps planning. The plan the model relies on lives in the ledger;
 /// this pane is the human's review of it.
@@ -208,55 +208,28 @@ impl PlanReview {
     }
 }
 
-/// One plan-review option. Approving carries a permission-mode transition;
-/// declining without feedback pauses the turn until the user says more.
+/// One plan-review option. Execution keeps the current permission mode; only
+/// the fresh-session choice replaces the conversation and asks for its model.
 struct PlanOption {
     label: &'static str,
     decision: ApprovalDecision,
-    set_mode: Option<PermissionMode>,
-    /// This decision closes the planning turn and hands the accepted markdown
-    /// to an intentionally empty execution session.
     fresh_session: bool,
 }
 
-const PLAN_OPTIONS: [PlanOption; 6] = [
+const PLAN_OPTIONS: [PlanOption; 3] = [
     PlanOption {
-        label: "Yes, and approve edits manually",
+        label: "Yes, start a fresh session and choose a model…",
         decision: ApprovalDecision::Yes,
-        set_mode: Some(PermissionMode::Default),
-        fresh_session: false,
-    },
-    PlanOption {
-        label: "Yes, and auto-accept edits",
-        decision: ApprovalDecision::Yes,
-        set_mode: Some(PermissionMode::AcceptEdits),
-        fresh_session: false,
-    },
-    PlanOption {
-        label: "Yes, and use auto mode",
-        decision: ApprovalDecision::Yes,
-        set_mode: Some(PermissionMode::Auto),
-        fresh_session: false,
-    },
-    // Planning stopped being a permission mode precisely so this row could
-    // exist: how much risk to take during execution is the user's call, and
-    // approving a plan is where they are best placed to make it.
-    PlanOption {
-        label: "Yes, and run unsafe",
-        decision: ApprovalDecision::Yes,
-        set_mode: Some(PermissionMode::Unsafe),
-        fresh_session: false,
-    },
-    PlanOption {
-        label: "Yes, execute in a fresh session…",
-        decision: ApprovalDecision::Yes,
-        set_mode: Some(PermissionMode::Default),
         fresh_session: true,
+    },
+    PlanOption {
+        label: "Yes, continue in this session",
+        decision: ApprovalDecision::Yes,
+        fresh_session: false,
     },
     PlanOption {
         label: "No, keep planning",
         decision: ApprovalDecision::No,
-        set_mode: None,
         fresh_session: false,
     },
 ];
@@ -628,7 +601,7 @@ impl Dialog {
                 scroll: Cell::new(0),
                 rendered_focus: Cell::new(0),
                 cursor: 0,
-                options_focused: false,
+                options_focused: true,
                 compose: None,
                 mouse_anchor: None,
                 mouse_head: None,
@@ -1558,12 +1531,11 @@ impl Dialog {
     }
 
     fn submit_plan(&mut self) -> DialogResult {
-        let (decision, set_mode, fresh_session, revised, approved_input) = {
+        let (decision, fresh_session, revised, approved_input) = {
             let plan = self.plan.as_ref().expect("plan dialog");
             let opt = &PLAN_OPTIONS[plan.cursor];
             (
                 opt.decision,
-                opt.set_mode,
                 opt.fresh_session,
                 plan.revised.clone(),
                 plan.approved_input(),
@@ -1587,7 +1559,7 @@ impl Dialog {
         let approval = Approval {
             decision,
             comment: (!parts.is_empty()).then(|| parts.join("\n\n")),
-            set_mode,
+            set_mode: None,
             approved_input,
             end_turn_after_execution: fresh_session,
         };
@@ -1757,20 +1729,14 @@ impl Dialog {
         plan.scroll.set(scroll);
         out.extend(rows.into_iter().skip(scroll).take(k));
 
-        // Decision options. After an external edit these are deliberately
-        // phrased as the available destinations: options 1–4 approve the
-        // revised artifact under a chosen permission mode; option 5 opens a
-        // fresh execution session, while option 6 sends its diff back for
-        // another planning pass.
+        // Decision options. The current session keeps its current permission
+        // mode; the fresh-session route opens the model picker before execution.
         for (i, opt) in PLAN_OPTIONS.iter().enumerate() {
             let label = if plan.has_revision() {
                 match i {
-                    0 => "Approve revised plan, approve edits manually",
-                    1 => "Approve revised plan, auto-accept edits",
-                    2 => "Approve revised plan, use auto mode",
-                    3 => "Approve revised plan, run unsafe",
-                    4 => "Execute revised plan in a fresh session…",
-                    _ => "Send revision back as feedback",
+                    0 => "Yes, start a fresh session with the revised plan and choose a model…",
+                    1 => "Yes, continue in this session with the revised plan",
+                    _ => "No, keep planning",
                 }
             } else {
                 opt.label
@@ -1837,11 +1803,11 @@ impl Dialog {
         } else if plan.feedback_focused {
             "  type note or feedback · enter confirm · esc return to plan"
         } else if plan.options_focused {
-            "  ↑↓/1-5 choose · y copy full path · tab note · enter confirm · → return to plan · esc decline"
+            "  ↑↓/1-3 choose · y copy full path · tab note · enter confirm · → return to plan · esc decline"
         } else if plan.has_revision() {
-            "  ↑↓ blocks · c comment · e edit · y copy full path · ←/1-5 choose · esc = keep planning"
+            "  ↑↓ blocks · c comment · e edit · y copy full path · ←/1-3 choose · esc = keep planning"
         } else {
-            "  ↑↓ blocks · c comment · drag text to quote · y copy full path · ←/1-5 choose · tab feedback · esc = keep planning"
+            "  ↑↓ blocks · c comment · drag text to quote · y copy full path · ←/1-3 choose · tab feedback · esc = keep planning"
         };
         out.push(Line::styled(hint, theme::dim()));
         out
@@ -2453,7 +2419,7 @@ mod tests {
     }
 
     #[test]
-    fn the_fresh_session_option_requests_execution_in_default_mode() {
+    fn fresh_session_is_the_initial_choice_and_opens_the_execution_model_picker() {
         let mut plan = Dialog::plan(
             "Review plan".into(),
             json!({ "plan": "# Plan" }),
@@ -2462,12 +2428,15 @@ mod tests {
                 crate::markdown::Renderer::default().parse("# Plan"),
             )],
         );
-        plan.handle_key(key(KeyCode::Char('5')));
+        let screen = screen(&plan, 100);
+        assert!(screen.contains("▸ 1. Yes, start a fresh session and choose a model…"));
+        assert!(screen.contains("2. Yes, continue in this session"));
+        assert!(screen.contains("3. No, keep planning"));
         let DialogResult::PlanHandoff(approval) = plan.handle_key(key(KeyCode::Enter)) else {
             panic!("the fresh-session option should open the execution-model picker");
         };
         assert_eq!(approval.decision, ApprovalDecision::Yes);
-        assert_eq!(approval.set_mode, Some(PermissionMode::Default));
+        assert_eq!(approval.set_mode, None);
         assert!(approval.end_turn_after_execution);
     }
 
@@ -3113,13 +3082,15 @@ mod tests {
     }
 
     #[test]
-    fn plan_default_approval_requires_manual_edit_approval() {
+    fn plan_continue_in_current_session_preserves_permission_mode() {
         let mut d = plan_dialog("# T\n\nBody.");
+        d.handle_key(key(KeyCode::Char('2')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
-            panic!("enter approves");
+            panic!("enter continues in the current session");
         };
         assert_eq!(a.decision, ApprovalDecision::Yes);
-        assert_eq!(a.set_mode, Some(PermissionMode::Default));
+        assert_eq!(a.set_mode, None);
+        assert!(!a.end_turn_after_execution);
         assert_eq!(a.comment, None);
     }
 
@@ -3139,18 +3110,20 @@ mod tests {
     }
 
     #[test]
-    fn plan_digit_picks_the_auto_mode_option() {
+    fn plan_digit_three_keeps_planning() {
         let mut d = plan_dialog("# T\n\nBody.");
-        d.handle_key(key(KeyCode::Char('3'))); // "use auto mode"
+        d.handle_key(key(KeyCode::Char('3')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
-            panic!("enter approves");
+            panic!("enter keeps planning");
         };
-        assert_eq!(a.set_mode, Some(PermissionMode::Auto));
+        assert_eq!(a.decision, ApprovalDecision::No);
+        assert_eq!(a.set_mode, None);
     }
 
     #[test]
     fn plan_comment_anchors_to_the_focused_block() {
         let mut d = plan_dialog("First block.\n\nSecond block.");
+        d.handle_key(key(KeyCode::Right)); // leave the initially focused decisions
         d.handle_key(key(KeyCode::Down)); // focus the second block
         d.handle_key(key(KeyCode::Char('c')));
         type_str(&mut d, "reword this");
@@ -3172,16 +3145,18 @@ mod tests {
     }
 
     #[test]
-    fn saved_comment_moves_to_options_and_can_select_auto_accept() {
+    fn saved_comment_moves_to_options_and_can_continue_in_the_current_session() {
         let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Right));
         d.handle_key(key(KeyCode::Char('c')));
         type_str(&mut d, "looks good");
         d.handle_key(key(KeyCode::Enter));
-        d.handle_key(key(KeyCode::Down)); // manual approval → auto-accept
+        d.handle_key(key(KeyCode::Down)); // fresh session → current session
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter confirms the selected option");
         };
-        assert_eq!(a.set_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(a.set_mode, None);
+        assert!(!a.end_turn_after_execution);
     }
 
     #[test]
@@ -3229,6 +3204,7 @@ mod tests {
         d.plan_mouse_up(3, 8, 80, 20);
         type_str(&mut d, "make this concrete");
         d.handle_key(key(KeyCode::Enter));
+        d.handle_key(key(KeyCode::Char('2')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("approval should complete");
         };
@@ -3248,7 +3224,7 @@ mod tests {
     #[test]
     fn escape_from_plan_options_declines_without_feedback() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('6')));
+        d.handle_key(key(KeyCode::Char('3')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Esc)) else {
             panic!("Esc from plan options must decline immediately");
         };
@@ -3259,7 +3235,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_without_feedback_pauses_the_turn() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('6')));
+        d.handle_key(key(KeyCode::Char('3')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter must decline without forcing a feedback editor");
         };
@@ -3270,7 +3246,7 @@ mod tests {
     #[test]
     fn plan_keep_planning_tab_opens_its_feedback_editor() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('6')));
+        d.handle_key(key(KeyCode::Char('3')));
         d.handle_key(key(KeyCode::Tab));
         assert!(
             d.plan.as_ref().expect("plan dialog").feedback_focused,
@@ -3287,7 +3263,7 @@ mod tests {
     #[test]
     fn plan_tab_opens_a_note_editor_for_approval_options() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('2'))); // auto-accept edits
+        d.handle_key(key(KeyCode::Char('2'))); // continue in this session
         d.handle_key(key(KeyCode::Tab));
         assert!(
             d.plan.as_ref().expect("plan dialog").feedback_focused,
@@ -3298,7 +3274,7 @@ mod tests {
             panic!("enter approves the plan with the note");
         };
         assert_eq!(a.decision, ApprovalDecision::Yes);
-        assert_eq!(a.set_mode, Some(PermissionMode::AcceptEdits));
+        assert_eq!(a.set_mode, None);
         assert_eq!(
             a.comment.as_deref(),
             Some("run the focused tests afterwards")
@@ -3308,7 +3284,7 @@ mod tests {
     #[test]
     fn plan_tab_note_keeps_the_chosen_option_marked() {
         let mut d = plan_dialog("Body.");
-        d.handle_key(key(KeyCode::Char('2'))); // auto-accept edits
+        d.handle_key(key(KeyCode::Char('2'))); // continue in this session
                                                // Regression: opening the Tab note editor used to blank every
                                                // option's marker, leaving no way to tell which one a note applies to.
         let before = render_text(&d, 60, 20);
@@ -3333,7 +3309,7 @@ mod tests {
             .join("\n\n");
         let mut d = plan_dialog(&src);
         let _ = render_text(&d, 60, 14); // establish the initial viewport
-        d.handle_key(key(KeyCode::Char('6')));
+        d.handle_key(key(KeyCode::Char('3')));
         d.handle_key(key(KeyCode::Tab));
         assert!(d.plan.as_ref().expect("plan dialog").feedback_focused);
 
@@ -3358,11 +3334,12 @@ mod tests {
     fn plan_editor_revision_is_approved_as_the_new_source_of_truth() {
         let mut d = plan_dialog("Original body.");
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
+        d.handle_key(key(KeyCode::Char('2')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter approves");
         };
         assert_eq!(a.decision, ApprovalDecision::Yes);
-        assert_eq!(a.set_mode, Some(PermissionMode::Default));
+        assert_eq!(a.set_mode, None);
         let comment = a.comment.expect("the revision travels with the approval");
         assert!(comment.contains("Revised body."), "{comment}");
         assert!(comment.contains("revised plan"), "{comment}");
@@ -3379,7 +3356,7 @@ mod tests {
     fn plan_editor_revision_can_be_sent_back_as_a_diff() {
         let mut d = plan_dialog("Original body.");
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
-        d.handle_key(key(KeyCode::Char('6'))); // keep planning
+        d.handle_key(key(KeyCode::Char('3'))); // keep planning
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter submits the edit as feedback");
         };
@@ -3399,10 +3376,10 @@ mod tests {
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
         let text = render_text(&d, 80, 20);
         assert!(
-            text.contains("Approve revised plan, auto-accept edits"),
-            "{text}"
+            text.contains("Yes, start a fresh session with the revised plan and choose a model…")
         );
-        assert!(text.contains("Send revision back as feedback"), "{text}");
+        assert!(text.contains("Yes, continue in this session with the revised plan"));
+        assert!(text.contains("No, keep planning"));
     }
 
     #[test]
@@ -3410,6 +3387,7 @@ mod tests {
         let mut d = plan_dialog("Original body.");
         d.revise_plan("Revised body.".into(), blocks_for("Revised body."));
         d.revise_plan("Original body.".into(), blocks_for("Original body."));
+        d.handle_key(key(KeyCode::Char('2')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter approves");
         };
@@ -3421,6 +3399,7 @@ mod tests {
     fn plan_editor_no_change_adds_nothing() {
         let mut d = plan_dialog("Same body.");
         d.revise_plan("Same body.".into(), blocks_for("Same body."));
+        d.handle_key(key(KeyCode::Char('2')));
         let DialogResult::Done(a) = d.handle_key(key(KeyCode::Enter)) else {
             panic!("enter approves");
         };
@@ -3430,6 +3409,7 @@ mod tests {
     #[test]
     fn plan_e_key_requests_an_external_edit() {
         let mut d = plan_dialog("Body.");
+        d.handle_key(key(KeyCode::Right));
         assert!(matches!(
             d.handle_key(key(KeyCode::Char('e'))),
             DialogResult::EditPlan
@@ -3443,6 +3423,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n\n");
         let mut d = plan_dialog(&src);
+        d.handle_key(key(KeyCode::Right));
         d.handle_key(key(KeyCode::End)); // jump to the last block
         let text = render_text(&d, 60, 14);
         assert!(

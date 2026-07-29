@@ -312,22 +312,13 @@ impl Progress {
         Ok(())
     }
 
-    pub fn set_title(&mut self, title: &str) {
-        let title = title.trim();
-        if !title.is_empty() {
-            self.title = title.to_string();
-        }
-    }
-
     /// Apply the parts of a `progress` call a review does not decide: the
-    /// title and the breakdown. Split out from [`Progress::apply`] because a
-    /// draft submitted for approval is saved *before* the human answers —
-    /// their decision is about `state`, and applying it up front would make
-    /// declining silently promote the plan.
+    /// breakdown. The title chooses the progress file before this method runs;
+    /// it is never mutable content of an existing tracker. Split out from
+    /// [`Progress::apply`] because a draft submitted for approval is saved
+    /// *before* the human answers — their decision is about `state`, and
+    /// applying it up front would make declining silently promote the plan.
     pub fn apply_content(&mut self, input: &Value) -> Result<Option<String>, String> {
-        if let Some(title) = input["title"].as_str() {
-            self.set_title(title);
-        }
         match input.get("phases") {
             Some(phases) if !phases.is_null() => Ok(self.set_phases(phases_from_json(phases)?)),
             _ => Ok(None),
@@ -544,24 +535,29 @@ pub fn is_submission(input: &Value) -> bool {
     input["state"].as_str() == Some(ProgressState::Active.label())
 }
 
-/// The session's current progress, opening a new file if there is none. The
-/// first call for a task must name it — the title is what every later listing
-/// shows, and a directory of files named after their timestamp is a directory
-/// nobody reads.
+/// The session's selected progress file, opening a new file when this call
+/// names a different task. A title identifies a tracker rather than mutable
+/// metadata: a reused session may keep its current file only when the incoming
+/// title is absent or exactly matches. That lets a declined draft remain on
+/// disk without making the next task overwrite its title or phases.
 fn current_or_create<'a>(
     slot: &'a mut Option<Progress>,
     cwd: &Path,
     input: &Value,
     fresh: ProgressState,
 ) -> Result<&'a mut Progress, String> {
-    if slot.is_none() {
-        let title = input["title"]
-            .as_str()
-            .map(str::trim)
-            .filter(|title| !title.is_empty())
-            .ok_or_else(|| {
-                "there is no progress file open yet, so this call needs a `title`".to_string()
-            })?;
+    let title = input["title"]
+        .as_str()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let needs_new = match slot.as_ref() {
+        Some(progress) => title.is_some_and(|title| title != progress.title),
+        None => true,
+    };
+    if needs_new {
+        let title = title.ok_or_else(|| {
+            "there is no progress file open yet, so this call needs a `title`".to_string()
+        })?;
         let mut created = Progress::create(cwd, title)?;
         created.state = fresh;
         *slot = Some(created);
@@ -1263,6 +1259,57 @@ mod tests {
         let progress = slot.as_ref().unwrap();
         assert_eq!(progress.state(), ProgressState::Active);
         assert_eq!(progress.phases()[0].phase, "what the user wants");
+    }
+
+    /// A session can retain a declined draft, but the next task's title must
+    /// select a new tracker rather than mutating the abandoned file in place.
+    #[test]
+    fn a_new_title_replaces_a_declined_draft_without_rewriting_its_file() {
+        let ctx = test_ctx();
+        let first = review_copy(
+            &ctx,
+            &json!({
+                "title": "Functional test plan",
+                "state": "active",
+                "phases": [{ "phase": "run tests", "status": "pending" }]
+            }),
+        )
+        .unwrap();
+        let first_path = PathBuf::from(first[REVIEW_PATH_FIELD].as_str().unwrap());
+        assert!(first_path.exists());
+
+        // The reviewer declined the first draft. It remains selected by the
+        // session, just as it does after the ledger is truncated for a fresh
+        // conversation, until the following title identifies a new task.
+        let second = review_copy(
+            &ctx,
+            &json!({
+                "title": "Fix plan review flow",
+                "state": "active",
+                "phases": [{ "phase": "write regression", "status": "pending" }]
+            }),
+        )
+        .unwrap();
+        let second_path = PathBuf::from(second[REVIEW_PATH_FIELD].as_str().unwrap());
+
+        assert_ne!(second_path, first_path);
+        assert!(second_path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("fix-plan-review-flow"));
+        assert_eq!(
+            Progress::load(&first_path).unwrap().title,
+            "Functional test plan"
+        );
+        assert_eq!(
+            Progress::load(&second_path).unwrap().title,
+            "Fix plan review flow"
+        );
+        assert_eq!(
+            ctx.progress.lock().unwrap().as_ref().unwrap().path(),
+            second_path
+        );
     }
 
     /// Rule (2) of the design: a twelve-phase plan keeps one phase's prose in

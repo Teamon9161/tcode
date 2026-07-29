@@ -20,10 +20,14 @@ use crate::types::{ContentBlock, Usage};
 /// again once it is delivered — the same two renderings a normal prompt has.
 #[derive(Clone, Debug)]
 pub struct PendingMessage {
+    /// Human-visible prompt text. Harness-authored instructions stay separate
+    /// so transcript rendering never mistakes them for the user's words.
     pub text: String,
     /// Attachment labels, in the order they hang under the prompt.
     pub attachments: Vec<String>,
     pub blocks: Vec<ContentBlock>,
+    /// Model-visible harness guidance to append immediately before this prompt.
+    pub instructions: Vec<String>,
 }
 
 /// Messages the user submitted while a turn was still running.
@@ -861,6 +865,7 @@ mod tests {
             text: "start the new turn".into(),
             attachments: vec![],
             blocks: vec![],
+            instructions: vec![],
         });
 
         pending.defer_to_next_turn();

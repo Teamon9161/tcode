@@ -48,18 +48,18 @@ impl SlashCommand for PlanCommand {
     }
 }
 
-/// The planning turn itself. The text goes in as the user's own words, because
-/// that is what it is — a request about how to spend this turn, not a harness
-/// setting. Nothing here touches the permission mode.
+/// The planning turn itself. `/plan`'s guidance is harness-authored model
+/// context, not text the user wrote, so it must not appear in the transcript.
+/// Nothing here touches the permission mode.
 fn plan_turn(task: &str) -> CommandOutcome {
-    let prompt = match task {
+    let instruction = match task {
         "" => PLAN_REQUEST.to_string(),
-        task => format!("{PLAN_REQUEST}\n\nThe task: {task}"),
+        task => format!("{PLAN_REQUEST}\n\nTask: {task}"),
     };
-    CommandOutcome::effect(CommandEffect::SubmitPrompt(prompt))
+    CommandOutcome::effect(CommandEffect::SubmitInstruction(instruction))
 }
 
-const PLAN_REQUEST: &str = "Plan this before doing it. Investigate as much as you need — reading, searching and running read-only checks are all part of planning — then record the plan with the `progress` tool using `state: \"draft\"`, with one phase per real unit of work and the reasoning in each phase's `detail`. Do not start making changes. When the plan is ready, call `progress` with `state: \"active\"` to submit it for my approval; I may rewrite it before accepting.";
+const PLAN_REQUEST: &str = include_str!("../../prompts/commands/plan.md");
 
 fn split_verb(args: &str) -> (&str, &str) {
     let args = args.trim();
@@ -176,7 +176,7 @@ mod tests {
 
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::SubmitPrompt(prompt)] if prompt.contains("state: \"draft\"")
+            [CommandEffect::SubmitInstruction(instruction)] if instruction.contains("state: \"draft\"")
         ));
         assert_eq!(session.mode, mode, "planning is not a permission mode");
     }
@@ -186,8 +186,8 @@ mod tests {
         let outcome = outcome("rewrite the resume path");
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::SubmitPrompt(prompt)]
-                if prompt.contains("The task: rewrite the resume path")
+            [CommandEffect::SubmitInstruction(instruction)]
+                if instruction.contains("Task: rewrite the resume path")
         ));
     }
 

@@ -361,6 +361,7 @@ async fn a_prompt_queued_mid_turn_lands_after_the_tool_results() {
                 text: "actually, stop after the read".into(),
             },
         ],
+        instructions: vec![],
     });
     let events = run(&agent, &mut session, &approver, "read lib.rs").await;
 

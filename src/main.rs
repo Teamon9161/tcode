@@ -755,8 +755,10 @@ async fn main() -> anyhow::Result<()> {
                             "{DIM}interactive resume picker needs the full TUI — use /resume <id>{RESET}"
                         );
                     }
-                    CommandEffect::SubmitPrompt(prompt) => {
-                        if let Err(e) = run_turn(&agent, &mut session, prompt, &line_approver).await
+                    CommandEffect::SubmitInstruction(instruction) => {
+                        if let Err(e) =
+                            run_instruction_turn(&agent, &mut session, instruction, &line_approver)
+                                .await
                         {
                             eprintln!("{DIM}error: {e}{RESET}");
                         }
@@ -795,6 +797,52 @@ async fn run_turn(
         .user_turn(
             session,
             vec![ContentBlock::Text { text: input }],
+            &tx,
+            approver,
+            cancel,
+        )
+        .await;
+    drop(tx);
+    let _ = printer.await;
+    watcher.abort();
+
+    let u = &session.turn_usage;
+    let cache_pct = if u.total_input() > 0 {
+        (u.cache_read_tokens as f64 / u.total_input() as f64 * 100.0).round()
+    } else {
+        0.0
+    };
+    println!(
+        "{DIM}· in {} | out {} | cache r {} ({cache_pct:.0}%) w {}{RESET}",
+        u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens
+    );
+    result
+}
+
+async fn run_instruction_turn(
+    agent: &Agent,
+    session: &mut Session,
+    instruction: String,
+    approver: &dyn tcode_core::Approver,
+) -> Result<(), AgentError> {
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let printer = tokio::spawn(printer::print_events(rx));
+
+    let cancel = CancellationToken::new();
+    let watcher = {
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                cancel.cancel();
+            }
+        })
+    };
+
+    let result = agent
+        .instruction_turn(
+            session,
+            vec![instruction],
+            Vec::new(),
             &tx,
             approver,
             cancel,

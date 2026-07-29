@@ -47,9 +47,9 @@ impl Provider for StubProvider {
     }
 }
 
-/// Keeps the fresh execution turn open while its harness test inspects the
-/// first prompt. The test runtime aborts it during teardown.
-struct PendingProvider;
+/// Keeps the fresh execution turn open while its harness test records the
+/// first request. The test runtime aborts it during teardown.
+struct PendingProvider(Arc<Mutex<Vec<Request>>>);
 
 #[async_trait::async_trait]
 impl Provider for PendingProvider {
@@ -64,9 +64,10 @@ impl Provider for PendingProvider {
     }
     async fn stream(
         &self,
-        _req: Request,
+        req: Request,
         _cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
+        self.0.lock().expect("request log").push(req);
         Ok(Box::pin(futures::stream::pending::<
             Result<tcode_core::StreamEvent, ProviderError>,
         >()))
@@ -137,6 +138,22 @@ pub(super) fn app(cwd: &Path, width: u16, height: u16) -> App {
     app_with(cwd, width, height, config())
 }
 
+/// Same harness, but with a provider that records an actual model request.
+pub(super) fn app_for_instruction_turn(
+    cwd: &Path,
+    width: u16,
+    height: u16,
+    requests: Arc<Mutex<Vec<Request>>>,
+) -> App {
+    app_with_provider(
+        cwd,
+        width,
+        height,
+        config(),
+        Arc::new(PendingProvider(requests)),
+    )
+}
+
 /// A harness app configured for the Plan fresh-session handoff. It records
 /// the mode assigned to the newly created Session and uses a pending provider
 /// so the first execution prompt remains observable.
@@ -145,9 +162,11 @@ pub(super) fn app_for_plan_handoff(
     width: u16,
     height: u16,
     created_modes: Arc<Mutex<Vec<PermissionMode>>>,
+    requests: Arc<Mutex<Vec<Request>>>,
 ) -> App {
     let fresh_cwd = cwd.to_path_buf();
     let recorded_modes = created_modes.clone();
+    let captured_requests = requests.clone();
     app_with(
         cwd,
         width,
@@ -159,9 +178,9 @@ pub(super) fn app_for_plan_handoff(
                     def: tcode_core::config::ModelDef::bare("handoff-model"),
                 }],
                 current: 0,
-                switch: Box::new(|_, _| {
+                switch: Box::new(move |_, _| {
                     Ok(ActiveModel {
-                        provider: Arc::new(PendingProvider),
+                        provider: Arc::new(PendingProvider(captured_requests.clone())),
                         max_tokens: 1024,
                         context_window: 200_000,
                         effort: None,
@@ -222,13 +241,23 @@ pub(super) fn app_with_provider_setup(
 }
 
 fn app_with(cwd: &Path, width: u16, height: u16, config: crate::TuiConfig) -> App {
+    app_with_provider(cwd, width, height, config, Arc::new(StubProvider))
+}
+
+fn app_with_provider(
+    cwd: &Path,
+    width: u16,
+    height: u16,
+    config: crate::TuiConfig,
+    provider: Arc<dyn Provider>,
+) -> App {
     let mut tools = tcode_tools::builtin_tools(cwd);
     // `progress` is a main-agent-only frontend addition, not part of the
     // delegated base toolset. Keep the harness aligned with that assembly.
     tools.push(Arc::new(tcode_tools::ProgressTool));
     let agent = Agent {
         model: ModelCell::new(ActiveModel {
-            provider: Arc::new(StubProvider),
+            provider,
             max_tokens: 1024,
             context_window: 200_000,
             effort: None,

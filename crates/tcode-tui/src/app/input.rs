@@ -152,6 +152,7 @@ impl App {
             text: input,
             attachments,
             blocks,
+            instructions: Vec::new(),
         }
     }
 
