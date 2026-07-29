@@ -190,7 +190,7 @@ loop {
 | 子 agent 类型化返回 | **不做**（无落地场景） | 见下。当前子 agent（general/explore）都是探索+总结，散文才是对的输出；schema 只对"父 agent 机器化汇总多路 fan-out 结果"有用，而现在没有这种用法。 |
 | 统一 read URI（`pr://` / `issue://`） | **候选** | 对齐"统一接口 + 注册表"：URI scheme 是可插拔 resolver，一个 read 读 PR/issue，替代一堆 `gh_*`。但要接 GitHub 凭证，优先级次于上两项。 |
 | `/commit` 原子拆分 | **候选** | 分析 working tree diff，拆依赖排序的原子 commit、跳过 lock 文件。语义作用于 git/文件系统 → 归 core `commands/`，独立小功能。 |
-| 持久 Python/Bun kernel + loopback（kernel 回调 read/search/task） | **暂缓** | 重，偏数据分析场景（load CSV → chart）。tcode 已有 shell + 后台任务注册表覆盖编码 harness 的主线；loopback bridge 优雅但需求未明，不为它上马一套常驻 runtime。出现明确数据分析需求再评估。 |
+| 持久 Python/Bun kernel + loopback（kernel 回调 read/search/task） | **暂缓（`show` 之后更弱）** | 重，偏数据分析场景（load CSV → chart）。tcode 已有 shell + 后台任务注册表覆盖编码 harness 的主线；loopback bridge 优雅但需求未明，不为它上马一套常驻 runtime。桌面端的 `show(路径)` 把"load CSV → chart"这条主诉求用**一次性脚本 + 一个路径**接住了（数据不进对话，因此与数据量无关），常驻 runtime 的剩余理由只有跨调用保活状态——那正是最贵的部分。 |
 | Hindsight `retain`/`recall`/mental model | **多数已覆盖** | tcode 自动记忆（`~/.tcode/projects/<id>/memory/` + `MEMORY.md` 索引 + 会话末维护 + 首会话加载）已等价于 mental model。delta 只是一个**显式 `recall` 搜索工具**，让模型执行中主动拉记忆而非仅末尾维护——优先级低，可作精化。 |
 | LSP + DAP debug | **不做** | 稍重，非当前核心。 |
 | ACP/Zed 集成 | **暂缓** | 分发/集成决策，非 harness 内核，等 TUI/桌面 app 稳定后再议。 |

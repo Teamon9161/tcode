@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use tcode_core::config::{Config, ModelState, Selection};
-use tcode_core::{Agent, AgentModels, ModelCell, PermissionMode, PermissionRules};
+use tcode_core::{Agent, AgentModels, ModelCell, PermissionMode, PermissionRules, Tool};
 use tcode_tools::{AgentDef, AgentRegistry, ShellFilters, Skill};
 
 use crate::agent::{build_agent, AgentBuild};
@@ -37,6 +37,11 @@ pub struct BootSpec<'a> {
     /// rather than a warning — the user asked for a specific agent and would
     /// otherwise silently get the ordinary one.
     pub agent: Option<String>,
+    /// Capabilities this frontend can actually carry out, offered to the model
+    /// only where they mean something (`show` needs a pane to open). Empty for
+    /// frontends with nothing to show it in — a tool whose whole effect is
+    /// invisible would be a capability the model is told it has and does not.
+    pub display_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// The assembled agent plus the pieces frontends need alongside it.
@@ -66,6 +71,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Booted> {
         selection,
         model_cell,
         agent: named_agent,
+        display_tools,
     } = spec;
     let mut warnings = Vec::new();
 
@@ -159,6 +165,7 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Booted> {
         classifier_policy,
         classifier_config,
         mcp_tools,
+        display_tools,
     });
 
     Ok(Booted {

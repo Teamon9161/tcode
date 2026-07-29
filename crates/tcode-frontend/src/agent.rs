@@ -40,6 +40,12 @@ pub struct AgentBuild<'a> {
     /// Pre-connected MCP tools, appended to the toolset and handed to the
     /// `agent` tool so sub-agents inherit them.
     pub mcp_tools: Vec<Arc<dyn Tool>>,
+    /// Tools that only exist because *this* frontend can show their effect —
+    /// today, `show` in the desktop app. They are the main agent's alone and are
+    /// deliberately not handed to the `agent` tool: a sub-agent's work reaches
+    /// the user as a report, so a pane opened from inside one would appear
+    /// beside a conversation that never asked for it.
+    pub display_tools: Vec<Arc<dyn Tool>>,
 }
 
 /// Build the interactive agent. Faithful extraction of the composition root's
@@ -60,6 +66,7 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
         classifier_policy,
         classifier_config,
         mcp_tools,
+        display_tools,
     } = build;
 
     let mut tools = tcode_tools::builtin_tools_with_skills_and_web_fetch(
@@ -76,6 +83,7 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
     tools.push(Arc::new(AskUserTool));
     tools.push(Arc::new(AddNoteTool));
     tools.extend(mcp_tools.iter().cloned());
+    tools.extend(display_tools);
     let agent_tool = AgentTool::new(
         model_cell.clone(),
         config.watchdog.clone(),

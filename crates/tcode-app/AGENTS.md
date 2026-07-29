@@ -70,6 +70,24 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 12. **沙箱拿到的主题值必须是 sRGB**。主题用 OKLCH 写，而沙箱里的第三方库自己解析颜色（mermaid 的 khroma 直接拒绝 `oklch(...)`）。`Sandbox.tsx` 的 `readTheme()` 负责光栅化转换后再发过去——注意只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回。
 
+13. **`show` 出来的文件与模型自己写的正文同级不可信**（`ui/src/Shown.tsx` + `src/commands.rs::shown_file`）。文件是脚本产出的、不是模型手写的，但那不抬高它的信任等级——它同样是观察到的数据。所以 `.html`/`.svg`/`.mmd`/echarts option **必须走规则 11 那同一个 `sandbox="allow-scripts"` 无 same-origin 的 iframe**，不许因为"这是本机文件"改用 asset 协议、`same-origin` 或直接 `location = file://`。图片走后端返回的 `data:` URL（CSP `img-src` 已有 `data:`），因此也不需要任何新协议。
+
+    **路径来自 webview，所以是数据**（规则 3）：`shown_file` 不因为"模型调 show 时已经查过了"就信它，重新过一遍 `tcode_tools::is_viewable_path`——工具与命令共用**同一个** boundary 定义，两处各写一份必然漂移。`VIEWER_TEXT_BUDGET` 同理：工具说"会被截断"和 viewer 真截断，用的是同一个常量。
+
+    **`Inspect` 的 `shown` 是唯一读磁盘的检视值**，与 `Inspector.tsx` 顶上"一切来自 blocks 而非磁盘"刻意相反：其余每一种都在回答"agent 做了什么"，重读文件会把问题换成"现在是什么"；而 `show` 的文件正是为了**不进对话**才写到磁盘的，transcript 里根本没有它的字节。因此陈旧只靠 reload 按钮说清楚，**不要上文件监听**——为一个按钮换一套常驻机制不划算。
+
+    **`ui/src/show.ts` 是 `fences.tsx` 的第二个入口，不是第二张表**：围栏语言与文件扩展名问的是同一个问题，答案重合（mermaid/html/svg/markdown）。分成两套的后果是同一张图内联写和写成文件长得不一样，而 `show` 的全部意义就是"改的只有成本，不是结果"。`.json` 是唯一按内容判定的条目（它是容器不是一种东西），其余在加载任何字节之前就定了。
+
+    **artifact 画在调用点，不自动开窗格**（`toolViews.tsx` 的 `showing.body`）。第一版是调用成功就自己开一个 inspect 窗格，错在没人要求就重排了窗口。现在它和 edit 画 diff 是同一件事：结果就在对话流里，`.shown.is-inline` 只加一个高度上限，**渲染的东西与窗格里一模一样**——两处画得不一样，那个按钮就从放大镜变成了赌博。
+
+14. **"到自己的窗格"只有一个控件：`Transcript.tsx` 的 `PopOut`**。以前是把 summary（那条路径）本身做成 hover 出下划线的按钮，两个毛病：链接语义承诺的是"跳到别处"，而这里其实是**同一个东西、更大**；而且只在指针已经压上去时才出现的控件，没人会主动找到。现在每一条有去处的行——工具调用、exploration 行、sub-agent run——末尾都是同一个图标按钮，语义单一。新增可检视的东西时**用它，别再发明第二种点法**。
+
+15. **模型/preset/模式的选择逻辑不在这里重写**（硬规则 1 的具体一例）。`picker.rs` 只做两件事：把 `tcode-frontend` 的 `ModelMenu`/`PresetMenu` 转成 webview 能画的 JSON，和把选择转回那两个结构自带的闭包。切模型、写 `[tcode_state]`、重建 provider、重建全部 role pin——全在闭包里，TUI 的 `/model` 用的是同一批。**第二份"切模型"实现 = 第二个几乎正确的优先级链**（CLI flag > `[tcode_state]` > preset > config）。
+
+    **模式按会话，模型按进程**：模式是"这个对话可以不问就做什么"，两个文件夹并排开时天然该不同；模型走共享 `ModelCell`，本来就是全窗口一个。模式仍然记进 `[tcode_state]` 当新会话默认——**除了 `unsafe`**，它刻意不粘（一次性放行不得静默武装以后每个会话），这条与 TUI 的 `/mode` 必须一致。
+
+    **turn 跑着时改模式是 stage 不是丢**（`SessionHandle::staged_mode`）：`Session` 被跑 turn 的一方 take 走了（硬规则 4），所以选择存下来、`put_back` 时落地，chip 上显示 `→`。别改成"忙时报错"——那是把所有权约束当成用户的问题。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。
@@ -84,6 +102,7 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。
   - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿；其中 `quiet_output` 真的由 `Tool::batch_policy()` 派生，而 `route` 目前仍是 `commands.rs` 里的名字表，因为 `CallRoute` 住在 `tcode-tui` 而本 crate 不能依赖它——该文件写明了把 `route()` 提升为 core 的 trait 方法才是终局。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
+  - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。表格只把有限行放进 DOM（`ROW_STEP`），不是分页而是上限——20 万行 DOM 就是一个冻住的窗口。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
   - **语法高亮是自己写的**（`syntax.ts`），因为 Shiki/highlight.js 自带调色板是字面值，主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色。它输出语义 class，颜色由 `base.css` 的 `--syn-*` 契约决定。
 - `src/paths.rs`：`canonical_dir`——app 里唯一一处把用户选的文件夹变成键的地方（见硬规则 9）。

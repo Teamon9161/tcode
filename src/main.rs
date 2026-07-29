@@ -405,6 +405,8 @@ async fn main() -> anyhow::Result<()> {
         selection: selection.clone(),
         model_cell: model_cell.clone(),
         agent: cli.agent.clone(),
+        // A terminal has nowhere to put a chart; `show` is the desktop app's.
+        display_tools: Vec::new(),
     })
     .await?;
     for warning in warnings {

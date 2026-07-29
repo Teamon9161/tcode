@@ -7,7 +7,7 @@ use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, Tool
 
 use crate::redact::{marker_error, read_marker};
 
-use super::{rel, write_error, write_with_windows_retry};
+use super::{misdirected_scratch, rel, write_error, write_with_windows_retry};
 
 pub struct WriteTool;
 
@@ -92,6 +92,11 @@ impl Tool for WriteTool {
             return ToolOutput::err(marker_error(kind, "content"));
         }
         let path = ctx.resolve(path_str);
+        // Before the file is created, not after: the whole point is that a
+        // phantom directory tree never comes into existence.
+        if let Some(reason) = misdirected_scratch(&path, ctx) {
+            return ToolOutput::err(reason);
+        }
         // The freshness lock is taken in short scopes rather than held across
         // the IO: a `std::sync::MutexGuard` alive across an `.await` would make
         // this future non-Send, and holding it would serialize a whole

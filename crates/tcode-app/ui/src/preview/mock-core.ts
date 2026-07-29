@@ -52,6 +52,47 @@ const HISTORY: StoredSession[] = [
 
 const OPEN: SessionInfo[] = [];
 
+/** Mirrors `picker::MODES`; the wording is the product's, so the preview has to
+ *  show the real strings rather than placeholders. */
+const MODES = [
+  { key: "default", label: "Ask first", detail: "Rules decide; anything else asks you." },
+  {
+    key: "accept-edits",
+    label: "Accept edits",
+    detail: "File edits go through; commands still ask.",
+  },
+  {
+    key: "auto",
+    label: "Auto",
+    detail: "Runs without prompting; a safety classifier reviews the rest.",
+  },
+  {
+    key: "unsafe",
+    label: "Bypass permissions",
+    detail: "Nothing asks. Deny rules still apply. For isolated environments.",
+  },
+];
+
+/** What `show` panes read. Keyed by extension so one fixture covers the whole
+ *  registry in `show.ts` — the preview's job is to make every rendered form
+ *  visible without a script having to produce one first. */
+const SHOWN: Record<string, string> = {
+  csv: [
+    "date,bond,ytm,net_basis",
+    "2026-07-20,240215.IB,1.6725,0.0412",
+    "2026-07-21,240215.IB,1.6690,0.0388",
+    '2026-07-22,"CDB, 10Y",1.7415,0.0501',
+    "2026-07-23,240215.IB,1.6712,0.0367",
+  ].join("\n"),
+  json: JSON.stringify({
+    xAxis: { type: "category", data: ["Mar", "Apr", "May", "Jun", "Jul"] },
+    yAxis: { type: "value" },
+    series: [{ type: "line", data: [12, 8, 19, 15, 24], smooth: true }],
+  }),
+  md: "# Carry report\n\nThe 10Y **outperformed** the futures leg by 4bp.\n",
+  html: "<h2 style='font-family:sans-serif'>rendered artifact</h2>",
+};
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
     case "launchpad":
@@ -70,6 +111,35 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
         },
         history: [],
       } satisfies OpenedSession as T;
+    // The composer strip. Deliberately not the careful default: the amber mode
+    // chip and a model with an effort dial are the states worth looking at.
+    case "picker_state":
+      return {
+        models: [
+          { profile: "anthropic", label: "Opus 5", efforts: ["low", "medium", "high"] },
+          { profile: "anthropic", label: "Sonnet 5", efforts: ["low", "medium", "high"] },
+          { profile: "openai", label: "gpt-5.1-codex", efforts: ["medium", "high"] },
+        ],
+        model: 0,
+        effort: "high",
+        presets: [
+          { key: "quant", label: "quant" },
+          { key: "cheap", label: "cheap" },
+        ],
+        preset: 0,
+        modes: MODES,
+        mode: "accept-edits",
+        mode_staged: false,
+      } as T;
+    case "choose_model":
+    case "choose_preset":
+    case "choose_mode":
+      return undefined as T;
+    case "shown_file": {
+      const path = String(args?.path ?? "");
+      const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "no fixture for this file";
+      return { body, bytes: body.length, truncated: false } as T;
+    }
     default:
       return undefined as T;
   }

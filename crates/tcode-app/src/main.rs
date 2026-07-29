@@ -38,6 +38,11 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::open_folder,
             tcode_app::commands::close_session,
             tcode_app::commands::tool_views,
+            tcode_app::commands::shown_file,
+            tcode_app::commands::picker_state,
+            tcode_app::commands::choose_model,
+            tcode_app::commands::choose_preset,
+            tcode_app::commands::choose_mode,
         ])
         .run(tauri::generate_context!())
         .context("the desktop app exited with an error")

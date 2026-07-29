@@ -1198,3 +1198,85 @@ fn append_permission_is_an_edit() {
     assert_eq!(descriptor, "append(a.txt)");
     assert!(is_edit, "append must auto-allow in accept-edits mode");
 }
+
+/// The field failure this guard exists for: a `<project-id>` segment with one
+/// character wrong. `write` used to create the phantom tree and report success,
+/// and nothing noticed until a later call could not find the file.
+#[tokio::test]
+async fn a_write_into_another_conversations_scratch_directory_is_refused() {
+    let home = tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::for_test(cwd.path().to_path_buf(), 25_000);
+
+    let wrong = home
+        .join(".tcode")
+        .join("projects")
+        .join("c--code-rust-tcode-app")
+        .join("scratchpad")
+        .join("runs")
+        .join("0019fae9d88ba")
+        .join("show-demo.svg");
+
+    let out = WriteTool
+        .run(
+            json!({ "path": wrong.to_string_lossy(), "content": "<svg/>" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(out.is_error, "{}", out.content);
+    // Self-healing: it names the directory that was meant.
+    assert!(
+        out.content.contains(&ctx.scratch_dir.display().to_string()),
+        "{}",
+        out.content
+    );
+    assert!(!wrong.exists(), "the phantom tree must never be created");
+}
+
+#[tokio::test]
+async fn this_conversations_own_scratch_directory_is_still_writable() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::for_test(cwd.path().to_path_buf(), 25_000);
+    let mine = ctx.scratch_dir.join("chart.html");
+
+    let out = WriteTool
+        .run(
+            json!({ "path": mine.to_string_lossy(), "content": "<p>hi</p>" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(mine.exists());
+}
+
+/// Auto-memory legitimately writes under a *different* project id than the
+/// session's, because memory keys on the project root while a session keys on
+/// its cwd. Anchoring the check on `scratchpad` is what keeps that working.
+#[tokio::test]
+async fn a_memory_file_under_another_project_id_is_not_caught_by_the_guard() {
+    let home = tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let ctx = ToolCtx::for_test(cwd.path().to_path_buf(), 25_000);
+
+    let memory = home
+        .join(".tcode")
+        .join("projects")
+        .join("c--code-rust-tcode")
+        .join("memory")
+        .join("a-fact.md");
+
+    let out = WriteTool
+        .run(
+            json!({ "path": memory.to_string_lossy(), "content": "note" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+
+    assert!(!out.is_error, "{}", out.content);
+}

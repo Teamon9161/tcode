@@ -28,6 +28,12 @@ pub struct SessionHandle {
     session: Mutex<Option<Session>>,
     cancel: Mutex<CancellationToken>,
     pending: Pending,
+    /// A permission mode chosen while a turn held the session, applied when it
+    /// comes back. The mode belongs to the `Session`, and the running turn owns
+    /// that — so the choice is staged rather than dropped or forced. The TUI
+    /// stages the same way and shows it as `→ auto`; this is that, without the
+    /// mid-batch commit, because nothing here can reach into a running turn.
+    staged_mode: Mutex<Option<tcode_core::PermissionMode>>,
 }
 
 /// A turn could not start.
@@ -47,6 +53,38 @@ impl SessionHandle {
             session: Mutex::new(Some(session)),
             cancel: Mutex::new(CancellationToken::new()),
             pending: Pending::default(),
+            staged_mode: Mutex::new(None),
+        }
+    }
+
+    /// The mode this conversation is under, and whether it is still waiting for
+    /// the turn to end. Both, because "auto" and "auto as soon as this finishes"
+    /// are different facts and a chip that shows only the first is a lie during
+    /// the exact window where it matters.
+    pub fn mode(&self) -> (tcode_core::PermissionMode, bool) {
+        if let Some(staged) = *self.staged_mode.lock().unwrap() {
+            return (staged, true);
+        }
+        let live = self
+            .session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.mode)
+            .unwrap_or_default();
+        (live, false)
+    }
+
+    /// Choose the permission mode. Applies now when the session is idle, and is
+    /// staged when a turn holds it.
+    pub fn set_mode(&self, mode: tcode_core::PermissionMode) {
+        let mut session = self.session.lock().unwrap();
+        match session.as_mut() {
+            Some(session) => {
+                session.mode = mode;
+                *self.staged_mode.lock().unwrap() = None;
+            }
+            None => *self.staged_mode.lock().unwrap() = Some(mode),
         }
     }
 
@@ -95,7 +133,12 @@ impl SessionHandle {
         self.session.lock().unwrap().take()
     }
 
-    fn put_back(&self, session: Session) {
+    fn put_back(&self, mut session: Session) {
+        // A mode chosen mid-turn lands here, at the first moment this side owns
+        // the session again.
+        if let Some(staged) = self.staged_mode.lock().unwrap().take() {
+            session.mode = staged;
+        }
         *self.session.lock().unwrap() = Some(session);
     }
 }
@@ -104,6 +147,11 @@ impl SessionHandle {
 pub struct Supervisor {
     agent: Arc<Agent>,
     factory: SessionFactory,
+    /// The model/preset menus the composer's chips read and write. Process-wide
+    /// rather than per-session: they act on the shared `ModelCell` and on the
+    /// selected config file, both of which every conversation in this window
+    /// already shares.
+    menus: crate::picker::Menus,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     /// Insertion order, so the session rail does not reshuffle on every read.
     /// A `HashMap` alone would hand the UI a different order each time.
@@ -111,10 +159,15 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(agent: Arc<Agent>, factory: SessionFactory) -> Self {
+    pub fn new(
+        agent: Arc<Agent>,
+        factory: SessionFactory,
+        menus: crate::picker::Menus,
+    ) -> Self {
         Self {
             agent,
             factory,
+            menus,
             sessions: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
         }
@@ -122,6 +175,10 @@ impl Supervisor {
 
     pub fn agent(&self) -> Arc<Agent> {
         self.agent.clone()
+    }
+
+    pub fn menus(&self) -> crate::picker::Menus {
+        self.menus.clone()
     }
 
     pub fn open(&self, handle: Arc<SessionHandle>) {

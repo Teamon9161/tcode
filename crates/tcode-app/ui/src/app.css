@@ -1173,31 +1173,16 @@
   font-size: var(--text-2xs);
 }
 
-.exploration-summary,
-.exploration-target {
+.exploration-summary {
   flex: 1;
   min-width: 0;
+  color: var(--body);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: left;
-}
-.exploration-target {
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--body);
-  cursor: pointer;
-  text-decoration: underline;
-  text-decoration-color: transparent;
-  text-underline-offset: 3px;
-  transition: color var(--dur-fast) var(--ease), text-decoration-color var(--dur-fast) var(--ease);
-}
-.exploration-target:hover {
-  color: var(--brand-text);
-  text-decoration-color: currentColor;
 }
 
 /* ---- one trace row, for every kind of step ---- */
@@ -1299,10 +1284,10 @@
   font-size: var(--text-xs);
 }
 
-.tool-summary,
-.tool-target {
+.tool-summary {
   flex: 1;
   min-width: 0;
+  color: var(--muted);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   white-space: nowrap;
@@ -1310,24 +1295,38 @@
   text-overflow: ellipsis;
   text-align: left;
 }
-.tool-summary {
-  color: var(--muted);
-}
-.tool-target {
+
+/* One control, one meaning: "the same thing, in its own pane". It replaced a
+   summary that was itself a link — a hover-only affordance promising navigation
+   for what is really a magnifier. Dim until the row is hovered or it is
+   focused, so a column of steps is not a column of buttons. */
+.pop-out {
+  flex: none;
+  display: inline-grid;
+  place-items: center;
+  width: var(--s-5);
+  height: var(--s-5);
   padding: 0;
   border: 0;
+  border-radius: var(--r-sm);
   background: none;
-  color: var(--body);
+  color: var(--faint);
   cursor: pointer;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  text-decoration-color: transparent;
-  transition: color var(--dur-fast) var(--ease),
-    text-decoration-color var(--dur-fast) var(--ease);
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
 }
-.tool-target:hover {
-  color: var(--brand-text);
-  text-decoration-color: currentColor;
+.tool:hover .pop-out,
+.exploration-item:hover .pop-out,
+.run-head:hover .pop-out,
+.pop-out:focus-visible {
+  opacity: 1;
+}
+.pop-out:hover {
+  background: var(--hover);
+  color: var(--ink);
 }
 
 .tool-expand {
@@ -1637,6 +1636,222 @@
   display: flex;
   flex-direction: column;
   gap: var(--s-3);
+}
+
+/* ============================================================ composer chips */
+
+/* The strip under the input. Reads as a caption line, not a toolbar: the labels
+   are the controls, at the smallest size the theme has, with the model side
+   pushed right the way a status line reads. */
+.chips {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: var(--s-1) var(--s-1) 0;
+  min-height: var(--s-6);
+}
+.chips-gap {
+  flex: 1;
+}
+.chips-note {
+  padding: var(--s-1) var(--s-2);
+  color: var(--danger-text);
+  font-size: var(--text-2xs);
+}
+
+.chip-box {
+  position: relative;
+}
+
+.chip {
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  white-space: nowrap;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.chip:hover,
+.chip[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--ink);
+}
+/* The model side recedes: it is what you are running on, not a decision you are
+   making right now. */
+.chip.is-quiet {
+  color: var(--muted);
+}
+
+/* Chroma only when the mode is not the careful default — a permission state you
+   would not have assumed is the one thing on this strip worth a colour. */
+.chip.is-accept-edits,
+.chip.is-auto {
+  background: var(--amber-wash);
+  color: var(--amber-text);
+}
+.chip.is-unsafe {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.chip-menu {
+  position: absolute;
+  bottom: calc(100% + var(--s-1));
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 13rem;
+  max-height: 20rem;
+  overflow-y: auto;
+  padding: var(--s-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: var(--shadow-lift);
+}
+.chip-menu.is-left {
+  left: 0;
+}
+.chip-menu.is-right {
+  right: 0;
+}
+
+.chip-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.chip-item:hover {
+  background: var(--hover);
+}
+.chip-item-label {
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.chip-item.is-current .chip-item-label {
+  font-weight: var(--weight-medium);
+}
+/* The current row is marked by a dot in the gutter rather than a checkmark
+   glyph on the right, so the labels stay on one axis. */
+.chip-item.is-current .chip-item-label::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: var(--s-2);
+  border-radius: 50%;
+  background: var(--brand);
+  vertical-align: middle;
+}
+.chip-item-detail {
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+/* ============================================================ shown files */
+
+/* A file the model put on screen. Its header carries the two things a view of
+   live disk owes the reader that a transcript snapshot does not: which file, and
+   a way to look again. */
+.shown {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+}
+.shown-bar {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+.shown-bar .inspect-path {
+  margin-bottom: 0;
+  min-width: 0;
+}
+
+.shown-clipped {
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+/* At the call site the artifact is part of the reading flow, so it takes a
+   bounded slice of the column and scrolls inside it. The pop-out button on the
+   row above is the way to the full-height version — one component, two
+   framings, never two renderings. */
+.shown.is-inline {
+  gap: var(--s-2);
+  max-height: 22rem;
+  overflow: auto;
+}
+.shown.is-inline .shown-bar {
+  justify-content: flex-end;
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--bg);
+}
+
+.shown-image {
+  max-width: 100%;
+  height: auto;
+  border-radius: var(--r-sm);
+}
+
+/* The table scrolls inside itself. A wide export must never widen the pane —
+   the conversation beside it would reflow every time a column arrived. */
+.shown-table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+}
+.shown-table {
+  border-collapse: collapse;
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.shown-table th,
+.shown-table td {
+  padding: var(--s-1) var(--s-3) var(--s-1) 0;
+  text-align: left;
+  white-space: nowrap;
+}
+.shown-table th {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-weight: var(--weight-medium);
+}
+.shown-table td {
+  color: var(--body);
+}
+/* No zebra striping and no row borders: the rhythm is doing the separating, and
+   a rule under every row turns a table into a grid of boxes. */
+.shown-table tbody tr:hover td {
+  background: var(--sunken);
+}
+
+.shown-more {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+  padding-top: var(--s-2);
+  color: var(--faint);
+  font-size: var(--text-xs);
 }
 
 /* ============================================================ file index */
@@ -2502,27 +2717,13 @@
 .run-title {
   flex: none;
   max-width: 60%;
-  padding: 0;
-  border: 0;
-  background: none;
   color: var(--ink);
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   text-align: left;
-  cursor: pointer;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  text-decoration: underline;
-  text-underline-offset: 3px;
-  text-decoration-color: transparent;
-  transition:
-    color var(--dur-fast) var(--ease),
-    text-decoration-color var(--dur-fast) var(--ease);
-}
-.run-title:hover {
-  color: var(--brand-text);
-  text-decoration-color: currentColor;
 }
 
 .run-meta {

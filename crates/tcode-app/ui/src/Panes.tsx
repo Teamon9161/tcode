@@ -1,7 +1,7 @@
 import { useMemo, useRef, type CSSProperties, type RefObject } from "react";
 
 import type { Decision, SessionInfo, Status } from "./types";
-import type { SessionState } from "./session";
+import { SessionContext, type SessionState } from "./session";
 import {
   canBack,
   canForward,
@@ -188,11 +188,17 @@ function Pane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
       data-pane={leaf.id}
       onPointerDownCapture={() => context.onFocus(leaf.id)}
     >
-      {leaf.pane.kind === "session" ? (
-        <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
-      ) : (
-        <InspectPane leaf={leaf} context={context} />
-      )}
+      {/* A pane is where "which conversation" is answered, so it is where the
+          answer is published. Leaves that need it — a `show` artifact loading
+          its file — read it from here instead of having it threaded through
+          every layer of the transcript. */}
+      <SessionContext.Provider value={leaf.pane.session}>
+        {leaf.pane.kind === "session" ? (
+          <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
+        ) : (
+          <InspectPane leaf={leaf} context={context} />
+        )}
+      </SessionContext.Provider>
     </section>
   );
 }

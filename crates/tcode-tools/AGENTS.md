@@ -10,6 +10,9 @@
 - 自愈式错误的匹配回退（`edit` 的 punct/ws 归一化）跑在失败路径上，仍要控复杂度：行 key 每行只算一次，别在滑窗里重算（分配级 O(n·m)）。
 - **shell/bash 的静默非零退出要自报名字解析**（`shell.rs::resolution_hint`）：两条管道都空 + 非零退出时，模型分不出"解释器是个假货"和"命令真失败"，只能换 shell 盲试——而 harness 知道答案。三条不可省：① 解析必须**在同一 interpreter 里**跑（Git Bash 先搜 `/usr/bin`，Rust 侧走 Windows PATH 会自信地报错误的 binary）；② 名字经**环境变量**传给探针，不拼进脚本——它们出自模型写的命令，插值等于给诊断路径开注入；③ **只在有异常项（解析不到 / 落在 `Microsoft/WindowsApps` 这种 app-execution alias 假货目录）时才吐整张表**，因为 `grep -q`、`test`、`git diff --quiet` 天生静默非零且在批次里极常见，无条件标注就是纯噪音。
 
+- **只有某个前端做得到的工具不进 `builtin_tools()`**：`ShowTool` 由能画的那个前端在 composition root 里注册（`BootSpec::display_tools`），终端与 ACP 传空。理由是零猜测原则——一个全部效果就是"窗格里出现一样东西"的工具，在没有窗格的前端里等于告诉模型它有一项其实没有的能力。新增这类工具照此办理，别为图省事塞进 `builtin_tools()` 再在描述里写"如果你的前端支持的话"。
+- **`show` 的返回值里永远不许出现文件内容**：它存在的全部理由就是让数据绕开对话（一个 50 万行的表和一个空表花一样的 token）。返回一行"路径 + 类型 + 大小"即可，读文件是前端的事。
+
 ## read / grep 的返回内容
 
 - **改动了返回内容就必须三条齐全**（`redact.rs` + `fs/mod.rs::clip`）：① 标记自释（`…[+N chars]` / `[redacted: N chars, starts "…"]`，不许退回裸 `…`）；② `write`/`edit` 用同一个 `read_marker` 拒绝带标记的写回——freshness 只认行范围、认不出行内截断，模型照 context 重写就把标记写进文件；③ 错误与尾注说清怎么拿原文。

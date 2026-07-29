@@ -9,6 +9,7 @@ import { relativeTo, type TouchedFile } from "./files";
 import { FilesView } from "./FilePanel";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
+import { ShownView } from "./Shown";
 import { BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
 
@@ -23,7 +24,10 @@ import { displayToolOutput } from "./toolViews";
  *
  * Everything here reads from blocks rather than from disk. A review surface
  * that re-read the file would answer a different question than the one being
- * asked — what the agent did, not what happens to be there now.
+ * asked — what the agent did, not what happens to be there now. The single
+ * exception is `shown`, and it is one for the opposite reason: that file was
+ * written by a script so it would *not* have to pass through the conversation,
+ * so the transcript has nothing to draw (see `Shown.tsx`).
  *
  * The frame around it — header, history buttons, close — belongs to
  * `Panes.tsx`, because it is the same frame every pane wears.
@@ -54,6 +58,8 @@ export function InspectView({
       return <RunView run={value.run} blocks={blocks} onOpen={onOpen} />;
     case "artifact":
       return <Sandbox kind={value.sandbox} source={value.source} label={value.label} />;
+    case "shown":
+      return <ShownView value={value} cwd={cwd} />;
     case "doc":
       return <div className="doc">{rich(value.text)}</div>;
   }

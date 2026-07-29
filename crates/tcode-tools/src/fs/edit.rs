@@ -9,7 +9,9 @@ use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, Tool
 
 use crate::redact::{marker_error, read_marker};
 
-use super::{not_found_help, numbered, rel, write_error, write_with_windows_retry};
+use super::{
+    misdirected_scratch, not_found_help, numbered, rel, write_error, write_with_windows_retry,
+};
 
 pub struct EditTool;
 
@@ -140,6 +142,9 @@ impl Tool for EditTool {
             return ToolOutput::err("target_line cannot be combined with replace_all=true");
         }
         let path = ctx.resolve(path_str);
+        if let Some(reason) = misdirected_scratch(&path, ctx) {
+            return ToolOutput::err(reason);
+        }
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {

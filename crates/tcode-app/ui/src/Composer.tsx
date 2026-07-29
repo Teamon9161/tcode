@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { imagesFrom, isImagePaste, type Pasted } from "./paste";
+import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
 
 /**
@@ -174,6 +175,10 @@ export function Composer({
           </button>
         )}
       </div>
+
+      {/* Under the field, not above it and not in a settings screen: these are
+          properties of the message about to be sent. */}
+      <Chips />
     </form>
   );
 }

@@ -5,7 +5,7 @@ import type { Inspect } from "./inspect";
 import { rich } from "./rich";
 import { readChanges } from "./diff";
 import { useToolMeta, viewFor, displayToolOutput, displayToolSummary, transcriptGroupFor } from "./toolViews";
-import { ChevronDown, ChevronRight } from "./components/Icons";
+import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
 import { StatusDot } from "./components/Status";
 
 /**
@@ -341,15 +341,29 @@ function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: 
   return (
     <div className={`exploration-item${failed ? " is-failed" : ""}`}>
       <span className="exploration-tool">{block.name}</span>
-      {target ? (
-        <button className="exploration-target" onClick={() => onOpen(target)} title="Open in the panel">
-          {summary || "details"}
-        </button>
-      ) : (
-        <span className="exploration-summary">{summary || "details"}</span>
-      )}
+      <span className="exploration-summary">{summary || "details"}</span>
       {failed && <span className="tool-failed">failed</span>}
+      {target && <PopOut onOpen={() => onOpen(target)} />}
     </div>
+  );
+}
+
+/**
+ * "Give this its own pane."
+ *
+ * One affordance, in one place, on every row that has somewhere to go. What it
+ * replaces was the summary itself: the path was a button that underlined on
+ * hover and moved the thing you were reading into a pane at the side. Two
+ * problems with that, and the second is the real one — a link is a promise of
+ * navigation, but the target here is *the same content, bigger*, and a control
+ * that only appears when the pointer is already on it is a control nobody finds
+ * on purpose. A magnifier at the end of the row says what it does and stays put.
+ */
+function PopOut({ onOpen }: { onOpen: () => void }) {
+  return (
+    <button className="pop-out" onClick={onOpen} title="Open in its own pane" aria-label="Open in its own pane">
+      <PanelIcon size={12} />
+    </button>
   );
 }
 
@@ -405,22 +419,13 @@ function ToolCall({
             <span className="tool-separator" aria-hidden>
               ·
             </span>
-            {target ? (
-              <button
-                className="tool-target"
-                onClick={() => onOpen(target)}
-                title="Open in the panel"
-              >
-                {summary}
-              </button>
-            ) : (
-              <span className="tool-summary">{summary}</span>
-            )}
+            <span className="tool-summary">{summary}</span>
           </>
         )}
 
         {!done && <span className="tool-spinner" aria-label="running" />}
         {failed && <span className="tool-failed">failed</span>}
+        {target && <PopOut onOpen={() => onOpen(target)} />}
         {canExpand && (
           <button
             className="tool-expand"
@@ -492,19 +497,14 @@ function RunCall({
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
         <StatusDot status={state} />
-        <button
-          className="run-title"
-          onClick={() => onOpen({ kind: "run", run: block.run })}
-          title="Open this run in the panel"
-        >
-          {block.meta.summary || block.meta.kind}
-        </button>
+        <span className="run-title">{block.meta.summary || block.meta.kind}</span>
         <span className="run-meta">
           {block.meta.kind}
           {block.meta.model && ` · ${block.meta.model}`}
           {block.meta.toolCalls !== undefined &&
             ` · ${block.meta.toolCalls} call${block.meta.toolCalls === 1 ? "" : "s"}`}
         </span>
+        <PopOut onOpen={() => onOpen({ kind: "run", run: block.run })} />
       </div>
       {open && (
         <div className="run-body">

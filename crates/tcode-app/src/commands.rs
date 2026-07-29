@@ -323,6 +323,197 @@ fn save_pasted(
     Ok(path)
 }
 
+/// One file, loaded for an inspect pane opened by `show`.
+///
+/// `body` is whatever the caller asked for: the file's text, or a `data:` URL
+/// when it asked for one. Which of the two a given file needs is the frontend's
+/// single extension table (`ui/src/show.ts`) — duplicating that judgement here
+/// would be a second table to keep in step with the first, so this command
+/// stays a byte server and takes the answer as an argument.
+#[derive(Serialize, Debug)]
+pub struct ShownFile {
+    pub body: String,
+    /// The file's real size, so a truncated view can say what it is a prefix of.
+    pub bytes: u64,
+    /// True when `body` stops short of the file.
+    pub truncated: bool,
+}
+
+/// An image has to arrive whole to be an image, so it gets a larger allowance
+/// than text — but not an unbounded one: the `data:` URL is base64 and lands in
+/// the webview's memory in one piece.
+const VIEWER_IMAGE_BUDGET: u64 = 4 * tcode_tools::VIEWER_TEXT_BUDGET;
+
+/// Load a file for a `show` pane.
+///
+/// The path arrives from the webview, so it is data (AGENTS.md rule 3): it is
+/// re-checked against the session's own folder here rather than trusted because
+/// the tool checked it earlier. The two share one definition of the boundary
+/// (`tcode_tools::is_viewable_path`) so they cannot drift into disagreeing.
+#[tauri::command]
+pub fn shown_file(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+    binary: bool,
+) -> Result<ShownFile, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    load_shown(Path::new(&path), &handle.cwd, binary)
+}
+
+/// The command's whole body, reachable without a window (AGENTS.md rule 2).
+pub fn load_shown(path: &Path, cwd: &Path, as_data_url: bool) -> Result<ShownFile, String> {
+    let file = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    tcode_tools::is_viewable_path(&file, cwd)?;
+
+    let bytes = std::fs::metadata(&file)
+        .map_err(|error| format!("cannot read {}: {error}", file.display()))?
+        .len();
+    let budget = if as_data_url {
+        VIEWER_IMAGE_BUDGET
+    } else {
+        tcode_tools::VIEWER_TEXT_BUDGET
+    };
+    if as_data_url && bytes > budget {
+        return Err(format!(
+            "{} is {bytes} bytes — too large to display as an image",
+            file.display()
+        ));
+    }
+
+    let raw =
+        std::fs::read(&file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    if as_data_url {
+        return Ok(ShownFile {
+            body: format!(
+                "data:{};base64,{}",
+                media_type(&file),
+                {
+                    use base64::Engine as _;
+                    base64::engine::general_purpose::STANDARD.encode(&raw)
+                }
+            ),
+            bytes,
+            truncated: false,
+        });
+    }
+
+    let truncated = raw.len() as u64 > budget;
+    let body = if truncated {
+        // Cut on a line, not mid-row: a table whose last row is half a line
+        // reads as data that is wrong rather than data that is incomplete.
+        let clipped = &raw[..budget as usize];
+        let cut = clipped
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|at| at + 1)
+            .unwrap_or(clipped.len());
+        String::from_utf8_lossy(&clipped[..cut]).into_owned()
+    } else {
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+    Ok(ShownFile {
+        body,
+        bytes,
+        truncated,
+    })
+}
+
+fn media_type(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .map(|extension| extension.to_string_lossy().to_lowercase())
+        .unwrap_or_default()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        _ => "image/png",
+    }
+}
+
+// ---------------------------------------------------------------- pickers
+//
+// Thin, like everything here: the menus and their apply-closures come from
+// `tcode-frontend` and live in `crate::picker`.
+
+/// Everything the composer's chips show. Read together because a preset moves
+/// the model, which moves the effort — three commands would let the strip
+/// render a state that never existed.
+#[tauri::command]
+pub fn picker_state(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+) -> Result<crate::picker::PickerState, String> {
+    let (mode, staged) = match supervisor.get(&session) {
+        Some(handle) => handle.mode(),
+        // The launchpad has no session yet and still wants the model chip.
+        None => (tcode_core::PermissionMode::default(), false),
+    };
+    let menus = supervisor.menus();
+    let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    Ok(crate::picker::state_of(&menus, mode, staged))
+}
+
+#[tauri::command]
+pub fn choose_model(
+    supervisor: State<'_, Arc<Supervisor>>,
+    index: usize,
+    effort: Option<String>,
+) -> Result<(), String> {
+    let menus = supervisor.menus();
+    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    crate::picker::choose_model(&mut menus, index, effort.as_deref())
+}
+
+#[tauri::command]
+pub fn choose_preset(
+    supervisor: State<'_, Arc<Supervisor>>,
+    key: String,
+) -> Result<String, String> {
+    let menus = supervisor.menus();
+    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    crate::picker::choose_preset(&mut menus, &key)
+}
+
+/// Choose the permission mode for one conversation.
+///
+/// Per session, unlike the model: the mode is what *this* conversation is
+/// allowed to do without asking, and two folders open side by side routinely
+/// deserve different answers. It is still remembered as the default for new
+/// sessions, which is the part `[tcode_state]` holds.
+#[tauri::command]
+pub fn choose_mode(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    mode: String,
+) -> Result<(), String> {
+    // From the webview, so it is data (AGENTS.md rule 3): an unrecognized mode
+    // is refused, never coerced into the most permissive thing it resembles.
+    let chosen = crate::picker::mode_from_key(&mode)
+        .ok_or_else(|| format!("'{mode}' is not a permission mode"))?;
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    handle.set_mode(chosen);
+    let menus = supervisor.menus();
+    let config_file = {
+        let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+        menus.config_file.clone()
+    };
+    crate::picker::remember_mode(&config_file, chosen);
+    Ok(())
+}
+
 /// Answer an approval the agent is parked on.
 #[tauri::command]
 pub fn respond_approval(
@@ -398,6 +589,53 @@ mod tests {
             panic!("expected a note");
         };
         assert!(text.contains("could not be saved"), "{text}");
+    }
+
+    #[test]
+    fn a_shown_text_file_arrives_whole_when_it_fits() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("t.csv"), "a,b\n1,2\n").unwrap();
+        let file = load_shown(Path::new("t.csv"), dir.path(), false).unwrap();
+        assert_eq!(file.body, "a,b\n1,2\n");
+        assert!(!file.truncated);
+    }
+
+    /// A prefix must end where a row ends, or the last line of a table is a
+    /// row that was never in the data.
+    #[test]
+    fn a_truncated_text_file_stops_on_a_line_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let row = "0123456789012345678901234567890123456789012345678901234567890,x\n";
+        let rows = row.repeat((tcode_tools::VIEWER_TEXT_BUDGET as usize / row.len()) + 64);
+        std::fs::write(dir.path().join("big.csv"), &rows).unwrap();
+
+        let file = load_shown(Path::new("big.csv"), dir.path(), false).unwrap();
+        assert!(file.truncated);
+        assert_eq!(file.bytes, rows.len() as u64);
+        assert!(file.body.ends_with('\n'), "cut mid-row");
+        assert!((file.body.len() as u64) <= tcode_tools::VIEWER_TEXT_BUDGET);
+    }
+
+    #[test]
+    fn an_image_comes_back_as_a_data_url_with_its_own_media_type() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("p.jpg"), b"hi").unwrap();
+        let file = load_shown(Path::new("p.jpg"), dir.path(), true).unwrap();
+        assert_eq!(file.body, "data:image/jpeg;base64,aGk=");
+    }
+
+    /// The webview's path is data, not authority: the boundary is re-checked
+    /// here even though the tool checked it when the model called `show`.
+    #[test]
+    fn a_path_outside_the_session_folder_is_refused_at_the_command_too() {
+        tcode_core::home::testing::temp_home();
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let outside = elsewhere.path().join("secret.txt");
+        std::fs::write(&outside, "s").unwrap();
+
+        let refused = load_shown(&outside, dir.path(), false).unwrap_err();
+        assert!(refused.contains("outside"), "{refused}");
     }
 
     #[test]

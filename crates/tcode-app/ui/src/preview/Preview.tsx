@@ -347,7 +347,15 @@ const OTHER_BLOCKS: Block[] = [
   },
 ];
 
-const SCENES = ["launchpad", "session", "approval", "question", "split", "empty"] as const;
+const SCENES = [
+  "launchpad",
+  "session",
+  "approval",
+  "question",
+  "split",
+  "shown",
+  "empty",
+] as const;
 type Scene = (typeof SCENES)[number];
 
 /** One conversation, filling the window. */
@@ -362,6 +370,18 @@ function tiled(): Tiling {
   return openInspect(two, panes(two)[0].id, "a", { kind: "diff", callId: "t2" });
 }
 
+/** A conversation with a file the model put on screen beside it — the state
+ *  `show` produces, which is otherwise reachable only by running a script that
+ *  writes one. The fixture bodies live in `mock-core.ts`. */
+function showing(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", {
+    kind: "shown",
+    path: "/home/teamon/code/py/duck_ext/out/carry.csv",
+    label: "Carry by tenor",
+  });
+}
+
 export function Preview() {
   const [scene, setScene] = useState<Scene>("launchpad");
   const [tiling, setTiling] = useState<Tiling>(solo);
@@ -370,7 +390,7 @@ export function Preview() {
 
   const pick = (name: Scene) => {
     setScene(name);
-    setTiling(name === "split" ? tiled() : solo());
+    setTiling(name === "split" ? tiled() : name === "shown" ? showing() : solo());
   };
 
   const stateOf = (id: string): SessionState =>

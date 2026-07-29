@@ -195,6 +195,17 @@ fn session(cwd: PathBuf) -> Session {
 /// A factory these tests never call `open` on: they hand the supervisor
 /// sessions directly. It exists so `Supervisor` can hold one unconditionally
 /// rather than an `Option` that production code would have to branch on.
+/// This test is about event isolation, not model switching, so the menus are
+/// the "nothing configured" ones — a real state, not a stub.
+fn menus() -> tcode_app::picker::Menus {
+    Arc::new(std::sync::Mutex::new(
+        tcode_app::picker::Pickers::unavailable(
+            PathBuf::from("/nonexistent/config.toml"),
+            "no provider is configured",
+        ),
+    ))
+}
+
 fn factory() -> tcode_app::boot::SessionFactory {
     tcode_app::boot::SessionFactory::new(
         PathBuf::from("/nonexistent/config.toml"),
@@ -364,7 +375,7 @@ async fn concurrent_sessions_never_cross_streams() {
 
     let agent_one = agent(MockProvider::new(vec![text_done("from one")]), one.path());
     let agent_two = agent(MockProvider::new(vec![text_done("from two")]), two.path());
-    let supervisor = Supervisor::new(agent_one.clone(), factory());
+    let supervisor = Supervisor::new(agent_one.clone(), factory(), menus());
     let handle_one = handle("s1", one.path().to_path_buf());
     let handle_two = handle("s2", two.path().to_path_buf());
     supervisor.open(handle_one.clone());

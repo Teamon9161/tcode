@@ -4640,3 +4640,86 @@ async fn approving_a_plan_in_this_session_keeps_the_turn_going() {
     assert!(results[1].0.contains("cleared to execute"), "{results:?}");
     assert!(results[2].0.contains("Now starting"), "{results:?}");
 }
+
+/// Four new files in one batch, the shape a model uses to lay out an example
+/// set. Reported from the field as "four successes, one file on disk"; this
+/// pins the whole path — distinct lanes, distinct writes, every one durable —
+/// so a regression there is a failing test rather than a lost afternoon.
+#[tokio::test]
+async fn four_new_files_written_in_one_batch_all_reach_disk() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "write",
+                r#"{"path":"demo.html","content":"<p>hi</p>\n"}"#,
+            ),
+            ("t2", "write", r#"{"path":"demo.svg","content":"<svg/>\n"}"#),
+            ("t3", "write", r##"{"path":"demo.md","content":"# hi\n"}"##),
+            (
+                "t4",
+                "write",
+                r#"{"path":"demo.csv","content":"a,b\n1,2\n"}"#,
+            ),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    session.checkpoints = tcode_core::CheckpointStore::new(dir.path().join(".ckpts"));
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "write four example files").await;
+
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 4);
+    for (content, is_error) in &results {
+        assert!(!is_error, "{content}");
+    }
+    for (name, expected) in [
+        ("demo.html", "<p>hi</p>\n"),
+        ("demo.svg", "<svg/>\n"),
+        ("demo.md", "# hi\n"),
+        ("demo.csv", "a,b\n1,2\n"),
+    ] {
+        let path = dir.path().join(name);
+        assert!(path.exists(), "{name} reported success but is not on disk");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected, "{name}");
+    }
+}
+
+/// The same batch when the files already exist. `write` refuses to overwrite
+/// what was never read, so this is the shape that produces *errors*, not
+/// silence — the distinction the field report could not make from the outside.
+#[tokio::test]
+async fn rewriting_existing_files_in_a_batch_refuses_loudly_rather_than_silently() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["demo.html", "demo.svg"] {
+        std::fs::write(dir.path().join(name), "old\n").unwrap();
+    }
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            ("t1", "write", r#"{"path":"demo.html","content":"new\n"}"#),
+            ("t2", "write", r#"{"path":"demo.svg","content":"new\n"}"#),
+        ]),
+        text_done("done"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "rewrite them").await;
+
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 2);
+    for (content, is_error) in &results {
+        assert!(is_error, "an unread overwrite must fail, got: {content}");
+        assert!(content.contains("read"), "{content}");
+    }
+    // And the originals are untouched, which is the point of refusing.
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("demo.html")).unwrap(),
+        "old\n"
+    );
+}

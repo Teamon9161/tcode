@@ -37,6 +37,17 @@ export type Inspect =
   | { kind: "output"; callId: string }
   /** Model-authored rich content, rendered behind the sandbox boundary. */
   | { kind: "artifact"; sandbox: SandboxKind; source: string; label: string }
+  /**
+   * A file on disk the model asked to display (`show`).
+   *
+   * The one value here that is *not* a function of the transcript. Every other
+   * kind answers "what did the agent do", and re-reading the file would answer a
+   * different question than the one being asked. This one's whole question is
+   * the file: it was produced by a script precisely so its contents never had to
+   * enter the conversation, so there is nothing in the transcript to read it
+   * from. It carries the path rather than the bytes for the same reason.
+   */
+  | { kind: "shown"; path: string; label: string }
   /** A document — a plan draft, a markdown file — read as prose. */
   | { kind: "doc"; path: string; text: string };
 
@@ -102,6 +113,8 @@ export function inspectTitle(value: Inspect): string {
     case "output":
       return "Output";
     case "artifact":
+      return value.label;
+    case "shown":
       return value.label;
     case "doc":
       return basename(value.path);

@@ -4,6 +4,8 @@ import type { ToolResult } from "./blocks";
 import { Diff } from "./components/Diff";
 import { isEditShape } from "./diff";
 import type { Inspect } from "./inspect";
+import { basename } from "./show";
+import { ShownView } from "./Shown";
 
 /**
  * How each tool call draws, and what clicking it opens.
@@ -62,7 +64,8 @@ export type TranscriptGroup = "exploration" | "changes" | "commands";
 export type ToolView = {
   /** Change preview under the header, shown at the call site. */
   body?(input: unknown): ReactNode;
-  /** What opening this call shows in the inspector. */
+  /** What opening this call shows in the inspector — where the call's
+   *  pop-out button leads. */
   inspect?(input: unknown, callId: string, result?: ToolResult): Inspect | null;
   /** What this call is *about*, derived from its input. */
   summary?(input: unknown): string | null;
@@ -120,7 +123,40 @@ const pattern: ToolView = {
   transcriptGroup: "exploration",
 };
 
+/**
+ * `show` puts a file on screen, at the call site.
+ *
+ * The artifact *is* the result, so it draws in the transcript where the
+ * conversation is, exactly like an edit draws its diff. `inspect` then makes the
+ * pop-out button lead to the same thing with room to breathe. It is deliberately
+ * not grouped with exploration: a chart is not a step on the way to an answer.
+ */
+const showing: ToolView = {
+  body: (input) => {
+    const value = shownValue(input);
+    return value ? <ShownView value={value} inline /> : null;
+  },
+  inspect: (input) => shownValue(input),
+  summary: (input) => targetPath(input),
+  preferInputSummary: true,
+};
+
+function shownValue(input: unknown): Extract<Inspect, { kind: "shown" }> | null {
+  const path = targetPath(input);
+  if (!path) return null;
+  const label =
+    typeof input === "object" && input !== null
+      ? (input as Record<string, unknown>).label
+      : null;
+  return {
+    kind: "shown",
+    path,
+    label: typeof label === "string" && label.trim() ? label.trim() : basename(path),
+  };
+}
+
 const VIEWS: Record<string, ToolView> = {
+  show: showing,
   edit: editing,
   write: editing,
   multi_edit: editing,

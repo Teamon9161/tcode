@@ -392,6 +392,9 @@ async fn build_session(state: &ServerState, params: &Value) -> anyhow::Result<Ac
         selection,
         model_cell: model_cell.clone(),
         agent: state.spec.agent.clone(),
+        // No pane of our own: an ACP client draws the conversation, so `show`
+        // would open nothing.
+        display_tools: Vec::new(),
     })
     .await?;
     for warning in warnings {

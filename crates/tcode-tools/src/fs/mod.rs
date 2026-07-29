@@ -49,6 +49,49 @@ async fn write_with_windows_retry(path: &Path, content: &[u8]) -> std::io::Resul
     }
 }
 
+/// A path inside tcode's own scratch area that is not *this* conversation's.
+///
+/// Always a mistyped path, and a uniquely expensive one to mistype. The
+/// `<project-id>` segment is a lossy transform of the working directory
+/// (`store::project_id` folds every non-alphanumeric character to `-`), so it is
+/// forty-odd opaque characters the model has to reproduce exactly, with no
+/// feedback if it does not. Get one wrong and `write` cheerfully creates a whole
+/// phantom project tree that looks almost right.
+///
+/// That is not hypothetical: four example files written in one batch, three of
+/// them with one segment misspelled, four successes reported, and the failure
+/// only surfaced two turns later when `show` could not find them — costing a
+/// directory listing, a rewrite and a verification pass. The harness has always
+/// known the correct directory, so under the zero-guessing rule it must say so
+/// at the call that got it wrong rather than let the model discover it.
+fn misdirected_scratch(path: &Path, ctx: &tcode_core::ToolCtx) -> Option<String> {
+    if crate::show::is_within(path, &ctx.scratch_dir) {
+        return None;
+    }
+    // Only the scratch area. `~/.tcode/projects/<id>/memory/` is a legitimate
+    // target under a *different* id — memory keys on the project root while a
+    // session keys on its cwd — so the check is anchored on `scratchpad`.
+    if !path
+        .components()
+        .any(|part| part.as_os_str() == "scratchpad")
+    {
+        return None;
+    }
+    let projects = tcode_core::home_dir()?.join(".tcode").join("projects");
+    if !crate::show::is_within(path, &projects) {
+        return None;
+    }
+    Some(format!(
+        "{} is another conversation's scratch directory, not this one's. \
+         Write to {} instead — that is this session's scratch root. \
+         The `<project-id>` segment is a lossy transform of the working directory, \
+         not something to spell out by hand; use the path the environment gave you \
+         or a path relative to the project.",
+        path.display(),
+        ctx.scratch_dir.display()
+    ))
+}
+
 fn write_error(path: &Path, error: &std::io::Error) -> String {
     if is_windows_user_mapped_file(error) {
         format!(

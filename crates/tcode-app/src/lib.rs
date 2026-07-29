@@ -8,5 +8,6 @@ pub mod boot;
 pub mod bridge;
 pub mod commands;
 pub mod paths;
+pub mod picker;
 pub mod projects;
 pub mod state;

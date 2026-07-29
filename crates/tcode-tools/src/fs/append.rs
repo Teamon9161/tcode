@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::freshness::{content_hash, Visibility};
 use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
-use super::{numbered, rel, write_error, write_with_windows_retry};
+use super::{misdirected_scratch, numbered, rel, write_error, write_with_windows_retry};
 
 pub struct AppendTool;
 
@@ -102,6 +102,9 @@ impl Tool for AppendTool {
             return ToolOutput::err("content must not be empty");
         }
         let path = ctx.resolve(path_str);
+        if let Some(reason) = misdirected_scratch(&path, ctx) {
+            return ToolOutput::err(reason);
+        }
         let old = match tokio::fs::read(&path).await {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(text) => text,

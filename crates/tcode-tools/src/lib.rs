@@ -10,6 +10,7 @@ mod redact;
 mod search;
 mod shell;
 mod shell_filter;
+mod show;
 mod skills;
 mod view_image;
 mod web;
@@ -28,6 +29,11 @@ pub use mcp::connect_mcp_servers;
 pub use progress::ProgressTool;
 pub use shell::ShellKind;
 pub use shell_filter::{OutputFilter, ShellFilters};
+/// Not part of [`builtin_tools`]: only a frontend with a viewer can honour it.
+/// See `show.rs` and `BootSpec::display_tools`. `is_viewable_path` and
+/// `VIEWER_TEXT_BUDGET` are the same boundary and the same budget the viewer
+/// must apply — one definition, used by the tool and by whoever loads the file.
+pub use show::{is_viewable_path, ShowTool, VIEWER_TEXT_BUDGET};
 pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,
@@ -209,6 +215,9 @@ mod tests {
         tools.push(Arc::new(crate::ProgressTool));
         tools.push(Arc::new(crate::AskUserTool));
         tools.push(Arc::new(crate::AddNoteTool));
+        // Registered by the desktop app rather than by `builtin_tools`, but the
+        // provider rejects a malformed schema wherever it came from.
+        tools.push(Arc::new(crate::ShowTool));
         for tool in &tools {
             let schema = tool.input_schema();
             assert_eq!(

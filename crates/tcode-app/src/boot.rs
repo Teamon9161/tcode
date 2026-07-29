@@ -99,19 +99,43 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     let active = tcode_providers::build_active(profile, &selection, &config.watchdog)?;
     let model_cell = ModelCell::new(active);
 
+    // `boot` consumes the selection; the model menu needs it to mark which
+    // option is current.
+    let selection_for_menu = selection.clone();
     let booted = tcode_frontend::boot(tcode_frontend::BootSpec {
         cwd: cwd.clone(),
         config: &mut config,
         selection,
         model_cell: model_cell.clone(),
         agent: None,
+        // The one thing this frontend has that the terminal does not: somewhere
+        // to put a rendered file. See `tcode_tools::ShowTool`.
+        display_tools: vec![Arc::new(tcode_tools::ShowTool)],
     })
     .await?;
+
+    // The same two menus `/model` renders in the terminal, with the same
+    // closures attached. Built here rather than in the command that reads them:
+    // they carry the provider swap and the selected-config writer, which are
+    // composition-root concerns (see `picker.rs`).
+    let menus = Arc::new(std::sync::Mutex::new(crate::picker::Pickers {
+        models: tcode_frontend::build_menu(&config, &selection_for_menu, config_file.clone()),
+        presets: tcode_frontend::build_preset_menu(
+            &config,
+            &state,
+            cwd.clone(),
+            model_cell.clone(),
+            booted.pinned.clone(),
+            booted.agent_defs.clone(),
+            config_file.clone(),
+        ),
+        config_file: config_file.clone(),
+    }));
 
     let factory = SessionFactory::new(config_file, model_cell, booted.shell_filters.clone());
     let session = factory.open(&cwd, None)?;
 
-    let supervisor = Arc::new(Supervisor::new(booted.agent, factory));
+    let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus));
     // The session id is the app's handle for this conversation, independent of
     // the JSONL log id: a resumed log and a fresh one are both just "a session"
     // to the frontend.
