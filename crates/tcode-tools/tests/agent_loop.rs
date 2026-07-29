@@ -4591,8 +4591,8 @@ async fn progress_state_never_reaches_the_cached_prefix() {
     // The draft itself is real, and it is what the per-turn tail is derived
     // from. (That the tail carries it is `status_block`'s own unit test: a mock
     // provider reports no usage, which is what suppresses the block here.)
-    let progress = session.progress();
-    let progress = progress.as_ref().expect("the draft is open");
+    let mut progress = session.progress();
+    let progress = progress.as_mut().expect("the draft is open");
     assert_eq!(progress.state(), tcode_core::ProgressState::Draft);
     assert!(progress.summary().contains("Ship it"));
 }

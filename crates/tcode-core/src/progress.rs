@@ -13,14 +13,19 @@
 //!    markdown, so a phase flip costs one call instead of two round trips of
 //!    full text. [`Progress::reconcile`] is what makes that safe when the user
 //!    edits the file by hand.
-//! 2. **Phase detail is delivered on demand.** A twelve-phase plan keeps
-//!    exactly one phase's prose in context — the one just entered, handed back
-//!    by [`Progress::set_phases`].
+//! 2. **Phase detail is written once and delivered on demand.** A twelve-phase
+//!    plan keeps exactly one phase's prose in context — the one just entered,
+//!    handed back by [`Progress::set_phases`], or the one already running when
+//!    a session adopts the file ([`Progress::summary`]). The resend that
+//!    carries phase flips need not carry the prose again ([`carry_detail`]),
+//!    which is what keeps "write the reasoning down" from being a recurring
+//!    charge the model can see and will avoid.
 //!
 //! A progress file is externally mutable state, not history. The ledger records
 //! the tool calls the model made; this file records what is true now. Nothing
 //! here touches the append-only invariant.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -196,6 +201,15 @@ impl Phase {
     }
 }
 
+/// Every phase in a breakdown, parents before children.
+fn walk_phases(phases: &[Phase]) -> Vec<&Phase> {
+    let mut out = Vec::new();
+    for phase in phases {
+        phase.walk(&mut out);
+    }
+    out
+}
+
 /// Read a whole `phases` array out of tool input.
 pub fn phases_from_json(value: &Value) -> Result<Vec<Phase>, String> {
     let Some(items) = value.as_array() else {
@@ -234,6 +248,14 @@ pub struct Progress {
     /// Hash of the bytes last read from or written to `path`. A mismatch means
     /// a human edited the file.
     disk_hash: u64,
+    /// Phase titles whose stored `detail` this conversation has actually been
+    /// shown. Deliberately not persisted: it is what *this* model knows, not
+    /// what the file holds, so a new session starts knowing nothing.
+    seen: HashSet<String>,
+    /// Hash of the body at the last [`Progress::full_view`], so asking again
+    /// for a plan that has not moved costs a pointer instead of a copy. Same
+    /// contract as `read`'s freshness check, for the same reason.
+    viewed: Option<u64>,
 }
 
 impl Progress {
@@ -254,6 +276,8 @@ impl Progress {
             // No file yet: any hash that cannot match an existing file's would
             // do, but 0 also means "never written", which `reconcile` needs.
             disk_hash: 0,
+            seen: HashSet::new(),
+            viewed: None,
         })
     }
 
@@ -278,6 +302,10 @@ impl Progress {
             created: front.created,
             phases: parse_phases(body),
             disk_hash: fnv1a(text.as_bytes()),
+            // Parsing a file is not reading it: the text went to disk, not to
+            // the model. Whoever hands some of it over marks that much seen.
+            seen: HashSet::new(),
+            viewed: None,
         })
     }
 
@@ -320,7 +348,7 @@ impl Progress {
     /// applying it up front would make declining silently promote the plan.
     pub fn apply_content(&mut self, input: &Value) -> Result<Option<String>, String> {
         match input.get("phases") {
-            Some(phases) if !phases.is_null() => Ok(self.set_phases(phases_from_json(phases)?)),
+            Some(phases) if !phases.is_null() => self.set_phases(phases_from_json(phases)?),
             _ => Ok(None),
         }
     }
@@ -341,9 +369,30 @@ impl Progress {
     /// no diffing). Returns the detail of the phase that just became
     /// `in_progress`, which is the one piece of prose worth spending context
     /// on right now.
-    pub fn set_phases(&mut self, phases: Vec<Phase>) -> Option<String> {
+    ///
+    /// Detail is the one field a resend does *not* have to carry: a phase sent
+    /// without it keeps what the file already holds. See [`carry_detail`] —
+    /// that rule is what makes writing detail worth doing at all.
+    ///
+    /// Rejects a rewrite of detail this conversation was never shown, the same
+    /// bargain the file tools strike over `edit`: overwriting prose you have
+    /// not read is not an edit, it is a guess. The error hands the text over,
+    /// which is also what makes the retry legal.
+    pub fn set_phases(&mut self, mut phases: Vec<Phase>) -> Result<Option<String>, String> {
+        let stored = self.stored_detail();
+        self.refuse_blind_rewrites(&phases, &stored)?;
         let was_running = self.running_titles();
+        carry_detail(&mut phases, &stored);
         self.phases = phases;
+        // Every phase whose prose the model just wrote out, it has by
+        // definition seen; the one it is handed below joins them.
+        let written: Vec<String> = self
+            .flatten()
+            .iter()
+            .filter(|phase| !phase.detail.is_empty())
+            .map(|phase| phase.phase.clone())
+            .collect();
+        self.seen.extend(written);
         let entered = self
             .flatten()
             .into_iter()
@@ -352,7 +401,54 @@ impl Progress {
             })
             .filter(|phase| !phase.detail.is_empty())
             .map(|phase| format!("{}\n{}", phase.phase, phase.detail));
-        entered
+        Ok(entered)
+    }
+
+    /// Refuse to replace stored detail this conversation has not been shown,
+    /// and hand it over in the error so the next attempt is an informed one.
+    /// Reporting every offending phase at once: one round trip beats N.
+    fn refuse_blind_rewrites(
+        &mut self,
+        incoming: &[Phase],
+        stored: &HashMap<String, String>,
+    ) -> Result<(), String> {
+        let blind: Vec<(String, String)> = walk_phases(incoming)
+            .into_iter()
+            .filter(|phase| !phase.detail.is_empty() && !self.seen.contains(&phase.phase))
+            .filter_map(|phase| {
+                let held = stored.get(&phase.phase)?;
+                (*held != phase.detail).then(|| (phase.phase.clone(), held.clone()))
+            })
+            .collect();
+        if blind.is_empty() {
+            return Ok(());
+        }
+        let mut error = String::from(
+            "Nothing was applied: these phases already have detail that was written outside this conversation, and you have not been shown it. Here it is. Re-send with `detail` left out to keep it, or with your replacement if you still mean to replace it.\n",
+        );
+        for (phase, detail) in blind {
+            error.push_str(&format!(
+                "\n<tcode-progress-detail phase=\"{}\">\n{}\n</tcode-progress-detail>\n",
+                escape_attr(&phase),
+                detail.trim_end()
+            ));
+            self.seen.insert(phase);
+        }
+        Err(error)
+    }
+
+    /// The detail this file already holds, keyed by phase title. First writer
+    /// wins for a duplicated title: the alternative is picking a loser, and no
+    /// choice there is better than the earlier one.
+    fn stored_detail(&self) -> HashMap<String, String> {
+        let mut out = HashMap::new();
+        for phase in self.flatten() {
+            if !phase.detail.is_empty() {
+                out.entry(phase.phase.clone())
+                    .or_insert_with(|| phase.detail.clone());
+            }
+        }
+        out
     }
 
     fn running_titles(&self) -> Vec<String> {
@@ -390,7 +486,15 @@ impl Progress {
     /// Refuse to overwrite a file the user has edited since tcode wrote it.
     /// Called before every write; the returned conflict carries their text so
     /// the caller never has to read the file back.
-    pub fn reconcile(&self) -> Result<(), Conflict> {
+    ///
+    /// Rejecting is only half of "their version wins" — the other half is
+    /// adopting it here, before returning. Without that the handle keeps
+    /// comparing against the bytes it wrote long ago, so every later call
+    /// re-reports the same conflict and the tool is wedged for the rest of the
+    /// session, while the error tells the model to do the one thing that
+    /// cannot work. Their text is also handed to the model in the same breath,
+    /// so every detail in it counts as seen.
+    pub fn reconcile(&mut self) -> Result<(), Conflict> {
         // Never written: there is nothing of the user's to protect. A file that
         // appeared under this path in the meantime is still theirs, though.
         let Ok(text) = std::fs::read_to_string(&self.path) else {
@@ -398,6 +502,11 @@ impl Progress {
         };
         if fnv1a(text.as_bytes()) == self.disk_hash {
             return Ok(());
+        }
+        if let Ok(theirs) = Self::parse(&self.path, &text) {
+            let seen = theirs.flatten().iter().map(|p| p.phase.clone()).collect();
+            *self = theirs;
+            self.seen = seen;
         }
         Err(Conflict {
             path: self.path.clone(),
@@ -445,26 +554,107 @@ impl Progress {
         self.phases = parse_phases(markdown);
     }
 
-    /// The model-facing summary: title lines and boxes, never the detail
-    /// prose. Detail reaches the model one phase at a time, through the tool
-    /// result that entered it.
-    pub fn summary(&self) -> String {
+    /// The model-facing summary: title lines and boxes, plus the detail of the
+    /// phase currently `[>]` — and no other phase's.
+    ///
+    /// The one-phase-at-a-time budget is the point, not the omission. This is
+    /// injected when a session takes the file over (new session, resume,
+    /// compact, a user edit), and the phase already running at that moment is
+    /// the one case where the hand-back on entry never comes: it was entered by
+    /// someone else, in a conversation this model cannot see. Withholding it
+    /// here does not save the prose for later — it drops it.
+    ///
+    /// Takes `&mut self` because handing prose to the model is a fact about
+    /// what this conversation now knows, and that fact is what later lets it
+    /// rewrite the phase it is standing on.
+    /// This also *resets* what the conversation is taken to know, because every
+    /// caller of it is a moment the prose it was handed before is gone or was
+    /// never theirs: a new session, a resume, a compact that dropped the text,
+    /// a user rewrite. What it knows afterwards is what this summary carries.
+    pub fn summary(&mut self) -> String {
+        let running: Vec<String> = self
+            .flatten()
+            .into_iter()
+            .filter(|phase| phase.status == PhaseStatus::InProgress && !phase.detail.is_empty())
+            .map(|phase| phase.phase.clone())
+            .collect();
+        self.seen = running.into_iter().collect();
+        self.viewed = None;
+        self.envelope(&self.summary_body())
+    }
+
+    /// The whole file as the model reads it: every phase, every detail. The
+    /// deliberately expensive one — nothing injects this, the model asks for it
+    /// when it wants the plan rather than the checklist.
+    ///
+    /// Asking twice for a plan that has not moved gets a pointer to the copy
+    /// already in context, exactly as a repeated `read` does. The stale-copy
+    /// worry that would argue against it is handled at the other end:
+    /// [`Progress::summary`] runs at precisely the moments the earlier copy
+    /// stops being reachable, and clears this.
+    pub fn full_view(&mut self) -> String {
+        let body = self.body();
+        let hash = fnv1a(body.as_bytes());
+        if self.viewed == Some(hash) {
+            return format!(
+                "unchanged: {} has not changed since you read it in full; the plan is already in your context above.",
+                self.path.display()
+            );
+        }
+        let all: Vec<String> = self
+            .flatten()
+            .into_iter()
+            .map(|phase| phase.phase.clone())
+            .collect();
+        self.seen.extend(all);
+        self.viewed = Some(hash);
+        self.envelope(body.trim_start_matches('\n'))
+    }
+
+    /// One tag for both views, so the model never has to work out which shape
+    /// of progress text it is looking at.
+    fn envelope(&self, contents: &str) -> String {
         let name = self
             .path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
-        let mut out = format!(
-            "<tcode-progress file=\"{}\" title=\"{}\" state=\"{}\">\n",
+        format!(
+            "<tcode-progress file=\"{}\" title=\"{}\" state=\"{}\">\n{}\n</tcode-progress>",
             name,
             escape_attr(&self.title),
-            self.state.label()
-        );
+            self.state.label(),
+            contents.trim_end()
+        )
+    }
+
+    fn summary_body(&self) -> String {
+        let mut out = String::new();
         for (i, phase) in self.phases.iter().enumerate() {
             summarize_phase(&mut out, phase, &format!("{}", i + 1), 0);
         }
-        out.push_str("</tcode-progress>");
         out
+    }
+}
+
+/// Carry stored detail onto a resent breakdown, matching by phase title. A
+/// phase resent without `detail` means "unchanged", never "erased".
+///
+/// Without this rule the tool's own economics argue against ever writing
+/// detail: the breakdown is resent in full on every phase flip, so prose paid
+/// for once would be paid for again on every call, while its only payoff is
+/// the single hand-back when that phase starts. Worse, a fresh session is
+/// handed titles and boxes alone — it would resend the plan it can see and
+/// silently wipe the reasoning it never saw, which is exactly the reader this
+/// detail was written for.
+fn carry_detail(phases: &mut [Phase], stored: &HashMap<String, String>) {
+    for phase in phases {
+        if phase.detail.is_empty() {
+            if let Some(detail) = stored.get(&phase.phase) {
+                phase.detail = detail.clone();
+            }
+        }
+        carry_detail(&mut phase.phases, stored);
     }
 }
 
@@ -506,6 +696,13 @@ fn summarize_phase(out: &mut String, phase: &Phase, number: &str, indent: usize)
         out.push_str("  ← current");
     }
     out.push('\n');
+    if phase.status == PhaseStatus::InProgress {
+        for line in phase.detail.lines() {
+            out.push_str(&"  ".repeat(indent + 1));
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     for (i, child) in phase.phases.iter().enumerate() {
         summarize_phase(out, child, &format!("{number}.{}", i + 1), indent + 1);
     }
@@ -533,6 +730,14 @@ pub const REVIEW_PATH_FIELD: &str = "_progress_path";
 /// intents never collide.
 pub fn is_submission(input: &Value) -> bool {
     input["state"].as_str() == Some(ProgressState::Active.label())
+}
+
+/// Whether this call only asks to see the file. A call that carries neither a
+/// breakdown nor a lifecycle change has nothing to apply, so the honest reading
+/// of it is "show me", not "rewrite the file with what it already says".
+fn is_view(input: &Value) -> bool {
+    let absent = |field: &str| input.get(field).is_none_or(Value::is_null);
+    absent("phases") && absent("state")
 }
 
 /// The session's selected progress file, opening a new file when this call
@@ -599,6 +804,14 @@ pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, S
         false => ProgressState::Active,
     };
     let progress = current_or_create(&mut slot, &ctx.cwd, input, fresh)?;
+    // Nothing to apply is a request to look: the model has no other way to read
+    // a file this tool owns, and reading it should not cost a guessed path or a
+    // second tool. Every other call answers with counts, so the plan itself has
+    // to be askable for.
+    if is_view(input) {
+        return Ok(progress.full_view());
+    }
+    let submitted = is_submission(input).then(|| progress.body());
     let entered = if is_submission(input) {
         // The approved call: whatever the reviewer left in the pane is the
         // authority, including a rewrite, so `reconcile` is deliberately not
@@ -627,6 +840,16 @@ pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, S
         result.push_str("\n\nNow starting — ");
         result.push_str(&entered);
     }
+    // An approval the reviewer rewrote is the one moment the file says
+    // something the model never wrote and would otherwise never read. It is
+    // about to execute this; handing it back here costs one echo, and skipping
+    // it means executing the plan it proposed rather than the one approved.
+    if submitted.is_some_and(|before| before != progress.body()) {
+        result.push_str(
+            "\n\nThe user rewrote this plan before approving it. Theirs is the one to execute:\n\n",
+        );
+        result.push_str(&progress.full_view());
+    }
     // A finished plan stops being this conversation's current one, so the next
     // task opens its own file instead of appending to a completed one.
     if state == ProgressState::Done {
@@ -640,7 +863,7 @@ pub fn current_summary(ctx: &crate::tool::ToolCtx) -> Option<String> {
     ctx.progress
         .lock()
         .expect("progress lock")
-        .as_ref()
+        .as_mut()
         .map(Progress::summary)
 }
 
@@ -986,8 +1209,10 @@ mod tests {
             created: "2026-07-29T10:12:00Z".into(),
             phases: Vec::new(),
             disk_hash: 0,
+            seen: HashSet::new(),
+            viewed: None,
         };
-        progress.set_phases(vec![
+        let _ = progress.set_phases(vec![
             Phase {
                 phase: "勘查调用面".into(),
                 status: PhaseStatus::Completed,
@@ -1066,7 +1291,7 @@ mod tests {
         let mut progress = sample();
         // Re-sending the same list enters nothing new.
         let phases = progress.phases().to_vec();
-        assert!(progress.set_phases(phases).is_none());
+        assert!(progress.set_phases(phases).unwrap().is_none());
 
         let entered = progress
             .set_phases(vec![
@@ -1078,21 +1303,101 @@ mod tests {
                     phases: Vec::new(),
                 },
             ])
+            .unwrap()
             .expect("newly entered phase carries its detail");
         assert!(entered.contains("迁移调用方"));
         assert!(entered.contains("ledger.rs"));
     }
 
     #[test]
-    fn summary_carries_boxes_but_never_detail() {
+    fn summary_carries_boxes_and_only_the_running_phase_detail() {
         let summary = sample().summary();
         assert!(summary.contains("[x] 1. 勘查调用面"));
         assert!(summary.contains("← current"));
         assert!(summary.contains("state=\"active\""));
         assert!(
-            !summary.contains("aux 事件"),
-            "detail prose must stay out of the summary: {summary}"
+            summary.contains("风险：compact"),
+            "the running phase's detail is the one a resuming session cannot get any other way: {summary}"
         );
+        assert!(
+            !summary.contains("aux 事件"),
+            "every other phase's detail must stay out of the summary: {summary}"
+        );
+    }
+
+    /// The resume path in one test: a fresh session is handed the summary,
+    /// which names the phases but carries no detail for the ones it is not
+    /// running. Resending that — the only breakdown it can see — must not cost
+    /// the file its reasoning.
+    #[test]
+    fn resending_titles_alone_keeps_the_stored_detail() {
+        let mut progress = sample();
+        let titles: Vec<Phase> = progress
+            .phases()
+            .iter()
+            .map(|phase| Phase {
+                phase: phase.phase.clone(),
+                status: phase.status,
+                detail: String::new(),
+                phases: phase
+                    .phases
+                    .iter()
+                    .map(|child| Phase::new(child.phase.clone(), child.status))
+                    .collect(),
+            })
+            .collect();
+        progress.set_phases(titles).unwrap();
+        assert_eq!(
+            progress.phases()[0].detail,
+            "只读。确认 rewind 之后 aux 事件的重放顺序。"
+        );
+        assert!(progress.phases()[1].detail.starts_with("风险："));
+    }
+
+    #[test]
+    fn a_resent_phase_may_still_rewrite_its_own_detail() {
+        let mut progress = sample();
+        progress
+            .set_phases(vec![Phase {
+                phase: "勘查调用面".into(),
+                status: PhaseStatus::Completed,
+                detail: "改主意了".into(),
+                phases: Vec::new(),
+            }])
+            .unwrap();
+        assert_eq!(progress.phases()[0].detail, "改主意了");
+    }
+
+    /// Detail carried forward is detail the model never re-read, so entering a
+    /// phase a previous session wrote still hands back that session's prose.
+    #[test]
+    fn entering_a_phase_hands_back_detail_written_by_someone_else() {
+        let mut progress = sample();
+        let entered = progress
+            .set_phases(vec![
+                Phase::new("勘查调用面", PhaseStatus::Completed),
+                Phase::new("改 truncate_tail 的归档语义", PhaseStatus::Completed),
+                Phase::new("迁移调用方", PhaseStatus::InProgress),
+            ])
+            .unwrap()
+            .is_none();
+        assert!(entered, "a phase with no stored detail hands back nothing");
+
+        let mut progress = sample();
+        progress
+            .set_phases(vec![
+                Phase::new("勘查调用面", PhaseStatus::Completed),
+                Phase::new("改 truncate_tail 的归档语义", PhaseStatus::Pending),
+            ])
+            .unwrap();
+        let entered = progress
+            .set_phases(vec![
+                Phase::new("勘查调用面", PhaseStatus::Completed),
+                Phase::new("改 truncate_tail 的归档语义", PhaseStatus::InProgress),
+            ])
+            .unwrap()
+            .expect("stored detail is handed back on entry");
+        assert!(entered.contains("跨越 Summary 边界"), "{entered}");
     }
 
     #[test]
@@ -1104,14 +1409,16 @@ mod tests {
         assert!(progress.set_state(ProgressState::Done).is_err());
         progress.set_state(ProgressState::Draft).unwrap();
         progress.set_state(ProgressState::Active).unwrap();
-        progress.set_phases(
-            progress
-                .phases()
-                .iter()
-                .cloned()
-                .map(complete_phase)
-                .collect(),
-        );
+        progress
+            .set_phases(
+                progress
+                    .phases()
+                    .iter()
+                    .cloned()
+                    .map(complete_phase)
+                    .collect(),
+            )
+            .unwrap();
         progress.set_state(ProgressState::Done).unwrap();
         assert!(progress.set_state(ProgressState::Active).is_err());
     }
@@ -1127,7 +1434,9 @@ mod tests {
         crate::home::testing::temp_home();
         let cwd = tempfile::tempdir().unwrap();
         let mut progress = Progress::create(cwd.path(), "Rewrite the resume path").unwrap();
-        progress.set_phases(vec![Phase::new("one", PhaseStatus::InProgress)]);
+        progress
+            .set_phases(vec![Phase::new("one", PhaseStatus::InProgress)])
+            .unwrap();
         progress.save().unwrap();
         assert!(progress.reconcile().is_ok());
 
@@ -1330,6 +1639,191 @@ mod tests {
         assert!(result.contains("1/2"), "{result}");
     }
 
+    /// The whole resume path, end to end: one session writes the reasoning, a
+    /// later one reloads the file from disk with only titles and boxes in hand,
+    /// resends that, and must both keep the prose on disk and be handed the
+    /// phase it just entered.
+    #[test]
+    fn a_later_session_reloading_the_file_keeps_and_receives_the_detail() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "in_progress", "detail": "read ledger.rs first" },
+                { "phase": "change it", "status": "pending", "detail": "touch truncate_tail" }
+            ] }),
+        )
+        .unwrap();
+        let path = ctx
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        // A fresh session: nothing in context but the file on disk.
+        *ctx.progress.lock().unwrap() = Some(Progress::load(&path).unwrap());
+        let summary = current_summary(&ctx).unwrap();
+        assert!(summary.contains("read ledger.rs first"), "{summary}");
+        assert!(!summary.contains("truncate_tail"), "{summary}");
+
+        // Resending what that summary showed — titles and boxes.
+        let result = apply_call(
+            &ctx,
+            &json!({ "phases": [
+                { "phase": "survey", "status": "completed" },
+                { "phase": "change it", "status": "in_progress" }
+            ] }),
+        )
+        .unwrap();
+        assert!(result.contains("touch truncate_tail"), "{result}");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("read ledger.rs first"),
+            "a resend must not erase detail it was never shown"
+        );
+    }
+
+    /// The model's only way to read a file this tool owns.
+    #[test]
+    fn a_call_with_nothing_to_apply_shows_the_whole_file() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "completed", "detail": "old news" },
+                { "phase": "change it", "status": "pending", "detail": "touch ledger.rs" }
+            ] }),
+        )
+        .unwrap();
+
+        let view = apply_call(&ctx, &json!({})).unwrap();
+        assert!(view.contains("old news"), "{view}");
+        assert!(view.contains("touch ledger.rs"), "{view}");
+        assert!(view.contains("title=\"Ship it\""), "{view}");
+
+        // Same contract as a repeated `read`: a plan that has not moved costs
+        // a pointer, not a second copy.
+        let again = apply_call(&ctx, &json!({})).unwrap();
+        assert!(again.starts_with("unchanged:"), "{again}");
+        assert!(!again.contains("old news"), "{again}");
+
+        // Moved, so worth serving again.
+        apply_call(
+            &ctx,
+            &json!({ "phases": [
+                { "phase": "survey", "status": "completed" },
+                { "phase": "change it", "status": "in_progress" }
+            ] }),
+        )
+        .unwrap();
+        let moved = apply_call(&ctx, &json!({})).unwrap();
+        assert!(moved.contains("old news"), "{moved}");
+    }
+
+    /// A summary injection is the harness saying "here is the file, because
+    /// what you had is gone or was never yours". Anything the model was shown
+    /// before that no longer counts as shown.
+    #[test]
+    fn re_describing_the_file_resets_what_the_conversation_knows() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "pending", "detail": "the reasoning" }
+            ] }),
+        )
+        .unwrap();
+        assert!(apply_call(&ctx, &json!({})).unwrap().contains("reasoning"));
+
+        // Compact, resume, a user edit: same call, same meaning.
+        current_summary(&ctx).unwrap();
+
+        let rewrite =
+            json!({ "phases": [{ "phase": "survey", "status": "pending", "detail": "mine" }] });
+        let error = apply_call(&ctx, &rewrite).unwrap_err();
+        assert!(
+            error.contains("the reasoning"),
+            "prose the model can no longer see is prose it has not seen: {error}"
+        );
+        // And the copy it was handed before is no longer reachable either, so
+        // asking for the file again must serve it rather than point at it.
+        assert!(apply_call(&ctx, &json!({})).unwrap().contains("reasoning"));
+        apply_call(&ctx, &rewrite).unwrap();
+    }
+
+    /// Overwriting prose you have never read is a guess, not an edit — the same
+    /// bargain `edit` strikes over file contents.
+    #[test]
+    fn detail_this_session_never_saw_cannot_be_rewritten_blind() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "pending", "detail": "the reasoning nobody read" }
+            ] }),
+        )
+        .unwrap();
+        let path = ctx
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+        *ctx.progress.lock().unwrap() = Some(Progress::load(&path).unwrap());
+
+        let rewrite = json!({ "phases": [{ "phase": "survey", "status": "pending", "detail": "my version" }] });
+        let error = apply_call(&ctx, &rewrite).unwrap_err();
+        assert!(error.contains("the reasoning nobody read"), "{error}");
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("the reasoning nobody read"));
+
+        // Refusing once and handing the text over is the whole mechanism: the
+        // informed retry goes through, or the tool would be wedged.
+        apply_call(&ctx, &rewrite).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("my version"));
+    }
+
+    /// Detail delivered by any route counts as read.
+    #[test]
+    fn seeing_a_phase_detail_is_what_unlocks_rewriting_it() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "phases": [
+                { "phase": "survey", "status": "in_progress", "detail": "the reasoning" }
+            ] }),
+        )
+        .unwrap();
+        let path = ctx
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        // A fresh session that was handed the summary has seen the running
+        // phase, and only that one.
+        *ctx.progress.lock().unwrap() = Some(Progress::load(&path).unwrap());
+        current_summary(&ctx).unwrap();
+        apply_call(
+            &ctx,
+            &json!({ "phases": [{ "phase": "survey", "status": "in_progress", "detail": "revised" }] }),
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("revised"));
+    }
+
     /// A finished plan stops being the conversation's current one, so the next
     /// task opens its own file instead of appending to a completed one.
     #[test]
@@ -1380,6 +1874,44 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("I disagree"), "{error}");
         assert!(error.contains("authoritative"), "{error}");
+
+        // "Their version wins" has to mean the handle adopts it too. Reporting
+        // the same conflict forever would wedge the tool for the rest of the
+        // session, and the error asks for a resend that could never land.
+        apply_call(
+            &ctx,
+            &json!({ "phases": [{ "phase": "I disagree", "status": "completed" }] }),
+        )
+        .unwrap();
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert!(after.contains("[x] 1. I disagree"), "{after}");
+    }
+
+    /// The reviewer's rewrite is the plan that gets executed, so the model has
+    /// to be told when it is not the one it submitted.
+    #[test]
+    fn an_approved_rewrite_comes_back_to_the_model() {
+        let ctx = test_ctx();
+        let draft = json!({ "title": "Ship it", "state": "active", "phases": [
+            { "phase": "mine", "status": "pending", "detail": "my reasoning" }
+        ] });
+        review_copy(&ctx, &draft).unwrap();
+
+        let mut approved = draft.clone();
+        approved[REVIEW_BODY_FIELD] =
+            Value::String("\n## [ ] 1. theirs\ntheir reasoning\n".to_string());
+        let result = apply_call(&ctx, &approved).unwrap();
+        assert!(result.contains("their reasoning"), "{result}");
+        assert!(result.contains("rewrote"), "{result}");
+
+        // Unchanged approvals stay quiet — the model already has that text.
+        let ctx = test_ctx();
+        review_copy(&ctx, &draft).unwrap();
+        let mut approved = draft.clone();
+        approved[REVIEW_BODY_FIELD] =
+            Value::String(ctx.progress.lock().unwrap().as_ref().unwrap().body());
+        let result = apply_call(&ctx, &approved).unwrap();
+        assert!(!result.contains("rewrote"), "{result}");
     }
 
     #[test]
