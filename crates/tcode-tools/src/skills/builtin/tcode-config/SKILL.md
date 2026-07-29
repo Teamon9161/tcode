@@ -18,17 +18,27 @@ Use these locations deliberately:
   file for this run; all setup and runtime choices then use that same file.
   Put API-key environment-variable names and personal provider profiles here.
 - `[tcode_state]` in the selected user config is runtime state written by
-  `/model`, `/agents`, `/suggest`, voice controls, and other UI choices.
-  tcode changes only this table through a comment-preserving `toml_edit`
-  read-modify-write; do not use it for normal handwritten defaults. The single
+  `/model`, `/agents`, `/suggest`, permission-mode and voice controls,
+  `/dogfood`, and folder-trust choices. It stores the active
+  profile/model/effort/preset, ad-hoc agent pins, UI toggles, and the
+  machine-local `folder_trust` map keyed by canonical folder path. tcode changes
+  only this table through a comment-preserving `toml_edit` read-modify-write;
+  do not use it for normal handwritten defaults or project policy. The single
   exception is `/model save`, which adds or replaces one `[presets.<name>]`
-  table the same way.
+  table the same way. `unsafe` mode is deliberately never persisted, so a
+  one-off unsafe session cannot arm later sessions.
 - `.tcode/config.toml` is the project overlay. It is appropriate for
-  project-specific profiles, sub-agent pins, permissions, hooks, and MCP
+  project-specific profiles, model catalog entries, presets, non-`auto`
+  sub-agent pins, permission rules, instruction discovery, hooks, and MCP
   servers. Do not put credentials in a repository configuration file.
 - Built-in defaults load first, then the selected user file, then the project
   overlay. Profile entries merge by name; a model entry with the same `name`
-  replaces its catalog entry. Project configuration cannot set `[tcode_state]`.
+  replaces its catalog entry. Project configuration cannot set `[tcode_state]`,
+  `[auto_mode]`, `[watchdog]`, `[limits]`, `[ui]`, `[voice]`, or
+  `[permissions].mode`; it can append `allow`/`ask`/`deny` permission rules.
+  Hooks append across layers, while a project MCP server with the same name
+  replaces the user server. `instructions.directory_candidates`, when supplied
+  by a higher layer, replaces the complete candidate list rather than merging.
 
 For the initial selection, CLI `--profile` / `--model` win over saved runtime
 state; `[tcode_state]` wins over `config.toml` defaults. Start a one-off run
@@ -234,8 +244,10 @@ another profile. So a brand-new profile (one not in the catalog) must declare
 
 ## Watchdog and retries
 
-`[watchdog]` controls provider request recovery. The defaults are intentionally
-conservative: avoid reducing them merely because a healthy request is faster.
+`[watchdog]` controls provider request recovery. It is read only from the
+selected user configuration; a project overlay cannot shorten another user's
+request deadlines. The defaults are intentionally conservative: avoid reducing
+them merely because a healthy request is faster.
 
 ```toml
 [watchdog]
@@ -253,12 +265,16 @@ of this time. `max_retries` is the retry limit. Backoff starts at
 `initial_backoff_ms`, doubles for each retry, and is capped by
 `max_backoff_ms`.
 
-## Sub-agent model pins
+## Sub-agent and helper-model pins
 
-`[agents.<kind>]` pins a delegated agent or auxiliary role to a model. Omitted
-fields inherit the current main model. A pin can name a profile, a model, and
-an effort; a bare model is resolved against the profile that offers it when
-possible.
+`[agents.<kind>]` pins a delegated task agent or helper role to a model.
+Omitted model fields inherit the current main model. The task-agent kinds are
+`explore`, `plan`, `general`, and `orchestrator`; helper roles are `auto`,
+`compact`, `suggest`, `vision`, and opt-in `fetch` (shown as `web-fetch` in the
+picker). `compact` summarizes history, so pinning it to a less expensive model
+can reduce compaction cost. Keep `auto` and `suggest` on a small, inexpensive
+model if explicitly pinning them: they are convenience requests, not the main
+coding session.
 
 ```toml
 [agents.explore]
@@ -270,13 +286,16 @@ effort = "low"
 profile = "anthropic"
 model = "claude-sonnet-5"
 
+[agents.compact]
+model = "gpt-5.6-luna"
+
 [agents.fetch]
 enabled = true # opt in to web_fetch(prompt = "...") using the main model
 ```
 
-A pin may also be written as a single string instead of a table: `"off"` (same
-as `enabled = false`), `"inherit"` (same as `enabled = true`), or a bare model
-name (same as `model = "..."`). This is the readable form for a long list:
+A pin may also be written as a single string instead of a table: a bare model
+name means `model = "..."`; `"inherit"` means `enabled = true` with no model
+pin; and `"off"` means `enabled = false`.
 
 ```toml
 [agents]
@@ -284,6 +303,13 @@ explore = "gpt-5.6-luna"
 suggest = "inherit"
 fetch = "off"
 ```
+
+Only `fetch` is off by default and can be disabled by `"off"` or
+`enabled = false`. For task agents and the inheriting helper roles (`auto`,
+`compact`, `suggest`, and `vision`), those forms merely remove a configured
+pin: the capability remains available and resolves to the main model. Conversely,
+`fetch = "inherit"` or `enabled = true` explicitly enables its summarizer with
+the main model.
 
 A pin is the standing default. For a one-off, the model can also override a
 single delegation's model and effort at spawn time — e.g. when you say "explore
@@ -295,13 +321,7 @@ the pins below remain the durable setting.
 
 `/agents` lists and changes these assignments interactively; those choices are
 persisted in `[tcode_state]` in the selected config and override both
-`[agents.*]` and the active preset. Builtin task kinds are
-`explore`, `plan`, `general`, and `orchestrator` (a tool-less coordinator that
-only delegates to the other kinds; pin it to an inexpensive model). Auxiliary
-roles include `auto`, `suggest`,
-`vision`, and opt-in `fetch` (shown as `web-fetch` in the picker). Keep `auto`
-and `suggest` on a small, inexpensive model if explicitly pinning them: they
-are convenience requests, not the main coding session.
+`[agents.*]` and the active preset.
 
 ## Presets: named model line-ups
 
@@ -441,7 +461,7 @@ max_steps_per_turn = 500
 shell_output_filters = true
 
 [ui]
-suggest_next = true
+suggest_next = false # default; true makes one small auxiliary request per turn
 show_reasoning = false
 
 [voice]
@@ -456,6 +476,14 @@ only; shell and other non-edit actions still require approval. `unsafe` bypasses
 routine prompts but deny rules still apply. Prefer `default` or `accept-edits`
 for normal work.
 
+The effective permission mode is `--mode` (when supplied), then
+`[tcode_state].mode`, then the selected user's `[permissions].mode`. The TUI
+persists modes chosen interactively except `unsafe`; remove or change the state
+through the mode picker if a hand-written default appears ignored. A project
+`.tcode/config.toml` may append `allow`, `ask`, and `deny` rules, but its
+`[permissions].mode` is ignored so a checked-out repository cannot choose the
+user's approval posture.
+
 `auto_compact` enables automatic history compaction; set it to `false` only if
 you intentionally manage compaction with `/compact`. `auto_compact_percent` is
 the context occupancy threshold and is clamped to `1..=100`. `tool_output_tokens`
@@ -465,13 +493,15 @@ an agent definition's targeted `gatesOutput: false` only for a final report the
 parent genuinely needs whole. `max_steps_per_turn` limits the main agent's model
 round-trips; a custom agent's `maxTurns` is separate. `shell_output_filters`
 (default `true`) turns the declarative shell output filters on or off; see
-"Shell output filters" below. Like every other `[limits]` field it is read from
-the **user's** config only — a project's `.tcode/config.toml` cannot re-enable
-filtering you turned off.
+"Shell output filters" below. Every `[limits]` field is read from the user's
+config only — a project's `.tcode/config.toml` cannot change a limit or
+re-enable filtering you turned off.
 
 `ui.suggest_next` controls the post-turn next-prompt guess and costs one small
-auxiliary request per turn. `ui.show_reasoning` only displays provider reasoning
-summaries; it does not change provider behaviour.
+auxiliary request per turn; its default is `false`, and `[tcode_state].suggestions`
+from `/suggest` takes precedence when present. `ui.show_reasoning` only displays
+provider reasoning summaries; it does not change provider behaviour. Like the
+other `[ui]` fields, both are read only from the selected user configuration.
 
 ## Voice input
 
@@ -565,15 +595,25 @@ so it never has to be guessed.
 
 `[auto_mode]` is global-only safety configuration: project overlays cannot
 loosen it. Its values are natural-language rules supplied to the safety
-classifier, not descriptor patterns:
+classifier, not descriptor patterns. The classifier timing and retry fields are
+also global because a project must not weaken or stall the user's approval path:
 
 ```toml
 [auto_mode]
 hard_deny = ["Never deploy or publish anything."]
 soft_deny = ["Avoid modifying CI configuration unless the user explicitly asks."]
 allow = ["Creating files inside the session scratch directory is allowed."]
+fast_timeout_secs = 10
+reasoned_timeout_secs = 20
+retry_count = 1
 trusted_read_hosts = ["api.github.com", "raw.githubusercontent.com"]
 ```
+
+`fast_timeout_secs` is the end-to-end deadline for the classifier's fast
+ALLOW/BLOCK stage; `reasoned_timeout_secs` is the deadline for its explanatory
+verdict stage. Both default to the values above and are clamped to at least one
+second. `retry_count` is retries after a failed stage, defaults to `1`, and is
+capped at `1`; total attempts are therefore `retry_count + 1` (at most two).
 
 `hard_deny` rules cannot be overridden. `soft_deny` rules may be overridden by
 specific user intent; `allow` adds exceptions to those soft denials.
@@ -585,8 +625,10 @@ Auto Mode safety decisions.
 ## Hooks
 
 Hooks run an external command around matching tool calls in the project working
-directory. Each hook receives a JSON object on stdin with `event`, `tool`,
-`input`, `output`, and `cwd`; stdout is discarded and stderr is reported.
+directory. They may be declared in either user or project configuration and
+append across layers, so a project hook does not replace a personal hook. Each
+hook receives a JSON object on stdin with `event`, `tool`, `input`, `output`,
+and `cwd`; stdout is discarded and stderr is reported.
 
 ```toml
 [[hooks]]
@@ -615,8 +657,9 @@ env = { LOG_LEVEL = "info" }
 Use the server's documented command and arguments. `env` values are passed
 literally; tcode does not expand `${...}` there. Prefer launching through a
 small wrapper or setting the real environment in the parent process when a
-server needs secrets. MCP tools register as `mcp__github__<tool>` and can be
-selected in agent tool policies.
+server needs secrets. MCP servers may be declared in user or project config;
+a project entry with the same server name replaces the user entry. MCP tools
+register as `mcp__github__<tool>` and can be selected in agent tool policies.
 
 For a project skill, add `.tcode/skills/<name>/SKILL.md`; for a personal one,
 use `~/.tcode/skills/<name>/SKILL.md`. A skill begins with `name` and

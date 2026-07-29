@@ -4596,3 +4596,47 @@ async fn progress_state_never_reaches_the_cached_prefix() {
     assert_eq!(progress.state(), tcode_core::ProgressState::Draft);
     assert!(progress.summary().contains("Ship it"));
 }
+
+/// Approving a plan without handing it to a fresh session must leave the model
+/// running: the approval is the go-ahead, so the turn that carried it has to
+/// continue into execution rather than end on the tool result.
+#[tokio::test]
+async fn approving_a_plan_in_this_session_keeps_the_turn_going() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "progress",
+            r#"{"title":"Ship it","state":"draft","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
+        ),
+        tool_use(
+            "t2",
+            "progress",
+            r#"{"state":"active","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
+        ),
+        tool_use(
+            "t3",
+            "progress",
+            r#"{"phases":[{"phase":"one","status":"in_progress"}]}"#,
+        ),
+        text_done("executing"),
+    ]);
+    let agent = progress_agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "/plan it").await;
+
+    let results = tool_results(&session);
+    assert_eq!(
+        results.len(),
+        3,
+        "the model must get to work after approval: {results:?}"
+    );
+    // A bare phase count reads like the end of the task the user asked for
+    // ("plan this, submit it"), which is how an approved plan ends up with
+    // nothing happening next.
+    assert!(results[1].0.contains("cleared to execute"), "{results:?}");
+    assert!(results[2].0.contains("Now starting"), "{results:?}");
+}

@@ -836,6 +836,17 @@ pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, S
     let (done, total) = progress.counts();
     let state = progress.state();
     let mut result = format!("{} · {done}/{total} phases done", state.label());
+    // An approval is a go-ahead, and this result is the only thing the model
+    // reads after it. Left as a bare phase count it reads like the end of the
+    // task it was asked to do — draft a plan, submit it — so the model stops
+    // exactly where the user expected it to start. (The other approval route,
+    // handing the plan to a fresh session, says this in that session's opening
+    // instruction; this is the same sentence for staying put.)
+    if submitted.is_some() {
+        result.push_str(
+            "\n\nApproved — you are cleared to execute this plan now. Start with its first phase: mark it in_progress in your next `progress` call and begin the work.",
+        );
+    }
     if let Some(entered) = entered {
         result.push_str("\n\nNow starting — ");
         result.push_str(&entered);

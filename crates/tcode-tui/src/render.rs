@@ -454,12 +454,49 @@ impl ToolRenderer for ProgressRenderer {
         }
     }
 
-    fn body(&self, input: &Value) -> Vec<Line<'static>> {
-        match submitted_plan(input) {
-            Some(plan) => crate::markdown::Renderer::default().render(plan.trim()),
-            None => Vec::new(),
-        }
+    /// Folded, not inline. Once the plan is approved it also lives in the
+    /// progress pane, which is where the phase list belongs; repeating it in
+    /// the transcript as a column of accent headings says nothing new and
+    /// drowns out the reasoning. Folded, the header alone marks the moment,
+    /// and opening it gives the whole document.
+    fn initial_detail(&self, input: &Value) -> Vec<Line<'static>> {
+        plan_block(input)
     }
+
+    /// The one moment the reviewer must see it without asking.
+    fn approval_detail(&self, input: &Value) -> Vec<Line<'static>> {
+        plan_block(input)
+    }
+}
+
+fn plan_block(input: &Value) -> Vec<Line<'static>> {
+    match submitted_plan(input) {
+        Some(plan) => crate::markdown::Renderer::default().render(&demote_headings(plan.trim())),
+        None => Vec::new(),
+    }
+}
+
+/// Push every heading down one level for display. A phase is a row in a
+/// document here, not a section of one: rendered at their authored depth the
+/// phase titles take the accent-and-underline treatment reserved for the top
+/// of a document, and a six-phase plan becomes six banners with the reasoning
+/// between them as an afterthought. The file on disk keeps its own levels —
+/// this is presentation, and the plan is read as a whole.
+fn demote_headings(markdown: &str) -> String {
+    let mut out = String::with_capacity(markdown.len() + 16);
+    let mut fenced = false;
+    for line in markdown.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            fenced = !fenced;
+        }
+        if !fenced && trimmed.starts_with('#') {
+            out.push('#');
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 struct SilentRenderer;
@@ -748,13 +785,26 @@ mod tests {
         assert!(ProgressRenderer
             .header("progress", &submission, None)
             .contains("Rewrite the resume path"));
-        assert!(!ProgressRenderer.body(&submission).is_empty());
+        // The plan is foldable, not inline: the phase list is the progress
+        // pane's job, and the reviewer still gets the whole document while the
+        // approval dialog is open.
+        assert!(ProgressRenderer.body(&submission).is_empty());
+        assert!(!ProgressRenderer.initial_detail(&submission).is_empty());
+        assert!(!ProgressRenderer.approval_detail(&submission).is_empty());
 
         // Retired `exit_plan` calls carry the body itself, not phases.
         let legacy = json!({ "plan": "# Do it
 
 body" });
         assert_eq!(ProgressRenderer.route_for(&legacy), CallRoute::Transcript);
+    }
+
+    #[test]
+    fn plan_headings_are_demoted_for_display_but_fences_are_left_alone() {
+        let plan = "## [ ] 1. One\nwhy\n\n```\n# not a heading\n```\n";
+        let shown = demote_headings(plan);
+        assert!(shown.contains("### [ ] 1. One"), "{shown}");
+        assert!(shown.contains("\n# not a heading\n"), "{shown}");
     }
 
     #[test]
