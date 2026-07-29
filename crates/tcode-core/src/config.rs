@@ -428,6 +428,17 @@ impl Default for UiConfig {
     }
 }
 
+/// `[instructions]`: human-maintained instruction discovery.
+///
+/// `None` retains tcode's built-in per-directory candidates. An explicit empty
+/// list disables that discoverer while leaving `.tcode/rules/**/*.md` active.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InstructionsConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory_candidates: Option<Vec<String>>,
+}
+
 /// Which key holds the microphone open.
 ///
 /// There are three because no single choice survives every setup: `ctrl+space`
@@ -805,6 +816,7 @@ pub struct Config {
     pub permissions: PermissionsConfig,
     pub auto_mode: AutoModeConfig,
     pub ui: UiConfig,
+    pub instructions: InstructionsConfig,
     pub voice: VoiceConfig,
     pub profiles: BTreeMap<String, Profile>,
     /// Known-model catalog, keyed by model id. A profile that lists a model by
@@ -1144,6 +1156,9 @@ impl Config {
         self.permissions.allow.extend(over.permissions.allow);
         self.permissions.ask.extend(over.permissions.ask);
         self.permissions.deny.extend(over.permissions.deny);
+        if over.instructions.directory_candidates.is_some() {
+            self.instructions.directory_candidates = over.instructions.directory_candidates;
+        }
         self.hooks.extend(over.hooks);
         self.mcp_servers.extend(over.mcp_servers);
         // Catalog entries replace by key (a layer may redefine a known model's
@@ -2319,6 +2334,33 @@ context_window = 300000
             .unwrap(),
         );
         assert_eq!(config.models["team-model"].context_window, Some(300_000));
+    }
+
+    #[test]
+    fn project_instruction_candidates_replace_user_candidates() {
+        let mut config = Config::defaults();
+        config.overlay(
+            toml::from_str(
+                r#"
+[instructions]
+directory_candidates = ["USER_RULES.md"]
+"#,
+            )
+            .unwrap(),
+        );
+        config.overlay(
+            toml::from_str(
+                r#"
+[instructions]
+directory_candidates = ["PROJECT_RULES.md"]
+"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            config.instructions.directory_candidates,
+            Some(vec!["PROJECT_RULES.md".into()])
+        );
     }
 
     #[test]

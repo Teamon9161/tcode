@@ -177,7 +177,11 @@ impl App {
                 session.ledger = resumed.ledger;
                 session.ledger.attach_sink(Box::new(resumed.store));
                 session.bind_scratch_session(&imported_id);
-                let opening = opening_context(&session.tool_ctx.cwd, &session.tool_ctx.scratch_dir);
+                let opening = opening_context(
+                    &session.tool_ctx.cwd,
+                    &session.tool_ctx.scratch_dir,
+                    &session.tool_ctx.instruction_discovery,
+                );
                 session.set_startup_context(opening);
                 session.sync_environment(environment(&session.tool_ctx.cwd), None);
                 self.scratch_dir = session.tool_ctx.scratch_dir.clone();

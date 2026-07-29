@@ -315,6 +315,9 @@ pub struct ToolCtx {
     pub blobs: Mutex<BlobStore>,
     pub background: Mutex<BackgroundTasks>,
     pub memory: Mutex<crate::memory::MemoryManager>,
+    /// Session-stable instruction discovery policy reused by `/cd` and
+    /// delegated agents.
+    pub instruction_discovery: crate::memory::InstructionDiscovery,
     /// The model active for this invocation. Tools may use its capabilities
     /// without owning model selection or provider construction.
     pub model: Option<ModelCell>,
@@ -355,8 +358,25 @@ fn ephemeral_session_id() -> String {
 
 impl ToolCtx {
     pub fn new(cwd: PathBuf, output_budget_tokens: usize) -> Self {
+        Self::new_with_discovery(
+            cwd,
+            output_budget_tokens,
+            crate::memory::InstructionDiscovery::default(),
+        )
+    }
+
+    pub fn new_with_discovery(
+        cwd: PathBuf,
+        output_budget_tokens: usize,
+        instruction_discovery: crate::memory::InstructionDiscovery,
+    ) -> Self {
         let scratch_dir = crate::store::session_scratchpad_dir(&cwd, &ephemeral_session_id());
-        Self::with_scratch_dir(cwd, output_budget_tokens, scratch_dir)
+        Self::with_scratch_dir_and_discovery(
+            cwd,
+            output_budget_tokens,
+            scratch_dir,
+            instruction_discovery,
+        )
     }
 
     /// Like `new`, but with this process's harness state redirected into a
@@ -378,7 +398,22 @@ impl ToolCtx {
         output_budget_tokens: usize,
         scratch_dir: PathBuf,
     ) -> Self {
-        let memory = crate::memory::MemoryManager::new(&cwd);
+        Self::with_scratch_dir_and_discovery(
+            cwd,
+            output_budget_tokens,
+            scratch_dir,
+            crate::memory::InstructionDiscovery::default(),
+        )
+    }
+
+    pub fn with_scratch_dir_and_discovery(
+        cwd: PathBuf,
+        output_budget_tokens: usize,
+        scratch_dir: PathBuf,
+        instruction_discovery: crate::memory::InstructionDiscovery,
+    ) -> Self {
+        let memory =
+            crate::memory::MemoryManager::new_with_discovery(&cwd, instruction_discovery.clone());
         // Sweep every session's stale files from the shared parent; this run's
         // blobs and background logs then stay inside its own child directory.
         crate::store::sweep_scratchpad(&crate::store::scratchpad_dir(&cwd));
@@ -393,6 +428,7 @@ impl ToolCtx {
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
+            instruction_discovery,
             model: None,
             task_traces: Arc::new(Mutex::new(TaskTraces::default())),
             output_budget_tokens,

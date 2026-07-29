@@ -118,7 +118,7 @@ fn config() -> crate::TuiConfig {
         fresh_session: crate::FreshSession(Arc::new(|| {
             Err("no fresh session factory in tests".into())
         })),
-        opening_context: Arc::new(|cwd: &Path, _| tcode_core::StartupContext {
+        opening_context: Arc::new(|cwd: &Path, _, _| tcode_core::StartupContext {
             text: String::new(),
             environment: environment(cwd),
         }),

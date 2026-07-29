@@ -211,6 +211,4 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 ## 改进
 1. claude-code rules?
 2. gpt订阅有图片生成模型吗
-3. voice另外开版本?不然每次tcode升级都要重下不合理,因为voice其实没更新.
-4. update_progress如果之前中断后(比如compact了)后面还会记得吗.sub-agent是不是也默认不应该用update_progress, 这个tool是不是也要默认排除
-5. acp支持
+3. acp支持

@@ -62,8 +62,17 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
         environment,
     } = spec;
 
+    let instruction_discovery = tcode_core::memory::InstructionDiscovery::from_config(
+        config.instructions.directory_candidates.as_deref(),
+    )
+    .map_err(anyhow::Error::msg)?;
     let mut session = Session::new(
-        ToolCtx::new(cwd.clone(), config.limits.tool_output_tokens).with_model(model_cell),
+        ToolCtx::new_with_discovery(
+            cwd.clone(),
+            config.limits.tool_output_tokens,
+            instruction_discovery,
+        )
+        .with_model(model_cell),
         mode,
         rules,
     );
@@ -79,7 +88,11 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
     // Persistence: every ledger mutation is recorded to a JSONL session log;
     // resume replays it.
     let Some(data_dir) = tcode_core::store::project_data_dir(&cwd) else {
-        session.set_startup_context((opening_context)(&cwd, &session.tool_ctx.scratch_dir));
+        session.set_startup_context((opening_context)(
+            &cwd,
+            &session.tool_ctx.scratch_dir,
+            &session.tool_ctx.instruction_discovery,
+        ));
         return Ok(session);
     };
     // Before this run's log exists, so the empty log we are about to create is
@@ -103,8 +116,13 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
             session.ledger = ledger;
             session.ledger.attach_sink(Box::new(store));
             session.bind_scratch_session(&session_id);
-            let startup =
-                startup.unwrap_or_else(|| (opening_context)(&cwd, &session.tool_ctx.scratch_dir));
+            let startup = startup.unwrap_or_else(|| {
+                (opening_context)(
+                    &cwd,
+                    &session.tool_ctx.scratch_dir,
+                    &session.tool_ctx.instruction_discovery,
+                )
+            });
             session.restore_startup_context(startup, previous_environment, delivered_environment);
             session.sync_environment((environment)(&cwd), None);
         }
@@ -116,7 +134,11 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
                 CheckpointStore::new(data_dir.join("checkpoints").join(&session_id));
             session.ledger.attach_sink(Box::new(store));
             session.bind_scratch_session(&session_id);
-            session.set_startup_context((opening_context)(&cwd, &session.tool_ctx.scratch_dir));
+            session.set_startup_context((opening_context)(
+                &cwd,
+                &session.tool_ctx.scratch_dir,
+                &session.tool_ctx.instruction_discovery,
+            ));
         }
     }
     Ok(session)

@@ -29,8 +29,10 @@ use crate::types::Usage;
 
 /// Rebuild cwd-specific startup context when `/cd` runs before any
 /// model-visible history exists. The second argument is the current session's
-/// private scratch root and remains stable across `/cd`.
-pub type OpeningContextFn = Arc<dyn Fn(&Path, &Path) -> StartupContext + Send + Sync>;
+/// private scratch root and remains stable across `/cd`; the third argument
+/// carries the session's configured instruction-discovery policy.
+pub type OpeningContextFn =
+    Arc<dyn Fn(&Path, &Path, &crate::memory::InstructionDiscovery) -> StartupContext + Send + Sync>;
 /// Capture live harness facts for a runtime environment diff. Core owns the
 /// comparison and ledger mutation; the frontend/tools own platform probing.
 pub type EnvironmentFn = Arc<dyn Fn(&Path) -> EnvironmentSnapshot + Send + Sync>;
@@ -224,7 +226,7 @@ pub(crate) fn test_ctx_parts() -> (Session, OpeningContextFn, EnvironmentFn) {
         PermissionMode::Default,
         PermissionRules::default(),
     );
-    let opening: OpeningContextFn = Arc::new(|_, _| StartupContext {
+    let opening: OpeningContextFn = Arc::new(|_, _, _| StartupContext {
         text: String::new(),
         environment: EnvironmentSnapshot {
             cwd: String::new(),

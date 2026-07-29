@@ -1009,9 +1009,14 @@ impl AgentTool {
             .map(|permissions| (permissions.mode, permissions.rules))
             .unwrap_or_else(|| (PermissionMode::Auto, PermissionRules::default()));
         let session = Session::new(
-            ToolCtx::with_scratch_dir(ctx.cwd.clone(), self.output_budget, ctx.scratch_dir.clone())
-                .with_model(model)
-                .with_task_traces(ctx.task_traces.clone()),
+            ToolCtx::with_scratch_dir_and_discovery(
+                ctx.cwd.clone(),
+                self.output_budget,
+                ctx.scratch_dir.clone(),
+                ctx.instruction_discovery.clone(),
+            )
+            .with_model(model)
+            .with_task_traces(ctx.task_traces.clone()),
             mode,
             rules,
         )

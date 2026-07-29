@@ -46,7 +46,7 @@ pub use home::{home_dir, TCODE_HOME};
 pub use hooks::{HookDef, HookEvent, Hooks};
 pub use import::import_entries;
 pub use ledger::{Entry, Ledger, LedgerSink, SKILL_ECHO_OPEN};
-pub use memory::{MemoryManager, MemoryUpdate};
+pub use memory::{InstructionDiscovery, MemoryManager, MemoryUpdate};
 pub use permission::{
     Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk, PermissionMode, PermissionRules,
 };

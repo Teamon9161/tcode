@@ -795,6 +795,50 @@ async fn new_directory_instructions_block_only_their_mutations() {
 }
 
 #[tokio::test]
+async fn newly_discovered_native_rule_blocks_every_matching_mutation_in_a_batch() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".git")).unwrap();
+    std::fs::create_dir_all(root.path().join(".tcode/rules")).unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(
+        root.path().join(".tcode/rules/rust.md"),
+        "---\npaths: \"src/**/*.rs\"\n---\nrust mutation rule",
+    )
+    .unwrap();
+    let first = root.path().join("src/first.rs");
+    let second = root.path().join("src/second.rs");
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            (
+                "t1",
+                "write",
+                &serde_json::json!({ "path": first, "content": "first" }).to_string(),
+            ),
+            (
+                "t2",
+                "write",
+                &serde_json::json!({ "path": second, "content": "second" }).to_string(),
+            ),
+        ]),
+        text_done("rules applied"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(root.path(), PermissionMode::Unsafe);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "write rust files").await;
+
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|(_, is_error)| *is_error), "{results:?}");
+    assert!(results
+        .iter()
+        .all(|(text, _)| text.contains("newly discovered directory-scoped instructions")));
+    assert!(!root.path().join("src/first.rs").exists());
+    assert!(!root.path().join("src/second.rs").exists());
+}
+
+#[tokio::test]
 async fn approval_comment_becomes_note_for_the_model() {
     let dir = tempfile::tempdir().unwrap();
     let provider = MockProvider::new(vec![

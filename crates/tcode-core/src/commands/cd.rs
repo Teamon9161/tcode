@@ -15,8 +15,11 @@ impl SlashCommand for CdCommand {
         match ctx.session.change_cwd(args) {
             Ok(change) => {
                 if change.refresh_opening_context {
-                    let startup =
-                        (ctx.opening_context)(&change.new, &ctx.session.tool_ctx.scratch_dir);
+                    let startup = (ctx.opening_context)(
+                        &change.new,
+                        &ctx.session.tool_ctx.scratch_dir,
+                        &ctx.session.tool_ctx.instruction_discovery,
+                    );
                     ctx.session.set_startup_context(startup);
                 } else if change.changed {
                     let environment = (ctx.environment)(&change.new);
@@ -65,7 +68,7 @@ mod tests {
         session.tool_ctx.cwd = root.canonicalize().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let calls2 = calls.clone();
-        let opening: OpeningContextFn = Arc::new(move |cwd, _| {
+        let opening: OpeningContextFn = Arc::new(move |cwd, _, _| {
             calls2.fetch_add(1, Ordering::SeqCst);
             StartupContext {
                 text: "fresh map".into(),

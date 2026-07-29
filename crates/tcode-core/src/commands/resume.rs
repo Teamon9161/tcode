@@ -40,6 +40,7 @@ impl SlashCommand for ResumeCommand {
                     (ctx.opening_context)(
                         &ctx.session.tool_ctx.cwd,
                         &ctx.session.tool_ctx.scratch_dir,
+                        &ctx.session.tool_ctx.instruction_discovery,
                     )
                 });
                 ctx.session.restore_startup_context(

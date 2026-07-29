@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use globset::{Glob, GlobSetBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::ledger::Entry;
@@ -15,6 +16,60 @@ const MAINTENANCE_INTERVAL_SECS: u64 = 7 * 24 * 60 * 60;
 const SOURCE_MARKER: &str = "tcode-memory-source: ";
 const PROJECT_MARKER: &str = "tcode-memory-project: ";
 const AUTO_MEMORY_SYSTEM: &str = include_str!("../prompts/memory/system.md");
+const DEFAULT_DIRECTORY_CANDIDATES: &[&str] = &[".tcode/AGENTS.md", "AGENTS.md", "CLAUDE.md"];
+
+/// Runtime policy for the legacy per-directory instruction discoverer.
+///
+/// Native `.tcode/rules/**/*.md` discovery is always available; this only
+/// controls which single-file convention wins in each ancestor directory.
+#[derive(Debug, Clone)]
+pub struct InstructionDiscovery {
+    directory_candidates: Vec<PathBuf>,
+}
+
+impl Default for InstructionDiscovery {
+    fn default() -> Self {
+        Self {
+            directory_candidates: DEFAULT_DIRECTORY_CANDIDATES
+                .iter()
+                .map(PathBuf::from)
+                .collect(),
+        }
+    }
+}
+
+impl InstructionDiscovery {
+    pub fn from_config(candidates: Option<&[String]>) -> Result<Self, String> {
+        let Some(candidates) = candidates else {
+            return Ok(Self::default());
+        };
+        let mut normalized = Vec::with_capacity(candidates.len());
+        for raw in candidates {
+            let path = PathBuf::from(raw);
+            if raw.is_empty()
+                || path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                    )
+                })
+            {
+                return Err(format!(
+                    "invalid instructions.directory_candidates entry '{raw}': use a non-empty relative path without '..'"
+                ));
+            }
+            normalized.push(path);
+        }
+        Ok(Self {
+            directory_candidates: normalized,
+        })
+    }
+
+    fn candidates(&self) -> &[PathBuf] {
+        &self.directory_candidates
+    }
+}
 
 #[derive(Debug, Clone)]
 struct Project {
@@ -50,6 +105,7 @@ pub struct MemoryUpdate {
 pub struct MemoryManager {
     home: Option<PathBuf>,
     project: Project,
+    discovery: InstructionDiscovery,
     auto_dir: Option<PathBuf>,
     initial_sources: Vec<PathBuf>,
     loaded_sources: Vec<PathBuf>,
@@ -60,10 +116,23 @@ pub struct MemoryManager {
 
 impl MemoryManager {
     pub fn new(cwd: &Path) -> Self {
-        Self::new_with_home(cwd, crate::home_dir())
+        Self::new_with_discovery(cwd, InstructionDiscovery::default())
     }
 
+    pub fn new_with_discovery(cwd: &Path, discovery: InstructionDiscovery) -> Self {
+        Self::new_with_home_and_discovery(cwd, crate::home_dir(), discovery)
+    }
+
+    #[cfg(test)]
     fn new_with_home(cwd: &Path, home: Option<PathBuf>) -> Self {
+        Self::new_with_home_and_discovery(cwd, home, InstructionDiscovery::default())
+    }
+
+    fn new_with_home_and_discovery(
+        cwd: &Path,
+        home: Option<PathBuf>,
+        discovery: InstructionDiscovery,
+    ) -> Self {
         let cwd = canonical_or_normal(cwd);
         let project = locate_project(&cwd, home.as_deref(), true).unwrap_or_else(|| Project {
             root: cwd.clone(),
@@ -85,8 +154,14 @@ impl MemoryManager {
             if global.is_file() {
                 initial_sources.push(canonical_or_normal(&global));
             }
+            initial_sources.extend(unconditional_rule_sources(
+                &home.join(".tcode").join("rules"),
+            ));
         }
-        initial_sources.extend(instruction_sources(&project.root, &cwd));
+        initial_sources.extend(instruction_sources(&project.root, &cwd, &discovery));
+        initial_sources.extend(unconditional_rule_sources(
+            &project.root.join(".tcode").join("rules"),
+        ));
         if maintenance.enabled {
             if let Some(memory) = auto_dir.as_ref().map(|dir| dir.join("MEMORY.md")) {
                 if memory.is_file() {
@@ -102,6 +177,7 @@ impl MemoryManager {
         Self {
             home,
             project,
+            discovery,
             auto_dir,
             initial_sources,
             loaded_sources,
@@ -200,6 +276,8 @@ impl MemoryManager {
 
     pub fn discover_for_paths(&mut self, paths: &[PathBuf]) -> Option<MemoryUpdate> {
         let mut new_sources = Vec::new();
+        let mut new_rule_keys = HashSet::new();
+        let mut rule_targets = Vec::new();
         let mut new_projects = Vec::new();
         for path in paths {
             let target = canonical_target(path);
@@ -217,12 +295,54 @@ impl MemoryManager {
                 let auto_enabled = self.auto_enabled_for(&project);
                 new_projects.push((project.clone(), project_key, auto_enabled));
             }
+            if first_project_access {
+                for source in unconditional_rule_sources(&project.root.join(".tcode").join("rules"))
+                {
+                    let key = path_key(&source);
+                    if self.loaded_keys.insert(key) {
+                        self.loaded_sources.push(source.clone());
+                        new_sources.push(source);
+                    }
+                }
+            }
             let target_dir = target_directory(&target);
-            for source in instruction_sources(&project.root, &target_dir) {
+            for source in instruction_sources(&project.root, &target_dir, &self.discovery) {
                 let key = path_key(&source);
                 if self.loaded_keys.insert(key) {
                     self.loaded_sources.push(source.clone());
                     new_sources.push(source);
+                }
+            }
+            if let Some(home) = &self.home {
+                for source in matching_rule_sources(
+                    &home.join(".tcode").join("rules"),
+                    &project.root,
+                    &target,
+                ) {
+                    let key = path_key(&source);
+                    if self.loaded_keys.insert(key.clone()) {
+                        self.loaded_sources.push(source.clone());
+                        new_sources.push(source);
+                        new_rule_keys.insert(key.clone());
+                    }
+                    if new_rule_keys.contains(&key) {
+                        rule_targets.push(target.clone());
+                    }
+                }
+            }
+            for source in matching_rule_sources(
+                &project.root.join(".tcode").join("rules"),
+                &project.root,
+                &target,
+            ) {
+                let key = path_key(&source);
+                if self.loaded_keys.insert(key.clone()) {
+                    self.loaded_sources.push(source.clone());
+                    new_sources.push(source);
+                    new_rule_keys.insert(key.clone());
+                }
+                if new_rule_keys.contains(&key) {
+                    rule_targets.push(target.clone());
                 }
             }
             if first_project_access && self.auto_enabled_for(&project) {
@@ -246,8 +366,10 @@ impl MemoryManager {
         let mut affected_roots: Vec<PathBuf> = new_sources
             .iter()
             .filter(|source| source.file_name().is_none_or(|name| name != "MEMORY.md"))
+            .filter(|source| !is_native_rule_path(source))
             .filter_map(|source| instruction_scope(source))
             .collect();
+        affected_roots.extend(rule_targets);
         affected_roots.extend(
             new_projects
                 .iter()
@@ -429,6 +551,13 @@ impl MemoryManager {
     }
 }
 
+fn instruction_text(source: &Path) -> Option<String> {
+    if is_native_rule_path(source) {
+        return parse_rule_file(source).map(|rule| rule.body);
+    }
+    fs::read_to_string(source).ok()
+}
+
 fn append_sources<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBuf>, cap: usize) {
     let start = out.len();
     for source in sources {
@@ -439,7 +568,7 @@ fn append_sources<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBu
             ));
             break;
         }
-        let Ok(text) = fs::read_to_string(source) else {
+        let Some(text) = instruction_text(source) else {
             continue;
         };
         out.push_str(&format!("## {}\n", source.display()));
@@ -503,7 +632,11 @@ fn instruction_scope(source: &Path) -> Option<PathBuf> {
     Some(canonical_or_normal(parent))
 }
 
-fn instruction_sources(root: &Path, target: &Path) -> Vec<PathBuf> {
+fn instruction_sources(
+    root: &Path,
+    target: &Path,
+    discovery: &InstructionDiscovery,
+) -> Vec<PathBuf> {
     if !target.starts_with(root) {
         return Vec::new();
     }
@@ -515,7 +648,7 @@ fn instruction_sources(root: &Path, target: &Path) -> Vec<PathBuf> {
     dirs.reverse();
     let mut sources = Vec::new();
     for dir in dirs {
-        for relative in [".tcode/AGENTS.md", "AGENTS.md", "CLAUDE.md"] {
+        for relative in discovery.candidates() {
             let candidate = dir.join(relative);
             if candidate.is_file() {
                 sources.push(canonical_or_normal(&candidate));
@@ -524,6 +657,119 @@ fn instruction_sources(root: &Path, target: &Path) -> Vec<PathBuf> {
         }
     }
     sources
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum RulePaths {
+    One(String),
+    Many(Vec<String>),
+}
+
+#[derive(Debug, Deserialize)]
+struct RuleFrontmatter {
+    #[serde(default)]
+    paths: Option<RulePaths>,
+}
+
+#[derive(Debug)]
+struct RuleFile {
+    paths: Option<Vec<String>>,
+    body: String,
+}
+
+fn native_rule_files(root: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = Vec::new();
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = fs::read_dir(dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|extension| extension == "md")
+            {
+                files.push(canonical_or_normal(&path));
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn parse_rule_file(path: &Path) -> Option<RuleFile> {
+    let text = fs::read_to_string(path).ok()?;
+    let Some(frontmatter_body) = text
+        .strip_prefix("---\n")
+        .or_else(|| text.strip_prefix("---\r\n"))
+    else {
+        return Some(RuleFile {
+            paths: None,
+            body: text,
+        });
+    };
+    let (frontmatter, body) = frontmatter_body
+        .split_once("\n---\n")
+        .or_else(|| frontmatter_body.split_once("\n---\r\n"))?;
+    let frontmatter: RuleFrontmatter = serde_yaml::from_str(frontmatter).ok()?;
+    let paths = frontmatter.paths.map(|paths| match paths {
+        RulePaths::One(path) => vec![path],
+        RulePaths::Many(paths) => paths,
+    });
+    Some(RuleFile {
+        paths,
+        body: body.to_string(),
+    })
+}
+
+fn unconditional_rule_sources(root: &Path) -> Vec<PathBuf> {
+    native_rule_files(root)
+        .into_iter()
+        .filter(|path| parse_rule_file(path).is_some_and(|rule| rule.paths.is_none()))
+        .collect()
+}
+
+fn matching_rule_sources(rule_root: &Path, project_root: &Path, target: &Path) -> Vec<PathBuf> {
+    let Ok(relative) = target.strip_prefix(project_root) else {
+        return Vec::new();
+    };
+    let relative = relative.to_string_lossy().replace('\\', "/");
+    native_rule_files(rule_root)
+        .into_iter()
+        .filter(|path| {
+            let Some(rule) = parse_rule_file(path) else {
+                return false;
+            };
+            let Some(patterns) = rule.paths else {
+                return false;
+            };
+            let mut builder = GlobSetBuilder::new();
+            for pattern in patterns {
+                let Ok(glob) = Glob::new(&pattern) else {
+                    return false;
+                };
+                builder.add(glob);
+            }
+            builder.build().is_ok_and(|set| set.is_match(&relative))
+        })
+        .collect()
+}
+
+fn is_native_rule_path(path: &Path) -> bool {
+    let mut components = path.components();
+    while let Some(component) = components.next() {
+        if matches!(component, Component::Normal(name) if name == ".tcode")
+            && matches!(components.next(), Some(Component::Normal(name)) if name == "rules")
+        {
+            return true;
+        }
+    }
+    false
 }
 
 fn locate_project(path: &Path, home: Option<&Path>, implicit: bool) -> Option<Project> {
@@ -940,6 +1186,103 @@ mod tests {
 
         let reminder = manager.maintenance_reminder();
         assert!(reminder.is_some());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_path_rules_load_lazily_and_never_scan_claude_rules() {
+        let base = temp("native-path-rules");
+        let home = base.join("home");
+        let root = base.join("repo");
+        let target = root.join("src/app.py");
+        fs::create_dir_all(home.join(".tcode/rules")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".tcode/rules")).unwrap();
+        fs::create_dir_all(root.join(".claude/rules")).unwrap();
+        fs::write(home.join(".tcode/rules/global.md"), "global rule").unwrap();
+        fs::write(
+            root.join(".tcode/rules/python.md"),
+            "---\npaths: \"**/*.py\"\n---\npython body",
+        )
+        .unwrap();
+        fs::write(root.join(".claude/rules/ignored.md"), "must not load").unwrap();
+
+        let mut manager = MemoryManager::new_with_home(&root, Some(home));
+        let startup = manager.startup_prompt();
+        assert!(startup.contains("global rule"));
+        assert!(!startup.contains("python body"));
+        assert!(!startup.contains("must not load"));
+
+        let update = manager
+            .discover_for_paths(std::slice::from_ref(&target))
+            .unwrap();
+        assert!(update.note.contains("python body"));
+        assert!(!update.note.contains("paths:"));
+        assert_eq!(update.affected_roots, vec![canonical_or_normal(&target)]);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn newly_discovered_native_rule_marks_every_matching_target_in_a_batch() {
+        let base = temp("native-rule-batch-targets");
+        let home = base.join("home");
+        let root = base.join("repo");
+        let first = root.join("src/first.rs");
+        let second = root.join("src/second.rs");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".tcode/rules")).unwrap();
+        fs::write(
+            root.join(".tcode/rules/rust.md"),
+            "---\npaths: \"src/**/*.rs\"\n---\nrust rule",
+        )
+        .unwrap();
+
+        let mut manager = MemoryManager::new_with_home(&root, Some(home));
+        let update = manager
+            .discover_for_paths(&[first.clone(), second.clone()])
+            .unwrap();
+
+        assert!(update.note.contains("rust rule"));
+        assert_eq!(
+            update.affected_roots,
+            vec![canonical_or_normal(&first), canonical_or_normal(&second)]
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn native_unconditional_rules_load_at_startup_before_project_rules() {
+        let base = temp("native-unconditional-rules");
+        let home = base.join("home");
+        let root = base.join("repo");
+        fs::create_dir_all(home.join(".tcode/rules")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(root.join(".tcode/rules")).unwrap();
+        fs::write(home.join(".tcode/rules/base.md"), "user rule").unwrap();
+        fs::write(root.join(".tcode/rules/project.md"), "project rule").unwrap();
+
+        let manager = MemoryManager::new_with_home(&root, Some(home));
+        let startup = manager.startup_prompt();
+        assert!(startup.find("user rule").unwrap() < startup.find("project rule").unwrap());
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn configured_directory_candidates_replace_the_builtin_order() {
+        let base = temp("configured-candidates");
+        let home = base.join("home");
+        let root = base.join("repo");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::write(root.join("AGENTS.md"), "builtin candidate").unwrap();
+        fs::write(root.join("TEAM_RULES.md"), "configured candidate").unwrap();
+        let configured = InstructionDiscovery::from_config(Some(&["TEAM_RULES.md".into()]))
+            .expect("valid relative candidate");
+
+        let manager = MemoryManager::new_with_home_and_discovery(&root, Some(home), configured);
+        let startup = manager.startup_prompt();
+        assert!(startup.contains("configured candidate"));
+        assert!(!startup.contains("builtin candidate"));
+        assert!(InstructionDiscovery::from_config(Some(&["../escape.md".into()])).is_err());
         let _ = fs::remove_dir_all(base);
     }
 }

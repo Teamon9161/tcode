@@ -8,7 +8,11 @@ use crate::shell;
 /// Build the byte-stable startup context for a new conversation. The scratch
 /// parameter remains in the signature so existing frontends can call it, while
 /// the exact path comes from the stable `${TCODE_SCRATCH_DIR}` substitution.
-pub fn startup_context_with_scratch(cwd: &Path, _scratch: &Path) -> StartupContext {
+pub fn startup_context_with_scratch(
+    cwd: &Path,
+    _scratch: &Path,
+    discovery: &tcode_core::memory::InstructionDiscovery,
+) -> StartupContext {
     let environment = environment_snapshot(cwd);
     let mut out = String::new();
 
@@ -19,7 +23,9 @@ pub fn startup_context_with_scratch(cwd: &Path, _scratch: &Path) -> StartupConte
         ));
     }
 
-    out.push_str(&tcode_core::MemoryManager::new(cwd).startup_prompt());
+    out.push_str(
+        &tcode_core::MemoryManager::new_with_discovery(cwd, discovery.clone()).startup_prompt(),
+    );
     out.push_str(&render_environment(&environment));
     out.push_str(&render_git(&environment.git));
     StartupContext {
@@ -45,7 +51,12 @@ pub fn environment_snapshot(cwd: &Path) -> EnvironmentSnapshot {
 
 /// Compatibility wrapper for callers that only need the text portion.
 pub fn project_map_with_scratch(cwd: &Path, scratch: &Path) -> String {
-    startup_context_with_scratch(cwd, scratch).text
+    startup_context_with_scratch(
+        cwd,
+        scratch,
+        &tcode_core::memory::InstructionDiscovery::default(),
+    )
+    .text
 }
 
 /// Convenience wrapper for callers that do not own a live `ToolCtx`.
@@ -240,8 +251,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_context_uses_the_session_instruction_discovery_policy() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "default instructions").unwrap();
+        std::fs::write(root.path().join("TEAM.md"), "configured instructions").unwrap();
+        let discovery =
+            tcode_core::memory::InstructionDiscovery::from_config(Some(&["TEAM.md".into()]))
+                .unwrap();
+
+        let context = startup_context_with_scratch(root.path(), Path::new("/scratch"), &discovery);
+
+        assert!(context.text.contains("configured instructions"));
+        assert!(!context.text.contains("default instructions"));
+    }
+
+    #[test]
     fn startup_context_ends_with_environment_and_git_blocks() {
-        let context = startup_context_with_scratch(Path::new("."), Path::new("/scratch"));
+        let context = startup_context_with_scratch(
+            Path::new("."),
+            Path::new("/scratch"),
+            &tcode_core::memory::InstructionDiscovery::default(),
+        );
         let environment = context.text.rfind("# Environment").unwrap();
         let git = context.text.rfind("# Git").unwrap();
         assert!(environment < git);

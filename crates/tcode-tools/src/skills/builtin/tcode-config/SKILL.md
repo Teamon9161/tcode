@@ -57,6 +57,51 @@ unrelated profiles and user comments. If a saved `/model` or `/agents` choice
 appears to defeat the new default, explain that it lives in `[tcode_state]` and
 use the interactive picker to change it rather than deleting state blindly.
 
+## Project instruction discovery
+
+`tcode` loads human-maintained instructions from two sources. Its native
+path-scoped rules live under `~/.tcode/rules/**/*.md` and
+`<project>/.tcode/rules/**/*.md`; user rules load first and project rules load
+afterward. Rule files use Claude Code-compatible Markdown frontmatter, but
+`tcode` never scans `.claude/rules/` automatically. Copy a rule into
+`.tcode/rules/` to use it.
+
+```md
+---
+paths:
+  - "src/**/*.py"
+  - "pyproject.toml"
+---
+
+- Use the repository's existing Python toolchain.
+- Update tests when behavior changes.
+```
+
+`paths` accepts one glob string or a list and matches project-root-relative
+paths. A rule with `paths` loads when a tool targets a match; a plain Markdown
+rule or a rule without `paths` loads at startup. Invalid frontmatter or globs
+are ignored. Only the Markdown body becomes an instruction.
+
+The existing root-to-target directory discovery remains enabled by default:
+for each directory, tcode selects the first present file from
+`.tcode/AGENTS.md`, `AGENTS.md`, then `CLAUDE.md`. Change that convention in
+either the selected user config or the project `.tcode/config.toml`:
+
+```toml
+[instructions]
+directory_candidates = [
+  ".tcode/TEAM_RULES.md",
+  "TEAM_RULES.md",
+  "AGENTS.md",
+]
+```
+
+Omit `directory_candidates` to keep the built-in order. An explicit empty list
+disables only this ancestor-file discoverer; `.tcode/rules` still works. A
+higher-precedence configuration layer replaces the complete candidate list.
+Each entry must be a non-empty relative path and cannot contain `..` or an
+absolute path.
+
 ## Profiles and models
 
 Choose a default profile and define profiles under `[profiles.<name>]`.

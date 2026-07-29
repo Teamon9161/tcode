@@ -664,7 +664,10 @@ impl Session {
         // answering from the directory the process happened to start in.
         let scope_notes = self.cwd_scopes.rescope_all(&new);
         if refresh_opening_context {
-            self.tool_ctx.memory = std::sync::Mutex::new(crate::MemoryManager::new(&new));
+            self.tool_ctx.memory = std::sync::Mutex::new(crate::MemoryManager::new_with_discovery(
+                &new,
+                self.tool_ctx.instruction_discovery.clone(),
+            ));
             self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
             return Ok(CwdChange {
                 old,
