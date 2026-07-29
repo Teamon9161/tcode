@@ -4,6 +4,8 @@ import type { ApprovalRequest, SessionInfo, Status } from "../types";
 import type { Block } from "../blocks";
 import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
+import { BLANK, type SessionState } from "../session";
+import { openInspect, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
@@ -327,13 +329,63 @@ const QUESTION: ApprovalRequest = {
   },
 };
 
-const SCENES = ["launchpad", "session", "approval", "question", "empty"] as const;
+/** The second conversation in the split scene. Short on purpose: the point of
+ *  that scene is the layout, and a second full transcript would only compete
+ *  with the first for attention. */
+const OTHER_BLOCKS: Block[] = [
+  { kind: "user", text: "Why is the bond curve loader re-fetching on every call?" },
+  {
+    kind: "assistant",
+    text: "The cache key includes the request timestamp, so no two calls ever hit. Checking where it is built.",
+  },
+  {
+    kind: "tool",
+    callId: "d1",
+    name: "shell",
+    summary: "rg -n 'cache_key' src/duck_ext",
+    input: { command: "rg -n 'cache_key' src/duck_ext" },
+  },
+];
+
+const SCENES = ["launchpad", "session", "approval", "question", "split", "empty"] as const;
 type Scene = (typeof SCENES)[number];
+
+/** One conversation, filling the window. */
+const solo = (): Tiling => single({ kind: "session", session: "a" });
+
+/** Two conversations, one of them looking into a change: `row(row(a, diff), b)`.
+ *  Three panes and a nested split, which is the case worth looking at — an even
+ *  two-up never shows whether the recursion reads correctly. */
+function tiled(): Tiling {
+  const one = solo();
+  const two = split(one, panes(one)[0].id, "row", { kind: "session", session: "b" });
+  return openInspect(two, panes(two)[0].id, "a", { kind: "diff", callId: "t2" });
+}
 
 export function Preview() {
   const [scene, setScene] = useState<Scene>("launchpad");
+  const [tiling, setTiling] = useState<Tiling>(solo);
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Pasted[]>([]);
+
+  const pick = (name: Scene) => {
+    setScene(name);
+    setTiling(name === "split" ? tiled() : solo());
+  };
+
+  const stateOf = (id: string): SessionState =>
+    id === "a"
+      ? {
+          ...BLANK,
+          blocks: scene === "empty" ? [] : BLOCKS,
+          files: scene === "empty" ? [] : FILES,
+          running: scene === "session",
+          approval:
+            scene === "approval" ? APPROVAL : scene === "question" ? QUESTION : null,
+          draft,
+          attachments,
+        }
+      : { ...BLANK, blocks: OTHER_BLOCKS, running: true };
 
   return (
     <ToolMetaProvider meta={TOOL_META}>
@@ -343,7 +395,7 @@ export function Preview() {
             <button
               key={name}
               className={scene === name ? "is-on" : undefined}
-              onClick={() => setScene(name)}
+              onClick={() => pick(name)}
             >
               {name}
             </button>
@@ -361,33 +413,25 @@ export function Preview() {
                   c: "done",
                 })[id] ?? ""
               }
-              onEnter={() => setScene("session")}
-              onOpenFolder={async () => setScene("session")}
+              onEnter={() => pick("session")}
+              onOpenFolder={async () => pick("session")}
             />
           )}
           {scene !== "launchpad" && (
             <Workspace
-              key={scene}
-              session={SESSIONS[0]}
+              tiling={tiling}
               sessions={SESSIONS}
-              blocks={scene === "empty" ? [] : BLOCKS}
-              files={scene === "empty" ? [] : FILES}
-              running={scene === "session"}
-              approval={
-                scene === "approval" ? APPROVAL : scene === "question" ? QUESTION : null
-              }
+              stateOf={stateOf}
               statusOf={(id) => STATUS[id] ?? "idle"}
-              draft={draft}
-              attachments={attachments}
-              onDraft={setDraft}
-              onAttach={(items) => setAttachments((was) => [...was, ...items])}
-              onDetach={(id) => setAttachments((was) => was.filter((item) => item.id !== id))}
+              onTiling={(step) => setTiling(step)}
+              onDraft={(_, value) => setDraft(value)}
+              onAttach={(_, items) => setAttachments((was) => [...was, ...items])}
+              onDetach={(_, id) => setAttachments((was) => was.filter((item) => item.id !== id))}
               onSend={() => {}}
               onInterrupt={() => {}}
-              onAnswer={() => setScene("session")}
-              onSelect={() => {}}
-              onClose={() => {}}
-              onHome={() => setScene("launchpad")}
+              onAnswer={() => pick("session")}
+              onCloseSession={() => {}}
+              onHome={() => pick("launchpad")}
             />
           )}
         </div>

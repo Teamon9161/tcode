@@ -50,6 +50,15 @@ export const ArrowUp = (props: IconProps) => (
   </Glyph>
 );
 
+/** The return key's own glyph. Used where the affordance *is* the key rather
+ *  than a button that happens to be bound to it. */
+export const ReturnIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M19 6v5.5a2 2 0 0 1-2 2H6" />
+    <path d="m9.5 10 -3.5 3.5 3.5 3.5" />
+  </Glyph>
+);
+
 export const StopIcon = (props: IconProps) => (
   <Glyph {...props}>
     <rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor" />

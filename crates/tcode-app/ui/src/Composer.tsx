@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 
 import { imagesFrom, isImagePaste, type Pasted } from "./paste";
-import { ArrowUp, CloseIcon, StopIcon } from "./components/Icons";
+import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
 
 /**
  * The input. One control that changes intent with the turn: send while idle,
@@ -145,25 +145,32 @@ export function Composer({
             }
           }}
         />
+        {/* Inside the field's own box, not a filled button beside it. What sends
+            a message here is the return key; the glyph is a reminder of that
+            and a target for the pointer, so it shows the key rather than
+            inventing a second control with its own colour and weight. It is
+            `--faint` with nothing to send and `--ink` once there is — the state
+            is carried by the same mark getting darker, which is as quiet as a
+            control can be while still being one. */}
         {running ? (
           <button
             type="button"
-            className="btn btn-icon btn-stop"
+            className="composer-key is-stop"
             onClick={onInterrupt}
             aria-label="Stop this turn"
             title="Stop (Esc)"
           >
-            <StopIcon size={15} />
+            <StopIcon size={13} />
           </button>
         ) : (
           <button
             type="submit"
-            className="btn btn-icon btn-primary"
+            className="composer-key"
             disabled={!sendable}
             aria-label="Send"
             title="Send (Enter)"
           >
-            <ArrowUp size={16} />
+            <ReturnIcon size={16} />
           </button>
         )}
       </div>

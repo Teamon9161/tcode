@@ -36,14 +36,22 @@ The neutrals carry `chroma 0.004–0.008` at the brand's own hue, not a default
 warm tint. Hue 130 at that chroma reads as cool paper grey and stays clear of
 the cream/sand band that light AI interfaces settle into.
 
-**Two surfaces, and the step between them is the boundary.** The window frame —
-title bar, rail, side panel — is `--chrome`. The conversation column is `--bg`,
-and it runs unbroken from under the title bar to the bottom edge: transcript,
-approval dock and composer are the same surface, not three panels stacked with
-rules between them. A hairline is only drawn where two regions share a tone
-(rows within a list, a tool call against the transcript). Adding one where the
-tone already changed is what makes a window look assembled out of parts, and it
-is the thing this app was most often accused of.
+**Two surfaces, and the step between them is the boundary.** The window itself
+— title bar, rail, and the field the panes lie on — is `--chrome`. Every pane is
+`--bg`, and inside one the surface runs unbroken from under the pane's header to
+the bottom edge: transcript, approval dock and composer are the same sheet, not
+three panels stacked with rules between them. A hairline is only drawn where two
+regions share a tone (rows within a list, a tool call against the transcript, a
+pane's header against its own body). Adding one where the tone already changed is
+what makes a window look assembled out of parts, and it is the thing this app was
+most often accused of.
+
+**The gutter is the separator, and it is not drawn.** Panes are separated by
+`--gutter` of the window's own chrome showing through — no rules, no borders, no
+shadows. That gap is also the resize handle and the only place a focused pane's
+ring is allowed to land, so it costs nothing and touches nothing. It is the one
+structural idea the split view rests on: a pane is a sheet laid on the window,
+not a region carved out of it.
 
 `--sunken` marks what is inset into a surface: the composer's field, code
 wells, tool output. The composer's field returns to `--bg` on focus, so the
@@ -125,6 +133,17 @@ Prose caps at 72ch. Monospace blocks may run wider.
 An 8px base with a 4px half-step. `--density` scales the whole rhythm, so a
 theme can ship compact or roomy without touching a component.
 
+`--gutter` (4px) is separate from that rhythm on purpose: it is not spacing
+between things on a surface, it is the width of the window showing between two
+sheets. It stays constant when density changes, because a compact theme wants
+tighter padding, not thinner seams.
+
+`--measure` (760px) is the conversation's width, shared by the transcript, the
+approval dock and the composer. It is one token because those three have to
+agree: the dock once carried its own wider number and sat visibly off-axis from
+the very change it was asking about. Anything that lines up with the
+conversation reads the token instead of repeating the figure.
+
 Radii climb with the element's size (`--r-xs` 4px … `--r-lg` 12px) so a pill
 inside a card never looks flatter than its container. Nested cards are banned
 outright; a panel inside a panel gets a hairline, not a second border and
@@ -149,27 +168,81 @@ One shape per job, used everywhere:
 
 - **Button** — three intents (primary ink-filled, secondary outlined on chrome,
   ghost) × one size scale. Every one ships default / hover / focus-visible /
-  active / disabled / loading.
+  active / disabled / loading. Disabled restates its colours (`--sunken` fill,
+  `--faint` text) rather than dropping opacity: a filled ink button at 40%
+  shows the surface through it and reads as mud.
+- **Key affordance** — where the real control is a keystroke, show the key
+  rather than inventing a button beside it. The composer's send is a return
+  glyph inside the field's own box, `--faint` with nothing to send and `--ink`
+  once there is; the state is the same mark getting darker. A filled circle
+  floating next to the field was a second control competing with the one thing
+  on the screen you actually type into.
 - **Status pill** — dot + word, wash background. The only place state color
   appears as a fill.
 - **Card** — used for sessions on the launchpad, where "a discrete resumable
   thing" genuinely is the affordance. Not used for lists, not nested.
 - **Row** — the default list affordance: hairline-separated, hover-tinted, full
   width. Projects, files and sessions in the rail are rows, not cards.
-- **Tool call** — a collapsed hairline block, expandable to full output. Header
-  is mono; body is mono in a `--sunken` well.
+- **Trace row** — every step in the transcript, whatever kind: thinking, one
+  call, a run of reads, a run of edits, a concurrent batch, a delegated
+  sub-agent. Chevron, label, state; expandable, and its contents indent beneath
+  it. No border, no background, no rule between steps — the column's rhythm
+  separates them, and consecutive steps sit closer to each other than to the
+  prose around them. Cards were tried and are wrong here for a structural
+  reason, not a stylistic one: these nest (a group holds calls, a run holds a
+  whole transcript) and nested cards are banned. Rows nest by indentation for as
+  deep as it goes.
+
+  The row's label is our words in the UI face ("run 2 commands"); monospace is
+  reserved for what is literally machine text — the tool's name, the command,
+  the path. That distinction is what keeps the trace from reading as a terminal,
+  which is the product's stated anti-reference.
 - **Empty state** — teaches the surface (what this panel will hold and how to
   put something in it), never "nothing here". It sits on the column's own left
   edge, not centred: it is the first thing in the conversation, and the
   conversation has one axis.
+- **Pane** — a sheet of `--bg` at `--r-sm`, holding a thin header over a body.
+  Every pane wears the same frame whatever is inside it, which is what makes a
+  diff and a conversation read as two of the same thing rather than a panel
+  bolted to the side of the app. The header carries the pane's identity on the
+  left and its actions on the right; it never carries window-level controls.
+  Focus is a 1px `--brand` ring in the gutter, drawn only when more than one
+  pane exists — with one pane, "which is current" is not a question anyone is
+  asking, and answering it anyway spends the state colour on nothing.
 - **Title bar** — the app draws it (`decorations: false`). The thinnest band in
-  the window: back, the session's name and path, the panel toggle, the window
-  buttons. No product mark — the window is already named by the OS and by the
-  word beside it — and no page-level actions; an action that belongs to content
-  goes on the content.
+  the window: back, and the window buttons. Nothing else. It deliberately
+  carries no title: once the window can hold several conversations, naming one
+  of them at window level is a second and sometimes-wrong answer to a question
+  each pane's own header already answers. No product mark either — the window is
+  already named by the OS.
 - **Scrollbars** — the platform's own, thin, and invisible until the pointer is
-  over the region that scrolls. A permanent track beside the side panel reads as
-  a divider nobody drew.
+  over the region that scrolls. A permanent track down a pane's edge reads as a
+  divider nobody drew.
+
+## Keyboard
+
+The window is arranged from the keyboard, and every binding carries `Mod`
+(Ctrl, or Cmd on a Mac). That is not decoration: the hand that works this app is
+in a composer nearly all the time, so a bare key is text.
+
+| Key | Does |
+|---|---|
+| `Mod` + `1…9` | show that conversation in this pane |
+| `Mod` + `Shift` + `1…9` | open it beside this one |
+| `Mod` + `Alt` + `← ↑ ↓ →` | move focus to the pane that way |
+| `Mod` + `W` | close this pane — the conversation keeps running |
+| `Mod` + `Alt` + `R` | turn this split from side-by-side to stacked |
+| `Esc` | close the pane you are looking into |
+
+Directional focus is decided by the panes' boxes, not by the tree: `row(a,
+col(b, c))` cannot say whether → from `a` means `b` or `c`, because the answer
+is about where the eye is. Ties break toward straight ahead — drift across the
+axis costs double — so from a tall pane the neighbour level with your eye wins
+over one that is technically nearer.
+
+They are listed on the empty conversation, which is the one screen with room
+for them and the one moment nobody is mid-task. A shortcut nothing ever mentions
+is a shortcut nobody uses.
 
 ## Theme packs
 

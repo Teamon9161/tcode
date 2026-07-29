@@ -1,125 +1,212 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { ApprovalRequest, Decision, SessionInfo, Status } from "./types";
-import type { Block } from "./blocks";
-import type { TouchedFile } from "./files";
-import type { Pasted } from "./paste";
-import { useInspector } from "./inspect";
-import { Path } from "./components/Path";
+import type { Decision, SessionInfo, Status } from "./types";
+import type { SessionState } from "./session";
+import {
+  close,
+  focusPane,
+  focused,
+  navigate,
+  openInspect,
+  panes,
+  parentSplit,
+  rotate,
+  sessionsInView,
+  setRatio,
+  show,
+  showBeside,
+  type Tiling,
+} from "./layout";
+import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, PanelIcon, PlusIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, PlusIcon } from "./components/Icons";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
-import { Transcript } from "./Transcript";
-import { Composer } from "./Composer";
-import { Inspector } from "./Inspector";
-import { Approval } from "./Approval";
-
-/** Wide enough for a split diff without crowding the conversation. */
-const DEFAULT_WIDTH = 380;
-const MIN_WIDTH = 280;
-const MAX_WIDTH = 900;
+import { Panes, type PaneContext } from "./Panes";
 
 /**
- * One conversation, with the other open ones a click away on the left and one
- * inspectable thing on the right.
+ * The window: a rail of conversations on the left, a tiled field of panes
+ * beside it, and a title bar over both.
  *
  * The rail is always present rather than a drawer: knowing that another session
  * needs you is the reason this app exists, and information you have to open a
- * menu to see is information you will miss.
+ * menu to see is information you will miss. It lists every conversation the
+ * process is holding, on screen or not — the panes show a few, the rail
+ * accounts for all of them.
  *
- * The right region is a single slot (see `inspect.ts`). Its root is the file
- * index, and anything opened from the conversation — a diff, a snapshot, a
- * sub-agent's own turn — pushes onto a stack whose back button returns there.
- *
- * The top row spans the whole window rather than sitting inside the stage,
- * because it is also the title bar (`decorations: false`, see
+ * The title bar spans the whole window rather than sitting inside the field,
+ * because it is also the window's own bar (`decorations: false`, see
  * `components/WindowControls.tsx`): window buttons belong at the window's
- * corner, not at the conversation column's.
+ * corner. It deliberately carries no title. With the window split, no single
+ * conversation is "the" one, and a bar naming one of them would be a second,
+ * sometimes-wrong answer to a question each pane's own header already answers.
  */
 export function Workspace({
-  session,
+  tiling,
   sessions,
-  blocks,
-  files,
-  running,
-  approval,
+  stateOf,
   statusOf,
-  draft,
-  attachments,
+  onTiling,
   onDraft,
   onAttach,
   onDetach,
   onSend,
   onInterrupt,
   onAnswer,
-  onSelect,
-  onClose,
+  onCloseSession,
   onHome,
 }: {
-  session: SessionInfo;
+  tiling: Tiling;
   sessions: SessionInfo[];
-  blocks: Block[];
-  files: TouchedFile[];
-  running: boolean;
-  approval: ApprovalRequest | null;
-  statusOf: (id: string) => Status;
-  draft: string;
-  attachments: Pasted[];
-  onDraft: (value: string) => void;
-  onAttach: (items: Pasted[]) => void;
-  onDetach: (id: string) => void;
-  onSend: () => void;
-  onInterrupt: () => void;
-  onAnswer: (decision: Decision, comment: string) => void;
-  onSelect: (id: string) => void;
-  onClose: (id: string) => void;
+  stateOf: (session: string) => SessionState;
+  statusOf: (session: string) => Status;
+  onTiling: (step: (current: Tiling) => Tiling) => void;
+  onDraft: (session: string, value: string) => void;
+  onAttach: (session: string, items: SessionState["attachments"]) => void;
+  onDetach: (session: string, id: string) => void;
+  onSend: (session: string) => void;
+  onInterrupt: (session: string) => void;
+  onAnswer: (session: string, decision: Decision, comment: string) => void;
+  onCloseSession: (session: string) => void;
   onHome: () => void;
 }) {
-  const nav = useInspector();
-  const [width, setWidth] = useState(DEFAULT_WIDTH);
-  const open = nav.value !== null;
-  const { open: openPanel, close: closePanel } = nav;
+  const narrow = useNarrow();
+  const leaves = panes(tiling);
+  const here = focused(tiling);
+  const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
 
-  // The panel opens itself the first time a turn touches a file, then stays
-  // wherever the user last put it — useful without being insistent.
-  const touched = files.length > 0;
-  useEffect(() => {
-    if (touched) openPanel({ kind: "files" });
-  }, [touched, openPanel]);
+  // The files index is the one inspect view not reached by pointing at
+  // something in the transcript, so it keeps a button — on the conversation's
+  // own header, because that is whose files it shows. A single window-level
+  // toggle had to guess which conversation was meant, and with two on screen it
+  // would have guessed wrong half the time.
+  //
+  // It toggles: a second press closes the pane it opened rather than stacking
+  // another history entry nobody asked for.
+  const toggleFiles = useCallback(
+    (pane: string, session: string) => {
+      onTiling((current) => {
+        const sibling = panes(current).find(
+          (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
+        );
+        return sibling
+          ? close(current, sibling.id)
+          : openInspect(current, pane, session, { kind: "files" });
+      });
+    },
+    [onTiling],
+  );
 
-  // Esc closes the panel before it reaches the composer's interrupt: a panel
-  // that ignores Esc is the one thing every panel is expected to handle.
+  // Esc closes the pane you are looking into, before it reaches the composer's
+  // interrupt. A conversation pane ignores it: Esc must never be the key that
+  // removes the thing you are typing into.
   useEffect(() => {
-    if (!open) return;
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape") {
-        event.stopPropagation();
-        closePanel();
-      }
+      if (event.key !== "Escape") return;
+      const seat = focused(tiling);
+      if (!seat || seat.pane.kind !== "inspect") return;
+      event.stopPropagation();
+      onTiling((current) => close(current, seat.id));
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [open, closePanel]);
+  }, [tiling, onTiling]);
+
+  /**
+   * Driving the layout from the keyboard.
+   *
+   * Every binding carries a modifier, and that is not a style choice: the hand
+   * that works this app is in a composer nearly all the time, so a bare key is
+   * text. `Mod` is Ctrl, or Cmd on a Mac.
+   *
+   *   Mod+1…9          show that conversation here
+   *   Mod+Shift+1…9    open it beside this one
+   *   Mod+Alt+←↑↓→     move focus to the pane that way
+   *   Mod+W            close this pane (the conversation keeps running)
+   *   Mod+Alt+R        turn this split from side-by-side to stacked
+   *
+   * Digits are read from `event.code`, not `event.key`: with Shift down the
+   * key is "!" on a US layout and something else again elsewhere, so the digit
+   * is only reliably in the physical code.
+   */
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+
+      const digit = /^Digit([1-9])$/.exec(event.code);
+      if (digit && !event.altKey) {
+        const pick = sessions[Number(digit[1]) - 1];
+        if (!pick) return;
+        event.preventDefault();
+        onTiling((current) =>
+          event.shiftKey ? showBeside(current, pick.id) : show(current, pick.id),
+        );
+        return;
+      }
+
+      if (event.altKey && ARROWS[event.key]) {
+        event.preventDefault();
+        const boxes = new Map<string, Box>();
+        for (const node of document.querySelectorAll<HTMLElement>("[data-pane]")) {
+          const id = node.dataset.pane;
+          if (id) boxes.set(id, node.getBoundingClientRect());
+        }
+        const next = nearestPane(boxes, tiling.focus, ARROWS[event.key]);
+        if (next) onTiling((current) => focusPane(current, next));
+        return;
+      }
+
+      if (event.altKey && (event.key === "r" || event.key === "R")) {
+        event.preventDefault();
+        onTiling((current) => {
+          const divider = parentSplit(current, current.focus);
+          return divider ? rotate(current, divider) : current;
+        });
+        return;
+      }
+
+      if (!event.altKey && !event.shiftKey && (event.key === "w" || event.key === "W")) {
+        event.preventDefault();
+        onTiling((current) => close(current, current.focus));
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [sessions, tiling.focus, onTiling]);
+
+  const context: PaneContext = {
+    sessions,
+    stateOf,
+    statusOf,
+    focus: tiling.focus,
+    split: leaves.length > 1 && !narrow,
+    onFocus: (pane) => onTiling((current) => focusPane(current, pane)),
+    onClosePane: (pane) => onTiling((current) => close(current, pane)),
+    onRatio: (divider, ratio) => onTiling((current) => setRatio(current, divider, ratio)),
+    onOpen: (pane, session, value) =>
+      onTiling((current) => openInspect(current, pane, session, value)),
+    onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
+    onToggleFiles: toggleFiles,
+    onDraft,
+    onAttach,
+    onDetach,
+    onSend,
+    onInterrupt,
+    onAnswer,
+  };
+
+  // Below the threshold the tree stops being shown and only the current pane
+  // is: two panes in 700px are two unreadable panes. Structural, not fluid —
+  // nothing shrinks, one thing is chosen (PRODUCT.md § Design Principles).
+  const shown = narrow && here ? { root: here, focus: here.id } : tiling;
 
   return (
-    <div className={`workspace${open ? " has-panel" : ""}`}>
+    <div className="workspace">
       <header className="topbar" {...DRAG}>
         <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
           <BackIcon size={15} />
         </button>
-        <span className="stage-title" {...DRAG}>
-          {session.name}
-        </span>
-        <Path className="stage-path" path={session.cwd} home={session.home} keep={4} drag />
-        <button
-          className={`icon-btn${open ? " is-on" : ""}`}
-          onClick={() => (open ? closePanel() : openPanel({ kind: "files" }))}
-          aria-pressed={open}
-          aria-label={open ? "Hide the panel" : "Show the panel"}
-        >
-          <PanelIcon size={15} />
-        </button>
+        <span className="topbar-gap" {...DRAG} />
         <WindowControls />
       </header>
 
@@ -131,8 +218,8 @@ export function Workspace({
           {sessions.map((entry) => (
             <li key={entry.id}>
               <button
-                className={`rail-item${entry.id === session.id ? " is-current" : ""}`}
-                onClick={() => onSelect(entry.id)}
+                className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
+                onClick={() => onTiling((current) => show(current, entry.id))}
                 title={entry.cwd}
               >
                 <StatusDot status={statusOf(entry.id)} />
@@ -140,7 +227,7 @@ export function Workspace({
               </button>
               <button
                 className="rail-close"
-                onClick={() => onClose(entry.id)}
+                onClick={() => onCloseSession(entry.id)}
                 aria-label={`Close ${entry.name}`}
               >
                 <CloseIcon size={13} />
@@ -155,34 +242,29 @@ export function Workspace({
         </button>
       </nav>
 
-      <div className="stage">
-        <Transcript blocks={blocks} running={running} onOpen={openPanel} />
-
-        {/* Docked, not modal: the other sessions stay reachable while this one
-            waits. See `Approval.tsx`. */}
-        {approval && <Approval request={approval} onAnswer={onAnswer} />}
-
-        <Composer
-          value={draft}
-          running={running}
-          disabled={false}
-          attachments={attachments}
-          onChange={onDraft}
-          onAttach={onAttach}
-          onDetach={onDetach}
-          onSubmit={onSend}
-          onInterrupt={onInterrupt}
-        />
-      </div>
-
-      <Inspector
-        nav={nav}
-        blocks={blocks}
-        files={files}
-        cwd={session.cwd}
-        width={width}
-        onWidth={(next) => setWidth(Math.min(Math.max(next, MIN_WIDTH), MAX_WIDTH))}
-      />
+      <Panes tiling={shown} context={context} />
     </div>
   );
+}
+
+const ARROWS: Record<string, Dir4> = {
+  ArrowLeft: "left",
+  ArrowRight: "right",
+  ArrowUp: "up",
+  ArrowDown: "down",
+};
+
+/** True while the window is too narrow to tile. `matchMedia` rather than a
+ *  resize listener: the browser only tells us when the answer changes. */
+function useNarrow(): boolean {
+  const query = "(max-width: 900px)";
+  const [narrow, setNarrow] = useState(() => window.matchMedia(query).matches);
+  useEffect(() => {
+    const media = window.matchMedia(query);
+    const update = () => setNarrow(media.matches);
+    media.addEventListener("change", update);
+    update();
+    return () => media.removeEventListener("change", update);
+  }, []);
+  return narrow;
 }

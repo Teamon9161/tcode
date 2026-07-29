@@ -1,0 +1,396 @@
+import { navOf, navOpen, type Inspect, type Nav } from "./inspect";
+
+/**
+ * The window's pane tree.
+ *
+ * This file is pure data and pure functions — no React, no DOM, no knowledge of
+ * what a pane looks like. That separation is the point: every layout question
+ * ("what happens to focus when this closes?", "does splitting twice nest the
+ * right way?") becomes a unit test instead of something only reproducible by
+ * clicking.
+ *
+ * ## Why a binary tree
+ *
+ * A list of columns cannot express "the conversation on the left, and on the
+ * right a diff above a chart"; a free-floating grid can, but then every pane
+ * needs coordinates and the user needs to place them. A binary space partition
+ * — the tiling model hyprland and every window manager like it uses — gets
+ * arbitrary nesting from one rule: a leaf splits into two, forever. The whole
+ * structure is `{dir, ratio, a, b}`, which serializes to JSON without help and
+ * maps one-to-one onto nested split containers when it is time to render.
+ *
+ * ## Why `Pane` unions session and inspect
+ *
+ * A conversation and a diff are not different species of thing to this file;
+ * they are both "something occupying a rectangle". Making them one union is
+ * what lets a diff be opened beside its conversation, or two conversations sit
+ * side by side, without either case being special. `inspect.ts` already
+ * established that everything lookable-into is one value dispatched on `kind`;
+ * this lifts that value one level up, so the panel is no longer a fixed column
+ * bolted to the right edge but a pane like any other.
+ *
+ * Both variants carry `session`, and that is load-bearing rather than
+ * incidental: closing a conversation has to take its diffs and charts with it,
+ * and `closeSession` can only be this short because every pane knows whose it
+ * is.
+ */
+
+/** What occupies one rectangle. */
+export type Pane =
+  /** A conversation: transcript, approval dock, composer. */
+  | { kind: "session"; session: string }
+  /** Something belonging to a conversation, looked into. The pane carries its
+   *  own back/forward history rather than a bare value — see `inspect.ts`. */
+  | { kind: "inspect"; session: string; nav: Nav };
+
+/** Which way a split lays its two children out, named after the flex axis:
+ *  `row` puts them side by side, `col` stacks them. */
+export type Dir = "row" | "col";
+
+export type Leaf = { kind: "leaf"; id: string; pane: Pane };
+
+export type Split = {
+  kind: "split";
+  id: string;
+  dir: Dir;
+  /** Share of the space given to `a`, 0–1. `b` gets the rest. */
+  ratio: number;
+  a: Layout;
+  b: Layout;
+};
+
+export type Layout = Leaf | Split;
+
+/**
+ * The tree and the cursor into it, as one value.
+ *
+ * Same reasoning as `Nav` in `inspect.ts`: a focus id that can be updated
+ * without the tree is a focus id that will eventually point at a pane that was
+ * closed three renders ago. Every function here returns both or neither, so
+ * that state is unrepresentable.
+ *
+ * `root: null` means no panes at all — the launchpad, not an empty window.
+ */
+export type Tiling = { root: Layout | null; focus: string };
+
+export const EMPTY: Tiling = { root: null, focus: "" };
+
+// Ids identify tree nodes for React keys and for every operation below. They
+// are opaque and never meaningful across a reload, so a process-wide counter is
+// enough; nothing may parse or order them.
+let seq = 0;
+const nextId = () => `pane-${(seq += 1)}`;
+
+/** How small a split's `a` side may be dragged. The rest of the floor is the
+ *  panes' own min sizes, which are a rendering concern, not this file's. */
+const MIN_RATIO = 0.1;
+
+export function leafOf(pane: Pane): Leaf {
+  return { kind: "leaf", id: nextId(), pane };
+}
+
+/** A window showing exactly one thing. */
+export function single(pane: Pane): Tiling {
+  const only = leafOf(pane);
+  return { root: only, focus: only.id };
+}
+
+/** Every leaf, in the order they read on screen (left/top first). */
+export function panes(tiling: Tiling): Leaf[] {
+  const out: Leaf[] = [];
+  const walk = (node: Layout) => {
+    if (node.kind === "leaf") out.push(node);
+    else {
+      walk(node.a);
+      walk(node.b);
+    }
+  };
+  if (tiling.root) walk(tiling.root);
+  return out;
+}
+
+/** The distinct sessions with at least one pane on screen, in reading order. */
+export function sessionsInView(tiling: Tiling): string[] {
+  const seen = new Set<string>();
+  for (const leaf of panes(tiling)) seen.add(leaf.pane.session);
+  return [...seen];
+}
+
+export function findLeaf(tiling: Tiling, id: string): Leaf | null {
+  const node = tiling.root && findNode(tiling.root, id);
+  return node && node.kind === "leaf" ? node : null;
+}
+
+export function focused(tiling: Tiling): Leaf | null {
+  return findLeaf(tiling, tiling.focus);
+}
+
+/** Moves the cursor. Unknown ids and splits are ignored rather than clearing
+ *  focus: a stray click must never leave the window with no current pane. */
+export function focusPane(tiling: Tiling, id: string): Tiling {
+  return findLeaf(tiling, id) ? { ...tiling, focus: id } : tiling;
+}
+
+/**
+ * Splits `target` in two and puts `pane` in the new half, which takes focus —
+ * you asked for it, so you are looking at it.
+ *
+ * Splitting an unknown target is a no-op rather than an append: the caller
+ * named a pane that is gone, and guessing where they meant instead is worse
+ * than doing nothing.
+ */
+export function split(tiling: Tiling, target: string, dir: Dir, pane: Pane): Tiling {
+  if (!tiling.root) return single(pane);
+  const added = leafOf(pane);
+  const root = mapNode(tiling.root, target, (node) => ({
+    kind: "split",
+    id: nextId(),
+    dir,
+    ratio: 0.5,
+    a: node,
+    b: added,
+  }));
+  return root === tiling.root ? tiling : { root, focus: added.id };
+}
+
+/**
+ * Removes a node — a leaf, or a whole subtree — and collapses the split that
+ * held it into its sibling, which is what keeps the tree from filling up with
+ * one-child splits.
+ *
+ * Focus lands on the sibling's first leaf, the way closing a window in a tiling
+ * WM hands focus to whatever grew to fill the space.
+ */
+export function close(tiling: Tiling, id: string): Tiling {
+  if (!tiling.root) return tiling;
+  const heir = siblingHeir(tiling.root, id);
+  const root = without(tiling.root, id);
+  if (root === tiling.root) return tiling;
+  if (!root) return EMPTY;
+  const focus = findNode(root, tiling.focus) ? tiling.focus : (heir ?? firstLeaf(root).id);
+  return { root, focus };
+}
+
+/** Closes every pane belonging to one conversation — its transcript and each
+ *  diff, run and artifact opened out of it. */
+export function closeSession(tiling: Tiling, session: string): Tiling {
+  let out = tiling;
+  for (const leaf of panes(tiling)) {
+    if (leaf.pane.session === session) out = close(out, leaf.id);
+  }
+  return out;
+}
+
+/** Puts something else in a pane, keeping its place and its id. */
+export function updatePane(tiling: Tiling, id: string, pane: Pane): Tiling {
+  if (!tiling.root) return tiling;
+  const root = mapNode(tiling.root, id, (node) =>
+    node.kind === "leaf" ? { ...node, pane } : node,
+  );
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
+/**
+ * Brings a conversation on screen.
+ *
+ * If it already has a pane, that pane is simply focused — opening a second
+ * transcript of the same conversation beside the first is never what was meant.
+ * Otherwise it takes over the focused pane. Splitting instead would tile the
+ * window down to slivers over a working day; a split is something the user asks
+ * for explicitly.
+ *
+ * The one exception is landing on an inspect pane: taking that one over would
+ * throw away what it was showing *and* leave its conversation without a place
+ * to look into things, so it splits rather than overwrites.
+ */
+export function show(tiling: Tiling, session: string): Tiling {
+  const already = panes(tiling).find(
+    (leaf) => leaf.pane.kind === "session" && leaf.pane.session === session,
+  );
+  if (already) return { ...tiling, focus: already.id };
+
+  const pane: Pane = { kind: "session", session };
+  if (!tiling.root) return single(pane);
+  const seat = focused(tiling) ?? firstLeaf(tiling.root);
+  if (seat.pane.kind === "inspect") return split(tiling, seat.id, "row", pane);
+  return { root: mapNode(tiling.root, seat.id, () => ({ ...seat, pane })), focus: seat.id };
+}
+
+/**
+ * Shows something belonging to `session`, beside the pane it was opened from.
+ *
+ * One inspect pane per conversation, reused. Opening a diff, then a file, then
+ * a sub-agent's run must not tile the window into four slivers — they are the
+ * same act of looking, so they share a pane and stack into its history. Only
+ * the first one splits.
+ */
+export function openInspect(
+  tiling: Tiling,
+  from: string,
+  session: string,
+  value: Inspect,
+): Tiling {
+  const existing = panes(tiling).find(
+    (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
+  );
+  if (existing && existing.pane.kind === "inspect") {
+    const grown = updatePane(tiling, existing.id, {
+      ...existing.pane,
+      nav: navOpen(existing.pane.nav, value),
+    });
+    return { ...grown, focus: existing.id };
+  }
+  return split(tiling, from, "row", { kind: "inspect", session, nav: navOf(value) });
+}
+
+/** Steps one inspect pane's history — back, forward, or on to something new. */
+export function navigate(tiling: Tiling, id: string, step: (nav: Nav) => Nav): Tiling {
+  const leaf = findLeaf(tiling, id);
+  if (!leaf || leaf.pane.kind !== "inspect") return tiling;
+  return updatePane(tiling, id, { ...leaf.pane, nav: step(leaf.pane.nav) });
+}
+
+/**
+ * Brings a conversation on screen *beside* the current pane instead of in place
+ * of it — the deliberate "put these two side by side" act, which is why it has
+ * a keystroke and `show` has the rail.
+ *
+ * A conversation that already has a pane is focused rather than opened twice.
+ */
+export function showBeside(tiling: Tiling, session: string): Tiling {
+  const already = panes(tiling).find(
+    (leaf) => leaf.pane.kind === "session" && leaf.pane.session === session,
+  );
+  if (already) return { ...tiling, focus: already.id };
+
+  const seat = focused(tiling);
+  if (!tiling.root || !seat) return single({ kind: "session", session });
+  return split(tiling, seat.id, "row", { kind: "session", session });
+}
+
+/** The split holding a node, for rotating it. The root has none. */
+export function parentSplit(tiling: Tiling, id: string): string | null {
+  const walk = (node: Layout): string | null => {
+    if (node.kind === "leaf") return null;
+    if (node.a.id === id || node.b.id === id) return node.id;
+    return walk(node.a) ?? walk(node.b);
+  };
+  return tiling.root ? walk(tiling.root) : null;
+}
+
+/** Drag of a divider. Clamped here rather than at the handle so a restored
+ *  layout cannot come back with a pane pinched to nothing. */
+export function setRatio(tiling: Tiling, id: string, ratio: number): Tiling {
+  if (!tiling.root) return tiling;
+  const clamped = Math.min(Math.max(ratio, MIN_RATIO), 1 - MIN_RATIO);
+  const root = mapNode(tiling.root, id, (node) =>
+    node.kind === "split" ? { ...node, ratio: clamped } : node,
+  );
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
+/** Flips a split between side-by-side and stacked, in place. */
+export function rotate(tiling: Tiling, id: string): Tiling {
+  if (!tiling.root) return tiling;
+  const root = mapNode(tiling.root, id, (node) =>
+    node.kind === "split" ? { ...node, dir: node.dir === "row" ? "col" : "row" } : node,
+  );
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
+/** A box as fractions of the field, 0–1. */
+export type Rect = { left: number; top: number; width: number; height: number };
+
+export type Placed = { leaf: Leaf; rect: Rect };
+/** A divider, plus the box of the split it belongs to — which is what turns a
+ *  pointer position anywhere on the field back into that split's own ratio. */
+export type PlacedDivider = { id: string; dir: Dir; ratio: number; within: Rect };
+
+const WHOLE: Rect = { left: 0, top: 0, width: 1, height: 1 };
+
+/**
+ * The tree flattened into boxes: every pane and every divider, positioned.
+ *
+ * This exists so the renderer can draw one flat list instead of nesting
+ * containers, and that is a correctness requirement rather than a preference.
+ * Nesting means a pane's depth in the DOM changes whenever the tree around it
+ * does — splitting once wraps the existing leaf in a new node — and React
+ * unmounts and rebuilds a subtree that moves. A rebuilt pane loses its scroll
+ * position (so opening a panel yanked the conversation back to the bottom), its
+ * expanded tool output, and any artifact iframe it was running.
+ *
+ * Flat and keyed by leaf id, a pane survives every split, close, resize and
+ * rotate around it untouched.
+ */
+export function frames(tiling: Tiling): { panes: Placed[]; dividers: PlacedDivider[] } {
+  const panes: Placed[] = [];
+  const dividers: PlacedDivider[] = [];
+
+  const walk = (node: Layout, rect: Rect) => {
+    if (node.kind === "leaf") {
+      panes.push({ leaf: node, rect });
+      return;
+    }
+    dividers.push({ id: node.id, dir: node.dir, ratio: node.ratio, within: rect });
+    if (node.dir === "row") {
+      const width = rect.width * node.ratio;
+      walk(node.a, { ...rect, width });
+      walk(node.b, { ...rect, left: rect.left + width, width: rect.width - width });
+    } else {
+      const height = rect.height * node.ratio;
+      walk(node.a, { ...rect, height });
+      walk(node.b, { ...rect, top: rect.top + height, height: rect.height - height });
+    }
+  };
+
+  if (tiling.root) walk(tiling.root, WHOLE);
+  return { panes, dividers };
+}
+
+// ---------------------------------------------------------------- internals
+
+/**
+ * Rebuilds the tree with one node replaced.
+ *
+ * Returns the *same reference* when the id is not present, and that is relied
+ * on: every operation above uses `root === tiling.root` to tell "nothing
+ * matched" from "matched and produced an identical-looking tree". Untouched
+ * subtrees keep their identity too, so React reconciliation skips them.
+ */
+function mapNode(node: Layout, id: string, fn: (node: Layout) => Layout): Layout {
+  if (node.id === id) return fn(node);
+  if (node.kind === "leaf") return node;
+  const a = mapNode(node.a, id, fn);
+  const b = mapNode(node.b, id, fn);
+  return a === node.a && b === node.b ? node : { ...node, a, b };
+}
+
+function without(node: Layout, id: string): Layout | null {
+  if (node.id === id) return null;
+  if (node.kind === "leaf") return node;
+  const a = without(node.a, id);
+  const b = without(node.b, id);
+  if (a === node.a && b === node.b) return node;
+  if (!a) return b;
+  if (!b) return a;
+  return { ...node, a, b };
+}
+
+function findNode(node: Layout, id: string): Layout | null {
+  if (node.id === id) return node;
+  if (node.kind === "leaf") return null;
+  return findNode(node.a, id) ?? findNode(node.b, id);
+}
+
+function firstLeaf(node: Layout): Leaf {
+  return node.kind === "leaf" ? node : firstLeaf(node.a);
+}
+
+/** The leaf that should inherit focus when `id` is removed: the first one on
+ *  the other side of the split holding it. */
+function siblingHeir(node: Layout, id: string): string | null {
+  if (node.kind === "leaf") return null;
+  if (node.a.id === id) return firstLeaf(node.b).id;
+  if (node.b.id === id) return firstLeaf(node.a).id;
+  return siblingHeir(node.a, id) ?? siblingHeir(node.b, id);
+}

@@ -36,11 +36,27 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **进 app 的文件夹路径一律经 `paths::canonical_dir`**，不许直接 `canonicalize()`。Windows 上后者返回 `\\?\C:\…`，而 `store::project_id` 把非字母数字折成 `-`，于是同一个文件夹在桌面端落到 `----c--code-rust-tcode`、在终端落到 `c--code-rust-tcode`：会话与自动记忆分成两份互不知情。这条是踩出来的，`~/.tcode/projects/` 里那个四横线目录就是证据。
 
-9b. **审批不是模态**。`Approval.tsx` 停在 composer 上方，不铺 scrim、不抢焦点、不能被关掉。理由是这个 app 的立身之本：一个会话在等审批时，另外三个必须还能读、还能开、还能看谁在等——模态把并行管理直接废掉。安全性由别处保证：没有任何按键能回答它（旧的模态靠"焦点停在拒绝键上"防误触，一个抢焦点的常驻面板反而会和输入框抢每一次击键）；而"不可关闭"保留了模态真正买到的东西——未答的审批是一个停着的 turn，能被关掉的卡片等于没有回去的路。
+9b. **审批不是模态**。`Approval.tsx` 停在**它自己那个窗格**的 composer 上方，不铺 scrim、不抢焦点、不能被关掉。理由是这个 app 的立身之本：一个会话在等审批时，另外三个必须还能读、还能开、还能看谁在等——模态把并行管理直接废掉。分屏之后这条只会更硬：两个会话同屏，其中一个弹模态等于把另一个也冻住。安全性由别处保证：没有任何按键能回答它（旧的模态靠"焦点停在拒绝键上"防误触，一个抢焦点的常驻面板反而会和输入框抢每一次击键）；而"不可关闭"保留了模态真正买到的东西——未答的审批是一个停着的 turn，能被关掉的卡片等于没有回去的路。
+
+    **它是一条横幅，不是一张卡片**：铺满窗格宽度、顶上一条 `--line` 发丝线、不投影，内容宽度走 `--measure`——和 transcript、composer 同一根轴。它曾经是 980px 的浮起卡片，于是既像丢了遮罩的模态，又和它正在询问的那个改动明显不对齐。**新加任何与对话对齐的东西一律读 `--measure`，不许再抄一个数字**，这条就是这么来的。另外它的高度上限是窗格的 50%（flex 的 `max-height`，不是 `vh`，也不是 grid track——grid 会把 `minmax(0, 50%)` 贪心撑满）。
 
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
-9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在 stage 里：窗口按钮属于窗口的角，不属于中间那一栏的角。
+9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在窗格里：窗口按钮属于窗口的角，不属于某一个窗格的角。
+
+    **topbar 里只放窗口级别的东西**（返回启动台、窗口按钮），不放会话名、路径，也不放作用于某个会话的动作。窗口能同时开几个会话之后，任何"当前会话"的说法在这里都是猜的——文件索引开关就因此下沉到了每个会话窗格自己的 header。它看起来空是对的：它是 title bar，不是工具条。
+
+9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。thinking、单个调用、连续读、连续编辑、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
+
+    配套的排版规则：**行的标签用 UI 字体，等宽只留给真正的机器文本**（工具名、命令、路径）。"run 2 commands" 是我们写的说明，不是机器输出；全用等宽就退化成 PRODUCT.md 点名反对的终端外观。
+
+9d. **窗格树是纯数据**（`layout.ts`）：`Tiling = {root, focus}`，`Layout = Leaf | Split{dir, ratio, a, b}`。分裂/关闭/聚焦/改比例全是纯函数，由 `layout.test.ts` 钉住；`Panes.tsx` 只负责把这棵树画出来，`ratio` 变成 `flex-grow` 交给浏览器算。**布局判断不许写进组件**——发现自己在 `Panes.tsx`/`Workspace.tsx` 里算"这个窗格该被谁顶掉"时，那条规则属于 `layout.ts`（`show` 的"落在 inspect 窗格上就分裂而不是覆盖"就是这么回来的）。
+
+    **键盘布局操作一律带 `Mod` 修饰键**（Ctrl/Cmd）。手基本一直在 composer 里，裸键就是文字。数字键从 `event.code`（`Digit1`）读，不从 `event.key`——按下 Shift 后 key 在美式布局上是 `!`，换个布局又是别的。方向移焦点靠 DOM 的 box 算（`focus.ts`，纯函数、有测试），不靠树：`row(a, col(b, c))` 里 `a` 往右该去 b 还是 c，树答不了，那是像素的事。
+
+    **窗格必须画成平的一层**（`frames()` 出 rect，`Panes.tsx` 绝对定位，按 leaf id 作 key）。**不许改回嵌套容器**：嵌套时一个窗格的 DOM 深度会随周围的树变化——分裂一次就把原叶子包进新节点——React 会把移动了的子树卸载重建，于是转录的滚动位置、展开的工具输出、正在跑的 artifact iframe 全部丢失。"开个侧栏结果左边窗口跳回底部"就是这么来的，那不是滚动逻辑的 bug。
+
+    `Pane` 的两个变体都带 `session`，这是承重的：关掉一个会话必须连它开出去的 diff、run、artifact 一起收走，`closeSession` 能写成几行全靠它。inspect 窗格持有的是 `Nav`（整条前进后退历史）而不是一个 `Inspect` 值——历史属于窗格，不属于组件，否则窗格一挪位置历史就没了。
 
 10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
 
@@ -62,10 +78,10 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（会话栏 + 对话 + 单值检视面板）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture）。
+- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对）。
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。
-  - **右侧面板是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。
+  - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。
   - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿；其中 `quiet_output` 真的由 `Tool::batch_policy()` 派生，而 `route` 目前仍是 `commands.rs` 里的名字表，因为 `CallRoute` 住在 `tcode-tui` 而本 crate 不能依赖它——该文件写明了把 `route()` 提升为 core 的 trait 方法才是终局。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。

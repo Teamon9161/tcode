@@ -1,15 +1,15 @@
-import { useCallback, useMemo, useState } from "react";
+import { useMemo } from "react";
 
 import type { Block } from "./blocks";
 import type { SandboxKind } from "./sandbox/protocol";
 
 /**
- * What the right-hand panel is showing.
+ * What an inspect pane is showing.
  *
- * The panel holds **one value**, not a set of tabs. That is the whole design:
+ * A pane holds **one value**, not a set of tabs. That is the whole design:
  * every place in the app that can be looked into — a path in the transcript, a
  * file in the list, a sub-agent run, a tool's full output, an artifact — does
- * the same single thing, `open(...)`, and the panel dispatches on `kind`.
+ * the same single thing, `open(...)`, and the pane dispatches on `kind`.
  *
  * Tabs were the obvious alternative and are worse: they add a second piece of
  * state (which tab is active) that has nothing to do with what the user asked
@@ -18,7 +18,9 @@ import type { SandboxKind } from "./sandbox/protocol";
  *
  * Holding one value also makes navigation free. A stack of them is history, so
  * following a sub-agent to the file it edited and coming back is a back button
- * rather than a feature.
+ * rather than a feature. Splitting the window did not weaken that rule: each
+ * pane holds one value and its own history, so two things can be side by side
+ * without either becoming a tab strip.
  */
 export type Inspect =
   /** The index of everything this conversation touched. The panel's root: the
@@ -38,60 +40,52 @@ export type Inspect =
   /** A document — a plan draft, a markdown file — read as prose. */
   | { kind: "doc"; path: string; text: string };
 
-export type Inspector = {
-  value: Inspect | null;
-  open: (next: Inspect) => void;
-  close: () => void;
-  back: () => void;
-  forward: () => void;
-  canBack: boolean;
-  canForward: boolean;
-};
+/**
+ * One pane's browsing history.
+ *
+ * Cursor and entries are one piece of state on purpose: they are only ever
+ * meaningful together, and splitting them invites an update that moves one
+ * without the other.
+ *
+ * These are plain functions rather than a hook because a `Nav` lives inside the
+ * pane tree (`layout.ts`), not inside a component. That is what survives a pane
+ * being moved, resized or re-rendered — and what will let a saved layout come
+ * back with its history intact.
+ *
+ * Every `Nav` holds at least one entry by construction: a pane that shows
+ * nothing is a pane that should have been closed.
+ */
+export type Nav = { entries: Inspect[]; at: number };
 
-/** Cursor and entries are one piece of state on purpose: they are only ever
- *  meaningful together, and splitting them invites an update that moves one
- *  without the other. */
-type Nav = { entries: Inspect[]; at: number };
+export function navOf(value: Inspect): Nav {
+  return { entries: [value], at: 0 };
+}
 
-const EMPTY: Nav = { entries: [], at: -1 };
+export function navValue(nav: Nav): Inspect {
+  return nav.entries[nav.at] ?? nav.entries[0];
+}
 
-export function useInspector(): Inspector {
-  const [nav, setNav] = useState<Nav>(EMPTY);
+/** Opening something new abandons whatever was forward of here, the way every
+ *  history in every browser behaves. */
+export function navOpen(nav: Nav, next: Inspect): Nav {
+  const kept = nav.entries.slice(0, nav.at + 1);
+  return { entries: [...kept, next], at: kept.length };
+}
 
-  const open = useCallback((next: Inspect) => {
-    setNav(({ entries, at }) => {
-      // Opening something new abandons whatever was forward of here, the way
-      // every history in every browser behaves.
-      const kept = entries.slice(0, at + 1);
-      return { entries: [...kept, next], at: kept.length };
-    });
-  }, []);
+export function navBack(nav: Nav): Nav {
+  return { ...nav, at: Math.max(nav.at - 1, 0) };
+}
 
-  const close = useCallback(() => setNav(EMPTY), []);
+export function navForward(nav: Nav): Nav {
+  return { ...nav, at: Math.min(nav.at + 1, nav.entries.length - 1) };
+}
 
-  const back = useCallback(
-    () => setNav((current) => ({ ...current, at: Math.max(current.at - 1, 0) })),
-    [],
-  );
+export function canBack(nav: Nav): boolean {
+  return nav.at > 0;
+}
 
-  const forward = useCallback(
-    () =>
-      setNav((current) => ({
-        ...current,
-        at: Math.min(current.at + 1, current.entries.length - 1),
-      })),
-    [],
-  );
-
-  return {
-    value: nav.at >= 0 ? (nav.entries[nav.at] ?? null) : null,
-    open,
-    close,
-    back,
-    forward,
-    canBack: nav.at > 0,
-    canForward: nav.at >= 0 && nav.at < nav.entries.length - 1,
-  };
+export function canForward(nav: Nav): boolean {
+  return nav.at < nav.entries.length - 1;
 }
 
 /** A short label for the panel header. */

@@ -81,6 +81,20 @@
   --r-lg: 12px;
   --r-pill: 999px;
 
+  /* The conversation's measure: the width the transcript, the approval dock and
+     the composer all share. One token because they have to agree — the dock
+     once carried its own wider number and sat visibly off-axis from the very
+     change it was asking about. Anything that lines up with the conversation
+     reads this rather than repeating the figure. */
+  --measure: 760px;
+
+  /* The gap between tiled panes, and between the field and the window's edge.
+     It is not a border and not a divider — it is the window's own frame colour
+     showing through, which is what makes each pane read as its own sheet
+     instead of a region carved out of one. Wide enough that a focused pane's
+     1px ring sits inside it without touching either neighbour. */
+  --gutter: 4px;
+
   /* ---- Density -------------------------------------------------------- */
   /* One multiplier over the whole spacing rhythm. A compact theme ships 0.85,
      a roomy one 1.15; no component changes. */

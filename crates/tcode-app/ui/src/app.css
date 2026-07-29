@@ -22,56 +22,230 @@
   gap: var(--s-7);
 }
 
-/* The top row spans every column because it is also the window's title bar
-   (`decorations: false`): window buttons belong at the window's corner, not at
-   the middle column's. */
+/* The window is a sheet of `--chrome` with panes laid on it. The top row spans
+   every column because it is also the window's title bar (`decorations:
+   false`): window buttons belong at the window's corner, not at a pane's. */
 .workspace {
   display: grid;
   grid-template-columns: 196px minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
   overflow: hidden;
-}
-
-/* The panel sizes itself: its width is dragged, so the track follows it. */
-.workspace.has-panel {
-  grid-template-columns: 196px minmax(0, 1fr) auto;
+  background: var(--chrome);
 }
 
 .workspace > .topbar {
   grid-column: 1 / -1;
 }
 
-/* One surface, not three stacked panels. The transcript, the approval dock and
-   the composer all sit on `--bg`, and the only thing separating this column
-   from the rail and the panel beside it is the tonal step to `--chrome`. Rules
-   between regions that already differ in tone are the seams that make a window
-   look assembled out of parts (PRODUCT.md: earn density with alignment and
-   rhythm, not with borders and boxes). */
-.stage {
-  display: grid;
-  grid-template-rows: minmax(0, 1fr) auto;
+/* ============================================================ panes */
+
+/* The tiling field. Its padding *is* the outer gutter: the frame colour runs
+   around every pane and between them, and that gap is the only separator the
+   layout draws. No rules, no borders, no shadows — a tonal step already
+   separates a pane from the window it sits in, and adding a line where the tone
+   already changed is what makes a window look assembled out of parts. */
+.panes {
+  display: flex;
   min-width: 0;
   min-height: 0;
-  overflow: hidden;
+  padding: calc(var(--gutter) / 2);
+}
+
+/* Every pane is positioned against this one box, so no pane is ever nested
+   inside another pane's container. That keeps a pane at the same place in the
+   DOM through every split, close and resize around it — see `frames` in
+   `layout.ts` for why that is a correctness requirement and not a style. */
+.panes-field {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* The slot is the pane's share of the field; its padding is half a gutter, so
+   two neighbours together make one full gutter and the field's own half-gutter
+   padding completes the outer edge. */
+.pane-slot {
+  position: absolute;
+  padding: calc(var(--gutter) / 2);
+}
+
+/* The divider sits on the seam, centred on it, and paints nothing at rest: a
+   permanent line between panes would be the border this design decided not to
+   draw. */
+.divider {
+  position: absolute;
+  z-index: var(--z-sticky);
+  background: transparent;
+  transition: background var(--dur-fast) var(--ease);
+}
+.divider.is-row {
+  width: var(--gutter);
+  margin-left: calc(var(--gutter) / -2);
+  cursor: col-resize;
+}
+.divider.is-col {
+  height: var(--gutter);
+  margin-top: calc(var(--gutter) / -2);
+  cursor: row-resize;
+}
+
+/* A 4px gutter is an unkind target, so the grab area reaches into both panes
+   without moving anything or painting there. Hovering the pseudo-element
+   counts as hovering the divider, which is what lets the tint below fire. */
+.divider::after {
+  content: "";
+  position: absolute;
+}
+.divider.is-row::after {
+  inset: 0 -4px;
+}
+.divider.is-col::after {
+  inset: -4px 0;
+}
+
+.divider:hover {
+  background: var(--line-strong);
+}
+/* The global focus ring is a 2px outline offset by 2px, which on a 4px bar
+   reads as a stray mark. The bar itself becomes the ring instead. */
+.divider:focus-visible {
+  outline: none;
+  background: var(--brand);
+}
+
+/* A pane is a sheet: content surface, small radius, no border. Everything
+   inside is clipped by it, which is what lets the header sit flush in the
+   corner without a second radius of its own (DESIGN.md bans nested cards). */
+.pane {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
   background: var(--bg);
+  border-radius: var(--r-sm);
+  overflow: hidden;
 }
 
-/* Structural, not fluid: the rail loses its labels before the panel goes,
-   because knowing which sessions exist matters more than reading their names. */
-@media (max-width: 1080px) {
-  .workspace.has-panel .inspector {
-    max-width: 46vw;
-  }
+/* Only ever drawn when the window actually holds more than one pane — with a
+   single pane, "which one is current" is not a question anybody is asking, and
+   an olive ring around the whole window would be answering it anyway. The ring
+   lands in the gutter, so it costs no space and touches no neighbour. */
+.panes.is-split .pane.is-focused {
+  box-shadow: 0 0 0 1px var(--brand);
 }
 
+/* The pane's own title bar. It shares `--bg` with the body below it, so this is
+   exactly the case where a hairline is the right separator rather than a tonal
+   step. */
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-3);
+  min-height: 32px;
+  border-bottom: 1px solid var(--line);
+}
+
+.pane-name {
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pane-path {
+  flex: 1;
+  min-width: 0;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Back and forward belong together, so they sit closer to each other than to
+   anything else in the row. */
+.pane-history {
+  display: flex;
+  gap: 2px;
+}
+.pane-history + .pane-name {
+  flex: 1;
+}
+
+.pane-body {
+  min-width: 0;
+  min-height: 0;
+}
+
+/* A conversation: one surface from the transcript down through the approval
+   dock to the composer.
+
+   Flex rather than grid, and that is load-bearing: grid grows a `minmax(0, 50%)`
+   track to its limit greedily, before any `1fr` track gets a say, so the dock
+   reserved half the pane whether or not it had anything to put there. In a
+   column flexbox it takes its content's height and shrinks only when it has to.
+
+   The dock is capped at half the pane so a long diff can never squeeze the
+   conversation it is asking about down to nothing; past that it scrolls inside
+   itself. The cap is a percentage of the pane rather than of the window,
+   because with the window split a pane is not the window's height and `vh`
+   would reserve space this pane does not have. */
+.pane-body.is-stage {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+}
+
+.pane-body.is-stage > .transcript {
+  flex: 1 1 0;
+  min-height: 0;
+}
+
+.pane-body.is-stage > .approval {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 50%;
+}
+
+.pane-body.is-stage > .composer {
+  flex: none;
+}
+
+.pane-body.is-inspect {
+  flex: 1;
+  overflow: auto;
+  padding: var(--s-3);
+}
+
+/* The file index is the inspect pane's root view, so it spans the padding. */
+.pane-body.is-inspect > .file-list,
+.pane-body.is-inspect > .files-empty {
+  margin: calc(var(--s-3) * -1);
+}
+
+.pane-empty {
+  padding: var(--s-4);
+  color: var(--muted);
+  font-size: var(--text-sm);
+}
+
+/* Structural, not fluid: below this width the tree stops being drawn and only
+   the current pane is (see `useNarrow` in `Workspace.tsx`), and the rail loses
+   its labels — knowing which conversations exist matters more than reading
+   their names. Nothing shrinks; things are chosen. */
 @media (max-width: 900px) {
-  .workspace,
-  .workspace.has-panel {
+  .workspace {
     grid-template-columns: 52px minmax(0, 1fr);
-  }
-  .workspace.has-panel .inspector {
-    display: none;
   }
   .rail-name,
   .rail-close {
@@ -171,23 +345,6 @@
   }
 }
 
-.stage-title {
-  color: var(--ink);
-  font-weight: var(--weight-semibold);
-  font-size: var(--text-sm);
-}
-
-.stage-path {
-  flex: 1;
-  min-width: 0;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
 /* ============================================================ buttons */
 
 .btn {
@@ -254,9 +411,22 @@
   color: var(--danger-text);
 }
 
+/* Disabled is a state, not a transparency. A filled ink button at 40% opacity
+   lets the surface through and reads as mud — worst on the one that matters,
+   the unanswered question's Send. Restating the colours keeps the shape crisp
+   and dims it the same way the composer's return key goes quiet when there is
+   nothing to send. */
 .btn:disabled {
-  opacity: 0.4;
   cursor: default;
+}
+.btn-primary:disabled,
+.btn-secondary:disabled {
+  background: var(--sunken);
+  border-color: var(--line);
+  color: var(--faint);
+}
+.btn-ghost:disabled {
+  color: var(--faint);
 }
 
 .icon-btn {
@@ -676,7 +846,11 @@
   text-align: left;
   cursor: pointer;
 }
-.rail-item.is-current {
+/* Marks the conversations that have a pane, not "the current one" — with the
+   window split there are several, and which of them holds focus is already said
+   by the ring around that pane. The rail answers a different question: of
+   everything this process is holding, what is on screen? */
+.rail-item.is-onscreen {
   background: var(--selected);
   color: var(--brand-text);
   font-weight: var(--weight-medium);
@@ -728,11 +902,15 @@
 
 /* ============================================================ transcript */
 
+/* No `scroll-behavior: smooth`. The only thing that scrolls this programmatically
+   is the autoscroll pin, which fires on every streamed delta — animating each
+   one makes the view visibly chase the text instead of sitting at the bottom,
+   and it re-plays that slide even when nothing moved. Instant is what "stay at
+   the bottom" means. */
 .transcript {
   min-height: 0;
   overflow-y: auto;
   overscroll-behavior: contain;
-  scroll-behavior: smooth;
 }
 
 /* The first thing in the conversation, so it starts where the conversation
@@ -742,19 +920,35 @@
 .transcript.is-empty {
   display: grid;
   align-items: center;
-  max-width: 760px;
+  max-width: var(--measure);
   width: 100%;
   margin: 0 auto;
   padding: var(--s-5);
 }
 
+/* Spacing between children rather than one uniform gap, because the two kinds
+   of thing here want different air: consecutive steps are one continuous action
+   and read as a block when they sit close, while a paragraph the model wrote
+   needs room around it to be the thing you actually read. With `gap` they were
+   forced to share a value, and at the value prose wanted the trace fell apart
+   into unrelated fragments. This is what separates steps now that no rule
+   does. */
 .transcript-inner {
-  max-width: 760px;
+  max-width: var(--measure);
   margin: 0 auto;
   padding: var(--s-5) var(--s-5) var(--s-4);
   display: flex;
   flex-direction: column;
-  gap: var(--s-4);
+}
+
+.transcript-inner > * + * {
+  margin-top: var(--s-4);
+}
+.transcript-inner > .trace + .trace,
+.transcript-inner > .trace + .tool,
+.transcript-inner > .tool + .trace,
+.transcript-inner > .tool + .tool {
+  margin-top: var(--s-1);
 }
 
 .msg-user {
@@ -879,23 +1073,6 @@
   font-size: 0.92em;
 }
 
-.thinking {
-  align-self: flex-start;
-}
-.thinking-head {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-1);
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--faint);
-  font-size: var(--text-xs);
-  cursor: pointer;
-}
-.thinking-head:hover {
-  color: var(--muted);
-}
 .thinking-body {
   margin-top: var(--s-2);
   padding-left: var(--s-4);
@@ -925,7 +1102,7 @@
   flex-direction: column;
   align-items: flex-start;
   gap: var(--s-3);
-  max-width: 46ch;
+  max-width: 54ch;
 }
 .first-run h3 {
   font-size: var(--text-lg);
@@ -957,61 +1134,19 @@
   color: var(--muted);
 }
 
+/* The layout keys are longer than the composer's, so their column is wider.
+   Two lists rather than one because they answer different questions — how do I
+   talk, and how do I arrange the window — and a single twelve-row table would
+   bury the first three under the ones you need far less often. */
+.shortcuts.is-layout dt {
+  min-width: 150px;
+}
+
 /* ============================================================ tool calls */
 
 /* Read and search are a single exploration step until someone asks for its
    particulars. The container earns a card because it is a meaningful group,
    not because each tiny operation needs its own chrome. */
-.exploration {
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-  overflow: hidden;
-}
-.exploration.is-failed {
-  border-color: var(--danger-wash);
-}
-
-.exploration-head {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  width: 100%;
-  min-width: 0;
-  padding: var(--s-2) var(--s-3);
-  border: 0;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  text-align: left;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
-}
-.exploration-head:hover,
-.exploration-head:focus-visible,
-.exploration.is-open .exploration-head {
-  background: var(--hover);
-  color: var(--ink);
-}
-
-.exploration-label {
-  flex: 1;
-  min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.exploration-body {
-  display: grid;
-  gap: var(--s-1);
-  padding: var(--s-2);
-  border-top: 1px solid var(--line);
-  background: var(--sunken);
-}
-
 .exploration-item {
   display: flex;
   align-items: center;
@@ -1065,72 +1200,73 @@
   text-decoration-color: currentColor;
 }
 
-/* Consecutive writes and commands each receive one reviewable boundary. Writes
-   remain open because their diff is the result; commands stay quiet until their
-   full invocation or output is needed. Neither repeats card chrome per call. */
-.change-set,
-.command-set {
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--bg);
-  overflow: hidden;
-}
-.change-set.is-failed,
-.command-set.is-failed {
-  border-color: var(--danger-wash);
-}
+/* ---- one trace row, for every kind of step ---- */
 
-.change-set-head,
-.command-set-head {
+/* Read/search runs, edit runs, command runs, concurrent batches and thinking
+   were five components with five class namespaces and three different
+   containers, so the same tool rendered as a bordered card or as a bare line
+   depending only on whether it had a neighbour of its own kind. They are one
+   shape now.
+
+   No border, no background, no rule between steps — the column's own rhythm
+   separates them (PRODUCT.md: earn density with alignment and whitespace, not
+   with rules and boxes). A card could not have worked anyway: these nest, and
+   nested cards are banned outright. Rows nest by indentation, as deep as it
+   goes. */
+.trace-head {
   display: flex;
   align-items: center;
   gap: var(--s-2);
   width: 100%;
   min-width: 0;
-  padding: var(--s-2) var(--s-3);
+  padding: var(--s-1) var(--s-2);
+  margin-left: calc(var(--s-2) * -1);
   border: 0;
+  border-radius: var(--r-sm);
   background: transparent;
   color: var(--muted);
   cursor: pointer;
   text-align: left;
   transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
 }
-.change-set-head:hover,
-.change-set-head:focus-visible,
-.change-set.is-open .change-set-head,
-.command-set-head:hover,
-.command-set-head:focus-visible,
-.command-set.is-open .command-set-head {
+.trace-head:hover,
+.trace-head:focus-visible,
+.trace.is-open > .trace-head {
   background: var(--hover);
   color: var(--ink);
 }
 
-.change-set-label,
-.command-set-label {
+/* Our words, not the machine's: "run 2 commands" is a caption this app wrote.
+   Monospace is kept for what is literally machine text — the tool's name, the
+   command, the path — which is what makes the distinction mean something
+   instead of everything looking like a terminal (PRODUCT.md anti-references). */
+.trace-label {
   flex: 1;
   min-width: 0;
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-.change-set-body,
-.command-set-body {
+.trace-count {
+  flex: none;
+  padding: 0 var(--s-2);
+  border-radius: var(--r-pill);
+  background: var(--sunken);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* Indented under its own head, aligned to the chevron's text rather than to the
+   pane edge, so depth is legible without a single line being drawn. */
+.trace-body {
   display: flex;
   flex-direction: column;
-  gap: var(--s-3);
-  padding: var(--s-2) var(--s-3) var(--s-3);
-  border-top: 1px solid var(--line);
-  background: var(--sunken);
-}
-.change-set-body .tool,
-.command-set-body .tool {
-  border-top: 0;
+  gap: var(--s-2);
+  padding: var(--s-2) 0 var(--s-2) var(--s-4);
 }
 
-.tool {
-  border-top: 1px solid var(--line);
-}
 .tool.is-failed {
   background: var(--danger-wash);
 }
@@ -1215,6 +1351,16 @@
 .tool.is-open .tool-expand {
   opacity: 1;
 }
+
+/* A run's chevron is always visible. On a tool the row already says everything
+   worth knowing and the chevron is an extra; a run is a whole conversation
+   folded shut, so the one thing that opens it cannot be invisible until hovered
+   — it also reserved its own width while hidden, which left every run row
+   indented past the steps around it for no reason a reader could see. */
+.run-head .tool-expand {
+  opacity: 1;
+  color: var(--muted);
+}
 .tool-expand:hover {
   background: var(--pressed);
   color: var(--ink);
@@ -1278,16 +1424,10 @@
   flex-direction: column;
   gap: var(--s-2);
   width: 100%;
-  max-width: 760px;
+  max-width: var(--measure);
   margin: 0 auto;
   padding: 0 var(--s-5) var(--s-4);
   background: var(--bg);
-}
-
-.composer-row {
-  display: flex;
-  align-items: flex-end;
-  gap: var(--s-2);
 }
 
 /* A drop target has to say so before the file is let go of. */
@@ -1356,96 +1496,86 @@
   color: var(--ink);
 }
 
-/* Resting on the page rather than cut into it: a hairline and the inset tone
+/* The field is the row, not the textarea. Moving the border and the inset tone
+   out here is what lets the send glyph live *inside* the box: one control with
+   a key at its edge, instead of a field and a separate filled button that has
+   to invent its own colour and weight to be noticed.
+
+   Resting on the page rather than cut into it: a hairline and the inset tone
    say "field", and focus lifts it to the content surface instead of adding a
    ring on top of a ring. */
+.composer-row {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--s-1);
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--sunken);
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+.composer-row:focus-within {
+  border-color: var(--line-strong);
+  background: var(--bg);
+}
+
 .composer textarea {
   flex: 1;
   min-width: 0;
   resize: none;
   overflow-y: hidden;
-  padding: var(--s-2) var(--s-3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  background: var(--sunken);
+  padding: var(--s-1) 0;
+  border: 0;
+  background: transparent;
   color: var(--ink);
   font-size: var(--text-base);
   line-height: var(--lh-normal);
-  transition:
-    border-color var(--dur-fast) var(--ease),
-    background var(--dur-fast) var(--ease);
 }
 .composer textarea::placeholder {
   color: var(--muted);
 }
 .composer textarea:focus {
   outline: none;
-  border-color: var(--line-strong);
-  background: var(--bg);
 }
 
-/* ============================================================ inspector */
-
-/* One region, one thing in it. The width is set inline from the drag handle,
-   so the column tracks whatever the user pulled it to. */
-.inspector {
-  position: relative;
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  min-width: 0;
-  min-height: 0;
-  background: var(--chrome);
-  overflow: hidden;
-}
-
-.inspector-grip {
-  position: absolute;
-  inset-block: 0;
-  inset-inline-start: -3px;
-  width: 7px;
-  z-index: var(--z-sticky);
-  cursor: col-resize;
-  /* The hairline it sits on belongs to the layout; the grip only tints on
-     contact so the seam does not read as a third border. */
-  background: transparent;
-  transition: background var(--dur-fast) var(--ease);
-}
-.inspector-grip:hover,
-.inspector-grip:focus-visible {
-  background: var(--brand-wash);
-}
-
-.inspector-head {
+/* The return key, shown where it acts. No fill, no border, no radius until it
+   is hovered: at rest it is a mark on the field, not a button sitting on one.
+   Disabled it drops to --faint, which is the whole state model — there is
+   nothing to send, so the key is dim. */
+.composer-key {
   display: flex;
   align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-2) var(--s-2) var(--s-2) var(--s-3);
-  border-bottom: 1px solid var(--line);
+  justify-content: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
+}
+.composer-key:hover:not(:disabled) {
+  background: var(--hover);
+}
+.composer-key:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+.composer-key.is-stop {
+  color: var(--muted);
+}
+.composer-key.is-stop:hover {
+  color: var(--danger-text);
 }
 
-.inspector-nav {
-  display: flex;
-  gap: 2px;
-}
-
-.inspector-head .panel-title {
-  flex: 1;
-  min-width: 0;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.inspector-body {
-  overflow: auto;
-  padding: var(--s-3);
-}
-
-/* The file index is the panel's root view, so it spans the body's padding. */
-.inspector-body > .file-list,
-.inspector-body > .files-empty {
-  margin: calc(var(--s-3) * -1);
-}
+/* ============================================================ inspect views */
 
 .inspect-path {
   margin-bottom: var(--s-2);
@@ -1622,27 +1752,46 @@
 /* Docked above the composer rather than floating over the window: the whole
    app stays reachable while one session waits (see `Approval.tsx`).
 
-   It stays on the content surface and lifts off it with a shadow — a coloured
-   edge along the top would be a stripe standing in for the status dot the
-   header already carries, and the dock would read as one more stitched-on
-   panel. Same measure as the transcript, a little wider where an option and
-   its artifact sit side by side. */
+   **A band, not a card.** It used to be a lifted panel on its own wider measure,
+   and that was two mistakes at once: a shadow over the transcript reads as a
+   modal that forgot its scrim, and a measure nothing else in the pane shared
+   left it visibly off-axis from the conversation above and the box below. Now
+   the band spans the pane and its contents sit on exactly the composer's
+   column, so the question, the note field and the buttons all line up with what
+   you would type into.
+
+   A hairline is the whole boundary, because the band and the transcript share
+   `--bg` and that is the one case where this design draws a line. Not a
+   coloured edge: that would be a stripe standing in for the status dot the
+   header already carries. */
 .approval {
   display: flex;
   flex-direction: column;
   gap: var(--s-3);
-  width: 100%;
   /* Grid items floor at their min-content width unless told otherwise, and a
      diff's longest line is wider than any column — without this the dock grows
-     under the side panel instead of scrolling inside itself. */
+     past the pane instead of scrolling inside itself. */
   min-width: 0;
-  max-width: 980px;
-  margin: 0 auto;
-  max-height: 52vh;
-  padding: var(--s-4) var(--s-5);
+  min-height: 0;
+  padding: var(--s-4) 0;
+  border-top: 1px solid var(--line);
   background: var(--bg);
-  box-shadow: var(--shadow-lift);
   animation: rise var(--dur-slow) var(--ease);
+}
+
+/* The column. The measure minus the composer's own inset, so every edge in the
+   dock agrees with the field below it. Applied to the children rather than to
+   the band because the hairline above has to run the full width of the pane —
+   a rule that stops short of the edges is a card again.
+
+   The inset is a width, not padding: `padding-inline` on the note `<input>`
+   would style the field's own box instead of insetting it, which is exactly how
+   that one control ended up 24px wider on each side than everything it was
+   stacked with. */
+.approval > * {
+  width: 100%;
+  max-width: calc(var(--measure) - var(--s-5) * 2);
+  margin-inline: auto;
 }
 
 .approval-head {
@@ -2322,69 +2471,32 @@
 
 /* ---- batch ---- */
 
-.batch {
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  overflow: hidden;
-}
-
-.batch-head {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  width: 100%;
-  padding: var(--s-1) var(--s-2);
-  border: 0;
-  background: transparent;
-  cursor: pointer;
-  text-align: left;
-}
-.batch-head:hover {
-  background: var(--hover);
-}
-.batch-label {
-  flex: 1;
-  color: var(--ink);
-  font-size: var(--text-xs);
-}
-.batch-count {
-  padding: 0 var(--s-2);
-  border-radius: var(--r-pill);
-  background: var(--sunken);
-  color: var(--muted);
-  font-size: var(--text-2xs);
-}
-
-.batch-body {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-2);
-  padding: var(--s-2);
-  border-top: 1px solid var(--line);
-  background: var(--sunken);
-}
-
 /* ---- sub-agent run ---- */
 
 /* Heavier than a tool card because it is a whole conversation. The edge is a
    hairline, not a colour bar: status is already carried by the dot. */
+/* A delegated run is a step like any other, so it is a row like any other. It
+   was the last card left in the column and that is exactly what made it read as
+   a different species of thing. What distinguishes it is what should: a status
+   dot, the objective a human wrote, and the model that ran it — not a border.
+   State is on the dot, never on an edge (DESIGN.md: status is never hue-only,
+   and a coloured edge would be a second, quieter dot). */
 .run {
-  border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  overflow: hidden;
-}
-.run.is-running {
-  border-color: var(--brand-wash);
-}
-.run.is-failed {
-  border-color: var(--danger-wash);
 }
 
 .run-head {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  padding: var(--s-2);
+  padding: var(--s-1) var(--s-2);
+  margin-left: calc(var(--s-2) * -1);
+  border-radius: var(--r-sm);
+  transition: background var(--dur-fast) var(--ease);
+}
+.run:hover > .run-head,
+.run.is-open > .run-head {
+  background: var(--hover);
 }
 
 .run-title {
@@ -2424,13 +2536,13 @@
   text-overflow: ellipsis;
 }
 
+/* Indented under its head, same as any other trace body — the nesting is the
+   boundary, so no rule and no inset surface. */
 .run-body {
   display: flex;
   flex-direction: column;
   gap: var(--s-3);
-  padding: var(--s-3);
-  border-top: 1px solid var(--line);
-  background: var(--sunken);
+  padding: var(--s-2) 0 var(--s-2) var(--s-4);
 }
 
 .run-waiting {

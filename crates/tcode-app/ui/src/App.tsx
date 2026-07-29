@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -15,44 +15,23 @@ import {
   type Status,
   type TurnFinished,
 } from "./types";
-import { applyEvent, errorBlock, userBlock, type Block } from "./blocks";
-import { applyFileEvent, type TouchedFile } from "./files";
-import type { Pasted } from "./paste";
+import { applyEvent, errorBlock, userBlock } from "./blocks";
+import { applyFileEvent } from "./files";
+import { EMPTY, closeSession as closePanesOf, show, type Tiling } from "./layout";
+import { BLANK, type SessionState } from "./session";
 import { replayLedger } from "./replay";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
 import { Mark } from "./components/Mark";
 
-/** Everything the UI knows about one open conversation. */
-type SessionState = {
-  blocks: Block[];
-  files: TouchedFile[];
-  running: boolean;
-  approval: ApprovalRequest | null;
-  failed: boolean;
-  draft: string;
-  /** Images pasted into the draft, not yet sent. */
-  attachments: Pasted[];
-  /** One line for the launchpad card: the last thing that happened. */
-  activity: string;
-};
-
-const BLANK: SessionState = {
-  blocks: [],
-  files: [],
-  running: false,
-  approval: null,
-  failed: false,
-  draft: "",
-  attachments: [],
-  activity: "not started",
-};
-
 export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const [states, setStates] = useState<Record<string, SessionState>>({});
-  const [view, setView] = useState<string | null>(null);
+  // What the window is showing, as a pane tree (`layout.ts`). Today it only
+  // ever holds a single conversation pane, so this renders exactly as a plain
+  // `view: string | null` did; it is the seat the split view sits down in.
+  const [tiling, setTiling] = useState<Tiling>(EMPTY);
   const [fault, setFault] = useState<string | null>(null);
   const [toolMeta, setToolMeta] = useState<Map<string, ToolMeta>>(new Map());
 
@@ -154,25 +133,27 @@ export function App() {
       ...current,
       [session.id]: { ...BLANK, ...replayed, activity: history.length > 0 ? "resumed" : BLANK.activity },
     }));
-    setView(session.id);
+    setTiling((current) => show(current, session.id));
   }, []);
 
   const closeSession = useCallback(
     async (id: string) => {
       await invoke("close_session", { session: id }).catch(() => {});
-      setSessions((current) => {
-        const left = current.filter((open) => open.id !== id);
-        setView((showing) =>
-          showing === id ? (left[0]?.id ?? null) : showing,
-        );
-        return left;
-      });
+      const left = sessions.filter((open) => open.id !== id);
+      setSessions(left);
       setStates((current) => {
         const { [id]: _gone, ...rest } = current;
         return rest;
       });
+      setTiling((current) => {
+        const next = closePanesOf(current, id);
+        // Losing the last pane falls back to another open conversation rather
+        // than to the launchpad — the rail is not empty, so neither is the
+        // window.
+        return next.root || !left[0] ? next : show(next, left[0].id);
+      });
     },
-    [],
+    [sessions],
   );
 
   const send = useCallback(
@@ -242,66 +223,53 @@ export function App() {
   const waiting = sessions.find((open) => states[open.id]?.approval);
   const alerted = useRef<string | null>(null);
   useEffect(() => {
-    if (!waiting || view !== null) return;
+    if (!waiting || tiling.root !== null) return;
     if (alerted.current === waiting.id) return;
     alerted.current = waiting.id;
-    setView(waiting.id);
-  }, [waiting, view]);
+    setTiling((current) => show(current, waiting.id));
+  }, [waiting, tiling.root]);
 
-  const current = useMemo(
-    () => sessions.find((open) => open.id === view) ?? null,
-    [sessions, view],
-  );
+  const stateOf = useCallback((id: string) => states[id] ?? BLANK, [states]);
 
   if (fault) return <Fault reason={fault} />;
 
-  if (!current) {
+  if (!tiling.root) {
     return (
       <Launchpad
         open={sessions}
         statusOf={statusOf}
         activityOf={(id) => states[id]?.activity ?? BLANK.activity}
-        onEnter={setView}
+        onEnter={(id) => setTiling((current) => show(current, id))}
         onOpenFolder={openFolder}
       />
     );
   }
 
-  const state = states[current.id] ?? BLANK;
   return (
     <ToolMetaProvider meta={toolMeta}>
       <Workspace
-        // Remounting per session keeps each conversation's panel history and
-        // scroll position its own; carrying them across a switch would show one
-        // session's open diff under another session's name.
-        key={current.id}
-        session={current}
+        tiling={tiling}
         sessions={sessions}
-        blocks={state.blocks}
-        files={state.files}
-        running={state.running}
-        approval={state.approval}
+        stateOf={stateOf}
         statusOf={statusOf}
-        draft={state.draft}
-        attachments={state.attachments}
-        onDraft={(draft) => patch(current.id, (was) => ({ ...was, draft }))}
-        onAttach={(items) =>
-          patch(current.id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
+        onTiling={(step) => setTiling(step)}
+        onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
+        onAttach={(id, items) =>
+          patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
         }
-        onDetach={(id) =>
-          patch(current.id, (was) => ({
+        onDetach={(id, item) =>
+          patch(id, (was) => ({
             ...was,
-            attachments: was.attachments.filter((item) => item.id !== id),
+            attachments: was.attachments.filter((entry) => entry.id !== item),
           }))
         }
-        onSend={() => send(current.id)}
-        onInterrupt={() => {
-          invoke("interrupt", { session: current.id }).catch(() => {});
+        onSend={send}
+        onInterrupt={(id) => {
+          invoke("interrupt", { session: id }).catch(() => {});
         }}
-        onAnswer={(decision, comment) => answer(current.id, decision, comment)}
-        onSelect={setView}
-        onClose={closeSession}
-        onHome={() => setView(null)}
+        onAnswer={answer}
+        onCloseSession={closeSession}
+        onHome={() => setTiling(EMPTY)}
       />
     </ToolMetaProvider>
   );
