@@ -26,6 +26,12 @@ export type Inspect =
   /** The index of everything this conversation touched. The panel's root: the
    *  list is what you return to, not a second column beside the viewer. */
   | { kind: "files" }
+  /** A live, session-confined workspace tree. This is distinct from `files`,
+   * which is the conversation's agent-touched history. */
+  | { kind: "workspace-tree" }
+  /** A workspace file selected from the live tree. Its editor arrives in the
+   * next stage; it remains a distinct value from transcript snapshots. */
+  | { kind: "workspace-file"; path: string }
   /** A file as some call saw it. `at` pins a specific call; without it, the
    *  most recent one wins. */
   | { kind: "file"; path: string; at?: string }
@@ -126,6 +132,10 @@ export function inspectTitle(value: Inspect): string {
   switch (value.kind) {
     case "files":
       return "Files";
+    case "workspace-tree":
+      return "Workspace";
+    case "workspace-file":
+      return basename(value.path);
     case "file":
       return basename(value.path);
     case "diff":

@@ -7,29 +7,31 @@ import { languageOf } from "./diff";
 import { useFileHistory, type Inspect } from "./inspect";
 import { relativeTo, type TouchedFile } from "./files";
 import { FilesView } from "./FilePanel";
+import { WorkspaceFiles } from "./WorkspaceFiles";
+import { WorkspaceEditor } from "./WorkspaceEditor";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
 import { ShownView } from "./Shown";
 import { BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
 import { PlanEditor } from "./PlanEditor";
+import { useSession } from "./session";
 import { draftOf, type Plan, type PlanDraft } from "./plan";
 
 /**
  * The body of an inspect pane: one `Inspect` value, drawn.
  *
  * It dispatches on `Inspect["kind"]` and holds no state of its own — the
- * navigation stack lives in the pane (`layout.ts` + `inspect.ts`), and every
- * view below is a pure function of the transcript. That is what lets "open the
- * file this sub-agent edited" and "open the file the transcript mentioned" be
- * the same code path.
+ * navigation stack lives in the pane (`layout.ts` + `inspect.ts`). Transcript
+ * views below remain pure functions of the recorded conversation; live workspace
+ * values are explicit exceptions whose state belongs to their own session pane.
  *
- * Everything here reads from blocks rather than from disk. A review surface
- * that re-read the file would answer a different question than the one being
- * asked — what the agent did, not what happens to be there now. The single
- * exception is `shown`, and it is one for the opposite reason: that file was
- * written by a script so it would *not* have to pass through the conversation,
- * so the transcript has nothing to draw (see `Shown.tsx`).
+ * Everything here normally reads from blocks rather than from disk. A review
+ * surface that re-read the file would answer a different question than the one
+ * being asked — what the agent did, not what happens to be there now. `shown`,
+ * plans, and the session-confined workspace tree are deliberate live exceptions;
+ * each says so through a separate inspect kind rather than changing Files'
+ * transcript-derived semantics.
  *
  * The frame around it — header, history buttons, close — belongs to
  * `Panes.tsx`, because it is the same frame every pane wears.
@@ -55,9 +57,15 @@ export function InspectView({
   onPlanDraft: (draft: PlanDraft) => void;
   onSavePlan: () => void;
 }) {
+  const session = useSession();
+
   switch (value.kind) {
     case "files":
       return <FilesView files={files} cwd={cwd} onOpen={onOpen} />;
+    case "workspace-tree":
+      return <WorkspaceFiles onOpenFile={(path) => onOpen({ kind: "workspace-file", path })} />;
+    case "workspace-file":
+      return <WorkspaceEditor key={`${session}:${value.path}`} path={value.path} />;
     case "file":
       return <FileView value={value} blocks={blocks} cwd={cwd} onOpen={onOpen} />;
     case "diff":

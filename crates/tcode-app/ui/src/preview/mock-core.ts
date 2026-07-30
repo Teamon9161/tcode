@@ -129,6 +129,220 @@ const SHOWN: Record<string, string> = {
   html: "<h2 style='font-family:sans-serif'>rendered artifact</h2>",
 };
 
+type WorkspaceKind = "file" | "directory" | "link";
+type WorkspaceNode = { kind: WorkspaceKind; text?: string; revision: number };
+type WorkspaceFixture = { nodes: Record<string, WorkspaceNode>; changedAfterFirstSave: boolean };
+type WorkspaceEntry = { name: string; path: string; kind: WorkspaceKind };
+type WorkspaceText = { path: string; text: string; revision: string; bytes: number; truncated: boolean };
+
+/**
+ * The workspace fixtures use the same relative paths as the workspace wire
+ * contract. Keeping them per session matters: two sessions can have a
+ * README.md without a preview edit in one leaking into the other.
+ */
+function workspace(nodes: Record<string, WorkspaceNode>): WorkspaceFixture {
+  return { nodes, changedAfterFirstSave: false };
+}
+
+function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
+  return {
+    a: workspace({
+      "README.md": {
+        kind: "file",
+        revision: 1,
+        text: [
+          "# tcode workspace preview",
+          "",
+          "This is a **real Markdown editor preview** backed by the workspace fixture.",
+          "",
+          "- expand `crates` to inspect nested source",
+          "- `empty-fixture` intentionally has no children",
+          "- links remain visible but cannot be opened",
+        ].join("\n"),
+      },
+      crates: { kind: "directory", revision: 1 },
+      "crates/tcode-app": { kind: "directory", revision: 1 },
+      "crates/tcode-app/src": { kind: "directory", revision: 1 },
+      "crates/tcode-app/src/Workspace.tsx": {
+        kind: "file",
+        revision: 1,
+        text: [
+          "export function workspaceTitle(session: string): string {",
+          "  return `workspace for ${session}`;",
+          "}",
+          "",
+          "const focused = new Set([\"workspace-tree\", \"workspace-file\"]);",
+          "export const hasWorkspaceView = (view: string) => focused.has(view);",
+        ].join("\n"),
+      },
+      "crates/tcode-app/src/theme": { kind: "directory", revision: 1 },
+      "crates/tcode-app/src/theme/preview.css": {
+        kind: "file",
+        revision: 1,
+        text: ".workspace-preview { display: grid; gap: var(--s-3); }\n",
+      },
+      docs: { kind: "directory", revision: 1 },
+      "docs/fixture-notes.md": {
+        kind: "file",
+        revision: 1,
+        text: "# Fixture notes\n\nWorkspace paths are relative to the session root.\n",
+      },
+      "empty-fixture": { kind: "directory", revision: 1 },
+      "outside-workspace": { kind: "link", revision: 1 },
+    }),
+    b: workspace({
+      "README.md": { kind: "file", revision: 1, text: "# duck_ext\n\nA separate session fixture.\n" },
+      src: { kind: "directory", revision: 1 },
+      "src/curve.py": { kind: "file", revision: 1, text: "def load_curve(date):\n    return date\n" },
+      cache: { kind: "directory", revision: 1 },
+    }),
+    c: workspace({
+      "README.md": { kind: "file", revision: 1, text: "# pybond\n\nIndependent workspace fixture.\n" },
+      pybond: { kind: "directory", revision: 1 },
+      "pybond/pricing.rs": { kind: "file", revision: 1, text: "pub fn price() -> f64 { 100.0 }\n" },
+    }),
+  };
+}
+
+let WORKSPACES = fixtureWorkspaces();
+
+/** Reset only the mutable workspace state so fixture tests remain deterministic. */
+export function resetPreviewFixtures(): void {
+  WORKSPACES = fixtureWorkspaces();
+}
+
+function workspaceFor(args: Record<string, unknown> | undefined): [string, WorkspaceFixture] {
+  const session = typeof args?.session === "string" ? args.session : "";
+  const fixture = WORKSPACES[session];
+  if (!fixture) throw new Error(`session '${session}' is not open`);
+  return [session, fixture];
+}
+
+function relativePath(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.length === 0 || value.startsWith("/") || value.includes("\\")) {
+    throw new Error(`${label} must be a non-empty workspace-relative path`);
+  }
+  if (value.split("/").some((part) => part === "" || part === "." || part === "..")) {
+    throw new Error(`${label} must be a normalized workspace-relative path`);
+  }
+  return value;
+}
+
+function parentOf(path: string): string {
+  const at = path.lastIndexOf("/");
+  return at === -1 ? "" : path.slice(0, at);
+}
+
+function entryFor(path: string, node: WorkspaceNode): WorkspaceEntry {
+  return { name: path.slice(path.lastIndexOf("/") + 1), path, kind: node.kind };
+}
+
+function revision(session: string, path: string, number: number): string {
+  return `fixture:${session}:${path}:${number}`;
+}
+
+function textView(session: string, path: string, node: WorkspaceNode): WorkspaceText {
+  const text = node.text ?? "";
+  return {
+    path,
+    text,
+    revision: revision(session, path, node.revision),
+    bytes: new TextEncoder().encode(text).length,
+    truncated: false,
+  };
+}
+
+function listWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry[] {
+  const [, fixture] = workspaceFor(args);
+  const path = args?.path === null || args?.path === undefined ? "" : relativePath(args.path, "path");
+  if (path && fixture.nodes[path]?.kind !== "directory") throw new Error(`workspace path '${path}' is not a directory`);
+  if (path && !fixture.nodes[path]) throw new Error(`workspace path '${path}' does not exist`);
+  return Object.entries(fixture.nodes)
+    .filter(([entryPath]) => parentOf(entryPath) === path)
+    .map(([entryPath, node]) => entryFor(entryPath, node));
+}
+
+function readWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
+  const [session, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const node = fixture.nodes[path];
+  if (!node) throw new Error(`workspace path '${path}' does not exist`);
+  if (node.kind !== "file") throw new Error(`workspace path '${path}' is not a regular file`);
+  return textView(session, path, node);
+}
+
+function writeWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
+  const [session, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const text = typeof args?.text === "string" ? args.text : null;
+  const expected = typeof args?.revision === "string" ? args.revision : "";
+  const node = fixture.nodes[path];
+  if (!node || node.kind !== "file") throw new Error(`workspace path '${path}' is not a regular file`);
+  if (text === null) throw new Error("text must be a string");
+  if (expected !== revision(session, path, node.revision)) {
+    throw new Error(`revision conflict: the file changed; re-read it before writing (current revision ${revision(session, path, node.revision)})`);
+  }
+
+  node.text = text;
+  node.revision += 1;
+  const saved = textView(session, path, node);
+
+  // One successful preview save represents a collaborator's subsequent change.
+  // The editor retains `saved.revision`, so the next edit visibly exercises its
+  // normal conflict branch instead of relying on a fabricated error button.
+  if (!fixture.changedAfterFirstSave) {
+    fixture.changedAfterFirstSave = true;
+    node.text = `${text}\n\n<!-- preview fixture: remote change after save -->`;
+    node.revision += 1;
+  }
+  return saved;
+}
+
+function createWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry {
+  const [, fixture] = workspaceFor(args);
+  const parent = args?.parent === null || args?.parent === undefined ? "" : relativePath(args.parent, "parent");
+  const name = relativePath(args?.name, "name");
+  const kind = args?.kind;
+  if (name.includes("/")) throw new Error("name must be one workspace path component");
+  if (kind !== "file" && kind !== "directory") throw new Error(`'${String(kind)}' is not a workspace entry kind`);
+  if (parent && fixture.nodes[parent]?.kind !== "directory") throw new Error(`workspace path '${parent}' is not a directory`);
+  if (parent && !fixture.nodes[parent]) throw new Error(`workspace path '${parent}' does not exist`);
+  const path = parent ? `${parent}/${name}` : name;
+  if (fixture.nodes[path]) throw new Error(`workspace path '${path}' already exists`);
+  const node: WorkspaceNode = { kind, revision: 1, ...(kind === "file" ? { text: "" } : {}) };
+  fixture.nodes[path] = node;
+  return entryFor(path, node);
+}
+
+function renameWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry {
+  const [, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const name = relativePath(args?.name, "name");
+  if (name.includes("/")) throw new Error("name must be one workspace path component");
+  const node = fixture.nodes[path];
+  if (!node) throw new Error(`workspace path '${path}' does not exist`);
+  const renamed = parentOf(path) ? `${parentOf(path)}/${name}` : name;
+  if (fixture.nodes[renamed]) throw new Error(`workspace path '${renamed}' already exists`);
+
+  const moved = Object.entries(fixture.nodes).filter(([candidate]) => candidate === path || candidate.startsWith(`${path}/`));
+  for (const [candidate] of moved) delete fixture.nodes[candidate];
+  for (const [candidate, value] of moved) {
+    fixture.nodes[`${renamed}${candidate.slice(path.length)}`] = value;
+  }
+  return entryFor(renamed, node);
+}
+
+function deleteWorkspace(args: Record<string, unknown> | undefined): void {
+  const [, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const node = fixture.nodes[path];
+  if (!node) throw new Error(`workspace path '${path}' does not exist`);
+  if (node.kind === "directory" && Object.keys(fixture.nodes).some((candidate) => candidate.startsWith(`${path}/`))) {
+    throw new Error(`workspace directory '${path}' is not empty`);
+  }
+  delete fixture.nodes[path];
+}
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
     case "launchpad":
@@ -195,6 +409,19 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "no fixture for this file";
       return { body, bytes: body.length, truncated: false } as T;
     }
+    case "workspace_list":
+      return listWorkspace(args) as T;
+    case "workspace_read_text":
+      return readWorkspace(args) as T;
+    case "workspace_write_text":
+      return writeWorkspace(args) as T;
+    case "workspace_create":
+      return createWorkspace(args) as T;
+    case "workspace_rename":
+      return renameWorkspace(args) as T;
+    case "workspace_delete":
+      deleteWorkspace(args);
+      return undefined as T;
     default:
       return undefined as T;
   }

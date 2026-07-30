@@ -14,7 +14,7 @@ import {
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
 import { FolderMenu } from "./FolderMenu";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, ForwardIcon, PanelIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, FolderIcon, ForwardIcon, PanelIcon } from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
@@ -53,6 +53,7 @@ export type PaneContext = {
   onOpen: (pane: string, session: string, value: Inspect) => void;
   onNavigate: (pane: string, step: typeof navBack) => void;
   onToggleFiles: (pane: string, session: string) => void;
+  onToggleWorkspace: (pane: string, session: string) => void;
   onDraft: (session: string, value: string) => void;
   onAttach: (session: string, items: SessionState["attachments"]) => void;
   onDetach: (session: string, id: string) => void;
@@ -255,6 +256,14 @@ function SessionPane({
           title={`Files ${info.name} touched`}
         >
           <PanelIcon size={14} />
+        </button>
+        <button
+          className="icon-btn"
+          onClick={() => context.onToggleWorkspace(leaf.id, session)}
+          aria-label={`Browse ${info.name} workspace`}
+          title={`Browse ${info.name} workspace`}
+        >
+          <FolderIcon size={14} />
         </button>
         <button
           className="icon-btn"

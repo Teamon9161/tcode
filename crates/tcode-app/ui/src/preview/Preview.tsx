@@ -496,6 +496,7 @@ const PLAN_REVIEW: ApprovalRequest = {
 const SCENES = [
   "launchpad",
   "session",
+  "workspace",
   "approval",
   "question",
   "plan",
@@ -537,10 +538,19 @@ function showing(): Tiling {
   });
 }
 
-/** The window each scene wants. Every scene but two is one conversation. */
+/** A real session beside its live workspace tree. From here, opening README.md
+ * reaches Markdown preview, while the nested TypeScript fixture reaches the
+ * highlighted source view; the inspect pane keeps both in its normal history. */
+function workspace(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", { kind: "workspace-tree" });
+}
+
+/** The window each scene wants. Every scene but the split views is one conversation. */
 function layoutFor(scene: Scene): Tiling {
   if (scene === "split") return tiled();
   if (scene === "shown") return showing();
+  if (scene === "workspace") return workspace();
   return solo();
 }
 

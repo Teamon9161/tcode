@@ -4212,3 +4212,288 @@
   font-size: var(--text-2xs);
   letter-spacing: var(--tracking-wide);
 }
+
+
+/* ============================================================ workspace tree */
+
+/* Live workspace browsing is deliberately a plain directory listing rather than
+   a second file-history panel: the conversation's Files index remains the
+   record of agent activity, while this view answers what exists now. */
+.workspace-files {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+
+.workspace-tree-toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-filter {
+  display: flex;
+  align-items: baseline;
+  flex: 1;
+  min-width: 0;
+  gap: var(--s-2);
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
+.workspace-filter input,
+.workspace-name-entry input {
+  min-width: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-snug);
+}
+
+.workspace-filter input {
+  flex: 1;
+  padding: var(--s-1) var(--s-2);
+}
+
+.workspace-filter input::placeholder {
+  color: var(--faint);
+}
+
+.workspace-filter:focus-within {
+  color: var(--muted);
+}
+
+.workspace-new,
+.workspace-row-action {
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.workspace-new {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: var(--s-1) var(--s-2);
+}
+
+.workspace-new:hover,
+.workspace-row-action:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.workspace-new:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+.workspace-tree-error {
+  margin-top: var(--s-3);
+  padding: var(--s-2);
+  border-radius: var(--r-sm);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+  font-size: var(--text-xs);
+}
+
+.workspace-tree {
+  flex: 1;
+  min-height: 0;
+  margin: var(--s-2) 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.workspace-row,
+.workspace-name-entry {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  padding-inline-start: calc(var(--workspace-depth) * var(--s-3));
+}
+
+.workspace-row {
+  gap: var(--s-1);
+}
+
+.workspace-row-main {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  gap: var(--s-1);
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--body);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-snug);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+.workspace-row-main:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.workspace-row-main > span:not(.workspace-row-note):not(.workspace-link-kind) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.workspace-row-main.is-link {
+  color: var(--muted);
+  cursor: default;
+}
+
+.workspace-chevron-gap {
+  width: var(--s-3);
+  flex: none;
+}
+
+.workspace-row-note,
+.workspace-link-kind {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+}
+
+.workspace-row-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+
+.workspace-row:hover .workspace-row-actions,
+.workspace-row:focus-within .workspace-row-actions {
+  opacity: 1;
+}
+
+.workspace-row-action {
+  padding: var(--s-1);
+  white-space: nowrap;
+}
+
+.workspace-row-action.is-delete:hover {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.workspace-name-entry {
+  gap: var(--s-1);
+  padding-block: var(--s-1);
+}
+
+.workspace-name-entry input {
+  flex: 1;
+  padding: var(--s-1) var(--s-2);
+  background: var(--sunken);
+}
+
+.workspace-editor {
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+  gap: var(--s-3);
+}
+
+/* A file editor is one flat pane: the header names and acts on the file, the
+   textarea or preview is the content itself, and the single divider is the
+   only boundary it needs. */
+.workspace-editor-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  padding-bottom: var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-editor-bar .inspect-path {
+  min-width: 0;
+  margin-bottom: 0;
+}
+
+.workspace-editor-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: var(--s-2);
+}
+
+.workspace-editor-save {
+  padding: var(--s-1) var(--s-3);
+  font-size: var(--text-xs);
+}
+
+.workspace-editor-warning,
+.workspace-editor-conflict,
+.workspace-editor-error {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  font-size: var(--text-xs);
+}
+
+.workspace-editor-warning,
+.workspace-editor-conflict {
+  background: var(--amber-wash);
+  color: var(--amber-text);
+}
+
+.workspace-editor-error {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.workspace-editor-source {
+  display: block;
+  width: 100%;
+  min-height: calc(var(--s-8) * 4);
+  padding: var(--s-3);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-normal);
+  resize: vertical;
+}
+
+.workspace-editor-source:focus {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-color: var(--line-strong);
+  background: var(--bg);
+}
+
+.workspace-editor-source:read-only {
+  color: var(--muted);
+  cursor: default;
+}
+
+.workspace-editor-preview {
+  min-width: 0;
+}

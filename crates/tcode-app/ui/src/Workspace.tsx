@@ -22,6 +22,7 @@ import {
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
 import { BackIcon, CloseIcon, SidebarIcon } from "./components/Icons";
+import { navValue } from "./inspect";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
@@ -115,6 +116,24 @@ export function Workspace({
         return sibling
           ? close(current, sibling.id)
           : openInspect(current, pane, session, { kind: "files" });
+      });
+    },
+    [onTiling],
+  );
+
+  // Workspace browsing is an inspect value too: when another view is current,
+  // follow normal inspect history to the tree; when the tree is current, close
+  // the pane. This keeps a session's one inspect pane and its navigation intact.
+  const toggleWorkspace = useCallback(
+    (pane: string, session: string) => {
+      onTiling((current) => {
+        const sibling = panes(current).find(
+          (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
+        );
+        if (sibling?.pane.kind === "inspect" && navValue(sibling.pane.nav).kind === "workspace-tree") {
+          return close(current, sibling.id);
+        }
+        return openInspect(current, pane, session, { kind: "workspace-tree" });
       });
     },
     [onTiling],
@@ -226,6 +245,7 @@ export function Workspace({
       onTiling((current) => openInspect(current, pane, session, value)),
     onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
     onToggleFiles: toggleFiles,
+    onToggleWorkspace: toggleWorkspace,
     onDraft,
     onAttach,
     onDetach,

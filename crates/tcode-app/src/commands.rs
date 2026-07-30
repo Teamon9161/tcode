@@ -16,6 +16,7 @@ use tcode_core::ContentBlock;
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
 use crate::projects::{self, ProjectInfo, StoredSession};
 use crate::state::{run_turn, Supervisor};
+use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry};
 
 /// What the frontend needs to render a session before any turn has run.
 #[derive(Serialize)]
@@ -324,6 +325,161 @@ pub fn open_folder(
 #[tauri::command]
 pub fn close_session(supervisor: State<'_, Arc<Supervisor>>, session: String) {
     supervisor.close(&session);
+}
+
+/// One workspace entry in the webview contract.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct WorkspaceEntryView {
+    pub name: String,
+    /// Slash-separated path relative to the session's workspace root.
+    pub path: String,
+    /// `file`, `directory`, or `link`.
+    pub kind: &'static str,
+}
+
+impl From<WorkspaceEntry> for WorkspaceEntryView {
+    fn from(entry: WorkspaceEntry) -> Self {
+        Self {
+            name: entry.name,
+            path: entry.path,
+            kind: match entry.kind {
+                EntryKind::File => "file",
+                EntryKind::Directory => "directory",
+                EntryKind::Link => "link",
+            },
+        }
+    }
+}
+
+/// A text file response in the webview contract.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct WorkspaceTextView {
+    pub path: String,
+    pub text: String,
+    pub revision: String,
+    pub bytes: u64,
+    pub truncated: bool,
+}
+
+impl From<TextFile> for WorkspaceTextView {
+    fn from(file: TextFile) -> Self {
+        Self {
+            path: file.path,
+            text: file.text,
+            revision: file.revision,
+            bytes: file.bytes,
+            truncated: file.truncated,
+        }
+    }
+}
+
+fn session_workspace(supervisor: &Supervisor, session: &str) -> Result<Workspace, String> {
+    let handle = supervisor
+        .get(session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    Workspace::open(&handle.cwd).map_err(|error| error.to_string())
+}
+
+/// List the direct children of the session workspace root or one of its directories.
+#[tauri::command]
+pub fn workspace_list(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: Option<String>,
+) -> Result<Vec<WorkspaceEntryView>, String> {
+    session_workspace(&supervisor, &session)?
+        .list(path.as_deref())
+        .map(|entries| entries.into_iter().map(WorkspaceEntryView::from).collect())
+        .map_err(|error| error.to_string())
+}
+
+/// Read a UTF-8 text file from the session workspace.
+#[tauri::command]
+pub fn workspace_read_text(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+) -> Result<WorkspaceTextView, String> {
+    session_workspace(&supervisor, &session)?
+        .read(&path)
+        .map(WorkspaceTextView::from)
+        .map_err(|error| error.to_string())
+}
+
+/// Write a UTF-8 text file when its revision still matches.
+#[tauri::command]
+pub fn workspace_write_text(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+    text: String,
+    revision: String,
+) -> Result<WorkspaceTextView, String> {
+    session_workspace(&supervisor, &session)?
+        .write(&path, &text, &revision)
+        .map(WorkspaceTextView::from)
+        .map_err(|error| error.to_string())
+}
+
+/// Create an empty file or directory under the session workspace.
+#[tauri::command]
+pub fn workspace_create(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    parent: Option<String>,
+    name: String,
+    kind: String,
+) -> Result<WorkspaceEntryView, String> {
+    let workspace = session_workspace(&supervisor, &session)?;
+    create_workspace_entry(&workspace, parent.as_deref(), &name, &kind)
+}
+
+fn create_workspace_entry(
+    workspace: &Workspace,
+    parent: Option<&str>,
+    name: &str,
+    kind: &str,
+) -> Result<WorkspaceEntryView, String> {
+    match kind {
+        "file" => workspace
+            .create_file(parent, name, "")
+            .map(|file| WorkspaceEntryView {
+                name: name.to_owned(),
+                path: file.path,
+                kind: "file",
+            }),
+        "directory" => workspace
+            .create_dir(parent, name)
+            .map(WorkspaceEntryView::from),
+        _ => return Err(format!("'{kind}' is not a workspace entry kind")),
+    }
+    .map_err(|error| error.to_string())
+}
+
+/// Rename a file or directory without moving it from its parent directory.
+#[tauri::command]
+pub fn workspace_rename(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+    name: String,
+) -> Result<WorkspaceEntryView, String> {
+    session_workspace(&supervisor, &session)?
+        .rename(&path, &name)
+        .map(WorkspaceEntryView::from)
+        .map_err(|error| error.to_string())
+}
+
+/// Delete a file, link, or empty directory from the session workspace.
+#[tauri::command]
+pub fn workspace_delete(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+) -> Result<(), String> {
+    session_workspace(&supervisor, &session)?
+        .delete(&path)
+        .map_err(|error| error.to_string())
 }
 
 /// Start a turn. Returns as soon as it is running, not when it finishes:
@@ -831,5 +987,33 @@ mod tests {
         let history = handle.history();
         assert_eq!(history.len(), 1);
         assert!(matches!(history.as_slice(), [Entry::User(_)]));
+    }
+
+    #[test]
+    fn create_workspace_entry_delegates_to_the_workspace_with_an_empty_file() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(root.path()).unwrap();
+
+        let file = create_workspace_entry(&workspace, None, "new.txt", "file").unwrap();
+        let directory = create_workspace_entry(&workspace, None, "src", "directory").unwrap();
+
+        assert_eq!(file.kind, "file");
+        assert_eq!(file.path, "new.txt");
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("new.txt")).unwrap(),
+            ""
+        );
+        assert_eq!(directory.kind, "directory");
+        assert!(root.path().join("src").is_dir());
+    }
+
+    #[test]
+    fn create_workspace_entry_rejects_unknown_kinds() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = Workspace::open(root.path()).unwrap();
+
+        let error = create_workspace_entry(&workspace, None, "new", "symlink").unwrap_err();
+        assert_eq!(error, "'symlink' is not a workspace entry kind");
+        assert!(!root.path().join("new").exists());
     }
 }

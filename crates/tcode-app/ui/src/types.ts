@@ -137,6 +137,15 @@ export type SessionInfo = {
   home: string;
 };
 
+/** Mirrors `commands.rs::WorkspaceTextView`, including the complete-file revision. */
+export type WorkspaceTextView = {
+  path: string;
+  text: string;
+  revision: string;
+  bytes: number;
+  truncated: boolean;
+};
+
 /** A durable ledger entry serialized by `tcode_core::Entry`. */
 export type LedgerEntry = { kind: string; data: unknown };
 
