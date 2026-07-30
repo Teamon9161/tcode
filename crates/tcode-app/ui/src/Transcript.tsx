@@ -7,6 +7,7 @@ import { RewindContext, rewindPoints, useRewinding, type RewindTarget } from "./
 import { rich } from "./rich";
 import { readChanges } from "./diff";
 import { isPlanSubmission } from "./plan";
+import { MOD } from "./keys";
 import {
   useToolMeta,
   useToolName,
@@ -781,11 +782,6 @@ function Working() {
     </p>
   );
 }
-
-/** What the platform calls the modifier every layout key carries. Named from
- *  the user agent because this app ships on all three desktops and "Ctrl" shown
- *  to a Mac user is simply wrong. */
-const MOD = /mac/i.test(navigator.platform || navigator.userAgent) ? "Cmd" : "Ctrl";
 
 /** The empty transcript teaches the surface rather than announcing emptiness. */
 function FirstRun() {

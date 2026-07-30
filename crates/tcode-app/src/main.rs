@@ -49,6 +49,8 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::workspace_create,
             tcode_app::commands::workspace_rename,
             tcode_app::commands::workspace_delete,
+            tcode_app::commands::workspace_openers,
+            tcode_app::commands::workspace_open_external,
             tcode_app::commands::tool_views,
             tcode_app::commands::plan,
             tcode_app::commands::write_plan,

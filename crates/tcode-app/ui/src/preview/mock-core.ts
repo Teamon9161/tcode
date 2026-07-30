@@ -422,6 +422,17 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     case "workspace_delete":
       deleteWorkspace(args);
       return undefined as T;
+    // Two openers rather than all three: the backend only ever reports what is
+    // installed, and a fixture where everything is present would never show the
+    // shape a real machine has (rule: a fixture writes what the wire really
+    // carries, or it stops being an acceptance surface).
+    case "workspace_openers":
+      return [
+        { id: "reveal", name: "Explorer" },
+        { id: "vscode", name: "VS Code" },
+      ] as T;
+    case "workspace_open_external":
+      return undefined as T;
     default:
       return undefined as T;
   }

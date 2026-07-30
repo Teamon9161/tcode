@@ -5,10 +5,12 @@ import type { SessionState } from "./session";
 import type { PlanDraft } from "./plan";
 import type { PlanDecision } from "./PlanEditor";
 import {
+  browserPane,
   close,
   focusPane,
   focused,
   navigate,
+  openAside,
   openInspect,
   panes,
   parentSplit,
@@ -22,7 +24,6 @@ import {
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
 import { BackIcon, ChevronDown, ChevronRight, CloseIcon, SidebarIcon } from "./components/Icons";
-import { navValue } from "./inspect";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
@@ -166,25 +167,37 @@ export function Workspace({
     [onTiling],
   );
 
-  // Workspace browsing is an inspect value too: when another view is current,
-  // follow normal inspect history to the tree; when the tree is current, close
-  // the pane. This keeps a session's one inspect pane and its navigation intact.
+  // Workspace browsing is an inspect value too, so turning it on follows normal
+  // inspect history. Turning it off closes the pane that is browsing — a tree is
+  // not something you navigate away from, it is the place you navigate *from*
+  // (`browsing` in `layout.ts`).
   const toggleWorkspace = useCallback(
     (pane: string, session: string) => {
       onTiling((current) => {
-        const sibling = panes(current).find(
-          (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
-        );
-        if (
-          sibling?.pane.kind === "inspect" &&
-          navValue(sibling.pane.nav).kind === "workspace-tree"
-        ) {
-          return close(current, sibling.id);
-        }
-        return openInspect(current, pane, session, { kind: "workspace-tree" });
+        // Specifically the pane already browsing, not simply this session's
+        // first inspect pane: once a file is open beside the tree there are two
+        // of them, and closing the wrong one would shut the file while leaving
+        // the tree the button was meant to hide.
+        const browser = browserPane(current, session);
+        return browser
+          ? close(current, browser.id)
+          : openInspect(current, pane, session, { kind: "workspace-tree" });
       });
     },
     [onTiling],
+  );
+
+  // Naming a file to the agent, from the list of files. It writes into the
+  // composer instead of sending, because `@thing` is the start of a sentence
+  // somebody is still writing — and it appends rather than replaces, so
+  // mentioning three files in one message is three clicks.
+  const mention = useCallback(
+    (session: string, path: string) => {
+      const quoted = /\s/.test(path) ? `@"${path}"` : `@${path}`;
+      const draft = stateOf(session).draft;
+      onDraft(session, draft.trim() ? `${draft.replace(/\s+$/, "")} ${quoted} ` : `${quoted} `);
+    },
+    [stateOf, onDraft],
   );
 
   // Esc closes the pane you are looking into, before it reaches the composer's
@@ -193,6 +206,24 @@ export function Workspace({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      // Escape belongs to the innermost thing that can take it, and this — the
+      // pane — is the outermost. Both of the things ahead of it listen on
+      // `window` in the capture phase too, where `stopPropagation` cannot
+      // separate them: the handler that runs first is whichever mounted first,
+      // which is this one. So the precedence is stated here rather than left as
+      // an accident of mounting order.
+      //
+      // A popover goes first (`seat.ts` closes it on this key). Then anything
+      // being typed into: a rename in the file tree, an unsaved edit in the
+      // editor. Escape must never be the key that throws away what you were
+      // writing — that is the same rule the composer's own Escape follows.
+      if (document.querySelector(".seated")) return;
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement
+      ) {
+        return;
+      }
       const seat = focused(tiling);
       if (!seat || seat.pane.kind !== "inspect") return;
       event.stopPropagation();
@@ -291,6 +322,9 @@ export function Workspace({
     onRatio: (divider, ratio) => onTiling((current) => setRatio(current, divider, ratio)),
     onOpen: (pane, session, value) =>
       onTiling((current) => openInspect(current, pane, session, value)),
+    onOpenAside: (pane, session, value) =>
+      onTiling((current) => openAside(current, pane, session, value)),
+    onMention: mention,
     onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
     onToggleFiles: toggleFiles,
     onToggleWorkspace: toggleWorkspace,

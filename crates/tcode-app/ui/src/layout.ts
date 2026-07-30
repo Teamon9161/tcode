@@ -1,4 +1,4 @@
-import { navOf, navOpen, type Inspect, type Nav } from "./inspect";
+import { navOf, navOpen, navValue, type Inspect, type Nav } from "./inspect";
 
 /**
  * The window's pane tree.
@@ -139,19 +139,35 @@ export function focusPane(tiling: Tiling, id: string): Tiling {
  * named a pane that is gone, and guessing where they meant instead is worse
  * than doing nothing.
  */
-export function split(tiling: Tiling, target: string, dir: Dir, pane: Pane): Tiling {
+export function split(
+  tiling: Tiling,
+  target: string,
+  dir: Dir,
+  pane: Pane,
+  ratio = 0.5,
+): Tiling {
   if (!tiling.root) return single(pane);
   const added = leafOf(pane);
   const root = mapNode(tiling.root, target, (node) => ({
     kind: "split",
     id: nextId(),
     dir,
-    ratio: 0.5,
+    ratio,
     a: node,
     b: added,
   }));
   return root === tiling.root ? tiling : { root, focus: added.id };
 }
+
+/**
+ * What a pane splitting out of the file tree leaves the tree.
+ *
+ * Halves are right when two panes hold comparable things. A list of file names
+ * and the file itself are not comparable: the list needs enough width for a name
+ * and the file needs all the rest, and an even split spends a third of the
+ * window on trailing whitespace. Only a default — the divider is still there.
+ */
+const BROWSER_SHARE = 0.34;
 
 /**
  * Removes a node — a leaf, or a whole subtree — and collapses the split that
@@ -217,12 +233,40 @@ export function show(tiling: Tiling, session: string): Tiling {
 }
 
 /**
+ * True while a pane is browsing the workspace.
+ *
+ * The distinction it draws is between a pane you *look at* and a pane you *look
+ * things up in*. Every other inspect value is the second half of an act that
+ * started elsewhere — a diff you clicked, a run you opened — and replacing one
+ * with the next is exactly right, because you are done with the last one. The
+ * file tree is the opposite: it is how you get to the next thing, so a tree that
+ * turns into the file you picked is a tree you have to walk back to after every
+ * single look.
+ */
+export function browsing(pane: Pane): boolean {
+  return pane.kind === "inspect" && navValue(pane.nav).kind === "workspace-tree";
+}
+
+/** The pane browsing `session`'s workspace, if one is open. */
+export function browserPane(tiling: Tiling, session: string): Leaf | null {
+  return (
+    panes(tiling).find((leaf) => leaf.pane.session === session && browsing(leaf.pane)) ?? null
+  );
+}
+
+/**
  * Shows something belonging to `session`, beside the pane it was opened from.
  *
  * One inspect pane per conversation, reused. Opening a diff, then a file, then
  * a sub-agent's run must not tile the window into four slivers — they are the
  * same act of looking, so they share a pane and stack into its history. Only
  * the first one splits.
+ *
+ * The workspace browser is the one pane never reused this way (`browsing`), so
+ * picking a file out of the tree lands beside the tree rather than on top of it,
+ * and the second pick reuses the pane the first one made. That is the whole of
+ * "click swaps the file, the tree stays" — no tab strip, no preview slot, just
+ * one pane that is a list and one pane that is a file.
  */
 export function openInspect(
   tiling: Tiling,
@@ -231,7 +275,8 @@ export function openInspect(
   value: Inspect,
 ): Tiling {
   const existing = panes(tiling).find(
-    (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
+    (leaf) =>
+      leaf.pane.kind === "inspect" && leaf.pane.session === session && !browsing(leaf.pane),
   );
   if (existing && existing.pane.kind === "inspect") {
     const grown = updatePane(tiling, existing.id, {
@@ -240,7 +285,27 @@ export function openInspect(
     });
     return { ...grown, focus: existing.id };
   }
-  return split(tiling, from, "row", { kind: "inspect", session, nav: navOf(value) });
+  return openAside(tiling, from, session, value);
+}
+
+/**
+ * The same, but always in a pane of its own.
+ *
+ * This is how a second file joins the first rather than replacing it. It is a
+ * separate function instead of a flag because it is a separate decision the
+ * person made — `openInspect` is "show me this", and this is "show me this *as
+ * well*", which is the same distinction `show` and `showBeside` already draw for
+ * conversations.
+ */
+export function openAside(
+  tiling: Tiling,
+  from: string,
+  session: string,
+  value: Inspect,
+): Tiling {
+  const leaf = findLeaf(tiling, from);
+  const share = leaf && browsing(leaf.pane) ? BROWSER_SHARE : undefined;
+  return split(tiling, from, "row", { kind: "inspect", session, nav: navOf(value) }, share);
 }
 
 /** Steps one inspect pane's history — back, forward, or on to something new. */

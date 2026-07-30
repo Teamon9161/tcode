@@ -133,7 +133,11 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **阈值与 TUI 同源**（context 85/95，额度 75/90）。两个前端在不同时刻变黄，等于同一个契约有两份定义。
 
-17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。
+17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。右键菜单是同一个弹出层的另一种锚（`at` 传视口坐标当零尺寸矩形），不是第四份实现；子菜单画在父菜单的 DOM 里而不是另开 portal，否则点子菜单会被父菜单判成"点了外面"。
+
+    **`mousedown` 监听必须是捕获阶段。** Tauri 自己的 `drag.js` 在 `document` 上监听 mousedown，命中 `data-tauri-drag-region` 就 `stopImmediatePropagation()`——而按 9c 整条标题栏都是拖拽区，于是冒泡阶段的监听永远听不到"点了标题栏"，而设置菜单的触发器恰好就在那儿：表现是"点旁边关不掉，只能再按一次按钮"。
+
+    **Esc 的优先级写在 `Workspace.tsx` 里，不靠挂载顺序。** 它和 `seat.ts` 都在 window 捕获阶段，`stopPropagation` 分不开同一元素上的两个监听，先跑的是先挂的（就是窗格那个）。所以窗格的 Esc 显式让位给两样东西：开着的 `.seated`，以及正在被输入的 input/textarea（树里的重命名、编辑器里没存的改动）。**Esc 永远不许是那个把你正在写的东西扔掉的键。**
 
 18. **"窗口怎么画"的偏好留在 webview，不进 config**（`ui/src/display.ts` + `DisplayMenu.tsx` + `rail.ts` 的项目顺序，都在 `localStorage`）。判据是这个开关能不能改变 agent 做的事：不能，就不是配置。`[tcode_state]` / `config.toml` 里每加一个字段都要同步 `tcode-config` skill（根 CLAUDE.md 的硬要求），而"显示不显示推理"错了只值一次点击，不值一条配置契约。反过来也成立：**任何影响一次 turn 的行为、发送内容或落盘内容的开关，绝不许悄悄住进 `localStorage`。**
 
@@ -168,6 +172,8 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。`runPairs` / `reportOf` 是这棵树上的两个纯查询，把委派调用和它的 run 认成一步（见硬规则 9f）。
   - **会话栏这一摊**：`rail.ts`（纯函数：按 cwd 分组、项目换序、从第一条 user 块取会话标题 + 顺序的 `localStorage` 存取）、`Workspace.tsx` 的 `RailProject`。**会话名不是文件夹名**：会话名等于文件夹名，所以同一个文件夹开两个会话就是两条一模一样的行，会话栏能把它们都列出来却说不清哪个是哪个。文件夹上升成分组标题，行上写"这个会话是被要求做什么的"（第一条 prompt，不是最后一条——对话是为它开的那件事而存在，跟着最新消息改名等于每打一行字就改一次名）。换序用 Alt+方向 + hover 出来的两个按钮，与 `PlanEditor` 同一套词汇；**存下来的顺序只记被移动过的文件夹**，没记过的按到达顺序排在后面，这样新开一个文件夹不会把已经排好的打乱。
+  - **文件树是"往哪儿去"的那个窗格，不是"看什么"的那个**（`layout.ts::browsing` / `browserPane`）。`openInspect` 复用 inspect 窗格时**跳过正在浏览的那个**，所以点一个文件是开在树旁边而不是把树顶掉，第二次点复用第一次开出来的那个窗格——"点击换文件、树不动"就是这一条，没有 tab 条也没有 preview 槽。`openAside`（右键 open in → 一个新窗格 / Mod+点击 / Mod+Enter）永远新分裂一个，这是"再开一个"这个明确的动作，和会话的 `show` / `showBeside` 是同一组区分。从树里分裂出来的窗格默认给树 `BROWSER_SHARE`（0.34）而不是一半：一列文件名和文件本身不是同量级的东西。
+  - **外部打开的两条边界**（`src/openers.rs`）：webview 送的是**表里的 id**（`vscode`/`cursor`/`zed`/`reveal`），永远不是命令行——认不出就报错，不猜（规则 3）；路径先过 `Workspace::host_path`（与读写同一套 link/canonical 检查）再交出去。Windows 上 `code` 是 `.cmd`，`CreateProcess` 跑不了批处理，只能过 `cmd.exe`，所以**路径里含 cmd 元字符时整条拒绝**而不是加引号赌一把——仓库里允许有叫 `a&b.txt` 的文件，这个 app 不允许去跑它。检测是文件系统探测（PATH + 各平台固定安装位置），没装的编辑器**不进菜单**，而不是进了菜单点了才失败。
   - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。
   - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿，`route`、`quiet_output` 与 `display_name` 都由活着的工具派生（`Tool::route` / `Tool::batch_policy` / `Tool::display_name`），名字表已经删了。**一个工具的行只说得清"哪个工具、干什么"时，缺的那一半属于这张注册表**：core 的 `summarize_call` 只认一组固定的参数键，`skill` 的参数叫 `name` 不在里面，于是每次加载 skill 在转录里都只是光秃秃一个 `skill`——补法是给它一个 `ToolView.summary`，不是去改 core 那组键的语义。（TUI 的**工具调用**路径至今是同一个洞、同一个原因；它的 `/名字` **斜杠**路径不受影响，那条走 `parse_skill_echo` + `skill_echo_lines`，名字本来就在。两条路径不是一回事，别拿其中一条的表现推另一条。）
 
@@ -176,6 +182,7 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。表格只把有限行放进 DOM（`ROW_STEP`），不是分页而是上限——20 万行 DOM 就是一个冻住的窗口。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
   - **语法高亮是自己写的**（`syntax.ts`），因为 Shiki/highlight.js 自带调色板是字面值，主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色。它输出语义 class，颜色由 `base.css` 的 `--syn-*` 契约决定。
+- `src/openers.rs`：把工作区里的一个路径交给外面的程序（编辑器 / 文件管理器）。表在这里，边界见上面那条。
 - `src/paths.rs`：`canonical_dir`——app 里唯一一处把用户选的文件夹变成键的地方（见硬规则 9）。
 - `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + 四条 window 授权（自绘标题栏，见 9c）+ `dialog:allow-open`（"打开文件夹"要它）。
 - `icons/`：由 `icons/mark.svg` 用 `rsvg-convert` 生成，改标记要重新导出全部尺寸。

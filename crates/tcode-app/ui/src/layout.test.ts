@@ -8,7 +8,9 @@ import {
   focused,
   frames,
   navigate,
+  openAside,
   openInspect,
+  browserPane,
   panes,
   parentSplit,
   rotate,
@@ -23,7 +25,7 @@ import {
   type Pane,
   type Tiling,
 } from "./layout";
-import { navBack, navForward, navOf, navValue } from "./inspect";
+import { navBack, navForward, navOf, navValue, type Inspect } from "./inspect";
 
 const talk = (session: string): Pane => ({ kind: "session", session });
 const diff = (session: string, callId: string): Pane => ({
@@ -420,5 +422,69 @@ describe("sessionsInView", () => {
     const three = split(two, id(two, "tcode"), "col", diff("duck_ext", "edit-1"));
 
     expect(sessionsInView(three)).toEqual(["duck_ext", "tcode"]);
+  });
+});
+
+describe("the workspace browser's pane", () => {
+  const tree = (session: string): Pane => ({
+    kind: "inspect",
+    session,
+    nav: navOf({ kind: "workspace-tree" }),
+  });
+  const file = (path: string): Inspect => ({ kind: "workspace-file", path });
+
+  /** A conversation with the file tree open beside it. */
+  function browsing(): Tiling {
+    const one = single(talk("tcode"));
+    return split(one, id(one, "tcode"), "row", tree("tcode"));
+  }
+
+  it("is never taken over by what is opened out of it", () => {
+    const open = browsing();
+    const picked = openInspect(open, open.focus, "tcode", file("src/main.rs"));
+
+    expect(shape(picked)).toBe(
+      "row(tcode, row(tcode:workspace-tree, tcode:workspace-file))",
+    );
+  });
+
+  it("hands the second file to the pane the first one made", () => {
+    const open = browsing();
+    const first = openInspect(open, open.focus, "tcode", file("a.rs"));
+    const second = openInspect(first, browserPane(first, "tcode")!.id, "tcode", file("b.rs"));
+
+    // Still two panes, and the file pane is the one that changed.
+    expect(shape(second)).toBe(
+      "row(tcode, row(tcode:workspace-tree, tcode:workspace-file))",
+    );
+    expect(second.focus).toBe(first.focus);
+  });
+
+  it("keeps a diff from the transcript out of the tree as well", () => {
+    const open = browsing();
+    const seat = panes(open).find((leaf) => leaf.pane.kind === "session")!;
+    const looked = openInspect(open, seat.id, "tcode", { kind: "diff", callId: "edit-1" });
+
+    // Beside the pane it was opened from, which is the transcript — and the
+    // tree is still there, which is the whole point.
+    expect(shape(looked)).toBe("row(row(tcode, tcode:diff), tcode:workspace-tree)");
+  });
+
+  it("gives openAside a pane even when a file pane already exists", () => {
+    const open = browsing();
+    const first = openInspect(open, open.focus, "tcode", file("a.rs"));
+    const beside = openAside(first, first.focus, "tcode", file("b.rs"));
+
+    expect(panes(beside).filter((leaf) => leaf.pane.kind === "inspect")).toHaveLength(3);
+    expect(browserPane(beside, "tcode")).not.toBeNull();
+  });
+
+  it("finds the browsing pane and only that one", () => {
+    const open = browsing();
+    const picked = openInspect(open, open.focus, "tcode", file("a.rs"));
+    const found = browserPane(picked, "tcode")!;
+
+    expect(found.pane.kind === "inspect" && navValue(found.pane.nav).kind).toBe("workspace-tree");
+    expect(browserPane(picked, "duck_ext")).toBeNull();
   });
 });

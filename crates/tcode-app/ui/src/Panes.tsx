@@ -54,6 +54,13 @@ export type PaneContext = {
   onClosePane: (pane: string) => void;
   onRatio: (divider: string, ratio: number) => void;
   onOpen: (pane: string, session: string, value: Inspect) => void;
+  /** Show it *as well*, in a pane of its own — the deliberate "keep this one and
+   *  add another" act, which is why it is a second callback rather than a flag. */
+  onOpenAside: (pane: string, session: string, value: Inspect) => void;
+  /** Put `@path` in this conversation's composer — what the tree's "mention"
+   *  does. It writes a draft rather than sending, because naming a file is the
+   *  start of a sentence somebody is still writing. */
+  onMention: (session: string, path: string) => void;
   onNavigate: (pane: string, step: typeof navBack) => void;
   onToggleFiles: (pane: string, session: string) => void;
   onToggleWorkspace: (pane: string, session: string) => void;
@@ -420,6 +427,8 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
           plan={state.plan}
           planDraft={draft}
           onOpen={(next) => context.onOpen(leaf.id, session, next)}
+          onOpenAside={(next) => context.onOpenAside(leaf.id, session, next)}
+          onMention={(path) => context.onMention(session, path)}
           onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
           onSavePlan={() => context.onSavePlan(session)}
         />

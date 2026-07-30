@@ -134,6 +134,18 @@ impl Workspace {
         &self.root
     }
 
+    /// The host path of an existing entry, for handing to something outside this
+    /// process (see `openers`).
+    ///
+    /// This is the one method that returns an operating-system path, and it is
+    /// still not an escape hatch: it resolves through exactly the same checks as
+    /// every read and write — no component may be a link, and every one of them
+    /// must canonicalize inside the root — so the caller receives a path only for
+    /// entries this boundary already agreed to.
+    pub fn host_path(&self, path: &str) -> Result<PathBuf, WorkspaceError> {
+        self.resolve_existing_entry(path)
+    }
+
     /// List one directory without recursing. `None` means the workspace root;
     /// all `Some` values must be non-empty relative wire paths.
     pub fn list(&self, path: Option<&str>) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {

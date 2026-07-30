@@ -103,6 +103,23 @@ export const PlusIcon = (props: IconProps) => (
   </Glyph>
 );
 
+export const SearchIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <circle cx="10.8" cy="10.8" r="6.3" />
+    <path d="m15.4 15.4 4.1 4.1" />
+  </Glyph>
+);
+
+/** A turn all the way round, back to where it started — re-reading what is
+ *  already on screen rather than fetching something new. The head sits exactly
+ *  on the arc's end so the stroke reads as one motion. */
+export const RefreshIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M19.5 12a7.5 7.5 0 1 1-2.2-5.3" />
+    <path d="M14.3 6.7h3v-3" />
+  </Glyph>
+);
+
 export const BackIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M19 12H5.5" />

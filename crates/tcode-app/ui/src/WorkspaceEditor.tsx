@@ -2,7 +2,9 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { Code } from "./components/Code";
+import { RefreshIcon } from "./components/Icons";
 import { languageOf } from "./diff";
+import { MOD } from "./keys";
 import { rich } from "./rich";
 import { useSession } from "./session";
 import type { WorkspaceTextView } from "./types";
@@ -133,7 +135,19 @@ export function WorkspaceEditor({ path }: { path: string }) {
   const saveEnabled = file !== null && canSaveWorkspaceText({ dirty, truncated: !complete, conflicted });
 
   return (
-    <section className="workspace-editor" aria-label={`Editor for ${path}`}>
+    <section
+      className="workspace-editor"
+      aria-label={`Editor for ${path}`}
+      // The key everyone's hands already know. On the section rather than the
+      // textarea so it works from the preview too, and stopped here so it cannot
+      // reach anything else that might one day want it.
+      onKeyDown={(event) => {
+        if (!(event.ctrlKey || event.metaKey) || event.key !== "s") return;
+        event.preventDefault();
+        event.stopPropagation();
+        if (saveEnabled && !saving) save();
+      }}
+    >
       <header className="workspace-editor-bar">
         <p className="inspect-path" title={path}>{path}</p>
         <div className="workspace-editor-actions">
@@ -153,10 +167,27 @@ export function WorkspaceEditor({ path }: { path: string }) {
               preview
             </button>
           </div>
-          <button className="link-btn" onClick={reload} disabled={loading || saving}>
-            reload
+          {/* Reading the file again is a repeatable action with nothing to
+              report, so it is the same glyph the file tree refreshes with.
+              Saving keeps its word: it is the primary action, it is the only
+              control here with states to say out loud (disabled while there is
+              nothing to write, `saving…` while it is in flight), and a floppy
+              disk is a picture of a thing this app's user has never owned. */}
+          <button
+            className="icon-btn"
+            onClick={reload}
+            disabled={loading || saving}
+            aria-label="Read this file again"
+            title="Read this file again"
+          >
+            <RefreshIcon size={14} />
           </button>
-          <button className="btn btn-primary workspace-editor-save" onClick={save} disabled={!saveEnabled || saving}>
+          <button
+            className="btn btn-primary workspace-editor-save"
+            onClick={save}
+            disabled={!saveEnabled || saving}
+            title={`Save (${MOD}+S)`}
+          >
             {saving ? "saving…" : "save"}
           </button>
         </div>

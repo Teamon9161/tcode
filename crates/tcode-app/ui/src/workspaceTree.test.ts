@@ -9,6 +9,7 @@ import {
   replaceWorkspaceChildren,
   toggleWorkspaceDirectory,
   visibleWorkspaceTree,
+  workspaceHostPath,
   type WorkspaceEntry,
 } from "./workspaceTree";
 
@@ -93,5 +94,22 @@ describe("workspace tree state", () => {
 
     tree = deleteWorkspaceEntry(tree, "code/lib.ts");
     expect(visibleWorkspaceTree(tree, "").map((entry) => entry.path)).toEqual(["code", "code/main.ts"]);
+  });
+});
+
+describe("workspaceHostPath", () => {
+  it("writes a Windows path with Windows separators", () => {
+    expect(workspaceHostPath("C:\\code\\tcode", "crates/app/src/main.rs")).toBe(
+      "C:\\code\\tcode\\crates\\app\\src\\main.rs",
+    );
+  });
+
+  it("leaves a posix path alone", () => {
+    expect(workspaceHostPath("/home/me/tcode", "src/main.rs")).toBe("/home/me/tcode/src/main.rs");
+  });
+
+  it("does not double a separator the folder already ends with", () => {
+    expect(workspaceHostPath("/home/me/tcode/", "a.txt")).toBe("/home/me/tcode/a.txt");
+    expect(workspaceHostPath("C:\\code\\", "a.txt")).toBe("C:\\code\\a.txt");
   });
 });

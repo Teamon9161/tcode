@@ -22,6 +22,23 @@ export type WorkspaceTreeNode = WorkspaceEntry & {
 
 export const WORKSPACE_ROOT = "";
 
+/**
+ * A workspace-relative path as the host operating system writes it.
+ *
+ * Only for handing to a human — the clipboard. Nothing sent back over the wire
+ * uses it: the workspace commands take slash-separated relative paths and turn
+ * them into host paths themselves, which is the confinement (`AGENTS.md` rule 3
+ * — what the webview says about paths is data). The separator is read off `cwd`
+ * rather than sniffed from a user-agent string, because `cwd` is a real path
+ * from the machine this is running on.
+ */
+export function workspaceHostPath(cwd: string, path: string): string {
+  const separator = cwd.includes("\\") ? "\\" : "/";
+  const root = cwd.replace(/[\\/]+$/, "");
+  const rest = path.split("/").join(separator);
+  return root ? `${root}${separator}${rest}` : rest;
+}
+
 export function emptyWorkspaceTree(): WorkspaceTreeState {
   return { children: {}, expanded: new Set() };
 }

@@ -476,6 +476,48 @@ pub fn workspace_rename(
         .map_err(|error| error.to_string())
 }
 
+/// One way to hand a workspace file to a program outside this app.
+#[derive(Serialize)]
+pub struct OpenerView {
+    pub id: String,
+    pub name: String,
+}
+
+/// The external openers installed on this machine, file manager first.
+///
+/// Read once per menu rather than at startup: an editor installed while the app
+/// was running should turn up without a restart, and the probe is a handful of
+/// `stat` calls.
+#[tauri::command]
+pub fn workspace_openers() -> Vec<OpenerView> {
+    crate::openers::available()
+        .into_iter()
+        .map(|opener| OpenerView {
+            id: opener.id,
+            name: opener.name,
+        })
+        .collect()
+}
+
+/// Open one workspace entry in an external program.
+///
+/// The webview sends an opener *id*, never a command: the table of programs is
+/// in `openers.rs` and an id that is not in it is refused (rule 3). The path is
+/// resolved through the same confinement as every read, so this cannot reach
+/// outside the session's workspace whatever the webview says.
+#[tauri::command]
+pub fn workspace_open_external(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+    opener: String,
+) -> Result<(), String> {
+    let resolved = session_workspace(&supervisor, &session)?
+        .host_path(&path)
+        .map_err(|error| error.to_string())?;
+    crate::openers::open(&opener, &resolved)
+}
+
 /// Delete a file, link, or empty directory from the session workspace.
 #[tauri::command]
 pub fn workspace_delete(

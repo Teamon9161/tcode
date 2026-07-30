@@ -21,16 +21,25 @@ import { useCallback, useEffect, useLayoutEffect, type RefObject } from "react";
  *   down out of a header.
  * - `--seat-room` / `--seat-below`: how much room there is above and below it, so
  *   a panel caps its own height rather than growing off the edge of the window.
+ *
+ * A context menu is the same popover with a different anchor: it belongs where
+ * the pointer was, not where a control is. `at` supplies that point as a
+ * zero-size rect, so one implementation still places every popover in the window
+ * and a right-click menu does not become the fourth copy rule 17 exists to
+ * prevent.
  */
 export function useSeat({
   open,
   trigger,
+  at,
   box,
   onEscape,
   onOutside,
 }: {
   open: boolean;
   trigger: RefObject<HTMLElement | null>;
+  /** Anchor to this viewport point instead of the trigger's box. */
+  at?: { x: number; y: number } | null;
   box: RefObject<HTMLElement | null>;
   /** Escape was pressed. A panel with its own levels can go back one instead of
    *  closing; most callers pass the same function as `onOutside`. */
@@ -39,17 +48,19 @@ export function useSeat({
   onOutside: () => void;
 }) {
   const place = useCallback(() => {
-    const anchor = trigger.current;
     const panel = box.current;
-    if (!anchor || !panel) return;
-    const rect = anchor.getBoundingClientRect();
+    if (!panel) return;
+    const rect = at
+      ? { left: at.x, right: at.x, top: at.y, bottom: at.y }
+      : trigger.current?.getBoundingClientRect();
+    if (!rect) return;
     panel.style.setProperty("--seat-right", `${window.innerWidth - rect.right}px`);
     panel.style.setProperty("--seat-left", `${rect.left}px`);
     panel.style.setProperty("--seat-top", `${rect.bottom}px`);
     panel.style.setProperty("--seat-bottom", `${window.innerHeight - rect.top}px`);
     panel.style.setProperty("--seat-room", `${rect.top}px`);
     panel.style.setProperty("--seat-below", `${window.innerHeight - rect.bottom}px`);
-  }, [trigger, box]);
+  }, [trigger, at, box]);
 
   // Before paint: a panel that flashes at the window's corner on the way to its
   // anchor is worse than one that appears a frame later.
@@ -71,11 +82,18 @@ export function useSeat({
       event.stopPropagation();
       onEscape();
     };
-    window.addEventListener("mousedown", onDown);
+    // Capture, and that is load-bearing rather than tidy: Tauri's own drag-region
+    // script listens for `mousedown` on `document` and calls
+    // `stopImmediatePropagation()` on anything that hits a `data-tauri-drag-region`
+    // element (rule 9c puts that attribute on the whole title bar). A bubble-phase
+    // listener therefore never hears a click on the bar — which is exactly where
+    // the display menu's own trigger sits, so the one popover most likely to be
+    // dismissed by clicking beside it was the one that could not be.
+    window.addEventListener("mousedown", onDown, true);
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("resize", place);
     return () => {
-      window.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mousedown", onDown, true);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("resize", place);
     };

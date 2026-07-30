@@ -471,6 +471,13 @@
   background: var(--selected);
   color: var(--brand-text);
 }
+/* Restates its colours rather than dropping opacity, like every other disabled
+   control here: a glyph at 40% over a tinted hover is two greys, not one. */
+.icon-btn:disabled {
+  background: transparent;
+  color: var(--faint);
+  cursor: default;
+}
 
 .link-btn {
   padding: 0;
@@ -2939,6 +2946,115 @@
   text-wrap: pretty;
 }
 
+/* ---- what can be done to this ----------------------------------------------
+
+   The context menu: same `.seated` frame and same `seat.ts`, anchored to where
+   the pointer was rather than to a control. A short list of verbs in the UI face
+   — the row it came from already carries the name in mono, and repeating it here
+   in a menu of actions would say the noun twice.
+
+   Its own width is a constant so the clamp below can keep it inside the window
+   without measuring: near the right edge, or near the bottom, it steps back
+   rather than growing off screen. */
+.cmenu {
+  --cmenu-w: 11.75rem;
+  --cmenu-h: 17rem;
+  left: min(var(--seat-left, 0px), calc(100vw - var(--cmenu-w) - var(--s-2)));
+  top: min(var(--seat-top, 0px), calc(100vh - var(--cmenu-h) - var(--s-2)));
+  width: var(--cmenu-w);
+  padding: var(--s-1);
+  /* `.seated` hides overflow so a scrolling panel cannot escape its own corner
+     radius. This one never scrolls, and it has a submenu to let out. */
+  overflow: visible;
+}
+
+.cmenu-item {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--s-3);
+  width: 100%;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+
+/* The key that also does this. `--faint` and never anything else: it is read by
+   accident, on the way to the verb, and a second column at full strength would
+   make every row two things to read instead of one. */
+.cmenu-key {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
+/* The submenu is inside its parent's box rather than in a portal of its own —
+   see `Flyout`. `.cmenu-nest` is only the positioning context; it is not a
+   frame, so it draws nothing. */
+.cmenu-nest {
+  position: relative;
+}
+
+.cmenu-sub {
+  position: absolute;
+  left: calc(100% + var(--s-1));
+  top: calc(var(--s-1) * -1);
+  /* The parent is clamped inside the window, so a submenu hanging off its right
+     edge is the one case left that can leave it. `Flyout` measures once on
+     reveal and flips this class rather than the panel measuring itself. */
+}
+.cmenu-sub.is-left {
+  left: auto;
+  right: calc(100% + var(--s-1));
+}
+.cmenu-item:hover,
+.cmenu-item:focus-visible {
+  background: var(--hover);
+  color: var(--ink);
+}
+/* Wash and text, the pair the palette already defines for a destructive answer.
+   Only on the pointer: a red item sitting in a list at rest reads as a warning
+   about the menu rather than as one action in it. */
+.cmenu-item.is-danger:hover,
+.cmenu-item.is-danger:focus-visible {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+.cmenu-rule {
+  display: block;
+  height: 1px;
+  margin: var(--s-1) var(--s-2);
+  background: var(--line);
+}
+
+/* The question stays in the menu the answer was asked from — `window.confirm`
+   freezes a window that is holding other conversations still running, which is
+   the same reason an approval is not a modal (rule 9b). */
+.cmenu-ask {
+  margin: 0;
+  padding: var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+.cmenu-subject {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  word-break: break-all;
+}
+
 /* ============================================================ shown files */
 
 /* A file the model put on screen. Its header carries the two things a view of
@@ -4876,29 +4992,47 @@
   min-height: 100%;
 }
 
-.workspace-tree-toolbar {
+/* One line of instruments over the list: somewhere to type, somewhere to add,
+   somewhere to re-read. They were four word buttons, which made the top of a
+   file tree read as a form — the words `filter`, `refresh`, `+ file` and
+   `+ folder` took more of the pane than the first three filenames. */
+.workspace-bar {
   display: flex;
   align-items: center;
-  gap: var(--s-2);
-  padding-bottom: var(--s-3);
+  gap: var(--s-1);
+  padding-bottom: var(--s-2);
   border-bottom: 1px solid var(--line);
 }
 
-.workspace-filter {
+/* Inset, like every other field in the app, and it opens onto `--bg` when it
+   takes focus rather than gaining a second ring. */
+.workspace-find {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   flex: 1;
   min-width: 0;
   gap: var(--s-2);
+  padding: 0 var(--s-2);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
   color: var(--faint);
-  font-size: var(--text-xs);
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 
-.workspace-filter input,
-.workspace-name-entry input {
+.workspace-find:focus-within {
+  background: var(--bg);
+  color: var(--muted);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
+}
+
+.workspace-find input {
+  flex: 1;
   min-width: 0;
+  padding: var(--s-1) 0;
   border: 0;
-  border-radius: var(--r-sm);
   background: transparent;
   color: var(--ink);
   font-family: var(--font-mono);
@@ -4906,51 +5040,17 @@
   line-height: var(--lh-snug);
 }
 
-.workspace-filter input {
-  flex: 1;
-  padding: var(--s-1) var(--s-2);
+.workspace-find input:focus-visible {
+  outline: 0;
 }
 
-.workspace-filter input::placeholder {
-  color: var(--faint);
-}
-
-.workspace-filter:focus-within {
+/* `--muted`, not `--faint`: a placeholder is still text somebody reads, and
+   this one is the only thing naming what the field does. */
+.workspace-find input::placeholder {
   color: var(--muted);
 }
 
-.workspace-new,
-.workspace-row-action {
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--muted);
-  font-size: var(--text-xs);
-  cursor: pointer;
-  transition:
-    background var(--dur-fast) var(--ease),
-    color var(--dur-fast) var(--ease);
-}
-
-.workspace-new {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-1);
-  padding: var(--s-1) var(--s-2);
-}
-
-.workspace-new:hover,
-.workspace-row-action:hover {
-  background: var(--hover);
-  color: var(--ink);
-}
-
-.workspace-new:disabled {
-  color: var(--faint);
-  cursor: default;
-}
-
-.workspace-tree-error {
+.workspace-error {
   margin-top: var(--s-3);
   padding: var(--s-2);
   border-radius: var(--r-sm);
@@ -4967,100 +5067,122 @@
   list-style: none;
 }
 
+/* The whole row is the target, indent included. A tree drawn as buttons the
+   width of their own text answers nothing when the pointer is two pixels left
+   of the first glyph, which on a list you scan is most of the time. */
 .workspace-row,
-.workspace-name-entry {
+.workspace-naming {
   display: flex;
   align-items: center;
-  min-width: 0;
-  padding-inline-start: calc(var(--workspace-depth) * var(--s-3));
-}
-
-.workspace-row {
   gap: var(--s-1);
-}
-
-.workspace-row-main {
-  display: flex;
-  align-items: center;
-  flex: 1;
+  width: 100%;
   min-width: 0;
-  gap: var(--s-1);
   padding: var(--s-1) var(--s-2);
+  padding-inline-start: calc(var(--s-2) + var(--workspace-depth) * var(--s-4));
   border: 0;
   border-radius: var(--r-sm);
   background: transparent;
-  color: var(--body);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   line-height: var(--lh-snug);
   text-align: left;
+}
+
+.workspace-row {
+  color: var(--body);
   cursor: pointer;
   transition:
     background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
 }
 
-.workspace-row-main:hover {
+.workspace-row:hover,
+.workspace-row.is-target {
   background: var(--hover);
   color: var(--ink);
 }
 
-.workspace-row-main > span:not(.workspace-row-note):not(.workspace-link-kind) {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.workspace-row-main.is-link {
+/* A symlink is listed but cannot be opened from here, so it does not pretend to
+   be a control. Its menu still reaches it, which is why it stays focusable. */
+.workspace-row.is-link {
   color: var(--muted);
   cursor: default;
 }
 
-.workspace-chevron-gap {
-  width: var(--s-3);
+/* The chevron and the kind recede so the column of names is what the eye runs
+   down; both step up with the row they are on. */
+.workspace-row > svg {
   flex: none;
+  color: var(--faint);
+  transition: color var(--dur-fast) var(--ease);
 }
 
-.workspace-row-note,
-.workspace-link-kind {
+.workspace-row:hover > svg,
+.workspace-row.is-target > svg {
+  color: var(--muted);
+}
+
+.workspace-name {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Where a chevron would be, so files line up under the folders they sit in. */
+.workspace-indent {
+  flex: none;
+  width: 13px;
+}
+
+.workspace-tag {
   flex: none;
   color: var(--faint);
   font-family: var(--font-ui);
   font-size: var(--text-2xs);
 }
 
-.workspace-row-actions {
-  display: flex;
-  align-items: center;
-  gap: var(--s-1);
-  opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease);
+/* `--muted`, not `--faint`: it is short and it is quiet, but somebody has to be
+   able to read it — it is the sentence that makes the list above it mean what
+   it says. */
+.workspace-note {
+  margin: var(--s-2) 0 calc(var(--s-2) * -1);
+  padding-inline: var(--s-2);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
 }
 
-.workspace-row:hover .workspace-row-actions,
-.workspace-row:focus-within .workspace-row-actions {
-  opacity: 1;
+.workspace-naming {
+  background: var(--bg);
+  color: var(--muted);
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
 }
 
-.workspace-row-action {
-  padding: var(--s-1);
-  white-space: nowrap;
+.workspace-naming > svg {
+  flex: none;
 }
 
-.workspace-row-action.is-delete:hover {
-  background: var(--danger-wash);
-  color: var(--danger-text);
-}
-
-.workspace-name-entry {
-  gap: var(--s-1);
-  padding-block: var(--s-1);
-}
-
-.workspace-name-entry input {
+.workspace-naming input {
   flex: 1;
-  padding: var(--s-1) var(--s-2);
-  background: var(--sunken);
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-snug);
+}
+
+.workspace-naming input:focus-visible {
+  outline: 0;
+}
+
+.workspace-naming input::placeholder {
+  color: var(--muted);
 }
 
 .workspace-editor {

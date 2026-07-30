@@ -44,6 +44,8 @@ export function InspectView({
   plan,
   planDraft,
   onOpen,
+  onOpenAside,
+  onMention,
   onPlanDraft,
   onSavePlan,
 }: {
@@ -54,6 +56,8 @@ export function InspectView({
   plan: Plan | null;
   planDraft: PlanDraft | null;
   onOpen: (next: Inspect) => void;
+  onOpenAside: (next: Inspect) => void;
+  onMention: (path: string) => void;
   onPlanDraft: (draft: PlanDraft) => void;
   onSavePlan: () => void;
 }) {
@@ -63,7 +67,14 @@ export function InspectView({
     case "files":
       return <FilesView files={files} cwd={cwd} onOpen={onOpen} />;
     case "workspace-tree":
-      return <WorkspaceFiles onOpenFile={(path) => onOpen({ kind: "workspace-file", path })} />;
+      return (
+        <WorkspaceFiles
+          cwd={cwd}
+          onOpenFile={(path) => onOpen({ kind: "workspace-file", path })}
+          onOpenAside={(path) => onOpenAside({ kind: "workspace-file", path })}
+          onMention={onMention}
+        />
+      );
     case "workspace-file":
       return <WorkspaceEditor key={`${session}:${value.path}`} path={value.path} />;
     case "file":
