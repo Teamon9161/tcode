@@ -38,11 +38,18 @@ describe("displayToolSummary", () => {
   // The whole row for a skill call used to be the word `skill`: core's generic
   // summary picks the first of a fixed set of argument keys, and this tool's
   // argument is `name`, which is not one of them.
-  it("says which skill was loaded", () => {
+  it("says which skill was loaded, and nothing else", () => {
     expect(displayToolSummary("skill", "skill", { name: "impeccable" })).toBe("impeccable");
+    // The arguments are a separate fact, behind the same disclosure a shell
+    // command's full text uses. Joined onto the name they were one run of words
+    // with no boundary in it.
     expect(
       displayToolSummary("skill", "skill", { name: "dolphindb", arguments: "bond curve" }),
-    ).toBe("dolphindb bond curve");
+    ).toBe("dolphindb");
+    expect(viewFor("skill").detail?.({ name: "dolphindb", arguments: "bond curve" })).toBe(
+      "bond curve",
+    );
+    expect(viewFor("skill").detail?.({ name: "dolphindb" })).toBeNull();
   });
 
   // The fallback describer feeds a batched call's row, where there is no

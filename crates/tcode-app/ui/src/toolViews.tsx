@@ -194,16 +194,27 @@ const progressView: ToolView = {
  * still has for the same reason.
  */
 const skillView: ToolView = {
-  summary: (input) => {
-    if (typeof input !== "object" || input === null) return null;
-    const record = input as Record<string, unknown>;
-    const name = typeof record.name === "string" ? record.name.trim() : "";
-    if (!name) return null;
-    const args = typeof record.arguments === "string" ? record.arguments.trim() : "";
-    return args ? `${name} ${args}` : name;
-  },
+  summary: skillName,
   preferInputSummary: true,
+  // The arguments go behind the same disclosure a shell command's full text
+  // does, not into the header. Joined onto the name they made one unreadable
+  // run of words — `impeccable audit the trace column` gives the reader no way
+  // to tell where the skill's name stops and what it was handed begins, and the
+  // question the row answers is *which skill*.
+  detail: skillArguments,
 };
+
+function skillName(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const name = (input as Record<string, unknown>).name;
+  return typeof name === "string" && name.trim() ? name.trim() : null;
+}
+
+function skillArguments(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const args = (input as Record<string, unknown>).arguments;
+  return typeof args === "string" && args.trim() ? args.trim() : null;
+}
 
 const VIEWS: Record<string, ToolView> = {
   show: showing,

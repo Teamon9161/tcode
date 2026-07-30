@@ -366,11 +366,19 @@ function TraceGroup({
       }`}
     >
       <button className="trace-head" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
-        {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <span className="trace-label">{label}</span>
         {count !== undefined && <span className="trace-count">{count}</span>}
         {running && <span className="tool-spinner" aria-label="running" />}
         {failed && <span className="tool-failed">failed</span>}
+        {/* At the end and dim until pointed at, like every other row's
+            disclosure. Leading, it pushed this row's label one glyph right of
+            every single call's name, so the column of steps had two left edges
+            depending on whether a step happened to have neighbours of its own
+            kind — the exact raggedness one row shape was meant to remove. The
+            whole row is still the target; this is the hint, not the handle. */}
+        <span className="trace-chevron" aria-hidden="true">
+          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+        </span>
       </button>
       {open && <div className="trace-body">{children}</div>}
     </section>
@@ -631,9 +639,6 @@ function RunCall({
   return (
     <div className={`run is-${state}${open ? " is-open" : ""}`}>
       <div className="run-head">
-        <button className="tool-expand" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
-          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
-        </button>
         <StatusDot status={state} />
         <span className="run-kind">{kind}</span>
         <span className="run-title">{block.meta.summary || block.meta.prompt.split("\n", 1)[0]}</span>
@@ -650,6 +655,15 @@ function RunCall({
           <span className="run-status">{status}</span>
         )}
         <PopOut onOpen={() => onOpen(runInspect(block.run, block.meta, kind))} />
+        <button
+          className="tool-expand"
+          onClick={() => setOpen((was) => !was)}
+          aria-expanded={open}
+          title={open ? "Hide this run" : "Show what this run did"}
+        >
+          {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
+          <span className="tool-expand-label">this run</span>
+        </button>
       </div>
       {open && (
         <div className="run-body">

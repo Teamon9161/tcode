@@ -202,6 +202,16 @@ One shape per job, used everywhere:
   these nest (a group holds calls, a run holds a whole transcript) and nested
   cards are banned. Rows nest by indentation for as deep as it goes.
 
+  **The disclosure is at the row's end, dim until the row is pointed at, on every
+  kind of row.** It used to lead on a group and on a run and trail on a single
+  call, which gave one column of steps two left edges — a group's label sat a
+  glyph right of a call's name, exactly the raggedness one row shape exists to
+  remove. A run's chevron used to be permanent as well, on the argument that a
+  folded conversation must not hide the thing that opens it; moving it to the end
+  retired that, because a permanent control on one row kind out of three is the
+  inconsistency a reader actually notices. On a group the whole row is still the
+  target and the chevron is only the hint.
+
   Every row is a *thing that happened*, and that is what the shape means. Model
   reasoning used to be one of them and is no longer: it is prose (`--muted`, one
   size down, its own faint tag), shown when the reader asks for it and absent when

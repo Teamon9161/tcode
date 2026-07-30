@@ -1446,14 +1446,24 @@
    with rules and boxes). A card could not have worked anyway: these nest, and
    nested cards are banned outright. Rows nest by indentation, as deep as it
    goes. */
+/* The row's tinted box reaches `--s-2` past the text on *both* sides, and all
+   three row kinds do it the same way, which is what puts one column of steps on
+   one pair of edges. `width: 100%` plus a negative left margin is the trap: the
+   box then ends `--s-2` short of the right edge, so a group's trailing chevron
+   sat 8px left of every single call's. `.trace` is a flex column so this button
+   stretches without asking for a width at all. */
+.trace {
+  display: flex;
+  flex-direction: column;
+}
+
 .trace-head {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  width: 100%;
   min-width: 0;
   padding: var(--s-1) var(--s-2);
-  margin-left: calc(var(--s-2) * -1);
+  margin-inline: calc(var(--s-2) * -1);
   border: 0;
   border-radius: var(--r-sm);
   background: transparent;
@@ -1493,6 +1503,28 @@
   font-size: var(--text-2xs);
 }
 
+/* Every row's disclosure is at its end and dim until the row is pointed at —
+   this one, a single call's, and a delegated run's. It used to lead here and
+   trail there, so one column of steps had two left edges: a group's label sat a
+   glyph right of a single call's name, which is precisely the raggedness one row
+   shape exists to remove. A `<span>`, not a button: the whole row is already the
+   toggle, and a button inside a button is invalid. */
+.trace-chevron {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: calc(var(--s-3) + var(--s-1));
+  height: calc(var(--s-3) + var(--s-1));
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.trace-head:hover .trace-chevron,
+.trace-head:focus-visible .trace-chevron,
+.trace.is-open > .trace-head .trace-chevron {
+  opacity: 1;
+}
+
 /* Indented under its own head, aligned to the chevron's text rather than to the
    pane edge, so depth is legible without a single line being drawn. */
 .trace-body {
@@ -1521,11 +1553,11 @@
   align-items: center;
   gap: var(--s-1);
   min-width: 0;
-  /* Padded and pulled back by the same amount, so a tinted row reaches past the
-     text without moving it — the same trick `.trace-head` uses, because they are
-     the same row. */
+  /* Padded and pulled back by the same amount on both sides, so a tinted row
+     reaches past the text without moving it — the same box `.trace-head` and
+     `.run-head` draw, because they are the same row. */
   padding: var(--s-1) var(--s-2);
-  margin-left: calc(var(--s-2) * -1);
+  margin-inline: calc(var(--s-2) * -1);
   border-radius: var(--r-sm);
   transition: background var(--dur-slow) var(--ease);
 }
@@ -1629,14 +1661,17 @@
   opacity: 1;
 }
 
-/* A run's chevron is always visible. On a tool the row already says everything
-   worth knowing and the chevron is an extra; a run is a whole conversation
-   folded shut, so the one thing that opens it cannot be invisible until hovered
-   — it also reserved its own width while hidden, which left every run row
-   indented past the steps around it for no reason a reader could see. */
-.run-head .tool-expand {
+/* A run's chevron follows the same rule as every other row's now: at the end,
+   dim until pointed at. It used to lead and stay visible, on the argument that a
+   whole folded conversation must not hide the one thing that opens it. Two things
+   retired that argument. Leading, it reserved its own width and pushed every run
+   row's text past the steps around it — and once it moved to the end, "always
+   visible" would have made runs the one row in the column with a permanent
+   control, which is the inconsistency the reader actually notices. */
+.run:hover .tool-expand,
+.run:focus-within .tool-expand,
+.run.is-open .tool-expand {
   opacity: 1;
-  color: var(--muted);
 }
 .tool-expand:hover {
   background: var(--pressed);
@@ -3813,13 +3848,22 @@
   align-items: center;
   gap: var(--s-2);
   padding: var(--s-1) var(--s-2);
-  margin-left: calc(var(--s-2) * -1);
+  margin-inline: calc(var(--s-2) * -1);
   border-radius: var(--r-sm);
-  transition: background var(--dur-fast) var(--ease);
+  transition: background var(--dur-slow) var(--ease);
 }
 .run:hover > .run-head,
 .run.is-open > .run-head {
   background: var(--hover);
+}
+/* A run in flight is a step in flight, so it wears the same wash as a running
+   call or a running group. `is-running` was already on the element (`run
+   is-${state}`) and was the one row kind the rule had not reached. */
+.run.is-running > .run-head {
+  background: var(--brand-wash);
+}
+.run.is-running .run-kind {
+  color: var(--brand-text);
 }
 
 /* Which sub-agent ran, in the same position and the same face the tool name holds
@@ -4479,7 +4523,8 @@
   .phase-tools,
   /* The running wash still says a step is in flight; it just arrives at once. */
   .tool-head,
-  .trace-head {
+  .trace-head,
+  .run-head {
     transition: none;
   }
   .selection-bubble {
