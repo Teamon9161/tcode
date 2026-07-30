@@ -263,6 +263,16 @@ fn plain() -> Vec<String> {
     Vec::new()
 }
 
+/// A prompt typed while a turn was running.
+fn queued(text: &str) -> tcode_core::PendingMessage {
+    tcode_core::PendingMessage {
+        text: text.into(),
+        attachments: Vec::new(),
+        blocks: say(text),
+        instructions: Vec::new(),
+    }
+}
+
 /// An ordinary approval answer. The plan-review fields are what the desktop
 /// review adds on top; the tests that exercise them fill those in themselves.
 fn answer(id: &Value, decision: &str) -> ApprovalAnswer {
@@ -485,6 +495,135 @@ async fn a_second_turn_on_a_busy_session_is_refused() {
 
     let _ = session.pending().answer(answer(&request["id"], "no"));
     turn.await.unwrap().unwrap();
+}
+
+// ------------------------------------------------------------------- queue
+
+/// Typing while a turn runs queues the prompt, and the queue is emptied by a
+/// turn — always. The delivery core does at a safe boundary covers the common
+/// case; this covers the other one, where the turn ends before reaching a
+/// boundary, and without the flush in `run_turn` the message would sit in a
+/// queue nothing ever drains: accepted, shown, and silently never sent.
+#[tokio::test]
+async fn a_prompt_typed_during_a_turn_is_queued_and_then_sent() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let target = cwd.path().join("note.txt");
+    let agent = agent(
+        MockProvider::new(vec![
+            tool_use(
+                "call-1",
+                "write",
+                &serde_json::json!({ "path": target.to_string_lossy(), "content": "x\n" })
+                    .to_string(),
+            ),
+            text_done("first done"),
+            text_done("second done"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent.clone(), session.clone(), emit.clone());
+        async move { run_turn(agent, session, emit, say("first"), plain()).await }
+    });
+    // Park the turn on an approval, so it is provably still holding the session.
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
+        .await;
+
+    // Free hands the message back for the caller to send; busy takes it.
+    assert!(
+        session.send_or_queue(queued("second thoughts")).is_none(),
+        "a busy session takes the message rather than refusing it"
+    );
+    assert!(session.send_or_queue(queued("while you work")).is_none());
+    assert_eq!(
+        session.queued().iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+        ["second thoughts", "while you work"]
+    );
+
+    // Taking one back is by position *and* text: the queue drains whole, so a
+    // stale index normally finds nothing — but queue, watch it delivered, queue
+    // again, and a late withdraw would take a message meant to be kept.
+    assert!(session.withdraw_queued(0, "something else entirely").is_none());
+    assert_eq!(session.queued().len(), 2, "a mismatch removes nothing");
+    assert_eq!(
+        session.withdraw_queued(0, "second thoughts").map(|m| m.text),
+        Some("second thoughts".to_string())
+    );
+
+    let _ = session.pending().answer(answer(&request["id"], "no"));
+    turn.await.unwrap().unwrap();
+
+    assert!(session.queued().is_empty(), "the queue is drained by a turn");
+    let finished = collector.payloads(TURN_FINISHED);
+    assert_eq!(finished.len(), 2, "what stayed queued got its own turn");
+}
+
+// ------------------------------------------------------------------ rewind
+
+/// Rewinding truncates at a real user entry, hands the prompt back, and returns
+/// the conversation as replay will rebuild it.
+#[tokio::test]
+async fn rewinding_drops_the_tail_and_returns_the_prompt() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![text_done("first answer"), text_done("second answer")]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    run_turn(agent.clone(), session.clone(), emit.clone(), say("one"), plain())
+        .await
+        .unwrap();
+    run_turn(agent, session.clone(), emit, say("two"), plain())
+        .await
+        .unwrap();
+
+    let targets = session.rewind_targets();
+    assert_eq!(
+        targets.iter().map(|t| t.text.clone()).collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+
+    let before = session.history().len();
+    let (text, restored) = session.rewind(targets[1].index, false).unwrap();
+
+    assert_eq!(text, "two", "the prompt comes back to be edited and resent");
+    assert!(restored.is_empty(), "nothing asked for files to be rolled back");
+    assert!(session.history().len() < before, "the tail stopped existing");
+    assert_eq!(
+        session.rewind_targets().iter().map(|t| t.text.clone()).collect::<Vec<_>>(),
+        ["one"]
+    );
+}
+
+/// The index arrives from the webview, so it is data: an entry that is not a
+/// rewind point must not truncate the ledger anywhere at all (AGENTS.md rule 3).
+#[tokio::test]
+async fn a_rewind_to_something_that_is_not_a_prompt_is_refused() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(vec![text_done("answer")]), cwd.path());
+    let collector = Arc::new(Collector::default());
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    run_turn(agent, session.clone(), sink(&collector), say("one"), plain())
+        .await
+        .unwrap();
+
+    let before = session.history().len();
+    assert!(session.rewind(9_999, false).is_err());
+    // The assistant's own reply is a real entry and still not a rewind point.
+    assert!(session.rewind(1, false).is_err());
+    assert_eq!(session.history().len(), before, "a refused rewind changes nothing");
 }
 
 // ------------------------------------------------------------- tool routing

@@ -137,7 +137,7 @@ export function Composer({
           rows={1}
           placeholder={
             running
-              ? "running — Esc to stop"
+              ? "running — type to queue, Esc to stop"
               : planFirst
                 ? "Describe what to plan"
                 : "Ask for something in this folder"
@@ -153,7 +153,13 @@ export function Composer({
           onKeyDown={(event) => {
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
-              if (!running && sendable) onSubmit();
+              // Enter sends while idle and queues while running — the same key
+              // for the same act, because "say this" is one intention and which
+              // of the two happens is the backend's answer, not the typist's.
+              // This used to refuse outright while a turn ran, which made the
+              // most ordinary thing in the app (seeing where it is going and
+              // saying one more thing) impossible.
+              if (sendable) onSubmit();
               return;
             }
             if (event.key === "Escape" && running) {

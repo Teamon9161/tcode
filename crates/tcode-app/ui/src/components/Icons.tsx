@@ -159,6 +159,16 @@ export const CheckIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/* An arrow returning to where it came from. Deliberately not a trash can: what
+   this offers is going back to a point, and only incidentally losing what came
+   after. */
+export const RewindIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M4 5v6h6" />
+    <path d="M4.5 11a8 8 0 1 1 2 6" />
+  </Glyph>
+);
+
 /* Sliders rather than a cog: what this opens is a short list of switches, and a
    cog in a title bar promises the application's whole preferences. */
 export const SettingsIcon = (props: IconProps) => (

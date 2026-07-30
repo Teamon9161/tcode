@@ -34,6 +34,12 @@ pub struct SessionHandle {
     progress: Arc<Mutex<Option<Progress>>>,
     cancel: Mutex<CancellationToken>,
     pending: Pending,
+    /// Prompts typed while a turn was running. A clone of the `Session`'s own
+    /// handle, held here *because* of the `Option` above: the running turn owns
+    /// the session, and "let me say one more thing" is the single most natural
+    /// thing to do while it does. Core made this a shared handle for exactly
+    /// this, and the desktop app is the second frontend to need it.
+    queue: tcode_core::PendingInput,
     /// A permission mode chosen while a turn held the session, applied when it
     /// comes back. The mode belongs to the `Session`, and the running turn owns
     /// that — so the choice is staged rather than dropped or forced. The TUI
@@ -57,6 +63,7 @@ impl SessionHandle {
             id,
             cwd,
             progress: session.tool_ctx.progress_cell(),
+            queue: session.pending.clone(),
             session: Mutex::new(Some(session)),
             cancel: Mutex::new(CancellationToken::new()),
             pending: Pending::default(),
@@ -97,6 +104,95 @@ impl SessionHandle {
 
     pub fn pending(&self) -> Pending {
         self.pending.clone()
+    }
+
+    /// Send this prompt, or queue it if a turn already holds the session.
+    ///
+    /// The decision is made **under the session lock**, which is the same lock
+    /// `take` uses to start a turn — so "is it busy" and "then queue it" cannot
+    /// be separated by a turn starting in between. Asking `is_busy()` first and
+    /// acting on the answer afterwards is the version of this that drops a
+    /// message roughly never, which is the worst rate for a bug like that.
+    ///
+    /// Hands the message back when the session is free and the caller must
+    /// start a turn with it; `None` once it has been queued.
+    pub fn send_or_queue(
+        &self,
+        message: tcode_core::PendingMessage,
+    ) -> Option<tcode_core::PendingMessage> {
+        let held = self.session.lock().unwrap();
+        if held.is_some() {
+            return Some(message);
+        }
+        self.queue.push(message);
+        None
+    }
+
+    /// What this conversation still owes the model, oldest first.
+    pub fn queued(&self) -> Vec<tcode_core::PendingMessage> {
+        self.queue.queued()
+    }
+
+    /// Take one queued prompt back. See `PendingInput::withdraw` for why the
+    /// text is checked as well as the position.
+    pub fn withdraw_queued(&self, index: usize, text: &str) -> Option<tcode_core::PendingMessage> {
+        self.queue.withdraw(index, text)
+    }
+
+    /// "Stop what you are doing and say this now."
+    ///
+    /// Two steps in one order that matters: the queue is deferred *before* the
+    /// turn is cancelled, so the turn being torn down cannot drain at a safe
+    /// boundary on its way out and swallow the messages meant for its successor.
+    /// `run_turn` starts that successor when it finds them.
+    pub fn interrupt_and_flush(&self) {
+        self.queue.defer_to_next_turn();
+        self.interrupt();
+    }
+
+    /// Everything owed, handed over now that no turn holds the session.
+    fn take_queued(&self) -> Vec<tcode_core::PendingMessage> {
+        self.queue.take_for_next_turn()
+    }
+
+    /// Where this conversation can be rewound to. Empty while a turn holds the
+    /// session: rewinding under a running turn would truncate a ledger it is
+    /// still appending to.
+    pub fn rewind_targets(&self) -> Vec<tcode_core::RewindTarget> {
+        self.session
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|session| session.rewind_targets())
+            .unwrap_or_default()
+    }
+
+    /// Drop everything from `index` onward, optionally rolling back the files
+    /// that era touched. Returns the prompt to hand back for editing, and what
+    /// happened to each file.
+    ///
+    /// Refuses while a turn is running rather than waiting for one: the turn is
+    /// appending to the ledger this would truncate, and "your rewind will happen
+    /// in a minute" is not a thing a person can act on. The index is checked
+    /// against the session's own targets, because it arrived from the webview
+    /// and an arbitrary integer here would truncate the ledger anywhere at all
+    /// (AGENTS.md rule 3).
+    pub fn rewind(
+        &self,
+        index: usize,
+        restore_files: bool,
+    ) -> Result<(String, Vec<(PathBuf, tcode_core::checkpoint::Restore)>), String> {
+        let mut held = self.session.lock().unwrap();
+        let session = held
+            .as_mut()
+            .ok_or("this conversation is busy; stop the turn before rewinding it")?;
+        let target = session
+            .rewind_targets()
+            .into_iter()
+            .find(|target| target.index == index)
+            .ok_or("that point is no longer in this conversation")?;
+        let restored = session.rewind_to(index, restore_files);
+        Ok((target.text, restored))
     }
 
     /// A display-only copy of the durable conversation. Project instructions
@@ -434,6 +530,26 @@ pub async fn run_turn(
         })
         .unwrap_or(serde_json::Value::Null),
     );
+
+    // Anything still queued belongs to a turn that has to happen now.
+    //
+    // Two ways to arrive here with messages in hand, and both need this: the
+    // user asked to stop and say it immediately (`interrupt_and_flush` deferred
+    // the queue past the dying turn), or the turn simply ended before reaching a
+    // safe boundary to deliver at. Without this the second case leaves a prompt
+    // sitting in a queue nothing will ever drain — queued, acknowledged, and
+    // silently never sent.
+    //
+    // Boxed because this is recursion through an `async fn`: the future would
+    // otherwise have to contain itself.
+    let waiting = handle.take_queued();
+    if !waiting.is_empty() {
+        let blocks = waiting
+            .into_iter()
+            .flat_map(|message| message.blocks)
+            .collect();
+        return Box::pin(run_turn(agent, handle, emit, blocks, Vec::new())).await;
+    }
     Ok(())
 }
 

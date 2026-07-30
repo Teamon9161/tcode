@@ -4,7 +4,8 @@ import type { Block } from "./blocks";
 import type { TouchedFile } from "./files";
 import type { Pasted } from "./paste";
 import type { Plan, PlanDraft } from "./plan";
-import type { ApprovalRequest } from "./types";
+import type { ApprovalRequest, Queued, RewindPreview } from "./types";
+import type { RewindTarget } from "./rewind";
 import { NO_METER, type Limits, type Meter } from "./usage";
 
 /**
@@ -24,6 +25,28 @@ export type SessionState = {
   draft: string;
   /** Images pasted into the draft, not yet sent. */
   attachments: Pasted[];
+  /**
+   * Prompts typed while this turn was running, still owed to the model.
+   *
+   * The backend's answer, never a local mirror. "Is this session busy" is only
+   * decidable under the lock that starts turns, so every command that can change
+   * the queue returns the whole queue and this is set from it — a frontend copy
+   * kept in step by hand would disagree exactly at a turn boundary, which is the
+   * one moment anybody is looking at it.
+   */
+  queued: Queued[];
+  /**
+   * Where this conversation can go back to, from the backend. Empty while a
+   * turn holds the session, which is also when a rewind would be refused — so
+   * the control is absent rather than offered and then denied.
+   */
+  rewindTargets: RewindTarget[];
+  /** The rewind being asked about, or `null` when nothing is. It holds the
+   *  *preview* rather than the target, because what the question needs to say —
+   *  how much is dropped, whether files changed — is the backend's answer. */
+  rewindAsk: (RewindPreview & { index: number }) | null;
+  /** The rewind command is in flight, so the answer cannot be given twice. */
+  rewinding: boolean;
   /** One line for the launchpad card: the last thing that happened. */
   activity: string;
   /** Whether the next message asks for a plan first. A property of the message
@@ -96,6 +119,10 @@ export const BLANK: SessionState = {
   failed: false,
   draft: "",
   attachments: [],
+  queued: [],
+  rewindTargets: [],
+  rewindAsk: null,
+  rewinding: false,
   activity: "not started",
   planFirst: false,
   plan: null,

@@ -149,6 +149,33 @@ export type WorkspaceTextView = {
 /** A durable ledger entry serialized by `tcode_core::Entry`. */
 export type LedgerEntry = { kind: string; data: unknown };
 
+/** One prompt typed while a turn was running, still owed to the model.
+ *  Mirrors `commands.rs::QueuedView`. */
+export type Queued = { text: string; attachments: string[] };
+
+/** What rewinding to a point would cost, asked before anything is done.
+ *  Mirrors `commands.rs::RewindPreview`. */
+export type RewindPreview = {
+  /** The prompt, to hand back for editing. */
+  text: string;
+  /** Whether that era changed any files, so "roll them back too" is worth
+   *  offering at all. */
+  dirty: boolean;
+  /** How many prompts stop existing — the part no click undoes. */
+  dropped: number;
+};
+
+/** Mirrors `commands.rs::RestoredFile`. Three outcomes, not a boolean. */
+export type RestoredFile = { path: string; outcome: string };
+
+/** Mirrors `commands.rs::Rewound`: the conversation as replay will rebuild it,
+ *  plus what the rewind did. */
+export type Rewound = {
+  session: OpenedSession;
+  text: string;
+  restored: RestoredFile[];
+};
+
 /**
  * The session identity plus its persisted display history, if any.
  *

@@ -141,6 +141,18 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     读存下来的值时它是**数据**：每个字段逐个校验，认不出的落回默认，`localStorage` 抛异常（webview 关了存储）也必须能开窗——`loadDisplay` / `loadOrder` 都这么写。
 
+19. **"这个会话忙不忙"只有开 turn 的那把锁答得了**（`SessionHandle::send_or_queue`）。跑着就入队、闲着就把消息**交还**给调用方去开 turn，两件事在同一把锁下完成——先问 `is_busy()` 再动作的写法，只会在"turn 刚好结束的那一瞬间打字"时丢消息，那正是最难复现也最气人的丢法。前端一律不自己判：`send_message` 返回当前队列，空数组=已开始发送，非空=这就是要画在 composer 上面的东西。
+
+    **队列必须由一个 turn 排空，永远。** core 在安全边界 drain 覆盖常规情况；`run_turn` 结尾那次 `take_for_next_turn` 覆盖另一种——turn 没走到边界就结束了。少了它，消息会停在一个再没人 drain 的队列里：收下了、画出来了、然后永远不发。"停下并立刻发送"也走这条路（`interrupt_and_flush` 先 defer 再 cancel，顺序承重：反过来的话正在拆的 turn 会在退出途中把留给后继者的消息吞掉）。
+
+    **撤回按位置 + 文本双验证**。队列只会整体 drain，所以陈旧下标通常落在空队列上；但"入队 → 看着它被发出 → 再入队"之后，一次迟到的撤回就会删掉用户想留的那条。文本比对是免费的，`PendingInput::withdraw` 因此收两个参数。
+
+20. **rewind 的截断点只能是后端给的 ledger 下标**（`Session::rewind_targets` / `rewind_to`，两个前端共用）。前端**不许自己数**：转录是从 `history()`（archived ++ entries）重放的，而 core 明说 archived 段**没有任何合法的 truncate 索引**——压缩掉的那段正是 rewind 不进去的地方，所以"转录里的第 N 条 user 块"根本不是一个 ledger 下标。webview 拿后端的目标列表，按**文本顺序配对**到屏幕上的 prompt（`ui/src/rewind.ts::rewindPoints`，按 block 对象作 key，因为分组与过滤会挪动位置）。配不上就不画按钮，后端收到下标还要再验一遍——**失败模式必须是"少一个按钮"，绝不能是"截在没人指的地方"**。
+
+    **truncate + freshness 清空 + 可选文件回滚是一个操作**（`Session::rewind_to`）。freshness 是最容易漏的那个：它记着"模型已经看过这个文件"，而那些 read 就在刚被删掉的历史里——不清空，下一次 read 会对着模型再也看不见的调用回答"你已经有了"。**文件回滚是另一个决定**，由调用方传参：忘掉说过的话重打一遍就有了，把文件推回去可能丢掉之后手改的东西。所以 UI 上那个勾**默认不勾**，而且那段历史没动过文件时**整条不出现**。
+
+    **rewind 之后重放，不要就地截断**。webview 有四份从事件流派生的东西（转录、文件索引、用量、rewind 点），手工截四次就是四次漏掉一处的机会——所以 `rewind` 命令返回整个 `OpenedSession`，前端走已经存在且已经正确的 `replayLedger`。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。

@@ -3,7 +3,9 @@ mod session;
 mod suggest;
 mod summarize;
 
-pub use session::{CwdChange, PendingInput, PendingMessage, PendingMode, Session};
+pub use session::{
+    CwdChange, PendingInput, PendingMessage, PendingMode, RewindTarget, Session,
+};
 pub use suggest::SuggestRequest;
 pub use summarize::summarize_call;
 use summarize::{preview, split_malformed};

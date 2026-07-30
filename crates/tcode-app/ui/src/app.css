@@ -218,7 +218,9 @@
    the composer: never squeezed, and its own list scrolls rather than pushing the
    conversation off the top. The ceiling is a percentage of the *pane*, not of the
    viewport — a `vh` here would ignore that a pane is a fraction of the window. */
-.pane-body.is-stage > .progress-strip {
+.pane-body.is-stage > .progress-strip,
+.pane-body.is-stage > .queue-strip,
+.pane-body.is-stage > .rewind-bar {
   flex: 0 1 auto;
   min-height: 0;
   max-height: 40%;
@@ -1093,6 +1095,39 @@
 .transcript-inner > .tool + .trace,
 .transcript-inner > .tool + .tool {
   margin-top: var(--s-1);
+}
+
+/* A prompt and the way back to it. The control is under the message, at the
+   same edge, so it reads as belonging to it rather than to the row below. */
+.msg-turn {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+}
+
+.msg-rewind {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 0 var(--s-1);
+  border: 0;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--faint);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.msg-turn:hover .msg-rewind,
+.msg-rewind:focus-visible {
+  opacity: 1;
+}
+.msg-rewind:hover {
+  color: var(--amber-text);
 }
 
 .msg-user {
@@ -3935,6 +3970,234 @@
   padding-left: var(--s-3);
   border-left: 2px solid var(--line);
   color: var(--body);
+}
+
+/* ---- what you said while it was working -------------------------------------
+
+   Between the conversation and the composer, on the same sheet and the same
+   axis: it is not part of the record yet — the transcript is what happened, and
+   these have not — but it is part of what you are about to say, which is what
+   the composer end of the column is for. */
+
+.queue-strip {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+/* One box owns the axis, and everything is inside it. Same rule as the plan
+   strip, learned the same way. */
+.queue-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  width: 100%;
+  min-height: 0;
+  max-width: var(--measure);
+  margin-inline: auto;
+  padding: var(--s-3) var(--s-5);
+}
+
+.queue-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  min-width: 0;
+  font-size: var(--text-xs);
+}
+
+.queue-title {
+  flex: none;
+  color: var(--ink);
+  font-weight: var(--weight-medium);
+}
+
+.queue-note {
+  flex: 1;
+  min-width: 0;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Worded as what it does, because what it does is destroy a turn in flight. It
+   is a ghost control rather than a filled one for the same reason: this is the
+   escape hatch, not the thing you came here to press. */
+.queue-now {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex: none;
+  padding: 0 var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.queue-now:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.queue-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  min-height: 0;
+  max-height: 30vh;
+  overflow-y: auto;
+}
+
+/* A row, in delivery order. `--sunken` because it is inset into the sheet the
+   way the composer's own field is: this is text on its way in, not a step that
+   happened. */
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+  padding: var(--s-1) var(--s-2);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+}
+
+.queue-text {
+  flex: 1;
+  min-width: 0;
+  color: var(--body);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.queue-attachments {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+}
+
+.queue-drop {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: var(--s-4);
+  height: var(--s-4);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--faint);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.queue-item:hover .queue-drop,
+.queue-drop:focus-visible {
+  opacity: 1;
+}
+.queue-drop:hover {
+  color: var(--danger-text);
+}
+
+/* ---- going back --------------------------------------------------------------
+
+   The one question in this app worth stopping for, and still not a modal: the
+   messages it is about are directly above it, and the other panes are other
+   conversations. Docked over the composer like the approval dock, on the
+   conversation's own axis. */
+
+.rewind-bar {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  background: var(--amber-wash);
+}
+
+.rewind-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+  padding: var(--s-3) var(--s-5);
+}
+
+.rewind-question {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+.rewind-question svg {
+  flex: none;
+  translate: 0 2px;
+  color: var(--amber-text);
+}
+
+/* Unticked, and absent when that era changed nothing. Dropping messages can be
+   undone by retyping; rolling a file back throws away edits that may have been
+   made by hand since, so it is a second decision and never a default. */
+.rewind-files {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.rewind-files:hover {
+  background: var(--hover);
+}
+.rewind-files .chip-tick {
+  margin-top: 3px;
+}
+.rewind-files.is-on .chip-tick {
+  border-color: var(--brand);
+  background: var(--brand);
+}
+.rewind-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.rewind-label {
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.rewind-hint {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+.rewind-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s-2);
 }
 
 /* ---- the plan strip ---------------------------------------------------------

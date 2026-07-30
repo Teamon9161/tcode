@@ -28,8 +28,8 @@ pub mod tool;
 pub mod types;
 
 pub use agent::{
-    Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, PendingMode, Session,
-    DEFAULT_MAX_STEPS,
+    Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, PendingMode,
+    RewindTarget, Session, DEFAULT_MAX_STEPS,
 };
 pub use agent_roles::{AgentRole, AgentRoleMeta, RoleDefault};
 pub use auto_mode::{

@@ -488,9 +488,36 @@ pub fn workspace_delete(
         .map_err(|error| error.to_string())
 }
 
-/// Start a turn. Returns as soon as it is running, not when it finishes:
-/// progress arrives as events, and the webview must stay responsive to answer
-/// the approvals this very turn may raise.
+/// One prompt still waiting for the turn to reach a delivery point.
+#[derive(Serialize)]
+pub struct QueuedView {
+    pub text: String,
+    pub attachments: Vec<String>,
+}
+
+fn queue_of(handle: &crate::state::SessionHandle) -> Vec<QueuedView> {
+    handle
+        .queued()
+        .into_iter()
+        .map(|message| QueuedView {
+            text: message.text,
+            attachments: message.attachments,
+        })
+        .collect()
+}
+
+/// Start a turn — or queue the prompt when one is already running.
+///
+/// Returns the queue as it now stands, so an empty answer means "this is being
+/// sent" and a non-empty one is exactly what to draw above the composer. The
+/// webview never decides which of the two happened: "is this session busy" is
+/// only answerable under the lock that starts turns, and a frontend that
+/// answered it from its own state would drop the prompt typed in the same
+/// moment a turn ended.
+///
+/// Returns as soon as it is running, not when it finishes: progress arrives as
+/// events, and the webview must stay responsive to answer the approvals this
+/// very turn may raise.
 ///
 /// The task goes on `tauri::async_runtime`, not `tokio::spawn`. A sync command
 /// runs on the main thread, where no Tokio runtime is guaranteed to be entered
@@ -505,14 +532,14 @@ pub fn send_message(
     text: String,
     images: Option<Vec<ImageInput>>,
     plan: Option<bool>,
-) -> Result<(), String> {
+) -> Result<Vec<QueuedView>, String> {
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     let agent = supervisor.agent();
     let vision = agent.model.snapshot().provider.supports_vision();
     let input = compose(
-        text,
+        text.clone(),
         images.unwrap_or_default(),
         vision,
         &handle.scratch_dir(),
@@ -525,20 +552,220 @@ pub fn send_message(
         true => vec![tcode_core::commands::plan::planning_instruction("")],
         false => Vec::new(),
     };
+
+    // The queued path carries `instructions` too: core appends them as
+    // `Entry::Instruction` immediately before the prompt when it delivers, so
+    // "plan this first" means the same thing whether the turn was free or busy.
+    let Some(message) = handle.send_or_queue(tcode_core::PendingMessage {
+        text,
+        attachments: Vec::new(),
+        blocks: input,
+        instructions,
+    }) else {
+        return Ok(queue_of(&handle));
+    };
+    let (input, instructions) = (message.blocks, message.instructions);
+
     let emit: Arc<dyn Emit> = Arc::new(app);
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
         {
-            // `Busy` is the only way here, and it is a frontend bug (two sends
-            // for one session). The command already returned, so the only way
-            // to tell the user is the same channel the turn would have used.
+            // `Busy` still reaches here: `send_or_queue` closed the ordinary
+            // race, but two sends can both find the session free before either
+            // spawned task has taken it. The command already returned, so the
+            // only way to tell the user is the channel the turn would have used.
             emit.emit(
                 TURN_FINISHED,
                 serde_json::json!({ "session": handle.id, "error": error.to_string() }),
             );
         }
     });
+    Ok(Vec::new())
+}
+
+/// What this conversation still owes the model, for the strip above the
+/// composer. Read rather than pushed: the queue is the backend's, and a webview
+/// mirror would be a second answer to "what have I got waiting".
+#[tauri::command]
+pub fn queued(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+) -> Result<Vec<QueuedView>, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    Ok(queue_of(&handle))
+}
+
+/// Take one queued prompt back, returning the queue as it now stands.
+///
+/// The text goes with the index and has to match, because both came from the
+/// webview and a stale index alone would remove whatever now sits at that
+/// position (AGENTS.md rule 3). A mismatch removes nothing and the answer shows
+/// the caller why.
+#[tauri::command]
+pub fn withdraw_queued(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    index: usize,
+    text: String,
+) -> Result<Vec<QueuedView>, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    handle.withdraw_queued(index, &text);
+    Ok(queue_of(&handle))
+}
+
+/// Stop the running turn and send what is queued straight away.
+///
+/// Distinct from `interrupt`, which stops and leaves the queue for whenever the
+/// turn would have delivered it. This is the "no, do this instead" button, and
+/// the follow-up turn is started by `run_turn` itself once the cancelled one has
+/// let go of the session.
+#[tauri::command]
+pub fn interrupt_and_send(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+) -> Result<(), String> {
+    supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?
+        .interrupt_and_flush();
     Ok(())
+}
+
+/// A prompt this conversation can be rewound to.
+#[derive(Serialize)]
+pub struct RewindTargetView {
+    /// Ledger index — the truncation point, and the only thing `rewind` accepts.
+    pub index: usize,
+    pub text: String,
+    pub dirty: bool,
+}
+
+/// Every point this conversation can go back to, oldest first.
+///
+/// The webview matches these onto the prompts in its transcript by text, in
+/// order, and draws the control only where one lands. That is deliberately a
+/// *lookup* rather than a shared numbering: the transcript is replayed from
+/// `history()`, which includes the compacted-away era that holds no valid
+/// truncation index at all, so a position in one list is not a position in the
+/// other. A prompt this fails to match simply gets no button, and `rewind`
+/// re-checks the index against this same list anyway — the failure mode is a
+/// missing affordance, never a truncation somewhere nobody asked for.
+#[tauri::command]
+pub fn rewind_targets(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+) -> Result<Vec<RewindTargetView>, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    Ok(handle
+        .rewind_targets()
+        .into_iter()
+        .map(|target| RewindTargetView {
+            index: target.index,
+            text: target.text,
+            dirty: target.dirty,
+        })
+        .collect())
+}
+
+/// What rewinding to this point would cost, before anything is done.
+///
+/// Two round trips instead of one confirm-and-hope, because the second question
+/// only exists sometimes: rolling files back is worth offering when that era
+/// actually changed some, and is noise when it did not. `dropped` is how many
+/// prompts stop existing, which is the part nobody can undo by clicking again.
+#[derive(Serialize)]
+pub struct RewindPreview {
+    pub text: String,
+    pub dirty: bool,
+    pub dropped: usize,
+}
+
+#[tauri::command]
+pub fn rewind_preview(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    entry_index: usize,
+) -> Result<RewindPreview, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let targets = handle.rewind_targets();
+    if targets.is_empty() {
+        return Err("this conversation is busy; stop the turn before rewinding it".into());
+    }
+    let at = targets
+        .iter()
+        .position(|target| target.index == entry_index)
+        .ok_or("that point is no longer in this conversation")?;
+    Ok(RewindPreview {
+        text: targets[at].text.clone(),
+        dirty: targets[at].dirty,
+        dropped: targets.len() - at,
+    })
+}
+
+/// What a file rewind did to one path.
+#[derive(Serialize)]
+pub struct RestoredFile {
+    pub path: String,
+    /// `restored` / `deleted` / the failure, in words — the three outcomes are
+    /// not interchangeable and a boolean would have to pick two of them.
+    pub outcome: String,
+}
+
+/// The conversation after a rewind: everything `open_folder` returns, because
+/// every derived thing the webview holds — the transcript, the file index, the
+/// meter — has to be rebuilt from the ledger that just got shorter.
+///
+/// Rebuilt rather than truncated on the far side. The webview keeps four
+/// separate reductions of the event stream, and hand-truncating each at the
+/// right point is four chances to leave one showing work that no longer
+/// happened. Replay is a path that already exists and is already correct.
+#[derive(Serialize)]
+pub struct Rewound {
+    pub session: OpenedSession,
+    /// The prompt, handed back to be edited and sent again.
+    pub text: String,
+    pub restored: Vec<RestoredFile>,
+}
+
+#[tauri::command]
+pub fn rewind(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    entry_index: usize,
+    restore_files: bool,
+) -> Result<Rewound, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let (text, restored) = handle.rewind(entry_index, restore_files)?;
+    eprintln!(
+        "tcode-app: rewound session {} to entry {entry_index} (files: {})",
+        handle.id,
+        if restore_files { "restored" } else { "kept" }
+    );
+    Ok(Rewound {
+        session: OpenedSession::of(&handle, &supervisor.agent()),
+        text,
+        restored: restored
+            .into_iter()
+            .map(|(path, outcome)| RestoredFile {
+                path: path.display().to_string(),
+                outcome: match outcome {
+                    tcode_core::checkpoint::Restore::Restored => "restored".into(),
+                    tcode_core::checkpoint::Restore::Deleted => "deleted".into(),
+                    tcode_core::checkpoint::Restore::Failed(error) => format!("failed: {error}"),
+                },
+            })
+            .collect(),
+    })
 }
 
 /// One image pasted or dropped into the composer. Base64 because that is what

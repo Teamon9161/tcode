@@ -20,6 +20,9 @@ import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
 import { Approval } from "./Approval";
 import { ProgressStrip } from "./ProgressStrip";
+import { QueueStrip } from "./QueueStrip";
+import { RewindBar } from "./RewindBar";
+import type { RewindTarget } from "./rewind";
 import type { PlanDecision } from "./PlanEditor";
 import { draftOf, isPlanReview, type PlanDraft } from "./plan";
 
@@ -59,6 +62,14 @@ export type PaneContext = {
   onDetach: (session: string, id: string) => void;
   onSend: (session: string) => void;
   onInterrupt: (session: string) => void;
+  /** Take one queued prompt back. Index *and* text: the backend refuses a pair
+   *  that disagrees rather than dropping whatever now sits at that position. */
+  onWithdrawQueued: (session: string, index: number, text: string) => void;
+  /** Stop the turn and send what is queued straight away. */
+  onSendQueuedNow: (session: string) => void;
+  /** Ask what going back to this point would cost; `null` withdraws the ask. */
+  onAskRewind: (session: string, target: RewindTarget | null) => void;
+  onRewind: (session: string, restoreFiles: boolean) => void;
   onAnswer: (session: string, decision: Decision, comment: string) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
@@ -281,7 +292,9 @@ function SessionPane({
         <Transcript
           blocks={state.blocks}
           running={state.running}
+          rewindTargets={state.rewindTargets}
           onOpen={(value) => context.onOpen(leaf.id, session, value)}
+          onRewind={(target) => context.onAskRewind(session, target)}
         />
 
         {/* Docked, not modal: every other pane stays readable while this one
@@ -304,6 +317,27 @@ function SessionPane({
             While a review is open it stays out of the way: the panel above *is*
             the plan, in full, and two of them would be two answers to "which
             plan is this". */}
+        {/* Above the composer and below the conversation, in the order the
+            things there happen: what is being asked, then what is waiting to be
+            said, then where the plan stands, then the field. The rewind question
+            joins that stack rather than covering it — the messages it is about
+            are directly above, and a modal would hide them at the moment they
+            matter (AGENTS.md rule 9b). */}
+        {state.rewindAsk && (
+          <RewindBar
+            preview={state.rewindAsk}
+            busy={state.rewinding}
+            onConfirm={(restoreFiles) => context.onRewind(session, restoreFiles)}
+            onCancel={() => context.onAskRewind(session, null)}
+          />
+        )}
+
+        <QueueStrip
+          queued={state.queued}
+          onWithdraw={(index, text) => context.onWithdrawQueued(session, index, text)}
+          onSendNow={() => context.onSendQueuedNow(session)}
+        />
+
         {state.plan && !(state.approval && isPlanReview(state.approval.input)) && (
           <ProgressStrip
             plan={state.plan}

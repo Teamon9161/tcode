@@ -11,11 +11,15 @@ import {
   type Decision,
   type SessionEvent,
   type OpenedSession,
+  type Queued,
+  type RewindPreview,
+  type Rewound,
   type SessionInfo,
   type Status,
   type TurnFinished,
 } from "./types";
-import { applyEvent, errorBlock, userBlock } from "./blocks";
+import { applyEvent, errorBlock, noteBlock, userBlock } from "./blocks";
+import type { RewindTarget } from "./rewind";
 import { applyFileEvent } from "./files";
 import {
   EMPTY,
@@ -93,6 +97,32 @@ export function App() {
     [patch],
   );
 
+  /**
+   * Re-read the two things only the backend can answer about a settled session:
+   * what is still queued, and where it can be rewound to.
+   *
+   * Both are read rather than mirrored. The queue is shared state a running turn
+   * drains without telling anyone, and the rewind points are ledger indices —
+   * the one number this side must never invent, since it is what truncation acts
+   * on. A failure leaves the last answer standing, which costs an affordance and
+   * never a wrong one.
+   */
+  const refreshTurnState = useCallback(
+    (id: string) => {
+      Promise.all([
+        invoke<Queued[]>("queued", { session: id }).catch(() => null),
+        invoke<RewindTarget[]>("rewind_targets", { session: id }).catch(() => null),
+      ]).then(([queued, rewindTargets]) =>
+        patch(id, (state) => ({
+          ...state,
+          queued: queued ?? state.queued,
+          rewindTargets: rewindTargets ?? state.rewindTargets,
+        })),
+      );
+    },
+    [patch],
+  );
+
   // The listeners must be registered before the first turn can start, and
   // exactly once — a second subscription would double every delta.
   //
@@ -144,6 +174,13 @@ export function App() {
             : state.blocks,
         }));
         readPlan(payload.session);
+        // Both are answers only the backend has, and a turn boundary is when
+        // both change: the queue was drained into the turn (or into the one this
+        // is about to start), and the prompts that can be gone back to are
+        // whatever the ledger now holds. Reading them here is also what makes
+        // rewinding available at all — the targets are empty while a turn owns
+        // the session, which is exactly when the control must not be offered.
+        refreshTurnState(payload.session);
       }),
     ];
     Promise.all(subscriptions).catch((error) =>
@@ -166,7 +203,7 @@ export function App() {
         pending.then((unlisten) => unlisten()).catch(() => {}),
       );
     };
-  }, [patch, readPlan]);
+  }, [patch, readPlan, refreshTurnState]);
 
   const statusOf = useCallback(
     (id: string): Status => {
@@ -208,7 +245,10 @@ export function App() {
     // disk, and the session adopted it — so the strip must not wait for the next
     // turn to find that out.
     readPlan(session.id);
-  }, [readPlan]);
+    // Same reasoning for going back: a resumed conversation's earlier prompts
+    // are rewind points from the moment it opens, not once a turn has run.
+    refreshTurnState(session.id);
+  }, [readPlan, refreshTurnState]);
 
   const closeSession = useCallback(
     async (id: string) => {
@@ -230,37 +270,37 @@ export function App() {
     [sessions],
   );
 
+  /**
+   * Send, or queue when a turn is already running.
+   *
+   * Which of the two happened is the backend's answer, not a guess made here:
+   * `send_message` returns the queue as it now stands, so an empty array means
+   * the turn started and anything else is exactly what to draw above the
+   * composer. Asking `running` first and acting on it would drop the prompt typed
+   * in the same moment a turn ended.
+   *
+   * The optimistic user block is therefore appended only on the sending path.
+   * A queued prompt has not happened yet — the transcript is a record, and a
+   * message that might still be taken back does not belong in one. Core puts it
+   * there for real (`QueuedInput`) at the boundary where it is delivered.
+   */
   const send = useCallback(
     async (id: string) => {
       const text = (states[id]?.draft ?? "").trim();
       const attachments = states[id]?.attachments ?? [];
-      if ((!text && attachments.length === 0) || states[id]?.running) return;
+      if (!text && attachments.length === 0) return;
       const planFirst = states[id]?.planFirst ?? false;
       patch(id, (state) => ({
         ...state,
         draft: "",
         attachments: [],
         planFirst: false,
-        running: true,
-        failed: false,
-        // The receipt is per turn, so it is zeroed where the turn is submitted.
-        // Not on `AgentEvent::Started`: core emits that per model request, and a
-        // six-step turn would end up reporting only its last step's cost.
-        meter: { ...state.meter, turn: NO_USAGE },
-        blocks: [
-          ...state.blocks,
-          userBlock(
-            text,
-            attachments.map((item) => item.url),
-          ),
-        ],
-        activity: text || `${attachments.length} image(s)`,
       }));
       try {
         // `plan` is a flag, never the instruction text: the words come from core
         // (the same ones `/plan` submits), so the webview cannot author model
         // context that claims to be the harness speaking.
-        await invoke("send_message", {
+        const queued = await invoke<Queued[]>("send_message", {
           session: id,
           text,
           plan: planFirst,
@@ -269,11 +309,147 @@ export function App() {
             data: item.data,
           })),
         });
+        patch(id, (state) =>
+          queued.length > 0
+            ? { ...state, queued }
+            : {
+                ...state,
+                running: true,
+                failed: false,
+                // The receipt is per turn, so it is zeroed where the turn is
+                // submitted. Not on `AgentEvent::Started`: core emits that per
+                // model request, and a six-step turn would end up reporting
+                // only its last step's cost.
+                meter: { ...state.meter, turn: NO_USAGE },
+                blocks: [
+                  ...state.blocks,
+                  userBlock(
+                    text,
+                    attachments.map((item) => item.url),
+                  ),
+                ],
+                activity: text || `${attachments.length} image(s)`,
+              },
+        );
       } catch (error) {
         patch(id, (state) => ({
           ...state,
           running: false,
           failed: true,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [states, patch],
+  );
+
+  const withdrawQueued = useCallback(
+    async (id: string, index: number, text: string) => {
+      const queued = await invoke<Queued[]>("withdraw_queued", { session: id, index, text }).catch(
+        () => null,
+      );
+      // A refusal is not an error worth a banner: the queue is re-read either
+      // way, and the answer to "why is it still there" is that it was already
+      // delivered.
+      if (queued) patch(id, (state) => ({ ...state, queued }));
+    },
+    [patch],
+  );
+
+  const sendQueuedNow = useCallback((id: string) => {
+    invoke("interrupt_and_send", { session: id }).catch(() => {});
+  }, []);
+
+  /**
+   * Ask what going back to a point would cost — or withdraw the question.
+   *
+   * The preview is a command rather than something worked out here: how many
+   * messages stop existing, and whether any file changed in that era, are facts
+   * about the ledger and the checkpoint store.
+   */
+  const askRewind = useCallback(
+    async (id: string, target: RewindTarget | null) => {
+      if (!target) {
+        patch(id, (state) => ({ ...state, rewindAsk: null }));
+        return;
+      }
+      try {
+        const preview = await invoke<RewindPreview>("rewind_preview", {
+          session: id,
+          entryIndex: target.index,
+        });
+        patch(id, (state) => ({ ...state, rewindAsk: { ...preview, index: target.index } }));
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          rewindAsk: null,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [patch],
+  );
+
+  /**
+   * Go back, and rebuild everything derived from what is now a shorter ledger.
+   *
+   * The backend returns the whole conversation, and it is replayed rather than
+   * truncated in place. Four separate reductions of the event stream live here —
+   * the transcript, the file index, the meter, the rewind points — and
+   * hand-truncating each at the right spot is four chances to leave one showing
+   * work that no longer happened. Replay is a path that already exists and is
+   * already right.
+   *
+   * The prompt comes back to the composer, which is the whole point of going
+   * back: you are here to say it differently.
+   */
+  const rewind = useCallback(
+    async (id: string, restoreFiles: boolean) => {
+      const ask = states[id]?.rewindAsk;
+      if (!ask || states[id]?.rewinding) return;
+      patch(id, (state) => ({ ...state, rewinding: true }));
+      try {
+        const done = await invoke<Rewound>("rewind", {
+          session: id,
+          entryIndex: ask.index,
+          restoreFiles,
+        });
+        const replayed = replayLedger(done.session.history);
+        const targets = await invoke<RewindTarget[]>("rewind_targets", { session: id }).catch(
+          () => [],
+        );
+        patch(id, (state) => ({
+          ...state,
+          ...replayed,
+          rewindAsk: null,
+          rewinding: false,
+          rewindTargets: targets,
+          draft: done.text,
+          failed: false,
+          activity: "rewound",
+          meter: adoptContext(
+            { ...state.meter, turn: NO_USAGE },
+            done.session.context_tokens,
+            done.session.context_estimated,
+          ),
+          blocks: [
+            ...replayed.blocks,
+            ...(done.restored.length > 0
+              ? [
+                  noteBlock(
+                    `files rolled back — ${done.restored
+                      .map((file) => `${file.path}: ${file.outcome}`)
+                      .join(", ")}`,
+                  ),
+                ]
+              : []),
+          ],
+        }));
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          rewinding: false,
+          rewindAsk: null,
           blocks: [...state.blocks, errorBlock(String(error))],
         }));
       }
@@ -463,6 +639,10 @@ export function App() {
             onInterrupt={(id) => {
               invoke("interrupt", { session: id }).catch(() => {});
             }}
+            onWithdrawQueued={withdrawQueued}
+            onSendQueuedNow={sendQueuedNow}
+            onAskRewind={askRewind}
+            onRewind={rewind}
             onAnswer={answer}
             onDecidePlan={decidePlan}
             onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}

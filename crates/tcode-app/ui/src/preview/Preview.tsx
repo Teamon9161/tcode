@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 
-import type { ApprovalRequest, SessionInfo, Status } from "../types";
+import type { ApprovalRequest, Queued, SessionInfo, Status } from "../types";
 import type { Block } from "../blocks";
 import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
@@ -9,6 +9,7 @@ import { NO_METER, type Limits, type Meter } from "../usage";
 import { openInspect, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
+import type { RewindTarget } from "../rewind";
 import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
@@ -396,6 +397,16 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
   { kind: "queued", text: "also add a test for the cap at 30s", attachments: [], entryIndex: 12 },
 ];
 
+/** What the backend would answer for `BLOCKS`: its one real prompt, at the
+ *  ledger index that prompt actually sits at, and an era that touched files. */
+const REWIND_TARGETS: RewindTarget[] = [
+  {
+    index: 1,
+    text: "Make the retry path testable — right now the backoff sleeps for real.",
+    dirty: true,
+  },
+];
+
 const FILES: TouchedFile[] = [
   {
     path: AGENT_FILE,
@@ -656,6 +667,17 @@ export function Preview() {
     ...DISPLAY_DEFAULT,
     thinking: wanted() === "session",
   }));
+  // Live, like the draft: a queue whose rows cannot be taken back demonstrates
+  // half of the thing. The `session` scene starts with one waiting, because a
+  // running turn is the only state in which the strip exists at all.
+  const [queued, setQueued] = useState<Queued[]>(() =>
+    wanted() === "session"
+      ? [{ text: "also add a test for the cap at 30s", attachments: [] }]
+      : [],
+  );
+  // The rewind question, opened by the control on any prompt. Its numbers are
+  // the ones a real preview would return for that point.
+  const [rewindAsk, setRewindAsk] = useState<SessionState["rewindAsk"]>(null);
 
   const pick = (name: Scene) => {
     setScene(name);
@@ -704,6 +726,13 @@ export function Preview() {
                   : null,
           draft,
           attachments,
+          queued,
+          // Matched onto the fixture's own prompts by text, exactly as the real
+          // backend's targets are. A hard-coded index here would demonstrate a
+          // mapping that does not exist.
+          rewindTargets: REWIND_TARGETS,
+          rewindAsk,
+          rewinding: false,
           planFirst: scene === "empty",
           plan,
           planDraft: plan ? { ...draftOf(plan), comments: comments(plan) } : null,
@@ -762,6 +791,26 @@ export function Preview() {
                 onDetach={(_, id) => setAttachments((was) => was.filter((item) => item.id !== id))}
                 onSend={() => {}}
                 onInterrupt={() => {}}
+                onWithdrawQueued={(_, index) =>
+                  setQueued((was) => was.filter((_item, at) => at !== index))
+                }
+                onSendQueuedNow={() => setQueued([])}
+                onAskRewind={(_, target) =>
+                  setRewindAsk(
+                    target
+                      ? {
+                          index: target.index,
+                          text: target.text,
+                          dirty: target.dirty,
+                          // The count the backend works out from its own list.
+                          dropped:
+                            REWIND_TARGETS.length -
+                            REWIND_TARGETS.findIndex((entry) => entry.index === target.index),
+                        }
+                      : null,
+                  )
+                }
+                onRewind={() => setRewindAsk(null)}
                 onAnswer={() => pick("session")}
                 onDecidePlan={() => pick("session")}
                 onPlanDraft={() => {}}

@@ -30,6 +30,18 @@ pub struct PendingMessage {
     pub instructions: Vec<String>,
 }
 
+/// A prompt this conversation can be rewound to.
+#[derive(Debug, Clone)]
+pub struct RewindTarget {
+    /// Ledger index of the user entry — the truncation point.
+    pub index: usize,
+    /// The prompt as typed, to hand back for editing and resending.
+    pub text: String,
+    /// Whether any file changed at or after this point, so the caller knows
+    /// whether offering to restore them means anything.
+    pub dirty: bool,
+}
+
 /// Messages the user submitted while a turn was still running.
 ///
 /// They cannot be appended the moment they are typed: between an assistant's
@@ -89,6 +101,23 @@ impl PendingInput {
         let mut pending = self.0.lock().expect("pending input lock");
         pending.defer_to_next_turn = false;
         pending.messages.drain(..).collect()
+    }
+
+    /// Take one queued message back, by position.
+    ///
+    /// `text` is checked against the message at that position and the removal is
+    /// refused if it disagrees. The queue is only ever drained whole, so a stale
+    /// index normally lands on an empty queue and removes nothing — but a user
+    /// who queues, sees it delivered, and queues again can hand this an index
+    /// that now points at a message they meant to keep. The check costs a string
+    /// compare and rules that out; a caller that gets `None` back re-reads the
+    /// queue and finds it already gone.
+    pub fn withdraw(&self, index: usize, text: &str) -> Option<PendingMessage> {
+        let mut pending = self.0.lock().expect("pending input lock");
+        if pending.messages.get(index)?.text != text {
+            return None;
+        }
+        pending.messages.remove(index)
     }
 
     /// What the frontend still owes the model, for display.
@@ -446,6 +475,83 @@ impl Session {
     /// This conversation's current progress file, if it has one.
     pub fn progress(&self) -> std::sync::MutexGuard<'_, Option<crate::progress::Progress>> {
         self.tool_ctx.progress.lock().expect("progress lock")
+    }
+
+    /// The points this conversation can be rewound to: every prompt the user
+    /// actually typed, oldest first.
+    ///
+    /// The index is a `Ledger` position, never a recomputed guess — rewind is
+    /// the one sanctioned exception to append-only history (see
+    /// `Ledger::truncate_tail`), so the target has to be a real entry. Harness
+    /// text is filtered out because it is not something anyone can go back to
+    /// and edit: a status block and a paste marker were written by us.
+    pub fn rewind_targets(&self) -> Vec<RewindTarget> {
+        self.ledger
+            .entries()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                Entry::User(blocks) => {
+                    let text = blocks
+                        .iter()
+                        .filter_map(|block| match block {
+                            ContentBlock::Text { text }
+                                if !text.starts_with("<tcode-status>")
+                                    && !text.starts_with("[pasted content]") =>
+                            {
+                                Some(text.as_str())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!text.is_empty()).then(|| RewindTarget {
+                        index,
+                        text,
+                        dirty: self.checkpoints.dirty_since(index),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drop everything from `index` onward, and optionally put the files that
+    /// era touched back the way they were.
+    ///
+    /// Lives here rather than in a frontend because every part of it is session
+    /// state with an invariant attached, and two copies would be two chances to
+    /// forget one of them. The freshness cache is the subtle one: it records
+    /// which files the model has already seen so a re-read can return a stub, and
+    /// those reads are in the history that just stopped existing. Left alone, the
+    /// next read of such a file answers "you already have this" about a call the
+    /// model can no longer see.
+    ///
+    /// Restoring files is separate from truncating history because they are
+    /// separate decisions: forgetting what was said is cheap and reversible only
+    /// by retyping, while rolling a file back throws away work that may have been
+    /// edited by hand since. The caller asks; this never decides.
+    ///
+    /// `last_prompt_tokens` is zeroed rather than recomputed: the estimate needs
+    /// the `Agent`'s system prompt and tool schemas, which this type does not
+    /// have. Zero is what every other "not measured yet" path here means, and it
+    /// makes the next reading an honest estimate instead of a stale fact.
+    pub fn rewind_to(
+        &mut self,
+        index: usize,
+        restore_files: bool,
+    ) -> Vec<(std::path::PathBuf, crate::checkpoint::Restore)> {
+        self.ledger.truncate_tail(index);
+        self.tool_ctx
+            .freshness
+            .lock()
+            .expect("freshness lock")
+            .clear();
+        self.last_prompt_tokens = 0;
+        match restore_files {
+            true => self.checkpoints.restore_to(index),
+            false => Vec::new(),
+        }
     }
 
     /// Take over a progress file found on disk (`/plan resume`, or a resumed
@@ -839,7 +945,9 @@ fn path_key(path: &Path) -> String {
 mod tests {
     use super::{PendingInput, PendingMessage, Session};
     use crate::cwd_scope::CwdScoped;
-    use crate::{Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx};
+    use crate::{
+        ContentBlock, Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
@@ -875,6 +983,107 @@ mod tests {
         assert_eq!(next_turn.len(), 1);
         assert_eq!(next_turn[0].text, "start the new turn");
         assert!(pending.take_at_safe_boundary().is_empty());
+    }
+
+    fn queued(text: &str) -> PendingMessage {
+        PendingMessage {
+            text: text.into(),
+            attachments: vec![],
+            blocks: vec![],
+            instructions: vec![],
+        }
+    }
+
+    #[test]
+    fn a_queued_message_can_be_taken_back_before_it_is_delivered() {
+        let pending = PendingInput::default();
+        pending.push(queued("first"));
+        pending.push(queued("second"));
+
+        assert_eq!(pending.withdraw(0, "first").map(|m| m.text).as_deref(), Some("first"));
+        assert_eq!(
+            pending.queued().iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            ["second"]
+        );
+    }
+
+    /// The index alone is not enough. A queue is drained whole, so a stale index
+    /// usually finds nothing — but queue, watch it delivered, queue again, and a
+    /// late withdraw would land on a message the user meant to keep.
+    #[test]
+    fn a_withdraw_that_disagrees_about_the_text_removes_nothing() {
+        let pending = PendingInput::default();
+        pending.push(queued("the one still wanted"));
+
+        assert!(pending.withdraw(0, "the one already sent").is_none());
+        assert!(pending.withdraw(7, "the one still wanted").is_none());
+        assert_eq!(pending.queued().len(), 1);
+    }
+
+    #[test]
+    fn rewind_targets_are_the_prompts_a_person_typed() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::for_test(root, 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        let user = |text: &str| Entry::User(vec![ContentBlock::Text { text: text.into() }]);
+        session.ledger.append(user("first ask"));
+        session.ledger.append(Entry::Assistant(vec![]));
+        // Harness-authored text is not somewhere anyone can go back to and edit.
+        session.ledger.append(user("<tcode-status>mode: default</tcode-status>"));
+        session.ledger.append(user("second ask"));
+
+        let targets = session.rewind_targets();
+        assert_eq!(
+            targets.iter().map(|t| (t.index, t.text.as_str())).collect::<Vec<_>>(),
+            [(0, "first ask"), (3, "second ask")]
+        );
+    }
+
+    /// Truncation and the freshness reset are one operation: the reads that
+    /// taught freshness "the model already has this file" are in the history
+    /// that just stopped existing, so a stub afterwards would answer about a
+    /// call the model can no longer see.
+    #[test]
+    fn rewinding_forgets_the_tail_and_the_reads_inside_it() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::for_test(root.clone(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        let user = |text: &str| Entry::User(vec![ContentBlock::Text { text: text.into() }]);
+        session.ledger.append(user("first ask"));
+        session.ledger.append(Entry::Assistant(vec![]));
+        session.ledger.append(user("second ask"));
+        session.last_prompt_tokens = 4_200;
+        let seen = root.join("seen.rs");
+        let hash = crate::freshness::content_hash(b"fn main() {}");
+        session
+            .tool_ctx
+            .freshness
+            .lock()
+            .expect("freshness lock")
+            .record_read(&seen, hash, None);
+
+        // `restore_files: false` — forgetting what was said must not roll a file
+        // back on its own; that is the caller's separate decision.
+        let restored = session.rewind_to(2, false);
+
+        assert!(restored.is_empty());
+        assert_eq!(session.ledger.len(), 2);
+        assert_eq!(session.last_prompt_tokens, 0, "re-measured, not remembered");
+        assert!(
+            !session
+                .tool_ctx
+                .freshness
+                .lock()
+                .expect("freshness lock")
+                .seen_current(&seen, hash),
+            "a read inside the rewound tail must not still count as seen"
+        );
     }
 
     #[test]

@@ -300,6 +300,33 @@ One shape per job, used everywhere:
   why it read as a green line of arbitrary length. **It says the word `plan`**: a
   title, a phase and a fraction with nothing naming what they belong to is legible
   only to somebody who already knows the app has plans in it.
+- **Queue strip** — what you said while it was working, above the composer and
+  below the conversation, in the order it will be delivered. Typing during a turn
+  is the most ordinary thing there is, and the prompt has to go *somewhere*; the
+  one place it must not go is invisibly into a queue, because a message that was
+  accepted and is not on screen is a message you will send twice. Rows are
+  `--sunken` — text on its way in, like the composer's own field — not trace rows,
+  because none of this has happened. Each can be taken back on hover. "Stop and
+  send now" is the only control here that destroys something (a turn in flight),
+  so it is worded as what it does and drawn as an outline rather than as the
+  row's default action. When core delivers one at a safe boundary it becomes an
+  ordinary part of the transcript and leaves.
+- **Rewind** — going back to an earlier prompt. The control sits on the message,
+  on hover, because the message *is* the checkpoint: a picker listing prompts by
+  their first line would be a second copy of the conversation to read. It does
+  not act on the click — this is the only operation in the app that destroys
+  conversation and the only one that can undo work on disk — so it opens a docked
+  question on the amber wash, above the composer and below the messages it is
+  about. Not a modal, for the same reason the approval dock is not (the other
+  panes are other conversations), and not a dialog over the transcript, because
+  the messages being dropped are the thing to look at while deciding.
+
+  The two halves are asked separately and only one is offered by default:
+  dropping messages is recoverable by retyping, while rolling files back throws
+  away edits that may have been made by hand since. The file switch starts off,
+  and is absent entirely when that era changed nothing — an option that never
+  applies is a decision nobody should have to read. The count is stated in words
+  because it is the part no click takes back.
 - **Composer strip** — the row under the field: `plan first` and the permission
   mode on the left, the usage ring and the model on the right. It reads as one
   sentence — what this message is, what it costs, what answers it — and as a

@@ -3,6 +3,7 @@ import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { runPairs, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
 import { useDisplay } from "./display";
+import { RewindContext, rewindPoints, useRewinding, type RewindTarget } from "./rewind";
 import { rich } from "./rich";
 import { readChanges } from "./diff";
 import { isPlanSubmission } from "./plan";
@@ -14,7 +15,7 @@ import {
   displayToolSummary,
   transcriptGroupFor,
 } from "./toolViews";
-import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
+import { ChevronDown, ChevronRight, PanelIcon, RewindIcon } from "./components/Icons";
 import { StatusDot } from "./components/Status";
 import type { Status } from "./types";
 
@@ -33,14 +34,27 @@ import type { Status } from "./types";
 export function Transcript({
   blocks,
   running,
+  rewindTargets,
   onOpen,
+  onRewind,
 }: {
   blocks: Block[];
   running: boolean;
+  /** Where this conversation can go back to, from the backend. Empty while a
+   *  turn holds the session, which is also when rewinding is refused. */
+  rewindTargets?: RewindTarget[];
   onOpen: (value: Inspect) => void;
+  onRewind?: (target: RewindTarget) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
+
+  // Matched here rather than per row: one walk over the conversation, and the
+  // map keys on the block itself so grouping and filtering below cannot move it.
+  const rewinding = useMemo(
+    () => ({ points: rewindPoints(blocks, rewindTargets ?? []), onRewind }),
+    [blocks, rewindTargets, onRewind],
+  );
 
   // Layout effect, not effect: the scroll correction has to land in the same
   // frame as the new content, or a long delta paints once at the old offset.
@@ -67,7 +81,9 @@ export function Transcript({
       }}
     >
       <div className="transcript-inner">
-        <BlockList blocks={blocks} onOpen={onOpen} />
+        <RewindContext.Provider value={rewinding}>
+          <BlockList blocks={blocks} onOpen={onOpen} />
+        </RewindContext.Provider>
         {running && <Working />}
       </div>
     </div>
@@ -195,12 +211,7 @@ export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
 function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) => void }) {
   switch (block.kind) {
     case "user":
-      return (
-        <div className="msg msg-user">
-          <Images urls={block.images ?? []} onOpen={onOpen} />
-          {block.text}
-        </div>
-      );
+      return <UserMessage block={block} onOpen={onOpen} />;
     case "queued":
       return (
         <div className="msg msg-user is-queued">
@@ -256,6 +267,56 @@ function Images({ urls, onOpen }: { urls: string[]; onOpen: (value: Inspect) => 
           <PopOut onOpen={() => onOpen({ kind: "image", url, label: name(at) })} />
         </figure>
       ))}
+    </div>
+  );
+}
+
+/**
+ * Something you said, and the way back to it.
+ *
+ * The control is on the message because the message *is* the checkpoint: going
+ * back means "start again from here", and here is a thing already on screen with
+ * its own text on it. A picker listing prompts by their first line would be a
+ * second copy of the conversation to read.
+ *
+ * It appears on hover and on keyboard focus, like every other row-level control
+ * in this transcript. It does not act on the click: rewinding deletes
+ * conversation and can roll files back, so what this opens is a question
+ * (`RewindBar`), not the operation.
+ *
+ * Absent while a turn runs, and that is the backend's answer rather than a
+ * guess: `rewind_targets` is empty when a turn holds the session, because
+ * truncating a ledger something is still appending to is not a thing to offer
+ * and then refuse.
+ */
+function UserMessage({
+  block,
+  onOpen,
+}: {
+  block: Extract<Block, { kind: "user" }>;
+  onOpen: (value: Inspect) => void;
+}) {
+  const { points, onRewind } = useRewinding();
+  const target = points.get(block);
+
+  return (
+    <div className="msg-turn">
+      <div className="msg msg-user">
+        <Images urls={block.images ?? []} onOpen={onOpen} />
+        {block.text}
+      </div>
+      {target && onRewind && (
+        <button
+          type="button"
+          className="msg-rewind"
+          onClick={() => onRewind(target)}
+          title="Go back to here — everything after this is dropped"
+          aria-label="Go back to this message"
+        >
+          <RewindIcon size={12} />
+          back to here
+        </button>
+      )}
     </div>
   );
 }

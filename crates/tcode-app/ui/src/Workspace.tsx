@@ -79,6 +79,10 @@ export function Workspace({
   onDetach,
   onSend,
   onInterrupt,
+  onWithdrawQueued,
+  onSendQueuedNow,
+  onAskRewind,
+  onRewind,
   onAnswer,
   onDecidePlan,
   onPlanDraft,
@@ -101,6 +105,10 @@ export function Workspace({
   onDetach: (session: string, id: string) => void;
   onSend: (session: string) => void;
   onInterrupt: (session: string) => void;
+  onWithdrawQueued: PaneContext["onWithdrawQueued"];
+  onSendQueuedNow: PaneContext["onSendQueuedNow"];
+  onAskRewind: PaneContext["onAskRewind"];
+  onRewind: PaneContext["onRewind"];
   onAnswer: (session: string, decision: Decision, comment: string) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
@@ -291,6 +299,10 @@ export function Workspace({
     onDetach,
     onSend,
     onInterrupt,
+    onWithdrawQueued,
+    onSendQueuedNow,
+    onAskRewind,
+    onRewind,
     onAnswer,
     onDecidePlan,
     onPlanDraft,

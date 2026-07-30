@@ -390,3 +390,9 @@ export function userBlock(text: string, images: string[] = []): Block {
 export function errorBlock(text: string): Block {
   return { kind: "error", text };
 }
+
+/** Something the harness did that the conversation should record — a rewind
+ *  putting files back, say. Not an error, and not the model speaking. */
+export function noteBlock(text: string): Block {
+  return { kind: "note", text };
+}

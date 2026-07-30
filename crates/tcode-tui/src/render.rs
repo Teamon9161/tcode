@@ -167,6 +167,49 @@ impl ToolRenderer for AgentRenderer {
     }
 }
 
+/// Which skill was loaded — the only thing about the call worth a header.
+///
+/// The generic header could not say it: `summarize_call` picks the first of a
+/// fixed set of argument keys, and this tool's argument is `name`, so every skill
+/// call in the transcript was the bare word `skill`. Note that the `/name`
+/// slash path was never affected — that one goes through `parse_skill_echo` and
+/// has always shown the name — so the two paths disagreed about the same act.
+///
+/// The arguments go in the foldout rather than the header, for the same reason
+/// a long shell command does: the header answers *which*, and a name run
+/// together with its arguments gives the reader no boundary between them.
+struct SkillRenderer;
+
+impl ToolRenderer for SkillRenderer {
+    fn header(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
+        match input["name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(skill) => format!("{name}({skill})"),
+            None => name.to_string(),
+        }
+    }
+
+    fn batch_item(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
+        self.header(name, input, cwd)
+    }
+
+    fn initial_detail(&self, input: &Value) -> Vec<Line<'static>> {
+        match input["arguments"]
+            .as_str()
+            .map(str::trim)
+            .filter(|args| !args.is_empty())
+        {
+            Some(args) => vec![Line::styled(args.to_string(), theme::dim())],
+            None => Vec::new(),
+        }
+    }
+
+    /// A skill's body is the instructions it just injected — a document, and
+    /// one the user did not ask to read again.
+    fn folds_result(&self, _input: &Value) -> bool {
+        true
+    }
+}
+
 struct ShellRenderer;
 
 /// Header previews must leave room for the tool label, result affordance, and
@@ -498,6 +541,7 @@ impl RenderRegistry {
                 "web_fetch" => Box::new(WebFetchRenderer),
                 "view_image" => Box::new(ViewImageRenderer),
                 "agent" => Box::new(AgentRenderer),
+                "skill" => Box::new(SkillRenderer),
                 "progress" => Box::new(ProgressRenderer),
                 "ask_user" => Box::new(SilentRenderer),
                 _ => Box::new(DefaultRenderer { quiet }),
@@ -702,6 +746,24 @@ mod tests {
         assert!(registry.get("task").folds_result(&input));
         assert!(registry.get("task").markdown_detail(Some(&input)));
         assert_eq!(registry.display_name("task"), "Agent");
+    }
+
+    /// The header used to be the bare word `skill`, because `summarize_call`
+    /// knows nothing about a `name` argument — while the `/name` slash path
+    /// showed the skill all along. One act, two answers.
+    #[test]
+    fn a_skill_call_names_the_skill_and_folds_its_arguments() {
+        let renderer = SkillRenderer;
+        let input = json!({"name": "impeccable", "arguments": "audit the trace column"});
+        assert_eq!(renderer.header("skill", &input, None), "skill(impeccable)");
+        assert_eq!(renderer.batch_item("skill", &input, None), "skill(impeccable)");
+        assert_eq!(renderer.initial_detail(&input).len(), 1);
+        // No arguments is the common case and must not open an empty foldout.
+        assert!(renderer
+            .initial_detail(&json!({"name": "impeccable"}))
+            .is_empty());
+        // A malformed call still says which tool ran rather than panicking.
+        assert_eq!(renderer.header("skill", &json!({}), None), "skill");
     }
 
     #[test]

@@ -9,19 +9,10 @@
 
 use super::*;
 
-pub(super) struct RewindCandidate {
-    /// Ledger index of the user entry (truncate target).
-    pub(super) index: usize,
-    /// Full original input, prefilled into the editor.
-    pub(super) text: String,
-    /// Files changed at/after this point → offer to restore them.
-    pub(super) dirty: bool,
-}
-
 /// Double-Esc rewind navigation: the transcript itself jumps to and
 /// highlights the chosen user input — no picker dialog.
 pub(super) struct RewindNav {
-    pub(super) candidates: Vec<RewindCandidate>,
+    pub(super) candidates: Vec<tcode_core::RewindTarget>,
     pub(super) pos: usize,
     /// Editor content before navigation began, restored on exit.
     pub(super) saved_input: String,
@@ -32,35 +23,12 @@ impl App {
         let Some(session) = self.session.as_ref() else {
             return;
         };
-        let candidates: Vec<RewindCandidate> = session
-            .ledger
-            .entries()
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| match e {
-                tcode_core::Entry::User(blocks) => {
-                    let text = blocks
-                        .iter()
-                        .filter_map(|b| match b {
-                            ContentBlock::Text { text }
-                                if !text.starts_with("<tcode-status>")
-                                    && !text.starts_with("[pasted content]") =>
-                            {
-                                Some(text.as_str())
-                            }
-                            _ => None,
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    (!text.is_empty()).then(|| RewindCandidate {
-                        index: i,
-                        text,
-                        dirty: session.checkpoints.dirty_since(i),
-                    })
-                }
-                _ => None,
-            })
-            .collect();
+        // Which prompts exist and what a rewind does to the session both live in
+        // core (`Session::rewind_targets` / `rewind_to`), because the desktop app
+        // rewinds the same conversations through the same invariants. This used
+        // to walk the ledger here, which is one of the two places the filter for
+        // harness-authored text would have had to stay in step.
+        let candidates = session.rewind_targets();
         if candidates.is_empty() {
             self.bake(vec![Line::styled("nothing to rewind to", theme::dim())]);
             return;
@@ -114,24 +82,20 @@ impl App {
         // exactly like the ledger does. (False only for history without an
         // echo, e.g. compacted or imported conversations.)
         self.transcript.truncate_from_entry(index);
-        session.ledger.truncate_tail(index);
+        let dirty = session.checkpoints.dirty_since(index);
+        // Ledger truncation, the freshness reset and the optional file restore
+        // are one operation in core, so this frontend cannot perform three
+        // quarters of it. Re-estimating is ours: it needs the `Agent`.
+        let restored = session.rewind_to(index, restore_files);
         session.last_prompt_tokens = self.agent.estimate_context_tokens(session);
         self.meter
             .set_context(session.last_prompt_tokens, !session.ledger.is_empty());
-        // Earlier reads are gone from the model's context: freshness
-        // stubs would point at nothing. Reset it wholesale.
-        session
-            .tool_ctx
-            .freshness
-            .lock()
-            .expect("freshness lock")
-            .clear();
         let mut lines = vec![Line::styled(
             format!("↺ rewound conversation to entry {index}"),
             ratatui::style::Style::default().fg(theme::WARN),
         )];
         if restore_files {
-            for (path, outcome) in session.checkpoints.restore_to(index) {
+            for (path, outcome) in restored {
                 use tcode_core::checkpoint::Restore;
                 let what = match outcome {
                     Restore::Restored => "restored".to_string(),
@@ -143,7 +107,7 @@ impl App {
                     theme::dim(),
                 ));
             }
-        } else if session.checkpoints.dirty_since(index) {
+        } else if dirty {
             lines.push(Line::styled(
                 "  ⎿ files keep their current content (not rolled back)",
                 theme::dim(),
