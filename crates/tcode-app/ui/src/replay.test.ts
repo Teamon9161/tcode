@@ -45,4 +45,19 @@ describe("replayLedger", () => {
 
     expect(resumed.blocks).toEqual([{ kind: "assistant", text: "visible answer" }]);
   });
+
+  it("brings a compaction back as the boundary it is, summary and all", () => {
+    // The persisted `summary` entry holds the whole document. As a note it was a
+    // paragraph of unattributed prose in the middle of the conversation, with
+    // nothing saying it was the account of everything above it.
+    const resumed = replayLedger([
+      { kind: "summary", data: "## Earlier\n\nThe user asked for a parser." },
+      { kind: "user", data: [{ type: "text", text: "carry on" }] },
+    ]);
+
+    expect(resumed.blocks).toEqual([
+      { kind: "compact", summary: "## Earlier\n\nThe user asked for a parser." },
+      { kind: "user", text: "carry on", images: undefined },
+    ]);
+  });
 });

@@ -104,7 +104,15 @@ export type AgentEvent =
   | { type: string; data?: unknown };
 
 export type SessionEvent = { session: string; event: AgentEvent };
-export type TurnFinished = { session: string; error: string | null };
+/** Mirrors `bridge.rs::TurnFinished`. The context pair is the backend's
+ *  authoritative reading of what the conversation now occupies — see
+ *  `usage.ts::adoptContext` for why a turn boundary is where it is needed. */
+export type TurnFinished = {
+  session: string;
+  error: string | null;
+  context_tokens: number;
+  context_estimated: boolean;
+};
 
 export type ApprovalRequest = {
   session: string;
@@ -132,8 +140,20 @@ export type SessionInfo = {
 /** A durable ledger entry serialized by `tcode_core::Entry`. */
 export type LedgerEntry = { kind: string; data: unknown };
 
-/** The session identity plus its persisted display history, if any. */
-export type OpenedSession = { session: SessionInfo; history: LedgerEntry[] };
+/**
+ * The session identity plus its persisted display history, if any.
+ *
+ * `history` is the *human's* view and keeps everything a compaction moved out of
+ * the model's window, so it must not be measured to size the context meter —
+ * `context_tokens` is the backend's reading of the model-visible prompt
+ * (`SessionHandle::context`), system prompt and tool schemas included.
+ */
+export type OpenedSession = {
+  session: SessionInfo;
+  history: LedgerEntry[];
+  context_tokens: number;
+  context_estimated: boolean;
+};
 
 /** A folder tcode has held a conversation in. */
 export type ProjectInfo = {

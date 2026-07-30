@@ -142,6 +142,7 @@ export function Workspace({
    * that works this app is in a composer nearly all the time, so a bare key is
    * text. `Mod` is Ctrl, or Cmd on a Mac.
    *
+   *   Mod+N            start a fresh conversation in this pane's folder
    *   Mod+1…9          show that conversation here
    *   Mod+Shift+1…9    open it beside this one
    *   Mod+Alt+←↑↓→     move focus to the pane that way
@@ -155,6 +156,21 @@ export function Workspace({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey)) return;
+
+      // A new conversation in *this pane's* folder, which is the only folder the
+      // keyboard can name without guessing: with the window split there are two
+      // on screen, so "the current folder" is not a question the window answers
+      // (AGENTS.md rule 9c) — the focused pane is what makes it answerable.
+      // Same destination as the folder chip's first item, reached without the
+      // menu.
+      if (!event.altKey && !event.shiftKey && (event.key === "n" || event.key === "N")) {
+        const seat = focused(tiling);
+        const cwd = sessions.find((open) => open.id === seat?.pane.session)?.cwd;
+        if (!cwd) return;
+        event.preventDefault();
+        onOpenFolder(cwd).catch(() => {});
+        return;
+      }
 
       const digit = /^Digit([1-9])$/.exec(event.code);
       if (digit && !event.altKey) {
@@ -195,7 +211,7 @@ export function Workspace({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sessions, tiling.focus, onTiling]);
+  }, [sessions, tiling, onTiling, onOpenFolder]);
 
   const context: PaneContext = {
     sessions,
@@ -261,6 +277,12 @@ export function Workspace({
               and the mark that used to sit in this corner was a second status
               light for the session the rail is already showing. */}
           <ul className="rail-list">
+            {/* Two lines, and the second is the one that makes the list usable:
+                a conversation is named after its folder, so several open in one
+                folder were several identical rows and the rail could account for
+                them without telling you which was which. The activity line is
+                what each one is doing or last did — the same line the launchpad
+                card carries, which is where it was already the answer. */}
             {sessions.map((entry) => (
               <li key={entry.id}>
                 <button
@@ -269,7 +291,10 @@ export function Workspace({
                   title={entry.cwd}
                 >
                   <StatusDot status={statusOf(entry.id)} />
-                  <span className="rail-name">{entry.name}</span>
+                  <span className="rail-lines">
+                    <span className="rail-name">{entry.name}</span>
+                    <span className="rail-activity">{stateOf(entry.id).activity}</span>
+                  </span>
                 </button>
                 <button
                   className="rail-close"

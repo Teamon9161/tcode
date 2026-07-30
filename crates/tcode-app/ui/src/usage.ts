@@ -112,30 +112,37 @@ export function applyUsage(meter: Meter, event: AgentEvent): Meter {
       const added = (event.data as { added_tokens: number }).added_tokens;
       return { ...meter, context: meter.context + added, estimated: true };
     }
-    // A compaction replaced the history with a summary. Nothing here knows how
-    // big that summary is; the next response does, and until then saying so is
-    // better than showing the pre-compaction figure as if it still held.
+    // A compaction replaced the history with a summary, so the figure standing
+    // here is the *pre*-compaction prompt and is now simply wrong — not merely
+    // unconfirmed. Dropping it is the honest move: nothing on this side knows
+    // how big the summary came out, the next response does, and the turn's own
+    // end carries an authoritative reading either way (`adoptContext`). Keeping
+    // it was how a conversation that had just been compacted went on showing
+    // the number compaction existed to bring down.
     case "Compacted":
-      return { ...meter, estimated: true };
+      return { ...meter, context: 0, estimated: true };
     default:
       return meter;
   }
 }
 
 /**
- * A resumed conversation's window occupancy, from the log itself.
+ * Take the backend's reading of what the conversation occupies.
  *
- * A session log stores messages, not token counters, so there is no true answer
- * to give until the next response arrives — and a resumed conversation with
- * 90k of history showing `0%` would be the one moment the meter is read and the
- * one moment it is wrong. Same rough divisor as core's `approx_tokens`, and the
- * result is always flagged `estimated`: it under-counts (the harness prefix and
- * project instructions never reach this side) and the first real tally replaces
- * it.
+ * The only source for this figure, and none of it can be worked out here. The
+ * prompt is the system prompt plus every tool schema plus the *model-visible*
+ * ledger, and the webview holds none of the first two and gets the human's view
+ * of the third — `history` keeps the era a compaction archived so the transcript
+ * can still show it. Measuring what arrives therefore charges a compacted
+ * conversation for precisely the history that no longer costs anything, which is
+ * how a conversation that was not full read as full the moment it was resumed.
+ *
+ * `estimated` comes from the backend too: it is true when the session log had no
+ * token counters to offer and core had to approximate (`Agent::
+ * estimate_context_tokens`), and false when a provider tally stands behind it.
  */
-export function estimateContext(history: unknown[]): number {
-  if (history.length === 0) return 0;
-  return Math.ceil(JSON.stringify(history).length / 3);
+export function adoptContext(meter: Meter, context: number, estimated: boolean): Meter {
+  return { ...meter, context, estimated };
 }
 
 export function totalInput(usage: Usage): number {

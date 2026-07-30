@@ -38,6 +38,17 @@ export type Inspect =
   /** Model-authored rich content, rendered behind the sandbox boundary. */
   | { kind: "artifact"; sandbox: SandboxKind; source: string; label: string }
   /**
+   * An image the conversation holds, at the size the pane gives it.
+   *
+   * Carries the `data:` URL rather than a path because that is all there is: the
+   * bytes were pasted into a prompt and went into the request, and the only copy
+   * on this side is the one the transcript is already drawing at thumbnail size.
+   * A thumbnail is the right size for "which image was that" and the wrong size
+   * for reading anything in it, and the transcript must stay a column of prose —
+   * so the full size belongs where every other enlargement in this app goes.
+   */
+  | { kind: "image"; url: string; label: string }
+  /**
    * A file on disk the model asked to display (`show`).
    *
    * The one value here that is *not* a function of the transcript. Every other
@@ -124,6 +135,8 @@ export function inspectTitle(value: Inspect): string {
     case "output":
       return "Output";
     case "artifact":
+      return value.label;
+    case "image":
       return value.label;
     case "shown":
       return value.label;

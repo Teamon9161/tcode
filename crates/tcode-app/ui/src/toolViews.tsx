@@ -157,6 +157,12 @@ function shownValue(input: unknown): Extract<Inspect, { kind: "shown" }> | null 
   };
 }
 
+const progressView: ToolView = {
+  body: (input) => <PlanDocument input={input} />,
+  summary: planSummary,
+  preferInputSummary: true,
+};
+
 const VIEWS: Record<string, ToolView> = {
   show: showing,
   edit: editing,
@@ -171,15 +177,17 @@ const VIEWS: Record<string, ToolView> = {
   // A `progress` call routes to the plan surface, not here — except the one
   // that submits a plan for approval, which is a document the conversation must
   // still hold afterwards. `Transcript.tsx` makes that call; this draws it.
-  progress: {
-    body: (input) => <PlanDocument input={input} />,
-    summary: planSummary,
-    preferInputSummary: true,
-  },
+  progress: progressView,
   // Retired names, so a resumed session recorded before the rename still reads.
-  update_progress: { body: (input) => <Phases input={input} /> },
-  update_plan: { body: (input) => <Phases input={input} /> },
-  exit_plan: { body: (input) => <PlanDocument input={input} /> },
+  // The *same* view, not a lesser one: the backend aliases these onto the live
+  // tool (`RETIRED_NAMES` in `commands.rs`), so a call reaching the transcript
+  // under an old name got here for exactly one reason — it submits a plan — and
+  // a phase list would draw the wrong half of it. They used to render `Phases`
+  // because without those aliases every old call reached the transcript, phase
+  // flips included; the aliases are what made that a plan document again.
+  update_progress: progressView,
+  update_plan: progressView,
+  exit_plan: progressView,
 };
 
 /** The fallback opens the call's complete output, which is the only thing every

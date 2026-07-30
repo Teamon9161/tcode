@@ -117,6 +117,40 @@ impl SessionHandle {
             .unwrap_or_default()
     }
 
+    /// What this conversation occupies in the model window, and whether that
+    /// figure is still an estimate.
+    ///
+    /// The same two lines the TUI runs at every turn end and every conversation
+    /// reset (`app/turn.rs`, `app/views.rs`), and deliberately *not* something
+    /// the webview can work out for itself. Two reasons, both load-bearing:
+    ///
+    ///  - The prompt is more than the conversation. `estimate_context_tokens`
+    ///    counts the system prompt and every tool schema; neither ever crosses
+    ///    into the webview, so any figure computed over there starts short by
+    ///    tens of thousands of tokens.
+    ///  - **Compaction.** It counts the *model-visible* ledger, while the
+    ///    webview only ever receives `history()` — the human's view, which keeps
+    ///    the archived era so the transcript can still show it. Measuring that
+    ///    charges a compacted conversation for exactly the history compaction
+    ///    removed, which is how a conversation that was not full read as full
+    ///    the moment it was resumed.
+    ///
+    /// `(0, false)` while a turn holds the session. Both callers read this at a
+    /// point where it is back (`open_folder`, and the turn-end emit after
+    /// `put_back`), and a running turn's own `Usage` events are the authority
+    /// anyway.
+    pub fn context(&self, agent: &Agent) -> (u64, bool) {
+        let mut held = self.session.lock().unwrap();
+        let Some(session) = held.as_mut() else {
+            return (0, false);
+        };
+        let estimated = session.last_prompt_tokens == 0 && !session.ledger.is_empty();
+        if estimated {
+            session.last_prompt_tokens = agent.estimate_context_tokens(session);
+        }
+        (session.last_prompt_tokens, estimated)
+    }
+
     /// Where this session may drop files that are not the user's to keep —
     /// pasted images the current model cannot see, for one. `None` while a turn
     /// holds the session, which is also when nothing can be sent to it.
@@ -388,11 +422,15 @@ pub async fn run_turn(
     handle.pending.clear();
     handle.put_back(session);
 
+    // After `put_back`, so the reading sees the session it just finished with.
+    let (context_tokens, context_estimated) = handle.context(&agent);
     emit.emit(
         TURN_FINISHED,
         serde_json::to_value(TurnFinished {
             session: &handle.id,
             error: result.as_ref().err().map(describe_error),
+            context_tokens,
+            context_estimated,
         })
         .unwrap_or(serde_json::Value::Null),
     );

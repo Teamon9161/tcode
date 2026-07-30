@@ -245,11 +245,13 @@ fn factory_at(config: PathBuf) -> tcode_app::boot::SessionFactory {
 }
 
 fn handle(id: &str, cwd: PathBuf) -> Arc<SessionHandle> {
-    Arc::new(SessionHandle::new(
-        id.to_string(),
-        cwd.clone(),
-        session(cwd),
-    ))
+    let session = session(cwd.clone());
+    handle_of(id, cwd, session)
+}
+
+/// The same, for the tests that care what is already in the ledger.
+fn handle_of(id: &str, cwd: PathBuf, session: Session) -> Arc<SessionHandle> {
+    Arc::new(SessionHandle::new(id.to_string(), cwd, session))
 }
 
 fn say(text: &str) -> Vec<ContentBlock> {
@@ -566,6 +568,88 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
         1,
         "a tool that merely shares its name does not"
     );
+
+    // A resumed session holds whatever the tool was called when it was recorded.
+    // Without an entry the webview falls back to the plain transcript treatment,
+    // so an old `update_progress` call came back as a tool card in the
+    // conversation instead of feeding the plan surface.
+    for retired in ["update_progress", "update_plan", "exit_plan"] {
+        assert_eq!(
+            metas
+                .iter()
+                .filter(|meta| meta.name == retired && meta.route == "progress")
+                .count(),
+            1,
+            "{retired} routes where the live progress tool does"
+        );
+    }
+}
+
+// -------------------------------------------------------------- window occupancy
+
+/// What the webview is told the conversation occupies must follow the *model's*
+/// ledger, not the display history it is handed alongside it.
+///
+/// This is the whole reason the figure crossed the boundary instead of being
+/// worked out on the far side. `history()` keeps the compacted era so the
+/// transcript can still show it, so anything measuring what it receives charges
+/// a compacted conversation for precisely the history compaction removed: a
+/// conversation that was not full read as full the moment it was resumed.
+#[test]
+fn a_compacted_conversation_is_not_charged_for_the_history_it_shed() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(vec![]), cwd.path());
+
+    // A conversation worth compacting: enough text that the archived era is a
+    // large share of the prompt rather than noise beside the tool schemas.
+    let long = |turn: usize| {
+        tcode_core::Entry::User(vec![ContentBlock::Text {
+            text: format!("{turn}: {}", "an earlier exchange, at length. ".repeat(120)),
+        }])
+    };
+
+    let whole = {
+        let mut session = session(cwd.path().to_path_buf());
+        for turn in 0..40 {
+            session.ledger.append(long(turn));
+        }
+        handle_of("whole", cwd.path().to_path_buf(), session)
+    };
+    let compacted = {
+        let mut session = session(cwd.path().to_path_buf());
+        for turn in 0..40 {
+            session.ledger.append(long(turn));
+        }
+        session
+            .ledger
+            .compact("a short summary of all of it".into(), 40);
+        handle_of("compacted", cwd.path().to_path_buf(), session)
+    };
+
+    let (before, estimated) = whole.context(&agent);
+    let (after, _) = compacted.context(&agent);
+    assert!(
+        estimated,
+        "no provider has answered, so this is an estimate"
+    );
+
+    // The display history did not shrink — that is the trap, stated as an
+    // assertion so nobody "simplifies" this back to measuring what the webview
+    // is handed.
+    assert_eq!(
+        compacted.history().len(),
+        whole.history().len() + 1,
+        "the human's view keeps the archived era, plus the summary"
+    );
+    assert!(
+        after * 4 < before,
+        "compaction must show up as a large drop: {before} -> {after}"
+    );
+
+    // And the floor is the prompt that is there whatever the conversation says:
+    // system prompt and tool schemas, neither of which the webview ever sees.
+    assert!(after > 0, "an empty reading would mean the prompt was free");
 }
 
 // ---------------------------------------------------------------- plan review

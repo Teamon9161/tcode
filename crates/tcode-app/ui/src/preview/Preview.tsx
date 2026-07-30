@@ -67,6 +67,20 @@ const LIMITS: Limits = {
   },
 };
 
+/**
+ * What each conversation is doing, for the launchpad card *and* the rail row.
+ *
+ * One map for both, because it is one fact. The rail needs it for the case the
+ * fixture is built around: two of these are the same folder name away from being
+ * indistinguishable rows, and the activity line is the only thing that tells them
+ * apart.
+ */
+const ACTIVITY: Record<string, string> = {
+  a: "edit crates/tcode-core/src/agent/mod.rs",
+  b: "waiting on shell",
+  c: "done",
+};
+
 /** Mirrors what `tool_views()` returns for the real tool set. */
 const TOOL_META = new Map<string, ToolMeta>(
   (
@@ -76,6 +90,17 @@ const TOOL_META = new Map<string, ToolMeta>(
       { name: "write", route: "transcript", quiet_output: false, hide_success_result: true },
       { name: "shell", route: "transcript", quiet_output: false, hide_success_result: false },
       { name: "progress", route: "progress", quiet_output: false, hide_success_result: false },
+      // The retired name a resumed session still holds, aliased onto the live
+      // tool exactly as `RETIRED_NAMES` in `commands.rs` does it. In the fixture
+      // for the same reason it is in the backend: without it this scene showed a
+      // phase flip as a tool card in the transcript, which is what a resumed
+      // conversation used to do.
+      {
+        name: "update_progress",
+        route: "progress",
+        quiet_output: false,
+        hide_success_result: false,
+      },
       { name: "ask_user", route: "silent", quiet_output: false, hide_success_result: false },
     ] as ToolMeta[]
   ).map((meta) => [meta.name, meta]),
@@ -83,10 +108,30 @@ const TOOL_META = new Map<string, ToolMeta>(
 
 const AGENT_FILE = `${ROOT}/crates/tcode-core/src/agent/mod.rs`;
 
+/** A real image, small enough to sit in the source: what a pasted screenshot
+ *  looks like as a thumbnail, and what the pane enlarges. */
+const PASTED = `data:image/svg+xml;base64,${btoa(
+  `<svg xmlns="http://www.w3.org/2000/svg" width="480" height="300" viewBox="0 0 480 300">
+     <rect width="480" height="300" fill="#eceadf"/>
+     <path d="M40 250 L140 190 L240 210 L340 120 L440 70" fill="none" stroke="#3f5d3a" stroke-width="4"/>
+     <path d="M40 40 V260 H450" fill="none" stroke="#9a9887" stroke-width="2"/>
+     <text x="52" y="34" font-family="sans-serif" font-size="16" fill="#4a4838">retry latency, 3 attempts</text>
+   </svg>`,
+)}`;
+
 const BLOCKS: Block[] = [
+  // The scene opens after a compaction, because that boundary is the one thing
+  // in a transcript that has no other way to be looked at: it only exists in a
+  // conversation long enough to have run out of window.
+  {
+    kind: "compact",
+    summary:
+      "The conversation began with a survey of the retry path. `user_turn` was found to sleep inline via `tokio::time::sleep`, `step` was ruled out as the place to fix it, and two designs were weighed: threading a `Duration` through every call, or a `Sleeper` trait with a test double. The second was chosen. Nothing has been written to disk yet.",
+  },
   {
     kind: "user",
     text: "Make the retry path testable — right now the backoff sleeps for real.",
+    images: [PASTED],
   },
   {
     kind: "thinking",
@@ -572,8 +617,15 @@ export function Preview() {
           planDraft: plan ? { ...draftOf(plan), comments: comments(plan) } : null,
           planOpen: scene === "session",
           meter: METER,
+          activity: ACTIVITY.a,
         }
-      : { ...BLANK, blocks: OTHER_BLOCKS, running: true, meter: OTHER_METER };
+      : {
+          ...BLANK,
+          blocks: OTHER_BLOCKS,
+          running: true,
+          meter: OTHER_METER,
+          activity: ACTIVITY[id] ?? BLANK.activity,
+        };
 
   return (
     <ToolMetaProvider meta={TOOL_META}>
@@ -598,13 +650,7 @@ export function Preview() {
               <Launchpad
                 open={SESSIONS}
                 statusOf={(id) => STATUS[id] ?? "idle"}
-                activityOf={(id) =>
-                  ({
-                    a: "edit crates/tcode-core/src/agent/mod.rs",
-                    b: "waiting on shell",
-                    c: "done",
-                  })[id] ?? ""
-                }
+                activityOf={(id) => ACTIVITY[id] ?? ""}
                 onEnter={() => pick("session")}
                 onOpenFolder={async () => pick("session")}
               />

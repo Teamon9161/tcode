@@ -55,10 +55,19 @@ pub struct SessionEvent<'a> {
 
 /// A turn ended. `error` is `None` on a clean finish; the frontend needs this
 /// as a separate signal because a failed turn never produces `TurnEnd`.
+///
+/// The context figure rides along because a turn is exactly where the webview's
+/// running total can have gone wrong and cannot fix itself: an auto-compaction
+/// mid-turn rewrites the window out from under the last `Usage` event the
+/// webview saw, and nothing in the stream says how big the summary came out.
+/// One authoritative reading per turn (`SessionHandle::context`) is the TUI's
+/// answer too, and it costs nothing — the session is already back in hand here.
 #[derive(Serialize)]
 pub struct TurnFinished<'a> {
     pub session: &'a str,
     pub error: Option<String>,
+    pub context_tokens: u64,
+    pub context_estimated: bool,
 }
 
 /// One approval the frontend has been asked about and has not answered yet.

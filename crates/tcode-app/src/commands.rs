@@ -45,17 +45,28 @@ impl SessionInfo {
 
 /// The initial state of a just-opened session. A resumed ledger has no live
 /// event stream to replay, so its display history travels with this response.
+///
+/// The context figure travels with it too, and must: `history` is the *human's*
+/// view of the conversation and includes everything compaction moved out of the
+/// model's window, so a webview that measured what it was given would charge a
+/// resumed conversation for history that no longer costs anything. See
+/// `SessionHandle::context`.
 #[derive(Serialize)]
 pub struct OpenedSession {
     pub session: SessionInfo,
     pub history: Vec<tcode_core::Entry>,
+    pub context_tokens: u64,
+    pub context_estimated: bool,
 }
 
 impl OpenedSession {
-    fn of(handle: &crate::state::SessionHandle) -> Self {
+    fn of(handle: &crate::state::SessionHandle, agent: &tcode_core::Agent) -> Self {
+        let (context_tokens, context_estimated) = handle.context(agent);
         Self {
             session: SessionInfo::of(handle),
             history: handle.history(),
+            context_tokens,
+            context_estimated,
         }
     }
 }
@@ -92,6 +103,20 @@ pub struct ToolViewMeta {
 /// only repeats what the diff said.
 const BODY_IS_THE_RESULT: &[&str] = &["edit", "write", "multi_edit", "notebook_edit"];
 
+/// Names a tool used to answer to, and the live tool that still owns their
+/// routing. Sessions on disk hold whatever the tool was called when they were
+/// recorded, and a resumed call with no meta falls back to the plain transcript
+/// treatment — which is how `update_progress` calls came back as tool cards in
+/// the conversation instead of feeding the plan surface. The TUI's
+/// `RenderRegistry` keeps the same table for the same reason; both are aliases
+/// onto the live tool, so neither can drift from what `Tool::route` says.
+const RETIRED_NAMES: &[(&str, &str)] = &[
+    ("update_progress", "progress"),
+    ("update_plan", "progress"),
+    ("exit_plan", "progress"),
+    ("task", "agent"),
+];
+
 #[tauri::command]
 pub fn tool_views(supervisor: State<'_, Arc<Supervisor>>) -> Vec<ToolViewMeta> {
     tool_view_metas(&supervisor.agent().tools)
@@ -99,19 +124,28 @@ pub fn tool_views(supervisor: State<'_, Arc<Supervisor>>) -> Vec<ToolViewMeta> {
 
 /// The command's whole body, reachable without a window (AGENTS.md rule 2).
 pub fn tool_view_metas(tools: &[Arc<dyn tcode_core::Tool>]) -> Vec<ToolViewMeta> {
+    let meta = |name: String, tool: &Arc<dyn tcode_core::Tool>| ToolViewMeta {
+        route: tool.route(&serde_json::Value::Null).label(),
+        quiet_output: matches!(
+            tool.batch_policy(),
+            tcode_core::BatchPolicy::ParallelReadOnly
+        ),
+        hide_success_result: BODY_IS_THE_RESULT.contains(&name.as_str()),
+        name,
+    };
+    // Emitted from the tool outward rather than by looking each retired name up:
+    // an alias is then the same read as the live entry, so it cannot answer
+    // differently from the tool it stands for.
     tools
         .iter()
-        .map(|tool| {
-            let name = tool.name().to_string();
-            ToolViewMeta {
-                route: tool.route(&serde_json::Value::Null).label(),
-                quiet_output: matches!(
-                    tool.batch_policy(),
-                    tcode_core::BatchPolicy::ParallelReadOnly
-                ),
-                hide_success_result: BODY_IS_THE_RESULT.contains(&name.as_str()),
-                name,
-            }
+        .flat_map(|tool| {
+            let live = tool.name();
+            std::iter::once(meta(live.to_string(), tool)).chain(
+                RETIRED_NAMES
+                    .iter()
+                    .filter(move |(_, owner)| *owner == live)
+                    .map(|(retired, _)| meta((*retired).to_string(), tool)),
+            )
         })
         .collect()
 }
@@ -202,8 +236,8 @@ pub fn execute_plan_elsewhere(
     session: String,
 ) -> Result<OpenedSession, String> {
     let (handle, instructions) = crate::state::hand_off_plan(&supervisor, &session)?;
-    let opened = OpenedSession::of(&handle);
     let agent = supervisor.agent();
+    let opened = OpenedSession::of(&handle, &agent);
     let emit: Arc<dyn Emit> = Arc::new(app);
     tauri::async_runtime::spawn(async move {
         if let Err(error) = run_turn(
@@ -283,7 +317,7 @@ pub fn open_folder(
         handle.id,
         handle.cwd.display()
     );
-    Ok(OpenedSession::of(&handle))
+    Ok(OpenedSession::of(&handle, &supervisor.agent()))
 }
 
 /// Close a session, cancelling its turn if one is running.
@@ -792,8 +826,10 @@ mod tests {
             .append(Entry::Instruction("private project rule".into()));
         let handle = crate::state::SessionHandle::new("session".into(), cwd.path().into(), session);
 
-        let opened = OpenedSession::of(&handle);
-        assert_eq!(opened.history.len(), 1);
-        assert!(matches!(opened.history.as_slice(), [Entry::User(_)]));
+        // `OpenedSession::of` is this call plus an agent read; asserting on the
+        // filter directly keeps the test free of a provider it has no use for.
+        let history = handle.history();
+        assert_eq!(history.len(), 1);
+        assert!(matches!(history.as_slice(), [Entry::User(_)]));
     }
 }

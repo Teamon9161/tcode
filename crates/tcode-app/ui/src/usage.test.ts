@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  adoptContext,
   applyUsage,
   cacheShare,
   contextLevel,
@@ -65,13 +66,15 @@ describe("applyUsage", () => {
     expect(expanded.context).toBe(6_200);
     expect(expanded.estimated).toBe(true);
 
-    // A compaction rewrote the history; nothing on this side knows how large the
-    // summary is until the next response says so.
+    // A compaction rewrote the history, so the figure standing here is the
+    // *pre*-compaction prompt: not merely unconfirmed but wrong, and 90% of a
+    // window that was just reclaimed is the worst moment to be showing it.
     const compacted = applyUsage({ ...NO_METER, context: 180_000 }, {
       type: "Compacted",
       data: "…",
     });
     expect(compacted.estimated).toBe(true);
+    expect(compacted.context).toBe(0);
 
     // And the next authoritative tally takes the mark back off.
     expect(applyUsage(compacted, { type: "Usage", data: usage(9_000, 100) }).estimated).toBe(
@@ -89,6 +92,28 @@ describe("applyUsage", () => {
   it("ignores the events it is not about", () => {
     const meter = { ...NO_METER, context: 4_000 };
     expect(applyUsage(meter, { type: "TextDelta", data: "hello" })).toBe(meter);
+  });
+});
+
+describe("adoptContext", () => {
+  it("takes the backend's figure whole, and leaves the receipt alone", () => {
+    // The two quantities this module exists to keep apart: a reading of the
+    // window is not a reading of what the turn cost.
+    const meter: Meter = { context: 180_000, estimated: false, turn: usage(900, 300) };
+    const adopted = adoptContext(meter, 21_400, true);
+    expect(adopted.context).toBe(21_400);
+    expect(adopted.estimated).toBe(true);
+    expect(adopted.turn).toEqual(meter.turn);
+  });
+
+  it("lets a compaction's reading fall as far as it fell", () => {
+    // Not clamped, not maxed against what stood here, no floor: the backend
+    // measured the prompt it would send next, and after a compaction that number
+    // is *supposed* to be a fraction of the last one. Anything defensive here
+    // would reproduce the bug this replaced — a conversation reading full because
+    // the meter would not believe the history had gone.
+    const full: Meter = { context: 190_000, estimated: false, turn: usage(0, 0) };
+    expect(adoptContext(full, 8_000, true).context).toBe(8_000);
   });
 });
 

@@ -161,13 +161,7 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
     case "user":
       return (
         <div className="msg msg-user">
-          {block.images && block.images.length > 0 && (
-            <div className="msg-images">
-              {block.images.map((url, at) => (
-                <img key={at} src={url} alt="pasted image" />
-              ))}
-            </div>
-          )}
+          <Images urls={block.images ?? []} onOpen={onOpen} />
           {block.text}
         </div>
       );
@@ -184,6 +178,8 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
       return <Thinking text={block.text} />;
     case "note":
       return <p className="msg-note">{block.text}</p>;
+    case "compact":
+      return <CompactMark summary={block.summary} />;
     case "error":
       return (
         <p className="msg-error" role="alert">
@@ -203,11 +199,81 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
  *  trace row as every other step — it used to be the one thing in the column
  *  with no shared shape at all, which is what made the trace look assembled
  *  from parts. */
+/**
+ * Images that rode with a prompt, at a size that says which one it was.
+ *
+ * The full size is a pane, not a lightbox and not this element grown: a
+ * thumbnail answers "which image was that" and nothing else, and enlarging
+ * things is what panes are for in this app — an image beside the conversation
+ * that mentions it beats one covering it. The control is `PopOut` rather than
+ * the thumbnail itself, because "somewhere to go" has exactly one control in
+ * this transcript (AGENTS.md rule 14) and an image is a poor place to open a
+ * second: a picture that is silently also a button teaches nothing about the
+ * rows above it that work the same way.
+ */
+function Images({ urls, onOpen }: { urls: string[]; onOpen: (value: Inspect) => void }) {
+  if (urls.length === 0) return null;
+  const name = (at: number) => (urls.length > 1 ? `image ${at + 1}` : "image");
+  return (
+    <div className="msg-images">
+      {urls.map((url, at) => (
+        <figure key={at} className="msg-image">
+          <img src={url} alt={name(at)} />
+          <PopOut onOpen={() => onOpen({ kind: "image", url, label: name(at) })} />
+        </figure>
+      ))}
+    </div>
+  );
+}
+
 function Thinking({ text }: { text: string }) {
   return (
     <TraceGroup label="thinking">
       <div className="thinking-body">{text}</div>
     </TraceGroup>
+  );
+}
+
+/**
+ * Where a compaction cut the conversation, and the summary it left behind.
+ *
+ * Deliberately *not* a `TraceGroup`. That component is the vocabulary for one
+ * step the agent took (AGENTS.md rule 9e), and this is not a step — it is a
+ * boundary across the whole conversation, marking where what the model can still
+ * see begins. Drawn as one: a rule spanning the column with the label sitting in
+ * it, which is the same shape the TUI draws and the same shape any reader already
+ * knows means "time passed here".
+ *
+ * Folded by default because of what the two halves are worth. The mark answers
+ * the question people actually have — *why does the model not remember that* —
+ * and answers it at a glance. The summary is a document, and the longest one in
+ * the transcript: unfolded by default it would push the conversation off screen
+ * at the exact moment the context was being reclaimed. It goes through `rich`
+ * like any other model-authored prose (rule 10); it is a summary of a
+ * conversation that contained file contents and fetched pages, so it is data.
+ */
+function CompactMark({ summary }: { summary: string }) {
+  const [open, setOpen] = useState(false);
+  const has = summary.trim().length > 0;
+  return (
+    <section className={`compact${open ? " is-open" : ""}`}>
+      <button
+        type="button"
+        className="compact-mark"
+        onClick={() => has && setOpen((was) => !was)}
+        aria-expanded={has ? open : undefined}
+        disabled={!has}
+        title={has ? "The summary that replaced the earlier conversation" : undefined}
+      >
+        <span className="compact-rule" aria-hidden="true" />
+        <span className="compact-label">
+          earlier conversation compacted
+          {has && (open ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+        </span>
+        <span className="compact-rule" aria-hidden="true" />
+      </button>
+      {open && has && <div className="compact-body">{rich(summary)}</div>}
+    </section>
   );
 }
 

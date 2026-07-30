@@ -28,7 +28,7 @@ import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
 import type { PlanDecision } from "./PlanEditor";
 import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
-import { applyUsage, estimateContext, limitsFrom, NO_USAGE, type Limits } from "./usage";
+import { adoptContext, applyUsage, limitsFrom, NO_USAGE, type Limits } from "./usage";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
@@ -126,6 +126,11 @@ export function App() {
           approval: null,
           failed: payload.error !== null,
           activity: payload.error ? "failed" : "done",
+          // One authoritative reading per turn. A turn is where the running
+          // total can have gone wrong and cannot recover on its own: an
+          // auto-compaction rewrites the window after the last `Usage` event
+          // the webview saw, and no event says how big the summary came out.
+          meter: adoptContext(state.meter, payload.context_tokens, payload.context_estimated),
           blocks: payload.error
             ? [...state.blocks, errorBlock(payload.error)]
             : state.blocks,
@@ -182,13 +187,11 @@ export function App() {
       [session.id]: {
         ...BLANK,
         ...replayed,
-        // A resumed log carries no token counters, so the meter starts from an
-        // estimate that says so rather than from a confident `0%`.
-        meter: {
-          ...BLANK.meter,
-          context: estimateContext(history),
-          estimated: history.length > 0,
-        },
+        // The backend measured the prompt it would actually send. Sizing this
+        // from `history` was wrong in both directions at once: short by the
+        // system prompt and the tool schemas, and long by every entry a
+        // compaction had already moved out of the window.
+        meter: adoptContext(BLANK.meter, opened.context_tokens, opened.context_estimated),
         activity: history.length > 0 ? "resumed" : BLANK.activity,
       },
     }));
@@ -366,14 +369,21 @@ export function App() {
       if (!state.handoffPending || state.running || state.approval) continue;
       patch(id, (was) => ({ ...was, handoffPending: false }));
       invoke<OpenedSession>("execute_plan_elsewhere", { session: id })
-        .then(({ session, history }) => {
+        .then((opened) => {
+          const { session, history } = opened;
           const replayed = replayLedger(history);
           setSessions((current) =>
             current.some((open) => open.id === session.id) ? current : [...current, session],
           );
           setStates((current) => ({
             ...current,
-            [session.id]: { ...BLANK, ...replayed, running: true, activity: "executing the plan" },
+            [session.id]: {
+              ...BLANK,
+              ...replayed,
+              running: true,
+              activity: "executing the plan",
+              meter: adoptContext(BLANK.meter, opened.context_tokens, opened.context_estimated),
+            },
           }));
           // Beside, not instead: the plan came from the conversation next to it,
           // and both are worth watching while one works.

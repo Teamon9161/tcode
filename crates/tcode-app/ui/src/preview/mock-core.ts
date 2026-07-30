@@ -146,6 +146,11 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
           home: "/home/teamon",
         },
         history: [],
+        // A fresh folder, so the prompt is the system prompt and the tool
+        // schemas and nothing else — measured, not guessed, which is why it is
+        // not zero.
+        context_tokens: 14_200,
+        context_estimated: false,
       } satisfies OpenedSession as T;
     // The composer strip. Deliberately not the careful default: the amber mode
     // chip and a model with an effort dial are the states worth looking at.

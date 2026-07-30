@@ -254,7 +254,7 @@
   .workspace {
     grid-template-columns: 52px minmax(0, 1fr);
   }
-  .rail-name,
+  .rail-lines,
   .rail-close {
     display: none;
   }
@@ -863,11 +863,38 @@
   font-weight: var(--weight-medium);
 }
 
+/* Two lines, both truncating. The row's height is set by them rather than by a
+   fixed value: a list of conversations is a list, and a row is as tall as what
+   it has to say. */
+.rail-lines {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+
 .rail-name {
   min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* What this conversation is doing, one step below the name in size and tone —
+   the name identifies, this one distinguishes. Quiet enough that a rail of ten
+   still scans as ten names: the whole point is that several conversations in one
+   folder stop being identical rows, not that the rail becomes a second
+   transcript. */
+.rail-activity {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+.rail-item.is-onscreen .rail-activity {
+  color: var(--muted);
 }
 
 .rail-close {
@@ -951,18 +978,39 @@
 }
 
 /* Pasted images ride with the prompt they were pasted into, at a size that says
-   which image it was without taking the conversation over. */
+   which image it was without taking the conversation over. Full size is a pane
+   away, by the same `PopOut` every other enlargeable thing here uses — anchored
+   in the thumbnail's corner because that is the row this one has. */
 .msg-images {
   display: flex;
   flex-wrap: wrap;
   gap: var(--s-2);
   margin-bottom: var(--s-2);
 }
-.msg-images img {
+.msg-image {
+  position: relative;
+  margin: 0;
+  display: flex;
+}
+.msg-image img {
   max-width: 220px;
   max-height: 160px;
   border-radius: var(--r-sm);
   object-fit: contain;
+}
+/* Over the image, so it needs its own ground to stay legible on whatever the
+   picture happens to be — the only place a `PopOut` is not sitting on the
+   page's own background. */
+.msg-image .pop-out {
+  position: absolute;
+  top: var(--s-1);
+  right: var(--s-1);
+  background: var(--chrome);
+  color: var(--body);
+}
+.msg-image .pop-out:hover {
+  background: var(--sunken);
+  color: var(--ink);
 }
 
 .msg-assistant {
@@ -983,6 +1031,70 @@
 .msg-note {
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+/* The compaction boundary: a rule across the column with its label sitting in
+   the break, which is the oldest way there is of saying "time passed here" and
+   the same shape the TUI draws. Not a `.trace` row — that vocabulary is for one
+   step the agent took, and this is a statement about the transcript itself. It
+   spans `--measure` like everything else on the conversation's axis rather than
+   carrying a width of its own (AGENTS.md rule 9b). */
+.compact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  max-width: var(--measure);
+}
+
+.compact-mark {
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.compact-mark:disabled {
+  cursor: default;
+}
+.compact-mark:hover:not(:disabled),
+.compact-mark:focus-visible {
+  color: var(--muted);
+}
+
+.compact-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+.compact-label {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex: none;
+  white-space: nowrap;
+}
+
+/* The summary reads as prose, because it is: it is the only surviving account of
+   everything above the line. Indented and on the sunken surface so that what it
+   is quoting from — a conversation that is no longer here — stays distinct from
+   the conversation that is. */
+.compact-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3) var(--s-4);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--muted);
+  font-size: var(--text-sm);
+  line-height: var(--lh-prose);
+  overflow-wrap: anywhere;
 }
 
 .msg-error {
@@ -1309,6 +1421,7 @@
 .tool:hover .pop-out,
 .exploration-item:hover .pop-out,
 .run-head:hover .pop-out,
+.msg-image:hover .pop-out,
 .pop-out:focus-visible {
   opacity: 1;
 }
@@ -1576,6 +1689,23 @@
   padding: var(--s-4) 0;
   color: var(--faint);
   font-size: var(--text-xs);
+}
+
+/* The pane is the image's size, so the image takes it: `contain` and no upscale,
+   because a screenshot blown past its own pixels is less readable than the
+   thumbnail the reader came from. Centred, so a picture narrower than the pane
+   does not sit against one edge. */
+.inspect-image {
+  display: grid;
+  place-items: center;
+  min-height: 0;
+  height: 100%;
+  padding: var(--s-3);
+}
+.inspect-image img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
 }
 
 /* A snapshot that something has changed since must say so where it is read,
@@ -3927,7 +4057,7 @@
 }
 
 /* The composer's own row: what this message is on the left, what will answer it
-   on the right. "plan first", the permission mode, the context ring and the
+   on the right. "plan", the permission mode, the context ring and the
    model are all facts about the message about to be sent.
 
    The inset is measured, not chosen. The field's text starts at its 1px border

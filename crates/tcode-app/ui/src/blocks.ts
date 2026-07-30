@@ -45,6 +45,19 @@ export type Block =
   | { kind: "thinking"; text: string }
   | { kind: "note"; text: string }
   | { kind: "error"; text: string }
+  /**
+   * The boundary where a compaction replaced everything above with a summary.
+   *
+   * Its own kind rather than a note, because it is the one thing in a transcript
+   * that is *about* the transcript: it marks where the conversation the model can
+   * still see begins, and the summary under it is a document — the only surviving
+   * account of everything before that line. A note renders one paragraph of body
+   * text, so the summary either buried the boundary in prose nobody reads or the
+   * boundary threw the summary away. Held together and drawn folded (the TUI
+   * folds the same summary behind the same divider), the mark is always readable
+   * and the document is one click away.
+   */
+  | { kind: "compact"; summary: string }
   /** Typed while the turn ran, delivered at a safe boundary. */
   | { kind: "queued"; text: string; attachments: string[]; entryIndex: number }
   | {
@@ -80,8 +93,9 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
     }
     case "Compacting":
       return [...blocks, { kind: "note", text: "compacting history…" }];
+    // The event's payload *is* the summary — the whole document, not a headline.
     case "Compacted":
-      return [...blocks, { kind: "note", text: event.data as string }];
+      return [...blocks, { kind: "compact", summary: event.data as string }];
 
     case "QueuedInput": {
       const data = event.data as {

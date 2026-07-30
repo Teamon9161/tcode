@@ -217,7 +217,7 @@ export function Composer({
           title="Investigate and write a plan for your approval before changing anything"
         >
           <span className="chip-tick" aria-hidden="true" />
-          plan first
+          plan
         </button>
         <Chips meter={meter} />
       </div>

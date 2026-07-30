@@ -68,6 +68,15 @@ export function InspectView({
       return <RunView run={value.run} blocks={blocks} onOpen={onOpen} />;
     case "artifact":
       return <Sandbox kind={value.sandbox} source={value.source} label={value.label} />;
+    // No sandbox: an image is decoded by the browser, not executed. The
+    // `data:` URL is the same one the transcript thumbnail already draws, and
+    // `img-src data:` is in the CSP for exactly this.
+    case "image":
+      return (
+        <div className="inspect-image">
+          <img src={value.url} alt={value.label} />
+        </div>
+      );
     case "shown":
       return <ShownView value={value} cwd={cwd} />;
     case "doc":
@@ -92,7 +101,7 @@ export function InspectView({
         </div>
       ) : (
         <p className="inspect-empty">
-          this conversation has no plan — ask for one with “plan first”
+          this conversation has no plan — ask for one with “plan”
         </p>
       );
   }
