@@ -18,7 +18,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
-**改界面先开 `npm run preview:ui`。** 它用 `PREVIEW=1` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / empty 四个场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在 `PREVIEW=1` 下生效，发布产物里没有它们。
+**改界面先开 `npm run preview:ui`。** 它用 `PREVIEW=1` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在 `PREVIEW=1` 下生效，发布产物里没有它们。
 
 **`tauri.conf.json` 里刻意不配 `devUrl`。** Tauri 在 debug 构建下只要看见 `devUrl` 就去连它，于是 `cargo run` 会撞上 "Connection refused"——而 `cargo run` 正是这里的主流程。不配它，debug 与 release 一样加载 `frontendDist`（`ui/dist`），代价是改前端要重跑一次 `npm run build`。想要 HMR 就临时加回 `devUrl: "http://localhost:5173"` 并同时起 `npm run dev`，别把它留在提交里。
 
@@ -84,7 +84,28 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 14. **"到自己的窗格"只有一个控件：`Transcript.tsx` 的 `PopOut`**。以前是把 summary（那条路径）本身做成 hover 出下划线的按钮，两个毛病：链接语义承诺的是"跳到别处"，而这里其实是**同一个东西、更大**；而且只在指针已经压上去时才出现的控件，没人会主动找到。现在每一条有去处的行——工具调用、exploration 行、sub-agent run——末尾都是同一个图标按钮，语义单一。新增可检视的东西时**用它，别再发明第二种点法**。
 
-15. **模型/preset/模式的选择逻辑不在这里重写**（硬规则 1 的具体一例）。`picker.rs` 只做两件事：把 `tcode-frontend` 的 `ModelMenu`/`PresetMenu` 转成 webview 能画的 JSON，和把选择转回那两个结构自带的闭包。切模型、写 `[tcode_state]`、重建 provider、重建全部 role pin——全在闭包里，TUI 的 `/model` 用的是同一批。**第二份"切模型"实现 = 第二个几乎正确的优先级链**（CLI flag > `[tcode_state]` > preset > config）。
+14b. **计划有两条写盘路径，不许合并成一条**。progress 文件的语法与"省略 detail 即保留"的规则都在 core（`revise_plan_body`），前端只送结构化 phases，永远不写 markdown。两条路径各有各的语义：
+
+    - **审批期间**：编辑随 `respond_approval` 的 `phases` 回去，由 `into_approval` 用**后端自己留着的 review input** 拼出 `approved_input`（`Pending` 存 `asked` 就是为了这个：让 webview 回传整个 input，等于批准一件事、执行另一件事）。批准由 core 落盘，前端一个字节都不写；退回则不落盘，只把 diff 与评论送回。**校验失败不消费这次请求**——turn 正停在这个问题上，为了一个空标题把唯一的回答入口吃掉，会话就卡死了。
+    - **非审批时段**：`write_plan` 直接落盘，且**故意不动会话内存里的 `disk_hash`**，好让模型下一次 `progress` 调用照常报冲突并拿到用户的版本。这是 core 既有的自愈契约，不是遗漏。
+
+    读取只有一条：`plan(session)` 从磁盘重读（`SessionHandle::plan`），因为 progress 文件是外部可变状态，"计划现在说什么"问的是文件不是转录。它是 Inspector"一切来自 blocks 而非磁盘"的第二个例外，与 `show` 同理。**不许上轮询**：计划不会自己变，前端只在 `progress` 的 ToolEnd、审批到达、turn 结束、会话打开这四个时机重读。
+
+    **"新开会话执行"要等 turn 结束再调 `execute_plan_elsewhere`**：`progress` 工具是在审批被回答**之后**才跑的，只有那之后文件才是 active。后端仍然自己校验一遍状态（`hand_off_plan`），不靠前端的时序守规矩。
+
+    **`plan first` 送的是开关不是文本**：`send_message(plan: true)` 让后端取 core 的 `planning_instruction`。指令是 harness 的话，允许 webview 自己写指令正文，等于让它冒充 harness 对模型说话。
+
+15. **模型/preset/role/模式的选择逻辑不在这里重写**（硬规则 1 的具体一例）。`picker.rs` 只做两件事：把 `tcode-frontend` 的 `ModelMenu`/`PresetMenu`/`AgentMenu` 转成 webview 能画的 JSON，和把选择转回那三个结构自带的闭包。切模型、写 `[tcode_state]`、重建 provider、重建全部 role pin、校验 preset 名——全在闭包里，TUI 的 `/model` 与 `/agents` 用的是同一批。**第二份"切模型"实现 = 第二个几乎正确的优先级链**（CLI flag > `[tcode_state]` > preset > config）。
+
+    **闭包只到"建好新 provider"为止，装进共享 `ModelCell` 是调用方的活**（`picker::choose_model` 收 `&ModelCell` 并 `swap`，与 TUI 的 `apply_model` 同构）。preset 的 `apply` 闭包自己持有 cell 会顺手换掉，单选模型的 `switch` 不会——两者不对称，所以丢掉 `switch` 的返回值能编译、能过其余测试，表现只是"chip 弹回旧值、下个请求还是老模型"。`tests/bridge.rs` 有一条钉住它。同理，panel 显示的 effort 必须读 `ModelCell` 快照，不许读 `ModelDef::default_effort`——那是配置里的默认值，不是正在跑的值，读错就把一次生效的选择画成死控件。
+
+    **preset 一换，三张菜单一起换**：`apply` 返回重建后的 `ModelMenu` 与 `AgentMenu`，`choose_preset` 必须两个都装回去。留着旧的 `agents` 等于让 panel 列出已经不存在的 pin。
+
+    **webview 送来的 role 选择要校验两件事**：role 存在，且 `off` 对它合法（只有 `web-fetch` 这类默认关的角色可以关）。不许"宽容"地把不认识的 role 或非法的 off 归到最近的可行分支——那是规则 3 在这条路上的具体形态，`picker.rs` 有单测。
+
+    **模型、effort、preset、role 是一个 chip 一个面板**（`ModelPanel.tsx` + 纯函数 `picker.ts`）。它们本来是并排三个 chip，等于要求读的人已经知道"选 preset 会把旁边那个 chip 也改掉"，而最该配置的两件事（`explore` 跑什么、怎么存一套编排）只能回终端做。面板的形状是承重的，别改回菜单：**列表滚动、旋钮不滚动**（effort 与 preset 钉在底边——面板向上弹，底边才是离刚点的 chip 最近的地方；effort 曾经是长列表的最后一段，也就是离光标最远、经常还在视野外）；**provider 是分组标题不是每行的第二行**；**面板里任何一次选择都不关闭面板**（一条规则没有例外要记：选完当场回读，退出靠 Esc / 点外面 / 再点 chip）；**role 是第二个视图不是第三段**（十行 role 塞在模型下面，是拿常用路径去伺候罕用路径）。它走 portal 到 `document.body`：popover 留在 composer 的 `<form>` 里会被窗格裁掉，里面的文本框还会在 Enter 时把消息发出去。
+
+    **模式名一律显示原始 key**（`default` / `accept-edits` / `auto` / `unsafe`），与 `/mode`、config 文件、`PermissionMode::label()` 同一套词；另起一套好听的名字（"Ask first"）会让见过第一套的人以为是另一组模式。
 
     **模式按会话，模型按进程**：模式是"这个对话可以不问就做什么"，两个文件夹并排开时天然该不同；模型走共享 `ModelCell`，本来就是全窗口一个。模式仍然记进 `[tcode_state]` 当新会话默认——**除了 `unsafe`**，它刻意不粘（一次性放行不得静默武装以后每个会话），这条与 TUI 的 `/mode` 必须一致。
 
@@ -98,11 +119,13 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对）。
+- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
+  - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。
   - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。
-  - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿；其中 `quiet_output` 真的由 `Tool::batch_policy()` 派生，而 `route` 目前仍是 `commands.rs` 里的名字表，因为 `CallRoute` 住在 `tcode-tui` 而本 crate 不能依赖它——该文件写明了把 `route()` 提升为 core 的 trait 方法才是终局。
+  - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿，`route` 与 `quiet_output` 现在都由活着的工具派生（`Tool::route` / `Tool::batch_policy`），名字表已经删了。唯一的例外是 `progress`：它的路由**随 input 变**（阶段翻转归计划条，提交的计划是对话要留住的文档），后端送的是工具的默认答案，那一个例外由 `plan.ts::isPlanSubmission` 在调用点认出来——一个字段，紧挨着它读的类型。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
   - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。表格只把有限行放进 DOM（`ROW_STEP`），不是分页而是上限——20 万行 DOM 就是一个冻住的窗口。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。

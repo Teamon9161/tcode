@@ -52,14 +52,32 @@ impl SlashCommand for PlanCommand {
 /// context, not text the user wrote, so it must not appear in the transcript.
 /// Nothing here touches the permission mode.
 fn plan_turn(task: &str) -> CommandOutcome {
-    let instruction = match task {
+    CommandOutcome::effect(CommandEffect::SubmitInstruction(planning_instruction(task)))
+}
+
+/// The instruction a planning turn carries, with an optional task description.
+///
+/// Public because a frontend without a slash-command surface still has to be
+/// able to start one — the desktop app offers planning as a control on its
+/// composer — and two copies of this text would be two definitions of what
+/// planning means.
+pub fn planning_instruction(task: &str) -> String {
+    match task.trim() {
         "" => PLAN_REQUEST.to_string(),
         task => format!("{PLAN_REQUEST}\n\nTask: {task}"),
-    };
-    CommandOutcome::effect(CommandEffect::SubmitInstruction(instruction))
+    }
+}
+
+/// The instruction that hands an approved plan to a fresh conversation, for the
+/// review option that executes somewhere other than where it was planned. The
+/// plan travels in the text because that session has none of the planning
+/// conversation — only the progress file it just adopted.
+pub fn execution_instruction(plan: &str) -> String {
+    format!("{PLAN_EXECUTION_REQUEST}\n{}", plan.trim())
 }
 
 const PLAN_REQUEST: &str = include_str!("../../prompts/commands/plan.md");
+const PLAN_EXECUTION_REQUEST: &str = include_str!("../../prompts/commands/plan-execution.md");
 
 fn split_verb(args: &str) -> (&str, &str) {
     let args = args.trim();

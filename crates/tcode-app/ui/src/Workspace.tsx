@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import type { Decision, SessionInfo, Status } from "./types";
 import type { SessionState } from "./session";
+import type { PlanDraft } from "./plan";
+import type { PlanDecision } from "./PlanEditor";
 import {
   close,
   focusPane,
@@ -53,6 +55,11 @@ export function Workspace({
   onSend,
   onInterrupt,
   onAnswer,
+  onDecidePlan,
+  onPlanDraft,
+  onSavePlan,
+  onPlanOpen,
+  onPlanFirst,
   onCloseSession,
   onHome,
 }: {
@@ -67,6 +74,11 @@ export function Workspace({
   onSend: (session: string) => void;
   onInterrupt: (session: string) => void;
   onAnswer: (session: string, decision: Decision, comment: string) => void;
+  onDecidePlan: (session: string, choice: PlanDecision) => void;
+  onPlanDraft: (session: string, draft: PlanDraft) => void;
+  onSavePlan: (session: string) => void;
+  onPlanOpen: (session: string, open: boolean) => void;
+  onPlanFirst: (session: string, on: boolean) => void;
   onCloseSession: (session: string) => void;
   onHome: () => void;
 }) {
@@ -193,6 +205,11 @@ export function Workspace({
     onSend,
     onInterrupt,
     onAnswer,
+    onDecidePlan,
+    onPlanDraft,
+    onSavePlan,
+    onPlanOpen,
+    onPlanFirst,
   };
 
   // Below the threshold the tree stops being shown and only the current pane

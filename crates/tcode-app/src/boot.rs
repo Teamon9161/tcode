@@ -114,12 +114,12 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     })
     .await?;
 
-    // The same two menus `/model` renders in the terminal, with the same
-    // closures attached. Built here rather than in the command that reads them:
-    // they carry the provider swap and the selected-config writer, which are
-    // composition-root concerns (see `picker.rs`).
+    // The same three menus `/model` and `/agents` render in the terminal, with
+    // the same closures attached. Built here rather than in the command that
+    // reads them: they carry the provider swap and the selected-config writer,
+    // which are composition-root concerns (see `picker.rs`).
+    let models = tcode_frontend::build_menu(&config, &selection_for_menu, config_file.clone());
     let menus = Arc::new(std::sync::Mutex::new(crate::picker::Pickers {
-        models: tcode_frontend::build_menu(&config, &selection_for_menu, config_file.clone()),
         presets: tcode_frontend::build_preset_menu(
             &config,
             &state,
@@ -129,6 +129,16 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
             booted.agent_defs.clone(),
             config_file.clone(),
         ),
+        // Reads the model menu to resolve each pin back to a row in it, so it is
+        // built from the same list the panel will draw.
+        agents: tcode_frontend::build_agent_menu(
+            &config,
+            &models,
+            booted.pinned.clone(),
+            booted.agent_defs.as_ref(),
+            config_file.clone(),
+        ),
+        models,
         config_file: config_file.clone(),
     }));
 

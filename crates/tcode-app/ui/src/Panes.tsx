@@ -19,6 +19,9 @@ import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
 import { Approval } from "./Approval";
+import { ProgressStrip } from "./ProgressStrip";
+import type { PlanDecision } from "./PlanEditor";
+import { draftOf, isPlanReview, type PlanDraft } from "./plan";
 
 /**
  * The tiling field: the pane tree, drawn.
@@ -56,6 +59,11 @@ export type PaneContext = {
   onSend: (session: string) => void;
   onInterrupt: (session: string) => void;
   onAnswer: (session: string, decision: Decision, comment: string) => void;
+  onDecidePlan: (session: string, choice: PlanDecision) => void;
+  onPlanDraft: (session: string, draft: PlanDraft) => void;
+  onSavePlan: (session: string) => void;
+  onPlanOpen: (session: string, open: boolean) => void;
+  onPlanFirst: (session: string, on: boolean) => void;
 };
 
 /**
@@ -214,6 +222,13 @@ function SessionPane({
 }) {
   const info = context.sessions.find((open) => open.id === session);
   const state = context.stateOf(session);
+  // A draft is built once per plan, not per render: `draftOf` mints the row ids
+  // the editor keys on, so rebuilding it while someone is typing would remount
+  // every field and take the caret with it.
+  const draft = useMemo(
+    () => state.planDraft ?? (state.plan ? draftOf(state.plan) : null),
+    [state.planDraft, state.plan],
+  );
   if (!info) return <p className="pane-empty">this conversation was closed</p>;
 
   return (
@@ -254,7 +269,28 @@ function SessionPane({
         {state.approval && (
           <Approval
             request={state.approval}
+            plan={state.plan}
+            draft={draft}
             onAnswer={(decision, comment) => context.onAnswer(session, decision, comment)}
+            onDecidePlan={(choice) => context.onDecidePlan(session, choice)}
+            onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
+          />
+        )}
+
+        {/* Above the composer, below whatever is being asked: the plan is
+            context for what you are about to type, and it must not push an
+            unanswered question further from the answer. Absent entirely when
+            there is no plan — an empty strip over every composer is furniture.
+            While a review is open it stays out of the way: the panel above *is*
+            the plan, in full, and two of them would be two answers to "which
+            plan is this". */}
+        {state.plan && !(state.approval && isPlanReview(state.approval.input)) && (
+          <ProgressStrip
+            plan={state.plan}
+            expanded={state.planOpen}
+            running={state.running}
+            onToggle={() => context.onPlanOpen(session, !state.planOpen)}
+            onOpen={() => context.onOpen(leaf.id, session, { kind: "plan" })}
           />
         )}
 
@@ -263,6 +299,8 @@ function SessionPane({
           running={state.running}
           disabled={false}
           attachments={state.attachments}
+          planFirst={state.planFirst}
+          onPlanFirst={(on) => context.onPlanFirst(session, on)}
           onChange={(value) => context.onDraft(session, value)}
           onAttach={(items) => context.onAttach(session, items)}
           onDetach={(id) => context.onDetach(session, id)}
@@ -275,11 +313,17 @@ function SessionPane({
 }
 
 function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
-  if (leaf.pane.kind !== "inspect") return null;
-  const { session, nav } = leaf.pane;
+  const pane = leaf.pane.kind === "inspect" ? leaf.pane : null;
+  const state = context.stateOf(pane?.session ?? "");
+  // Same reason as the session pane: one draft per plan, not one per render.
+  const draft = useMemo(
+    () => state.planDraft ?? (state.plan ? draftOf(state.plan) : null),
+    [state.planDraft, state.plan],
+  );
+  if (!pane) return null;
+  const { session, nav } = pane;
   const value = navValue(nav);
   const info = context.sessions.find((open) => open.id === session);
-  const state = context.stateOf(session);
 
   return (
     <>
@@ -318,7 +362,11 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
           blocks={state.blocks}
           files={state.files}
           cwd={info?.cwd ?? ""}
+          plan={state.plan}
+          planDraft={draft}
           onOpen={(next) => context.onOpen(leaf.id, session, next)}
+          onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
+          onSavePlan={() => context.onSavePlan(session)}
         />
       </div>
     </>

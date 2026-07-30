@@ -16,6 +16,7 @@ use serde_json::Value;
 use tauri::Emitter;
 use tokio::sync::oneshot;
 
+use tcode_core::progress::{self, PlanNote};
 use tcode_core::{AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk};
 
 /// Event names the frontend listens on. Constants because the TypeScript side
@@ -75,6 +76,14 @@ pub struct ApprovalRequest<'a> {
     pub input: &'a Value,
 }
 
+/// One reviewer comment as the webview sends it. The quote is the passage the
+/// user selected; core turns the pair into the note the model reads.
+#[derive(serde::Deserialize)]
+pub struct AnswerNote {
+    pub quote: Option<String>,
+    pub text: String,
+}
+
 /// The answer coming back. A separate type from `Approval` because the wire
 /// side names decisions as strings and knows nothing about mode transitions.
 #[derive(serde::Deserialize)]
@@ -84,33 +93,141 @@ pub struct ApprovalAnswer {
     /// an answer this side cannot read must not be taken as consent.
     pub decision: String,
     pub comment: Option<String>,
+    /// Plan review only: the breakdown as the reviewer edited it. It is a
+    /// breakdown and not a rendered body on purpose — the markdown grammar of a
+    /// progress file is core's, so the webview never writes it, and this arrives
+    /// as data to be validated like any model input.
+    #[serde(default)]
+    pub phases: Option<Value>,
+    /// Plan review only: comments anchored to passages of the plan.
+    #[serde(default)]
+    pub notes: Vec<AnswerNote>,
+    /// Plan review only: execute the approved plan in a fresh conversation
+    /// instead of this one.
+    #[serde(default)]
+    pub fresh_session: bool,
 }
 
 impl ApprovalAnswer {
-    fn into_approval(self) -> Approval {
-        let decision = match self.decision.as_str() {
+    fn decision(&self) -> ApprovalDecision {
+        match self.decision.as_str() {
             "yes" => ApprovalDecision::Yes,
             "yes-session" => ApprovalDecision::YesSession,
             "yes-project" => ApprovalDecision::YesProject,
             _ => ApprovalDecision::No,
-        };
-        Approval::simple(decision, self.comment.filter(|c| !c.trim().is_empty()))
+        }
     }
+
+    fn free_comment(&self) -> &str {
+        self.comment.as_deref().unwrap_or("")
+    }
+
+    fn plan_notes(&self) -> Vec<PlanNote> {
+        self.notes
+            .iter()
+            .map(|note| PlanNote {
+                quote: note.quote.clone(),
+                text: note.text.clone(),
+            })
+            .collect()
+    }
+
+    /// Turn this into an `Approval`, given the request it answers.
+    ///
+    /// `asked` is the input **this side** sent to the webview, and the edited
+    /// plan is rebuilt on top of it rather than from anything the webview
+    /// returned. That is the whole reason the input is kept: an approval whose
+    /// tool input came back from the frontend would let a compromised or simply
+    /// buggy webview authorize one call and execute another.
+    fn into_approval(self, asked: &Value) -> Result<Approval, String> {
+        let decision = self.decision();
+        if !progress::is_plan_document(asked) {
+            return Ok(Approval::simple(
+                decision,
+                self.comment.filter(|c| !c.trim().is_empty()),
+            ));
+        }
+        let original = asked[progress::REVIEW_BODY_FIELD].as_str().unwrap_or("");
+        // Webview data, so the same validation the model's own breakdown gets.
+        // Rejecting leaves the approval unanswered rather than guessing, and the
+        // error names what is wrong with it.
+        let revised = match self.phases.as_ref() {
+            Some(phases) => {
+                let phases = progress::phases_from_json(phases)?;
+                // Detail the reviewer never opened is not detail they deleted:
+                // core carries the stored text onto phases that came back
+                // without any, exactly as it does for the model's own resends.
+                let body = progress::revise_plan_body(original, &phases);
+                (body.trim() != original.trim()).then_some(body)
+            }
+            None => None,
+        };
+        let notes = self.plan_notes();
+        if decision == ApprovalDecision::No {
+            return Ok(Approval {
+                decision,
+                comment: progress::declined_plan_note(
+                    revised
+                        .as_deref()
+                        .and_then(|revised| progress::plan_revision_diff(original, revised))
+                        .as_deref(),
+                    &notes,
+                    self.free_comment(),
+                ),
+                set_mode: None,
+                approved_input: None,
+                end_turn_after_execution: false,
+            });
+        }
+        let approved_input = revised.as_deref().map(|revised| {
+            let mut input = asked.clone();
+            input[progress::REVIEW_BODY_FIELD] = Value::String(revised.to_string());
+            input
+        });
+        Ok(Approval {
+            decision,
+            comment: progress::approved_plan_note(revised.as_deref(), &notes, self.free_comment()),
+            set_mode: None,
+            approved_input,
+            // The plan still executes here; ending the turn afterwards is what
+            // lets the handoff hand it to a session with a clean context.
+            end_turn_after_execution: self.fresh_session,
+        })
+    }
+}
+
+/// One approval awaiting an answer: where to send it, and what was asked.
+struct PendingAsk {
+    reply: oneshot::Sender<Approval>,
+    /// The exact input the webview was shown. Kept so an answer can only ever
+    /// modify what was actually proposed — see `into_approval`.
+    asked: Value,
 }
 
 /// Approvals awaiting an answer, keyed by request id.
 #[derive(Clone, Default)]
-pub struct Pending(Arc<Mutex<HashMap<String, oneshot::Sender<Approval>>>>);
+pub struct Pending(Arc<Mutex<HashMap<String, PendingAsk>>>);
 
 impl Pending {
-    /// Deliver an answer. Returns false if the id is unknown — a double answer,
-    /// or one for a turn that was interrupted while the dialog was open.
-    pub fn answer(&self, answer: ApprovalAnswer) -> bool {
-        let sender = self.0.lock().unwrap().remove(&answer.id);
-        match sender {
-            Some(sender) => sender.send(answer.into_approval()).is_ok(),
-            None => false,
-        }
+    /// Deliver an answer.
+    ///
+    /// An unreadable plan edit is refused *without* consuming the request, so
+    /// the dialog stays answerable: the turn is parked on this question, and
+    /// dropping the only way back to it because a phase title was empty would
+    /// strand the conversation. An unknown id is the other error — a double
+    /// answer, or one for a turn interrupted while the dialog was open.
+    pub fn answer(&self, answer: ApprovalAnswer) -> Result<(), String> {
+        const GONE: &str = "this request is no longer waiting for an answer";
+        let id = answer.id.clone();
+        let approval = {
+            let held = self.0.lock().unwrap();
+            let ask = held.get(&id).ok_or(GONE)?;
+            answer.into_approval(&ask.asked)?
+        };
+        let ask = self.0.lock().unwrap().remove(&id).ok_or(GONE)?;
+        ask.reply
+            .send(approval)
+            .map_err(|_| "the conversation stopped waiting for this answer".to_string())
     }
 
     /// Fail every outstanding request closed. Called when a turn ends by any
@@ -120,9 +237,15 @@ impl Pending {
         self.0.lock().unwrap().clear();
     }
 
-    fn register(&self, id: String) -> oneshot::Receiver<Approval> {
+    fn register(&self, id: String, asked: &Value) -> oneshot::Receiver<Approval> {
         let (tx, rx) = oneshot::channel();
-        self.0.lock().unwrap().insert(id, tx);
+        self.0.lock().unwrap().insert(
+            id,
+            PendingAsk {
+                reply: tx,
+                asked: asked.clone(),
+            },
+        );
         rx
     }
 }
@@ -160,7 +283,7 @@ impl Approver for WebviewApprover {
         input: &Value,
     ) -> Approval {
         let id = uuid::Uuid::new_v4().to_string();
-        let rx = self.pending.register(id.clone());
+        let rx = self.pending.register(id.clone(), input);
         self.emit.emit(
             APPROVAL_REQUEST,
             serde_json::to_value(ApprovalRequest {

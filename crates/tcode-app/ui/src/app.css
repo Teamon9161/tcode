@@ -217,6 +217,16 @@
   max-height: 50%;
 }
 
+/* The strip is a line on the same sheet, so it gets the same flex treatment as
+   the composer: never squeezed, and its own list scrolls rather than pushing the
+   conversation off the top. The ceiling is a percentage of the *pane*, not of the
+   viewport — a `vh` here would ignore that a pane is a fraction of the window. */
+.pane-body.is-stage > .progress-strip {
+  flex: 0 1 auto;
+  min-height: 0;
+  max-height: 40%;
+}
+
 .pane-body.is-stage > .composer {
   flex: none;
 }
@@ -1683,9 +1693,22 @@
   color: var(--ink);
 }
 /* The model side recedes: it is what you are running on, not a decision you are
-   making right now. */
-.chip.is-quiet {
+   making right now. Its name is set in the machine face — a model id is an
+   identifier, like a path or a tool name, and reading it as one is also what
+   tells it apart from the mode chip at a glance. */
+.chip.is-model {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--s-1);
   color: var(--muted);
+}
+.chip-model {
+  font-family: var(--font-mono);
+}
+.chip-effort::before {
+  content: "·";
+  margin-right: var(--s-1);
+  color: var(--faint);
 }
 
 /* Chroma only when the mode is not the careful default — a permission state you
@@ -1703,7 +1726,8 @@
 .chip-menu {
   position: absolute;
   bottom: calc(100% + var(--s-1));
-  z-index: 20;
+  left: 0;
+  z-index: var(--z-dropdown);
   display: flex;
   flex-direction: column;
   min-width: 13rem;
@@ -1714,12 +1738,6 @@
   border-radius: var(--r-md);
   background: var(--bg);
   box-shadow: var(--shadow-lift);
-}
-.chip-menu.is-left {
-  left: 0;
-}
-.chip-menu.is-right {
-  right: 0;
 }
 
 .chip-item {
@@ -1759,6 +1777,317 @@
   color: var(--faint);
   font-size: var(--text-2xs);
   text-wrap: pretty;
+}
+
+/* ============================================================ model panel */
+
+/* Everything about what this window thinks with, under the model chip: the
+   model, its effort, the saved presets, and what each sub-agent runs on. See the
+   header of `ModelPanel.tsx` for why it is a panel and not a menu.
+
+   Three bands, and the tone step is what separates them — chrome for the two
+   bands of controls, the content surface for the list between them, no rules
+   drawn anywhere. That is the same boundary the window draws between itself and
+   a pane, so the scrolling region needs no border to announce itself.
+
+   Fixed, in a portal, and positioned from the chip's measured box (`--seat-*`,
+   set by the component): a popover inside the composer would be clipped by the
+   pane it sits in, and one that grew past the window would be worse. */
+.mpanel {
+  position: fixed;
+  right: var(--seat-right, var(--s-4));
+  bottom: calc(var(--seat-bottom, var(--s-6)) + var(--s-2));
+  z-index: var(--z-dropdown);
+  display: flex;
+  flex-direction: column;
+  width: min(22rem, calc(100vw - var(--s-6)));
+  max-height: min(26rem, calc(var(--seat-room, 100vh) - var(--s-4)));
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  background: var(--bg);
+  box-shadow: var(--shadow-lift);
+  animation: mpanel-in var(--dur-fast) var(--ease);
+}
+@keyframes mpanel-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+
+/* Which set of dials. Two words, so a segmented pair rather than a menu — and
+   deliberately achromatic: this is where you are looking, not what is running.
+   Chroma on this panel means "in force". */
+.mpanel-tabs {
+  display: flex;
+  gap: var(--s-1);
+  padding: var(--s-2);
+  background: var(--chrome);
+}
+.mpanel-tab {
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.mpanel-tab:hover {
+  color: var(--ink);
+}
+.mpanel-tab.is-on {
+  background: var(--bg);
+  color: var(--ink);
+  box-shadow: var(--shadow-rest);
+}
+
+/* One role, one level down. The back arrow is the whole navigation: a panel deep
+   enough to need breadcrumbs would be the wrong shape for this. */
+.mpanel-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-2);
+  background: var(--chrome);
+}
+.mpanel-title {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+.mpanel-head-note {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+.mpanel-body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  /* More below than above: the last row must not sit flush against the footer's
+     tone change, or the two bands read as one crowded block. */
+  padding: var(--s-1) var(--s-1) var(--s-2);
+}
+.mpanel-section + .mpanel-section {
+  margin-top: var(--s-2);
+}
+
+/* Names a group of rows; it is not one of them. Lowercase and small, because in
+   this app a label is lowercase and the options carry the weight. */
+.mpanel-group {
+  margin: 0;
+  padding: var(--s-1) var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+.mpanel-group.is-id {
+  font-family: var(--font-mono);
+}
+
+.mpanel-empty {
+  margin: 0;
+  padding: var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+.mpanel-empty code {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+.mpanel-note {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  background: var(--danger-wash);
+  color: var(--danger-text);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+/* A row is the list affordance here as everywhere else in the app: a dot gutter
+   for the one in force, the name, and what it is set to. Never a card — these
+   sit inside a panel, and a panel of cards is the nested-card ban with extra
+   steps. */
+.mrow {
+  display: grid;
+  grid-template-columns: 12px 1fr auto auto;
+  align-items: center;
+  gap: 2px var(--s-2);
+  width: 100%;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+.mrow:hover {
+  background: var(--hover);
+}
+.mrow:focus-visible {
+  outline: 1px solid var(--focus-ring);
+  outline-offset: -1px;
+}
+.mrow-mark {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: none;
+}
+.mrow.is-current .mrow-mark {
+  background: var(--brand);
+}
+.mrow-name {
+  color: var(--ink);
+  font-size: var(--text-sm);
+}
+.mrow.is-current .mrow-name {
+  font-weight: var(--weight-medium);
+}
+.mrow-name.is-id,
+.mrow-meta.is-id {
+  font-family: var(--font-mono);
+}
+.mrow-meta {
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.mrow-more {
+  color: var(--faint);
+}
+/* The second line belongs under the name, not beside it: it explains the row,
+   and a row's explanation reads as prose on the name's own axis. */
+.mrow-detail {
+  grid-column: 2 / -1;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+/* The pinned dials. Label column fixed so `effort` and `preset` align, which is
+   what lets two rows of small controls read as a form rather than as leftovers. */
+.mpanel-foot {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  padding: var(--s-2);
+  background: var(--chrome);
+}
+.mfield {
+  display: grid;
+  grid-template-columns: 3rem 1fr;
+  align-items: center;
+  gap: var(--s-2);
+}
+.mfield-label {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+.mfield-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+}
+
+/* One shape for every small in-force choice on this panel: effort levels and
+   preset names are the same kind of answer, so they are the same control. */
+.mseg-item {
+  padding: 2px var(--s-2);
+  border: 0;
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.mseg-item:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+.mseg-item:focus-visible {
+  outline: 1px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.mseg-item.is-on {
+  background: var(--selected);
+  color: var(--brand-text);
+}
+
+.mfield-add {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 2px var(--s-2);
+  border: 0;
+  border-radius: var(--r-pill);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.mfield-add:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+/* Same field vocabulary as the composer and the plan editor: sunken at rest,
+   the surface opening up to `--bg` with a ring on focus. */
+.mfield-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px var(--s-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.mfield-input:focus {
+  border-color: var(--focus-ring);
+  background: var(--bg);
+  outline: none;
+}
+.mfield-input::placeholder {
+  color: var(--muted);
+}
+.mfield-go {
+  display: inline-flex;
+  padding: 2px;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--ink);
+  cursor: pointer;
+}
+.mfield-go:hover {
+  background: var(--hover);
+}
+.mfield-go:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mpanel {
+    animation: none;
+  }
 }
 
 /* ============================================================ shown files */
@@ -2749,6 +3078,533 @@
 .run-waiting {
   color: var(--faint);
   font-size: var(--text-xs);
+}
+
+/* ---- the plan strip ---------------------------------------------------------
+
+   One line above the composer saying where a multi-phase task stands. It reads
+   as part of the same sheet as the transcript and the composer — a hairline
+   above it, no card, no shadow — and it aligns on `--measure` like everything
+   else on the conversation's axis. */
+
+.progress-strip {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  border-top: 1px solid var(--line);
+  background: var(--bg);
+  overflow: hidden;
+}
+
+.progress-strip > * {
+  width: 100%;
+  max-width: var(--measure);
+  margin-inline: auto;
+}
+
+.strip-line {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-5);
+  font-size: var(--text-xs);
+}
+
+.strip-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.strip-toggle:hover .strip-title {
+  color: var(--ink);
+}
+.strip-title {
+  overflow: hidden;
+  color: var(--ink);
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* A word, not a colour: chroma in this app means a session is running or parked,
+   and a draft nobody has been asked about yet is neither. */
+.strip-state {
+  flex: none;
+  padding: 0 var(--s-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+.strip-current {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+  overflow: hidden;
+  color: var(--body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.strip-count {
+  flex: none;
+  margin-left: auto;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+.strip-mark {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+}
+.strip-mark.is-in_progress {
+  color: var(--brand);
+}
+.strip-mark.is-completed {
+  color: var(--muted);
+}
+
+/* The completed fraction, readable without reading. It is state, which is why it
+   may carry chroma at all — and only while a turn is actually running, so a
+   parked plan does not claim to be working. */
+.strip-meter {
+  height: 1px;
+  max-width: none;
+  margin-inline: 0;
+  background: var(--line-strong);
+  transition: width var(--dur-slow) var(--ease);
+}
+.progress-strip.is-running .strip-meter {
+  background: var(--brand);
+}
+
+.strip-phases {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin: 0;
+  padding: var(--s-1) var(--s-5) var(--s-3);
+  overflow-y: auto;
+  font-size: var(--text-xs);
+}
+.strip-phase {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--s-2);
+  color: var(--body);
+}
+.strip-phase.is-nested {
+  padding-left: var(--s-4);
+}
+.strip-phase.is-completed .strip-phase-name {
+  color: var(--muted);
+}
+.strip-phase.is-in_progress .strip-phase-name {
+  color: var(--ink);
+}
+.strip-detail {
+  grid-column: 2;
+  max-width: 72ch;
+  color: var(--muted);
+}
+
+/* ---- the plan editor -------------------------------------------------------
+
+   A document you can work on: every title and every piece of prose is the text
+   itself. The fields are invisible until pointed at, so the plan reads as a plan
+   rather than as a form — and rows, never cards, because phases nest. */
+
+.plan-editor {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  min-width: 0;
+  min-height: 0;
+}
+.plan-editor.is-review {
+  overflow-y: auto;
+}
+.plan-editor.is-edit {
+  padding: var(--s-4) 0;
+}
+
+.plan-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+}
+.plan-title {
+  font-size: var(--text-md);
+  text-wrap: pretty;
+}
+.plan-state {
+  padding: 0 var(--s-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+.plan-count {
+  margin-left: auto;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+.plan-phases,
+.phase-children {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  margin: 0;
+  padding: 0;
+}
+.phase-children {
+  padding-left: var(--s-5);
+}
+
+.phase-row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  padding: var(--s-2) 0;
+  border-top: 1px solid var(--line);
+}
+.plan-phases > .phase-row:first-child {
+  border-top: 0;
+}
+
+.phase-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+}
+
+/* The box a phase's status is: click it to advance. The file is the user's, so
+   marking a phase done by hand is an edit like any other. */
+.phase-box {
+  flex: none;
+  width: var(--s-5);
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--s-5);
+  cursor: pointer;
+}
+.phase-box.is-in_progress {
+  color: var(--brand);
+}
+.phase-box.is-completed {
+  color: var(--muted);
+}
+.phase-box:hover {
+  color: var(--ink);
+}
+
+.phase-name,
+.phase-detail,
+.comment-text {
+  width: 100%;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  resize: none;
+  overflow: hidden;
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+.phase-name {
+  padding: var(--s-1) var(--s-2);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+.phase-detail {
+  margin-left: var(--s-5);
+  max-width: 72ch;
+  padding: var(--s-1) var(--s-2);
+  color: var(--body);
+  font-size: var(--text-xs);
+}
+.phase-name:hover,
+.phase-detail:hover {
+  background: var(--sunken);
+}
+.phase-name:focus,
+.phase-detail:focus,
+.comment-text:focus {
+  background: var(--bg);
+  border-color: var(--focus-ring);
+  outline: none;
+}
+.phase-name::placeholder,
+.phase-detail::placeholder,
+.comment-text::placeholder {
+  color: var(--muted);
+}
+
+/* The row's own controls stay out of the way until the row is pointed at: four
+   icons beside every phase would compete with the text they act on. */
+.phase-tools {
+  display: flex;
+  flex: none;
+  gap: var(--s-1);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.phase-row:hover > .phase-line > .phase-tools,
+.phase-row:focus-within > .phase-line > .phase-tools {
+  opacity: 1;
+}
+
+.plan-add {
+  align-self: flex-start;
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.plan-add:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+/* ---- comments on a passage ----
+
+   The quote is the anchor: there is no highlight inside the text, because a
+   highlight tied to character offsets stops meaning anything the moment the
+   reviewer edits the paragraph it is in — which is what they are here to do. */
+
+.phase-comments {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin: 0 0 0 var(--s-5);
+  padding: 0;
+}
+.phase-comment {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0 var(--s-2);
+  padding: var(--s-1) var(--s-2);
+  border-left: 1px solid var(--line-strong);
+  border-radius: 0 var(--r-xs) var(--r-xs) 0;
+  background: var(--sunken);
+}
+.phase-quote {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  font-style: italic;
+}
+.phase-note {
+  grid-column: 1;
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.phase-comment .icon-btn {
+  grid-row: 1 / span 2;
+}
+
+.comment-composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  padding: var(--s-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-md);
+  background: var(--sunken);
+}
+.comment-text {
+  border-color: var(--line);
+  background: var(--bg);
+  font-size: var(--text-xs);
+  overflow: auto;
+  padding: var(--s-2);
+}
+.comment-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+
+/* The bubble that offers to comment on what is selected. Fixed, because a pane's
+   body scrolls and an absolutely positioned bubble inside one is clipped exactly
+   where a selection near the bottom of a long plan would put it. */
+.selection-bubble {
+  position: fixed;
+  /* A dropdown-class transient control: above the dock it floats over, below a
+     dialog. The scale is semantic (base → sticky → rail → dropdown → …), so it
+     never becomes a guessed number. */
+  z-index: var(--z-dropdown);
+  translate: var(--s-2) var(--s-2);
+  animation: rise var(--dur-fast) var(--ease);
+}
+.selection-bubble-btn {
+  padding: var(--s-1) var(--s-3);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  background: var(--bg);
+  box-shadow: var(--shadow-lift);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.selection-bubble-btn:hover {
+  background: var(--hover);
+}
+
+/* ---- what changed ---- */
+
+.plan-changes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.change-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin: 0;
+  padding: 0;
+  font-size: var(--text-xs);
+}
+.change {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--s-2);
+}
+.change-kind {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.change-title {
+  color: var(--ink);
+}
+.change-diff {
+  flex-basis: 100%;
+  min-width: 0;
+}
+
+.plan-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+}
+.plan-buttons {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+}
+
+/* A plan submitted for approval, kept at its call site in the conversation. */
+.plan-document {
+  max-width: 72ch;
+  padding: var(--s-2) 0;
+  color: var(--body);
+}
+
+.inspect-plan {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-height: 0;
+  padding: var(--s-4) var(--s-5);
+  overflow-y: auto;
+}
+
+/* The composer's own row of message properties, with "plan first" beside the
+   model and mode chips: they are all facts about the message about to be sent. */
+.composer-row-chips {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  min-width: 0;
+}
+.composer-row-chips > .chips {
+  flex: 1;
+  min-width: 0;
+}
+
+/* A switch, not a menu, and the only one on this strip — so unlike the chips
+   beside it, it draws its own outline at rest. Bare, it read as a caption
+   saying planning was already on: the state and the control were both invisible,
+   and the two invisibilities cancelled into a wrong answer. The box carries the
+   state (hollow / filled), the outline carries "this is a control", and the
+   filled state also takes the brand wash so the answer survives a glance that
+   never reaches the box. */
+.chip.is-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+.chip.is-toggle:hover {
+  border-color: var(--line-strong);
+}
+.chip-tick {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease);
+}
+.chip.is-toggle.is-on {
+  border-color: var(--brand);
+}
+.chip.is-toggle.is-on .chip-tick {
+  border-color: var(--brand);
+  background: var(--brand);
+}
+.chip.is-on {
+  background: var(--selected);
+  color: var(--brand-text);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .strip-meter,
+  .phase-name,
+  .phase-detail,
+  .phase-tools {
+    transition: none;
+  }
+  .selection-bubble {
+    animation: none;
+  }
 }
 
 /* ---- progress phases ---- */

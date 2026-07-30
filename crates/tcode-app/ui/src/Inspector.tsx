@@ -12,6 +12,8 @@ import { Sandbox } from "./Sandbox";
 import { ShownView } from "./Shown";
 import { BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
+import { PlanEditor } from "./PlanEditor";
+import { draftOf, type Plan, type PlanDraft } from "./plan";
 
 /**
  * The body of an inspect pane: one `Inspect` value, drawn.
@@ -37,13 +39,21 @@ export function InspectView({
   blocks,
   files,
   cwd,
+  plan,
+  planDraft,
   onOpen,
+  onPlanDraft,
+  onSavePlan,
 }: {
   value: Inspect;
   blocks: Block[];
   files: TouchedFile[];
   cwd: string;
+  plan: Plan | null;
+  planDraft: PlanDraft | null;
   onOpen: (next: Inspect) => void;
+  onPlanDraft: (draft: PlanDraft) => void;
+  onSavePlan: () => void;
 }) {
   switch (value.kind) {
     case "files":
@@ -62,6 +72,29 @@ export function InspectView({
       return <ShownView value={value} cwd={cwd} />;
     case "doc":
       return <div className="doc">{rich(value.text)}</div>;
+    case "plan":
+      // Room to work: the same editor the review dock mounts, on the same draft,
+      // with the whole height of a pane instead of half of one. Editing a plan
+      // outside a review is a legal thing to do at any time — the file is the
+      // user's, and the model is handed their version on its next call.
+      return plan ? (
+        <div className="inspect-plan">
+          <p className="inspect-path" title={plan.path}>
+            {plan.file}
+          </p>
+          <PlanEditor
+            plan={plan}
+            draft={planDraft ?? draftOf(plan)}
+            mode="edit"
+            onDraft={onPlanDraft}
+            onSave={onSavePlan}
+          />
+        </div>
+      ) : (
+        <p className="inspect-empty">
+          this conversation has no plan — ask for one with “plan first”
+        </p>
+      );
   }
 }
 

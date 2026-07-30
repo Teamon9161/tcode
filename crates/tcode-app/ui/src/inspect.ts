@@ -49,7 +49,18 @@ export type Inspect =
    */
   | { kind: "shown"; path: string; label: string }
   /** A document — a plan draft, a markdown file — read as prose. */
-  | { kind: "doc"; path: string; text: string };
+  | { kind: "doc"; path: string; text: string }
+  /**
+   * This conversation's plan, in full and editable.
+   *
+   * The second value here that is not a function of the transcript, and for the
+   * same reason `shown` is the first: a progress file is externally mutable state
+   * the user may edit by hand, so "what does the plan say" is a question about
+   * the file and not about what the agent said. It carries no data — the plan
+   * belongs to the session, not to this pane, so the review dock and this pane
+   * are looking at one draft rather than two copies of one.
+   */
+  | { kind: "plan" };
 
 /**
  * One pane's browsing history.
@@ -118,6 +129,8 @@ export function inspectTitle(value: Inspect): string {
       return value.label;
     case "doc":
       return basename(value.path);
+    case "plan":
+      return "Plan";
   }
 }
 

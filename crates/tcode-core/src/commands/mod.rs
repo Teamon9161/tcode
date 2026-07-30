@@ -16,7 +16,7 @@ mod export;
 mod memory;
 mod mode;
 mod note;
-mod plan;
+pub mod plan;
 mod resume;
 mod suggestions;
 

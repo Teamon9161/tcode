@@ -60,8 +60,8 @@ pub use store::{LogEvent, Resumed, SessionInfo, SessionStore};
 pub use task_trace::{TaskRunLoad, TaskRunMeta, TaskRunStatus, TaskTraces, TraceStore};
 pub use template::PromptVariables;
 pub use tool::{
-    BatchPolicy, CohortChannelMessage, CohortMember, CohortMemberRun, CohortMemberStatus,
-    CohortUpdate, Compacted, DelegateEvent, DelegatedApprovalRequest, PermissionRequest, Tool,
-    ToolCtx, ToolOutput,
+    BatchPolicy, CallRoute, CohortChannelMessage, CohortMember, CohortMemberRun,
+    CohortMemberStatus, CohortUpdate, Compacted, DelegateEvent, DelegatedApprovalRequest,
+    PermissionRequest, Tool, ToolCtx, ToolOutput,
 };
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

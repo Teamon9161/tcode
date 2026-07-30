@@ -19,6 +19,9 @@ dirs = { workspace = true }
 ignore = "0.4"
 globset = "0.4"
 serde_yaml = { workspace = true }
+# Plan review: the diff a declined plan sends back. It is core's because both
+# frontends send that note and the model must read one format, not two.
+similar = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

@@ -170,7 +170,7 @@ fn agent(provider: Arc<MockProvider>, cwd: &std::path::Path) -> Arc<Agent> {
             effort: None,
         }),
         models: AgentModels::default(),
-        tools: tcode_tools::builtin_tools(cwd),
+        tools: main_agent_tools(cwd),
         system: "test".into(),
         watchdog: WatchdogConfig::default(),
         hooks: Default::default(),
@@ -180,6 +180,18 @@ fn agent(provider: Arc<MockProvider>, cwd: &std::path::Path) -> Arc<Agent> {
         auto_compact: true,
         auto_compact_percent: 85,
     })
+}
+
+/// The toolset a main conversation gets, which is not `builtin_tools` alone:
+/// `progress` and `ask_user` are main-agent additions (a sub-agent must not be
+/// able to submit a plan or ask the user a question), and `tcode-frontend`
+/// assembles them for the real app. Tests that drive a plan through the loop
+/// need the same set, or the call they script is for a tool nobody registered.
+fn main_agent_tools(cwd: &std::path::Path) -> Vec<Arc<dyn tcode_core::Tool>> {
+    let mut tools = tcode_tools::builtin_tools(cwd);
+    tools.push(Arc::new(tcode_tools::ProgressTool));
+    tools.push(Arc::new(tcode_tools::AskUserTool));
+    tools
 }
 
 /// A session with no persistence: these tests are about the bridge, and a
@@ -207,8 +219,21 @@ fn menus() -> tcode_app::picker::Menus {
 }
 
 fn factory() -> tcode_app::boot::SessionFactory {
+    factory_at(PathBuf::from("/nonexistent/config.toml"))
+}
+
+/// A factory that can really open a session, for the one test that needs a
+/// second one to exist. The config file is empty on purpose: every default is
+/// fine here, and the model comes from the cell below rather than from disk.
+fn working_factory(dir: &std::path::Path) -> tcode_app::boot::SessionFactory {
+    let config = dir.join("config.toml");
+    std::fs::write(&config, "").unwrap();
+    factory_at(config)
+}
+
+fn factory_at(config: PathBuf) -> tcode_app::boot::SessionFactory {
     tcode_app::boot::SessionFactory::new(
-        PathBuf::from("/nonexistent/config.toml"),
+        config,
         ModelCell::new(ActiveModel {
             provider: MockProvider::new(Vec::new()),
             max_tokens: 1024,
@@ -231,6 +256,24 @@ fn say(text: &str) -> Vec<ContentBlock> {
     vec![ContentBlock::Text { text: text.into() }]
 }
 
+/// An ordinary turn: no harness-authored instruction in front of it.
+fn plain() -> Vec<String> {
+    Vec::new()
+}
+
+/// An ordinary approval answer. The plan-review fields are what the desktop
+/// review adds on top; the tests that exercise them fill those in themselves.
+fn answer(id: &Value, decision: &str) -> ApprovalAnswer {
+    ApprovalAnswer {
+        id: id.as_str().unwrap_or_default().to_string(),
+        decision: decision.into(),
+        comment: None,
+        phases: None,
+        notes: Vec::new(),
+        fresh_session: false,
+    }
+}
+
 // ---------------------------------------------------------------- the tests
 
 /// The baseline contract: a turn's events reach the frontend in order, each
@@ -245,7 +288,9 @@ async fn a_turn_streams_its_events_to_the_frontend() {
     let emit = sink(&collector);
     let session = handle("s1", cwd.path().to_path_buf());
 
-    run_turn(agent, session, emit, say("hi")).await.unwrap();
+    run_turn(agent, session, emit, say("hi"), plain())
+        .await
+        .unwrap();
 
     let types = collector.event_types("s1");
     assert!(types.contains(&"Started".to_string()), "got {types:?}");
@@ -284,7 +329,7 @@ async fn an_approval_crosses_the_boundary_and_comes_back() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("write a note")).await }
+        async move { run_turn(agent, session, emit, say("write a note"), plain()).await }
     });
 
     let request = collector
@@ -294,12 +339,10 @@ async fn an_approval_crosses_the_boundary_and_comes_back() {
     assert_eq!(request["is_edit"], true);
     assert_eq!(request["input"]["content"], "written\n");
 
-    let answered = session.pending().answer(ApprovalAnswer {
-        id: request["id"].as_str().unwrap().to_string(),
-        decision: "yes".into(),
-        comment: None,
-    });
-    assert!(answered, "the pending approval accepted its answer");
+    session
+        .pending()
+        .answer(answer(&request["id"], "yes"))
+        .expect("the pending approval accepted its answer");
 
     turn.await.unwrap().unwrap();
     assert_eq!(
@@ -335,17 +378,15 @@ async fn an_unrecognized_decision_denies() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("write a note")).await }
+        async move { run_turn(agent, session, emit, say("write a note"), plain()).await }
     });
 
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
         .await;
-    session.pending().answer(ApprovalAnswer {
-        id: request["id"].as_str().unwrap().to_string(),
-        decision: "sure-why-not".into(),
-        comment: None,
-    });
+    let _ = session
+        .pending()
+        .answer(answer(&request["id"], "sure-why-not"));
 
     turn.await.unwrap().unwrap();
     assert!(!target.exists(), "a decision we cannot read never runs");
@@ -356,11 +397,9 @@ async fn an_unrecognized_decision_denies() {
 #[tokio::test]
 async fn a_stale_answer_is_rejected_rather_than_replayed() {
     let pending = tcode_app::bridge::Pending::default();
-    assert!(!pending.answer(ApprovalAnswer {
-        id: "never-asked".into(),
-        decision: "yes".into(),
-        comment: None,
-    }));
+    assert!(pending
+        .answer(answer(&Value::from("never-asked"), "yes"))
+        .is_err());
 }
 
 /// The reason the supervisor exists. Two sessions run at the same time over
@@ -382,8 +421,8 @@ async fn concurrent_sessions_never_cross_streams() {
     supervisor.open(handle_two.clone());
 
     let (a, b) = tokio::join!(
-        run_turn(agent_one, handle_one, emit.clone(), say("one")),
-        run_turn(agent_two, handle_two, emit, say("two")),
+        run_turn(agent_one, handle_one, emit.clone(), say("one"), plain()),
+        run_turn(agent_two, handle_two, emit, say("two"), plain()),
     );
     a.unwrap();
     b.unwrap();
@@ -429,24 +468,20 @@ async fn a_second_turn_on_a_busy_session_is_refused() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent.clone(), session.clone(), emit.clone());
-        async move { run_turn(agent, session, emit, say("first")).await }
+        async move { run_turn(agent, session, emit, say("first"), plain()).await }
     });
     // Park the turn on an approval, so it is provably still running.
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
         .await;
 
-    let second = run_turn(agent, session.clone(), emit, say("second")).await;
+    let second = run_turn(agent, session.clone(), emit, say("second"), plain()).await;
     assert!(
         matches!(second, Err(tcode_app::state::TurnError::Busy(id)) if id == "s1"),
         "a busy session refuses a second turn"
     );
 
-    session.pending().answer(ApprovalAnswer {
-        id: request["id"].as_str().unwrap().to_string(),
-        decision: "no".into(),
-        comment: None,
-    });
+    let _ = session.pending().answer(answer(&request["id"], "no"));
     turn.await.unwrap().unwrap();
 }
 
@@ -486,8 +521,12 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(Fake("read", BatchPolicy::ParallelReadOnly)),
         Arc::new(Fake("edit", BatchPolicy::ParallelPerFile)),
+        // Named like the real thing, and deliberately not it: routing comes from
+        // the tool, so a look-alike must route like the ordinary tool it is.
+        // The name list this replaced could not tell the two apart.
         Arc::new(Fake("progress", BatchPolicy::Isolated)),
-        Arc::new(Fake("ask_user", BatchPolicy::Isolated)),
+        Arc::new(tcode_tools::ProgressTool),
+        Arc::new(tcode_tools::AskUserTool),
     ];
 
     let metas = tcode_app::commands::tool_view_metas(&tools);
@@ -508,6 +547,487 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
     assert!(!find("read").hide_success_result);
 
     assert_eq!(find("read").route, "transcript");
-    assert_eq!(find("progress").route, "progress");
     assert_eq!(find("ask_user").route, "silent");
+    // Two entries answer to "progress" here; the metas are per tool, and the
+    // real one is the one that owns the plan surface.
+    assert_eq!(
+        metas
+            .iter()
+            .filter(|meta| meta.name == "progress" && meta.route == "progress")
+            .count(),
+        1,
+        "the real progress tool routes to the plan surface"
+    );
+    assert_eq!(
+        metas
+            .iter()
+            .filter(|meta| meta.name == "progress" && meta.route == "transcript")
+            .count(),
+        1,
+        "a tool that merely shares its name does not"
+    );
+}
+
+// ---------------------------------------------------------------- plan review
+
+/// A `progress` submission, which is what puts a plan in front of the user.
+fn submit_plan(title: &str, phases: &[(&str, &str)]) -> Vec<StreamEvent> {
+    let phases: Vec<Value> = phases
+        .iter()
+        .map(|(phase, detail)| {
+            serde_json::json!({ "phase": phase, "status": "pending", "detail": detail })
+        })
+        .collect();
+    tool_use(
+        "call-plan",
+        "progress",
+        &serde_json::json!({ "title": title, "state": "active", "phases": phases }).to_string(),
+    )
+}
+
+/// A plan review with the user's edits, comments and choice of where to run.
+fn plan_answer(
+    id: &Value,
+    decision: &str,
+    phases: Option<Value>,
+    notes: Vec<(&str, &str)>,
+    fresh_session: bool,
+) -> ApprovalAnswer {
+    ApprovalAnswer {
+        id: id.as_str().unwrap_or_default().to_string(),
+        decision: decision.into(),
+        comment: None,
+        phases,
+        notes: notes
+            .into_iter()
+            .map(|(quote, text)| tcode_app::bridge::AnswerNote {
+                quote: Some(quote.to_string()),
+                text: text.to_string(),
+            })
+            .collect(),
+        fresh_session,
+    }
+}
+
+/// Every note this session's ledger holds, which is where the comment on an
+/// *approved* call lands — and therefore where to check what the model was told.
+fn notes_in(handle: &SessionHandle) -> String {
+    handle
+        .history()
+        .iter()
+        .filter_map(|entry| match entry {
+            tcode_core::Entry::UserNote { text, .. } => Some(text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+/// Tool results, which is where a *declined* call's reason goes: the call never
+/// ran, so there is no approved action for a note to annotate.
+fn tool_results_in(handle: &SessionHandle) -> String {
+    handle
+        .history()
+        .iter()
+        .filter_map(|entry| match entry {
+            tcode_core::Entry::ToolResults(blocks) => Some(
+                blocks
+                    .iter()
+                    .filter_map(|block| match block {
+                        ContentBlock::ToolResult { content, .. } => Some(content.clone()),
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n---\n")
+}
+
+/// The desktop review's whole point: the user rewrites the plan in the panel,
+/// and the plan that executes — and the file on disk — is theirs, not the
+/// model's. The edit arrives as a *breakdown*, and the tool input it becomes is
+/// rebuilt here from the request this side sent.
+#[tokio::test]
+async fn a_plan_edited_in_the_review_is_the_one_that_lands() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            submit_plan(
+                "Rewrite the resume path",
+                &[("survey the call sites", "read only")],
+            ),
+            text_done("starting"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+    });
+
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
+        .await;
+    assert_eq!(request["tool"], "progress");
+    assert!(
+        request["input"]["plan"]
+            .as_str()
+            .is_some_and(|plan| plan.contains("survey the call sites")),
+        "the review carries the plan body, not just the call: {request}"
+    );
+
+    session
+        .pending()
+        .answer(plan_answer(
+            &request["id"],
+            "yes",
+            Some(serde_json::json!([
+                { "phase": "write the regression test", "status": "pending", "detail": "cross a Summary boundary" },
+                { "phase": "survey the call sites", "status": "pending" },
+            ])),
+            vec![("read only", "do this second, after the test")],
+            false,
+        ))
+        .expect("the review was answered");
+    turn.await.unwrap().unwrap();
+
+    let plan = session.plan().expect("the approved plan is this session's");
+    assert_eq!(plan.state(), tcode_core::progress::ProgressState::Active);
+    assert_eq!(
+        plan.phases()
+            .iter()
+            .map(|phase| phase.phase.as_str())
+            .collect::<Vec<_>>(),
+        ["write the regression test", "survey the call sites"],
+        "the user's order and their new phase, on disk"
+    );
+    // Detail the user did not touch survives their edit: the phases they sent
+    // carried no `detail` for it, which core reads as "keep what you wrote".
+    assert_eq!(plan.phases()[1].detail, "read only");
+
+    let notes = notes_in(&session);
+    assert!(
+        notes.contains("The user edited the plan before approving"),
+        "the model must be told which plan won: {notes}"
+    );
+    assert!(
+        notes.contains("> read only") && notes.contains("do this second, after the test"),
+        "an anchored comment reaches the model with its passage: {notes}"
+    );
+}
+
+/// Keep planning: the comments and a diff go back, and the draft on disk stays
+/// the model's own. Declining is not a quiet way to rewrite someone's plan.
+#[tokio::test]
+async fn keeping_planning_sends_the_diff_and_leaves_the_draft_alone() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            submit_plan(
+                "Rewrite the resume path",
+                &[("survey the call sites", "read only")],
+            ),
+            text_done("understood"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+    });
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
+        .await;
+    session
+        .pending()
+        .answer(plan_answer(
+            &request["id"],
+            "no",
+            Some(serde_json::json!([
+                { "phase": "start with the test", "status": "pending" },
+            ])),
+            vec![("survey the call sites", "not a phase, do it while planning")],
+            false,
+        ))
+        .expect("keep planning is an answer");
+    turn.await.unwrap().unwrap();
+
+    let plan = session.plan().expect("the draft is still open");
+    assert_eq!(plan.state(), tcode_core::progress::ProgressState::Draft);
+    assert_eq!(
+        plan.phases()[0].phase,
+        "survey the call sites",
+        "a declined review must not rewrite the file"
+    );
+    let told = tool_results_in(&session);
+    assert!(told.contains("User declined this action"), "{told}");
+    assert!(told.contains("The user edited the plan:"), "{told}");
+    assert!(told.contains("+## [ ] 1. start with the test"), "{told}");
+    assert!(told.contains("> survey the call sites"), "{told}");
+}
+
+/// A plan edit that cannot be applied leaves the question standing. The turn is
+/// parked on this approval; consuming it because a phase title was blank would
+/// strand the conversation with no way back to it.
+#[tokio::test]
+async fn an_unreadable_plan_edit_leaves_the_review_answerable() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            submit_plan(
+                "Rewrite the resume path",
+                &[("survey the call sites", "read only")],
+            ),
+            text_done("starting"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+    });
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
+        .await;
+
+    let refused = session
+        .pending()
+        .answer(plan_answer(
+            &request["id"],
+            "yes",
+            Some(serde_json::json!([{ "phase": "  ", "status": "pending" }])),
+            Vec::new(),
+            false,
+        ))
+        .expect_err("a phase with no title is not a plan");
+    assert!(refused.contains("non-empty"), "{refused}");
+
+    session
+        .pending()
+        .answer(plan_answer(&request["id"], "yes", None, Vec::new(), false))
+        .expect("the review is still there to answer");
+    turn.await.unwrap().unwrap();
+    assert_eq!(
+        session.plan().unwrap().state(),
+        tcode_core::progress::ProgressState::Active
+    );
+}
+
+/// The plan surface reads the file, so an edit made behind the app's back — in
+/// an editor, by the user — is what it shows. Reading is not repairing: the
+/// model still finds out through its own next call.
+#[tokio::test]
+async fn the_plan_view_follows_the_file_and_a_hand_edit_writes_it() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            tool_use(
+                "call-plan",
+                "progress",
+                &serde_json::json!({
+                    "title": "Track my own work",
+                    "phases": [
+                        { "phase": "one", "status": "in_progress", "detail": "why one" },
+                        { "phase": "two", "status": "pending" },
+                    ]
+                })
+                .to_string(),
+            ),
+            text_done("tracking"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+    run_turn(agent, session.clone(), emit, say("do it"), plain())
+        .await
+        .unwrap();
+
+    let plan = session.plan().expect("the model opened a plan");
+    assert_eq!(
+        (plan.title.as_str(), plan.counts()),
+        ("Track my own work", (0, 2))
+    );
+    assert_eq!(
+        plan.phases()[0].detail,
+        "why one",
+        "detail reaches the panel"
+    );
+
+    // The user edits the file directly; the panel shows theirs.
+    let text = std::fs::read_to_string(plan.path())
+        .unwrap()
+        .replace("two", "two, renamed by hand");
+    std::fs::write(plan.path(), text).unwrap();
+    assert_eq!(
+        session.plan().unwrap().phases()[1].phase,
+        "two, renamed by hand"
+    );
+
+    // And an edit made in the panel lands on disk, phases validated on the way.
+    let written = session
+        .write_plan(&serde_json::json!([
+            { "phase": "one", "status": "completed" },
+            { "phase": "two, renamed by hand", "status": "in_progress" },
+        ]))
+        .expect("the plan is the user's to edit");
+    assert_eq!(written.counts(), (1, 2));
+    assert_eq!(
+        tcode_core::progress::Progress::load(written.path())
+            .unwrap()
+            .counts(),
+        (1, 2),
+        "the file, not just the copy in memory"
+    );
+    assert!(
+        session
+            .write_plan(&serde_json::json!([{ "phase": "x", "status": "pending",
+                "phases": [{ "phase": "y", "status": "pending",
+                    "phases": [{ "phase": "z", "status": "pending" }] }] }]))
+            .is_err(),
+        "webview input gets the same validation the model's does"
+    );
+}
+
+/// The handoff: an approved plan opens a second conversation on the same folder
+/// that has adopted the file, and its first turn is told to execute it. A draft
+/// is refused — the whole point is that this plan was approved.
+#[tokio::test]
+async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            submit_plan(
+                "Rewrite the resume path",
+                &[("survey the call sites", "read only")],
+            ),
+            text_done("starting"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+    let supervisor = Supervisor::new(agent.clone(), working_factory(cwd.path()), menus());
+    supervisor.open(session.clone());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+    });
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
+        .await;
+
+    // While the plan is still a draft, there is nothing to hand on.
+    let refused = match tcode_app::state::hand_off_plan(&supervisor, "s1") {
+        Err(reason) => reason,
+        Ok(_) => panic!("a draft must not be handed on"),
+    };
+    assert!(refused.contains("still a draft"), "{refused}");
+
+    session
+        .pending()
+        .answer(plan_answer(&request["id"], "yes", None, Vec::new(), true))
+        .expect("the review was answered");
+    turn.await.unwrap().unwrap();
+
+    let (fresh, instructions) =
+        tcode_app::state::hand_off_plan(&supervisor, "s1").expect("an approved plan travels");
+    assert_ne!(fresh.id, session.id);
+    assert_eq!(fresh.cwd, session.cwd, "the same folder, a clean context");
+    assert_eq!(instructions.len(), 1);
+    assert!(instructions[0].contains("Execute the approved plan"));
+    assert!(
+        instructions[0].contains("survey the call sites"),
+        "the plan travels in the text: that session has none of the conversation"
+    );
+    let adopted = fresh.plan().expect("the fresh session adopted the file");
+    assert_eq!(adopted.path(), session.plan().unwrap().path());
+}
+
+/// A pick from the webview has to reach the shared `ModelCell`, and the strip
+/// has to read that cell back.
+///
+/// This lives with the bridge tests because it *is* the boundary the desktop app
+/// adds: the frontend's `switch` closure builds the provider, and the only thing
+/// this crate contributes is handing the result to the cell every session reads
+/// through. Skipping that step type-checks, passes every other test, and shows
+/// up only as a chip that snaps back to its old value — which is how it shipped.
+#[test]
+fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
+    let cell = ModelCell::new(ActiveModel {
+        provider: MockProvider::new(Vec::new()),
+        max_tokens: 1024,
+        context_window: 200_000,
+        effort: None,
+    });
+
+    let mut def = tcode_core::config::ModelDef::bare("mock-1");
+    def.efforts = vec!["low".to_string(), "high".to_string()];
+    // Stands in for the real closure: what matters here is that whatever it
+    // returns becomes what the agent runs on.
+    let switch = Box::new(|_: &tcode_frontend::ModelOption, effort: Option<&str>| {
+        Ok(ActiveModel {
+            provider: MockProvider::new(Vec::new()),
+            max_tokens: 2048,
+            context_window: 400_000,
+            effort: effort.map(String::from),
+        })
+    });
+    let mut menus = tcode_app::picker::Pickers::unavailable(
+        PathBuf::from("/nonexistent/config.toml"),
+        "no provider is configured",
+    );
+    menus.models = tcode_frontend::ModelMenu {
+        options: vec![tcode_frontend::ModelOption {
+            profile: "mock".to_string(),
+            def,
+        }],
+        current: 0,
+        switch,
+    };
+
+    tcode_app::picker::choose_model(&mut menus, &cell, 0, Some("high")).expect("the pick applies");
+
+    assert_eq!(cell.snapshot().effort.as_deref(), Some("high"));
+    assert_eq!(
+        cell.snapshot().context_window,
+        400_000,
+        "the new model is live"
+    );
+
+    let state = tcode_app::picker::state_of(&menus, &cell, PermissionMode::Default, false);
+    assert_eq!(
+        state.effort.as_deref(),
+        Some("high"),
+        "the chip must show what is running, not the definition's default"
+    );
+
+    // Out-of-range indices come from the webview, so they are data: refused, and
+    // nothing about the live model moves.
+    assert!(tcode_app::picker::choose_model(&mut menus, &cell, 7, None).is_err());
+    assert_eq!(cell.snapshot().effort.as_deref(), Some("high"));
 }

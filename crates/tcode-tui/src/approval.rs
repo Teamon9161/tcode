@@ -12,7 +12,7 @@ use std::cell::{Cell, RefCell};
 
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use tcode_core::progress::{REVIEW_BODY_FIELD, REVIEW_PATH_FIELD};
+use tcode_core::progress::{PlanNote, REVIEW_BODY_FIELD, REVIEW_PATH_FIELD};
 use tcode_core::{Approval, ApprovalDecision, PermissionMode};
 
 use crate::editor::Editor;
@@ -195,16 +195,31 @@ impl PlanReview {
     }
 
     /// A unified diff from the original plan to the `$EDITOR` revision, for
-    /// sending back as feedback. `None` when the plan was not revised.
+    /// sending back as feedback. `None` when the plan was not revised, or was
+    /// revised into the same text.
     fn revision_diff(&self) -> Option<String> {
         let revised = self.revised.as_deref()?;
-        let diff = similar::TextDiff::from_lines(self.original().trim(), revised.trim());
-        Some(
-            diff.unified_diff()
-                .context_radius(3)
-                .header("plan", "revised")
-                .to_string(),
-        )
+        tcode_core::progress::plan_revision_diff(self.original(), revised)
+    }
+
+    /// Every anchored comment, in the shape core turns into the model's note. A
+    /// comment left without a dragged passage quotes its whole block: it is
+    /// about that block, and the model needs to know which one.
+    fn notes(&self) -> Vec<PlanNote> {
+        self.blocks
+            .iter()
+            .flat_map(|block| {
+                block.comments.iter().map(move |comment| PlanNote {
+                    quote: Some(
+                        comment
+                            .quote
+                            .clone()
+                            .unwrap_or_else(|| block.source.clone()),
+                    ),
+                    text: comment.text.clone(),
+                })
+            })
+            .collect()
     }
 }
 
@@ -1547,18 +1562,15 @@ impl Dialog {
         // Approval notes use the same append-only UserNote path as ordinary
         // approval annotations, so comments remain visible to the next turn and
         // after session replay.
-        let mut parts = Vec::new();
-        if let Some(revised) = revised {
-            parts.push(format!(
-                "The user edited the plan before approving. Use this revised plan as the source of truth for execution, not the earlier draft:\n\n{revised}"
-            ));
-        }
-        if let Some(feedback) = self.comments_feedback() {
-            parts.push(feedback);
-        }
+        let plan = self.plan.as_ref().expect("plan dialog");
+        let comment = tcode_core::progress::approved_plan_note(
+            revised.as_deref(),
+            &plan.notes(),
+            &plan.feedback.text(),
+        );
         let approval = Approval {
             decision,
-            comment: (!parts.is_empty()).then(|| parts.join("\n\n")),
+            comment,
             set_mode: None,
             approved_input,
             end_turn_after_execution: fresh_session,
@@ -1571,37 +1583,17 @@ impl Dialog {
     }
 
     /// The feedback the model receives on keep-planning: each anchored comment
-    /// as a `>`-quoted block plus the comment, then any free feedback. Anchoring
-    /// to the quoted source is what makes a TUI review approach the desktop
-    /// "comment on a passage" experience.
+    /// as a `>`-quoted block plus the comment, then any free feedback, with an
+    /// `$EDITOR` edit travelling as a diff so the model sees exactly what
+    /// changed. The assembly is core's ([`tcode_core::progress`]) because the
+    /// desktop review sends the same note, and the model must read one format.
     fn assemble_feedback(&self) -> Option<String> {
         let plan = self.plan.as_ref().expect("plan dialog");
-        let mut parts: Vec<String> = Vec::new();
-        // A `$EDITOR` edit sent back for more planning travels as a diff so the
-        // model sees exactly what changed.
-        if let Some(diff) = plan.revision_diff() {
-            parts.push(format!("The user edited the plan:\n\n{diff}"));
-        }
-        if let Some(comments) = self.comments_feedback() {
-            parts.push(comments);
-        }
-        (!parts.is_empty()).then(|| parts.join("\n\n"))
-    }
-
-    fn comments_feedback(&self) -> Option<String> {
-        let plan = self.plan.as_ref().expect("plan dialog");
-        let mut parts: Vec<String> = Vec::new();
-        for block in &plan.blocks {
-            for comment in &block.comments {
-                let quote = comment.quote.as_deref().unwrap_or(&block.source);
-                parts.push(format!("{}\n\n{}", quote_source(quote), comment.text));
-            }
-        }
-        let free = plan.feedback.text().trim().to_string();
-        if !free.is_empty() {
-            parts.push(free);
-        }
-        (!parts.is_empty()).then(|| parts.join("\n\n"))
+        tcode_core::progress::declined_plan_note(
+            plan.revision_diff().as_deref(),
+            &plan.notes(),
+            &plan.feedback.text(),
+        )
     }
 
     /// The wrapped plan body as display rows plus, for each block, the
@@ -2050,16 +2042,6 @@ fn option_columns(
         out.push(Line::from(spans));
     }
     (out, hitboxes)
-}
-
-/// Prefix every line of a block's source with `> ` so a comment quotes the
-/// exact passage it refers to.
-fn quote_source(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| format!("> {line}"))
-        .collect::<Vec<_>>()
-        .join("\n")
 }
 
 /// A single superscript digit for a comment index (1-based); falls back to a

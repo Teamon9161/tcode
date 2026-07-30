@@ -23,6 +23,8 @@ export function Composer({
   running,
   disabled,
   attachments,
+  planFirst,
+  onPlanFirst,
   onChange,
   onAttach,
   onDetach,
@@ -33,6 +35,9 @@ export function Composer({
   running: boolean;
   disabled: boolean;
   attachments: Pasted[];
+  /** Whether this message asks for a plan before anything is changed. */
+  planFirst: boolean;
+  onPlanFirst: (on: boolean) => void;
   onChange: (value: string) => void;
   onAttach: (items: Pasted[]) => void;
   onDetach: (id: string) => void;
@@ -125,7 +130,13 @@ export function Composer({
           ref={field}
           value={value}
           rows={1}
-          placeholder={running ? "running — Esc to stop" : "Ask for something in this folder"}
+          placeholder={
+            running
+              ? "running — Esc to stop"
+              : planFirst
+                ? "Describe what to plan"
+                : "Ask for something in this folder"
+          }
           disabled={disabled}
           onChange={(event) => onChange(event.target.value)}
           onPaste={(event) => {
@@ -177,8 +188,27 @@ export function Composer({
       </div>
 
       {/* Under the field, not above it and not in a settings screen: these are
-          properties of the message about to be sent. */}
-      <Chips />
+          properties of the message about to be sent — and so is this one.
+          Planning used to be a permission mode; it is a property of a request
+          now, which is exactly what this row holds. It clears when the message
+          is sent, like an attachment does, because it described that message. */}
+      {/* The one control on this row that is a switch rather than a menu, so it
+          is the one that has to look like it: an outline and a box that fills.
+          Bare like its neighbours, it read as a label announcing that planning
+          was already on — the opposite of its actual state. */}
+      <div className="composer-row-chips">
+        <button
+          type="button"
+          className={`chip is-toggle${planFirst ? " is-on" : ""}`}
+          aria-pressed={planFirst}
+          onClick={() => onPlanFirst(!planFirst)}
+          title="Investigate and write a plan for your approval before changing anything"
+        >
+          <span className="chip-tick" aria-hidden="true" />
+          plan first
+        </button>
+        <Chips />
+      </div>
     </form>
   );
 }

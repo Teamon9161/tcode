@@ -4,6 +4,8 @@ import type { ToolResult } from "./blocks";
 import { Diff } from "./components/Diff";
 import { isEditShape } from "./diff";
 import type { Inspect } from "./inspect";
+import { planBody } from "./plan";
+import { rich } from "./rich";
 import { basename } from "./show";
 import { ShownView } from "./Shown";
 
@@ -166,7 +168,18 @@ const VIEWS: Record<string, ToolView> = {
   bash: shell,
   grep: pattern,
   glob: pattern,
+  // A `progress` call routes to the plan surface, not here — except the one
+  // that submits a plan for approval, which is a document the conversation must
+  // still hold afterwards. `Transcript.tsx` makes that call; this draws it.
+  progress: {
+    body: (input) => <PlanDocument input={input} />,
+    summary: planSummary,
+    preferInputSummary: true,
+  },
+  // Retired names, so a resumed session recorded before the rename still reads.
   update_progress: { body: (input) => <Phases input={input} /> },
+  update_plan: { body: (input) => <Phases input={input} /> },
+  exit_plan: { body: (input) => <PlanDocument input={input} /> },
 };
 
 /** The fallback opens the call's complete output, which is the only thing every
@@ -290,12 +303,31 @@ export function transcriptGroupFor(name: string): ToolView["transcriptGroup"] {
 }
 
 /**
- * `update_progress` at the call site.
+ * The plan a `progress` call submitted, at the call site.
  *
- * Core routes this to a progress display rather than the transcript, and the
- * persistent panel that will hold it is not built yet. Until it is, the phases
- * render here: dropping the call because its final home does not exist would
- * lose the one thing it carries.
+ * The conversation keeps the document it was asked to approve: the strip above
+ * the composer shows where the work stands *now*, and that is a different fact
+ * from "this is what I proposed at this point in the conversation". Rendered
+ * through `rich` like any other model prose — it is model output, and the
+ * markdown grammar of the file is core's, so this reads the body core saved
+ * rather than reconstructing one.
+ */
+function PlanDocument({ input }: { input: unknown }) {
+  const body = planBody(input);
+  if (!body) return <Phases input={input} />;
+  return <div className="plan-document">{rich(body)}</div>;
+}
+
+function planSummary(input: unknown): string | null {
+  if (typeof input !== "object" || input === null) return null;
+  const title = (input as Record<string, unknown>).title;
+  return typeof title === "string" && title.trim() ? title : null;
+}
+
+/**
+ * A phase list at the call site, for a submitted plan whose body did not travel
+ * with the call — a live submission before the review copy is made, and the
+ * retired calls in older sessions.
  */
 function Phases({ input }: { input: unknown }) {
   const phases = readPhases(input);

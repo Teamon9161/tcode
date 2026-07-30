@@ -85,6 +85,33 @@ pub enum BatchPolicy {
     SequentialBatch,
 }
 
+/// Which surface tells a tool call's story.
+///
+/// This is the tool's own decision, not a frontend's: `Progress` means the call
+/// feeds whatever plan surface a frontend has (the TUI's pane, the desktop's
+/// strip) instead of the transcript, and `Silent` means another mechanism
+/// already told it — an `ask_user` question is baked by its own approval, so a
+/// second header for the call is noise. It lives in core because all three
+/// frontends need the same answer and the alternative is a list of tool names
+/// in each of them, going stale one frontend at a time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CallRoute {
+    Transcript,
+    Progress,
+    Silent,
+}
+
+impl CallRoute {
+    pub fn label(self) -> &'static str {
+        match self {
+            CallRoute::Transcript => "transcript",
+            CallRoute::Progress => "progress",
+            CallRoute::Silent => "silent",
+        }
+    }
+}
+
 /// What a specific invocation needs in terms of user consent.
 #[derive(Debug, Clone)]
 pub enum PermissionRequest {
@@ -323,7 +350,12 @@ pub struct ToolCtx {
     /// session, `/plan` and the frontends read it through this same cell. A
     /// sub-agent gets a fresh context and no `progress` tool, so delegation
     /// cannot touch the parent's plan.
-    pub progress: Mutex<Option<crate::progress::Progress>>,
+    ///
+    /// Shared rather than owned so a frontend can hold on to it: a `Session` is
+    /// moved into whoever is running its turn, and the moments a plan surface
+    /// most needs to read this — a phase flipping, a draft reaching review — all
+    /// happen while it is gone. See [`ToolCtx::progress_cell`].
+    pub progress: Arc<Mutex<Option<crate::progress::Progress>>>,
     /// Session-stable instruction discovery policy reused by `/cd` and
     /// delegated agents.
     pub instruction_discovery: crate::memory::InstructionDiscovery,
@@ -437,7 +469,7 @@ impl ToolCtx {
             blobs: Mutex::new(BlobStore::new(tool_output.clone(), output_budget_tokens)),
             background: Mutex::new(BackgroundTasks::new(tool_output)),
             memory: Mutex::new(memory),
-            progress: Mutex::new(None),
+            progress: Arc::new(Mutex::new(None)),
             instruction_discovery,
             model: None,
             task_traces: Arc::new(Mutex::new(TaskTraces::default())),
@@ -551,6 +583,17 @@ impl ToolCtx {
             .expect("delegated permission lock") = None;
     }
 
+    /// A handle on the plan cell that outlives borrowing the session.
+    ///
+    /// A frontend takes this once, when it opens the conversation, and can then
+    /// read the current plan at any instant — including mid-turn, when the
+    /// `Session` itself has been moved into the task running it. Reading a plan
+    /// is never a reason to interrupt work, so this is deliberately a clone of
+    /// the cell and not a borrow of the session.
+    pub fn progress_cell(&self) -> Arc<Mutex<Option<crate::progress::Progress>>> {
+        self.progress.clone()
+    }
+
     /// Bind (or unbind) where task traces persist. Called whenever the
     /// context is bound to a persistent session (startup, resume, import).
     pub fn bind_task_trace_root(&self, root: Option<PathBuf>) {
@@ -601,6 +644,14 @@ pub trait Tool: Send + Sync {
     /// instead of forcing the agent loop to match on names.
     fn batch_policy_for(&self, _input: &Value) -> BatchPolicy {
         self.batch_policy()
+    }
+    /// Which surface this invocation belongs to. Per-invocation, because one
+    /// tool can do both: a `progress` phase flip belongs to the plan surface,
+    /// while a plan submitted for review is a document the user reads in the
+    /// conversation. `Value::Null` is a legal argument — a call whose input is
+    /// no longer at hand gets the tool's default answer.
+    fn route(&self, _input: &Value) -> CallRoute {
+        CallRoute::Transcript
     }
     /// Human-facing name for this tool in the UI, e.g. `shell` → "Run".
     /// Defaults to the title-cased tool name; override for a clearer verb.

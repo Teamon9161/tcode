@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{CallRoute, PermissionRequest, Tool, ToolCtx, ToolOutput};
 
 pub struct AskUserTool;
 
@@ -56,6 +56,11 @@ impl Tool for AskUserTool {
             descriptor: "ask_user".into(),
             summary: summarize_questions(input),
         }
+    }
+    /// The question and the answer are baked by the surface that asked them; a
+    /// second header for the call itself would report the same event twice.
+    fn route(&self, _input: &Value) -> CallRoute {
+        CallRoute::Silent
     }
     async fn run(&self, _: Value, _: &ToolCtx, _: &CancellationToken) -> ToolOutput {
         ToolOutput::ok("user answered; read the following harness note before continuing")

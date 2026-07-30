@@ -137,7 +137,12 @@ impl PhaseStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// `Serialize` is for frontends, not for the model: a desktop review surface
+/// edits this structure directly and needs it on the wire. The way back in is
+/// [`phases_from_json`], never `Deserialize` — a breakdown arriving from a
+/// frontend is data like any other and goes through the same validation the
+/// model's own input does.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 pub struct Phase {
     pub phase: String,
     pub status: PhaseStatus,
@@ -730,6 +735,161 @@ pub const REVIEW_PATH_FIELD: &str = "_progress_path";
 /// intents never collide.
 pub fn is_submission(input: &Value) -> bool {
     input["state"].as_str() == Some(ProgressState::Active.label())
+}
+
+/// The plan body this call carries for a human to read, if it carries one.
+///
+/// The review copy's saved body wins over the call's own phases because it is
+/// the text the reviewer actually saw — including a rewrite they made. A
+/// retired `exit_plan` call in a resumed session carries the same field, which
+/// is why this is checked before the submission test rather than after it.
+pub fn plan_document(input: &Value) -> Option<String> {
+    if let Some(body) = input[REVIEW_BODY_FIELD].as_str() {
+        if !body.trim().is_empty() {
+            return Some(body.to_string());
+        }
+    }
+    if !is_submission(input) {
+        return None;
+    }
+    let phases = phases_from_json(&input["phases"]).ok()?;
+    Some(render_phases(&phases)).filter(|body| !body.trim().is_empty())
+}
+
+/// Whether this call is a plan for a human to read rather than a phase flip.
+/// The two are the same tool, and only the input says which happened, so every
+/// surface that has to tell them apart asks here.
+pub fn is_plan_document(input: &Value) -> bool {
+    plan_document(input).is_some()
+}
+
+/// Turn a reviewer's edited breakdown into the plan body to execute, keeping the
+/// detail they left alone.
+///
+/// A review surface that edits phases as structure — the desktop's does — sends
+/// back what the reviewer changed, and a phase they did not open carries no
+/// `detail`. Rendering that directly would erase the reasoning behind every
+/// phase they never looked at, which is the single most valuable text in the
+/// file. So the same rule the tool gives the model applies to the human:
+/// omitting detail keeps what is stored, and only text they actually wrote
+/// replaces it.
+///
+/// `body` is the plan as it stands (the review copy's own body), because that,
+/// not the ledger, is what the stored detail is being carried from.
+pub fn revise_plan_body(body: &str, edited: &[Phase]) -> String {
+    let stored: HashMap<String, String> = walk_phases(&parse_phases(body))
+        .into_iter()
+        .filter(|phase| !phase.detail.is_empty())
+        .map(|phase| (phase.phase.clone(), phase.detail.clone()))
+        .fold(HashMap::new(), |mut out, (title, detail)| {
+            out.entry(title).or_insert(detail);
+            out
+        });
+    let mut edited = edited.to_vec();
+    carry_detail(&mut edited, &stored);
+    render_phases(&edited)
+}
+
+/// One reviewer comment, anchored to the passage it is about.
+///
+/// The quote travels with the comment because it is the anchor the *model*
+/// reads: a character offset into a plan the model is about to rewrite tells it
+/// nothing, while the passage commented on stays unambiguous even after the
+/// text around it moves. Both review surfaces produce exactly this — the TUI
+/// from block navigation or a dragged passage, the desktop from a text
+/// selection.
+#[derive(Debug, Clone)]
+pub struct PlanNote {
+    /// The passage this is about. `None` comments on the plan as a whole.
+    pub quote: Option<String>,
+    pub text: String,
+}
+
+/// Reviewer comments as the model reads them: each quoted passage followed by
+/// what the human said about it, then any free-form remark.
+///
+/// This lives here, and not in either frontend, because two of them produce it.
+/// The model has learned this format from whichever surface it saw first; the
+/// other one arriving with a different shape would be two definitions of one
+/// contract. Empty comments are dropped rather than sent as blank quotes.
+pub fn plan_notes(notes: &[PlanNote], free: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    for note in notes {
+        let text = note.text.trim();
+        if text.is_empty() {
+            continue;
+        }
+        match note
+            .quote
+            .as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+        {
+            Some(quote) => parts.push(format!("{}\n\n{text}", quote_lines(quote))),
+            None => parts.push(text.to_string()),
+        }
+    }
+    let free = free.trim();
+    if !free.is_empty() {
+        parts.push(free.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The approval note for a plan the reviewer accepted. A rewrite leads, because
+/// the model is about to execute a plan it did not write and this note is the
+/// only place it learns which text won; the comments follow.
+pub fn approved_plan_note(revised: Option<&str>, notes: &[PlanNote], free: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(revised) = revised.map(str::trim).filter(|body| !body.is_empty()) {
+        parts.push(format!(
+            "The user edited the plan before approving. Use this revised plan as the source of truth for execution, not the earlier draft:\n\n{revised}"
+        ));
+    }
+    if let Some(notes) = plan_notes(notes, free) {
+        parts.push(notes);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// The note a declined ("keep planning") review sends back. An edit travels as
+/// a diff rather than a whole body: the plan on disk is still the model's own
+/// draft, so what the model needs is what the human would change about it.
+pub fn declined_plan_note(diff: Option<&str>, notes: &[PlanNote], free: &str) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(diff) = diff.map(str::trim).filter(|diff| !diff.is_empty()) {
+        parts.push(format!("The user edited the plan:\n\n{diff}"));
+    }
+    if let Some(notes) = plan_notes(notes, free) {
+        parts.push(notes);
+    }
+    (!parts.is_empty()).then(|| parts.join("\n\n"))
+}
+
+/// A unified diff from the plan the model submitted to the one the reviewer
+/// wrote. `None` when nothing meaningful changed — an empty diff is not
+/// feedback, and sending one would tell the model to look for a change it
+/// cannot find.
+pub fn plan_revision_diff(original: &str, revised: &str) -> Option<String> {
+    let (original, revised) = (original.trim(), revised.trim());
+    if original == revised {
+        return None;
+    }
+    let diff = similar::TextDiff::from_lines(original, revised);
+    Some(
+        diff.unified_diff()
+            .context_radius(3)
+            .header("plan", "revised")
+            .to_string(),
+    )
+}
+
+fn quote_lines(source: &str) -> String {
+    source
+        .lines()
+        .map(|line| format!("> {line}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Whether this call only asks to see the file. A call that carries neither a
@@ -1952,5 +2112,127 @@ mod tests {
         assert!(done.exists(), "archiving never deletes");
         let a = entries.iter().find(|e| e.file_name() == "a.md").unwrap();
         assert_eq!((a.done, a.total), (1, 2));
+    }
+
+    /// The question every review surface asks before deciding where a call
+    /// belongs. A phase flip is not a document; a submission and a review copy
+    /// both are.
+    #[test]
+    fn a_plan_document_is_a_submission_or_a_saved_review_body() {
+        let update = json!({ "phases": [{ "phase": "one", "status": "in_progress" }] });
+        assert!(!is_plan_document(&update));
+
+        let submission = json!({
+            "state": "active",
+            "phases": [{ "phase": "one", "status": "pending" }]
+        });
+        let document = plan_document(&submission).expect("a submission renders its own phases");
+        assert!(document.contains("[ ] 1. one"), "{document}");
+
+        // The saved body wins: it is the text the reviewer actually saw, which
+        // may be their own rewrite rather than the phases the model sent.
+        let mut reviewed = submission.clone();
+        reviewed[REVIEW_BODY_FIELD] = Value::String("\n## [ ] 1. theirs\n".into());
+        assert_eq!(
+            plan_document(&reviewed).unwrap().trim(),
+            "## [ ] 1. theirs",
+            "a rewritten body is the document"
+        );
+        // A submission with nothing in it is not a document to read.
+        assert!(!is_plan_document(&json!({ "state": "active" })));
+    }
+
+    /// The reviewer's counterpart to `resending_titles_alone_keeps_the_stored_
+    /// detail`: a structural review edit must not cost the file the reasoning
+    /// behind phases the reviewer never opened.
+    #[test]
+    fn a_reviewed_edit_keeps_detail_the_reviewer_left_alone() {
+        let body = "\n## [ ] 1. one\nwhy one\n\n## [ ] 2. two\nwhy two\n";
+        let revised = revise_plan_body(
+            body,
+            &[
+                Phase::new("two", PhaseStatus::Pending),
+                Phase {
+                    phase: "one".into(),
+                    status: PhaseStatus::Pending,
+                    detail: "rewritten by the reviewer".into(),
+                    phases: Vec::new(),
+                },
+            ],
+        );
+        assert!(
+            revised.contains("why two"),
+            "untouched prose survives: {revised}"
+        );
+        assert!(revised.contains("rewritten by the reviewer"), "{revised}");
+        assert!(
+            !revised.contains("why one"),
+            "and theirs replaces it: {revised}"
+        );
+        // Their order is the plan's order.
+        assert!(
+            revised.find("2. one").unwrap() > revised.find("1. two").unwrap(),
+            "{revised}"
+        );
+    }
+
+    #[test]
+    fn notes_quote_their_passage_and_free_feedback_comes_last() {
+        let notes = vec![
+            PlanNote {
+                quote: Some("risk: rewind crosses\nthe Summary boundary".into()),
+                text: "write the regression test first".into(),
+            },
+            PlanNote {
+                quote: None,
+                text: "no anchor, still feedback".into(),
+            },
+            // An empty comment is not feedback; sending it would be a bare quote.
+            PlanNote {
+                quote: Some("something".into()),
+                text: "   ".into(),
+            },
+        ];
+        let note = plan_notes(&notes, "  and rename the phase  ").unwrap();
+        assert_eq!(
+            note,
+            "> risk: rewind crosses\n> the Summary boundary\n\nwrite the regression test first\n\nno anchor, still feedback\n\nand rename the phase"
+        );
+        assert!(
+            plan_notes(&[], "").is_none(),
+            "nothing to say sends nothing"
+        );
+    }
+
+    #[test]
+    fn an_approved_rewrite_leads_the_note_and_a_declined_one_travels_as_a_diff() {
+        let notes = vec![PlanNote {
+            quote: Some("one".into()),
+            text: "start here".into(),
+        }];
+        let approved = approved_plan_note(Some("## [ ] 1. theirs"), &notes, "").unwrap();
+        assert!(
+            approved.starts_with("The user edited the plan before approving."),
+            "the model is about to execute a plan it did not write: {approved}"
+        );
+        assert!(approved.contains("## [ ] 1. theirs"));
+        assert!(approved.ends_with("start here"), "{approved}");
+
+        let diff = plan_revision_diff("## [ ] 1. mine\n", "## [ ] 1. theirs\n").unwrap();
+        let declined = declined_plan_note(Some(&diff), &notes, "").unwrap();
+        assert!(
+            declined.starts_with("The user edited the plan:"),
+            "{declined}"
+        );
+        assert!(declined.contains("-## [ ] 1. mine"), "{declined}");
+        assert!(declined.contains("+## [ ] 1. theirs"), "{declined}");
+
+        // An unedited plan says nothing about edits, in either direction.
+        assert!(plan_revision_diff("same\n", "  same  ").is_none());
+        assert_eq!(
+            approved_plan_note(None, &notes, "").unwrap(),
+            "> one\n\nstart here"
+        );
+        assert!(declined_plan_note(None, &[], "  ").is_none());
     }
 }

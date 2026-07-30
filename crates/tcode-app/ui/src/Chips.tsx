@@ -2,6 +2,8 @@ import { useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { useSession } from "./session";
+import { ModelPanel } from "./ModelPanel";
+import type { PickerState } from "./picker";
 
 /**
  * The strip under the composer: what this conversation is allowed to do, and
@@ -13,24 +15,15 @@ import { useSession } from "./session";
  * from the moment the question is asked — which is how a bypass-permissions
  * session gets left on by accident.
  *
- * Everything here is a chip: a label you can read without clicking, that opens
- * a list when you do. No icons standing in for words, no toggle whose state you
- * have to remember the convention for. The permission chip is the one that
- * carries colour, and only when it is not the careful default — chroma is
- * reserved for "this is not what you'd assume".
+ * Two controls, and they are deliberately different shapes. Permission mode is a
+ * short list of named answers, so it is a menu. Everything about the model —
+ * which one, its effort, the saved presets, what each sub-agent runs on — is one
+ * panel (`ModelPanel.tsx`), because those are one decision with four dials and
+ * not four decisions.
+ *
+ * The mode chip is the one that carries colour, and only when it is not the
+ * careful default: chroma is reserved for "this is not what you'd assume".
  */
-
-/** Mirrors `PickerState` in `src/picker.rs`. */
-type PickerState = {
-  models: { profile: string; label: string; efforts: string[] }[];
-  model: number;
-  effort: string | null;
-  presets: { key: string; label: string }[];
-  preset: number | null;
-  modes: { key: string; label: string; detail: string }[];
-  mode: string;
-  mode_staged: boolean;
-};
 
 export function Chips() {
   const session = useSession();
@@ -51,10 +44,6 @@ export function Chips() {
   if (failure) return <p className="chips-note">{failure}</p>;
   if (!state) return <div className="chips" />;
 
-  const model = state.models[state.model];
-  const mode = state.modes.find((one) => one.key === state.mode);
-  const efforts = model?.efforts ?? [];
-
   const act = (run: Promise<unknown>) =>
     run.then(refresh).catch((error) => setFailure(String(error)));
 
@@ -62,7 +51,7 @@ export function Chips() {
     <div className="chips">
       <Menu
         className={`chip is-mode is-${state.mode}`}
-        label={`${state.mode_staged ? "→ " : ""}${mode?.label ?? state.mode}`}
+        label={`${state.mode_staged ? "→ " : ""}${state.mode}`}
         title="What this conversation may do without asking"
       >
         {(close) =>
@@ -76,98 +65,15 @@ export function Chips() {
                 act(invoke("choose_mode", { session, mode: one.key }));
               }}
             >
-              {one.label}
+              {one.key}
             </MenuItem>
           ))
         }
       </Menu>
 
-      {state.presets.length > 0 && (
-        <Menu
-          className="chip"
-          label={
-            state.preset !== null ? state.presets[state.preset].label : "no preset"
-          }
-          title="A saved line-up: main model plus every role"
-        >
-          {(close) =>
-            state.presets.map((one, at) => (
-              <MenuItem
-                key={one.key}
-                current={at === state.preset}
-                onPick={() => {
-                  close();
-                  act(invoke("choose_preset", { key: one.key }));
-                }}
-              >
-                {one.label}
-              </MenuItem>
-            ))
-          }
-        </Menu>
-      )}
-
       <span className="chips-gap" />
 
-      <Menu
-        className="chip is-quiet"
-        label={model?.label ?? "no model"}
-        title="The model this conversation runs on"
-        align="right"
-      >
-        {(close) =>
-          state.models.length === 0 ? (
-            <MenuItem current={false} onPick={close}>
-              no usable provider is configured
-            </MenuItem>
-          ) : (
-            state.models.map((one, at) => (
-              <MenuItem
-                key={`${one.profile}/${one.label}`}
-                current={at === state.model}
-                detail={one.profile}
-                onPick={() => {
-                  close();
-                  act(invoke("choose_model", { index: at, effort: null }));
-                }}
-              >
-                {one.label}
-              </MenuItem>
-            ))
-          )
-        }
-      </Menu>
-
-      {/* Absent, not disabled, when the model has no effort dial: a control
-          that cannot do anything is worse than no control. */}
-      {efforts.length > 0 && (
-        <Menu
-          className="chip is-quiet"
-          label={state.effort ?? "auto"}
-          title="Reasoning effort"
-          align="right"
-        >
-          {(close) =>
-            ["auto", ...efforts].map((one) => (
-              <MenuItem
-                key={one}
-                current={one === (state.effort ?? "auto")}
-                onPick={() => {
-                  close();
-                  act(
-                    invoke("choose_model", {
-                      index: state.model,
-                      effort: one === "auto" ? null : one,
-                    }),
-                  );
-                }}
-              >
-                {one}
-              </MenuItem>
-            ))
-          }
-        </Menu>
-      )}
+      <ModelPanel state={state} refresh={refresh} />
     </div>
   );
 }
@@ -185,13 +91,11 @@ function Menu({
   className,
   label,
   title,
-  align = "left",
   children,
 }: {
   className: string;
   label: string;
   title: string;
-  align?: "left" | "right";
   children: (close: () => void) => ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -228,7 +132,7 @@ function Menu({
         {label}
       </button>
       {open && (
-        <div className={`chip-menu is-${align}`} role="menu">
+        <div className="chip-menu" role="menu">
           {children(() => setOpen(false))}
         </div>
       )}

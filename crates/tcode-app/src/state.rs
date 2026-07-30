@@ -15,6 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio_util::sync::CancellationToken;
 
+use tcode_core::progress::{Progress, ProgressState};
 use tcode_core::{Agent, AgentError, ContentBlock, Session};
 
 use crate::boot::SessionFactory;
@@ -26,6 +27,11 @@ pub struct SessionHandle {
     pub cwd: PathBuf,
     /// `None` while a turn is running — see the module comment.
     session: Mutex<Option<Session>>,
+    /// The session's plan cell, held separately *because* of that `Option`: a
+    /// phase flips and a draft reaches review while the turn owns the session,
+    /// which is exactly when the plan surface has something new to show. Reading
+    /// the plan is not a reason to wait for a turn to end.
+    progress: Arc<Mutex<Option<Progress>>>,
     cancel: Mutex<CancellationToken>,
     pending: Pending,
     /// A permission mode chosen while a turn held the session, applied when it
@@ -50,6 +56,7 @@ impl SessionHandle {
         Self {
             id,
             cwd,
+            progress: session.tool_ctx.progress_cell(),
             session: Mutex::new(Some(session)),
             cancel: Mutex::new(CancellationToken::new()),
             pending: Pending::default(),
@@ -121,6 +128,69 @@ impl SessionHandle {
             .map(|session| session.tool_ctx.scratch_dir.clone())
     }
 
+    /// This conversation's plan as it is right now, or `None` when it has none.
+    ///
+    /// Read from disk, not from the cell, whenever the file is still there: the
+    /// file is the authority on a plan (the user may have edited it by hand
+    /// since the last tool call, and core's own contract says their version
+    /// wins), while the cell is what this session last wrote or read. Falling
+    /// back to the cell covers the moment between a draft being created and
+    /// saved, and a file the user deleted underneath us.
+    ///
+    /// Reading never repairs the mismatch: the session's copy keeps the hash it
+    /// wrote, so the next `progress` call still reports the conflict and hands
+    /// the user's text to the model. Showing their edit is not the same as
+    /// telling the model about it, and this side must not do the second.
+    pub fn plan(&self) -> Option<Progress> {
+        let held = self.progress.lock().unwrap().clone()?;
+        Some(Progress::load(held.path()).unwrap_or(held))
+    }
+
+    /// Apply a breakdown the user edited by hand. Returns the plan as saved.
+    ///
+    /// The `phases` come from the webview, so they go through the same
+    /// validation the model's own input does — nesting cap included. The write
+    /// deliberately goes through a freshly loaded copy rather than the session's:
+    /// leaving the session's hash alone is what makes the next `progress` call
+    /// notice the file changed and hand the user's version to the model, which
+    /// is the whole self-healing contract for a hand-edited plan.
+    pub fn write_plan(&self, phases: &serde_json::Value) -> Result<Progress, String> {
+        let phases = tcode_core::progress::phases_from_json(phases)?;
+        let held = self
+            .progress
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or("no plan is open in this conversation")?;
+        let mut plan = Progress::load(held.path()).unwrap_or(held);
+        if plan.state() == ProgressState::Done {
+            return Err("this plan is finished; nothing left to edit".into());
+        }
+        // Same bargain as the review panel: a phase that came back without
+        // `detail` keeps the prose already in the file rather than losing it.
+        let body = tcode_core::progress::revise_plan_body(&plan.body(), &phases);
+        plan.set_body(&body);
+        plan.save()?;
+        Ok(plan)
+    }
+
+    /// Take over a plan file, for a session opened to execute one. Re-reads the
+    /// file rather than being handed a parsed plan: the approved bytes on disk
+    /// are the artifact, and `adopt_progress` also refuses a finished one.
+    pub fn adopt_plan(&self, path: &Path) -> Result<String, String> {
+        let mut session = self.session.lock().unwrap();
+        let session = session
+            .as_mut()
+            .ok_or("this conversation is busy; its plan cannot be adopted right now")?;
+        let title = session.adopt_progress(path)?;
+        // A fresh execution starts from the ordinary manual-approval default:
+        // the planning session's mode was a choice about planning, and it does
+        // not silently carry across a session boundary. The TUI's handoff makes
+        // the same choice.
+        session.apply_approved_mode(tcode_core::PermissionMode::Default);
+        Ok(title)
+    }
+
     /// Stop the running turn, if any. Also fails any open approval closed:
     /// an interrupted turn must not be authorized by an answer that arrives
     /// afterwards.
@@ -143,6 +213,39 @@ impl SessionHandle {
     }
 }
 
+/// Open a second conversation on the same folder to execute `session`'s
+/// approved plan, and return it with the instruction its first turn carries.
+///
+/// Separate from the command that calls it because it is the whole decision:
+/// only an approved plan may be handed on, the new session adopts the file
+/// rather than a copy of its text, and the instruction comes from core. The
+/// command is left with a spawn and an `AppHandle` (AGENTS.md rule 2).
+pub fn hand_off_plan(
+    supervisor: &Supervisor,
+    session: &str,
+) -> Result<(Arc<SessionHandle>, Vec<String>), String> {
+    let origin = supervisor
+        .get(session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let plan = origin.plan().ok_or("this conversation has no plan")?;
+    // The frontend calls this after the planning turn *ended*, by which time the
+    // `progress` tool has marked the approved plan active. A draft here means
+    // something else happened — a declined review, a failed write — and adopting
+    // it would hand the new session a plan nobody approved.
+    if plan.state() != ProgressState::Active {
+        return Err(format!(
+            "this plan is still a {}; only an approved plan can be handed to another session",
+            plan.state().label()
+        ));
+    }
+    let handle = supervisor
+        .open_folder(&origin.cwd, None)
+        .map_err(|error| format!("cannot open a session for the approved plan: {error}"))?;
+    handle.adopt_plan(plan.path())?;
+    let instruction = tcode_core::commands::plan::execution_instruction(&plan.body());
+    Ok((handle, vec![instruction]))
+}
+
 /// Holds the agent, every open session, and the means to open more.
 pub struct Supervisor {
     agent: Arc<Agent>,
@@ -159,11 +262,7 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(
-        agent: Arc<Agent>,
-        factory: SessionFactory,
-        menus: crate::picker::Menus,
-    ) -> Self {
+    pub fn new(agent: Arc<Agent>, factory: SessionFactory, menus: crate::picker::Menus) -> Self {
         Self {
             agent,
             factory,
@@ -237,11 +336,17 @@ impl Supervisor {
 /// Owns the `Session` for the duration and hands it back however the turn ends
 /// — including on error, since the ledger is consistent either way and a
 /// session that vanished on one failed request would be worse than the failure.
+/// `instructions` is harness-authored model context, not anything the user
+/// wrote: it stays out of the transcript, replay and export. Every string in it
+/// comes from core (planning, plan execution) — the webview asks for a *kind* of
+/// turn and never supplies the text, or it could impersonate the harness to the
+/// model.
 pub async fn run_turn(
     agent: Arc<Agent>,
     handle: Arc<SessionHandle>,
     emit: Arc<dyn Emit>,
     input: Vec<ContentBlock>,
+    instructions: Vec<String>,
 ) -> Result<(), TurnError> {
     let Some(mut session) = handle.take() else {
         return Err(TurnError::Busy(handle.id.clone()));
@@ -260,9 +365,18 @@ pub async fn run_turn(
     // frontend shows nothing, these two lines are what distinguish "never
     // started" from "started and produced no events".
     eprintln!("tcode-app: turn started on session {}", handle.id);
-    let result = agent
-        .user_turn(&mut session, input, &tx, &approver, cancel)
-        .await;
+    let result = match instructions.is_empty() {
+        true => {
+            agent
+                .user_turn(&mut session, input, &tx, &approver, cancel)
+                .await
+        }
+        false => {
+            agent
+                .instruction_turn(&mut session, instructions, input, &tx, &approver, cancel)
+                .await
+        }
+    };
     match &result {
         Ok(()) => eprintln!("tcode-app: turn finished on session {}", handle.id),
         Err(error) => eprintln!("tcode-app: turn failed on session {}: {error}", handle.id),

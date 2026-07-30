@@ -218,6 +218,52 @@ One shape per job, used everywhere:
 - **Scrollbars** — the platform's own, thin, and invisible until the pointer is
   over the region that scrolls. A permanent track down a pane's edge reads as a
   divider nobody drew.
+- **Progress strip** — one line above the composer, on the same sheet and the
+  same `--measure` axis, saying where a multi-phase task stands: the plan's name,
+  the phase it is on, `3/7`, and a 1px completed-fraction meter along its bottom
+  edge. Collapsed by default — the phase you are on is the whole answer most of
+  the time — and expanding it lists the phases, with prose only under the one
+  running. Absent entirely when there is no plan; an empty strip over every
+  composer is furniture. The meter is the only place a bar carries chroma, and it
+  earns it the same way a status dot does: it is state, and only while a turn is
+  actually running.
+- **Anchored panel** — the model panel, and the shape to reuse for any control
+  that carries several dials at once rather than one list of answers. Three bands
+  inside one popover: a chrome band of view switches, the content surface holding
+  a scrolling list of rows, and a chrome band of pinned dials at the bottom. The
+  tone step between chrome and content is the only separator — no rules — which
+  is the same boundary the window draws against a pane, so the scrolling region
+  needs no border to announce itself.
+
+  Two things about it are load-bearing rather than stylistic. **What is used most
+  is nearest the pointer**: the panel opens upward from its chip, so its bottom
+  edge is where the hand already is, and that is where the dials live while the
+  long list scrolls above them. And **a panel does not close on a pick** — a menu
+  answers one question and dismisses itself, but a surface holding four kinds of
+  setting cannot close after one of them and stay predictable; the pick is
+  confirmed on the spot by the mark moving instead. It is portalled to the body
+  and positioned from its trigger's measured box: a fixed popover inside a pane
+  is clipped by it, and a field inside the composer's form submits the message on
+  Enter.
+
+  Where a row's value is an identifier — a model id, a profile, a role's pin —
+  it is set in the mono face, for the same reason a path in the transcript is.
+  Grouping is a heading (the profile) rather than a repeated line under every
+  row.
+- **Editable document** — the plan review's field vocabulary, and the one place
+  in the app where text is edited in place. A title or a paragraph is a
+  transparent `<textarea>` that grows with its content: `--sunken` on hover, a
+  `--focus-ring` border and `--bg` on focus, and no border at rest, so the plan
+  reads as a plan rather than as a form. Row controls (reorder, remove, add)
+  appear on hover or focus-within — four icons beside every row would compete
+  with the text they act on. Never `contenteditable`: model text goes in these
+  fields, and a textarea has no path from that to markup (see rule 10).
+- **Anchored comment** — a quoted passage and a note, drawn under the field it is
+  about, with the quote standing in for a highlight. The highlight is deliberately
+  not drawn: it would have to be an overlay mirroring a textarea, and an anchor
+  tied to character offsets stops meaning anything the moment the reviewer edits
+  that paragraph — which is what they are there to do. The quote is also exactly
+  what the model receives, so what is on screen is what is sent.
 
 ## Keyboard
 

@@ -71,23 +71,15 @@ fn folder_name(cwd: &Path) -> String {
 /// The webview owns *presentation*; this owns *routing*, so `Transcript.tsx`
 /// never grows a chain of `if (name === …)`.
 ///
-/// Only `quiet_output` is genuinely derived: it comes from the live
-/// `Tool::batch_policy()`, exactly as `RenderRegistry::from_tools` does, so it
-/// cannot drift from core's parallel-read-only set.
+/// `route` and `quiet_output` are both derived from the live tools —
+/// `Tool::route` and `Tool::batch_policy` — exactly as the TUI's
+/// `RenderRegistry` derives them, so neither can drift from core. `route` is the
+/// tool's *default* answer (asked with a null input); the one tool whose route
+/// depends on the call is `progress`, and the frontend refines that at the call
+/// site (see `plan.ts::isPlanSubmission`).
 ///
-/// `route` and `hide_success_result` are **not** derivable today, because
-/// `CallRoute` lives in `tcode-tui` rather than in core — and this crate must
-/// not depend on the TUI. They are therefore a name list, kept here in one
-/// place rather than duplicated in TypeScript. That is a real drift risk: a new
-/// progress-style or silent tool will render as an ordinary call until this
-/// list learns about it.
-///
-/// The fix is to promote `CallRoute` to a `Tool` trait method in core (a
-/// default of `Transcript`, `Progress` on `ProgressTool`, `Silent` on
-/// `AskUserTool`) and have both the TUI registry and this function read it.
-/// That is the shape CLAUDE.md asks for — a capability expressed by a trait
-/// method instead of a match on names — and it is deliberately left out of this
-/// change because it touches core, tools and the TUI together.
+/// `hide_success_result` stays a name list: it is a presentation judgement about
+/// four tools whose body is a diff, not a capability core has any opinion about.
 #[derive(Serialize)]
 pub struct ToolViewMeta {
     pub name: String,
@@ -96,9 +88,6 @@ pub struct ToolViewMeta {
     pub hide_success_result: bool,
 }
 
-/// Tools whose story is told somewhere other than the transcript.
-const PROGRESS_TOOLS: &[&str] = &["progress", "update_progress"];
-const SILENT_TOOLS: &[&str] = &["ask_user"];
 /// Tools whose call body already showed the change, so a success line under it
 /// only repeats what the diff said.
 const BODY_IS_THE_RESULT: &[&str] = &["edit", "write", "multi_edit", "notebook_edit"];
@@ -115,13 +104,7 @@ pub fn tool_view_metas(tools: &[Arc<dyn tcode_core::Tool>]) -> Vec<ToolViewMeta>
         .map(|tool| {
             let name = tool.name().to_string();
             ToolViewMeta {
-                route: if PROGRESS_TOOLS.contains(&name.as_str()) {
-                    "progress"
-                } else if SILENT_TOOLS.contains(&name.as_str()) {
-                    "silent"
-                } else {
-                    "transcript"
-                },
+                route: tool.route(&serde_json::Value::Null).label(),
                 quiet_output: matches!(
                     tool.batch_policy(),
                     tcode_core::BatchPolicy::ParallelReadOnly
@@ -131,6 +114,114 @@ pub fn tool_view_metas(tools: &[Arc<dyn tcode_core::Tool>]) -> Vec<ToolViewMeta>
             }
         })
         .collect()
+}
+
+/// One conversation's plan, as the plan surface draws it.
+///
+/// Phases carry their `detail` because the desktop review edits it in place;
+/// that is the difference between this and what the TUI's pane gets from a tool
+/// call's input, which has detail only when the model happened to resend it.
+#[derive(Serialize)]
+pub struct PlanView {
+    /// Absolute path, for the pane's subtitle. Display only — nothing writes
+    /// through it, and `progress_write` reaches the file through the session.
+    pub path: String,
+    pub file: String,
+    pub title: String,
+    /// `draft` · `active` · `done`.
+    pub state: &'static str,
+    pub done: usize,
+    pub total: usize,
+    pub phases: Vec<tcode_core::progress::Phase>,
+}
+
+impl PlanView {
+    fn of(plan: &tcode_core::progress::Progress) -> Self {
+        let (done, total) = plan.counts();
+        Self {
+            path: plan.path().display().to_string(),
+            file: plan
+                .path()
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            title: plan.title.clone(),
+            state: plan.state().label(),
+            done,
+            total,
+            phases: plan.phases().to_vec(),
+        }
+    }
+}
+
+/// The plan this conversation is working through, or `null` when it has none.
+///
+/// The webview asks for this after every `progress` call, when a turn ends, and
+/// when an approval arrives — the three moments a plan can have changed. It is
+/// deliberately not polled: nothing here changes on its own.
+#[tauri::command]
+pub fn plan(supervisor: State<'_, Arc<Supervisor>>, session: String) -> Option<PlanView> {
+    let handle = supervisor.get(&session)?;
+    handle.plan().as_ref().map(PlanView::of)
+}
+
+/// Apply a breakdown the user edited by hand, outside any review.
+///
+/// This is the one write to a progress file that does not come from the model,
+/// and it is a legal one: the file is the user's. The model finds out the same
+/// way it finds out about an edit made in `$EDITOR` — its next `progress` call
+/// is handed their version.
+#[tauri::command]
+pub fn write_plan(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    phases: serde_json::Value,
+) -> Result<PlanView, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    handle.write_plan(&phases).map(|plan| PlanView::of(&plan))
+}
+
+/// Execute this conversation's approved plan in a fresh one.
+///
+/// The review option that leads here is the desktop's best answer to a real
+/// problem: a planning conversation is full of the exploration that produced the
+/// plan, and executing in it spends that context on every step. A second pane on
+/// the same folder, holding only the plan, is what this window is for.
+///
+/// Called by the frontend once the planning turn has *ended*, not when the
+/// approval was answered: the `progress` tool still had to run to mark the plan
+/// active, and adopting a draft would hand the new session a plan nobody
+/// approved. The state check below is that ordering made explicit rather than
+/// assumed.
+#[tauri::command]
+pub fn execute_plan_elsewhere(
+    app: AppHandle,
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+) -> Result<OpenedSession, String> {
+    let (handle, instructions) = crate::state::hand_off_plan(&supervisor, &session)?;
+    let opened = OpenedSession::of(&handle);
+    let agent = supervisor.agent();
+    let emit: Arc<dyn Emit> = Arc::new(app);
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = run_turn(
+            agent,
+            handle.clone(),
+            emit.clone(),
+            Vec::new(),
+            instructions,
+        )
+        .await
+        {
+            emit.emit(
+                TURN_FINISHED,
+                serde_json::json!({ "session": handle.id, "error": error.to_string() }),
+            );
+        }
+    });
+    Ok(opened)
 }
 
 #[tauri::command]
@@ -217,6 +308,7 @@ pub fn send_message(
     session: String,
     text: String,
     images: Option<Vec<ImageInput>>,
+    plan: Option<bool>,
 ) -> Result<(), String> {
     let handle = supervisor
         .get(&session)
@@ -229,9 +321,18 @@ pub fn send_message(
         vision,
         &handle.scratch_dir(),
     );
+    // "Plan this first" is a *kind* of turn, so the webview sends a flag and the
+    // text comes from core — the same instruction `/plan` submits in the
+    // terminal. The task itself stays the user's own message, which is what
+    // keeps it in the transcript where they wrote it.
+    let instructions = match plan.unwrap_or(false) {
+        true => vec![tcode_core::commands::plan::planning_instruction("")],
+        false => Vec::new(),
+    };
     let emit: Arc<dyn Emit> = Arc::new(app);
     tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input).await {
+        if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
+        {
             // `Busy` is the only way here, and it is a frontend bug (two sends
             // for one session). The command already returned, so the only way
             // to tell the user is the same channel the turn would have used.
@@ -391,14 +492,10 @@ pub fn load_shown(path: &Path, cwd: &Path, as_data_url: bool) -> Result<ShownFil
         std::fs::read(&file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
     if as_data_url {
         return Ok(ShownFile {
-            body: format!(
-                "data:{};base64,{}",
-                media_type(&file),
-                {
-                    use base64::Engine as _;
-                    base64::engine::general_purpose::STANDARD.encode(&raw)
-                }
-            ),
+            body: format!("data:{};base64,{}", media_type(&file), {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD.encode(&raw)
+            }),
             bytes,
             truncated: false,
         });
@@ -461,7 +558,12 @@ pub fn picker_state(
     };
     let menus = supervisor.menus();
     let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
-    Ok(crate::picker::state_of(&menus, mode, staged))
+    Ok(crate::picker::state_of(
+        &menus,
+        &supervisor.agent().model,
+        mode,
+        staged,
+    ))
 }
 
 #[tauri::command]
@@ -472,7 +574,15 @@ pub fn choose_model(
 ) -> Result<(), String> {
     let menus = supervisor.menus();
     let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
-    crate::picker::choose_model(&mut menus, index, effort.as_deref())
+    // The agent's own cell, not a copy: every open session reads through it, so
+    // one swap moves the whole window (see AGENTS.md rule 15 — mode is per
+    // session, model is per process).
+    crate::picker::choose_model(
+        &mut menus,
+        &supervisor.agent().model,
+        index,
+        effort.as_deref(),
+    )
 }
 
 #[tauri::command]
@@ -483,6 +593,26 @@ pub fn choose_preset(
     let menus = supervisor.menus();
     let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
     crate::picker::choose_preset(&mut menus, &key)
+}
+
+/// Pin one sub-agent or helper role to a model, to the main model, or off.
+#[tauri::command]
+pub fn pin_role(
+    supervisor: State<'_, Arc<Supervisor>>,
+    kind: String,
+    pin: crate::picker::PinChoice,
+) -> Result<String, String> {
+    let menus = supervisor.menus();
+    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    crate::picker::pin_role(&mut menus, &kind, pin)
+}
+
+/// Capture the live line-up as `[presets.<name>]`.
+#[tauri::command]
+pub fn save_preset(supervisor: State<'_, Arc<Supervisor>>, name: String) -> Result<(), String> {
+    let menus = supervisor.menus();
+    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    crate::picker::save_preset(&mut menus, &supervisor.agent().model, name.trim())
 }
 
 /// Choose the permission mode for one conversation.
@@ -524,12 +654,12 @@ pub fn respond_approval(
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
-    if !handle.pending().answer(answer) {
-        // Answering twice, or answering a turn that was interrupted while the
-        // dialog was open. Nothing ran on the strength of it either way.
-        return Err("that approval is no longer waiting for an answer".into());
-    }
-    Ok(())
+    // Two kinds of error come back here, and both are the frontend's to show:
+    // an answer that arrived too late (answered twice, or the turn was
+    // interrupted while the dialog was open — nothing ran on the strength of it
+    // either way), and a plan edit that cannot be applied, which leaves the
+    // question standing so the user can fix it.
+    handle.pending().answer(answer)
 }
 
 /// Stop the running turn. Safe to call when nothing is running.

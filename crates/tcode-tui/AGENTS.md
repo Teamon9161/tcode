@@ -12,7 +12,7 @@
 
 ## 渲染注册表
 
-- **按工具名 match 只许出现在 `RenderRegistry::from_tools` 一处**，其余渲染行为一律经 `ToolRenderer` 的 trait 方法（`route` / `header` / `body` / `batch_item` / `quiet_output` / …）。`quiet_output` 派生自活的 `Tool::batch_policy()`，不得退回手工同步的名字表。
+- **按工具名 match 只许出现在 `RenderRegistry::from_tools` 一处**，其余渲染行为一律经 `ToolRenderer` 的 trait 方法（`header` / `body` / `batch_item` / `quiet_output` / …）。`quiet_output` 派生自活的 `Tool::batch_policy()`，不得退回手工同步的名字表。**路由不是渲染**：`route_of` 直接问工具（core 的 `Tool::route(input)`），registry 只是把工具按名字存着（含 resume 才见得到的退役名）——三个前端要的是同一个答案，各留一份必然漂移。
 - **三条渲染路径（live / replay / approval）必须共用同一组入口**：`bake_call_start`、`batch_header_lines` + `batch_item_lines`、`bake_call_result`（内部 `call_lines` / `result_render`）。各写一套必然漂移——历史教训：重放曾丢批次分组、丢调用间空行、与实时对不上。
 - 批量渲染 item 紧跟自己的 result：批次 header 后每个 call 的 `├ 摘要`(+diff) 推迟到自己的 `ToolEnd` 再 bake（`PendingCall.header`），live 与 replay 一致。
 - 折叠输出默认：read/grep/glob 转录里默认只显示折叠摘要，不铺开首行。

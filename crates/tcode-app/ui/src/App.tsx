@@ -17,7 +17,15 @@ import {
 } from "./types";
 import { applyEvent, errorBlock, userBlock } from "./blocks";
 import { applyFileEvent } from "./files";
-import { EMPTY, closeSession as closePanesOf, show, type Tiling } from "./layout";
+import {
+  EMPTY,
+  closeSession as closePanesOf,
+  show,
+  showBeside,
+  type Tiling,
+} from "./layout";
+import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
+import type { PlanDecision } from "./PlanEditor";
 import { BLANK, type SessionState } from "./session";
 import { replayLedger } from "./replay";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
@@ -48,6 +56,30 @@ export function App() {
     [],
   );
 
+  /**
+   * Re-read one conversation's plan.
+   *
+   * Called at the three moments a plan can have changed — a `progress` call
+   * finished, a review arrived, a turn ended — rather than polled: nothing about
+   * a plan changes on its own, and a timer would ask a hundred times to catch
+   * the two answers that differ. The draft follows the file unless the user has
+   * unsaved edits in it, which are theirs to keep.
+   */
+  const readPlan = useCallback(
+    (id: string) => {
+      invoke<Plan | null>("plan", { session: id })
+        .then((plan) =>
+          patch(id, (state) => ({
+            ...state,
+            plan,
+            planDraft: rebase(state.planDraft, plan),
+          })),
+        )
+        .catch((error) => console.warn("plan unavailable:", error));
+    },
+    [patch],
+  );
+
   // The listeners must be registered before the first turn can start, and
   // exactly once — a second subscription would double every delta.
   //
@@ -64,6 +96,9 @@ export function App() {
           files: applyFileEvent(state.files, payload.event),
           activity: describe(payload.event) ?? state.activity,
         }));
+        // A `progress` call is the one event that changes a file the panel is
+        // showing, so it is the one event that asks the backend to read it again.
+        if (touchedPlan(payload.event)) readPlan(payload.session);
       }),
       listen<ApprovalRequest>(APPROVAL_REQUEST, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -71,6 +106,10 @@ export function App() {
           approval: payload,
           activity: `waiting on ${payload.tool}`,
         }));
+        // A plan review's draft was saved to disk before this arrived, which is
+        // where the editor gets the phases — with every phase's detail, not just
+        // the ones the model happened to resend in this call.
+        readPlan(payload.session);
       }),
       listen<TurnFinished>(TURN_FINISHED, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -83,6 +122,7 @@ export function App() {
             ? [...state.blocks, errorBlock(payload.error)]
             : state.blocks,
         }));
+        readPlan(payload.session);
       }),
     ];
     Promise.all(subscriptions).catch((error) =>
@@ -105,7 +145,7 @@ export function App() {
         pending.then((unlisten) => unlisten()).catch(() => {}),
       );
     };
-  }, [patch]);
+  }, [patch, readPlan]);
 
   const statusOf = useCallback(
     (id: string): Status => {
@@ -134,7 +174,11 @@ export function App() {
       [session.id]: { ...BLANK, ...replayed, activity: history.length > 0 ? "resumed" : BLANK.activity },
     }));
     setTiling((current) => show(current, session.id));
-  }, []);
+    // A resumed conversation may already be working through a plan — it is on
+    // disk, and the session adopted it — so the strip must not wait for the next
+    // turn to find that out.
+    readPlan(session.id);
+  }, [readPlan]);
 
   const closeSession = useCallback(
     async (id: string) => {
@@ -161,10 +205,12 @@ export function App() {
       const text = (states[id]?.draft ?? "").trim();
       const attachments = states[id]?.attachments ?? [];
       if ((!text && attachments.length === 0) || states[id]?.running) return;
+      const planFirst = states[id]?.planFirst ?? false;
       patch(id, (state) => ({
         ...state,
         draft: "",
         attachments: [],
+        planFirst: false,
         running: true,
         failed: false,
         blocks: [
@@ -177,9 +223,13 @@ export function App() {
         activity: text || `${attachments.length} image(s)`,
       }));
       try {
+        // `plan` is a flag, never the instruction text: the words come from core
+        // (the same ones `/plan` submits), so the webview cannot author model
+        // context that claims to be the harness speaking.
         await invoke("send_message", {
           session: id,
           text,
+          plan: planFirst,
           images: attachments.map((item) => ({
             media_type: item.mediaType,
             data: item.data,
@@ -216,6 +266,104 @@ export function App() {
     },
     [states, patch],
   );
+
+  /**
+   * Answer a plan review: the edits, the comments and the decision, in one call.
+   *
+   * A refused answer is the one case where the question comes *back*. The backend
+   * rejects a breakdown it cannot apply without consuming the request — a turn is
+   * parked on it — so the panel returns rather than leaving the conversation
+   * waiting on a dialog nobody can see.
+   */
+  const decidePlan = useCallback(
+    async (id: string, choice: PlanDecision) => {
+      const pending = states[id]?.approval;
+      if (!pending) return;
+      patch(id, (state) => ({
+        ...state,
+        approval: null,
+        handoffPending: choice.fresh && choice.decision === "yes",
+      }));
+      try {
+        await invoke("respond_approval", {
+          session: id,
+          answer: {
+            id: pending.id,
+            decision: choice.decision,
+            comment: choice.note || null,
+            phases: choice.phases,
+            notes: choice.comments.map((entry) => ({ quote: entry.quote, text: entry.text })),
+            fresh_session: choice.fresh,
+          },
+        });
+        patch(id, (state) => ({ ...state, planDraft: null }));
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          approval: pending,
+          handoffPending: false,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [states, patch],
+  );
+
+  const savePlan = useCallback(
+    async (id: string) => {
+      const draft = states[id]?.planDraft;
+      if (!draft) return;
+      try {
+        const plan = await invoke<Plan>("write_plan", {
+          session: id,
+          phases: fromDraft(draft.phases),
+        });
+        patch(id, (state) => ({ ...state, plan, planDraft: draftOf(plan) }));
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [states, patch],
+  );
+
+  /**
+   * Hand an approved plan to a fresh conversation, once the planning turn has
+   * ended.
+   *
+   * Waiting for the end is the whole correctness of it: the `progress` tool runs
+   * *after* the approval is answered, and only then is the plan on disk marked
+   * active. An effect rather than a line in the `TURN_FINISHED` listener because
+   * this reads state and starts work, which is not a reducer's job.
+   */
+  useEffect(() => {
+    for (const [id, state] of Object.entries(states)) {
+      if (!state.handoffPending || state.running || state.approval) continue;
+      patch(id, (was) => ({ ...was, handoffPending: false }));
+      invoke<OpenedSession>("execute_plan_elsewhere", { session: id })
+        .then(({ session, history }) => {
+          const replayed = replayLedger(history);
+          setSessions((current) =>
+            current.some((open) => open.id === session.id) ? current : [...current, session],
+          );
+          setStates((current) => ({
+            ...current,
+            [session.id]: { ...BLANK, ...replayed, running: true, activity: "executing the plan" },
+          }));
+          // Beside, not instead: the plan came from the conversation next to it,
+          // and both are worth watching while one works.
+          setTiling((current) => showBeside(current, session.id));
+        })
+        .catch((error) =>
+          patch(id, (was) => ({
+            ...was,
+            blocks: [...was.blocks, errorBlock(String(error))],
+          })),
+        );
+    }
+  }, [states, patch]);
 
   // A session that needs an answer pulls the view to itself, but only from the
   // launchpad: yanking someone out of a conversation they are reading would be
@@ -268,11 +416,42 @@ export function App() {
           invoke("interrupt", { session: id }).catch(() => {});
         }}
         onAnswer={answer}
+        onDecidePlan={decidePlan}
+        onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
+        onSavePlan={savePlan}
+        onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
+        onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
         onCloseSession={closeSession}
         onHome={() => setTiling(EMPTY)}
       />
     </ToolMetaProvider>
   );
+}
+
+/**
+ * Whether this event could have changed the plan on disk.
+ *
+ * Only `progress` writes that file, and only when its call finishes: asking on
+ * `ToolStart` would read the file the tool is still writing.
+ */
+function touchedPlan(event: AgentEvent): boolean {
+  if (event.type !== "ToolEnd") return false;
+  return (event.data as { name?: string }).name === "progress";
+}
+
+/**
+ * Keep a draft across a re-read of the plan.
+ *
+ * A draft with edits in it survives — those are the user's words, and dropping
+ * them because a phase flipped somewhere else would be the worst possible moment
+ * to do it. An untouched draft is rebuilt from the new plan, and a draft for a
+ * different plan file is abandoned: it was about something else.
+ */
+function rebase(draft: PlanDraft | null, plan: Plan | null): PlanDraft | null {
+  if (!plan) return null;
+  if (!draft || draft.path !== plan.path) return draftOf(plan);
+  const untouched = draft.phases === draft.base && draft.comments.length === 0;
+  return untouched ? draftOf(plan) : draft;
 }
 
 /** The one-line summary the launchpad card shows for a session. */

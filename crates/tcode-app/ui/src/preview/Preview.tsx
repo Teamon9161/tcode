@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 import type { ApprovalRequest, SessionInfo, Status } from "../types";
 import type { Block } from "../blocks";
@@ -7,6 +7,7 @@ import type { Pasted } from "../paste";
 import { BLANK, type SessionState } from "../session";
 import { openInspect, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
+import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
 
@@ -40,12 +41,7 @@ const TOOL_META = new Map<string, ToolMeta>(
       { name: "edit", route: "transcript", quiet_output: false, hide_success_result: true },
       { name: "write", route: "transcript", quiet_output: false, hide_success_result: true },
       { name: "shell", route: "transcript", quiet_output: false, hide_success_result: false },
-      {
-        name: "update_progress",
-        route: "progress",
-        quiet_output: false,
-        hide_success_result: false,
-      },
+      { name: "progress", route: "progress", quiet_output: false, hide_success_result: false },
       { name: "ask_user", route: "silent", quiet_output: false, hide_success_result: false },
     ] as ToolMeta[]
   ).map((meta) => [meta.name, meta]),
@@ -347,16 +343,96 @@ const OTHER_BLOCKS: Block[] = [
   },
 ];
 
+/**
+ * A plan, as the backend reads it off disk.
+ *
+ * Deliberately the hard case: prose on every phase (which is what the review
+ * panel edits), a sub-phase under the running one, and a title long enough to
+ * need the strip's ellipsis.
+ */
+const PLAN: Plan = {
+  path: `${HOME}/.tcode/projects/c--code-rust-tcode/progress/20260730-101200-testable-retry-path.md`,
+  file: "20260730-101200-testable-retry-path.md",
+  title: "Make the retry path testable",
+  state: "active",
+  done: 1,
+  total: 4,
+  phases: [
+    {
+      phase: "locate every inline sleep in the retry loop",
+      status: "completed",
+      detail:
+        "Read-only. `agent/mod.rs` sleeps inside the `'retry` loop; confirm nothing else in the crate waits on wall-clock time before the shape is chosen.",
+      phases: [],
+    },
+    {
+      phase: "thread an injectable clock through Agent",
+      status: "in_progress",
+      detail:
+        "Add a `Sleeper` the agent holds and the retry loop calls. Risk: the watchdog also sleeps, on its own task — if both take the injected clock, a test that advances time affects the stall detector too.",
+      phases: [
+        {
+          phase: "write the failing test first",
+          status: "completed",
+          detail: "One retry, instant clock, asserts the second attempt happened.",
+          phases: [],
+        },
+        {
+          phase: "replace the call in the retry loop",
+          status: "in_progress",
+          detail: "",
+          phases: [],
+        },
+      ],
+    },
+    {
+      phase: "cover cancellation while a retry is waiting",
+      status: "pending",
+      detail:
+        "A cancelled turn must stop sleeping rather than finish its backoff. This is the phase most likely to find a real bug.",
+      phases: [],
+    },
+  ],
+};
+
+/** The plan under review: same file, not yet approved. */
+const DRAFT_PLAN: Plan = { ...PLAN, state: "draft", done: 0 };
+
+/** A plan submitted for approval. The body is what core saved before asking. */
+const PLAN_REVIEW: ApprovalRequest = {
+  session: "a",
+  id: "ap3",
+  tool: "progress",
+  summary: "Make the retry path testable",
+  descriptor: "progress",
+  is_edit: false,
+  allows_project: false,
+  input: {
+    title: "Make the retry path testable",
+    state: "active",
+    plan: "\n## [ ] 1. locate every inline sleep in the retry loop\nRead-only.\n",
+  },
+};
+
 const SCENES = [
   "launchpad",
   "session",
   "approval",
   "question",
+  "plan",
+  "model",
   "split",
   "shown",
   "empty",
 ] as const;
 type Scene = (typeof SCENES)[number];
+
+/** The scene named in the URL, so a state can be linked to and survives a
+ *  reload — the one thing a scene switcher in component state cannot do. */
+function wanted(): Scene {
+  const asked = new URLSearchParams(window.location.search).get("scene");
+  return SCENES.includes(asked as Scene) ? (asked as Scene) : "launchpad";
+}
 
 /** One conversation, filling the window. */
 const solo = (): Tiling => single({ kind: "session", session: "a" });
@@ -382,16 +458,63 @@ function showing(): Tiling {
   });
 }
 
+/** The window each scene wants. Every scene but two is one conversation. */
+function layoutFor(scene: Scene): Tiling {
+  if (scene === "split") return tiled();
+  if (scene === "shown") return showing();
+  return solo();
+}
+
+/** A comment already on the plan: the panel with nothing on it never shows what
+ *  an anchored note looks like, and that is the state worth designing. */
+function comments(plan: Plan): PlanComment[] {
+  const detail = plan.phases[1]?.detail ?? "";
+  return [
+    {
+      id: "c1",
+      path: [1],
+      field: "detail",
+      quote: detail.slice(detail.indexOf("Risk:"), detail.indexOf("Risk:") + 96),
+      text: "Split the watchdog's clock out — one injected clock for two waiters is the bug this would hide.",
+    },
+  ];
+}
+
 export function Preview() {
-  const [scene, setScene] = useState<Scene>("launchpad");
-  const [tiling, setTiling] = useState<Tiling>(solo);
+  const [scene, setScene] = useState<Scene>(wanted);
+  const [tiling, setTiling] = useState<Tiling>(() => layoutFor(wanted()));
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Pasted[]>([]);
 
   const pick = (name: Scene) => {
     setScene(name);
-    setTiling(name === "split" ? tiled() : name === "shown" ? showing() : solo());
+    setTiling(layoutFor(name));
+    window.history.replaceState(null, "", `?scene=${name}`);
   };
+
+  // The model panel is a click away from any conversation, and clicking is the
+  // one thing a look-through cannot do for you. This scene opens it, so the
+  // surface with the most design in it is a state you can just look at.
+  //
+  // Across frames rather than in this one: the strip reads its state through the
+  // command bridge, so the chip does not exist until that promise has resolved.
+  useEffect(() => {
+    if (scene !== "model") return;
+    let alive = true;
+    let tries = 0;
+    const tick = () => {
+      if (!alive) return;
+      const chip = document.querySelector<HTMLButtonElement>(".chip.is-model");
+      if (chip) chip.click();
+      else if (tries++ < 20) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return () => {
+      alive = false;
+    };
+  }, [scene]);
+
+  const plan = scene === "plan" ? DRAFT_PLAN : scene === "empty" ? null : PLAN;
 
   const stateOf = (id: string): SessionState =>
     id === "a"
@@ -401,9 +524,19 @@ export function Preview() {
           files: scene === "empty" ? [] : FILES,
           running: scene === "session",
           approval:
-            scene === "approval" ? APPROVAL : scene === "question" ? QUESTION : null,
+            scene === "approval"
+              ? APPROVAL
+              : scene === "question"
+                ? QUESTION
+                : scene === "plan"
+                  ? PLAN_REVIEW
+                  : null,
           draft,
           attachments,
+          planFirst: scene === "empty",
+          plan,
+          planDraft: plan ? { ...draftOf(plan), comments: comments(plan) } : null,
+          planOpen: scene === "session",
         }
       : { ...BLANK, blocks: OTHER_BLOCKS, running: true };
 
@@ -450,6 +583,11 @@ export function Preview() {
               onSend={() => {}}
               onInterrupt={() => {}}
               onAnswer={() => pick("session")}
+              onDecidePlan={() => pick("session")}
+              onPlanDraft={() => {}}
+              onSavePlan={() => {}}
+              onPlanOpen={() => {}}
+              onPlanFirst={() => {}}
               onCloseSession={() => {}}
               onHome={() => pick("launchpad")}
             />

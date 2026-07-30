@@ -3,6 +3,8 @@ import { useMemo, useState } from "react";
 import type { ApprovalRequest, Decision } from "./types";
 import { Diff, isEditShape } from "./components/Diff";
 import { StatusDot } from "./components/Status";
+import { PlanEditor, type PlanDecision } from "./PlanEditor";
+import { isPlanReview, type Plan, type PlanDraft } from "./plan";
 
 /**
  * What the agent is parked on, docked above the composer.
@@ -26,30 +28,53 @@ import { StatusDot } from "./components/Status";
  */
 export function Approval({
   request,
+  plan,
+  draft,
   onAnswer,
+  onDecidePlan,
+  onPlanDraft,
 }: {
   request: ApprovalRequest;
+  plan: Plan | null;
+  draft: PlanDraft | null;
   onAnswer: (decision: Decision, comment: string) => void;
+  onDecidePlan: (choice: PlanDecision) => void;
+  onPlanDraft: (draft: PlanDraft) => void;
 }) {
   // Question forms are recognized by the shape of the call, not by the tool's
   // name: `ask_user` is the tool that produces this input, and anything else
   // that ever produces the same `questions` array means the same thing by it.
   const questions = useMemo(() => readQuestions(request.input), [request.input]);
+  // A plan review, recognized the same way: core attaches the saved plan body to
+  // the review copy of the call, and that body is what makes this a document to
+  // read rather than an action to authorize. The editor works from the *file*
+  // (`plan`), because that has every phase's prose — the call carries only what
+  // the model happened to resend.
+  const review = useMemo(() => isPlanReview(request.input), [request.input]);
 
   return (
     <section
-      className={`approval${questions ? " is-question" : ""}`}
+      className={`approval${questions ? " is-question" : ""}${review ? " is-plan" : ""}`}
       role="region"
-      aria-label={questions ? "A question for you" : "Approval needed"}
+      aria-label={review ? "A plan for you to review" : questions ? "A question for you" : "Approval needed"}
     >
       {/* The dot is the same "needs you" amber the rail uses for this session,
           so the two surfaces agree at a glance about which state this is. */}
       <header className="approval-head">
         <StatusDot status="waiting" />
-        <h2>{title(request, questions)}</h2>
-        {!questions && <span className="approval-tool">{request.tool}</span>}
+        <h2>{title(request, questions, review)}</h2>
+        {!questions && !review && <span className="approval-tool">{request.tool}</span>}
       </header>
-      {questions ? (
+      {review && plan && draft ? (
+        <PlanEditor
+          key={request.id}
+          plan={plan}
+          draft={draft}
+          mode="review"
+          onDraft={onPlanDraft}
+          onDecide={onDecidePlan}
+        />
+      ) : questions ? (
         <QuestionForm key={request.id} questions={questions} onAnswer={onAnswer} />
       ) : (
         <Consent key={request.id} request={request} onAnswer={onAnswer} />
@@ -58,7 +83,12 @@ export function Approval({
   );
 }
 
-function title(request: ApprovalRequest, questions: Question[] | null): string {
+function title(
+  request: ApprovalRequest,
+  questions: Question[] | null,
+  review: boolean,
+): string {
+  if (review) return "Review this plan";
   if (!questions) return request.is_edit ? "Change a file?" : "Run this?";
   return questions.length === 1 ? questions[0].question : "A few questions";
 }

@@ -4,6 +4,7 @@ import type { Block } from "./blocks";
 import type { Inspect } from "./inspect";
 import { rich } from "./rich";
 import { readChanges } from "./diff";
+import { isPlanSubmission } from "./plan";
 import { useToolMeta, viewFor, displayToolOutput, displayToolSummary, transcriptGroupFor } from "./toolViews";
 import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
 import { StatusDot } from "./components/Status";
@@ -390,6 +391,11 @@ function ToolCall({
   // Core decides where a call belongs; `silent` means another surface already
   // told its story (an `ask_user` question is baked by its approval).
   if (meta.route === "silent") return null;
+  // `progress` is the one tool that answers this per call (`Tool::route`): a
+  // phase flip belongs to the strip above the composer, while a plan submitted
+  // for approval is a document this conversation has to keep. The backend sends
+  // the tool's default route, so the exception is recognized from the call.
+  if (meta.route === "progress" && !isPlanSubmission(block.input)) return null;
 
   const done = block.result !== undefined;
   const failed = block.result?.isError ?? false;

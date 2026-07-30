@@ -17,16 +17,10 @@ use tcode_core::{BatchPolicy, Tool};
 use crate::diff;
 use crate::theme;
 
-/// Where a tool call's rendering goes. `Progress` feeds the execution-progress
-/// pane instead of the transcript (an ordinary `progress` update); `Silent`
-/// renders nothing because another mechanism already told the story (ask_user's
-/// approval record).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CallRoute {
-    Transcript,
-    Progress,
-    Silent,
-}
+/// Where a tool call's rendering goes. The tool decides (`Tool::route`), not
+/// this module: every frontend needs the same answer, so it is core's. Re-
+/// exported here because the TUI reaches it through this registry.
+pub use tcode_core::CallRoute;
 
 /// Colour treatment for a call header. Most tools foreground their verb; a
 /// delegated task instead foregrounds its human-authored objective.
@@ -48,17 +42,6 @@ pub fn batch_item_style(tone: HeaderTone) -> Style {
 pub trait ToolRenderer: Send + Sync {
     fn header_tone(&self) -> HeaderTone {
         HeaderTone::Tool
-    }
-
-    fn route(&self) -> CallRoute {
-        CallRoute::Transcript
-    }
-
-    /// Where *this* call goes. Only `progress` overrides it: a plan under
-    /// review and a phase flip are the same tool, and only the input says which
-    /// one happened.
-    fn route_for(&self, _input: &Value) -> CallRoute {
-        self.route()
     }
 
     /// One-line header text (uncolored; the App applies display-name
@@ -411,34 +394,13 @@ impl ToolRenderer for ViewImageRenderer {
 struct ProgressRenderer;
 
 /// The markdown of a plan submitted for approval, or `None` for an ordinary
-/// progress update. Live calls carry their phases and are rendered from them;
-/// the review copy and the retired `exit_plan` calls in older sessions carry a
-/// ready-made body, which wins because it is the text the human actually saw.
+/// progress update. Core's, because the same question decides where the call is
+/// routed (`Tool::route`) — "is this a document" must have one answer.
 fn submitted_plan(input: &Value) -> Option<String> {
-    if let Some(body) = input[tcode_core::progress::REVIEW_BODY_FIELD].as_str() {
-        if !body.trim().is_empty() {
-            return Some(body.to_string());
-        }
-    }
-    if !tcode_core::progress::is_submission(input) {
-        return None;
-    }
-    let phases = tcode_core::progress::phases_from_json(&input["phases"]).ok()?;
-    Some(tcode_core::progress::render_phases(&phases)).filter(|body| !body.trim().is_empty())
+    tcode_core::progress::plan_document(input)
 }
 
 impl ToolRenderer for ProgressRenderer {
-    fn route(&self) -> CallRoute {
-        CallRoute::Progress
-    }
-
-    fn route_for(&self, input: &Value) -> CallRoute {
-        match submitted_plan(input) {
-            Some(_) => CallRoute::Transcript,
-            None => CallRoute::Progress,
-        }
-    }
-
     fn header(&self, name: &str, input: &Value, cwd: Option<&Path>) -> String {
         if submitted_plan(input).is_none() {
             return tcode_core::agent::summarize_call(name, input);
@@ -499,18 +461,20 @@ fn demote_headings(markdown: &str) -> String {
     out
 }
 
+/// A tool whose story is told by another surface still needs a renderer entry,
+/// because `header` is what the plan pane and the task tree label it with.
 struct SilentRenderer;
 
-impl ToolRenderer for SilentRenderer {
-    fn route(&self) -> CallRoute {
-        CallRoute::Silent
-    }
-}
+impl ToolRenderer for SilentRenderer {}
 
 pub struct RenderRegistry {
     renderers: HashMap<String, Box<dyn ToolRenderer>>,
     /// Tool name → UI display name, snapshotted from the live tools.
     display_names: HashMap<String, String>,
+    /// Tool name → the live tool, kept solely to ask it where a call goes.
+    /// Routing is the tool's own answer (`Tool::route`); holding the tool is how
+    /// this registry asks without owning a second opinion about tool names.
+    routes: HashMap<String, Arc<dyn Tool>>,
     /// Imported or since-unregistered tools render generically.
     fallback: DefaultRenderer,
 }
@@ -519,6 +483,7 @@ impl RenderRegistry {
     pub fn from_tools(tools: &[Arc<dyn Tool>]) -> Self {
         let mut renderers: HashMap<String, Box<dyn ToolRenderer>> = HashMap::new();
         let mut display_names = HashMap::new();
+        let mut routes: HashMap<String, Arc<dyn Tool>> = HashMap::new();
         for tool in tools {
             let name = tool.name();
             display_names.insert(name.to_string(), tool.display_name());
@@ -538,6 +503,7 @@ impl RenderRegistry {
                 _ => Box::new(DefaultRenderer { quiet }),
             };
             renderers.insert(name.to_string(), renderer);
+            routes.insert(name.to_string(), tool.clone());
         }
         // Existing JSONL sessions retain retired tool names and schemas. Keep
         // their specialized renderers on resume without exposing those names
@@ -548,28 +514,36 @@ impl RenderRegistry {
         }
         // `update_plan`/`update_progress` are this tool's earlier names and
         // `exit_plan` its earlier plan-submission half; all three route by
-        // input exactly like the current one does.
+        // input exactly like the current one does — including through the live
+        // tool, which is why the alias lands in `routes` too.
         if renderers.contains_key("progress") {
+            let progress = routes.get("progress").cloned();
             for retired in ["update_plan", "update_progress", "exit_plan"] {
                 renderers.insert(retired.into(), Box::new(ProgressRenderer));
+                if let Some(tool) = progress.clone() {
+                    routes.insert(retired.into(), tool);
+                }
             }
         }
         Self {
             renderers,
             display_names,
+            routes,
             fallback: DefaultRenderer { quiet: false },
         }
     }
 
-    /// Where a call goes. `progress` decides from its input, so pass it when
-    /// it is still at hand; a call whose input has already been consumed falls
-    /// back to the tool's default route, which is what the header path chose
-    /// for it in the first place.
+    /// Where a call goes, straight from the tool that will run it. `progress`
+    /// decides from its input, so pass it when it is still at hand; a call whose
+    /// input has already been consumed asks with `Null` and gets the tool's
+    /// default answer, which is what the header path chose for it in the first
+    /// place. A tool this session does not have (an imported or since-removed
+    /// one) renders in the transcript.
     pub fn route_of(&self, name: &str, input: Option<&Value>) -> CallRoute {
-        match input {
-            Some(input) => self.get(name).route_for(input),
-            None => self.get(name).route(),
-        }
+        let Some(tool) = self.routes.get(name) else {
+            return CallRoute::Transcript;
+        };
+        tool.route(input.unwrap_or(&Value::Null))
     }
 
     pub fn get(&self, name: &str) -> &dyn ToolRenderer {
@@ -751,18 +725,26 @@ mod tests {
         }
     }
 
+    /// Routing is the tool's answer, so the registry has to be asked with the
+    /// live tools rather than with a renderer of its own.
     #[test]
     fn routes_split_progress_and_silent_tools_from_the_transcript() {
-        let registry = RenderRegistry::from_tools(&[]);
-        assert_eq!(registry.get("unknown").route(), CallRoute::Transcript);
-        assert_eq!(ProgressRenderer.route(), CallRoute::Progress);
-        assert_eq!(SilentRenderer.route(), CallRoute::Silent);
+        let empty = RenderRegistry::from_tools(&[]);
+        assert_eq!(empty.route_of("unknown", None), CallRoute::Transcript);
+        // A tool this session does not have renders in the transcript; nothing
+        // else could be shown for a call whose surface is unknown.
+        assert_eq!(empty.route_of("progress", None), CallRoute::Transcript);
 
-        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tcode_tools::ProgressTool)];
+        let tools: Vec<Arc<dyn Tool>> = vec![
+            Arc::new(tcode_tools::ProgressTool),
+            Arc::new(tcode_tools::AskUserTool),
+        ];
         let registry = RenderRegistry::from_tools(&tools);
-        // Retired names keep their renderer so resumed sessions still read.
+        assert_eq!(registry.route_of("ask_user", None), CallRoute::Silent);
+        // Retired names route through the live tool, so resumed sessions still
+        // send old progress calls to the plan surface.
         for name in ["progress", "update_progress", "update_plan", "exit_plan"] {
-            assert_eq!(registry.get(name).route(), CallRoute::Progress, "{name}");
+            assert_eq!(registry.route_of(name, None), CallRoute::Progress, "{name}");
         }
     }
 
@@ -770,8 +752,13 @@ mod tests {
     /// submitted for approval is a document the user reads in the transcript.
     #[test]
     fn a_submitted_plan_routes_to_the_transcript_and_an_update_does_not() {
+        let tools: Vec<Arc<dyn Tool>> = vec![Arc::new(tcode_tools::ProgressTool)];
+        let registry = RenderRegistry::from_tools(&tools);
         let update = json!({ "phases": [{ "phase": "one", "status": "in_progress" }] });
-        assert_eq!(ProgressRenderer.route_for(&update), CallRoute::Progress);
+        assert_eq!(
+            registry.route_of("progress", Some(&update)),
+            CallRoute::Progress
+        );
 
         let submission = json!({
             "title": "Rewrite the resume path",
@@ -779,7 +766,7 @@ mod tests {
             "phases": [{ "phase": "one", "status": "pending" }]
         });
         assert_eq!(
-            ProgressRenderer.route_for(&submission),
+            registry.route_of("progress", Some(&submission)),
             CallRoute::Transcript
         );
         assert!(ProgressRenderer
@@ -796,7 +783,10 @@ mod tests {
         let legacy = json!({ "plan": "# Do it
 
 body" });
-        assert_eq!(ProgressRenderer.route_for(&legacy), CallRoute::Transcript);
+        assert_eq!(
+            registry.route_of("exit_plan", Some(&legacy)),
+            CallRoute::Transcript
+        );
     }
 
     #[test]

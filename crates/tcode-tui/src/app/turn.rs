@@ -12,8 +12,6 @@
 
 use super::*;
 
-const PLAN_EXECUTION_REQUEST: &str = include_str!("../../prompts/plan-execution.md");
-
 /// Several prompts queued behind one turn become one prompt when that turn ends
 /// — starting a turn per queued line would make the model answer the first one
 /// with the rest still unsaid.
@@ -362,7 +360,7 @@ impl App {
         self.session = Some(session);
         self.reset_conversation_ui();
 
-        let instruction = format!("{PLAN_EXECUTION_REQUEST}\n{}", handoff.plan.trim());
+        let instruction = tcode_core::commands::plan::execution_instruction(&handoff.plan);
         self.start_turn(PendingMessage {
             text: String::new(),
             attachments: Vec::new(),
