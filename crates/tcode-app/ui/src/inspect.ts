@@ -37,8 +37,17 @@ export type Inspect =
   | { kind: "file"; path: string; at?: string }
   /** The change one edit/write call is making or made. */
   | { kind: "diff"; callId: string }
-  /** A sub-agent run's own transcript. */
-  | { kind: "run"; run: string }
+  /**
+   * A sub-agent run's own transcript.
+   *
+   * `label` is the pane header's whole text — the run's kind and what it was
+   * asked to do. It is carried rather than looked up because the header is drawn
+   * by the pane frame, which has the value and not the conversation: reaching
+   * back into the blocks for it would make the one label in the window that
+   * cannot be written down the only one that needs the transcript. Without it the
+   * header read "Sub-agent", which is true of every one of them.
+   */
+  | { kind: "run"; run: string; label?: string }
   /** A tool's complete output, when the preview was not enough. */
   | { kind: "output"; callId: string }
   /** Model-authored rich content, rendered behind the sandbox boundary. */
@@ -141,7 +150,7 @@ export function inspectTitle(value: Inspect): string {
     case "diff":
       return "Change";
     case "run":
-      return "Sub-agent";
+      return value.label || "Sub-agent";
     case "output":
       return "Output";
     case "artifact":

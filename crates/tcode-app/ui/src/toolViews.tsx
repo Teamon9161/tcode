@@ -33,12 +33,14 @@ import { ShownView } from "./Shown";
 /** Mirrors `ToolViewMeta` in `src/commands.rs`. */
 export type ToolMeta = {
   name: string;
+  /** `Tool::display_name()`, snapshotted from the live tool set. */
+  display_name: string;
   route: "transcript" | "progress" | "silent";
   quiet_output: boolean;
   hide_success_result: boolean;
 };
 
-const DEFAULT_META: Omit<ToolMeta, "name"> = {
+const DEFAULT_META: Omit<ToolMeta, "name" | "display_name"> = {
   route: "transcript",
   quiet_output: false,
   hide_success_result: false,
@@ -58,7 +60,26 @@ export function ToolMetaProvider({
 
 export function useToolMeta(name: string): ToolMeta {
   const table = useContext(MetaContext);
-  return table.get(name) ?? { name, ...DEFAULT_META };
+  return table.get(name) ?? { name, display_name: titleCase(name), ...DEFAULT_META };
+}
+
+/**
+ * What to call a tool on screen, from core's `Tool::display_name()`.
+ *
+ * A lookup function rather than a value because the callers that need it need
+ * several at once — a group of reads and searches is labelled from the calls in
+ * it. The fallback is for a name this session's tool set no longer has (a
+ * resumed log records whatever the tool was called then); it is the same rule
+ * core's default applies, kept here only so an unknown tool is not the one row
+ * in the column still wearing its wire name.
+ */
+export function useToolName(): (name: string) => string {
+  const table = useContext(MetaContext);
+  return (name) => table.get(name)?.display_name || titleCase(name);
+}
+
+function titleCase(name: string): string {
+  return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
 export type TranscriptGroup = "exploration" | "changes" | "commands";
@@ -163,6 +184,27 @@ const progressView: ToolView = {
   preferInputSummary: true,
 };
 
+/**
+ * Which skill was loaded — the only thing about the call worth a row.
+ *
+ * Core's generic summary cannot say it: `summarize_call` picks the first of a
+ * fixed set of argument keys, and this tool's argument is `name`, so every skill
+ * call reached the transcript as the bare word `skill`. The registry is the place
+ * to answer that (this file owns presentation), and it is the same gap the TUI
+ * still has for the same reason.
+ */
+const skillView: ToolView = {
+  summary: (input) => {
+    if (typeof input !== "object" || input === null) return null;
+    const record = input as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name.trim() : "";
+    if (!name) return null;
+    const args = typeof record.arguments === "string" ? record.arguments.trim() : "";
+    return args ? `${name} ${args}` : name;
+  },
+  preferInputSummary: true,
+};
+
 const VIEWS: Record<string, ToolView> = {
   show: showing,
   edit: editing,
@@ -174,6 +216,7 @@ const VIEWS: Record<string, ToolView> = {
   bash: shell,
   grep: pattern,
   glob: pattern,
+  skill: skillView,
   // A `progress` call routes to the plan surface, not here — except the one
   // that submits a plan for approval, which is a document the conversation must
   // still hold afterwards. `Transcript.tsx` makes that call; this draws it.
@@ -293,7 +336,9 @@ export function displayToolOutput(name: string, content: string): string {
 function describe(input: unknown): string | null {
   if (typeof input !== "object" || input === null) return null;
   const record = input as Record<string, unknown>;
-  for (const key of ["file_path", "path", "notebook_path", "filePath", "command", "pattern", "url", "query"]) {
+  // `name` is last: it is the least specific of these, and a tool that has both
+  // a path and a name is about the path.
+  for (const key of ["file_path", "path", "notebook_path", "filePath", "command", "pattern", "url", "query", "name"]) {
     const value = record[key];
     if (typeof value === "string" && value.length > 0) return value;
   }

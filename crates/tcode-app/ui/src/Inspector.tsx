@@ -1,6 +1,6 @@
 import { useMemo } from "react";
 
-import { findRun, findToolCall, type Block } from "./blocks";
+import { findRun, findToolCall, reportOf, type Block } from "./blocks";
 import { Diff } from "./components/Diff";
 import { Code } from "./components/Code";
 import { languageOf } from "./diff";
@@ -12,7 +12,7 @@ import { WorkspaceEditor } from "./WorkspaceEditor";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
 import { ShownView } from "./Shown";
-import { BlockList } from "./Transcript";
+import { agentKind, BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
 import { PlanEditor } from "./PlanEditor";
 import { useSession } from "./session";
@@ -210,7 +210,16 @@ function OutputView({ callId, blocks }: { callId: string; blocks: Block[] }) {
   );
 }
 
-/** A sub-agent's whole turn, drawn by the same list the main transcript uses. */
+/**
+ * A sub-agent's whole turn, drawn by the same list the main transcript uses —
+ * which is also how its reasoning obeys the same display switch as the
+ * conversation that delegated it.
+ *
+ * The order here is the order the questions get asked: what it was told to do,
+ * what it did, what it came back with. The report is last because it is the
+ * answer, and reading an answer before the work is what made this pane feel like
+ * three unrelated blocks.
+ */
 function RunView({
   run,
   blocks,
@@ -221,14 +230,16 @@ function RunView({
   onOpen: (next: Inspect) => void;
 }) {
   const found = findRun(blocks, run);
+  const report = useMemo(() => reportOf(blocks, run), [blocks, run]);
   if (!found) return <p className="inspect-empty">that run is no longer in this conversation</p>;
 
+  const calls = found.meta.toolCalls;
   return (
     <div className="inspect-run">
       <dl className="inspect-facts">
         <div>
-          <dt>kind</dt>
-          <dd>{found.meta.kind}</dd>
+          <dt>agent</dt>
+          <dd>{agentKind(found.meta.kind)}</dd>
         </div>
         <div>
           <dt>model</dt>
@@ -238,11 +249,42 @@ function RunView({
           <dt>status</dt>
           <dd>{found.meta.status ?? "running"}</dd>
         </div>
+        {calls !== undefined && (
+          <div>
+            <dt>calls</dt>
+            <dd>{calls}</dd>
+          </div>
+        )}
       </dl>
-      <p className="inspect-prompt">{found.meta.prompt}</p>
-      <div className="inspect-transcript">
-        <BlockList blocks={found.blocks} onOpen={onOpen} />
-      </div>
+
+      {/* The prompt is what one agent told another, and it arrives with the
+          paragraphs and lists the sender wrote. It used to go into a plain `<p>`,
+          which collapses every newline: a structured brief came out as one
+          run-on block whose second half read as though it belonged to a different
+          message. `pre-wrap` and nothing else — it is an instruction, not a
+          document, and putting it through the markdown renderer would dress up
+          text nobody wrote for a reader. */}
+      <section className="inspect-part">
+        <h4 className="inspect-part-head">Asked to</h4>
+        <p className="inspect-prompt">{found.meta.prompt}</p>
+      </section>
+
+      <section className="inspect-part">
+        <h4 className="inspect-part-head">Did</h4>
+        <div className="inspect-transcript">
+          <BlockList blocks={found.blocks} onOpen={onOpen} />
+          {found.blocks.length === 0 && <p className="inspect-empty">nothing recorded yet</p>}
+        </div>
+      </section>
+
+      {/* Model-authored prose for a human, so it goes through `rich` like the
+          conversation's own text (rule 10 covers it either way). */}
+      {report && (
+        <section className="inspect-part">
+          <h4 className="inspect-part-head">Reported back</h4>
+          <div className="run-report">{rich(report)}</div>
+        </section>
+      )}
     </div>
   );
 }

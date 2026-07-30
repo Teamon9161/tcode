@@ -33,6 +33,11 @@ export type RunMeta = {
   model: string;
   prompt: string;
   summary: string;
+  /** The `tool_use` id of the call that spawned this run, which is what lets the
+   *  transcript draw the call and its run as the one step they are. */
+  parentCall: string;
+  /** `TaskRunStatus`, snake_cased: `done` / `failed` / `cancelled` /
+   *  `interrupted`. Absent while the run is still going. */
   status?: string;
   toolCalls?: number;
 };
@@ -175,6 +180,7 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
     case "TaskRunStarted": {
       const data = event.data as {
         run: string;
+        parent_call: string;
         kind: string;
         model: string;
         prompt: string;
@@ -190,6 +196,7 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
             model: data.model,
             prompt: data.prompt,
             summary: data.summary,
+            parentCall: data.parent_call ?? "",
           },
           blocks: [],
         },
@@ -311,6 +318,52 @@ export function findToolCall(
     }
   }
   return null;
+}
+
+/**
+ * Which calls in this list are a run standing beside them.
+ *
+ * A delegating call and the run it started are two records of one step. The run
+ * carries the kind, the model, the call count, the status and its own whole
+ * transcript; the call carries the report that came back. Drawn as two rows the
+ * step took two lines, the first of them the redundant `agent · agent(explore)`
+ * — the tool's name twice and nothing the run did not already say.
+ *
+ * Paired by `parent_call`, which is a fact on the wire, so nothing in the
+ * transcript has to know what the delegating tool is called. A run whose parent
+ * is not in this list (an older log recorded before `parent_call` existed) pairs
+ * with nothing and both rows draw, which is the honest degradation: two rows
+ * beats a row that vanished.
+ */
+export function runPairs(blocks: Block[]): {
+  /** run id → the call that started it, for the report it returned. */
+  report: Map<string, Extract<Block, { kind: "tool" }>>;
+  /** call ids whose row the run beside them replaces. */
+  superseded: Set<string>;
+} {
+  const calls = new Map<string, Extract<Block, { kind: "tool" }>>();
+  for (const block of blocks) {
+    if (block.kind === "tool") calls.set(block.callId, block);
+  }
+  const report = new Map<string, Extract<Block, { kind: "tool" }>>();
+  const superseded = new Set<string>();
+  for (const block of blocks) {
+    if (block.kind !== "run") continue;
+    const call = calls.get(block.meta.parentCall);
+    if (!call) continue;
+    report.set(block.run, call);
+    superseded.add(call.callId);
+  }
+  return { report, superseded };
+}
+
+/** What a run came back with: the result of the call that started it, found
+ *  anywhere in the tree. Null for a log recorded before runs carried their
+ *  parent call, and while the run is still going. */
+export function reportOf(blocks: Block[], run: string): string | null {
+  const found = findRun(blocks, run);
+  if (!found?.meta.parentCall) return null;
+  return findToolCall(blocks, found.meta.parentCall)?.result?.content || null;
 }
 
 /** Runs that have started and not yet reported a status. */

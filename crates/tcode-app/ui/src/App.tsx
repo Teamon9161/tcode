@@ -29,7 +29,8 @@ import type { PlanDecision } from "./PlanEditor";
 import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
 import { adoptContext, applyUsage, limitsFrom, NO_USAGE, type Limits } from "./usage";
-import { ToolMetaProvider, type ToolMeta } from "./toolViews";
+import { displayToolSummary, ToolMetaProvider, type ToolMeta } from "./toolViews";
+import { DisplayContext, loadDisplay, saveDisplay, type Display } from "./display";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
 import { Mark } from "./components/Mark";
@@ -47,6 +48,13 @@ export function App() {
   // one. Whichever session's turn hears about it last is the one that is true.
   const [limits, setLimits] = useState<Limits | null>(null);
   const [toolMeta, setToolMeta] = useState<Map<string, ToolMeta>>(new Map());
+  // Read once at mount, not on every render: it is the reader's setting rather
+  // than the window's state, and it outlives the window.
+  const [display, setDisplay] = useState<Display>(loadDisplay);
+  const changeDisplay = useCallback((next: Display) => {
+    setDisplay(next);
+    saveDisplay(next);
+  }, []);
 
   // Sessions that are not on screen still receive events — that is the whole
   // point of the app — so the reducers are keyed by session id and run
@@ -428,38 +436,45 @@ export function App() {
 
   return (
     <ToolMetaProvider meta={toolMeta}>
-      <LimitsContext.Provider value={limits}>
-        <Workspace
-          tiling={tiling}
-          sessions={sessions}
-          stateOf={stateOf}
-          statusOf={statusOf}
-          onTiling={(step) => setTiling(step)}
-          onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
-          onAttach={(id, items) =>
-            patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
-          }
-          onDetach={(id, item) =>
-            patch(id, (was) => ({
-              ...was,
-              attachments: was.attachments.filter((entry) => entry.id !== item),
-            }))
-          }
-          onSend={send}
-          onInterrupt={(id) => {
-            invoke("interrupt", { session: id }).catch(() => {});
-          }}
-          onAnswer={answer}
-          onDecidePlan={decidePlan}
-          onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
-          onSavePlan={savePlan}
-          onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
-          onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
-          onCloseSession={closeSession}
-          onHome={() => setTiling(EMPTY)}
-          onOpenFolder={openFolder}
-        />
-      </LimitsContext.Provider>
+      {/* Wraps the whole window, which is what makes a sub-agent's reasoning obey
+          the same switch as the conversation that delegated it: the transcript
+          reads this at every depth it recurses to. */}
+      <DisplayContext.Provider value={display}>
+        <LimitsContext.Provider value={limits}>
+          <Workspace
+            tiling={tiling}
+            display={display}
+            onDisplay={changeDisplay}
+            sessions={sessions}
+            stateOf={stateOf}
+            statusOf={statusOf}
+            onTiling={(step) => setTiling(step)}
+            onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
+            onAttach={(id, items) =>
+              patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
+            }
+            onDetach={(id, item) =>
+              patch(id, (was) => ({
+                ...was,
+                attachments: was.attachments.filter((entry) => entry.id !== item),
+              }))
+            }
+            onSend={send}
+            onInterrupt={(id) => {
+              invoke("interrupt", { session: id }).catch(() => {});
+            }}
+            onAnswer={answer}
+            onDecidePlan={decidePlan}
+            onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
+            onSavePlan={savePlan}
+            onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
+            onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
+            onCloseSession={closeSession}
+            onHome={() => setTiling(EMPTY)}
+            onOpenFolder={openFolder}
+          />
+        </LimitsContext.Provider>
+      </DisplayContext.Provider>
     </ToolMetaProvider>
   );
 }
@@ -490,12 +505,22 @@ function rebase(draft: PlanDraft | null, plan: Plan | null): PlanDraft | null {
   return untouched ? draftOf(plan) : draft;
 }
 
-/** The one-line summary the launchpad card shows for a session. */
+/**
+ * The one-line summary the rail and the launchpad card show for a session.
+ *
+ * The tool's name and what the call is about, once each. Pasting core's summary
+ * after the name printed the name twice for every tool whose summary *is* its
+ * name — `progress progress`, `agent agent(explore)` — because `summarize_call`
+ * falls back to the bare name when it recognizes none of the call's argument
+ * keys. `displayToolSummary` is the registry's answer to exactly that, and the
+ * transcript has been using it all along.
+ */
 function describe(event: AgentEvent): string | null {
   switch (event.type) {
     case "ToolStart": {
-      const data = event.data as { name: string; summary: string };
-      return `${data.name} ${data.summary}`.trim();
+      const data = event.data as { name: string; summary: string; input: unknown };
+      const about = displayToolSummary(data.name, data.summary, data.input);
+      return about && about !== data.name ? `${data.name} · ${about}` : data.name;
     }
     case "Compacting":
       return "compacting history";

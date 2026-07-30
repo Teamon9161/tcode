@@ -35,6 +35,28 @@ describe("displayToolSummary", () => {
     );
   });
 
+  // The whole row for a skill call used to be the word `skill`: core's generic
+  // summary picks the first of a fixed set of argument keys, and this tool's
+  // argument is `name`, which is not one of them.
+  it("says which skill was loaded", () => {
+    expect(displayToolSummary("skill", "skill", { name: "impeccable" })).toBe("impeccable");
+    expect(
+      displayToolSummary("skill", "skill", { name: "dolphindb", arguments: "bond curve" }),
+    ).toBe("dolphindb bond curve");
+  });
+
+  // The fallback describer feeds a batched call's row, where there is no
+  // `ToolStart` summary at all.
+  it("reaches a name when a call has nothing more specific", () => {
+    expect(displayToolSummary("mcp__x__lookup", "mcp__x__lookup", { name: "GOVT-10Y" })).toBe(
+      "GOVT-10Y",
+    );
+    // A call with both is about the path; `name` is the last resort, not the first.
+    expect(
+      displayToolSummary("mcp__x__lookup", "mcp__x__lookup", { name: "n", path: "src/a.rs" }),
+    ).toBe("src/a.rs");
+  });
+
   it("strips terminal CSI and OSC escapes only for shell output", () => {
     const raw = "\x1b[32mgreen\x1b[0m\n\x1b]0;title\x07plain\n\x1b]8;;https://example.test\x1b\\link\x1b]8;;\x1b\\";
     expect(stripTerminalEscapes(raw)).toBe("green\nplain\nlink");

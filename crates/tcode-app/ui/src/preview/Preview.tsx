@@ -8,6 +8,7 @@ import { BLANK, LimitsContext, type SessionState } from "../session";
 import { NO_METER, type Limits, type Meter } from "../usage";
 import { openInspect, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
+import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
@@ -85,11 +86,16 @@ const ACTIVITY: Record<string, string> = {
 const TOOL_META = new Map<string, ToolMeta>(
   (
     [
-      { name: "read", route: "transcript", quiet_output: true, hide_success_result: false },
-      { name: "edit", route: "transcript", quiet_output: false, hide_success_result: true },
-      { name: "write", route: "transcript", quiet_output: false, hide_success_result: true },
-      { name: "shell", route: "transcript", quiet_output: false, hide_success_result: false },
-      { name: "progress", route: "progress", quiet_output: false, hide_success_result: false },
+      // `display_name` is core's own (`Tool::display_name`), so these are the
+      // real answers and not prettier ones: `shell` really does show as "Run".
+      { name: "read", display_name: "Read", route: "transcript", quiet_output: true, hide_success_result: false },
+      { name: "edit", display_name: "Edit", route: "transcript", quiet_output: false, hide_success_result: true },
+      { name: "write", display_name: "Write", route: "transcript", quiet_output: false, hide_success_result: true },
+      { name: "shell", display_name: "Run", route: "transcript", quiet_output: false, hide_success_result: false },
+      { name: "grep", display_name: "Search", route: "transcript", quiet_output: true, hide_success_result: false },
+      { name: "agent", display_name: "Agent", route: "transcript", quiet_output: false, hide_success_result: false },
+      { name: "skill", display_name: "Skill", route: "transcript", quiet_output: false, hide_success_result: false },
+      { name: "progress", display_name: "Progress", route: "progress", quiet_output: false, hide_success_result: false },
       // The retired name a resumed session still holds, aliased onto the live
       // tool exactly as `RETIRED_NAMES` in `commands.rs` does it. In the fixture
       // for the same reason it is in the backend: without it this scene showed a
@@ -97,11 +103,18 @@ const TOOL_META = new Map<string, ToolMeta>(
       // conversation used to do.
       {
         name: "update_progress",
+        display_name: "Progress",
         route: "progress",
         quiet_output: false,
         hide_success_result: false,
       },
-      { name: "ask_user", route: "silent", quiet_output: false, hide_success_result: false },
+      {
+        name: "ask_user",
+        display_name: "Ask_user",
+        route: "silent",
+        quiet_output: false,
+        hide_success_result: false,
+      },
     ] as ToolMeta[]
   ).map((meta) => [meta.name, meta]),
 );
@@ -246,7 +259,10 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
   },
   {
     kind: "batch",
-    label: "reading 3 files",
+    // Core's own `batch_label`, verbatim: it title-cases the tool, so a fixture
+    // that wrote "reading 3 files" was the reason two casings for one phrase went
+    // unnoticed sitting in the same column.
+    label: "Read 3 files",
     blocks: [
       {
         kind: "tool",
@@ -274,6 +290,27 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
       },
     ],
   },
+  // A skill call, which used to reach the transcript as the bare word `skill`:
+  // core's generic summary has no key for this tool's argument.
+  {
+    kind: "tool",
+    callId: "k1",
+    name: "skill",
+    summary: "skill",
+    input: { name: "impeccable", arguments: "audit the trace column" },
+    result: { preview: "# Skill: impeccable", content: "# Skill: impeccable\n\n…", isError: false },
+  },
+  // A delegating call and its run, paired by `parent_call` the way the wire pairs
+  // them. Both are here because the transcript's job is to draw them as one step:
+  // with the call's row alone the reader got `agent · agent(explore)` above a row
+  // that already said everything.
+  {
+    kind: "tool",
+    callId: "a1",
+    name: "agent",
+    summary: "agent(explore)",
+    input: { agent: "explore", prompt: "Search the workspace for direct calls to sleep." },
+  },
   {
     kind: "run",
     run: "r1",
@@ -281,7 +318,9 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
       kind: "explore",
       model: "claude-opus-5",
       summary: "Find every other place that sleeps inline",
-      prompt: "Search the workspace for direct calls to tokio::time::sleep outside tests.",
+      prompt:
+        "Search the workspace for direct calls to tokio::time::sleep outside tests.\n\nReport, for each hit:\n\n- the file and line\n- whether it is inside a retry loop\n- whether a test already covers it\n\nDo not edit anything.",
+      parentCall: "a1",
     },
     blocks: [
       { kind: "assistant", text: "Searching for direct sleeps outside test modules." },
@@ -295,6 +334,19 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
     ],
   },
   {
+    kind: "tool",
+    callId: "a2",
+    name: "agent",
+    summary: "agent(general)",
+    input: { agent: "general", prompt: "Write a Sleeper trait." },
+    result: {
+      preview: "Added `Sleeper` with two implementations.",
+      content:
+        "Added `Sleeper` in `agent/retry.rs` with two implementations:\n\n- `RealSleeper` — delegates to `tokio::time::sleep`.\n- `InstantSleeper` — returns immediately and records the delay it was asked for.\n\nThe retry loop takes `&dyn Sleeper`, so no type parameter spreads through `Agent`.",
+      isError: false,
+    },
+  },
+  {
     kind: "run",
     run: "r2",
     meta: {
@@ -302,7 +354,12 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
       model: "claude-sonnet-5",
       summary: "Draft the Sleeper trait and its test double",
       prompt: "Write a Sleeper trait with a real and an instant implementation.",
-      status: "ok",
+      parentCall: "a2",
+      // The real wire value (`TaskRunStatus::Done`). It said "ok" here, which no
+      // status has ever been — so the transcript's `status === "ok"` test looked
+      // right in the preview and drew a red cross on every finished run in the
+      // actual app.
+      status: "done",
       toolCalls: 4,
     },
     blocks: [
@@ -311,6 +368,22 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
         text: "Added `Sleeper` with `RealSleeper` and `InstantSleeper`.\n\n```rust\npub trait Sleeper: Send + Sync {\n    /// Instant in tests, real in production.\n    fn sleep(&self, delay: Duration) -> BoxFuture<'_, ()>;\n}\n```",
       },
     ],
+  },
+  // The other two endings, which are neither a success nor an error and had no
+  // way to say so: both used to wear the failure cross.
+  {
+    kind: "run",
+    run: "r3",
+    meta: {
+      kind: "explore",
+      model: "claude-haiku-4-5",
+      summary: "Survey the watchdog's other timers",
+      prompt: "List every timer the watchdog owns.",
+      parentCall: "",
+      status: "interrupted",
+      toolCalls: 2,
+    },
+    blocks: [{ kind: "assistant", text: "Found two so far — the step deadline and…" }],
   },
   { kind: "note", text: "retrying (1/3): connection reset by peer" },
   {
@@ -574,6 +647,15 @@ export function Preview() {
   const [tiling, setTiling] = useState<Tiling>(() => layoutFor(wanted()));
   const [draft, setDraft] = useState("");
   const [attachments, setAttachments] = useState<Pasted[]>([]);
+  // Live, like the draft and the picker fixtures: this is a switch whose whole
+  // acceptance test is "flip it and the column changes", which a fixed value
+  // cannot show. The `session` scene starts it on for the same reason the `model`
+  // scene opens its panel — reasoning-as-prose is a shape worth seeing, and the
+  // default state is "absent", which needs no demonstration.
+  const [display, setDisplay] = useState<Display>(() => ({
+    ...DISPLAY_DEFAULT,
+    thinking: wanted() === "session",
+  }));
 
   const pick = (name: Scene) => {
     setScene(name);
@@ -639,6 +721,7 @@ export function Preview() {
 
   return (
     <ToolMetaProvider meta={TOOL_META}>
+      <DisplayContext.Provider value={display}>
       {/* A conversation with nothing in it yet is also the honest place to show
           the other half of the usage panel: a provider that reports no
           subscription windows at all. */}
@@ -668,6 +751,8 @@ export function Preview() {
             {scene !== "launchpad" && (
               <Workspace
                 tiling={tiling}
+                display={display}
+                onDisplay={setDisplay}
                 sessions={SESSIONS}
                 stateOf={stateOf}
                 statusOf={(id) => STATUS[id] ?? "idle"}
@@ -691,6 +776,7 @@ export function Preview() {
           </div>
         </div>
       </LimitsContext.Provider>
+      </DisplayContext.Provider>
     </ToolMetaProvider>
   );
 }

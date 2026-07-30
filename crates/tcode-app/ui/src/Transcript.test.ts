@@ -1,7 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import type { Block } from "./blocks";
-import { changeSetLabel, groupTranscriptBlocks } from "./Transcript";
+import type { Block, RunMeta } from "./blocks";
+import {
+  agentKind,
+  changeSetLabel,
+  groupTranscriptBlocks,
+  runInspect,
+  runState,
+} from "./Transcript";
 
 const tool = (name: string, callId: string, input: unknown = {}): Extract<Block, { kind: "tool" }> => ({
   kind: "tool",
@@ -40,7 +46,7 @@ describe("groupTranscriptBlocks", () => {
         tool("write", "w2", { file_path: "src/toolViews.tsx", content: "next" }),
         tool("edit", "e5", { file_path: "src/Transcript.tsx", old_string: "b", new_string: "c" }),
       ]),
-    ).toBe("edit 2 files");
+    ).toBe("Edit 2 files");
   });
 
   it("collapses consecutive shell and bash calls into a command run", () => {
@@ -55,15 +61,63 @@ describe("groupTranscriptBlocks", () => {
     expect(separated.map((item) => item.kind)).toEqual(["block", "exploration", "block"]);
   });
 
-  it("keeps thinking inside an exploration step until another transcript block arrives", () => {
+  // Reasoning used to be swept into the surrounding exploration group, from when
+  // it was a folded row that looked like a step. It is prose now, so it is a
+  // boundary like any other prose — and a group must not be able to swallow it:
+  // folded shut, "show me the reasoning" would answer by hiding it.
+  it("treats reasoning as a boundary rather than part of an exploration step", () => {
     const items = groupTranscriptBlocks([
       tool("read", "r1"),
       { kind: "thinking", text: "The next target is likely nearby." },
       tool("grep", "g1"),
     ]);
 
-    expect(items).toHaveLength(1);
-    expect(items[0]).toMatchObject({ kind: "exploration", blocks: [{ callId: "r1" }, { kind: "thinking" }, { callId: "g1" }] });
+    expect(items.map((item) => item.kind)).toEqual(["exploration", "block", "exploration"]);
+  });
+});
+
+describe("runState", () => {
+  // `TaskRunStatus` on the wire, and the reason every finished sub-agent used to
+  // wear the failure cross: the comparison was against "ok", which no status has
+  // ever been.
+  it("reads the statuses core actually sends", () => {
+    expect(runState(undefined)).toBe("running");
+    expect(runState("running")).toBe("running");
+    expect(runState("done")).toBe("idle");
+    expect(runState("failed")).toBe("failed");
+  });
+
+  it("does not call a stopped run a failure", () => {
+    expect(runState("cancelled")).toBe("idle");
+    expect(runState("interrupted")).toBe("idle");
+  });
+});
+
+describe("runInspect", () => {
+  const meta = (over: Partial<RunMeta> = {}): RunMeta => ({
+    kind: "explore",
+    model: "claude-opus-5",
+    prompt: "Find every place that sleeps inline.\nReport file and line.",
+    summary: "Find the inline sleeps",
+    parentCall: "a1",
+    ...over,
+  });
+
+  it("names the pane after the run rather than after its species", () => {
+    expect(runInspect("r1", meta(), "Explore").label).toBe("Explore · Find the inline sleeps");
+  });
+
+  it("falls back to the prompt's first line when no summary was written", () => {
+    expect(runInspect("r1", meta({ summary: "" }), "Explore").label).toBe(
+      "Explore · Find every place that sleeps inline.",
+    );
+  });
+});
+
+describe("agentKind", () => {
+  it("capitalizes the config key, and names an unnamed one", () => {
+    expect(agentKind("explore")).toBe("Explore");
+    expect(agentKind("")).toBe("Agent");
   });
 
   it("keeps a model response and execution call as grouping boundaries", () => {

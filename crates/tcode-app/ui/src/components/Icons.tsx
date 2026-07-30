@@ -158,3 +158,13 @@ export const CheckIcon = (props: IconProps) => (
     <path d="m5 12.5 4.5 4.5L19 7" />
   </Glyph>
 );
+
+/* Sliders rather than a cog: what this opens is a short list of switches, and a
+   cog in a title bar promises the application's whole preferences. */
+export const SettingsIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M4 8h10M18 8h2M4 16h4M12 16h8" />
+    <circle cx="16" cy="8" r="2.3" />
+    <circle cx="10" cy="16" r="2.3" />
+  </Glyph>
+);

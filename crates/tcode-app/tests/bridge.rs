@@ -569,6 +569,15 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
         "a tool that merely shares its name does not"
     );
 
+    // The webview labels a call with core's own display name. Without it the
+    // far side has to title-case tool names itself, which is a second naming
+    // rule for the same tools sitting in the same column as core's own.
+    assert_eq!(find("read").display_name, "Read");
+    assert_eq!(find("progress").display_name, "Progress");
+    // A retired name wears the live tool's, exactly as the TUI's registry does
+    // it: an old log must not label the same call differently.
+    assert_eq!(find("update_progress").display_name, "Progress");
+
     // A resumed session holds whatever the tool was called when it was recorded.
     // Without an entry the webview falls back to the plain transcript treatment,
     // so an old `update_progress` call came back as a tool card in the

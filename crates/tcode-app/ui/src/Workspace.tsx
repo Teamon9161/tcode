@@ -21,11 +21,21 @@ import {
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, SidebarIcon } from "./components/Icons";
+import { BackIcon, ChevronDown, ChevronRight, CloseIcon, SidebarIcon } from "./components/Icons";
 import { navValue } from "./inspect";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
+import { DisplayMenu } from "./DisplayMenu";
+import type { Display } from "./display";
+import {
+  loadOrder,
+  moveProject,
+  railGroups,
+  saveOrder,
+  sessionTitle,
+  type RailGroup,
+} from "./rail";
 
 /**
  * The window: a rail of conversations on the left, a tiled field of panes
@@ -39,6 +49,12 @@ import { Panes, type PaneContext } from "./Panes";
  * for the stretch where one conversation is the whole job — the toggle lives
  * there because the rail is the window's, not any pane's, which is the same rule
  * that keeps session actions out of the bar (AGENTS.md rule 9c).
+ *
+ * It groups by folder (`rail.ts`), and that is not a nicety: a conversation is
+ * named after its folder, so two in one folder were two identical rows and the
+ * list could account for both without saying which was which. The folder is a
+ * heading and each conversation is named by what it was asked to do — the two
+ * facts a reader needs are different facts, so they are different elements.
  *
  * Nothing in the rail starts a *new* conversation any more. That button used to
  * sit at the bottom of the list and was the one row in it that was not a
@@ -72,6 +88,8 @@ export function Workspace({
   onCloseSession,
   onHome,
   onOpenFolder,
+  display,
+  onDisplay,
 }: {
   tiling: Tiling;
   sessions: SessionInfo[];
@@ -92,12 +110,31 @@ export function Workspace({
   onCloseSession: (session: string) => void;
   onHome: () => void;
   onOpenFolder: (path: string) => Promise<void>;
+  display: Display;
+  onDisplay: (next: Display) => void;
 }) {
   const narrow = useNarrow();
   const [rail, setRail] = useState(true);
+  // The arrangement of folders persists; which ones are folded does not. An
+  // order is something you set once and then rely on, while a fold is a thing
+  // you do to get a long list out of the way for the next few minutes — coming
+  // back to a rail with half of it collapsed by a decision you made last week is
+  // the opposite of accounting for every conversation.
+  const [order, setOrder] = useState<string[]>(loadOrder);
+  const [folded, setFolded] = useState<Set<string>>(() => new Set());
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
+  const groups = useMemo(() => railGroups(sessions, order), [sessions, order]);
+
+  const move = useCallback(
+    (path: string, to: number) => {
+      const next = moveProject(groups, path, to);
+      setOrder(next);
+      saveOrder(next);
+    },
+    [groups],
+  );
 
   // The files index is the one inspect view not reached by pointing at
   // something in the transcript, so it keeps a button — on the conversation's
@@ -130,7 +167,10 @@ export function Workspace({
         const sibling = panes(current).find(
           (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
         );
-        if (sibling?.pane.kind === "inspect" && navValue(sibling.pane.nav).kind === "workspace-tree") {
+        if (
+          sibling?.pane.kind === "inspect" &&
+          navValue(sibling.pane.nav).kind === "workspace-tree"
+        ) {
           return close(current, sibling.id);
         }
         return openInspect(current, pane, session, { kind: "workspace-tree" });
@@ -285,6 +325,11 @@ export function Workspace({
           <SidebarIcon size={15} />
         </button>
         <span className="topbar-gap" {...DRAG} />
+        {/* What the window draws, not what any conversation holds — which is why
+            it passes the bar's own test (rule 9c) where a session action would
+            not. With the window split, "show reasoning" cannot mean one thing in
+            the left pane and another in the right. */}
+        <DisplayMenu display={display} onChange={onDisplay} />
         <WindowControls />
       </header>
 
@@ -297,33 +342,27 @@ export function Workspace({
               and the mark that used to sit in this corner was a second status
               light for the session the rail is already showing. */}
           <ul className="rail-list">
-            {/* Two lines, and the second is the one that makes the list usable:
-                a conversation is named after its folder, so several open in one
-                folder were several identical rows and the rail could account for
-                them without telling you which was which. The activity line is
-                what each one is doing or last did — the same line the launchpad
-                card carries, which is where it was already the answer. */}
-            {sessions.map((entry) => (
-              <li key={entry.id}>
-                <button
-                  className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
-                  onClick={() => onTiling((current) => show(current, entry.id))}
-                  title={entry.cwd}
-                >
-                  <StatusDot status={statusOf(entry.id)} />
-                  <span className="rail-lines">
-                    <span className="rail-name">{entry.name}</span>
-                    <span className="rail-activity">{stateOf(entry.id).activity}</span>
-                  </span>
-                </button>
-                <button
-                  className="rail-close"
-                  onClick={() => onCloseSession(entry.id)}
-                  aria-label={`Close ${entry.name}`}
-                >
-                  <CloseIcon size={13} />
-                </button>
-              </li>
+            {groups.map((group, at) => (
+              <RailProject
+                key={group.path}
+                group={group}
+                at={at}
+                total={groups.length}
+                folded={folded.has(group.path)}
+                onScreen={onScreen}
+                stateOf={stateOf}
+                statusOf={statusOf}
+                onFold={() =>
+                  setFolded((was) => {
+                    const next = new Set(was);
+                    if (!next.delete(group.path)) next.add(group.path);
+                    return next;
+                  })
+                }
+                onMove={(to) => move(group.path, to)}
+                onShow={(id) => onTiling((current) => show(current, id))}
+                onCloseSession={onCloseSession}
+              />
             ))}
           </ul>
         </nav>
@@ -331,6 +370,142 @@ export function Workspace({
 
       <Panes tiling={shown} context={context} />
     </div>
+  );
+}
+
+/**
+ * One folder and the conversations in it.
+ *
+ * The heading is the folder; the rows are conversations, each named by the first
+ * thing it was asked to do. The count stays visible while the group is folded,
+ * which is what keeps folding from hiding the fact the rail exists to publish —
+ * and a folded group whose conversation needs an answer still shows it, because
+ * that is the one thing that must never be foldable away.
+ *
+ * Reordering is Alt+arrow and two buttons that appear on hover, which is the
+ * vocabulary the plan editor already uses for the same act. Drag was the obvious
+ * alternative and buys nothing here: five rows, and a keyboard path for free.
+ */
+function RailProject({
+  group,
+  at,
+  total,
+  folded,
+  onScreen,
+  stateOf,
+  statusOf,
+  onFold,
+  onMove,
+  onShow,
+  onCloseSession,
+}: {
+  group: RailGroup;
+  at: number;
+  total: number;
+  folded: boolean;
+  onScreen: Set<string>;
+  stateOf: (session: string) => SessionState;
+  statusOf: (session: string) => Status;
+  onFold: () => void;
+  onMove: (to: number) => void;
+  onShow: (session: string) => void;
+  onCloseSession: (session: string) => void;
+}) {
+  const needs = group.sessions.filter((entry) => statusOf(entry.id) === "waiting").length;
+  const running = group.sessions.some((entry) => statusOf(entry.id) === "running");
+
+  return (
+    <li
+      className={`rail-group${folded ? " is-folded" : ""}`}
+      onKeyDown={(event) => {
+        if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        onMove(event.key === "ArrowUp" ? at - 1 : at + 1);
+      }}
+    >
+      <div className="rail-project">
+        <button
+          type="button"
+          className="rail-project-head"
+          onClick={onFold}
+          aria-expanded={!folded}
+          title={group.path}
+        >
+          {folded ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
+          <span className="rail-project-name">{group.name}</span>
+          {/* Folded, the group has to keep answering the rail's whole question.
+              A conversation waiting on a human is said in words rather than a
+              count, because it is the one state worth interrupting for. */}
+          {needs > 0 ? (
+            <span className="rail-needs">{needs === 1 ? "needs you" : `${needs} need you`}</span>
+          ) : (
+            folded && (
+              <span className="rail-count">
+                {running && <span className="rail-live" aria-label="running" />}
+                {group.sessions.length}
+              </span>
+            )
+          )}
+        </button>
+        <span className="rail-project-tools">
+          <button
+            type="button"
+            className="icon-btn"
+            title="Move up (Alt+↑)"
+            aria-label={`Move ${group.name} up`}
+            disabled={at === 0}
+            onClick={() => onMove(at - 1)}
+          >
+            ↑
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
+            title="Move down (Alt+↓)"
+            aria-label={`Move ${group.name} down`}
+            disabled={at === total - 1}
+            onClick={() => onMove(at + 1)}
+          >
+            ↓
+          </button>
+        </span>
+      </div>
+
+      {!folded && (
+        <ul className="rail-sessions">
+          {group.sessions.map((entry) => {
+            const state = stateOf(entry.id);
+            // The first prompt, and the activity line only until there is one:
+            // "not started" is the whole truth about a conversation nobody has
+            // typed into yet, and a stale first line beats no line at all.
+            const title = sessionTitle(state.blocks) ?? state.activity;
+            return (
+              <li key={entry.id}>
+                <button
+                  className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
+                  onClick={() => onShow(entry.id)}
+                  title={title}
+                >
+                  <StatusDot status={statusOf(entry.id)} />
+                  <span className="rail-lines">
+                    <span className="rail-name">{title}</span>
+                    <span className="rail-activity">{state.activity}</span>
+                  </span>
+                </button>
+                <button
+                  className="rail-close"
+                  onClick={() => onCloseSession(entry.id)}
+                  aria-label={`Close this conversation in ${group.name}`}
+                >
+                  <CloseIcon size={13} />
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </li>
   );
 }
 

@@ -1,13 +1,22 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import type { Block } from "./blocks";
+import { runPairs, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
+import { useDisplay } from "./display";
 import { rich } from "./rich";
 import { readChanges } from "./diff";
 import { isPlanSubmission } from "./plan";
-import { useToolMeta, viewFor, displayToolOutput, displayToolSummary, transcriptGroupFor } from "./toolViews";
+import {
+  useToolMeta,
+  useToolName,
+  viewFor,
+  displayToolOutput,
+  displayToolSummary,
+  transcriptGroupFor,
+} from "./toolViews";
 import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
 import { StatusDot } from "./components/Status";
+import type { Status } from "./types";
 
 /**
  * The conversation.
@@ -75,7 +84,25 @@ export function BlockList({
   /** Batches are already a deliberate grouping boundary. */
   groupExploration?: boolean;
 }) {
-  const items = groupExploration ? groupTranscriptBlocks(blocks) : blocks.map((block) => ({ kind: "block" as const, block }));
+  const { thinking } = useDisplay();
+  const pairs = useMemo(() => runPairs(blocks), [blocks]);
+
+  // Two things leave the list before anything is grouped, so grouping stays one
+  // rule about steps: reasoning nobody asked to see, and the delegating call a
+  // run beside it already accounts for.
+  const shown = useMemo(
+    () =>
+      blocks.filter(
+        (block) =>
+          !(block.kind === "thinking" && !thinking) &&
+          !(block.kind === "tool" && pairs.superseded.has(block.callId)),
+      ),
+    [blocks, thinking, pairs],
+  );
+
+  const items = groupExploration
+    ? groupTranscriptBlocks(shown)
+    : shown.map((block) => ({ kind: "block" as const, block }));
   return (
     <>
       {items.map((item, index) =>
@@ -85,6 +112,13 @@ export function BlockList({
           <ChangesGroup key={index} blocks={item.blocks} onOpen={onOpen} />
         ) : item.kind === "commands" ? (
           <CommandsGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+        ) : item.block.kind === "run" ? (
+          <RunCall
+            key={index}
+            block={item.block}
+            report={pairs.report.get(item.block.run)}
+            onOpen={onOpen}
+          />
         ) : (
           <BlockView key={index} block={item.block} onOpen={onOpen} />
         ),
@@ -94,22 +128,26 @@ export function BlockList({
 }
 
 type ToolBlock = Extract<Block, { kind: "tool" }>;
-type ExplorationBlock = ToolBlock | Extract<Block, { kind: "thinking" }>;
 export type TranscriptItem =
   | { kind: "block"; block: Block }
-  | { kind: "exploration"; blocks: ExplorationBlock[] }
+  | { kind: "exploration"; blocks: ToolBlock[] }
   | { kind: "changes"; blocks: ToolBlock[] }
   | { kind: "commands"; blocks: ToolBlock[] };
 
 /** Consecutive low-risk inspection calls are one trace step, not a stack of
- * cards. Thinking stays with the surrounding inspection so the live trace
- * keeps one coherent boundary; it has its own disclosure inside the group.
+ * cards.
  *
  * Consecutive edits and commands receive their own boundaries, but only when
- * there are at least two: one call is already a complete, useful trace row. */
+ * there are at least two: one call is already a complete, useful trace row.
+ *
+ * Reasoning used to be swept into the surrounding exploration group, from when
+ * it was a folded row that looked like a step. It is prose now — shown as prose
+ * or not at all — so it is a boundary between steps like any other prose, and a
+ * group must not be able to swallow it: folded shut, "show me the reasoning"
+ * would have answered by hiding it. */
 export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
   const grouped: TranscriptItem[] = [];
-  let exploration: ExplorationBlock[] = [];
+  let exploration: ToolBlock[] = [];
   let changes: ToolBlock[] = [];
   let commands: ToolBlock[] = [];
   const flushExploration = () => {
@@ -132,8 +170,6 @@ export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
     if (block.kind === "tool" && group === "exploration") {
       flushChanges();
       flushCommands();
-      exploration.push(block);
-    } else if (block.kind === "thinking" && exploration.length > 0) {
       exploration.push(block);
     } else if (block.kind === "tool" && group === "changes") {
       flushExploration();
@@ -190,15 +226,13 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
       return <ToolCall block={block} onOpen={onOpen} />;
     case "batch":
       return <BatchCall block={block} onOpen={onOpen} />;
+    // Reached only for a run whose parent call is not in the same list — the
+    // paired case is drawn by `BlockList`, which is where the pairing is known.
     case "run":
       return <RunCall block={block} onOpen={onOpen} />;
   }
 }
 
-/** Reasoning is collapsed by default: available, not in the way. It is the same
- *  trace row as every other step — it used to be the one thing in the column
- *  with no shared shape at all, which is what made the trace look assembled
- *  from parts. */
 /**
  * Images that rode with a prompt, at a size that says which one it was.
  *
@@ -226,11 +260,28 @@ function Images({ urls, onOpen }: { urls: string[]; onOpen: (value: Inspect) => 
   );
 }
 
+/**
+ * Reasoning, when the reader has asked for it (`display.ts`).
+ *
+ * Prose in the column, not a row in the trace. Folded behind a chevron it was
+ * the worst available shape: identical to a step the agent took, so the eye had
+ * to check every row in the column to find out which ones were things that
+ * happened — and what it hid was the one kind of content nobody needs a
+ * disclosure for, because either you are reading the reasoning or you have it
+ * switched off.
+ *
+ * Deliberately not through `rich`. Reasoning is a draft — half-finished
+ * sentences, stray backticks, sometimes a fenced block that never closes — and
+ * rendering it as a document promises an editorial pass that is not there.
+ * `pre-wrap` keeps the line structure the model actually produced, which is the
+ * whole reason this is legible at all.
+ */
 function Thinking({ text }: { text: string }) {
   return (
-    <TraceGroup label="thinking">
+    <div className="thinking">
+      <span className="thinking-tag">thinking</span>
       <div className="thinking-body">{text}</div>
-    </TraceGroup>
+    </div>
   );
 }
 
@@ -309,7 +360,11 @@ function TraceGroup({
 }) {
   const [open, setOpen] = useState(defaultOpen);
   return (
-    <section className={`trace${open ? " is-open" : ""}${failed ? " is-failed" : ""}`}>
+    <section
+      className={`trace${open ? " is-open" : ""}${failed ? " is-failed" : ""}${
+        running ? " is-running" : ""
+      }`}
+    >
       <button className="trace-head" onClick={() => setOpen((was) => !was)} aria-expanded={open}>
         {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         <span className="trace-label">{label}</span>
@@ -326,23 +381,18 @@ function ExplorationGroup({
   blocks,
   onOpen,
 }: {
-  blocks: ExplorationBlock[];
+  blocks: ToolBlock[];
   onOpen: (value: Inspect) => void;
 }) {
-  const tools = blocks.filter((block): block is ToolBlock => block.kind === "tool");
   return (
     <TraceGroup
-      label={explorationSummary(tools)}
-      running={!tools.every((block) => block.result !== undefined)}
-      failed={tools.some((block) => block.result?.isError)}
+      label={explorationSummary(blocks)}
+      running={!blocks.every((block) => block.result !== undefined)}
+      failed={blocks.some((block) => block.result?.isError)}
     >
-      {blocks.map((block, index) =>
-        block.kind === "thinking" ? (
-          <Thinking key={`thinking-${index}`} text={block.text} />
-        ) : (
-          <ExplorationItem key={block.callId} block={block} onOpen={onOpen} />
-        ),
-      )}
+      {blocks.map((block) => (
+        <ExplorationItem key={block.callId} block={block} onOpen={onOpen} />
+      ))}
     </TraceGroup>
   );
 }
@@ -376,7 +426,7 @@ export function changeSetLabel(blocks: ToolBlock[]): string {
     }
   }
   const files = paths.size || blocks.length;
-  return `edit ${files} ${files === 1 ? "file" : "files"}`;
+  return `Edit ${files} ${files === 1 ? "file" : "files"}`;
 }
 
 function CommandsGroup({
@@ -388,7 +438,7 @@ function CommandsGroup({
 }) {
   return (
     <TraceGroup
-      label={`run ${blocks.length} ${blocks.length === 1 ? "command" : "commands"}`}
+      label={`Run ${blocks.length} ${blocks.length === 1 ? "command" : "commands"}`}
       running={!blocks.every((block) => block.result !== undefined)}
       failed={blocks.some((block) => block.result?.isError)}
     >
@@ -401,13 +451,14 @@ function CommandsGroup({
 
 function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: Inspect) => void }) {
   const view = viewFor(block.name);
+  const toolName = useToolName();
   const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
   const summary = displayToolSummary(block.name, block.summary, block.input);
   const failed = block.result?.isError ?? false;
 
   return (
     <div className={`exploration-item${failed ? " is-failed" : ""}`}>
-      <span className="exploration-tool">{block.name}</span>
+      <span className="exploration-tool">{toolName(block.name)}</span>
       <span className="exploration-summary">{summary || "details"}</span>
       {failed && <span className="tool-failed">failed</span>}
       {target && <PopOut onOpen={() => onOpen(target)} />}
@@ -434,12 +485,15 @@ function PopOut({ onOpen }: { onOpen: () => void }) {
   );
 }
 
+/** Our words, and capitalized like core's own batch labels ("Read 15 files").
+ *  Two casings for the same phrase used to sit in one column, because one string
+ *  came from `batch_label` and the other from here. */
 function explorationSummary(blocks: ToolBlock[]): string {
   const reads = blocks.filter((block) => block.name === "read").length;
   const searches = blocks.length - reads;
   const labels: string[] = [];
-  if (reads > 0) labels.push(`read ${reads} ${reads === 1 ? "file" : "files"}`);
-  if (searches > 0) labels.push(`search ${searches} ${searches === 1 ? "pattern" : "patterns"}`);
+  if (reads > 0) labels.push(`Read ${reads} ${reads === 1 ? "file" : "files"}`);
+  if (searches > 0) labels.push(`Search ${searches} ${searches === 1 ? "pattern" : "patterns"}`);
   return labels.join(" · ");
 }
 
@@ -452,6 +506,7 @@ function ToolCall({
 }) {
   const meta = useToolMeta(block.name);
   const view = viewFor(block.name);
+  const toolName = useToolName();
   const [open, setOpen] = useState(false);
 
   // Core decides where a call belongs; `silent` means another surface already
@@ -478,15 +533,21 @@ function ToolCall({
   // diagnostic in the main reading flow.
   const showResult = done && failed;
 
+  const label = toolName(block.name);
+
   return (
-    <div className={`tool${failed ? " is-failed" : ""}${open ? " is-open" : ""}`}>
+    <div
+      className={`tool${failed ? " is-failed" : ""}${open ? " is-open" : ""}${
+        done ? "" : " is-running"
+      }`}
+    >
       <div className="tool-head">
-        <span className="tool-name">{block.name}</span>
+        <span className="tool-name">{label}</span>
 
         {/* A tool whose summary is its own name has nothing to say after the
             separator, and `update_progress · update_progress` is not a caption.
             Drop both rather than printing the word twice. */}
-        {summary && summary !== block.name && (
+        {summary && summary !== block.name && summary !== label && (
           <>
             <span className="tool-separator" aria-hidden>
               ·
@@ -553,14 +614,19 @@ function BatchCall({
  */
 function RunCall({
   block,
+  report,
   onOpen,
 }: {
   block: Extract<Block, { kind: "run" }>;
+  /** The delegating call, whose result is the report this run came back with.
+   *  Absent for a log recorded before runs carried their parent call. */
+  report?: ToolBlock;
   onOpen: (value: Inspect) => void;
 }) {
   const [open, setOpen] = useState(false);
   const status = block.meta.status;
-  const state = !status ? "running" : status === "ok" ? "idle" : "failed";
+  const state = runState(status);
+  const kind = agentKind(block.meta.kind);
 
   return (
     <div className={`run is-${state}${open ? " is-open" : ""}`}>
@@ -569,23 +635,66 @@ function RunCall({
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </button>
         <StatusDot status={state} />
-        <span className="run-title">{block.meta.summary || block.meta.kind}</span>
+        <span className="run-kind">{kind}</span>
+        <span className="run-title">{block.meta.summary || block.meta.prompt.split("\n", 1)[0]}</span>
         <span className="run-meta">
-          {block.meta.kind}
-          {block.meta.model && ` · ${block.meta.model}`}
+          {block.meta.model}
           {block.meta.toolCalls !== undefined &&
             ` · ${block.meta.toolCalls} call${block.meta.toolCalls === 1 ? "" : "s"}`}
         </span>
-        <PopOut onOpen={() => onOpen({ kind: "run", run: block.run })} />
+        {/* Named only when it is not the ordinary ending. The dot carries
+            running / done / failed; `cancelled` and `interrupted` are neither a
+            success nor an error and have no glyph of their own, so they say so
+            in words rather than borrowing one. */}
+        {status && status !== "done" && status !== "failed" && (
+          <span className="run-status">{status}</span>
+        )}
+        <PopOut onOpen={() => onOpen(runInspect(block.run, block.meta, kind))} />
       </div>
       {open && (
         <div className="run-body">
           <BlockList blocks={block.blocks} onOpen={onOpen} />
           {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
+          {report?.result?.content && (
+            <div className="run-report">{rich(report.result.content)}</div>
+          )}
         </div>
       )}
     </div>
   );
+}
+
+/**
+ * `TaskRunStatus` (`tcode_core::task_trace`), snake_cased on the wire.
+ *
+ * It was compared against `"ok"`, which no status has ever been, so every
+ * sub-agent that finished perfectly wore the failure cross — and the preview
+ * fixture said `"ok"` too, which is why looking at it never showed the bug.
+ * `cancelled` and `interrupted` are not failures either: the work stopped, it did
+ * not go wrong, and the word beside the dot is what distinguishes them.
+ */
+export function runState(status: string | undefined): Status {
+  if (!status || status === "running") return "running";
+  return status === "failed" ? "failed" : "idle";
+}
+
+/** A sub-agent's kind is a config key (`explore`, `general`), not a tool name,
+ *  so it gets its own capitalization rather than the tool table's — the same
+ *  thing the TUI's `title_case_tool_name` does for the same field. */
+export function agentKind(kind: string): string {
+  return kind ? kind.charAt(0).toUpperCase() + kind.slice(1) : "Agent";
+}
+
+/** Where this run's pop-out leads, carrying its own name: an inspect pane's
+ *  header is one line of text, and "Sub-agent" told the reader nothing that
+ *  distinguished it from the other four they had opened. */
+export function runInspect(
+  run: string,
+  meta: RunMeta,
+  kind: string,
+): Extract<Inspect, { kind: "run" }> {
+  const summary = meta.summary.trim() || meta.prompt.split("\n", 1)[0].trim();
+  return { kind: "run", run, label: summary ? `${kind} · ${summary}` : kind };
 }
 
 /** Shown while a turn is in flight. The one continuous animation in the app. */

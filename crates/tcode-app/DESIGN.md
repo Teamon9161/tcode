@@ -183,20 +183,52 @@ One shape per job, used everywhere:
   thing" genuinely is the affordance. Not used for lists, not nested.
 - **Row** — the default list affordance: hairline-separated, hover-tinted, full
   width. Projects, files and sessions in the rail are rows, not cards.
-- **Trace row** — every step in the transcript, whatever kind: thinking, one
-  call, a run of reads, a run of edits, a concurrent batch, a delegated
-  sub-agent. Chevron, label, state; expandable, and its contents indent beneath
-  it. No border, no background, no rule between steps — the column's rhythm
-  separates them, and consecutive steps sit closer to each other than to the
-  prose around them. Cards were tried and are wrong here for a structural
-  reason, not a stylistic one: these nest (a group holds calls, a run holds a
-  whole transcript) and nested cards are banned. Rows nest by indentation for as
-  deep as it goes.
 
-  The row's label is our words in the UI face ("run 2 commands"); monospace is
+  The rail's rows sit under a **group heading**, which is the folder. That is not
+  organisation for its own sake: a conversation is named after its folder, so two
+  in one folder were two identical rows and the list could account for both
+  without saying which was which. The heading answers *where*, the row answers
+  *what for* — the first thing the conversation was asked to do, over what it is
+  doing now. Folding a group keeps its count, and keeps "needs you" in words,
+  because the one fact this rail exists to publish must not be foldable away.
+  Reordering is Alt+arrow plus two buttons on hover, the same vocabulary the plan
+  editor uses for the same act.
+- **Trace row** — every step in the transcript, whatever kind: one call, a run of
+  reads, a run of edits, a concurrent batch, a delegated sub-agent. Chevron,
+  label, state; expandable, and its contents indent beneath it. No border, no
+  background, no rule between steps — the column's rhythm separates them, and
+  consecutive steps sit closer to each other than to the prose around them. Cards
+  were tried and are wrong here for a structural reason, not a stylistic one:
+  these nest (a group holds calls, a run holds a whole transcript) and nested
+  cards are banned. Rows nest by indentation for as deep as it goes.
+
+  Every row is a *thing that happened*, and that is what the shape means. Model
+  reasoning used to be one of them and is no longer: it is prose (`--muted`, one
+  size down, its own faint tag), shown when the reader asks for it and absent when
+  they do not. As a folded row it was indistinguishable from a step the agent took,
+  so the column stopped answering "what happened" at a glance — the eye had to
+  open rows to find out which ones counted.
+
+  The row's label is our words in the UI face ("Run 2 commands"); monospace is
   reserved for what is literally machine text — the tool's name, the command,
   the path. That distinction is what keeps the trace from reading as a terminal,
-  which is the product's stated anti-reference.
+  which is the product's stated anti-reference. The tool's name comes from core's
+  `display_name()`, so `Read`, `Run` and `Agent` are the same words the terminal
+  uses and the app has one casing rule rather than two side by side.
+
+  **Running is the one thing a row may colour.** The step in flight takes
+  `--brand-wash` and its name `--brand-text`, and settles back over `--dur-slow`
+  when the result lands, so a call finishing is something you see rather than a
+  repaint. That is the palette rule exactly: chroma is state, so *running* earns
+  it and a tool name never does. The pulsing dot beside it is the app's one
+  continuous animation and already reports the same fact; a shimmer or a sweep
+  here would be motion for its own sake.
+
+  A delegated run is one row, not two. The `agent` call that started it and the
+  run itself are two records of the same step, so the run's row carries the kind,
+  the model, the call count, the status and — opened — the report the call came
+  back with. Drawn as two, the step took two lines and the first said
+  `agent · agent(explore)`: the tool's name twice.
 - **Empty state** — teaches the surface (what this panel will hold and how to
   put something in it), never "nothing here". It sits on the column's own left
   edge, not centred: it is the first thing in the conversation, and the
@@ -221,18 +253,43 @@ One shape per job, used everywhere:
   The fold toggle is drawn plain in both states. A pressed treatment would spend
   the brand colour saying "the rail is open" while the rail itself is the
   largest object on screen saying the same thing.
+
+  The display switches sit here too, at the right, and they pass the same test:
+  what the window *draws* is the window's, and with two conversations on screen
+  "show reasoning" cannot mean one thing in the left pane and another in the
+  right. They are a dropdown of one-line switches on the shared `.seated` frame,
+  and picking does not dismiss it — the point of a switch is watching what it
+  did. Nothing in it changes what an agent does; that lives in the config file,
+  and holding that line is what keeps this menu from becoming a preferences
+  dialog.
 - **Scrollbars** — the platform's own, thin, and invisible until the pointer is
   over the region that scrolls. A permanent track down a pane's edge reads as a
   divider nobody drew.
+
+  Where a scrolling region carries the conversation's axis it reserves the gutter
+  on *both* edges (`scrollbar-gutter: stable both-edges`). A scrollbar that takes
+  width takes it from one side, which put the transcript's centred column half a
+  scrollbar to the left of the composer and the strip below it — neither of which
+  scrolls. That is an axis rule wearing a scrollbar's clothes.
 - **Progress strip** — one line above the composer, on the same sheet and the
-  same `--measure` axis, saying where a multi-phase task stands: the plan's name,
-  the phase it is on, `3/7`, and a 1px completed-fraction meter along its bottom
-  edge. Collapsed by default — the phase you are on is the whole answer most of
-  the time — and expanding it lists the phases, with prose only under the one
-  running. Absent entirely when there is no plan; an empty strip over every
+  same `--measure` axis, saying where a multi-phase task stands: the word `plan`,
+  the plan's name, the phase it is on, `3/7`, and a completed-fraction meter along
+  its bottom edge. Collapsed by default — the phase you are on is the whole answer
+  most of the time — and expanding it lists the phases, with prose only under the
+  one running. Absent entirely when there is no plan; an empty strip over every
   composer is furniture. The meter is the only place a bar carries chroma, and it
   earns it the same way a status dot does: it is state, and only while a turn is
   actually running.
+
+  Three details are load-bearing. **One box holds the axis** (`.strip-body`) and
+  everything is inside it; handing `--measure` to each child instead is a rule any
+  child can lose, and one did — the phase list went to the pane's left edge while
+  the line above it stayed on the composer's. **The meter runs inside a visible
+  track** of that same width: a bar with no visible end is a length nobody can read
+  a proportion out of, and this one used to be a fraction of the *pane*, which is
+  why it read as a green line of arbitrary length. **It says the word `plan`**: a
+  title, a phase and a fraction with nothing naming what they belong to is legible
+  only to somebody who already knows the app has plans in it.
 - **Composer strip** — the row under the field: `plan first` and the permission
   mode on the left, the usage ring and the model on the right. It reads as one
   sentence — what this message is, what it costs, what answers it — and as a

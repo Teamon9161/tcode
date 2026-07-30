@@ -92,9 +92,14 @@ fn folder_name(cwd: &Path) -> String {
 ///
 /// `hide_success_result` stays a name list: it is a presentation judgement about
 /// four tools whose body is a diff, not a capability core has any opinion about.
+/// `display_name` is core's own answer (`Tool::display_name`), the same one the
+/// TUI's `RenderRegistry` snapshots. It travels because otherwise the webview
+/// has to invent a second naming rule for the same tools, and two title-casing
+/// rules is how `Read 15 files` ends up next to `read 3 files` in one column.
 #[derive(Serialize)]
 pub struct ToolViewMeta {
     pub name: String,
+    pub display_name: String,
     pub route: &'static str,
     pub quiet_output: bool,
     pub hide_success_result: bool,
@@ -126,6 +131,7 @@ pub fn tool_views(supervisor: State<'_, Arc<Supervisor>>) -> Vec<ToolViewMeta> {
 /// The command's whole body, reachable without a window (AGENTS.md rule 2).
 pub fn tool_view_metas(tools: &[Arc<dyn tcode_core::Tool>]) -> Vec<ToolViewMeta> {
     let meta = |name: String, tool: &Arc<dyn tcode_core::Tool>| ToolViewMeta {
+        display_name: tool.display_name(),
         route: tool.route(&serde_json::Value::Null).label(),
         quiet_output: matches!(
             tool.batch_policy(),

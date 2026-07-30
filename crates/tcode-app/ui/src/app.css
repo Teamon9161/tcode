@@ -255,10 +255,20 @@
     grid-template-columns: 52px minmax(0, 1fr);
   }
   .rail-lines,
-  .rail-close {
+  .rail-close,
+  .rail-project-name,
+  .rail-project-tools,
+  .rail-count,
+  .rail-needs {
     display: none;
   }
-  .rail-item {
+  /* The grouping survives as the gap between clusters of dots; there is no room
+     for the folder's name, and a truncated one would be worse than none. */
+  .rail-sessions {
+    padding-left: 0;
+  }
+  .rail-item,
+  .rail-project-head {
     justify-content: center;
   }
 }
@@ -826,15 +836,121 @@
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 1px;
+  gap: var(--s-2);
 }
 
-.rail-list li {
+/* A folder and its conversations. The gap above is larger than the gap between
+   the rows inside it, which is the only separator the group needs — a rule under
+   every heading in a list this short is a rule per row. */
+.rail-group {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+/* The heading: the folder. It is the group's identity, so it is the one thing
+   here in the interface face at full ink — the rows under it are the
+   conversations, and they are what the eye is scanning. */
+.rail-project {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  border-radius: var(--r-sm);
+}
+.rail-project:hover {
+  background: var(--hover);
+}
+
+.rail-project-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex: 1;
+  min-width: 0;
+  padding: var(--s-1) var(--s-1) var(--s-1) var(--s-2);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+.rail-project-head:hover .rail-project-name {
+  color: var(--ink);
+}
+
+.rail-project-name {
+  flex: 1;
+  min-width: 0;
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Folded, the group still has to answer the rail's whole question. The count is
+   achromatic — a number of conversations is not a state — and the dot beside it
+   is, because one of them running is. */
+.rail-count {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+.rail-live {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--brand);
+  animation: breathe 1.4s var(--ease) infinite;
+}
+
+/* The one state worth saying in words at group level: it is the reason somebody
+   looks at this rail at all, and it must survive the group being folded. */
+.rail-needs {
+  flex: none;
+  padding: 0 var(--s-1);
+  border-radius: var(--r-xs);
+  background: var(--amber-wash);
+  color: var(--amber-text);
+  font-size: var(--text-2xs);
+}
+
+/* Reordering, in the vocabulary the plan editor already uses for it: hidden
+   until the row is pointed at or holds focus, because two arrows beside every
+   heading would compete with the headings themselves. */
+.rail-project-tools {
+  display: flex;
+  flex: none;
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.rail-project:hover .rail-project-tools,
+.rail-project:focus-within .rail-project-tools {
+  opacity: 1;
+}
+
+.rail-sessions {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  /* Indented to the heading's text, so the nesting is legible without a line. */
+  margin: 2px 0 0;
+  padding-left: var(--s-3);
+}
+
+.rail-sessions > li {
   display: flex;
   align-items: center;
   border-radius: var(--r-sm);
 }
-.rail-list li:hover {
+.rail-sessions > li:hover {
   background: var(--hover);
 }
 
@@ -863,9 +979,13 @@
   font-weight: var(--weight-medium);
 }
 
-/* Two lines, both truncating. The row's height is set by them rather than by a
-   fixed value: a list of conversations is a list, and a row is as tall as what
-   it has to say. */
+/* Two lines, both truncating: what this conversation was asked to do, and what it
+   is doing now. The folder used to be the first line, which meant two
+   conversations in one folder were two identical rows — the rail could account
+   for both without saying which was which. The folder is the heading above them
+   now, and the row says the thing only it knows. The row's height is set by its
+   own two lines rather than by a fixed value: a row is as tall as what it has to
+   say. */
 .rail-lines {
   display: flex;
   flex-direction: column;
@@ -907,7 +1027,7 @@
   opacity: 0;
   cursor: pointer;
 }
-.rail-list li:hover .rail-close,
+.rail-sessions > li:hover .rail-close,
 .rail-close:focus-visible {
   opacity: 1;
 }
@@ -922,9 +1042,18 @@
    one makes the view visibly chase the text instead of sitting at the bottom,
    and it re-plays that slide even when nothing moved. Instant is what "stay at
    the bottom" means. */
+/* `both-edges`, and it is the axis rule rather than a scrollbar preference: a
+   scrollbar that takes width takes it from one side only, so a centred
+   `--measure` column inside a scrolling box sits half a scrollbar to the left of
+   the composer and the plan strip below it, which do not scroll. Reserving the
+   gutter on both sides is what makes one axis one axis. Where the platform draws
+   overlay scrollbars this reserves nothing and changes nothing; where the
+   property is unknown it is ignored, and the offset is the one that was there
+   before. */
 .transcript {
   min-height: 0;
   overflow-y: auto;
+  scrollbar-gutter: stable both-edges;
   overscroll-behavior: contain;
 }
 
@@ -1173,13 +1302,32 @@
   font-size: 0.92em;
 }
 
+/* Reasoning, when the reader has asked for it. Prose in the column, not a row in
+   the trace: folded behind a chevron it was indistinguishable from a step the
+   agent took, so the eye had to open rows to find out which ones were things that
+   happened. It is `--muted` and one size down from the transcript's own body,
+   which is what says "this is not the answer" without hiding it.
+
+   The tag is a marginal note, not a heading: it names the passage from outside the
+   text so the prose itself starts on the column's own left edge. */
+.thinking {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-width: 72ch;
+}
+
+.thinking-tag {
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wide);
+}
+
 .thinking-body {
-  margin-top: var(--s-2);
-  padding-left: var(--s-4);
-  max-width: 70ch;
   color: var(--muted);
   font-size: var(--text-sm);
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .working {
@@ -1312,7 +1460,9 @@
   color: var(--muted);
   cursor: pointer;
   text-align: left;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  /* Slow enough that a running group settling to idle reads as the step
+     finishing; hover is the same property and is not worth a second rule. */
+  transition: background var(--dur-slow) var(--ease), color var(--dur-fast) var(--ease);
 }
 .trace-head:hover,
 .trace-head:focus-visible,
@@ -1356,25 +1506,52 @@
   background: var(--danger-wash);
 }
 
+/* The step that is happening right now, in the app's one state colour.
+
+   This is what the palette rule permits and nothing more: chroma means state, so
+   a *running* call may carry the brand wash while an idle one may not, and the
+   tool's name is never tinted for being a tool's name. The wash arrives with the
+   call and fades out over `--dur-slow` when the result lands, so finishing is
+   something you see happen rather than a repaint. The pulsing dot beside it is
+   the app's one continuous animation and already reports the same fact; a second
+   animation here would be motion for its own sake, which DESIGN.md rules out.
+   Under `prefers-reduced-motion` the dot goes still and the wash keeps saying it. */
 .tool-head {
   display: flex;
   align-items: center;
   gap: var(--s-1);
   min-width: 0;
-  padding: var(--s-1) 0;
-  transition: background var(--dur-fast) var(--ease);
+  /* Padded and pulled back by the same amount, so a tinted row reaches past the
+     text without moving it — the same trick `.trace-head` uses, because they are
+     the same row. */
+  padding: var(--s-1) var(--s-2);
+  margin-left: calc(var(--s-2) * -1);
+  border-radius: var(--r-sm);
+  transition: background var(--dur-slow) var(--ease);
 }
 .tool:hover .tool-head,
 .tool:focus-within .tool-head {
   background: var(--hover);
 }
+.tool.is-running > .tool-head,
+.trace.is-running > .trace-head {
+  background: var(--brand-wash);
+}
+.tool.is-running .tool-name,
+.trace.is-running > .trace-head .trace-label {
+  color: var(--brand-text);
+}
 
+/* The tool's name, and it is the anchor of the row: title-cased from core's own
+   `display_name()` so the app has one naming rule rather than the wire name here
+   and `Read 15 files` in the batch label beside it. Weight and face carry the
+   emphasis, not hue — a tool name is not a state. */
 .tool-name {
   flex: none;
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
+  font-weight: var(--weight-semibold);
 }
 
 .tool-separator {
@@ -1739,14 +1916,42 @@
   font-family: var(--font-mono);
 }
 
+/* What one agent told another, with the paragraphs and lists the sender wrote.
+   It was a plain `<p>`, which collapses every newline: a structured brief came out
+   as one run-on block whose second half read as though it had been pasted in from
+   a different message. `pre-wrap` is the whole fix — the text was never wrong,
+   only its shape. */
 .inspect-prompt {
-  margin-bottom: var(--s-3);
+  margin: 0;
   padding: var(--s-2) var(--s-3);
   border-radius: var(--r-sm);
   background: var(--sunken);
   color: var(--body);
   font-size: var(--text-xs);
-  text-wrap: pretty;
+  max-width: 72ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* A run pane answers three questions in order — what it was told to do, what it
+   did, what it came back with — and unlabelled they read as three unrelated
+   blocks stacked on one screen. The heading is the smallest thing on it: it is a
+   signpost, not a title. */
+.inspect-part {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+.inspect-part + .inspect-part {
+  margin-top: var(--s-4);
+}
+.inspect-part-head {
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
 }
 
 .inspect-transcript,
@@ -2598,6 +2803,67 @@
 .fmenu-note {
   margin: 0;
   padding: var(--s-2) var(--s-3);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+/* ---- what this window shows ------------------------------------------------
+
+   The display switches, dropped out of the title bar. Same seat and same frame as
+   the folder menu, and the same rule as the model panel: a pick does not dismiss
+   it, because the point of a switch is seeing what it did. */
+.dmenu {
+  right: var(--seat-right, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: min(19rem, calc(100vw - var(--s-6)));
+  padding: 0 var(--s-1) var(--s-1);
+}
+
+.dmenu-head {
+  margin: 0;
+  padding: var(--s-2) var(--s-2) var(--s-1);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* The composer strip's switch at list width: the box carries the state, the row
+   carries the name and what turning it on gets you. `.chip-tick` is that box —
+   one shape for "this is on", wherever it appears. */
+.dmenu-switch {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.dmenu-switch:hover {
+  background: var(--hover);
+}
+.dmenu-switch .chip-tick {
+  margin-top: 3px;
+}
+.dmenu-switch.is-on .chip-tick {
+  border-color: var(--brand);
+  background: var(--brand);
+}
+
+.dmenu-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.dmenu-label {
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.dmenu-hint {
   color: var(--muted);
   font-size: var(--text-2xs);
   text-wrap: pretty;
@@ -3556,16 +3822,39 @@
   background: var(--hover);
 }
 
+/* Which sub-agent ran, in the same position and the same face the tool name holds
+   on every other step — because that is what it is. The row used to say the kind
+   twice, once as this and once inside the metadata, and the `agent` call above it
+   said it a third time as `agent · agent(explore)`. */
+.run-kind {
+  flex: none;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
 .run-title {
   flex: none;
   max-width: 60%;
-  color: var(--ink);
+  color: var(--body);
   font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
   text-align: left;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Only for the endings that are neither success nor error: the dot has no glyph
+   for "stopped", so the word carries it rather than a colour borrowed from
+   failure. */
+.run-status {
+  flex: none;
+  padding: 0 var(--s-1);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  color: var(--muted);
+  font-size: var(--text-2xs);
 }
 
 .run-meta {
@@ -3593,6 +3882,17 @@
   font-size: var(--text-xs);
 }
 
+/* What the sub-agent came back with — the result of the call that started it,
+   which is prose one model wrote for a human. It had nowhere to go while the
+   delegating call had a row of its own; folding that row into this one is what
+   made it homeless, so it lands where the run's own contents end. Inset, because
+   it is a reply and not a continuation of the trace above it. */
+.run-report {
+  padding-left: var(--s-3);
+  border-left: 2px solid var(--line);
+  color: var(--body);
+}
+
 /* ---- the plan strip ---------------------------------------------------------
 
    One line above the composer saying where a multi-phase task stands. It reads
@@ -3609,18 +3909,40 @@
   overflow: hidden;
 }
 
-.progress-strip > * {
+/* One element holds the conversation's axis, and everything in the strip is
+   inside it. It was a `> *` rule handing `--measure` and an auto margin to each
+   child, which is a rule any child can lose by accident and one of them did: the
+   `margin: 0` written for the `<ol>`'s own UA default has the same specificity
+   and comes later, so the phase list rendered hard against the pane's left edge
+   while the line above it stayed on the composer's axis. A shared axis has to be
+   owned by one box, not re-granted per child. */
+.strip-body {
+  display: flex;
+  flex-direction: column;
   width: 100%;
+  min-height: 0;
   max-width: var(--measure);
   margin-inline: auto;
+  padding-inline: var(--s-5);
 }
 
+/* Roomier above and below than the transcript's own rhythm, because this band is
+   not a step in the conversation: it sat one hairline under the last line of the
+   trace and read as another row of it. */
 .strip-line {
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  padding: var(--s-2) var(--s-5);
+  padding-block: var(--s-3);
   font-size: var(--text-xs);
+}
+
+/* What this band is, in one word. The strip carried a title, a phase and a
+   fraction with nothing naming the thing they described. */
+.strip-kind {
+  flex: none;
+  color: var(--faint);
+  letter-spacing: var(--tracking-wide);
 }
 
 .strip-toggle {
@@ -3689,15 +4011,33 @@
   color: var(--muted);
 }
 
-/* The completed fraction, readable without reading. It is state, which is why it
-   may carry chroma at all — and only while a turn is actually running, so a
-   parked plan does not claim to be working. */
+/* The completed fraction, readable without reading — but only against a track,
+   which is the thing that was missing. A bare 1px fill spanning a share of the
+   *pane* has no visible end, so its length says nothing: it read as a green line
+   someone drew rather than as three phases of five. The track is the same width
+   as the line above it, so the fraction is measured against something the eye can
+   already see. */
+.strip-track {
+  flex: none;
+  height: 2px;
+  border-radius: var(--r-pill);
+  background: var(--line);
+  overflow: hidden;
+}
+
+/* It is state, which is why it may carry chroma at all — and only while a turn is
+   actually running, so a parked plan does not claim to be working.
+
+   The fill is the full width scaled down from its left edge, not a narrower box:
+   `scaleX` is a compositor property, while animating `width` asks for layout on
+   every frame of the transition. The corners need no radius of their own — the
+   track already clips them, and a scaled radius would not stay round anyway. */
 .strip-meter {
-  height: 1px;
-  max-width: none;
-  margin-inline: 0;
+  width: 100%;
+  height: 100%;
   background: var(--line-strong);
-  transition: width var(--dur-slow) var(--ease);
+  transform-origin: left center;
+  transition: transform var(--dur-slow) var(--ease);
 }
 .progress-strip.is-running .strip-meter {
   background: var(--brand);
@@ -3708,8 +4048,8 @@
   display: flex;
   flex-direction: column;
   gap: var(--s-1);
-  margin: 0;
-  padding: var(--s-1) var(--s-5) var(--s-3);
+  margin-block: 0;
+  padding: var(--s-3) 0;
   overflow-y: auto;
   font-size: var(--text-xs);
 }
@@ -4136,7 +4476,10 @@
   .strip-meter,
   .phase-name,
   .phase-detail,
-  .phase-tools {
+  .phase-tools,
+  /* The running wash still says a step is in flight; it just arrives at once. */
+  .tool-head,
+  .trace-head {
     transition: none;
   }
   .selection-bubble {

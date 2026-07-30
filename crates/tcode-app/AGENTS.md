@@ -40,15 +40,27 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **它是一条横幅，不是一张卡片**：铺满窗格宽度、顶上一条 `--line` 发丝线、不投影，内容宽度走 `--measure`——和 transcript、composer 同一根轴。它曾经是 980px 的浮起卡片，于是既像丢了遮罩的模态，又和它正在询问的那个改动明显不对齐。**新加任何与对话对齐的东西一律读 `--measure`，不许再抄一个数字**，这条就是这么来的。另外它的高度上限是窗格的 50%（flex 的 `max-height`，不是 `vh`，也不是 grid track——grid 会把 `minmax(0, 50%)` 贪心撑满）。
 
+    **那根轴由一个盒子持有，不许按子元素逐个授予。** 读 `--measure` 只是第一半；写成 `.某容器 > * { max-width: var(--measure); margin-inline: auto }` 的那一半是个陷阱——任何子元素只要有一条同特异性、位置更后的规则就能把它丢掉。progress strip 就是这么破的：`.strip-phases` 为 `<ol>` 的 UA margin 写了一句 `margin: 0`，于是展开的阶段列表贴到窗格左边缘，而它上面那行还老实待在 composer 的轴上，窗格越宽（比如折起会话栏）两根轴分得越远。现在 `.strip-body` 一个盒子持有轴，里面所有东西继承，没有第二处可以丢。
+
+    **滚动区里的轴要 `scrollbar-gutter: stable both-edges`。** 占宽度的滚动条只从一侧拿走宽度，于是 transcript 里居中的 `--measure` 列比不滚动的 composer 与 progress strip 偏左半个滚动条（实测 5px）。这不是滚动条审美问题，是"一根轴"这句话的成立条件。平台画覆盖式滚动条时它什么也不占；属性不认识时被忽略，退回到原来那个偏移。
+
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
 9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在窗格里：窗口按钮属于窗口的角，不属于某一个窗格的角。
 
     **topbar 里只放窗口级别的东西**（返回启动台、折叠会话栏、窗口按钮），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于窗口还是属于某个会话"：会话栏属于窗口，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在窗口这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。它看起来空是对的：它是 title bar，不是工具条。
 
-9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。thinking、单个调用、连续读、连续编辑、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
+9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。单个调用、连续读、连续编辑、连续命令、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
 
-    配套的排版规则：**行的标签用 UI 字体，等宽只留给真正的机器文本**（工具名、命令、路径）。"run 2 commands" 是我们写的说明，不是机器输出；全用等宽就退化成 PRODUCT.md 点名反对的终端外观。
+    **thinking 不在这套形状里，而且这条是反过来学到的。** 它曾经也是一条 `TraceGroup`，于是与"并发批次""连续读"长得一模一样，读的人必须逐行展开才知道哪几行是真发生过的事——一个折叠行看起来像一步，但它不是一步。现在它是散文（`.thinking`）：勾选了就直接铺出来，没勾就整块不存在（默认不存在，见规则 18）。连带一条：`groupTranscriptBlocks` **不许再把 thinking 扫进 exploration 组**，折叠的组会把它吞掉，"给我看推理"最后靠藏起来回答。
+
+    配套的排版规则：**行的标签用 UI 字体，等宽只留给真正的机器文本**（工具名、命令、路径）。"Run 2 commands" 是我们写的说明，不是机器输出；全用等宽就退化成 PRODUCT.md 点名反对的终端外观。**工具名一律用 core 的 `Tool::display_name()`**（经 `ToolViewMeta.display_name` 过桥，`useToolName()` 读），前端不许自己再写一套大小写规则——两套的结果是同一列里 `Read 15 files`（core 的 `batch_label`）挨着 `read 3 files`（前端自己拼的组标签）。前端自己拼的组标签因此也首字母大写。
+
+    **正在跑的那一步带 `--brand-wash`，靠 `.is-running`**，结果到达时用 `--dur-slow` 褪掉——chroma 表示状态，所以运行中的行可以有，闲着的行不许有，工具名永远不因为"它是工具名"上色。旁边那颗呼吸的点已经是全 app 唯一一个常驻动画，这里不许再加第二个。
+
+9f. **一次委派只画一行。** `agent` 调用与它开出的 run 是同一步的两份记录：run 带 kind/model/调用数/状态与自己整份转录，调用带回来的 report。两行都画，这一步就占两行，第一行还是毫无信息的 `agent · agent(explore)`。`blocks.ts::runPairs` 按 **`parent_call`** 配对（`RunMeta.parentCall`，wire 上本来就有），把调用行让给 run 行，report 挪进 run 里；**不许按工具名判**——转录不需要知道那个工具叫什么。老日志没有 `parent_call` 时配不上，两行照画：多一行比少一行诚实。
+
+    **sub-agent 的状态串是 `TaskRunStatus`**（`done` / `failed` / `cancelled` / `interrupted`，snake_case），不是 `ok`。这里踩过一次：代码比的是 `"ok"`，于是每个正常跑完的 sub-agent 都戴着红叉，而 preview fixture 里写的也是 `"ok"`，所以设计预览永远看不出来。**fixture 写的必须是 wire 上真有的值**——一个替代实现陪着一个错误实现，等于把验收手段一起废掉。`cancelled`/`interrupted` 既不是成功也不是失败，状态点没有对应字形，所以用词说，不许借失败的颜色。
 
 9d. **窗格树是纯数据**（`layout.ts`）：`Tiling = {root, focus}`，`Layout = Leaf | Split{dir, ratio, a, b}`。分裂/关闭/聚焦/改比例全是纯函数，由 `layout.test.ts` 钉住；`Panes.tsx` 只负责把这棵树画出来，`ratio` 变成 `flex-grow` 交给浏览器算。**布局判断不许写进组件**——发现自己在 `Panes.tsx`/`Workspace.tsx` 里算"这个窗格该被谁顶掉"时，那条规则属于 `layout.ts`（`show` 的"落在 inspect 窗格上就分裂而不是覆盖"就是这么回来的）。
 
@@ -121,6 +133,12 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。
 
+18. **"窗口怎么画"的偏好留在 webview，不进 config**（`ui/src/display.ts` + `DisplayMenu.tsx` + `rail.ts` 的项目顺序，都在 `localStorage`）。判据是这个开关能不能改变 agent 做的事：不能，就不是配置。`[tcode_state]` / `config.toml` 里每加一个字段都要同步 `tcode-config` skill（根 CLAUDE.md 的硬要求），而"显示不显示推理"错了只值一次点击，不值一条配置契约。反过来也成立：**任何影响一次 turn 的行为、发送内容或落盘内容的开关，绝不许悄悄住进 `localStorage`。**
+
+    偏好按作用域归属，和用量那两笔账同理（规则 16）：`Display` 从 App 顶层的 `DisplayContext` 下发，所以 sub-agent 的转录跟着同一个开关走——转录递归时读的是同一个 context，不需要一处一份。什么该粘住也要想清楚：**项目顺序粘住，折叠状态不粘**——顺序是设一次就依赖的排列，折叠是为了眼下几分钟把长列表收起来，上周那个决定不该让今天的会话栏一半是收着的。
+
+    读存下来的值时它是**数据**：每个字段逐个校验，认不出的落回默认，`localStorage` 抛异常（webview 关了存储）也必须能开窗——`loadDisplay` / `loadOrder` 都这么写。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。
@@ -134,9 +152,10 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
-  - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。
+  - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。`runPairs` / `reportOf` 是这棵树上的两个纯查询，把委派调用和它的 run 认成一步（见硬规则 9f）。
+  - **会话栏这一摊**：`rail.ts`（纯函数：按 cwd 分组、项目换序、从第一条 user 块取会话标题 + 顺序的 `localStorage` 存取）、`Workspace.tsx` 的 `RailProject`。**会话名不是文件夹名**：会话名等于文件夹名，所以同一个文件夹开两个会话就是两条一模一样的行，会话栏能把它们都列出来却说不清哪个是哪个。文件夹上升成分组标题，行上写"这个会话是被要求做什么的"（第一条 prompt，不是最后一条——对话是为它开的那件事而存在，跟着最新消息改名等于每打一行字就改一次名）。换序用 Alt+方向 + hover 出来的两个按钮，与 `PlanEditor` 同一套词汇；**存下来的顺序只记被移动过的文件夹**，没记过的按到达顺序排在后面，这样新开一个文件夹不会把已经排好的打乱。
   - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。
-  - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿，`route` 与 `quiet_output` 现在都由活着的工具派生（`Tool::route` / `Tool::batch_policy`），名字表已经删了。唯一的例外是 `progress`：它的路由**随 input 变**（阶段翻转归计划条，提交的计划是对话要留住的文档），后端送的是工具的默认答案，那一个例外由 `plan.ts::isPlanSubmission` 在调用点认出来——一个字段，紧挨着它读的类型。
+  - **两张前端注册表**，同构于 core 的 `Tool`/`SlashCommand`/`ToolRenderer`：`fences.tsx`（围栏语言→富渲染，未命中落到高亮代码块）与 `toolViews.tsx`（工具→怎么画 + 点开看什么）。**路由不在前端定**，`tool_views()` 从后端拿，`route`、`quiet_output` 与 `display_name` 都由活着的工具派生（`Tool::route` / `Tool::batch_policy` / `Tool::display_name`），名字表已经删了。**一个工具的行只说得清"哪个工具、干什么"时，缺的那一半属于这张注册表**：core 的 `summarize_call` 只认一组固定的参数键，`skill` 的参数叫 `name` 不在里面，于是每次加载 skill 在转录里都只是光秃秃一个 `skill`——补法是给它一个 `ToolView.summary`，不是去改 core 那组键的语义（TUI 至今还有同一个洞，同一个原因）。唯一的例外是 `progress`：它的路由**随 input 变**（阶段翻转归计划条，提交的计划是对话要留住的文档），后端送的是工具的默认答案，那一个例外由 `plan.ts::isPlanSubmission` 在调用点认出来——一个字段，紧挨着它读的类型。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
   - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。表格只把有限行放进 DOM（`ROW_STEP`），不是分页而是上限——20 万行 DOM 就是一个冻住的窗口。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
