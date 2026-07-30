@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import { imagesFrom, isImagePaste, type Pasted } from "./paste";
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
+import type { Meter } from "./usage";
 
 /**
  * The input. One control that changes intent with the turn: send while idle,
@@ -23,6 +24,7 @@ export function Composer({
   running,
   disabled,
   attachments,
+  meter,
   planFirst,
   onPlanFirst,
   onChange,
@@ -35,6 +37,9 @@ export function Composer({
   running: boolean;
   disabled: boolean;
   attachments: Pasted[];
+  /** What this conversation occupies and what its last turn cost, for the ring
+   *  on the strip below the field. */
+  meter: Meter;
   /** Whether this message asks for a plan before anything is changed. */
   planFirst: boolean;
   onPlanFirst: (on: boolean) => void;
@@ -187,16 +192,23 @@ export function Composer({
         )}
       </div>
 
-      {/* Under the field, not above it and not in a settings screen: these are
-          properties of the message about to be sent — and so is this one.
-          Planning used to be a permission mode; it is a property of a request
-          now, which is exactly what this row holds. It clears when the message
-          is sent, like an attachment does, because it described that message. */}
-      {/* The one control on this row that is a switch rather than a menu, so it
-          is the one that has to look like it: an outline and a box that fills.
-          Bare like its neighbours, it read as a label announcing that planning
-          was already on — the opposite of its actual state. */}
-      <div className="composer-row-chips">
+      {/* Under the field, not above it and not in a settings screen: everything
+          on this row is a property of the message about to be sent or of what
+          will answer it. Planning used to be a permission mode; it is a property
+          of a request now, and it clears when the message is sent, like an
+          attachment does, because it described that message.
+
+          One row, one height, one baseline. Every control on it is the same
+          22px box whether or not it draws a border (`.chip` reserves the border
+          it may not use), and the row's own inset puts the first label on the
+          field's text column — the strip reads as a caption under the input
+          rather than as a toolbar of differently-sized parts, which is what it
+          looked like when a bordered switch stood beside bare labels. */}
+      <div className="composer-strip">
+        {/* The one control here that is a switch rather than a menu or a
+            reading, so it is the one that has to look like it: an outline and a
+            box that fills. Bare like its neighbours it read as a caption saying
+            planning was already on — the opposite of its actual state. */}
         <button
           type="button"
           className={`chip is-toggle${planFirst ? " is-on" : ""}`}
@@ -207,7 +219,7 @@ export function Composer({
           <span className="chip-tick" aria-hidden="true" />
           plan first
         </button>
-        <Chips />
+        <Chips meter={meter} />
       </div>
     </form>
   );

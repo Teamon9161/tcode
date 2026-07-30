@@ -38,6 +38,14 @@
   grid-column: 1 / -1;
 }
 
+/* Folded from the title bar: the rail is gone, not narrowed. A collapsed
+   sidebar that leaves a stub of itself behind is a sidebar you have to look at
+   anyway, and this one is folded for exactly the stretch where one conversation
+   is the whole job. */
+.workspace.is-folded {
+  grid-template-columns: minmax(0, 1fr);
+}
+
 /* ============================================================ panes */
 
 /* The tiling field. Its padding *is* the outer gutter: the frame colour runs
@@ -155,17 +163,6 @@
   color: var(--ink);
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.pane-path {
-  flex: 1;
-  min-width: 0;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -889,25 +886,6 @@
 }
 .rail-close:hover {
   color: var(--danger-text);
-}
-
-.rail-add {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  margin-top: var(--s-1);
-  padding: var(--s-2);
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--faint);
-  font-size: var(--text-sm);
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
-}
-.rail-add:hover {
-  background: var(--hover);
-  color: var(--ink);
 }
 
 /* ============================================================ transcript */
@@ -1651,14 +1629,19 @@
 /* ============================================================ composer chips */
 
 /* The strip under the input. Reads as a caption line, not a toolbar: the labels
-   are the controls, at the smallest size the theme has, with the model side
-   pushed right the way a status line reads. */
+   are the controls, at the smallest size the theme has, with what the message
+   runs on pushed right the way a status line reads.
+
+   The row owns no padding of its own beyond the inset that puts its first label
+   on the field's text column — the composer's own gap is the space above it.
+   It carried a 4px top pad inside a 32px minimum before, which is how a row of
+   22px controls ended up floating in a band a third taller than anything in
+   it. */
 .chips {
   display: flex;
   align-items: center;
   gap: var(--s-1);
-  padding: var(--s-1) var(--s-1) 0;
-  min-height: var(--s-6);
+  min-width: 0;
 }
 .chips-gap {
   flex: 1;
@@ -1669,13 +1652,31 @@
   font-size: var(--text-2xs);
 }
 
+/* Flex, not a block: an inline-flex button inside a block sits on a text
+   baseline, so the wrapper is a couple of pixels taller than the control and
+   the control hangs at the top of it. That is invisible on one chip and
+   unmistakable across four — the ring sat 1.5px above the labels beside it
+   purely because it is the one chip with an SVG in the line box. */
 .chip-box {
   position: relative;
+  display: flex;
+  min-width: 0;
 }
 
+/* One box for every control on the strip, whatever it is inside.
+   `border: 1px solid transparent` is the load-bearing line: the toggle is the
+   one chip that draws an outline, and without the border reserved here it stood
+   2px taller than its neighbours and dragged the row's centre line with it. The
+   fixed height does the rest — a menu, a switch and a reading now share a
+   baseline instead of each being as tall as its own contents. */
 .chip {
-  padding: var(--s-1) var(--s-2);
-  border: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  box-sizing: border-box;
+  min-height: 22px;
+  padding: 0 var(--s-2);
+  border: 1px solid transparent;
   border-radius: var(--r-sm);
   background: none;
   color: var(--body);
@@ -1697,13 +1698,17 @@
    identifier, like a path or a tool name, and reading it as one is also what
    tells it apart from the mode chip at a glance. */
 .chip.is-model {
-  display: inline-flex;
-  align-items: baseline;
   gap: var(--s-1);
+  min-width: 0;
   color: var(--muted);
 }
+/* The one label on the strip long enough to be worth truncating, and the one
+   whose first characters identify it. */
 .chip-model {
+  min-width: 0;
+  overflow: hidden;
   font-family: var(--font-mono);
+  text-overflow: ellipsis;
 }
 .chip-effort::before {
   content: "·";
@@ -1793,27 +1798,49 @@
    Fixed, in a portal, and positioned from the chip's measured box (`--seat-*`,
    set by the component): a popover inside the composer would be clipped by the
    pane it sits in, and one that grew past the window would be worse. */
-.mpanel {
+/* The frame every portalled popover in this window wears — model panel, usage
+   panel, folder menu. Only where it sits and how wide it is belongs to each of
+   them; the surface, the elevation and the entrance are one thing, because
+   three popovers that lift differently read as three different applications.
+
+   `seat.ts` measures the trigger and publishes `--seat-*`; each panel below
+   picks the corner it opens from. */
+.seated {
   position: fixed;
-  right: var(--seat-right, var(--s-4));
-  bottom: calc(var(--seat-bottom, var(--s-6)) + var(--s-2));
   z-index: var(--z-dropdown);
   display: flex;
   flex-direction: column;
-  width: min(22rem, calc(100vw - var(--s-6)));
-  max-height: min(26rem, calc(var(--seat-room, 100vh) - var(--s-4)));
   overflow: hidden;
   border: 1px solid var(--line);
   border-radius: var(--r-md);
   background: var(--bg);
   box-shadow: var(--shadow-lift);
-  animation: mpanel-in var(--dur-fast) var(--ease);
+  animation: seated-in var(--dur-fast) var(--ease);
 }
-@keyframes mpanel-in {
+@keyframes seated-in {
   from {
     opacity: 0;
     transform: translateY(4px);
   }
+}
+/* The travel is what conveys "this came out of that control", so under reduced
+   motion it becomes a crossfade rather than nothing: appearing instantly at a
+   corner of the screen is the thing the movement was explaining. */
+@media (prefers-reduced-motion: reduce) {
+  @keyframes seated-in {
+    from {
+      opacity: 0;
+    }
+  }
+}
+
+/* Up out of the composer, right edge aligned with its chip: the panel's bottom
+   is then where the hand already is, which is where its dials live. */
+.mpanel {
+  right: var(--seat-right, var(--s-4));
+  bottom: calc(var(--seat-bottom, var(--s-6)) + var(--s-2));
+  width: min(22rem, calc(100vw - var(--s-6)));
+  max-height: min(26rem, calc(var(--seat-room, 100vh) - var(--s-4)));
 }
 
 /* Which set of dials. Two words, so a segmented pair rather than a menu — and
@@ -2084,10 +2111,366 @@
   cursor: default;
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .mpanel {
-    animation: none;
-  }
+/* ============================================================ usage */
+
+/* What the conversation is spending, on the strip and in its panel.
+
+   Achromatic while the numbers are ordinary. That is the palette rule this app
+   is built on — chroma means state, and "34% of a window used" is not a state —
+   so the ring, the bars and the figures all live in the neutral ramp and take
+   amber, then red, only at the thresholds the terminal warns at. Every one of
+   them also carries a number, so the level is never hue alone. */
+.chip.is-usage {
+  gap: var(--s-1);
+  color: var(--muted);
+}
+
+.usage-ring {
+  flex: none;
+}
+.usage-ring-track {
+  fill: none;
+  stroke: var(--line-strong);
+  stroke-width: 2;
+}
+.usage-ring-arc {
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 2;
+  stroke-linecap: round;
+  transition:
+    stroke-dasharray var(--dur) var(--ease),
+    stroke var(--dur) var(--ease);
+}
+.usage-ring.is-high .usage-ring-arc {
+  stroke: var(--amber);
+}
+.usage-ring.is-full .usage-ring-arc {
+  stroke: var(--danger);
+}
+
+/* Tabular figures throughout: this number changes while you are looking at it,
+   and proportional digits make the whole strip twitch sideways when it does. */
+.chip-usage-figure,
+.chip-usage-alarm,
+.upanel-gauge-pct {
+  font-variant-numeric: tabular-nums;
+}
+.chip-usage-figure.is-high {
+  color: var(--amber-text);
+}
+.chip-usage-figure.is-full {
+  color: var(--danger-text);
+}
+
+/* The subscription window, promoted onto the strip only once it is tight enough
+   to change what you would do next. It names the window it is talking about, so
+   the second figure can never be mistaken for a second reading of the first. */
+.chip-usage-alarm {
+  color: var(--amber-text);
+}
+.chip-usage-alarm.is-full {
+  color: var(--danger-text);
+}
+.chip-usage-alarm::before {
+  content: "·";
+  margin-right: var(--s-1);
+  color: var(--faint);
+}
+
+/* Two bands, and the tone step between them is the separator — the same
+   boundary the window draws against a pane, and the same one the model panel
+   uses. The split is the point: the context window is this conversation's and a
+   compaction empties it, while a subscription window is the account's and only
+   the clock refills it. Averaging them into one number is how a meter ends up
+   saying you are fine at the moment you are out of hours. */
+.upanel {
+  right: var(--seat-right, var(--s-4));
+  bottom: calc(var(--seat-bottom, var(--s-6)) + var(--s-2));
+  width: min(19rem, calc(100vw - var(--s-6)));
+}
+
+.upanel-band {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+  padding: var(--s-3);
+}
+.upanel-band.is-limits {
+  gap: var(--s-2);
+  background: var(--chrome);
+}
+/* The windows keep the band's own rhythm; the heading above them sits closer,
+   because a label belongs to what follows it. */
+.upanel-windows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-3);
+}
+
+.upanel-gauge {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+}
+.upanel-gauge-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  font-size: var(--text-2xs);
+}
+.upanel-gauge-label {
+  color: var(--ink);
+}
+/* Both push right, so the counts land against the percentage and the
+   percentage against the edge — with no counts to show, the percentage simply
+   takes the whole gap. */
+.upanel-gauge-figure {
+  margin-left: auto;
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+.upanel-gauge-pct {
+  margin-left: auto;
+  color: var(--muted);
+}
+.upanel-gauge-pct.is-high {
+  color: var(--amber-text);
+}
+.upanel-gauge-pct.is-full {
+  color: var(--danger-text);
+}
+
+.upanel-bar {
+  height: 3px;
+  border-radius: var(--r-pill);
+  background: var(--line);
+  overflow: hidden;
+}
+.upanel-bar-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--muted);
+  transform: scaleX(var(--fill, 0));
+  transform-origin: left center;
+  transition:
+    transform var(--dur) var(--ease),
+    background var(--dur) var(--ease);
+}
+.upanel-bar.is-high .upanel-bar-fill {
+  background: var(--amber);
+}
+.upanel-bar.is-full .upanel-bar-fill {
+  background: var(--danger);
+}
+
+/* `--muted`, not `--faint`: when a window resets is the reason anyone opened
+   this panel, and the faint step is for text nobody has to read. */
+.upanel-gauge-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* Names the band, because "5h" and "weekly" are windows of something and the
+   something is the account rather than the conversation above them. */
+.upanel-group {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* The turn receipt: what was paid for, what came back, how much was reused. A
+   definition list because that is what it is, and the values are machine text. */
+.upanel-receipt {
+  display: flex;
+  gap: var(--s-4);
+  margin: 0;
+}
+.upanel-receipt > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.upanel-receipt dt {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+.upanel-receipt dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.upanel-note {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
+}
+
+/* ============================================================ folder chip */
+
+/* Which folder this conversation is in, in the pane header where the path
+   already was. It keeps the path's own type — a folder is an identifier, so it
+   is set in the machine face like every other path in this app — and gains only
+   what says it is a control: a hover surface and a chevron. */
+.folder-box {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+
+.folder-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+  box-sizing: border-box;
+  min-width: 0;
+  max-width: 100%;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.folder-chip:hover,
+.folder-chip[aria-expanded="true"] {
+  background: var(--hover);
+  color: var(--ink);
+}
+.folder-chip svg {
+  flex: none;
+  color: var(--faint);
+}
+.folder-chip:hover svg,
+.folder-chip[aria-expanded="true"] svg {
+  color: var(--muted);
+}
+/* The conversation's name, at the weight the pane header always gave it — the
+   chip took the whole identity over, it did not demote it. */
+.folder-chip-name {
+  flex: none;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+.folder-chip-path {
+  min-width: 0;
+  overflow: hidden;
+  font-family: var(--font-mono);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Down out of the header, aligned to the chip's left edge — the one popover in
+   the window that opens downward, because it hangs from the top of a pane
+   rather than sitting above the composer. */
+.fmenu {
+  left: var(--seat-left, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: min(20rem, calc(100vw - var(--s-6)));
+  max-width: calc(100vw - var(--seat-left, 0px) - var(--s-4));
+  max-height: min(24rem, calc(var(--seat-below, 100vh) - var(--s-4)));
+}
+
+/* Says what picking one does. Every item here starts a conversation rather than
+   moving this one — a session's folder is fixed when it opens — and that is the
+   single thing about this menu that could be misread. */
+.fmenu-head {
+  margin: 0;
+  padding: var(--s-2) var(--s-3) var(--s-1);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+.fmenu-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 0 var(--s-1) var(--s-1);
+}
+
+.fmenu-item {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+.fmenu-item:hover {
+  background: var(--hover);
+}
+.fmenu-item-name {
+  color: var(--ink);
+  font-size: var(--text-xs);
+}
+.fmenu-item.is-current .fmenu-item-name {
+  font-weight: var(--weight-medium);
+}
+/* The same dot in the same gutter as the model panel's current row: one mark
+   for "this is the one you are on", everywhere in the app. */
+.fmenu-item.is-current .fmenu-item-name::before {
+  content: "";
+  display: inline-block;
+  width: 5px;
+  height: 5px;
+  margin-right: var(--s-2);
+  border-radius: 50%;
+  background: var(--brand);
+  vertical-align: middle;
+}
+/* `--muted`, not `--faint`: two folders can share a name, and when they do the
+   path is the only thing telling them apart. */
+.fmenu-item-path {
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+/* Pinned to the bottom on the chrome band, out of the scrolling list: it is not
+   one of the folders, it is how a folder that is not in the list gets there. */
+.fmenu-pick {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+  border: 0;
+  background: var(--chrome);
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
+}
+.fmenu-pick:hover {
+  color: var(--ink);
+}
+
+.fmenu-note {
+  margin: 0;
+  padding: var(--s-2) var(--s-3);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  text-wrap: pretty;
 }
 
 /* ============================================================ shown files */
@@ -3543,31 +3926,55 @@
   overflow-y: auto;
 }
 
-/* The composer's own row of message properties, with "plan first" beside the
-   model and mode chips: they are all facts about the message about to be sent. */
-.composer-row-chips {
+/* The composer's own row: what this message is on the left, what will answer it
+   on the right. "plan first", the permission mode, the context ring and the
+   model are all facts about the message about to be sent.
+
+   The inset is measured, not chosen. The field's text starts at its 1px border
+   plus a 12px pad; a chip's label starts at its own 1px border plus an 8px pad;
+   4px here puts the two on the same column, so the strip hangs off the field
+   rather than sitting beside it. */
+.composer-strip {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: var(--s-1);
   min-width: 0;
+  padding-inline: var(--s-1);
 }
-.composer-row-chips > .chips {
-  flex: 1;
+/* A pane can be a third of the window, and four controls do not fit across
+   220px. What happens then is chosen rather than left to chance, in this order:
+   the subscription figure goes first (it is a promotion of what the panel
+   holds, and the ring is still there), then the model's label truncates, and
+   past that the whole group drops to a second line. Nothing is ever clipped and
+   no control becomes unreachable — which is what a narrow pane used to do to
+   the model chip, silently. */
+.composer-strip > .chips {
+  flex: 1 1 15rem;
   min-width: 0;
+}
+.composer {
+  container-type: inline-size;
+  container-name: composer;
+}
+@container composer (max-width: 25rem) {
+  .chip-usage-alarm,
+  /* The name identifies the model and the effort only qualifies it, so the
+     qualifier goes before the name starts losing characters. */
+  .chip-effort {
+    display: none;
+  }
 }
 
 /* A switch, not a menu, and the only one on this strip — so unlike the chips
-   beside it, it draws its own outline at rest. Bare, it read as a caption
-   saying planning was already on: the state and the control were both invisible,
-   and the two invisibilities cancelled into a wrong answer. The box carries the
-   state (hollow / filled), the outline carries "this is a control", and the
-   filled state also takes the brand wash so the answer survives a glance that
-   never reaches the box. */
+   beside it, it draws the outline every chip reserves room for. Bare, it read as
+   a caption saying planning was already on: the state and the control were both
+   invisible, and the two invisibilities cancelled into a wrong answer. The box
+   carries the state (hollow / filled), the outline carries "this is a control",
+   and the filled state also takes the brand wash so the answer survives a glance
+   that never reaches the box. */
 .chip.is-toggle {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--s-2);
-  border: 1px solid var(--line);
+  border-color: var(--line);
   color: var(--muted);
 }
 .chip.is-toggle:hover {

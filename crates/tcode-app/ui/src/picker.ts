@@ -35,6 +35,8 @@ export type PickerState = {
   models: ModelChoice[];
   model: number;
   effort: string | null;
+  /** The running model's window, in tokens. What the context ring divides by. */
+  context_window: number;
   presets: PresetChoice[];
   preset: number | null;
   roles: RoleChoice[];

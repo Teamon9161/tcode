@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { useSession } from "./session";
 import { ModelPanel } from "./ModelPanel";
+import { UsagePanel } from "./UsagePanel";
 import type { PickerState } from "./picker";
+import type { Meter } from "./usage";
 
 /**
  * The strip under the composer: what this conversation is allowed to do, and
@@ -15,17 +17,23 @@ import type { PickerState } from "./picker";
  * from the moment the question is asked — which is how a bypass-permissions
  * session gets left on by accident.
  *
- * Two controls, and they are deliberately different shapes. Permission mode is a
- * short list of named answers, so it is a menu. Everything about the model —
+ * Three controls, and they are deliberately different shapes. Permission mode is
+ * a short list of named answers, so it is a menu. Everything about the model —
  * which one, its effort, the saved presets, what each sub-agent runs on — is one
  * panel (`ModelPanel.tsx`), because those are one decision with four dials and
- * not four decisions.
+ * not four decisions. What the conversation is spending is neither: it is a
+ * reading, so it is a ring you glance at and a panel you open (`UsagePanel.tsx`).
+ *
+ * The order is the sentence the strip reads as, left to right: what this message
+ * is, then what it costs, then what it runs on. The two readings sit together on
+ * the right because "how full is the window" and "which model's window" are one
+ * question asked twice.
  *
  * The mode chip is the one that carries colour, and only when it is not the
  * careful default: chroma is reserved for "this is not what you'd assume".
  */
 
-export function Chips() {
+export function Chips({ meter }: { meter: Meter }) {
   const session = useSession();
   const [state, setState] = useState<PickerState | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
@@ -73,6 +81,7 @@ export function Chips() {
 
       <span className="chips-gap" />
 
+      <UsagePanel meter={meter} window={state.context_window} />
       <ModelPanel state={state} refresh={refresh} />
     </div>
   );

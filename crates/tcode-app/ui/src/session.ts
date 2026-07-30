@@ -5,6 +5,7 @@ import type { TouchedFile } from "./files";
 import type { Pasted } from "./paste";
 import type { Plan, PlanDraft } from "./plan";
 import type { ApprovalRequest } from "./types";
+import { NO_METER, type Limits, type Meter } from "./usage";
 
 /**
  * Everything the UI knows about one open conversation.
@@ -48,6 +49,9 @@ export type SessionState = {
    *  waits for the planning turn to *end*, because the `progress` tool still has
    *  to mark the plan active before another session may adopt it. */
   handoffPending: boolean;
+  /** What this conversation occupies, what the last turn cost, and what the
+   *  subscription has left. Folded from the event stream by `usage.ts`. */
+  meter: Meter;
 };
 
 /**
@@ -68,6 +72,22 @@ export function useSession(): string {
   return useContext(SessionContext);
 }
 
+/**
+ * What the subscription's budget windows have left.
+ *
+ * Window-level rather than per session, and a context rather than a prop for
+ * the same reason `SessionContext` is one: the thing that needs it is a leaf
+ * (the usage panel under every composer), and threading an account-wide fact
+ * through the workspace, the pane tree and the composer would put a parameter
+ * on five components for the benefit of one. `null` until a provider that
+ * reports limits has answered at least once.
+ */
+export const LimitsContext = createContext<Limits | null>(null);
+
+export function useLimits(): Limits | null {
+  return useContext(LimitsContext);
+}
+
 export const BLANK: SessionState = {
   blocks: [],
   files: [],
@@ -82,4 +102,5 @@ export const BLANK: SessionState = {
   planDraft: null,
   planOpen: false,
   handoffPending: false,
+  meter: NO_METER,
 };

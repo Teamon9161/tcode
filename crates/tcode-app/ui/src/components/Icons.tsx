@@ -86,6 +86,16 @@ export const PanelIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/** The rail, not a side panel: the divider sits on the *left* third, mirroring
+ *  `PanelIcon`, so the window's own sidebar and a pane's files panel are never
+ *  the same glyph pointing at two different things. */
+export const SidebarIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+    <path d="M9.5 4.5v15" />
+  </Glyph>
+);
+
 export const PlusIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M12 5.5v13" />

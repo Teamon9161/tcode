@@ -1,6 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { invoke } from "@tauri-apps/api/core";
+
+import { useSeat } from "./seat";
 
 import {
   byProfile,
@@ -74,22 +76,21 @@ export function ModelPanel({
     trigger.current?.focus();
   }, []);
 
-  // The chip's own box, in viewport coordinates, handed to CSS as custom
-  // properties: the geometry is measured here, the gap and the ceiling stay in
-  // the stylesheet where every other spacing decision lives.
-  const place = useCallback(() => {
-    const anchor = trigger.current;
-    const panel = box.current;
-    if (!anchor || !panel) return;
-    const rect = anchor.getBoundingClientRect();
-    panel.style.setProperty("--seat-right", `${window.innerWidth - rect.right}px`);
-    panel.style.setProperty("--seat-bottom", `${window.innerHeight - rect.top}px`);
-    panel.style.setProperty("--seat-room", `${rect.top}px`);
-  }, []);
+  // Anchoring, dismissal and the resize follow are `seat.ts`'s — the same three
+  // chores every portalled popover in this window has. Escape is the one thing
+  // this panel does differently, and it is the reason the hook takes it apart
+  // from the outside click: from a role, Escape goes back one level rather than
+  // closing the whole surface.
+  useSeat({
+    open,
+    trigger,
+    box,
+    onEscape: () => (view.at === "role" ? setView({ at: "agents" }) : close()),
+    onOutside: close,
+  });
 
   useLayoutEffect(() => {
     if (!open) return;
-    place();
     // Focus lands on the row already in force, which is both where the eye is
     // and where the arrow keys should start. Without it the panel opens with
     // focus still on the chip outside it, and the keyboard cannot reach the list
@@ -98,32 +99,7 @@ export function ModelPanel({
     const rows = box.current?.querySelectorAll<HTMLElement>("[data-row]");
     const here = box.current?.querySelector<HTMLElement>('[data-row][aria-current="true"]');
     (here ?? rows?.[0])?.focus();
-  }, [open, place]);
-
-  useEffect(() => {
-    if (!open) return;
-    const onDown = (event: MouseEvent) => {
-      const target = event.target as Node;
-      if (box.current?.contains(target) || trigger.current?.contains(target)) return;
-      close();
-    };
-    const onKey = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      // Before the pane's own Escape handler, which would close the pane.
-      event.stopPropagation();
-      // One level at a time: from a role back to the list it came from.
-      if (view.at === "role") setView({ at: "agents" });
-      else close();
-    };
-    window.addEventListener("mousedown", onDown);
-    window.addEventListener("keydown", onKey, true);
-    window.addEventListener("resize", place);
-    return () => {
-      window.removeEventListener("mousedown", onDown);
-      window.removeEventListener("keydown", onKey, true);
-      window.removeEventListener("resize", place);
-    };
-  }, [open, view, close, place]);
+  }, [open]);
 
   /** Apply, then re-read. Resolves to whether it worked, because the preset
    *  field must keep what was typed when the name was refused. */
@@ -195,7 +171,7 @@ export function ModelPanel({
       {open &&
         createPortal(
           <div
-            className="mpanel"
+            className="seated mpanel"
             ref={box}
             role="dialog"
             aria-label="Model"

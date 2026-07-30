@@ -26,8 +26,9 @@ import {
 } from "./layout";
 import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
 import type { PlanDecision } from "./PlanEditor";
-import { BLANK, type SessionState } from "./session";
+import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
+import { applyUsage, estimateContext, limitsFrom, NO_USAGE, type Limits } from "./usage";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
@@ -41,6 +42,10 @@ export function App() {
   // `view: string | null` did; it is the seat the split view sits down in.
   const [tiling, setTiling] = useState<Tiling>(EMPTY);
   const [fault, setFault] = useState<string | null>(null);
+  // One budget for the window, not one per conversation: the 5-hour and weekly
+  // windows belong to the account, and every session open here spends the same
+  // one. Whichever session's turn hears about it last is the one that is true.
+  const [limits, setLimits] = useState<Limits | null>(null);
   const [toolMeta, setToolMeta] = useState<Map<string, ToolMeta>>(new Map());
 
   // Sessions that are not on screen still receive events — that is the whole
@@ -94,8 +99,11 @@ export function App() {
           ...state,
           blocks: applyEvent(state.blocks, payload.event),
           files: applyFileEvent(state.files, payload.event),
+          meter: applyUsage(state.meter, payload.event),
           activity: describe(payload.event) ?? state.activity,
         }));
+        const reported = limitsFrom(payload.event);
+        if (reported) setLimits(reported);
         // A `progress` call is the one event that changes a file the panel is
         // showing, so it is the one event that asks the backend to read it again.
         if (touchedPlan(payload.event)) readPlan(payload.session);
@@ -171,7 +179,18 @@ export function App() {
     );
     setStates((current) => ({
       ...current,
-      [session.id]: { ...BLANK, ...replayed, activity: history.length > 0 ? "resumed" : BLANK.activity },
+      [session.id]: {
+        ...BLANK,
+        ...replayed,
+        // A resumed log carries no token counters, so the meter starts from an
+        // estimate that says so rather than from a confident `0%`.
+        meter: {
+          ...BLANK.meter,
+          context: estimateContext(history),
+          estimated: history.length > 0,
+        },
+        activity: history.length > 0 ? "resumed" : BLANK.activity,
+      },
     }));
     setTiling((current) => show(current, session.id));
     // A resumed conversation may already be working through a plan — it is on
@@ -213,6 +232,10 @@ export function App() {
         planFirst: false,
         running: true,
         failed: false,
+        // The receipt is per turn, so it is zeroed where the turn is submitted.
+        // Not on `AgentEvent::Started`: core emits that per model request, and a
+        // six-step turn would end up reporting only its last step's cost.
+        meter: { ...state.meter, turn: NO_USAGE },
         blocks: [
           ...state.blocks,
           userBlock(
@@ -395,35 +418,38 @@ export function App() {
 
   return (
     <ToolMetaProvider meta={toolMeta}>
-      <Workspace
-        tiling={tiling}
-        sessions={sessions}
-        stateOf={stateOf}
-        statusOf={statusOf}
-        onTiling={(step) => setTiling(step)}
-        onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
-        onAttach={(id, items) =>
-          patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
-        }
-        onDetach={(id, item) =>
-          patch(id, (was) => ({
-            ...was,
-            attachments: was.attachments.filter((entry) => entry.id !== item),
-          }))
-        }
-        onSend={send}
-        onInterrupt={(id) => {
-          invoke("interrupt", { session: id }).catch(() => {});
-        }}
-        onAnswer={answer}
-        onDecidePlan={decidePlan}
-        onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
-        onSavePlan={savePlan}
-        onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
-        onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
-        onCloseSession={closeSession}
-        onHome={() => setTiling(EMPTY)}
-      />
+      <LimitsContext.Provider value={limits}>
+        <Workspace
+          tiling={tiling}
+          sessions={sessions}
+          stateOf={stateOf}
+          statusOf={statusOf}
+          onTiling={(step) => setTiling(step)}
+          onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
+          onAttach={(id, items) =>
+            patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
+          }
+          onDetach={(id, item) =>
+            patch(id, (was) => ({
+              ...was,
+              attachments: was.attachments.filter((entry) => entry.id !== item),
+            }))
+          }
+          onSend={send}
+          onInterrupt={(id) => {
+            invoke("interrupt", { session: id }).catch(() => {});
+          }}
+          onAnswer={answer}
+          onDecidePlan={decidePlan}
+          onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
+          onSavePlan={savePlan}
+          onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
+          onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
+          onCloseSession={closeSession}
+          onHome={() => setTiling(EMPTY)}
+          onOpenFolder={openFolder}
+        />
+      </LimitsContext.Provider>
     </ToolMetaProvider>
   );
 }

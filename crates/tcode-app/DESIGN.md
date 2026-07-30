@@ -210,11 +210,17 @@ One shape per job, used everywhere:
   pane exists — with one pane, "which is current" is not a question anyone is
   asking, and answering it anyway spends the state colour on nothing.
 - **Title bar** — the app draws it (`decorations: false`). The thinnest band in
-  the window: back, and the window buttons. Nothing else. It deliberately
-  carries no title: once the window can hold several conversations, naming one
-  of them at window level is a second and sometimes-wrong answer to a question
-  each pane's own header already answers. No product mark either — the window is
-  already named by the OS.
+  the window: back, the rail's fold toggle, and the window buttons. Nothing
+  else, and the test for what may join them is whether the thing belongs to the
+  *window* — the rail does, which is why its toggle is here and the files toggle
+  is not. It deliberately carries no title: once the window can hold several
+  conversations, naming one of them at window level is a second and
+  sometimes-wrong answer to a question each pane's own header already answers.
+  No product mark either — the window is already named by the OS.
+
+  The fold toggle is drawn plain in both states. A pressed treatment would spend
+  the brand colour saying "the rail is open" while the rail itself is the
+  largest object on screen saying the same thing.
 - **Scrollbars** — the platform's own, thin, and invisible until the pointer is
   over the region that scrolls. A permanent track down a pane's edge reads as a
   divider nobody drew.
@@ -227,6 +233,51 @@ One shape per job, used everywhere:
   composer is furniture. The meter is the only place a bar carries chroma, and it
   earns it the same way a status dot does: it is state, and only while a turn is
   actually running.
+- **Composer strip** — the row under the field: `plan first` and the permission
+  mode on the left, the usage ring and the model on the right. It reads as one
+  sentence — what this message is, what it costs, what answers it — and as a
+  caption rather than a toolbar, which is a measured thing and not a mood. Every
+  control on it is the same 22px box whether or not it draws a border (`.chip`
+  reserves a transparent one, so the single outlined switch cannot be two pixels
+  taller than its neighbours), and the row's 4px inset puts the first label on
+  the field's own text column. It was a bordered pill standing beside bare
+  labels in a band a third taller than anything in it, which is what "not
+  particularly tidy" turned out to mean.
+
+  A pane can be a third of the window, so what goes first is chosen rather than
+  clipped: the subscription figure (a promotion of what the panel already
+  holds), then the model's effort, then the model's name truncates, then the
+  group drops to a second line. No control is ever unreachable.
+- **Usage ring** — the context window as a 13px donut on the strip, with its
+  percentage beside it, opening a panel of the whole account. A ring rather than
+  a bar because the strip has one line and no width to spare, and because a
+  circle reads as a proportion at that size where a 12px bar reads as a smudge.
+
+  Two budgets meet here and the design keeps them apart everywhere: the
+  **context window** is this conversation's and a compaction empties it; a
+  **subscription window** (5h, weekly) is the account's and only the clock
+  refills it. They never average into one "usage" number — that is how a meter
+  ends up saying you are fine at the moment you are out of hours — and the
+  subscription's figure appears on the strip only once it is tight enough to
+  change what you would do next, named by its window so it cannot be misread as
+  a second reading of the first.
+
+  Every meter here is achromatic until it matters. That is the palette rule, not
+  a shade of the terminal's: chroma means state, and a third of a window used is
+  the number being unremarkable. Amber and red arrive at the thresholds the TUI
+  warns at, so the two frontends never disagree about when to look up, and every
+  level carries a figure so it is never hue alone. An unconfirmed figure — a
+  resumed log, a fresh compaction — is prefixed `≈` rather than rounded into a
+  fact.
+- **Folder chip** — the pane header's identity and its folder picker, in one
+  control. The name and the path were the same fact twice (a conversation is
+  named after its folder), and the path was already answering "which folder" —
+  making it the control for it too is what let the rail stop carrying a button
+  that started a different kind of thing than everything else in it. It sits in
+  the pane rather than the title bar because with the window split there are two
+  folders on screen and "the current folder" is not a question the window can
+  answer. Picking never moves a conversation: a session's folder is fixed when
+  it opens, so every item starts one, which is what the menu's heading says.
 - **Anchored panel** — the model panel, and the shape to reuse for any control
   that carries several dials at once rather than one list of answers. Three bands
   inside one popover: a chrome band of view switches, the content surface holding
@@ -245,6 +296,13 @@ One shape per job, used everywhere:
   and positioned from its trigger's measured box: a fixed popover inside a pane
   is clipped by it, and a field inside the composer's form submits the message on
   Enter.
+
+  The frame is `.seated` and the measuring is `seat.ts`, both shared with the
+  usage panel and the folder menu. Only where a popover opens from and how wide
+  it is belongs to each of them — three popovers that lift differently read as
+  three different applications, and three copies of "measure the trigger,
+  re-measure on resize, dismiss on Escape or a click outside" is three places
+  for one of those to go missing.
 
   Where a row's value is an identifier — a model id, a profile, a role's pin —
   it is set in the mono face, for the same reason a path in the transcript is.

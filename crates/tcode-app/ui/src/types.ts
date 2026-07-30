@@ -68,6 +68,37 @@ export type AgentEvent =
       data: { run: string; status: string; tool_calls: number };
     }
   | { type: "AutoModePaused"; data: string }
+  /** One model request's normalized token counts. `input_tokens` is the
+   *  NON-cached input only — see `usage.ts` for why the two figures it feeds
+   *  must not be mixed. */
+  | {
+      type: "Usage";
+      data: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_read_tokens: number;
+        cache_write_tokens: number;
+      };
+    }
+  /** Spend inside a delegated sub-agent: it costs money, but occupies its own
+   *  window rather than this conversation's. */
+  | { type: "DelegatedUsage"; data: unknown }
+  /** What the subscription's budget windows have left, off the response
+   *  headers. Absent entirely for providers that report none. */
+  | {
+      type: "RateLimits";
+      data: {
+        primary: { used_percent: number; window_minutes: number; resets_at: number };
+        secondary: {
+          used_percent: number;
+          window_minutes: number;
+          resets_at: number;
+        } | null;
+      };
+    }
+  /** `@path` context expanded into the prompt before a message is appended. The
+   *  transcript keeps the short marker; the meter counts the real snapshot. */
+  | { type: "ReferencesExpanded"; data: { labels: string[]; added_tokens: number } }
   // Everything not spelled out above still arrives; the transcript ignores it
   // rather than crashing on a variant added since this file was written.
   | { type: string; data?: unknown };

@@ -153,6 +153,11 @@ pub struct PickerState {
     /// panel shows back after a pick, so anything else makes a working choice
     /// look like a dead control.
     pub effort: Option<String>,
+    /// How many tokens the running model's window holds. Read from the same
+    /// live `ModelCell` as `effort`, and for the same reason: the context meter
+    /// divides by this, and dividing by the *configured* window while running on
+    /// another model draws a percentage of the wrong thing.
+    pub context_window: u64,
     pub presets: Vec<PresetChoice>,
     pub preset: Option<usize>,
     pub roles: Vec<RoleChoice>,
@@ -210,6 +215,7 @@ pub fn state_of(
             .collect(),
         model: menus.models.current,
         effort: model.snapshot().effort,
+        context_window: model.snapshot().context_window,
         presets: menus
             .presets
             .options

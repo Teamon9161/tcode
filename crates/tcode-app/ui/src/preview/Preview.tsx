@@ -4,7 +4,8 @@ import type { ApprovalRequest, SessionInfo, Status } from "../types";
 import type { Block } from "../blocks";
 import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
-import { BLANK, type SessionState } from "../session";
+import { BLANK, LimitsContext, type SessionState } from "../session";
+import { NO_METER, type Limits, type Meter } from "../usage";
 import { openInspect, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { draftOf, type Plan, type PlanComment } from "../plan";
@@ -32,6 +33,39 @@ const SESSIONS: SessionInfo[] = [
 ];
 
 const STATUS: Record<string, Status> = { a: "running", b: "waiting", c: "idle" };
+
+/**
+ * The usage strip's world. Deliberately the states worth looking at rather than
+ * the comfortable ones: a window a third full with a real receipt behind it, a
+ * second conversation whose figure is still an estimate because it was resumed,
+ * and a subscription whose weekly window is tight enough to have climbed onto
+ * the strip on its own.
+ */
+const METER: Meter = {
+  context: 68_400,
+  estimated: false,
+  turn: {
+    input_tokens: 1_178,
+    output_tokens: 3_902,
+    cache_read_tokens: 61_200,
+    cache_write_tokens: 4_100,
+  },
+};
+
+const OTHER_METER: Meter = { ...NO_METER, context: 21_500, estimated: true };
+
+const LIMITS: Limits = {
+  primary: {
+    used_percent: 34,
+    window_minutes: 300,
+    resets_at: Math.floor(Date.now() / 1000) + 4_800,
+  },
+  secondary: {
+    used_percent: 91,
+    window_minutes: 10_080,
+    resets_at: Math.floor(Date.now() / 1000) + 259_200,
+  },
+};
 
 /** Mirrors what `tool_views()` returns for the real tool set. */
 const TOOL_META = new Map<string, ToolMeta>(
@@ -537,63 +571,70 @@ export function Preview() {
           plan,
           planDraft: plan ? { ...draftOf(plan), comments: comments(plan) } : null,
           planOpen: scene === "session",
+          meter: METER,
         }
-      : { ...BLANK, blocks: OTHER_BLOCKS, running: true };
+      : { ...BLANK, blocks: OTHER_BLOCKS, running: true, meter: OTHER_METER };
 
   return (
     <ToolMetaProvider meta={TOOL_META}>
-      <div className="preview">
-        <nav className="preview-bar">
-          {SCENES.map((name) => (
-            <button
-              key={name}
-              className={scene === name ? "is-on" : undefined}
-              onClick={() => pick(name)}
-            >
-              {name}
-            </button>
-          ))}
-        </nav>
-        <div className="preview-stage">
-          {scene === "launchpad" && (
-            <Launchpad
-              open={SESSIONS}
-              statusOf={(id) => STATUS[id] ?? "idle"}
-              activityOf={(id) =>
-                ({
-                  a: "edit crates/tcode-core/src/agent/mod.rs",
-                  b: "waiting on shell",
-                  c: "done",
-                })[id] ?? ""
-              }
-              onEnter={() => pick("session")}
-              onOpenFolder={async () => pick("session")}
-            />
-          )}
-          {scene !== "launchpad" && (
-            <Workspace
-              tiling={tiling}
-              sessions={SESSIONS}
-              stateOf={stateOf}
-              statusOf={(id) => STATUS[id] ?? "idle"}
-              onTiling={(step) => setTiling(step)}
-              onDraft={(_, value) => setDraft(value)}
-              onAttach={(_, items) => setAttachments((was) => [...was, ...items])}
-              onDetach={(_, id) => setAttachments((was) => was.filter((item) => item.id !== id))}
-              onSend={() => {}}
-              onInterrupt={() => {}}
-              onAnswer={() => pick("session")}
-              onDecidePlan={() => pick("session")}
-              onPlanDraft={() => {}}
-              onSavePlan={() => {}}
-              onPlanOpen={() => {}}
-              onPlanFirst={() => {}}
-              onCloseSession={() => {}}
-              onHome={() => pick("launchpad")}
-            />
-          )}
+      {/* A conversation with nothing in it yet is also the honest place to show
+          the other half of the usage panel: a provider that reports no
+          subscription windows at all. */}
+      <LimitsContext.Provider value={scene === "empty" ? null : LIMITS}>
+        <div className="preview">
+          <nav className="preview-bar">
+            {SCENES.map((name) => (
+              <button
+                key={name}
+                className={scene === name ? "is-on" : undefined}
+                onClick={() => pick(name)}
+              >
+                {name}
+              </button>
+            ))}
+          </nav>
+          <div className="preview-stage">
+            {scene === "launchpad" && (
+              <Launchpad
+                open={SESSIONS}
+                statusOf={(id) => STATUS[id] ?? "idle"}
+                activityOf={(id) =>
+                  ({
+                    a: "edit crates/tcode-core/src/agent/mod.rs",
+                    b: "waiting on shell",
+                    c: "done",
+                  })[id] ?? ""
+                }
+                onEnter={() => pick("session")}
+                onOpenFolder={async () => pick("session")}
+              />
+            )}
+            {scene !== "launchpad" && (
+              <Workspace
+                tiling={tiling}
+                sessions={SESSIONS}
+                stateOf={stateOf}
+                statusOf={(id) => STATUS[id] ?? "idle"}
+                onTiling={(step) => setTiling(step)}
+                onDraft={(_, value) => setDraft(value)}
+                onAttach={(_, items) => setAttachments((was) => [...was, ...items])}
+                onDetach={(_, id) => setAttachments((was) => was.filter((item) => item.id !== id))}
+                onSend={() => {}}
+                onInterrupt={() => {}}
+                onAnswer={() => pick("session")}
+                onDecidePlan={() => pick("session")}
+                onPlanDraft={() => {}}
+                onSavePlan={() => {}}
+                onPlanOpen={() => {}}
+                onPlanFirst={() => {}}
+                onCloseSession={() => {}}
+                onHome={() => pick("launchpad")}
+                onOpenFolder={async () => pick("session")}
+              />
+            )}
+          </div>
         </div>
-      </div>
+      </LimitsContext.Provider>
     </ToolMetaProvider>
   );
 }

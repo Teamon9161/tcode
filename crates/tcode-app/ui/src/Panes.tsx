@@ -12,7 +12,7 @@ import {
   type Inspect,
 } from "./inspect";
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
-import { Path } from "./components/Path";
+import { FolderMenu } from "./FolderMenu";
 import { StatusDot } from "./components/Status";
 import { BackIcon, CloseIcon, ForwardIcon, PanelIcon } from "./components/Icons";
 import { Transcript } from "./Transcript";
@@ -64,6 +64,8 @@ export type PaneContext = {
   onSavePlan: (session: string) => void;
   onPlanOpen: (session: string, open: boolean) => void;
   onPlanFirst: (session: string, on: boolean) => void;
+  /** Start a conversation in another folder, from this pane's folder chip. */
+  onOpenFolder: (path: string) => Promise<void>;
 };
 
 /**
@@ -235,8 +237,17 @@ function SessionPane({
     <>
       <header className="pane-head">
         <StatusDot status={context.statusOf(session)} />
-        <span className="pane-name">{info.name}</span>
-        <Path className="pane-path" path={info.cwd} home={info.home} keep={3} />
+        {/* The name and the path were the same fact twice — a conversation is
+            named after its folder — so they are one control now. It was already
+            the answer to "which folder"; making it the control for it too is
+            what let the rail stop carrying a button that started a different
+            kind of thing than everything else in it. */}
+        <FolderMenu
+          name={info.name}
+          cwd={info.cwd}
+          home={info.home}
+          onOpenFolder={context.onOpenFolder}
+        />
         <button
           className="icon-btn"
           onClick={() => context.onToggleFiles(leaf.id, session)}
@@ -299,6 +310,7 @@ function SessionPane({
           running={state.running}
           disabled={false}
           attachments={state.attachments}
+          meter={state.meter}
           planFirst={state.planFirst}
           onPlanFirst={(on) => context.onPlanFirst(session, on)}
           onChange={(value) => context.onDraft(session, value)}

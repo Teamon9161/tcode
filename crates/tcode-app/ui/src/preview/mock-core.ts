@@ -82,6 +82,7 @@ const PICKER: PickerState = {
   ],
   model: 0,
   effort: "high",
+  context_window: 200_000,
   presets: [
     { key: "quant", label: "quant" },
     { key: "cheap", label: "cheap" },

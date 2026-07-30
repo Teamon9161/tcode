@@ -44,7 +44,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在窗格里：窗口按钮属于窗口的角，不属于某一个窗格的角。
 
-    **topbar 里只放窗口级别的东西**（返回启动台、窗口按钮），不放会话名、路径，也不放作用于某个会话的动作。窗口能同时开几个会话之后，任何"当前会话"的说法在这里都是猜的——文件索引开关就因此下沉到了每个会话窗格自己的 header。它看起来空是对的：它是 title bar，不是工具条。
+    **topbar 里只放窗口级别的东西**（返回启动台、折叠会话栏、窗口按钮），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于窗口还是属于某个会话"：会话栏属于窗口，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在窗口这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。它看起来空是对的：它是 title bar，不是工具条。
 
 9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。thinking、单个调用、连续读、连续编辑、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
 
@@ -111,6 +111,16 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **turn 跑着时改模式是 stage 不是丢**（`SessionHandle::staged_mode`）：`Session` 被跑 turn 的一方 take 走了（硬规则 4），所以选择存下来、`put_back` 时落地，chip 上显示 `→`。别改成"忙时报错"——那是把所有权约束当成用户的问题。
 
+16. **用量的两笔账不许合并**（`ui/src/usage.ts` + `UsagePanel.tsx`）。**context** 是这段对话在模型窗口里占了多少（含缓存前缀——缓存过的输入照样占位置），是**每个会话**的，compact 一次就清掉一大半；**订阅额度**（5h / 周）是**整个账号**的，只有时钟能回填。两者作用域不同，所以 `Meter` 挂在 `SessionState` 上，`Limits` 挂在 App 顶层的 `LimitsContext` 上——把额度也塞进会话，结果就是新开的文件夹说"没有额度信息"，而旁边那个窗格正显示 42%。**它们也永远不许平均成一个"usage"数字**：那正好在你没时间了的那一刻告诉你一切正常。
+
+    **`Usage` 事件是替换不是累加**：一次请求的整个 prompt 就是 `total_input()`，跨步累加会把缓存前缀按请求数重复计。回合账单（`turn`）才是累加的那个，`DelegatedUsage` 进账单不进窗口——sub-agent 花钱，但占的是它自己的窗口。这条有单测钉住。
+
+    **算不准就说算不准**：resume 的日志里没有 token 计数，compact 之后没人知道摘要多大，`@path` 展开是在回合前就进了 prompt——这三种情况打 `estimated`，界面上是 `≈`。宁可显示 `≈68k` 也不要把猜的数字画成事实；下一次真实 usage 事件会把它换掉。
+
+    **阈值与 TUI 同源**（context 85/95，额度 75/90）。两个前端在不同时刻变黄，等于同一个契约有两份定义。
+
+17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。
@@ -119,8 +129,9 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
-  - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
+- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 用量环 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
+  - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。

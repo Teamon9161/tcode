@@ -21,7 +21,7 @@ import {
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, PlusIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, SidebarIcon } from "./components/Icons";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
@@ -30,11 +30,19 @@ import { Panes, type PaneContext } from "./Panes";
  * The window: a rail of conversations on the left, a tiled field of panes
  * beside it, and a title bar over both.
  *
- * The rail is always present rather than a drawer: knowing that another session
- * needs you is the reason this app exists, and information you have to open a
- * menu to see is information you will miss. It lists every conversation the
- * process is holding, on screen or not — the panes show a few, the rail
- * accounts for all of them.
+ * The rail lists every conversation the process is holding, on screen or not —
+ * the panes show a few, the rail accounts for all of them. It is shown by
+ * default rather than being a drawer: knowing that another session needs you is
+ * the reason this app exists, and information you have to open a menu to see is
+ * information you will miss. It can still be folded away from the title bar,
+ * for the stretch where one conversation is the whole job — the toggle lives
+ * there because the rail is the window's, not any pane's, which is the same rule
+ * that keeps session actions out of the bar (AGENTS.md rule 9c).
+ *
+ * Nothing in the rail starts a *new* conversation any more. That button used to
+ * sit at the bottom of the list and was the one row in it that was not a
+ * conversation; the folder chip in each pane's header owns it now, where the
+ * folder was already being named.
  *
  * The title bar spans the whole window rather than sitting inside the field,
  * because it is also the window's own bar (`decorations: false`, see
@@ -62,6 +70,7 @@ export function Workspace({
   onPlanFirst,
   onCloseSession,
   onHome,
+  onOpenFolder,
 }: {
   tiling: Tiling;
   sessions: SessionInfo[];
@@ -81,8 +90,10 @@ export function Workspace({
   onPlanFirst: (session: string, on: boolean) => void;
   onCloseSession: (session: string) => void;
   onHome: () => void;
+  onOpenFolder: (path: string) => Promise<void>;
 }) {
   const narrow = useNarrow();
+  const [rail, setRail] = useState(true);
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
@@ -210,6 +221,7 @@ export function Workspace({
     onSavePlan,
     onPlanOpen,
     onPlanFirst,
+    onOpenFolder,
   };
 
   // Below the threshold the tree stops being shown and only the current pane
@@ -218,46 +230,59 @@ export function Workspace({
   const shown = narrow && here ? { root: here, focus: here.id } : tiling;
 
   return (
-    <div className="workspace">
+    <div className={`workspace${rail ? "" : " is-folded"}`}>
       <header className="topbar" {...DRAG}>
         <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
           <BackIcon size={15} />
+        </button>
+        {/* No "on" styling: the rail being open is already answered by the rail
+            being there, and spending the brand colour on a control whose state
+            is the largest object on screen is exactly what the palette rule
+            exists to prevent. */}
+        <button
+          className="icon-btn"
+          onClick={() => setRail((shown) => !shown)}
+          aria-pressed={rail}
+          aria-label={rail ? "Hide the conversation list" : "Show the conversation list"}
+          title={rail ? "Hide the conversation list" : "Show the conversation list"}
+        >
+          <SidebarIcon size={15} />
         </button>
         <span className="topbar-gap" {...DRAG} />
         <WindowControls />
       </header>
 
-      <nav className="rail">
-        {/* No home button here: the title bar's back arrow already goes there,
-            and the mark that used to sit in this corner was a second status
-            light for the session the rail is already showing. */}
-        <ul className="rail-list">
-          {sessions.map((entry) => (
-            <li key={entry.id}>
-              <button
-                className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
-                onClick={() => onTiling((current) => show(current, entry.id))}
-                title={entry.cwd}
-              >
-                <StatusDot status={statusOf(entry.id)} />
-                <span className="rail-name">{entry.name}</span>
-              </button>
-              <button
-                className="rail-close"
-                onClick={() => onCloseSession(entry.id)}
-                aria-label={`Close ${entry.name}`}
-              >
-                <CloseIcon size={13} />
-              </button>
-            </li>
-          ))}
-        </ul>
-
-        <button className="rail-add" onClick={onHome}>
-          <PlusIcon size={14} />
-          <span className="rail-name">Open folder</span>
-        </button>
-      </nav>
+      {/* Unmounted rather than hidden when folded: it holds no state of its own,
+          and a `display: none` rail is still a grid column somebody has to
+          remember to zero. */}
+      {rail && (
+        <nav className="rail">
+          {/* No home button here: the title bar's back arrow already goes there,
+              and the mark that used to sit in this corner was a second status
+              light for the session the rail is already showing. */}
+          <ul className="rail-list">
+            {sessions.map((entry) => (
+              <li key={entry.id}>
+                <button
+                  className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
+                  onClick={() => onTiling((current) => show(current, entry.id))}
+                  title={entry.cwd}
+                >
+                  <StatusDot status={statusOf(entry.id)} />
+                  <span className="rail-name">{entry.name}</span>
+                </button>
+                <button
+                  className="rail-close"
+                  onClick={() => onCloseSession(entry.id)}
+                  aria-label={`Close ${entry.name}`}
+                >
+                  <CloseIcon size={13} />
+                </button>
+              </li>
+            ))}
+          </ul>
+        </nav>
+      )}
 
       <Panes tiling={shown} context={context} />
     </div>
