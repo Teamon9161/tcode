@@ -182,7 +182,11 @@ struct SkillRenderer;
 
 impl ToolRenderer for SkillRenderer {
     fn header(&self, name: &str, input: &Value, _cwd: Option<&Path>) -> String {
-        match input["name"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        match input["name"]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
             Some(skill) => format!("{name}({skill})"),
             None => name.to_string(),
         }
@@ -756,7 +760,10 @@ mod tests {
         let renderer = SkillRenderer;
         let input = json!({"name": "impeccable", "arguments": "audit the trace column"});
         assert_eq!(renderer.header("skill", &input, None), "skill(impeccable)");
-        assert_eq!(renderer.batch_item("skill", &input, None), "skill(impeccable)");
+        assert_eq!(
+            renderer.batch_item("skill", &input, None),
+            "skill(impeccable)"
+        );
         assert_eq!(renderer.initial_detail(&input).len(), 1);
         // No arguments is the common case and must not open an empty foldout.
         assert!(renderer

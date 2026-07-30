@@ -1000,9 +1000,16 @@ mod tests {
         pending.push(queued("first"));
         pending.push(queued("second"));
 
-        assert_eq!(pending.withdraw(0, "first").map(|m| m.text).as_deref(), Some("first"));
         assert_eq!(
-            pending.queued().iter().map(|m| m.text.as_str()).collect::<Vec<_>>(),
+            pending.withdraw(0, "first").map(|m| m.text).as_deref(),
+            Some("first")
+        );
+        assert_eq!(
+            pending
+                .queued()
+                .iter()
+                .map(|m| m.text.as_str())
+                .collect::<Vec<_>>(),
             ["second"]
         );
     }
@@ -1032,12 +1039,17 @@ mod tests {
         session.ledger.append(user("first ask"));
         session.ledger.append(Entry::Assistant(vec![]));
         // Harness-authored text is not somewhere anyone can go back to and edit.
-        session.ledger.append(user("<tcode-status>mode: default</tcode-status>"));
+        session
+            .ledger
+            .append(user("<tcode-status>mode: default</tcode-status>"));
         session.ledger.append(user("second ask"));
 
         let targets = session.rewind_targets();
         assert_eq!(
-            targets.iter().map(|t| (t.index, t.text.as_str())).collect::<Vec<_>>(),
+            targets
+                .iter()
+                .map(|t| (t.index, t.text.as_str()))
+                .collect::<Vec<_>>(),
             [(0, "first ask"), (3, "second ask")]
         );
     }
