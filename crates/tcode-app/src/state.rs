@@ -21,6 +21,11 @@ use tcode_core::{Agent, AgentError, ContentBlock, Session};
 use crate::boot::SessionFactory;
 use crate::bridge::{pump_events, Emit, Pending, TurnFinished, WebviewApprover, TURN_FINISHED};
 
+struct TurnControl {
+    id: Option<u64>,
+    cancel: CancellationToken,
+}
+
 /// One conversation, with everything that is private to it.
 pub struct SessionHandle {
     pub id: String,
@@ -32,7 +37,8 @@ pub struct SessionHandle {
     /// which is exactly when the plan surface has something new to show. Reading
     /// the plan is not a reason to wait for a turn to end.
     progress: Arc<Mutex<Option<Progress>>>,
-    cancel: Mutex<CancellationToken>,
+    turn: Mutex<TurnControl>,
+    next_turn: std::sync::atomic::AtomicU64,
     pending: Pending,
     /// Prompts typed while a turn was running. A clone of the `Session`'s own
     /// handle, held here *because* of the `Option` above: the running turn owns
@@ -40,12 +46,11 @@ pub struct SessionHandle {
     /// thing to do while it does. Core made this a shared handle for exactly
     /// this, and the desktop app is the second frontend to need it.
     queue: tcode_core::PendingInput,
-    /// A permission mode chosen while a turn held the session, applied when it
-    /// comes back. The mode belongs to the `Session`, and the running turn owns
-    /// that — so the choice is staged rather than dropped or forced. The TUI
-    /// stages the same way and shows it as `→ auto`; this is that, without the
-    /// mid-batch commit, because nothing here can reach into a running turn.
-    staged_mode: Mutex<Option<tcode_core::PermissionMode>>,
+    /// A permission mode chosen while a turn holds the session. This is the
+    /// session-owned shared cell the agent commits at its next permission
+    /// boundary, so a mid-turn switch can gate the next call rather than merely
+    /// changing the mode once the turn returns.
+    pending_mode: tcode_core::PendingMode,
 }
 
 /// A turn could not start.
@@ -64,19 +69,21 @@ impl SessionHandle {
             cwd,
             progress: session.tool_ctx.progress_cell(),
             queue: session.pending.clone(),
+            pending_mode: session.pending_mode.clone(),
             session: Mutex::new(Some(session)),
-            cancel: Mutex::new(CancellationToken::new()),
+            turn: Mutex::new(TurnControl {
+                id: None,
+                cancel: CancellationToken::new(),
+            }),
+            next_turn: std::sync::atomic::AtomicU64::new(0),
             pending: Pending::default(),
-            staged_mode: Mutex::new(None),
         }
     }
 
-    /// The mode this conversation is under, and whether it is still waiting for
-    /// the turn to end. Both, because "auto" and "auto as soon as this finishes"
-    /// are different facts and a chip that shows only the first is a lie during
-    /// the exact window where it matters.
+    /// The mode this conversation is under, and whether a running turn still
+    /// has a target waiting for Core's next permission boundary.
     pub fn mode(&self) -> (tcode_core::PermissionMode, bool) {
-        if let Some(staged) = *self.staged_mode.lock().unwrap() {
+        if let Some(staged) = self.pending_mode.get() {
             return (staged, true);
         }
         let live = self
@@ -89,16 +96,16 @@ impl SessionHandle {
         (live, false)
     }
 
-    /// Choose the permission mode. Applies now when the session is idle, and is
-    /// staged when a turn holds it.
+    /// Choose the permission mode. Applies now when the session is idle, and
+    /// stages through Core's shared cell when a turn owns it.
     pub fn set_mode(&self, mode: tcode_core::PermissionMode) {
         let mut session = self.session.lock().unwrap();
         match session.as_mut() {
             Some(session) => {
                 session.mode = mode;
-                *self.staged_mode.lock().unwrap() = None;
+                self.pending_mode.clear();
             }
-            None => *self.staged_mode.lock().unwrap() = Some(mode),
+            None => self.pending_mode.set(mode),
         }
     }
 
@@ -133,26 +140,32 @@ impl SessionHandle {
         self.queue.queued()
     }
 
+    /// A queue snapshot plus the running turn that owns its eventual delivery.
+    /// The turn id is part of the webview action boundary: a late "send now"
+    /// must not stop a successor.
+    pub fn queued_with_turn(&self) -> (Option<u64>, Vec<tcode_core::PendingMessage>) {
+        let turn = self.turn.lock().unwrap().id;
+        (turn, self.queue.queued())
+    }
+
     /// Take one queued prompt back. See `PendingInput::withdraw` for why the
     /// text is checked as well as the position.
     pub fn withdraw_queued(&self, index: usize, text: &str) -> Option<tcode_core::PendingMessage> {
         self.queue.withdraw(index, text)
     }
 
-    /// "Stop what you are doing and say this now."
-    ///
-    /// Two steps in one order that matters: the queue is deferred *before* the
-    /// turn is cancelled, so the turn being torn down cannot drain at a safe
-    /// boundary on its way out and swallow the messages meant for its successor.
-    /// `run_turn` starts that successor when it finds them.
-    pub fn interrupt_and_flush(&self) {
+    /// "Stop what you are doing and say this now." Returns false when the
+    /// visible queue belonged to a turn that has already ended, so a delayed
+    /// webview event cannot cancel the successor it was meant to start.
+    pub fn interrupt_and_flush(&self, turn: u64) -> bool {
+        let control = self.turn.lock().unwrap();
+        if control.id != Some(turn) {
+            return false;
+        }
         self.queue.defer_to_next_turn();
-        self.interrupt();
-    }
-
-    /// Everything owed, handed over now that no turn holds the session.
-    fn take_queued(&self) -> Vec<tcode_core::PendingMessage> {
-        self.queue.take_for_next_turn()
+        control.cancel.cancel();
+        self.pending.clear();
+        true
     }
 
     /// Where this conversation can be rewound to. Empty while a turn holds the
@@ -321,30 +334,56 @@ impl SessionHandle {
         Ok(title)
     }
 
-    /// Stop the running turn, if any. Also fails any open approval closed:
-    /// an interrupted turn must not be authorized by an answer that arrives
-    /// afterwards.
-    pub fn interrupt(&self) {
-        self.cancel.lock().unwrap().cancel();
-        self.pending.clear();
-    }
-
     fn take(&self) -> Option<Session> {
         self.session.lock().unwrap().take()
     }
 
-    fn put_back(&self, mut session: Session) {
-        // A mode chosen mid-turn lands here, at the first moment this side owns
-        // the session again.
-        if let Some(staged) = self.staged_mode.lock().unwrap().take() {
-            session.mode = staged;
+    /// Return the session to the idle pool only when there is no queued prompt
+    /// to continue with. Holding it through this decision means a foreground
+    /// submission cannot claim it between destructive queue drain and successor
+    /// startup.
+    fn put_back_or_take_queued(
+        &self,
+        session: Session,
+    ) -> (Option<Session>, Vec<tcode_core::PendingMessage>) {
+        let mut held = self.session.lock().unwrap();
+        let queued = self.queue.take_for_next_turn();
+        if queued.is_empty() {
+            *held = Some(session);
+            (None, queued)
+        } else {
+            (Some(session), queued)
         }
-        *self.session.lock().unwrap() = Some(session);
+    }
+
+    fn begin_turn(&self) -> (u64, CancellationToken) {
+        use std::sync::atomic::Ordering;
+
+        let id = self.next_turn.fetch_add(1, Ordering::Relaxed);
+        let cancel = CancellationToken::new();
+        let mut control = self.turn.lock().unwrap();
+        control.id = Some(id);
+        control.cancel = cancel.clone();
+        (id, cancel)
+    }
+
+    fn finish_turn(&self, id: u64) {
+        let mut control = self.turn.lock().unwrap();
+        if control.id == Some(id) {
+            control.id = None;
+        }
+    }
+
+    /// Stop the running turn, if any. Also fails any open approval closed:
+    /// an interrupted turn must not be authorized by an answer that arrives
+    /// afterwards.
+    pub fn interrupt(&self) {
+        self.turn.lock().unwrap().cancel.cancel();
+        self.pending.clear();
     }
 }
 
-/// Open a second conversation on the same folder to execute `session`'s
-/// approved plan, and return it with the instruction its first turn carries.
+/// Open a second conversation on the same folder to execute an approved plan, and return it with the instruction its first turn carries.
 ///
 /// Separate from the command that calls it because it is the whole decision:
 /// only an approved plan may be handed on, the new session adopts the file
@@ -478,79 +517,117 @@ pub async fn run_turn(
     input: Vec<ContentBlock>,
     instructions: Vec<String>,
 ) -> Result<(), TurnError> {
-    let Some(mut session) = handle.take() else {
+    let Some(session) = handle.take() else {
         return Err(TurnError::Busy(handle.id.clone()));
     };
+    run_owned_turn(agent, handle, emit, session, input, instructions, None).await
+}
 
-    let cancel = CancellationToken::new();
-    *handle.cancel.lock().unwrap() = cancel.clone();
+/// Continue a session while it remains exclusively owned by the current turn
+/// driver. This reserves queued input before the session is externally idle, so
+/// a foreground submission cannot race a destructive queue drain.
+async fn run_owned_turn(
+    agent: Arc<Agent>,
+    handle: Arc<SessionHandle>,
+    emit: Arc<dyn Emit>,
+    mut session: Session,
+    mut input: Vec<ContentBlock>,
+    mut instructions: Vec<String>,
+    mut queued_echo: Option<(String, Vec<String>)>,
+) -> Result<(), TurnError> {
+    loop {
+        let (turn, cancel) = handle.begin_turn();
 
-    // Depth 1: the pump forwards as fast as the webview accepts, and a deeper
-    // queue would only let the transcript drift further behind the ledger.
-    let (tx, rx) = tokio::sync::mpsc::channel(1);
-    let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
-    let approver = WebviewApprover::new(handle.id.clone(), emit.clone(), handle.pending());
+        // Depth 1: the pump forwards as fast as the webview accepts, and a deeper
+        // queue would only let the transcript drift further behind the ledger.
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
+        let approver = WebviewApprover::new(handle.id.clone(), emit.clone(), handle.pending());
 
-    // The turn's lifecycle goes to stderr as well as to the webview: when the
-    // frontend shows nothing, these two lines are what distinguish "never
-    // started" from "started and produced no events".
-    eprintln!("tcode-app: turn started on session {}", handle.id);
-    let result = match instructions.is_empty() {
-        true => {
-            agent
-                .user_turn(&mut session, input, &tx, &approver, cancel)
-                .await
+        if let Some((text, attachments)) = queued_echo.take() {
+            // The fallback starts a fresh physical turn, so core cannot emit its
+            // safe-boundary notification. Its user entry follows any instructions.
+            let entry_index = session.ledger.len() + instructions.len();
+            let _ = tx
+                .send(tcode_core::AgentEvent::QueuedInput {
+                    text,
+                    attachments,
+                    entry_index,
+                })
+                .await;
         }
-        false => {
-            agent
-                .instruction_turn(&mut session, instructions, input, &tx, &approver, cancel)
-                .await
+
+        // The turn's lifecycle goes to stderr as well as to the webview: when the
+        // frontend shows nothing, these two lines are what distinguish "never
+        // started" from "started and produced no events".
+        eprintln!("tcode-app: turn started on session {}", handle.id);
+        let result = match instructions.is_empty() {
+            true => {
+                agent
+                    .user_turn(&mut session, input, &tx, &approver, cancel)
+                    .await
+            }
+            false => {
+                agent
+                    .instruction_turn(&mut session, instructions, input, &tx, &approver, cancel)
+                    .await
+            }
+        };
+        match &result {
+            Ok(()) => eprintln!("tcode-app: turn finished on session {}", handle.id),
+            Err(error) => eprintln!("tcode-app: turn failed on session {}: {error}", handle.id),
         }
-    };
-    match &result {
-        Ok(()) => eprintln!("tcode-app: turn finished on session {}", handle.id),
-        Err(error) => eprintln!("tcode-app: turn failed on session {}: {error}", handle.id),
+
+        if let Some(mode) = session.commit_pending_mode() {
+            // Core commits at every permission boundary it reaches. A switch made
+            // during the closing answer has no further boundary, so mirror the
+            // TUI's turn-end fallback while the event pump is still alive.
+            let _ = tx.send(tcode_core::AgentEvent::ModeChanged(mode)).await;
+        }
+
+        drop(tx);
+        let _ = pump.await;
+        // Whatever the turn's fate, no dialog it opened may still be answerable.
+        handle.pending.clear();
+
+        let (next_session, waiting) = handle.put_back_or_take_queued(session);
+        handle.finish_turn(turn);
+        let Some(next_session) = next_session else {
+            // The session is back only after no queued successor was reserved.
+            let (context_tokens, context_estimated) = handle.context(&agent);
+            emit.emit(
+                TURN_FINISHED,
+                serde_json::to_value(TurnFinished {
+                    session: &handle.id,
+                    error: result.as_ref().err().map(describe_error),
+                    context_tokens,
+                    context_estimated,
+                })
+                .unwrap_or(serde_json::Value::Null),
+            );
+            return Ok(());
+        };
+
+        // Several prompts queued behind a turn become one successor, exactly as in
+        // the TUI: the model sees every prompt before answering either one.
+        let message = merge_queued(waiting).expect("non-empty queue reserves the session");
+        session = next_session;
+        input = message.blocks;
+        instructions = message.instructions;
+        queued_echo = Some((message.text, message.attachments));
     }
+}
 
-    drop(tx);
-    let _ = pump.await;
-    // Whatever the turn's fate, no dialog it opened may still be answerable.
-    handle.pending.clear();
-    handle.put_back(session);
-
-    // After `put_back`, so the reading sees the session it just finished with.
-    let (context_tokens, context_estimated) = handle.context(&agent);
-    emit.emit(
-        TURN_FINISHED,
-        serde_json::to_value(TurnFinished {
-            session: &handle.id,
-            error: result.as_ref().err().map(describe_error),
-            context_tokens,
-            context_estimated,
-        })
-        .unwrap_or(serde_json::Value::Null),
-    );
-
-    // Anything still queued belongs to a turn that has to happen now.
-    //
-    // Two ways to arrive here with messages in hand, and both need this: the
-    // user asked to stop and say it immediately (`interrupt_and_flush` deferred
-    // the queue past the dying turn), or the turn simply ended before reaching a
-    // safe boundary to deliver at. Without this the second case leaves a prompt
-    // sitting in a queue nothing will ever drain — queued, acknowledged, and
-    // silently never sent.
-    //
-    // Boxed because this is recursion through an `async fn`: the future would
-    // otherwise have to contain itself.
-    let waiting = handle.take_queued();
-    if !waiting.is_empty() {
-        let blocks = waiting
-            .into_iter()
-            .flat_map(|message| message.blocks)
-            .collect();
-        return Box::pin(run_turn(agent, handle, emit, blocks, Vec::new())).await;
+fn merge_queued(mut queued: Vec<tcode_core::PendingMessage>) -> Option<tcode_core::PendingMessage> {
+    let mut merged = queued.drain(..).next()?;
+    for next in queued {
+        merged.text.push('\n');
+        merged.text.push_str(&next.text);
+        merged.attachments.extend(next.attachments);
+        merged.blocks.extend(next.blocks);
+        merged.instructions.extend(next.instructions);
     }
-    Ok(())
+    Some(merged)
 }
 
 fn describe_error(error: &AgentError) -> String {

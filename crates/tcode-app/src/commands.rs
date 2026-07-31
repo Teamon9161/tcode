@@ -379,6 +379,21 @@ impl From<TextFile> for WorkspaceTextView {
     }
 }
 
+/// A file the viewer draws rather than reads, in the webview contract.
+///
+/// Which files these are is the frontend's one extension table
+/// (`ui/src/show.ts`), exactly as it is for `shown_file`: this side is a byte
+/// server that was told which of its two doors to open, not a second opinion
+/// about what a `.png` is.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct WorkspaceBinaryView {
+    pub path: String,
+    /// `data:<media type>;base64,…`. The webview's CSP already allows `data:`
+    /// in `img-src`, so drawing this needs no asset protocol and no new origin.
+    pub url: String,
+    pub bytes: u64,
+}
+
 fn session_workspace(supervisor: &Supervisor, session: &str) -> Result<Workspace, String> {
     let handle = supervisor
         .get(session)
@@ -409,6 +424,23 @@ pub fn workspace_read_text(
     session_workspace(&supervisor, &session)?
         .read(&path)
         .map(WorkspaceTextView::from)
+        .map_err(|error| error.to_string())
+}
+
+/// Read a file from the session workspace as a `data:` URL.
+#[tauri::command]
+pub fn workspace_read_binary(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    path: String,
+) -> Result<WorkspaceBinaryView, String> {
+    session_workspace(&supervisor, &session)?
+        .read_binary(&path)
+        .map(|file| WorkspaceBinaryView {
+            url: data_url(Path::new(&file.path), &file.data),
+            path: file.path,
+            bytes: file.bytes,
+        })
         .map_err(|error| error.to_string())
 }
 
@@ -535,15 +567,19 @@ pub fn workspace_delete(
 pub struct QueuedView {
     pub text: String,
     pub attachments: Vec<String>,
+    /// The active turn that owns this queue snapshot. A stop request must name
+    /// it so a late webview click cannot interrupt its successor.
+    pub turn: Option<u64>,
 }
 
 fn queue_of(handle: &crate::state::SessionHandle) -> Vec<QueuedView> {
-    handle
-        .queued()
+    let (turn, queued) = handle.queued_with_turn();
+    queued
         .into_iter()
         .map(|message| QueuedView {
             text: message.text,
             attachments: message.attachments,
+            turn,
         })
         .collect()
 }
@@ -669,12 +705,12 @@ pub fn withdraw_queued(
 pub fn interrupt_and_send(
     supervisor: State<'_, Arc<Supervisor>>,
     session: String,
-) -> Result<(), String> {
-    supervisor
+    turn: u64,
+) -> Result<bool, String> {
+    Ok(supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?
-        .interrupt_and_flush();
-    Ok(())
+        .interrupt_and_flush(turn))
 }
 
 /// A prompt this conversation can be rewound to.
@@ -957,10 +993,7 @@ pub fn load_shown(path: &Path, cwd: &Path, as_data_url: bool) -> Result<ShownFil
         std::fs::read(&file).map_err(|error| format!("cannot read {}: {error}", file.display()))?;
     if as_data_url {
         return Ok(ShownFile {
-            body: format!("data:{};base64,{}", media_type(&file), {
-                use base64::Engine as _;
-                base64::engine::general_purpose::STANDARD.encode(&raw)
-            }),
+            body: data_url(&file, &raw),
             bytes,
             truncated: false,
         });
@@ -987,6 +1020,18 @@ pub fn load_shown(path: &Path, cwd: &Path, as_data_url: bool) -> Result<ShownFil
     })
 }
 
+/// The bytes of a file, addressed the one way this webview can already draw
+/// them. Shared by both readers so a `.ico` cannot be one media type when the
+/// model shows it and another when it is opened from the tree.
+pub(crate) fn data_url(path: &Path, bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    format!(
+        "data:{};base64,{}",
+        media_type(path),
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    )
+}
+
 fn media_type(path: &Path) -> &'static str {
     match path
         .extension()
@@ -999,6 +1044,7 @@ fn media_type(path: &Path) -> &'static str {
         "webp" => "image/webp",
         "avif" => "image/avif",
         "bmp" => "image/bmp",
+        "ico" => "image/x-icon",
         _ => "image/png",
     }
 }

@@ -4,6 +4,7 @@ import { invoke, resetPreviewFixtures } from "./mock-core";
 
 type Entry = { name: string; path: string; kind: "file" | "directory" | "link" };
 type TextView = { path: string; text: string; revision: string; bytes: number; truncated: boolean };
+type BinaryView = { path: string; url: string; bytes: number };
 
 const call = <T>(command: string, args: Record<string, unknown>) => invoke<T>(command, args);
 
@@ -27,6 +28,25 @@ describe("preview workspace fixture", () => {
     expect(aReadme.text).toContain("Markdown editor preview");
     expect(bReadme.text).toContain("duck_ext");
     expect(aReadme.path).toBe("README.md");
+  });
+
+  /* The second door, and the fixture that proves the scene can show a picture
+     at all: before it existed, opening `mark.png` from the tree could only fail,
+     because the only reader refused anything that was not UTF-8. */
+  it("serves the files that arrive as bytes, and only those", async () => {
+    const png = await call<BinaryView>("workspace_read_binary", {
+      session: "a",
+      path: "icons/mark.png",
+    });
+    expect(png.url.startsWith("data:image/png;base64,")).toBe(true);
+    expect(png.bytes).toBeGreaterThan(0);
+
+    // A text file has no bytes door, exactly as the real workspace has none:
+    // which door a file uses is `show.ts`'s answer, and asking for the wrong one
+    // is a mistake rather than a fallback.
+    await expect(
+      call<BinaryView>("workspace_read_binary", { session: "a", path: "README.md" }),
+    ).rejects.toThrow(/not a regular file/);
   });
 
   it("creates, renames, and deletes entries through the fixture contract", async () => {

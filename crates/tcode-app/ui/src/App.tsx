@@ -7,6 +7,7 @@ import {
   APPROVAL_REQUEST,
   TURN_FINISHED,
   type AgentEvent,
+  type ApprovalMode,
   type ApprovalRequest,
   type Decision,
   type SessionEvent,
@@ -33,7 +34,8 @@ import type { PlanDecision } from "./PlanEditor";
 import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
 import { adoptContext, applyUsage, limitsFrom, NO_USAGE, type Limits } from "./usage";
-import { displayToolSummary, ToolMetaProvider, type ToolMeta } from "./toolViews";
+import { ToolMetaProvider, type ToolMeta } from "./toolViews";
+import { phaseOf } from "./activity";
 import { DisplayContext, loadDisplay, saveDisplay, type Display } from "./display";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
@@ -131,6 +133,15 @@ export function App() {
   // is missing the promise rejects, and an unhandled rejection would leave a
   // window that accepts messages and renders nothing back.
   useEffect(() => {
+    // The listener's own copy of the tool table, filled by the `tool_views`
+    // call further down this same effect. It cannot come from the `toolMeta`
+    // state: this effect must not re-run (a second subscription doubles every
+    // delta), so a closure over that state would keep reading the empty map it
+    // was registered with, and every phase line would wear a wire name.
+    let names = new Map<string, ToolMeta>();
+    const toolName = (name: string) =>
+      names.get(name)?.display_name || name.charAt(0).toUpperCase() + name.slice(1);
+
     const subscriptions = [
       listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -138,13 +149,16 @@ export function App() {
           blocks: applyEvent(state.blocks, payload.event),
           files: applyFileEvent(state.files, payload.event),
           meter: applyUsage(state.meter, payload.event),
-          activity: describe(payload.event) ?? state.activity,
+          activity: phaseOf(payload.event, toolName) ?? state.activity,
         }));
         const reported = limitsFrom(payload.event);
         if (reported) setLimits(reported);
         // A `progress` call is the one event that changes a file the panel is
         // showing, so it is the one event that asks the backend to read it again.
         if (touchedPlan(payload.event)) readPlan(payload.session);
+        // A delivered queued prompt leaves the backend queue before its
+        // successor starts. Re-read so a stale strip cannot target that turn.
+        if (payload.event.type === "QueuedInput") refreshTurnState(payload.session);
       }),
       listen<ApprovalRequest>(APPROVAL_REQUEST, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -195,7 +209,10 @@ export function App() {
     // get it is not fatal: every tool then falls back to the ordinary transcript
     // treatment, which is a duller conversation rather than a broken one.
     invoke<ToolMeta[]>("tool_views")
-      .then((list) => setToolMeta(new Map(list.map((meta) => [meta.name, meta]))))
+      .then((list) => {
+        names = new Map(list.map((meta) => [meta.name, meta]));
+        setToolMeta(names);
+      })
       .catch((error) => console.warn("tool_views unavailable:", error));
 
     return () => {
@@ -328,7 +345,11 @@ export function App() {
                     attachments.map((item) => item.url),
                   ),
                 ],
-                activity: text || `${attachments.length} image(s)`,
+                // The phase, not the prompt: the rail's first line already
+                // carries what was asked, and this line answers "where is it
+                // now". `sending` is the honest answer until the first event
+                // lands, and it is the word the TUI uses for the same gap.
+                activity: "sending",
               },
         );
       } catch (error) {
@@ -356,9 +377,24 @@ export function App() {
     [patch],
   );
 
-  const sendQueuedNow = useCallback((id: string) => {
-    invoke("interrupt_and_send", { session: id }).catch(() => {});
-  }, []);
+  const sendQueuedNow = useCallback(
+    async (id: string, turn: number) => {
+      try {
+        const interrupted = await invoke<boolean>("interrupt_and_send", { session: id, turn });
+        if (interrupted) {
+          patch(id, (state) => ({ ...state, queued: [] }));
+        } else {
+          refreshTurnState(id);
+        }
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [patch, refreshTurnState],
+  );
 
   /**
    * Ask what going back to a point would cost — or withdraw the question.
@@ -458,18 +494,19 @@ export function App() {
   );
 
   const answer = useCallback(
-    async (id: string, decision: Decision, comment: string) => {
+    async (id: string, decision: Decision, comment: string, setMode?: ApprovalMode) => {
       const pending = states[id]?.approval;
       if (!pending) return;
       patch(id, (state) => ({ ...state, approval: null }));
       try {
         await invoke("respond_approval", {
           session: id,
-          answer: { id: pending.id, decision, comment: comment || null },
+          answer: { id: pending.id, decision, comment: comment || null, set_mode: setMode ?? null },
         });
       } catch (error) {
         patch(id, (state) => ({
           ...state,
+          approval: pending,
           blocks: [...state.blocks, errorBlock(String(error))],
         }));
       }
@@ -683,32 +720,6 @@ function rebase(draft: PlanDraft | null, plan: Plan | null): PlanDraft | null {
   if (!draft || draft.path !== plan.path) return draftOf(plan);
   const untouched = draft.phases === draft.base && draft.comments.length === 0;
   return untouched ? draftOf(plan) : draft;
-}
-
-/**
- * The one-line summary the rail and the launchpad card show for a session.
- *
- * The tool's name and what the call is about, once each. Pasting core's summary
- * after the name printed the name twice for every tool whose summary *is* its
- * name — `progress progress`, `agent agent(explore)` — because `summarize_call`
- * falls back to the bare name when it recognizes none of the call's argument
- * keys. `displayToolSummary` is the registry's answer to exactly that, and the
- * transcript has been using it all along.
- */
-function describe(event: AgentEvent): string | null {
-  switch (event.type) {
-    case "ToolStart": {
-      const data = event.data as { name: string; summary: string; input: unknown };
-      const about = displayToolSummary(data.name, data.summary, data.input);
-      return about && about !== data.name ? `${data.name} · ${about}` : data.name;
-    }
-    case "Compacting":
-      return "compacting history";
-    case "Interrupted":
-      return "interrupted";
-    default:
-      return null;
-  }
 }
 
 /**

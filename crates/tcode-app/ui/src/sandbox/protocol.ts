@@ -38,7 +38,7 @@
  *  run any script at all. */
 export const SANDBOX_URL = "sandbox.html";
 
-export type SandboxKind = "mermaid" | "echarts" | "html";
+export type SandboxKind = "mermaid" | "echarts" | "html" | "svg";
 
 /** Resolved token values, since the frame cannot read the app's stylesheet. */
 export type SandboxTheme = Record<string, string>;

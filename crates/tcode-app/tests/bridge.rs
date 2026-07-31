@@ -95,13 +95,19 @@ fn sink(collector: &Arc<Collector>) -> Arc<dyn Emit> {
 
 struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
+    requests: Mutex<Vec<Request>>,
 }
 
 impl MockProvider {
     fn new(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
+            requests: Mutex::new(Vec::new()),
         })
+    }
+
+    fn requests(&self) -> Vec<Request> {
+        self.requests.lock().unwrap().clone()
     }
 }
 
@@ -118,9 +124,10 @@ impl Provider for MockProvider {
     }
     async fn stream(
         &self,
-        _req: Request,
+        req: Request,
         _cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError> {
+        self.requests.lock().unwrap().push(req);
         let script = self
             .scripts
             .lock()
@@ -280,6 +287,7 @@ fn answer(id: &Value, decision: &str) -> ApprovalAnswer {
         id: id.as_str().unwrap_or_default().to_string(),
         decision: decision.into(),
         comment: None,
+        set_mode: None,
         phases: None,
         notes: Vec::new(),
         fresh_session: false,
@@ -313,6 +321,86 @@ async fn a_turn_streams_its_events_to_the_frontend() {
     assert_eq!(finished.len(), 1);
     assert_eq!(finished[0]["session"], "s1");
     assert_eq!(finished[0]["error"], Value::Null);
+}
+
+/// A mode chosen while the first call waits must reach Core's next batch
+/// boundary, not wait until the turn returns. The visible event is a transcript
+/// record only; a bare setting change must not become a model-visible ledger
+/// note.
+#[tokio::test]
+async fn a_mid_turn_mode_switch_gates_the_next_call_and_reports_its_boundary() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let first = cwd.path().join("first.txt");
+    let second = cwd.path().join("second.txt");
+    let agent = agent(
+        MockProvider::new(vec![
+            tool_use(
+                "call-1",
+                "write",
+                &serde_json::json!({ "path": first.to_string_lossy(), "content": "first\n" })
+                    .to_string(),
+            ),
+            tool_use(
+                "call-2",
+                "write",
+                &serde_json::json!({ "path": second.to_string_lossy(), "content": "second\n" })
+                    .to_string(),
+            ),
+            text_done("done"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let turn = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("write two notes"), plain()).await }
+    });
+
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |payload| payload["session"] == "s1")
+        .await;
+    session.set_mode(PermissionMode::AcceptEdits);
+    assert_eq!(session.mode(), (PermissionMode::AcceptEdits, true));
+    session
+        .pending()
+        .answer(answer(&request["id"], "yes"))
+        .expect("the pending approval accepted its answer");
+
+    turn.await.unwrap().unwrap();
+
+    assert_eq!(std::fs::read_to_string(&first).unwrap(), "first\n");
+    assert_eq!(std::fs::read_to_string(&second).unwrap(), "second\n");
+    assert_eq!(collector.payloads(APPROVAL_REQUEST).len(), 1);
+    assert_eq!(session.mode(), (PermissionMode::AcceptEdits, false));
+    assert!(
+        !session.history().iter().any(|entry| {
+            matches!(entry, tcode_core::Entry::Note(text) if text == "permission mode → accept-edits")
+        }),
+        "the mode marker belongs to the frontend transcript, not the ledger"
+    );
+
+    let events = collector.payloads(AGENT_EVENT);
+    let changed = events
+        .iter()
+        .position(|payload| {
+            payload["event"]["type"] == "ModeChanged" && payload["event"]["data"] == "accept-edits"
+        })
+        .expect("the mode boundary reached the webview");
+    let second_start = events
+        .iter()
+        .position(|payload| {
+            payload["event"]["type"] == "ToolStart"
+                && payload["event"]["data"]["call_id"] == "call-2"
+        })
+        .expect("the second call started");
+    assert!(
+        changed < second_start,
+        "mode event must precede the re-gated call"
+    );
 }
 
 /// The approval round trip, which is the one thing the desktop app cannot
@@ -542,26 +630,136 @@ async fn a_prompt_typed_during_a_turn_is_queued_and_then_sent() {
     );
     assert!(session.send_or_queue(queued("while you work")).is_none());
     assert_eq!(
-        session.queued().iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+        session
+            .queued()
+            .iter()
+            .map(|m| m.text.clone())
+            .collect::<Vec<_>>(),
         ["second thoughts", "while you work"]
     );
 
     // Taking one back is by position *and* text: the queue drains whole, so a
     // stale index normally finds nothing — but queue, watch it delivered, queue
     // again, and a late withdraw would take a message meant to be kept.
-    assert!(session.withdraw_queued(0, "something else entirely").is_none());
+    assert!(session
+        .withdraw_queued(0, "something else entirely")
+        .is_none());
     assert_eq!(session.queued().len(), 2, "a mismatch removes nothing");
     assert_eq!(
-        session.withdraw_queued(0, "second thoughts").map(|m| m.text),
+        session
+            .withdraw_queued(0, "second thoughts")
+            .map(|m| m.text),
         Some("second thoughts".to_string())
     );
 
     let _ = session.pending().answer(answer(&request["id"], "no"));
     turn.await.unwrap().unwrap();
 
-    assert!(session.queued().is_empty(), "the queue is drained by a turn");
+    assert!(
+        session.queued().is_empty(),
+        "the queue is drained by a turn"
+    );
     let finished = collector.payloads(TURN_FINISHED);
-    assert_eq!(finished.len(), 2, "what stayed queued got its own turn");
+    assert_eq!(
+        finished.len(),
+        1,
+        "the fallback queue handoff stays within one visible turn lifecycle"
+    );
+}
+
+/// Stop-and-send is a handoff, not just a cancellation: the queued prompt must
+/// become the next model request even when the previous turn is parked on an
+/// approval and never reaches a normal safe boundary.
+#[tokio::test]
+async fn interrupt_and_send_delivers_the_queued_message_in_a_successor_turn() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let target = cwd.path().join("note.txt");
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "write",
+            &serde_json::json!({ "path": target.to_string_lossy(), "content": "first\n" })
+                .to_string(),
+        ),
+        tool_use(
+            "call-2",
+            "write",
+            &serde_json::json!({ "path": target.to_string_lossy(), "content": "second\n" })
+                .to_string(),
+        ),
+        text_done("sent now"),
+    ]);
+    let agent = agent(provider.clone(), cwd.path());
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    let running = tokio::spawn({
+        let (agent, session, emit) = (agent, session.clone(), emit);
+        async move { run_turn(agent, session, emit, say("first"), plain()).await }
+    });
+    let first_request = collector
+        .wait_for(APPROVAL_REQUEST, |payload| payload["session"] == "s1")
+        .await;
+
+    let mut immediate = queued("say this now");
+    immediate.instructions = vec!["Plan before making changes.".into()];
+    assert!(session.send_or_queue(immediate).is_none());
+    let (turn, waiting) = session.queued_with_turn();
+    assert_eq!(waiting.len(), 1);
+    let old_turn = turn.expect("running turn owns the queue");
+    assert!(session.interrupt_and_flush(old_turn));
+
+    // The replacement reaches its own approval before this old queue-strip
+    // action arrives. It must not cancel the successor's cancellation token.
+    let successor_request = collector
+        .wait_for(APPROVAL_REQUEST, |payload| {
+            payload["session"] == "s1" && payload["id"] != first_request["id"]
+        })
+        .await;
+    assert!(
+        !session.interrupt_and_flush(old_turn),
+        "a stale stop action cannot cancel the successor turn"
+    );
+    assert!(
+        session.queued().is_empty(),
+        "the successor owns the queued prompt"
+    );
+    session
+        .pending()
+        .answer(answer(&successor_request["id"], "yes"))
+        .expect("the successor approval remains live");
+
+    running.await.unwrap().unwrap();
+
+    let requests = provider.requests();
+    assert_eq!(
+        requests.len(),
+        3,
+        "the successor made its own model request and completed its tool call"
+    );
+    let successor_messages = serde_json::to_string(&requests[1].messages).unwrap();
+    assert!(
+        successor_messages.contains("say this now"),
+        "the queued prompt reached the successor request"
+    );
+    assert!(
+        successor_messages.contains("Plan before making changes."),
+        "the queued instructions reach the successor request too"
+    );
+    assert!(
+        collector
+            .event_types("s1")
+            .iter()
+            .any(|kind| kind == "QueuedInput"),
+        "the webview receives the delivered queued prompt"
+    );
+    assert_eq!(
+        collector.payloads(TURN_FINISHED).len(),
+        1,
+        "the handoff stays one visible running lifecycle"
+    );
 }
 
 // ------------------------------------------------------------------ rewind
@@ -580,9 +778,15 @@ async fn rewinding_drops_the_tail_and_returns_the_prompt() {
     let emit = sink(&collector);
     let session = handle("s1", cwd.path().to_path_buf());
 
-    run_turn(agent.clone(), session.clone(), emit.clone(), say("one"), plain())
-        .await
-        .unwrap();
+    run_turn(
+        agent.clone(),
+        session.clone(),
+        emit.clone(),
+        say("one"),
+        plain(),
+    )
+    .await
+    .unwrap();
     run_turn(agent, session.clone(), emit, say("two"), plain())
         .await
         .unwrap();
@@ -597,10 +801,20 @@ async fn rewinding_drops_the_tail_and_returns_the_prompt() {
     let (text, restored) = session.rewind(targets[1].index, false).unwrap();
 
     assert_eq!(text, "two", "the prompt comes back to be edited and resent");
-    assert!(restored.is_empty(), "nothing asked for files to be rolled back");
-    assert!(session.history().len() < before, "the tail stopped existing");
+    assert!(
+        restored.is_empty(),
+        "nothing asked for files to be rolled back"
+    );
+    assert!(
+        session.history().len() < before,
+        "the tail stopped existing"
+    );
     assert_eq!(
-        session.rewind_targets().iter().map(|t| t.text.clone()).collect::<Vec<_>>(),
+        session
+            .rewind_targets()
+            .iter()
+            .map(|t| t.text.clone())
+            .collect::<Vec<_>>(),
         ["one"]
     );
 }
@@ -615,15 +829,25 @@ async fn a_rewind_to_something_that_is_not_a_prompt_is_refused() {
     let collector = Arc::new(Collector::default());
     let session = handle("s1", cwd.path().to_path_buf());
 
-    run_turn(agent, session.clone(), sink(&collector), say("one"), plain())
-        .await
-        .unwrap();
+    run_turn(
+        agent,
+        session.clone(),
+        sink(&collector),
+        say("one"),
+        plain(),
+    )
+    .await
+    .unwrap();
 
     let before = session.history().len();
     assert!(session.rewind(9_999, false).is_err());
     // The assistant's own reply is a real entry and still not a rewind point.
     assert!(session.rewind(1, false).is_err());
-    assert_eq!(session.history().len(), before, "a refused rewind changes nothing");
+    assert_eq!(
+        session.history().len(),
+        before,
+        "a refused rewind changes nothing"
+    );
 }
 
 // ------------------------------------------------------------- tool routing
@@ -829,6 +1053,7 @@ fn plan_answer(
         id: id.as_str().unwrap_or_default().to_string(),
         decision: decision.into(),
         comment: None,
+        set_mode: None,
         phases,
         notes: notes
             .into_iter()

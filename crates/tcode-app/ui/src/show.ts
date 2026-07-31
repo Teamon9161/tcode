@@ -41,12 +41,13 @@ type View = {
 };
 
 const VIEWS: View[] = [
-  { ext: ["html", "htm", "svg"], as: { as: "sandbox", sandbox: "html" } },
+  { ext: ["html", "htm"], as: { as: "sandbox", sandbox: "html" } },
+  { ext: ["svg"], as: { as: "sandbox", sandbox: "svg" } },
   { ext: ["mmd", "mermaid"], as: { as: "sandbox", sandbox: "mermaid" } },
   { ext: ["csv"], as: { as: "table", separator: "," } },
   { ext: ["tsv"], as: { as: "table", separator: "\t" } },
   {
-    ext: ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp"],
+    ext: ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"],
     binary: true,
     as: { as: "image" },
   },

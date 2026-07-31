@@ -67,6 +67,19 @@ async function render(message: ToSandbox) {
     return;
   }
 
+  if (message.kind === "svg") {
+    // XML SVG is not HTML. Parsing it in its own namespace handles XML
+    // declarations and keeps the root's intrinsic geometry intact before it is
+    // imported into this opaque-origin document.
+    const image = new DOMParser().parseFromString(message.source, "image/svg+xml");
+    const svg = image.documentElement;
+    if (svg.localName !== "svg" || image.getElementsByTagName("parsererror").length > 0) {
+      throw new Error("the SVG file is not well-formed");
+    }
+    stage.append(document.importNode(svg, true));
+    return;
+  }
+
   await load(message.kind);
   const renderer = window.__tcodeRenderers?.[message.kind];
   if (!renderer) throw new Error(`no renderer registered for ${message.kind}`);

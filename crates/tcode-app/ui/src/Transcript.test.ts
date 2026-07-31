@@ -5,6 +5,7 @@ import {
   agentKind,
   changeSetLabel,
   groupTranscriptBlocks,
+  isAtBottom,
   runInspect,
   runState,
 } from "./Transcript";
@@ -130,5 +131,13 @@ describe("agentKind", () => {
     ]);
 
     expect(items.map((item) => item.kind)).toEqual(["exploration", "block", "exploration", "block", "exploration"]);
+  });
+});
+
+
+describe("isAtBottom", () => {
+  it("treats the bottom threshold as pinned without pulling a reader who scrolled up", () => {
+    expect(isAtBottom({ scrollHeight: 1_000, scrollTop: 570, clientHeight: 400 })).toBe(true);
+    expect(isAtBottom({ scrollHeight: 1_000, scrollTop: 550, clientHeight: 400 })).toBe(false);
   });
 });

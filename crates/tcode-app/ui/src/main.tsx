@@ -15,12 +15,17 @@ import "./theme/porcelain.css";
 import "./app.css";
 
 import { App } from "./App";
+import { Boundary } from "./Boundary";
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html lost its #root");
 
 createRoot(root).render(
   <StrictMode>
-    <App />
+    {/* Outside `App`, because the errors worth catching include the ones thrown
+        while `App` itself is rendering. */}
+    <Boundary>
+      <App />
+    </Boundary>
   </StrictMode>,
 );

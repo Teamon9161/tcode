@@ -234,6 +234,8 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
       return [...blocks, { kind: "note", text: "interrupted" }];
     case "AwaitingUserInput":
       return [...blocks, { kind: "note", text: "waiting for your direction" }];
+    case "ModeChanged":
+      return [...blocks, { kind: "note", text: `permission mode → ${event.data}` }];
     case "AutoModePaused":
       return [
         ...blocks,

@@ -12,6 +12,7 @@ import {
   useToolMeta,
   useToolName,
   viewFor,
+  inspectFor,
   displayToolOutput,
   displayToolSummary,
   transcriptGroupFor,
@@ -35,12 +36,17 @@ import type { Status } from "./types";
 export function Transcript({
   blocks,
   running,
+  phase,
   rewindTargets,
   onOpen,
   onRewind,
 }: {
   blocks: Block[];
   running: boolean;
+  /** Where the turn is right now — `thinking`, `Run · cargo test`. The same
+   *  string the rail carries for this conversation, because it is the same
+   *  question asked from two distances. */
+  phase?: string;
   /** Where this conversation can go back to, from the backend. Empty while a
    *  turn holds the session, which is also when rewinding is refused. */
   rewindTargets?: RewindTarget[];
@@ -77,18 +83,31 @@ export function Transcript({
       className="transcript"
       ref={scroller}
       onScroll={(event) => {
-        const box = event.currentTarget;
-        pinned.current = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        pinned.current = isAtBottom(event.currentTarget);
+      }}
+      // React can commit the next stream delta before the browser dispatches
+      // the following scroll event. Mark an upward wheel motion immediately so
+      // that commit cannot pull the reader back to the bottom mid-scroll.
+      onWheel={(event) => {
+        if (event.deltaY < 0) pinned.current = false;
       }}
     >
       <div className="transcript-inner">
         <RewindContext.Provider value={rewinding}>
           <BlockList blocks={blocks} onOpen={onOpen} />
         </RewindContext.Provider>
-        {running && <Working />}
+        {running && <Working phase={phase} />}
       </div>
     </div>
   );
+}
+
+export function isAtBottom({
+  scrollHeight,
+  scrollTop,
+  clientHeight,
+}: Pick<HTMLElement, "scrollHeight" | "scrollTop" | "clientHeight">): boolean {
+  return scrollHeight - scrollTop - clientHeight < 40;
 }
 
 export function BlockList({
@@ -474,10 +493,11 @@ function ChangesGroup({
   blocks: ToolBlock[];
   onOpen: (value: Inspect) => void;
 }) {
+  const { editDetails } = useDisplay();
   return (
     <TraceGroup
       label={changeSetLabel(blocks)}
-      defaultOpen
+      defaultOpen={editDetails}
       running={!blocks.every((block) => block.result !== undefined)}
       failed={blocks.some((block) => block.result?.isError)}
     >
@@ -520,11 +540,10 @@ function CommandsGroup({
 }
 
 function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: Inspect) => void }) {
-  const view = viewFor(block.name);
   const toolName = useToolName();
-  const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
-  const summary = displayToolSummary(block.name, block.summary, block.input);
   const failed = block.result?.isError ?? false;
+  const target = inspectFor(block.name, failed)?.(block.input, block.callId, block.result) ?? null;
+  const summary = displayToolSummary(block.name, block.summary, block.input);
 
   return (
     <div className={`exploration-item${failed ? " is-failed" : ""}`}>
@@ -577,6 +596,9 @@ function ToolCall({
   const meta = useToolMeta(block.name);
   const view = viewFor(block.name);
   const toolName = useToolName();
+  // Nothing here opens itself. The `editDetails` switch opens the *group*, so
+  // the diffs are on screen; it never meant "and unfold the text under each one
+  // as well", which is what it had come to do.
   const [open, setOpen] = useState(false);
 
   // Core decides where a call belongs; `silent` means another surface already
@@ -590,18 +612,36 @@ function ToolCall({
 
   const done = block.result !== undefined;
   const failed = block.result?.isError ?? false;
-  const body = view.body?.(block.input) ?? null;
-  const target = view.inspect?.(block.input, block.callId, block.result) ?? null;
+  // A call that failed changed nothing, so it draws no change. The diff a
+  // rejected edit renders is the most convincing lie in the transcript: red and
+  // green lines are how this app says "this is what happened to the file", and
+  // here nothing happened to the file at all. The row says `failed` and the
+  // error says why; the intended change is still one click away in its own pane.
+  const body = failed ? null : (view.body?.(block.input) ?? null);
+  const target = inspectFor(block.name, failed)?.(block.input, block.callId, block.result) ?? null;
   const summary = displayToolSummary(block.name, block.summary, block.input);
   const detail = view.detail?.(block.input) ?? null;
   const preview = block.result ? displayToolOutput(block.name, block.result.preview) : "";
   const output = block.result ? displayToolOutput(block.name, block.result.content) : "";
-  const canExpand = Boolean(detail || output);
-
   // The transcript is an execution trace, not an output log. A successful call
   // already has a stable destination in the inspector; only failures need a
   // diagnostic in the main reading flow.
+  //
+  // And a failure needs exactly one. `preview` is the result's first line and an
+  // error is usually one line, so a failed call printed its message twice —
+  // once in the flow and again, identically, inside the disclosure below it.
+  // Output belongs to a call that produced some; a failed one produced a reason,
+  // which is already on screen.
   const showResult = done && failed;
+  // And a tool whose body already drew the change says nothing more when it
+  // works. `edit` returns "edited <path> (1 replacement). Result:" followed by
+  // numbered lines — written so the *model* need not re-read the file — and
+  // under a diff that is the same change again in a worse notation, for a
+  // reader who has already seen it in red and green. The backend has published
+  // this judgement as `hide_success_result` since the meta existed and the TUI
+  // has honoured it (`view.rs::result_render`); this side simply never read it.
+  const shownOutput = failed || meta.hide_success_result ? "" : output;
+  const canExpand = Boolean(detail || shownOutput);
 
   const label = toolName(block.name);
 
@@ -644,12 +684,12 @@ function ToolCall({
 
       {body && <div className="tool-body">{body}</div>}
 
-      {showResult && preview && <p className="tool-preview">{preview}</p>}
+      {showResult && preview && <p className="tool-error">{preview}</p>}
 
-      {open && (detail || output) && (
+      {open && (detail || shownOutput) && (
         <div className="tool-details">
           {detail && <pre className="tool-command">{detail}</pre>}
-          {output && <pre className="tool-output">{output}</pre>}
+          {shownOutput && <pre className="tool-output">{shownOutput}</pre>}
         </div>
       )}
     </div>
@@ -665,10 +705,19 @@ function BatchCall({
   block: Extract<Block, { kind: "batch" }>;
   onOpen: (value: Inspect) => void;
 }) {
+  const { editDetails } = useDisplay();
   const done = block.blocks.every((child) => child.kind !== "tool" || child.result !== undefined);
+  const hasChanges = block.blocks.some(
+    (child) => child.kind === "tool" && transcriptGroupFor(child.name) === "changes",
+  );
 
   return (
-    <TraceGroup label={block.label} count={block.blocks.length} running={!done}>
+    <TraceGroup
+      label={block.label}
+      count={block.blocks.length}
+      defaultOpen={editDetails && hasChanges}
+      running={!done}
+    >
       <BlockList blocks={block.blocks} onOpen={onOpen} groupExploration={false} />
     </TraceGroup>
   );
@@ -773,12 +822,25 @@ export function runInspect(
   return { kind: "run", run, label: summary ? `${kind} · ${summary}` : kind };
 }
 
-/** Shown while a turn is in flight. The one continuous animation in the app. */
-function Working() {
+/**
+ * Shown while a turn is in flight: the app's one running indicator.
+ *
+ * It says *where* the turn is, not merely that there is one. `working` for
+ * every second of every turn was the least this line could have said — a turn
+ * waits on a model, streams a reply, runs a command and sits behind a sub-agent,
+ * and which of those it is doing is the question somebody glances over to ask.
+ * The words come from `activity.ts`, are the TUI's, and are the same string the
+ * rail shows for this conversation, so the two distances agree. `working` stays
+ * as the fallback for the instant before the first event lands.
+ *
+ * `aria-live="polite"` announces the phase changing, which is the point of it;
+ * the dot and the sweep are decoration to a screen reader and say so.
+ */
+function Working({ phase }: { phase?: string }) {
   return (
     <p className="working" aria-live="polite">
-      <span className="working-dot" />
-      working
+      <span className="working-dot" aria-hidden />
+      <span className="working-phase">{phase?.trim() || "working"}</span>
     </p>
   );
 }

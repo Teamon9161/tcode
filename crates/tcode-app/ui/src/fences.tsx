@@ -51,8 +51,12 @@ const FENCES: Fence[] = [
     render: sandbox("echarts", "chart", "preview"),
   },
   {
-    languages: ["html", "svg"],
+    languages: ["html"],
     render: sandbox("html", "artifact", "code"),
+  },
+  {
+    languages: ["svg"],
+    render: sandbox("svg", "artifact", "code"),
   },
   {
     languages: ["math", "tex", "latex"],

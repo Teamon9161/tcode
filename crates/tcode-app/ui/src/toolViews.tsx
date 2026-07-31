@@ -362,6 +362,30 @@ export function viewFor(name: string): ToolView {
   return { ...FALLBACK, ...view };
 }
 
+/**
+ * What a call is about, from its input alone.
+ *
+ * `displayToolSummary` answers the same question for the transcript, where a
+ * live `ToolStart` summary exists and may be the better string. The approval
+ * dock has no such thing to prefer — it is asking about a call that has not run
+ * — so it wants the registry's own answer, unmixed.
+ */
+export function callTarget(name: string, input: unknown): string | null {
+  return viewFor(name).summary?.(input) ?? null;
+}
+
+/**
+ * Where a call's pop-out leads, given how the call ended.
+ *
+ * A failed call is about its error, not about the thing that did not happen.
+ * An edit that was rejected has no diff to open — opening one would show a
+ * change that is not on disk — so a failure always leads to the call's own
+ * output, which is the one destination every tool has.
+ */
+export function inspectFor(name: string, failed: boolean): ToolView["inspect"] {
+  return failed ? FALLBACK.inspect : viewFor(name).inspect;
+}
+
 export function transcriptGroupFor(name: string): ToolView["transcriptGroup"] {
   return viewFor(name).transcriptGroup;
 }

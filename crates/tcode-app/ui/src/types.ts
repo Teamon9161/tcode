@@ -67,6 +67,8 @@ export type AgentEvent =
       type: "TaskRunFinished";
       data: { run: string; status: string; tool_calls: number };
     }
+  /** A staged permission mode took effect at a Core permission boundary. */
+  | { type: "ModeChanged"; data: string }
   | { type: "AutoModePaused"; data: string }
   /** One model request's normalized token counts. `input_tokens` is the
    *  NON-cached input only — see `usage.ts` for why the two figures it feeds
@@ -128,6 +130,9 @@ export type ApprovalRequest = {
 /** Anything the backend cannot parse is treated as a denial. */
 export type Decision = "yes" | "yes-session" | "yes-project" | "no";
 
+/** The only permission transition an ordinary approval may carry. */
+export type ApprovalMode = "accept-edits";
+
 /** A conversation open in this window. */
 export type SessionInfo = {
   id: string;
@@ -146,12 +151,26 @@ export type WorkspaceTextView = {
   truncated: boolean;
 };
 
+/** Mirrors `commands.rs::WorkspaceBinaryView`: a file the viewer draws rather
+ *  than reads. Which files those are is `show.ts`'s `isBinary`, on both sides. */
+export type WorkspaceBinaryView = {
+  path: string;
+  /** `data:<media type>;base64,…` — drawable with no asset protocol. */
+  url: string;
+  bytes: number;
+};
+
 /** A durable ledger entry serialized by `tcode_core::Entry`. */
 export type LedgerEntry = { kind: string; data: unknown };
 
 /** One prompt typed while a turn was running, still owed to the model.
  *  Mirrors `commands.rs::QueuedView`. */
-export type Queued = { text: string; attachments: string[] };
+export type Queued = {
+  text: string;
+  attachments: string[];
+  /** Turn that owned the queue snapshot; used to reject stale stop actions. */
+  turn: number | null;
+};
 
 /** What rewinding to a point would cost, asked before anything is done.
  *  Mirrors `commands.rs::RewindPreview`. */

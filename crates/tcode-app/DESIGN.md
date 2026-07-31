@@ -158,9 +158,30 @@ dialogs and popovers — both tinted with the ink hue rather than pure black.
 lifting on hover, a pill's pulse while a turn runs, a panel sliding in. No
 entrance choreography on load — the app opens into a task.
 
-The running pulse is the one continuous animation in the product, and it is
-tied to a real fact (a turn in flight). Under `prefers-reduced-motion` it
-becomes a static filled dot; nothing else in the interface animates at all.
+The running indicator is the one continuously animated thing in the product,
+and it is tied to a real fact (a turn in flight). It is one object with two
+parts — a pulsing dot, and a soft highlight sweeping the line beside it — not
+two effects that happened to accumulate; nothing else in the interface animates
+at all, and a second continuous animation anywhere else is a bug.
+
+The sweep is a band of `--brand` at low alpha travelling the row at constant
+speed, then holding past the right edge for a beat so two passes read as two
+events rather than a loop. The geometry is the TUI's (`theme.rs::shimmer_color`
+— one soft band, constant speed, a dwell between passes), because the two
+frontends should not report the same fact with two different rhythms. Constant
+speed rather than eased: an eased sweep reads as something arriving, and nothing
+arrives here.
+
+**It travels the surface, never the glyphs.** `background-clip: text` over a
+gradient is banned outright, and it would also have to overwrite the phase's own
+colour — where the whole idea, in the terminal and here, is that a live line is
+lifted without losing its identity. So the text holds one solid colour and the
+sheet under it moves.
+
+Under `prefers-reduced-motion` the dot resolves to a static filled dot and the
+band comes to rest off the edge. Nothing is lost: the wash, the brand-coloured
+text and the phase's own words all still say a turn is running, which is the
+rule that motion may not be the only carrier of a state.
 
 ## Component vocabulary
 
@@ -230,9 +251,22 @@ One shape per job, used everywhere:
   `--brand-wash` and its name `--brand-text`, and settles back over `--dur-slow`
   when the result lands, so a call finishing is something you see rather than a
   repaint. That is the palette rule exactly: chroma is state, so *running* earns
-  it and a tool name never does. The pulsing dot beside it is the app's one
-  continuous animation and already reports the same fact; a shimmer or a sweep
-  here would be motion for its own sake.
+  it and a tool name never does. A row does **not** sweep: the running indicator
+  at the foot of the transcript is the app's one animated object and already
+  reports this fact, and a column of five rows each sweeping on its own clock is
+  motion for its own sake — the wash arriving and settling is the whole story a
+  row has to tell.
+
+  **A step that failed draws no body.** Red and green in this app mean "this is
+  what happened to the file", and a rejected edit changed nothing — so the diff
+  comes off and the row keeps its `failed` word and one line of error. The
+  intended change is still reachable, in its own pane.
+
+  **A step that succeeded draws no output either, when its body already showed
+  the result.** `edit` returns its snippet so the *model* need not re-read the
+  file; under a diff that is the same change again in a worse notation, for a
+  reader who has already seen it. Core publishes the judgement as
+  `hide_success_result` and both frontends honour it.
 
   A delegated run is one row, not two. The `agent` call that started it and the
   run itself are two records of the same step, so the run's row carries the kind,
@@ -281,6 +315,26 @@ One shape per job, used everywhere:
   width takes it from one side, which put the transcript's centred column half a
   scrollbar to the left of the composer and the strip below it — neither of which
   scrolls. That is an axis rule wearing a scrollbar's clothes.
+- **Running indicator** — the last line of a live transcript: a pulsing dot,
+  where the turn is right now, and the sweep. It says the phase rather than the
+  fact — `thinking`, `writing`, `Run · cargo test -p tcode-core`, `retrying
+  (2/5)`, `sub-agent working` — because "is something happening" is already
+  answered by the dot, by the rail and by the pane's own status, while "which of
+  those is it doing" is answered nowhere else. It said the word `working` for
+  every second of every turn, which was the least it could have said and the
+  most it could have been wrong about.
+
+  The words are `activity.ts`, derived from the event stream, and they are the
+  TUI's `state_label` verbatim. Not a wire contract — nothing breaks if they
+  drift — but a person who runs both should not have to learn a second name for
+  the same state, and each of those words was already chosen once.
+
+  It is the same string the rail's second line carries for this conversation:
+  one question asked from two distances, so one answer. And it hugs its own
+  content rather than spanning the measure, so the sweep travels the label
+  instead of crossing an empty column — which is the width the TUI shimmers,
+  for the same reason.
+
 - **Progress strip** — one line above the composer, on the same sheet and the
   same `--measure` axis, saying where a multi-phase task stands: the word `plan`,
   the plan's name, the phase it is on, `3/7`, and a completed-fraction meter along

@@ -8,7 +8,7 @@ import { useFileHistory, type Inspect } from "./inspect";
 import { relativeTo, type TouchedFile } from "./files";
 import { FilesView } from "./FilePanel";
 import { WorkspaceFiles } from "./WorkspaceFiles";
-import { WorkspaceEditor } from "./WorkspaceEditor";
+import { WorkspaceFile } from "./WorkspaceFile";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
 import { ShownView } from "./Shown";
@@ -76,7 +76,7 @@ export function InspectView({
         />
       );
     case "workspace-file":
-      return <WorkspaceEditor key={`${session}:${value.path}`} path={value.path} />;
+      return <WorkspaceFile key={`${session}:${value.path}`} path={value.path} />;
     case "file":
       return <FileView value={value} blocks={blocks} cwd={cwd} onOpen={onOpen} />;
     case "diff":

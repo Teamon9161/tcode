@@ -1,19 +1,27 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 
-import { highlight, isHighlightable } from "../syntax";
+import { highlight, useGrammar } from "../syntax";
 import { CheckIcon, CopyIcon } from "./Icons";
 
 /**
  * A fenced code block.
  *
  * Tokens become spans with semantic classes; the theme decides how they read
- * (see `syntax.ts` for why the highlighter is local rather than a library).
- * Nothing here is ever markup — the token text goes in as a child, so a snippet
- * that happens to contain `<script>` is a string that says `<script>`.
+ * (see `syntax.ts` for why the grammar comes from a library and the colours do
+ * not). Nothing here is ever markup — the token text goes in as a child, so a
+ * snippet that happens to contain `<script>` is a string that says `<script>`.
+ *
+ * Until the grammar for this language has loaded, `highlight` answers null and
+ * the body draws as plain text. That is the whole loading state on purpose: the
+ * text is already correct and complete, and only its colouring is late.
  */
 export function Code({ source, language }: { source: string; language: string }) {
   const body = source.replace(/\n+$/, "");
-  const tokens = isHighlightable(language) ? highlight(body, language) : null;
+  const loaded = useGrammar(language);
+  const tokens = useMemo(
+    () => (loaded ? highlight(body, language) : null),
+    [body, language, loaded],
+  );
 
   return (
     <div className="code-block">

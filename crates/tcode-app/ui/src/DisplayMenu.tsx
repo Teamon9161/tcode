@@ -60,6 +60,12 @@ export function DisplayMenu({
               on={display.thinking}
               onToggle={() => onChange({ ...display, thinking: !display.thinking })}
             />
+            <Switch
+              label="Edit details"
+              hint="Show file changes in the conversation by default."
+              on={display.editDetails}
+              onToggle={() => onChange({ ...display, editDetails: !display.editDetails })}
+            />
           </div>,
           document.body,
         )}

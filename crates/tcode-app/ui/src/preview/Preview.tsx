@@ -77,8 +77,12 @@ const LIMITS: Limits = {
  * indistinguishable rows, and the activity line is the only thing that tells them
  * apart.
  */
+/* Phases as `activity.ts` produces them, not prose about them: the running one
+   is what the live line and the rail both draw, so a fixture that writes a
+   sentence here shows a line the app can never actually be in. `a` is mid-call
+   with a tool named the way `display_name()` names it. */
 const ACTIVITY: Record<string, string> = {
-  a: "edit crates/tcode-core/src/agent/mod.rs",
+  a: "Edit · crates/tcode-core/src/agent/mod.rs",
   b: "waiting on shell",
   c: "done",
 };
@@ -258,6 +262,27 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
     },
     result: { preview: "1 hunk", content: "", isError: false },
   },
+  // A rejected edit, which is the shape the transcript got wrong for longest: it
+  // drew the diff anyway, so a change that never touched the file was rendered
+  // in the same red and green as one that did, under a message the disclosure
+  // then repeated verbatim (`preview` is the first line of `content`, and a tool
+  // error is one line). Nothing in the fixtures failed, so nothing showed it.
+  {
+    kind: "tool",
+    callId: "t3",
+    name: "edit",
+    summary: "crates/tcode-app/tests/bridge.rs",
+    input: {
+      file_path: `${ROOT}/crates/tcode-app/tests/bridge.rs`,
+      old_string: "    let first_request = collector",
+      new_string: "    let first_request = collector\n        .wait_for(APPROVAL_REQUEST, |payload| payload[\"session\"] == \"s1\")",
+    },
+    result: {
+      preview: "target_line 696 does not contain an exact old_string occurrence",
+      content: "target_line 696 does not contain an exact old_string occurrence",
+      isError: true,
+    },
+  },
   {
     kind: "batch",
     // Core's own `batch_label`, verbatim: it title-cases the tool, so a fixture
@@ -434,18 +459,44 @@ const FILES: TouchedFile[] = [
   },
 ];
 
+/* The descriptor and summary are core's own, verbatim (`edit.rs::permission`).
+   They used to read as a path and a sentence somebody wrote, which is exactly
+   the pair of strings the panel is built to reconcile — a fixture that softens
+   them hides the thing under design. */
 const APPROVAL: ApprovalRequest = {
   session: "a",
   id: "ap1",
   tool: "edit",
-  summary: "Replace the inline sleep with the injected clock.",
-  descriptor: "crates/tcode-core/src/agent/mod.rs",
+  summary: "edit crates/tcode-core/src/agent/mod.rs",
+  descriptor: "edit(crates/tcode-core/src/agent/mod.rs)",
   is_edit: true,
   allows_project: true,
   input: {
     file_path: "crates/tcode-core/src/agent/mod.rs",
     old_string: "                tokio::time::sleep(Duration::from_millis(delay)).await;",
     new_string: "                self.sleeper.sleep(Duration::from_millis(delay)).await;",
+  },
+};
+
+/** The other authorization shape, and the one the panel was reworked for: a
+ *  command, which core describes twice — `run(cmd)` as the rule and `run: cmd`
+ *  as the sentence — and which arrives with its own line breaks that no
+ *  one-line summary can carry. */
+const COMMAND: ApprovalRequest = {
+  session: "a",
+  id: "ap4",
+  tool: "shell",
+  summary: `run: cargo test -p tcode-core --test agent_loop -- --nocapture \\
+  | rg -v '^\\s*$' | tail -40`,
+  descriptor: `run(cargo test -p tcode-core --test agent_loop -- --nocapture \\
+  | rg -v '^\\s*$' | tail -40)`,
+  is_edit: false,
+  allows_project: true,
+  input: {
+    command: `cargo test -p tcode-core --test agent_loop -- --nocapture \\
+  | rg -v '^\\s*$' | tail -40`,
+    cwd: `${ROOT}/crates/tcode-core`,
+    timeout_ms: 600000,
   },
 };
 
@@ -582,6 +633,7 @@ const SCENES = [
   "session",
   "workspace",
   "approval",
+  "command",
   "question",
   "plan",
   "model",
@@ -672,7 +724,7 @@ export function Preview() {
   // running turn is the only state in which the strip exists at all.
   const [queued, setQueued] = useState<Queued[]>(() =>
     wanted() === "session"
-      ? [{ text: "also add a test for the cap at 30s", attachments: [] }]
+      ? [{ text: "also add a test for the cap at 30s", attachments: [], turn: 1 }]
       : [],
   );
   // The rewind question, opened by the control on any prompt. Its numbers are
@@ -719,11 +771,13 @@ export function Preview() {
           approval:
             scene === "approval"
               ? APPROVAL
-              : scene === "question"
-                ? QUESTION
-                : scene === "plan"
-                  ? PLAN_REVIEW
-                  : null,
+              : scene === "command"
+                ? COMMAND
+                : scene === "question"
+                  ? QUESTION
+                  : scene === "plan"
+                    ? PLAN_REVIEW
+                    : null,
           draft,
           attachments,
           queued,

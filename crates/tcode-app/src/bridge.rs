@@ -17,7 +17,9 @@ use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use tcode_core::progress::{self, PlanNote};
-use tcode_core::{AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk};
+use tcode_core::{
+    AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk, PermissionMode,
+};
 
 /// Event names the frontend listens on. Constants because the TypeScript side
 /// hard-codes the same strings; a typo here is a silently dead UI.
@@ -102,6 +104,11 @@ pub struct ApprovalAnswer {
     /// an answer this side cannot read must not be taken as consent.
     pub decision: String,
     pub comment: Option<String>,
+    /// Ordinary approval only: a constrained mode transition requested by a
+    /// button the desktop UI owns. Unknown values are rejected, never treated
+    /// as extra consent.
+    #[serde(default)]
+    pub set_mode: Option<String>,
     /// Plan review only: the breakdown as the reviewer edited it. It is a
     /// breakdown and not a rendered body on purpose — the markdown grammar of a
     /// progress file is core's, so the webview never writes it, and this arrives
@@ -148,13 +155,26 @@ impl ApprovalAnswer {
     /// returned. That is the whole reason the input is kept: an approval whose
     /// tool input came back from the frontend would let a compromised or simply
     /// buggy webview authorize one call and execute another.
-    fn into_approval(self, asked: &Value) -> Result<Approval, String> {
+    fn into_approval(self, asked: &Value, is_edit: bool) -> Result<Approval, String> {
         let decision = self.decision();
+        let set_mode = match self.set_mode.as_deref() {
+            None => None,
+            Some("accept-edits") if is_edit && decision == ApprovalDecision::Yes => {
+                Some(PermissionMode::AcceptEdits)
+            }
+            Some("accept-edits") => {
+                return Err("only a one-time file-edit approval can enable accept-edits".into())
+            }
+            Some(_) => return Err("unrecognized permission mode".into()),
+        };
         if !progress::is_plan_document(asked) {
-            return Ok(Approval::simple(
+            return Ok(Approval {
                 decision,
-                self.comment.filter(|c| !c.trim().is_empty()),
-            ));
+                comment: self.comment.filter(|c| !c.trim().is_empty()),
+                set_mode,
+                approved_input: None,
+                end_turn_after_execution: false,
+            });
         }
         let original = asked[progress::REVIEW_BODY_FIELD].as_str().unwrap_or("");
         // Webview data, so the same validation the model's own breakdown gets.
@@ -211,6 +231,9 @@ struct PendingAsk {
     /// The exact input the webview was shown. Kept so an answer can only ever
     /// modify what was actually proposed — see `into_approval`.
     asked: Value,
+    /// Whether this request was a file edit, as determined by core rather than
+    /// by a mode string supplied from the webview.
+    is_edit: bool,
 }
 
 /// Approvals awaiting an answer, keyed by request id.
@@ -231,7 +254,7 @@ impl Pending {
         let approval = {
             let held = self.0.lock().unwrap();
             let ask = held.get(&id).ok_or(GONE)?;
-            answer.into_approval(&ask.asked)?
+            answer.into_approval(&ask.asked, ask.is_edit)?
         };
         let ask = self.0.lock().unwrap().remove(&id).ok_or(GONE)?;
         ask.reply
@@ -246,13 +269,14 @@ impl Pending {
         self.0.lock().unwrap().clear();
     }
 
-    fn register(&self, id: String, asked: &Value) -> oneshot::Receiver<Approval> {
+    fn register(&self, id: String, asked: &Value, is_edit: bool) -> oneshot::Receiver<Approval> {
         let (tx, rx) = oneshot::channel();
         self.0.lock().unwrap().insert(
             id,
             PendingAsk {
                 reply: tx,
                 asked: asked.clone(),
+                is_edit,
             },
         );
         rx
@@ -292,7 +316,7 @@ impl Approver for WebviewApprover {
         input: &Value,
     ) -> Approval {
         let id = uuid::Uuid::new_v4().to_string();
-        let rx = self.pending.register(id.clone(), input);
+        let rx = self.pending.register(id.clone(), input, is_edit);
         self.emit.emit(
             APPROVAL_REQUEST,
             serde_json::to_value(ApprovalRequest {
@@ -341,5 +365,42 @@ pub async fn pump_events(
             })
             .unwrap_or(Value::Null),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(set_mode: Option<&str>) -> ApprovalAnswer {
+        ApprovalAnswer {
+            id: "approval".into(),
+            decision: "yes".into(),
+            comment: None,
+            set_mode: set_mode.map(str::to_owned),
+            phases: None,
+            notes: vec![],
+            fresh_session: false,
+        }
+    }
+
+    #[test]
+    fn edit_approval_can_enable_accept_edits() {
+        let approval = answer(Some("accept-edits"))
+            .into_approval(&serde_json::json!({"path": "src/main.rs"}), true)
+            .unwrap();
+
+        assert_eq!(approval.decision, ApprovalDecision::Yes);
+        assert_eq!(approval.set_mode, Some(PermissionMode::AcceptEdits));
+    }
+
+    #[test]
+    fn approval_mode_is_rejected_outside_a_one_time_edit_approval() {
+        assert!(answer(Some("unsafe"))
+            .into_approval(&serde_json::json!({}), true)
+            .is_err());
+        assert!(answer(Some("accept-edits"))
+            .into_approval(&serde_json::json!({}), false)
+            .is_err());
     }
 }

@@ -44,6 +44,12 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **滚动区里的轴要 `scrollbar-gutter: stable both-edges`。** 占宽度的滚动条只从一侧拿走宽度，于是 transcript 里居中的 `--measure` 列比不滚动的 composer 与 progress strip 偏左半个滚动条（实测 5px）。这不是滚动条审美问题，是"一根轴"这句话的成立条件。平台画覆盖式滚动条时它什么也不占；属性不认识时被忽略，退回到原来那个偏移。
 
+    **面板正文来自 call 自己的 input，不是 core 那两个字符串**（`Approval.tsx::readCall`）。core 对每次授权都描述两遍：`descriptor` 是"永久允许"会落盘的规则（`run(git status)`），`summary` 是它的句子形态（`run: git status`）。两条叠着印，读的人要逐字比对才发现它们相等，而那对括号是权限规则的语法、不是给人读的东西。所以正文改成从 input 取：有 `command` 就整条画进代码井（`--sunken` + `pre-wrap`，**换行必须留着**——一行式 summary 天生丢 heredoc），否则画 registry 给的 target（裸路径/URL，不带 `edit(...)` 外壳）。`descriptor` 挪进 "show the exact call" 与两个持久化按钮的 `title`，因为它在那儿才是事实：那是**按下去会写进文件的那一行**。同理 `cwd` 只在 call 自己指定时画——沉默就是会话目录，窗格 header 已经在说了。
+
+    **命令用共享的 `Code` 块画，不另造一个代码井。** 它和对话里一个 ```sh 围栏拿到的是同一个组件：同一套高亮、同一个复制按钮。原来那块无高亮的等宽灰板是为"全 app 唯一一处必须逐字读懂代码"的地方另发明的、更差的第二种代码呈现——而一条 `rm` 正是藏在管道中段的，高亮在这儿不是装饰，是"你要同意的东西"的结构本身。三处按需覆盖：语言 chip 隐掉（"Run this?" 已经说了）、字号提到 `--text-sm`（这是屏幕上的那句话，不是句子里的引文）、`pre-wrap` 不横向滚动（尾巴在屏幕外的命令等于没读就批了）。还有 **`.tok-punct` 在这里提到 `--syn-plain`**：它在别处 muted 是对的（3.76:1，过 3:1 的次要文本底线），但这里被弱化掉的字符是把输出送去别处的管道和区分 `-v` 与 `--nocapture` 的横杠——它们不是意义周围的语法，它们就是意义。
+
+    **header 只能命名一次动作。** 标题按 shape 选（edit → "Change a file?"，有 command → "Run this?"，其余 → "Allow this?"），工具名 chip **只在标题落到那句泛问时才出现**——`shell` 的 `display_name()` 就是 "Run"，标题已经说了动词时再挂一个 chip 就是同一个词印两遍。反过来，web_fetch 与 MCP 工具正是标题猜不出动词的场合，那时 chip 就是这次调用的全部身份。判定在 `named()`，被 `consent.test.ts` 钉住（fixture 里的 descriptor/summary 必须是 core 真发的那两串，见规则 9f 的同一条教训）。
+
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
 9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在窗格里：窗口按钮属于窗口的角，不属于某一个窗格的角。
@@ -54,11 +60,25 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **thinking 不在这套形状里，而且这条是反过来学到的。** 它曾经也是一条 `TraceGroup`，于是与"并发批次""连续读"长得一模一样，读的人必须逐行展开才知道哪几行是真发生过的事——一个折叠行看起来像一步，但它不是一步。现在它是散文（`.thinking`）：勾选了就直接铺出来，没勾就整块不存在（默认不存在，见规则 18）。连带一条：`groupTranscriptBlocks` **不许再把 thinking 扫进 exploration 组**，折叠的组会把它吞掉，"给我看推理"最后靠藏起来回答。
 
+    **成功且"body 就是结果"的那一步不画 output。** `edit` 返回的 `edited <path> (1 replacement). Result:` 加编号片段是**写给模型看的**（省掉它再读一遍文件），画在 diff 底下就是同一处改动换个更差的记法再来一遍，而读的人刚刚已经在红绿里看过了。后端早就把这条判断发出来了（`ToolViewMeta::hide_success_result`，`BODY_IS_THE_RESULT` 那四个工具），TUI 一直在遵守（`view.rs::result_render`），**只有这边从来没读过它**——`tests/bridge.rs` 里有断言钉住这个字段，却没人消费。别再把它当成"前端可以自己判断的表现细节"重写一份名字列表。
+
+    连带一条：**转录里没有任何一行会自己展开。** `editDetails` 开关的语义是"把 changes 组打开，好让 diff 在屏幕上"，不是"再顺手把每条底下的文字也铺开"——它曾经悄悄兼任了后者，于是每个 edit 底下都挂着一段没人要看的模型自愈文本。
+
+    **失败的那一步不画它的 body，也不画第二遍错误。** 调用失败等于什么都没发生，所以被拒的 edit **不许再画 diff**：红绿两色在这个 app 里的意思就是"文件被这样改了"，而这里文件根本没动，那是转录里最有说服力的一句假话。行上的 `failed` 加一条 `.tool-error`（`--danger-text`，只为失败而生，不是伪装成 output 预览的 muted 小字）就是全部。同时 `preview` 是 result 的第一行、而工具错误通常只有一行，于是老写法在 flow 里印一遍、在下面的 disclosure 里再印一遍**一模一样**的字——所以失败时 disclosure 不带 output（`shownOutput`），expand 也就自然消失。想看完整输出走行尾的 PopOut：`inspectFor(name, failed)` 让失败一律回落到 `FALLBACK`（output），不去开一个不存在的 diff。preview fixture 里必须留一条 `isError: true` 的调用，这个 bug 长期没人看见就是因为 fixture 里没有任何东西会失败。
+
     **每一行的展开控件都在行尾，都是 hover 才显形**——组、单个调用、sub-agent run 一视同仁。之前组和 run 的 chevron 在行首、run 的还常驻，结果一列步骤有两条左边缘：组的标签比单个调用的工具名右一个字形，而这正是"只有一种形状"要消掉的那种参差。配套的两条几何：**tinted 行盒左右各外扩 `--s-2`**（`margin-inline: calc(var(--s-2) * -1)`，三种行同写法），`width: 100%` 配负左 margin 是陷阱——盒子右边会短 `--s-2`，组的尾部 chevron 因此比调用的左 8px；`.trace` 因此是 flex column，让那个 `<button>` 不必自己声明宽度。组的 chevron 是 `<span>` 不是 `<button>`：整行本来就是开关，button 套 button 是非法结构。
 
     配套的排版规则：**行的标签用 UI 字体，等宽只留给真正的机器文本**（工具名、命令、路径）。"Run 2 commands" 是我们写的说明，不是机器输出；全用等宽就退化成 PRODUCT.md 点名反对的终端外观。**工具名一律用 core 的 `Tool::display_name()`**（经 `ToolViewMeta.display_name` 过桥，`useToolName()` 读），前端不许自己再写一套大小写规则——两套的结果是同一列里 `Read 15 files`（core 的 `batch_label`）挨着 `read 3 files`（前端自己拼的组标签）。前端自己拼的组标签因此也首字母大写。
 
     **正在跑的那一步带 `--brand-wash`，靠 `.is-running`**，结果到达时用 `--dur-slow` 褪掉——chroma 表示状态，所以运行中的行可以有，闲着的行不许有，工具名永远不因为"它是工具名"上色。旁边那颗呼吸的点已经是全 app 唯一一个常驻动画，这里不许再加第二个。
+
+9g. **"正在跑"这一行说的是**在哪一步**，不是"有事在跑"**（`activity.ts::phaseOf` + `Transcript.tsx::Working`）。它曾经每一秒都只印 `working` 一个词——而"有没有在跑"这件事状态点、会话栏、窗格 header 已经各答一遍了，"跑到哪儿了"没有任何地方答。词表照抄 TUI 的 `state_label`（`app/turn.rs`）：`sending` / `responding` / `thinking` / `writing` / `calling a tool` / `Run · <目标>` / `retrying (2/5)` / `sub-agent working` / `compacting history`。**它不是 wire 契约**，两边漂了也不炸；但同一个人两个前端都在用，同一个状态取两个名字是白让人多学一遍。
+
+    三条容易破的：**返回 `null` 表示"这个事件与阶段无关"**，保留上一个答案——记账类事件（`Usage`/`Note`/`ToolEnd`）远多于有信息的事件，给它们一个兜底词只会让这行在两个有意义的状态之间不停闪回泛词。**`TaskRunEvent` 一律 `null`**：那是子 agent 的阶段、不是这个 turn 的，而且成百上千地来，放进来就是让屏幕上这一行替一个没人在看的会话闪。**工具名走 `display_name()`**，不许用 wire 名——它和 `.rail-activity` 是同一个字符串，一处写 `read` 一处写 `Read` 就是 9e 那条"一列里两种大小写"换个地方重演。
+
+    工具名的解析器在 `App.tsx` 的监听里，用的是那个 effect **自己的局部 `names` map**，不是 `toolMeta` state：这个 effect 不能重跑（重订阅会把每个 delta 收两遍），所以闭包会永远读到注册时那张空表。别"顺手"改成读 state。
+
+    **动效只有一个，就是这一行**（`.working` + `@keyframes working-sweep`，几何照搬 `theme.rs::shimmer_color`：一条软光带、匀速、走完在右边缘外停一拍）。**光带扫的是底，绝不扫字**——`background-clip: text` 是明令禁止项，而且它必须覆写文字自己的颜色才成立，恰好和"活着的行是被**提亮**而不是被换掉"这条相反。**转录里的行不许各自扫**：五行各扫各的时钟就是纯噪音。还有一条踩出来的：**`@keyframes` 是全局扁平命名空间，没有作用域也没有告警**——本来叫 `sweep`，被文件后面 artifact loader 的同名 `sweep` 静默顶掉，行还在动（动的是别人的 opacity 脉冲），看起来就像"扫光写坏了"。新加动画一律带宿主前缀命名。
 
 9f. **一次委派只画一行。** `agent` 调用与它开出的 run 是同一步的两份记录：run 带 kind/model/调用数/状态与自己整份转录，调用带回来的 report。两行都画，这一步就占两行，第一行还是毫无信息的 `agent · agent(explore)`。`blocks.ts::runPairs` 按 **`parent_call`** 配对（`RunMeta.parentCall`，wire 上本来就有），把调用行让给 run 行，report 挪进 run 里；**不许按工具名判**——转录不需要知道那个工具叫什么。老日志没有 `parent_call` 时配不上，两行照画：多一行比少一行诚实。
 
@@ -92,7 +112,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **未做的第二阶段**：让 option 里能写 `{"$file": "pnl.csv"}` 由前端解引用，见 `DATA-BINDING.md`（含承重约束：解引用只能在父窗口做，沙箱读不到文件）。
 
-    **`ui/src/show.ts` 是 `fences.tsx` 的第二个入口，不是第二张表**：围栏语言与文件扩展名问的是同一个问题，答案重合（mermaid/html/svg/markdown）。分成两套的后果是同一张图内联写和写成文件长得不一样，而 `show` 的全部意义就是"改的只有成本，不是结果"。`.json` 是唯一按内容判定的条目（它是容器不是一种东西），其余在加载任何字节之前就定了。
+    **`ui/src/show.ts` 是 `fences.tsx` 的第二个入口，不是第二张表**：围栏语言与文件扩展名问的是同一个问题，答案重合（mermaid/html/svg/markdown）。分成两套的后果是同一张图内联写和写成文件长得不一样，而 `show` 的全部意义就是"改的只有成本，不是结果"。`.json` 是唯一按内容判定的条目（它是容器不是一种东西），其余在加载任何字节之前就定了。**第三个入口是文件树点开的文件**（`WorkspaceFile.tsx`），同表同渲染（`FileBody.tsx`），理由同上。
 
     **artifact 画在调用点，不自动开窗格**（`toolViews.tsx` 的 `showing.body`）。第一版是调用成功就自己开一个 inspect 窗格，错在没人要求就重排了窗口。现在它和 edit 画 diff 是同一件事：结果就在对话流里，`.shown.is-inline` 只加一个高度上限，**渲染的东西与窗格里一模一样**——两处画得不一样，那个按钮就从放大镜变成了赌博。
 
@@ -179,9 +199,16 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **`summary` 回答"哪一个"，参数属于 `detail`。** skill 的 `name` 与 `arguments` 拼成一个字符串时读者看不出名字在哪儿结束（`impeccable audit the trace column`），而行要回答的问题是"加载了哪个 skill"。参数走 shell 命令用的那同一个折叠位。唯一的例外是 `progress`：它的路由**随 input 变**（阶段翻转归计划条，提交的计划是对话要留住的文档），后端送的是工具的默认答案，那一个例外由 `plan.ts::isPlanSubmission` 在调用点认出来——一个字段，紧挨着它读的类型。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
-  - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。表格只把有限行放进 DOM（`ROW_STEP`），不是分页而是上限——20 万行 DOM 就是一个冻住的窗口。
+  - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。渲染本体在 `FileBody.tsx`（表格只把有限行放进 DOM，`ROW_STEP` 不是分页而是上限——20 万行 DOM 就是一个冻住的窗口）。
+  - **文件树点开的文件是那张表的第三个入口，不是第四种画法**（`WorkspaceFile.tsx`）。它和 `Shown.tsx` 共用 `FileBody`，所以一个 `.svg` 是模型 show 出来的还是有人从树里点开的，画出来一模一样。它曾经是 `WorkspaceEditor`：所有文件一律开在灰 textarea 里，旁边挂一个 `source / preview` 开关——而"preview"这个区分只有 Markdown 有，`.rs` 点它没有意义，`.png` 后端根本读不出来（`Workspace::read` 只认 UTF-8）。
+
+    **两态是"看"和"改"，不是"源码"和"预览"。** 渲染是静止态（打开一个文件的窗格就是被要求把它显示出来），改是一次点击（改是一个决定）。**读的时候不许有输入框的外观**——沉底的灰井是"这里可以打字"的承诺，静止态给这个承诺就是承诺错了东西；井属于 textarea，跟它一起出现。哪些文件连这个开关都没有也由同一张表说了算：`isBinary` 认下的以 `data:` URL 到达，那是一张图片，图片没有源码可以放进 textarea。
+
+    **二进制走 `Workspace::read_binary`，不许改道去 `shown_file`。** 两者的"在不在工作区里"是两套定义（前者按 root 解析且每一段都不许是 link，后者按 `is_viewable_path`），图片能读了却换一条边界进来，就是给同一句话两个意思。`.ico` 之类新扩展名要同时进 `show.ts` 的表和 `commands.rs::media_type`。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
-  - **语法高亮是自己写的**（`syntax.ts`），因为 Shiki/highlight.js 自带调色板是字面值，主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色。它输出语义 class，颜色由 `base.css` 的 `--syn-*` 契约决定。
+  - **语法高亮：语法来自 Shiki，配色一律不来自它**（`syntax.ts`）。这里曾经是一个手写扫描器，理由是任何库都自带调色板、是字面值、主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色——那条理由至今成立，变的是划线的位置。现在交给 Shiki 的**主题根本不是调色板**：`mark()` 把八种 kind 各涂一个哨兵色（`#000001`…），`kindOf()` 再把它读回来，跨过这趟旅程的只有一个下标。到 DOM 的仍然是 `tok-*` class，值仍然在 `base.css` 的 `--syn-*` 契约里。
+
+    三条别改坏：**只调 `codeToTokens`，永远不调 `codeToHtml`**——前者返回数据，后者返回 markup，规则 10 在这里是靠类型成立的，不是靠 review。**scope→kind 的表是我们自己的**，不是 Shiki 的 `css-variables` 主题（它把对象属性和数字归一堆、把标签名和关键字归一堆，跟这个 app 画它们的方式不一样）。**语法是异步按语言懒加载的**，所以 `highlight()` 在拿到之前返回 `null`，调用方拿 `useGrammar` 订阅、这期间画纯文本——一段没上色的代码是完整可读的，为它画个 loading 比等它更差。
 - `src/openers.rs`：把工作区里的一个路径交给外面的程序（编辑器 / 文件管理器）。表在这里，边界见上面那条。
 - `src/paths.rs`：`canonical_dir`——app 里唯一一处把用户选的文件夹变成键的地方（见硬规则 9）。
 - `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + 四条 window 授权（自绘标题栏，见 9c）+ `dialog:allow-open`（"打开文件夹"要它）。

@@ -45,6 +45,7 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::close_session,
             tcode_app::commands::workspace_list,
             tcode_app::commands::workspace_read_text,
+            tcode_app::commands::workspace_read_binary,
             tcode_app::commands::workspace_write_text,
             tcode_app::commands::workspace_create,
             tcode_app::commands::workspace_rename,

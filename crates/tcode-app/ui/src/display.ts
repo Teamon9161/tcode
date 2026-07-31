@@ -22,9 +22,11 @@ export type Display = {
    * column is only things that happened.
    */
   thinking: boolean;
+  /** Whether file-change details begin expanded in the transcript. */
+  editDetails: boolean;
 };
 
-export const DISPLAY_DEFAULT: Display = { thinking: false };
+export const DISPLAY_DEFAULT: Display = { thinking: false, editDetails: true };
 
 const KEY = "tcode.display";
 
@@ -43,6 +45,8 @@ export function loadDisplay(): Display {
     return {
       thinking:
         typeof record.thinking === "boolean" ? record.thinking : DISPLAY_DEFAULT.thinking,
+      editDetails:
+        typeof record.editDetails === "boolean" ? record.editDetails : DISPLAY_DEFAULT.editDetails,
     };
   } catch {
     // A webview with storage disabled still has to open.

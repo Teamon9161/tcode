@@ -1,12 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-import type { Decision, SessionInfo, Status } from "./types";
+import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
 import type { SessionState } from "./session";
 import type { PlanDraft } from "./plan";
 import type { PlanDecision } from "./PlanEditor";
 import {
   browserPane,
   close,
+  findLeaf,
   focusPane,
   focused,
   navigate,
@@ -23,7 +24,7 @@ import {
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
-import { BackIcon, ChevronDown, ChevronRight, CloseIcon, SidebarIcon } from "./components/Icons";
+import { BackIcon, ChevronDown, ChevronRight, CloseIcon, PlusIcon, SidebarIcon } from "./components/Icons";
 import { WindowControls } from "./components/WindowControls";
 import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
@@ -57,10 +58,9 @@ import {
  * heading and each conversation is named by what it was asked to do — the two
  * facts a reader needs are different facts, so they are different elements.
  *
- * Nothing in the rail starts a *new* conversation any more. That button used to
- * sit at the bottom of the list and was the one row in it that was not a
- * conversation; the folder chip in each pane's header owns it now, where the
- * folder was already being named.
+ * Each folder heading also starts a new conversation in that folder. The
+ * folder chip in each pane remains the path for choosing a different folder,
+ * while the rail keeps the same-folder action next to the group it names.
  *
  * The title bar spans the whole window rather than sitting inside the field,
  * because it is also the window's own bar (`decorations: false`, see
@@ -110,7 +110,7 @@ export function Workspace({
   onSendQueuedNow: PaneContext["onSendQueuedNow"];
   onAskRewind: PaneContext["onAskRewind"];
   onRewind: PaneContext["onRewind"];
-  onAnswer: (session: string, decision: Decision, comment: string) => void;
+  onAnswer: (session: string, decision: Decision, comment: string, setMode?: ApprovalMode) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
   onSavePlan: (session: string) => void;
@@ -131,10 +131,17 @@ export function Workspace({
   // the opposite of accounting for every conversation.
   const [order, setOrder] = useState<string[]>(loadOrder);
   const [folded, setFolded] = useState<Set<string>>(() => new Set());
+  // A temporary viewing mode, not a layout operation: keeping it here preserves
+  // the full tiling tree and every pane's local state for the return trip.
+  const [expanded, setExpanded] = useState<string | null>(null);
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
   const groups = useMemo(() => railGroups(sessions, order), [sessions, order]);
+
+  useEffect(() => {
+    if (expanded && !findLeaf(tiling, expanded)) setExpanded(null);
+  }, [expanded, tiling]);
 
   const move = useCallback(
     (path: string, to: number) => {
@@ -224,6 +231,11 @@ export function Workspace({
       ) {
         return;
       }
+      if (expanded) {
+        event.stopPropagation();
+        setExpanded(null);
+        return;
+      }
       const seat = focused(tiling);
       if (!seat || seat.pane.kind !== "inspect") return;
       event.stopPropagation();
@@ -231,7 +243,7 @@ export function Workspace({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [tiling, onTiling]);
+  }, [tiling, onTiling, expanded]);
 
   /**
    * Driving the layout from the keyboard.
@@ -316,7 +328,7 @@ export function Workspace({
     stateOf,
     statusOf,
     focus: tiling.focus,
-    split: leaves.length > 1 && !narrow,
+    split: leaves.length > 1 && !narrow && !expanded,
     onFocus: (pane) => onTiling((current) => focusPane(current, pane)),
     onClosePane: (pane) => onTiling((current) => close(current, pane)),
     onRatio: (divider, ratio) => onTiling((current) => setRatio(current, divider, ratio)),
@@ -328,6 +340,11 @@ export function Workspace({
     onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
     onToggleFiles: toggleFiles,
     onToggleWorkspace: toggleWorkspace,
+    expanded,
+    onToggleExpanded: (pane) => {
+      onTiling((current) => focusPane(current, pane));
+      setExpanded((current) => (current === pane ? null : pane));
+    },
     onDraft,
     onAttach,
     onDetach,
@@ -408,6 +425,7 @@ export function Workspace({
                 onMove={(to) => move(group.path, to)}
                 onShow={(id) => onTiling((current) => show(current, id))}
                 onCloseSession={onCloseSession}
+                onOpenFolder={onOpenFolder}
               />
             ))}
           </ul>
@@ -444,6 +462,7 @@ function RailProject({
   onMove,
   onShow,
   onCloseSession,
+  onOpenFolder,
 }: {
   group: RailGroup;
   at: number;
@@ -456,7 +475,9 @@ function RailProject({
   onMove: (to: number) => void;
   onShow: (session: string) => void;
   onCloseSession: (session: string) => void;
+  onOpenFolder: (path: string) => Promise<void>;
 }) {
+  const [failure, setFailure] = useState<string | null>(null);
   const needs = group.sessions.filter((entry) => statusOf(entry.id) === "waiting").length;
   const running = group.sessions.some((entry) => statusOf(entry.id) === "running");
 
@@ -498,6 +519,17 @@ function RailProject({
           <button
             type="button"
             className="icon-btn"
+            title={`New conversation in ${group.name}`}
+            aria-label={`New conversation in ${group.name}`}
+            onClick={() =>
+              onOpenFolder(group.path).catch((error) => setFailure(String(error)))
+            }
+          >
+            <PlusIcon size={14} />
+          </button>
+          <button
+            type="button"
+            className="icon-btn"
             title="Move up (Alt+↑)"
             aria-label={`Move ${group.name} up`}
             disabled={at === 0}
@@ -517,6 +549,12 @@ function RailProject({
           </button>
         </span>
       </div>
+
+      {failure && (
+        <p className="rail-new-failure" role="alert">
+          {failure}
+        </p>
+      )}
 
       {!folded && (
         <ul className="rail-sessions">

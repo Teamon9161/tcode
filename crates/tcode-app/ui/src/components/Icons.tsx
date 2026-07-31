@@ -96,6 +96,24 @@ export const SidebarIcon = (props: IconProps) => (
   </Glyph>
 );
 
+export const ExpandIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M9 5H5v4" />
+    <path d="m5 5 5 5" />
+    <path d="M15 19h4v-4" />
+    <path d="m19 19-5-5" />
+  </Glyph>
+);
+
+export const CollapseIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M5 9h4V5" />
+    <path d="m9 9-4-4" />
+    <path d="M19 15h-4v4" />
+    <path d="m15 15 4 4" />
+  </Glyph>
+);
+
 export const PlusIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M12 5.5v13" />
@@ -183,6 +201,15 @@ export const RewindIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M4 5v6h6" />
     <path d="M4.5 11a8 8 0 1 1 2 6" />
+  </Glyph>
+);
+
+/* A nib, not a full pencil: at 14px the eraser and ferrule of a whole pencil
+   collapse into noise, and what this control means is "write on it". */
+export const PencilIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M4 20h4L19.5 8.5a2.5 2.5 0 0 0-3.5-3.5L4.5 16.5Z" />
+    <path d="m15 6 3 3" />
   </Glyph>
 );
 

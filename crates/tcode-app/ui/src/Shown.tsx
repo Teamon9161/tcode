@@ -1,22 +1,15 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
-import { Code } from "./components/Code";
-import { languageOf } from "./diff";
+import { RefreshIcon } from "./components/Icons";
+import { FileBody } from "./FileBody";
 import { relativeTo } from "./files";
 import type { Inspect } from "./inspect";
-import { rich } from "./rich";
-import { Sandbox } from "./Sandbox";
 import { useSession } from "./session";
-import { isBinary, parseRows, shownAs } from "./show";
+import { isBinary } from "./show";
 
 /** Mirrors `ShownFile` in `src/commands.rs`. */
 type ShownFile = { body: string; bytes: number; truncated: boolean };
-
-/** How many rows of a table are on screen before the reader asks for more.
- *  A bound, not a page size: 200k rows of DOM is a frozen window, and nobody
- *  reads past the first screen without deciding to. */
-const ROW_STEP = 200;
 
 /**
  * A file the model asked to display.
@@ -84,8 +77,14 @@ export function ShownView({
             {relativeTo(cwd ?? "", value.path)}
           </p>
         )}
-        <button className="link-btn" onClick={() => setReload((at) => at + 1)}>
-          reload
+        <button
+          type="button"
+          className="icon-btn"
+          onClick={() => setReload((at) => at + 1)}
+          aria-label="Read this file again"
+          title="Read this file again"
+        >
+          <RefreshIcon size={14} />
         </button>
       </div>
 
@@ -98,78 +97,9 @@ export function ShownView({
       {failure ? (
         <p className="inspect-empty">{failure}</p>
       ) : file ? (
-        <Body path={value.path} label={value.label} body={file.body} />
+        <FileBody path={value.path} label={value.label} body={file.body} />
       ) : (
         <p className="inspect-empty">loading…</p>
-      )}
-    </div>
-  );
-}
-
-/** Dispatch on what the registry says this file is. Every branch is a component
- *  the app already had, which is the point of keeping one table. */
-function Body({ path, label, body }: { path: string; label: string; body: string }) {
-  const view = useMemo(() => shownAs(path, body), [path, body]);
-
-  switch (view.as) {
-    case "sandbox":
-      return <Sandbox kind={view.sandbox} source={body} label={label} />;
-    case "image":
-      // `body` is a `data:` URL built by the backend, which is why this needs no
-      // asset protocol and no `same-origin` anywhere near it.
-      return <img className="shown-image" src={body} alt={label} />;
-    case "doc":
-      return <div className="doc">{rich(body)}</div>;
-    case "table":
-      return <Table body={body} separator={view.separator} />;
-    case "text":
-      return <Code source={body} language={languageOf(path)} />;
-  }
-}
-
-/**
- * Delimited data, with a bounded number of rows in the DOM.
- *
- * The first row is the header. That is an assumption, and it is the right one:
- * every table a script writes for a human to read has one, and a file that does
- * not simply loses one row to the header band rather than becoming unreadable.
- */
-function Table({ body, separator }: { body: string; separator: string }) {
-  const rows = useMemo(() => parseRows(body, separator), [body, separator]);
-  const [limit, setLimit] = useState(ROW_STEP);
-
-  if (rows.length === 0) return <p className="inspect-empty">no rows</p>;
-
-  const [header, ...data] = rows;
-  const shown = data.slice(0, limit);
-
-  return (
-    <div className="shown-table-wrap">
-      <table className="shown-table">
-        <thead>
-          <tr>
-            {header.map((cell, at) => (
-              <th key={at}>{cell}</th>
-            ))}
-          </tr>
-        </thead>
-        <tbody>
-          {shown.map((row, at) => (
-            <tr key={at}>
-              {row.map((cell, column) => (
-                <td key={column}>{cell}</td>
-              ))}
-            </tr>
-          ))}
-        </tbody>
-      </table>
-      {data.length > shown.length && (
-        <p className="shown-more">
-          {shown.length} of {data.length} rows
-          <button className="link-btn" onClick={() => setLimit((at) => at + ROW_STEP)}>
-            show {Math.min(ROW_STEP, data.length - shown.length)} more
-          </button>
-        </p>
       )}
     </div>
   );

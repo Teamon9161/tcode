@@ -79,6 +79,13 @@
   padding: calc(var(--gutter) / 2);
 }
 
+/* Focus view covers the field but retains every other mounted pane, preserving
+   scroll positions, editor drafts, and artifact iframes when it is restored. */
+.pane-slot.is-hidden {
+  visibility: hidden;
+  pointer-events: none;
+}
+
 /* The divider sits on the seam, centred on it, and paints nothing at rest: a
    permanent line between panes would be the border this design decided not to
    draw. */
@@ -944,6 +951,12 @@
   opacity: 1;
 }
 
+.rail-new-failure {
+  margin: var(--s-1) var(--s-2) 0;
+  color: var(--danger-text);
+  font-size: var(--text-2xs);
+}
+
 .rail-sessions {
   list-style: none;
   display: flex;
@@ -1372,19 +1385,100 @@
   overflow-wrap: anywhere;
 }
 
+/* The running indicator: a pulsing dot, where the turn is, and a highlight
+   sweeping the row.
+
+   It hugs its content (`align-self: flex-start`) rather than spanning the
+   measure, so the sweep travels the label instead of crossing an empty column —
+   the same scope the TUI shimmers, which is the line's own painted width.
+
+   Wearing the running row's vocabulary: `--brand-wash` behind, `--brand-text`
+   on the words, exactly what `.tool.is-running` wears. This is that state, so
+   it may spend the chroma; the difference is only that this one moves. */
 .working {
+  align-self: flex-start;
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  color: var(--muted);
+  max-width: 100%;
+  padding: var(--s-1) var(--s-2);
+  margin-inline: calc(var(--s-2) * -1);
+  border-radius: var(--r-sm);
+  background: var(--brand-wash);
+  color: var(--brand-text);
   font-size: var(--text-xs);
 }
+
+/* A band of light travelling left to right, then a beat of rest.
+
+   A band over the *surface*, never over the glyphs: `background-clip: text` is
+   banned outright, and it would also have to overwrite the phase's own colour
+   to work — where the whole idea, in the terminal and here, is that a live line
+   is lifted without losing its identity. So the text is one solid colour and
+   the sheet under it is what moves.
+
+   Geometry ported from `theme.rs::shimmer_color`: one soft band, constant
+   speed, and a dwell past the right edge so two passes read as separate events
+   rather than a loop. Constant speed on purpose — an eased sweep would read as
+   something arriving, and nothing arrives here. It is a composited transform
+   over a fixed gradient, so a turn that runs for minutes costs no layout. */
+.working::after {
+  content: "";
+  position: absolute;
+  z-index: -1;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 40%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--brand) 16%, transparent),
+    transparent
+  );
+  /* Named for what it belongs to, not for what it does. `@keyframes` is one
+     flat global namespace with no scoping and no warning: a second `sweep`
+     defined later in this file silently replaced this one, and the line went on
+     animating — with the artifact loader's opacity pulse. It looked like a
+     working sweep that had simply lost its travel. */
+  animation: working-sweep var(--dur-sweep) linear infinite;
+}
+
+@keyframes working-sweep {
+  /* Entirely off the left edge, across, then held past the right for the rest
+     between passes — the band's own width is the unit, so a narrow phase and a
+     wide one sweep at the same speed. */
+  0% {
+    transform: translateX(-100%);
+  }
+  72% {
+    transform: translateX(250%);
+  }
+  100% {
+    transform: translateX(250%);
+  }
+}
+
 .working-dot {
+  flex: none;
   width: 7px;
   height: 7px;
   border-radius: var(--r-pill);
   background: var(--brand);
   animation: breathe 1.4s var(--ease) infinite;
+}
+
+/* One line, ellipsized. A phase can be a whole command (`Run · cargo test -p
+   …`), and this line sits under the conversation rather than in it — it may not
+   grow into a paragraph that reflows the column every time a call starts. */
+.working-phase {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .first-run {
@@ -2032,10 +2126,69 @@
 }
 
 .inspect-transcript,
+/* A file read as a document, rather than as a message inside a conversation.
+   `rich()` is the same renderer in both places; what differs is the room it is
+   standing in. A transcript demotes headings (h1 → h3) and keeps everything in
+   the body's own scale, because there they are structure inside somebody else's
+   page, sitting between the agent's paragraphs. A README opened in a pane is
+   not inside anything — it *is* the page, so it gets a real scale and its own
+   measure.
+
+   Flow rather than flex, and this is the whole reason the old rule read as
+   mediocre: one `gap` cannot say that a heading belongs to what follows it. A
+   uniform 12px left every heading floating equidistant between two blocks, so
+   nothing on the page was grouped and the eye had no sections to land on.
+   Margins can be asymmetric, so a heading pushes away from the section above
+   and hugs the paragraph below. */
 .doc {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-3);
+  max-width: var(--measure);
+  color: var(--body);
+  line-height: var(--lh-prose);
+}
+
+.doc > * + * {
+  margin-top: var(--s-3);
+}
+
+.doc .prose-h {
+  margin-top: var(--s-6);
+  margin-bottom: var(--s-2);
+  line-height: var(--lh-snug);
+}
+
+/* Nothing pushes off the top of the pane: the first line sits where the header
+   left it, whatever kind of block it is. */
+.doc > :first-child {
+  margin-top: 0;
+}
+
+/* A scale, rather than two sizes and a weight. `rich` maps h1–h6 onto h3–h6, so
+   these four names carry six levels — the last two share a size and separate by
+   weight alone, which is what a sixth level is worth. */
+.doc .prose-h3 {
+  font-size: var(--text-lg);
+}
+.doc .prose-h4 {
+  font-size: var(--text-md);
+}
+.doc .prose-h5,
+.doc .prose-h6 {
+  font-size: var(--text-base);
+}
+.doc .prose-h5 {
+  font-weight: var(--weight-semibold);
+}
+
+/* Prose in a document is read, not scanned past. A transcript keeps tables and
+   code at the small end because they punctuate a conversation; here they are
+   the content. */
+.doc .prose-table {
+  font-size: var(--text-sm);
+}
+
+.doc .prose-quote {
+  padding-left: var(--s-4);
+  border-left-width: 2px;
 }
 
 /* ============================================================ composer chips */
@@ -3175,17 +3328,79 @@
   font-size: var(--text-xs);
 }
 
+.files-index {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  flex-direction: column;
+  gap: var(--s-4);
+  overflow-y: auto;
+  padding: var(--s-3) var(--s-2);
+}
+
+.file-group {
+  min-width: 0;
+}
+
+.file-group-label,
+.file-group-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  width: 100%;
+  margin: 0;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  text-align: left;
+}
+
+.file-group-toggle {
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
+}
+
+.file-group-toggle:hover {
+  color: var(--ink);
+}
+
+.file-group-toggle:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
+  border-radius: var(--r-sm);
+}
+
+.file-group-toggle svg {
+  flex: none;
+  color: var(--faint);
+}
+
+.file-group-count {
+  margin-left: auto;
+  color: var(--faint);
+  font-family: var(--font-mono);
+}
+
+.files-empty-note {
+  margin: 0;
+  padding: var(--s-1) var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
 .file-list {
   list-style: none;
   margin: 0;
-  padding: var(--s-2);
-  overflow-y: auto;
-  flex: 0 1 auto;
+  padding: 0;
 }
 
 .file-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   gap: 0 var(--s-2);
   width: 100%;
   padding: var(--s-2);
@@ -3199,8 +3414,19 @@
 .file-item:hover {
   background: var(--hover);
 }
+.file-item:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: -1px;
+}
+.file-item > svg {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+  align-self: center;
+  color: var(--faint);
+}
 
 .file-name {
+  grid-column: 2;
   color: var(--ink);
   font-family: var(--font-mono);
   font-size: var(--text-xs);
@@ -3211,7 +3437,7 @@
 }
 
 .file-dir {
-  grid-column: 1;
+  grid-column: 2;
   color: var(--faint);
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
@@ -3221,7 +3447,7 @@
 }
 
 .file-tag {
-  grid-column: 2;
+  grid-column: 3;
   grid-row: 1 / span 2;
   justify-self: end;
   align-self: center;
@@ -3247,7 +3473,7 @@
 /* Which agent touched a file is the question a parallel run raises, so it is
    on the row. Achromatic on purpose: it is a fact, not a state. */
 .file-run {
-  grid-column: 1;
+  grid-column: 2;
   justify-self: start;
   padding: 0 var(--s-1);
   border: 1px solid var(--line);
@@ -3330,6 +3556,10 @@
   overflow-y: auto;
 }
 
+/* What the call is about when it is not a command: a path, a URL, a pattern.
+   The bare thing, not core's `edit(path)` — those parentheses are the syntax of
+   a permission rule, and a rule is what the persist buttons grant, not what the
+   question is about. */
 .approval-target {
   color: var(--ink);
   font-family: var(--font-mono);
@@ -3337,14 +3567,79 @@
   overflow-wrap: anywhere;
 }
 
-.approval-summary {
-  color: var(--muted);
+/* The command, drawn by the shared `Code` block. Only two things differ here,
+   and both are because this is a decision rather than a passage being read:
+
+   it is set one step up (`--text-sm`, the panel's own size, against a fence's
+   `--text-xs`) because a command you are authorizing is the sentence on the
+   screen, not a quotation inside one; and it never scrolls sideways.
+   `pre-wrap` + `overflow-wrap` means a long pipeline folds onto a second line —
+   a command whose tail is off the edge is a command approved unread, which is
+   the one failure this panel exists to prevent. */
+.approval-command .code-body {
+  padding-top: 0;
   font-size: var(--text-sm);
-  text-wrap: pretty;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The language chip is noise here: "Run this?" already said it, and a `sh` tag
+   over a command in a consent panel is a label on the only thing in the room.
+   The copy button stays — reaching for the command to run it yourself is the
+   most likely thing to follow a "no". */
+.approval-command .code-lang {
+  display: none;
+}
+
+/* Punctuation is not secondary in a command you are authorizing.
+
+   `--syn-punct` is muted on purpose and clears the 3:1 floor for de-emphasized
+   text everywhere a fence is *read* (measured 3.76:1 on the code surface). Here
+   the de-emphasized characters are the pipe that sends output somewhere else
+   and the dashes that separate `-v` from `--nocapture`: they are not the syntax
+   around the meaning, they are the meaning. Lifted to `--syn-plain`, the same
+   colour as the words beside them, which clears 4.5:1 — the floor for text
+   somebody has to actually read. The token is not redefined, it is spent at a
+   different emphasis because this context changed what it is worth. */
+.approval-command .tok-punct {
+  color: var(--syn-plain);
+}
+
+/* Only drawn when the call named a directory of its own, so its presence is
+   itself the information: this is not running where you think it is. */
+.approval-where {
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.approval-path {
+  color: var(--ink);
+  font-family: var(--font-mono);
 }
 
 .approval-toggle {
   align-self: flex-start;
+}
+
+.approval-exact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  min-width: 0;
+}
+
+/* The rule a lasting yes would save, kept behind the same disclosure as the raw
+   call. It used to lead the panel, where it was the command a second time in
+   permission-rule punctuation; it belongs with the fine print, because that is
+   what it is. */
+.approval-rule {
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+.approval-rule code {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
 }
 
 .approval-input {
@@ -3515,6 +3810,24 @@
 }
 .fault-hint {
   color: var(--muted);
+}
+
+/* The stack is evidence, not prose: it stays monospaced, scrolls inside itself
+   rather than widening the window, and is bounded so a deep trace cannot push
+   the reload button off the screen. */
+.fault-stack {
+  max-width: 100%;
+  max-height: 40vh;
+  margin: 0;
+  padding: var(--s-3);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  line-height: var(--lh-normal);
+  overflow: auto;
+  white-space: pre;
 }
 .fault code {
   padding: 1px 5px;
@@ -3759,10 +4072,13 @@
 .artifact-loading {
   height: 2px;
   background: linear-gradient(90deg, transparent, var(--brand-wash), transparent);
-  animation: sweep 1.2s var(--ease) infinite;
+  animation: artifact-pulse 1.2s var(--ease) infinite;
 }
 
-@keyframes sweep {
+/* Renamed from `sweep`, which it never was — it pulses opacity in place. The
+   generic name was free to collide with any other travelling highlight in the
+   app, and did. */
+@keyframes artifact-pulse {
   from {
     opacity: 0.3;
   }
@@ -3971,11 +4287,21 @@
   border-top: 1px solid var(--line);
 }
 
-.tool-preview {
+/* The reason a call failed, and the only thing a failed call draws besides its
+   row. It is only ever rendered for a failure, so it is coloured as one instead
+   of sitting muted on the danger wash pretending to be a preview of output.
+   Set one step up from the row's metadata, because it is the sentence the
+   reader is here for; capped so a stack trace cannot take the column over, with
+   the whole of it a click away in its own pane. */
+.tool-error {
   padding: var(--s-1) var(--s-3) var(--s-2);
-  color: var(--muted);
+  max-height: 16em;
+  overflow: auto;
+  color: var(--danger-text);
   font-family: var(--font-mono);
-  font-size: var(--text-2xs);
+  font-size: var(--text-xs);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* ---- batch ---- */
@@ -5185,17 +5511,20 @@
   color: var(--muted);
 }
 
-.workspace-editor {
+.workspace-file {
   display: flex;
   flex-direction: column;
   min-height: 100%;
   gap: var(--s-3);
 }
 
-/* A file editor is one flat pane: the header names and acts on the file, the
-   textarea or preview is the content itself, and the single divider is the
-   only boundary it needs. */
-.workspace-editor-bar {
+/* A file pane is one flat pane: the header names and acts on the file, the
+   file itself is the content, and the single divider is the only boundary it
+   needs. Nothing frames the file while it is being read — a grey well around a
+   rendered document says "field to type in", which in the resting state is a
+   promise about the wrong thing. The well belongs to the textarea, and appears
+   with it. */
+.workspace-file-bar {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -5204,43 +5533,43 @@
   border-bottom: 1px solid var(--line);
 }
 
-.workspace-editor-bar .inspect-path {
+.workspace-file-bar .inspect-path {
   min-width: 0;
   margin-bottom: 0;
 }
 
-.workspace-editor-actions {
+.workspace-file-actions {
   display: flex;
   align-items: center;
   flex: none;
   gap: var(--s-2);
 }
 
-.workspace-editor-save {
+.workspace-file-save {
   padding: var(--s-1) var(--s-3);
   font-size: var(--text-xs);
 }
 
-.workspace-editor-warning,
-.workspace-editor-conflict,
-.workspace-editor-error {
+.workspace-file-warning,
+.workspace-file-conflict,
+.workspace-file-error {
   margin: 0;
   padding: var(--s-2) var(--s-3);
   font-size: var(--text-xs);
 }
 
-.workspace-editor-warning,
-.workspace-editor-conflict {
+.workspace-file-warning,
+.workspace-file-conflict {
   background: var(--amber-wash);
   color: var(--amber-text);
 }
 
-.workspace-editor-error {
+.workspace-file-error {
   background: var(--danger-wash);
   color: var(--danger-text);
 }
 
-.workspace-editor-source {
+.workspace-file-source {
   display: block;
   width: 100%;
   min-height: calc(var(--s-8) * 4);
@@ -5255,18 +5584,64 @@
   resize: vertical;
 }
 
-.workspace-editor-source:focus {
+.workspace-file-source:focus {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
   border-color: var(--line-strong);
   background: var(--bg);
 }
 
-.workspace-editor-source:read-only {
+.workspace-file-source:read-only {
   color: var(--muted);
   cursor: default;
 }
 
-.workspace-editor-preview {
+/* The read view. It grows into the pane so an image or a diagram gets the room
+   it was opened for, and it owns no chrome of its own: whatever `FileBody`
+   drew — a document, a picture, a code block — is already a finished surface. */
+.workspace-file-body {
   min-width: 0;
+  flex: 1;
+}
+
+/* A picture is sized by the pane, never enlarged past its own pixels: an icon
+   blown up to fill a column is a blurrier answer to "which icon is this". */
+.workspace-file-body .shown-image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+}
+
+/* A source file is the pane, not a snippet sitting in one. The shared code
+   block is right everywhere else — inside a conversation it has to say where a
+   quotation starts and stops — but here the tinted card is the same grey well
+   this view was rebuilt to get rid of, drawn around the entire contents of the
+   window. The language chip goes with it: the header above already spells out
+   the extension, and printing `tsx` under `…/Workspace.tsx` is one fact taking
+   two lines. The copy button stays; it is the only thing in that bar that was
+   ever an action. */
+.workspace-file-body .code-block {
+  background: none;
+}
+
+.workspace-file-body .code-lang {
+  display: none;
+}
+
+/* With the chip gone the bar holds one hover-only button, so it keeps just
+   enough height to be that button's seat and none of a caption's padding. */
+.workspace-file-body .code-bar {
+  padding: 0;
+  min-height: 20px;
+}
+
+.workspace-file-body .code-body {
+  padding: 0;
+  font-size: var(--text-sm);
+}
+
+/* The textarea is the pane's whole body once editing starts, rather than a box
+   four lines tall that the file scrolls inside. */
+.workspace-file-source {
+  flex: 1;
 }

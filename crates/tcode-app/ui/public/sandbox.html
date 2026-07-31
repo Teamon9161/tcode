@@ -32,9 +32,17 @@
         display: flow-root;
       }
       #stage img,
-      #stage svg,
       #stage table {
         max-width: 100%;
+      }
+      /* SVG files often only declare a viewBox. Making the root a block and
+         giving it the available width lets that intrinsic ratio determine a
+         measurable height instead of leaving the opaque frame at zero. */
+      #stage > svg {
+        display: block;
+        max-width: 100%;
+        width: 100%;
+        height: auto;
       }
     </style>
   </head>

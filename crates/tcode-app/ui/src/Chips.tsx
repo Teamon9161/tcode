@@ -1,6 +1,8 @@
-import { useEffect, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 
+import { AGENT_EVENT, type SessionEvent } from "./types";
 import { useSession } from "./session";
 import { ModelPanel } from "./ModelPanel";
 import { UsagePanel } from "./UsagePanel";
@@ -38,16 +40,29 @@ export function Chips({ meter }: { meter: Meter }) {
   const [state, setState] = useState<PickerState | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
 
-  const refresh = () =>
-    invoke<PickerState>("picker_state", { session })
-      .then(setState)
-      .catch((error) => setFailure(String(error)));
+  const refresh = useCallback(
+    () =>
+      invoke<PickerState>("picker_state", { session })
+        .then(setState)
+        .catch((error) => setFailure(String(error))),
+    [session],
+  );
 
   useEffect(() => {
     refresh();
-    // Re-read on session change only. Nothing else moves these without going
-    // through the commands below, each of which refreshes on the way back.
-  }, [session]);
+  }, [refresh]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
+      if (payload.session === session && payload.event.type === "ModeChanged") refresh();
+    })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((error) => setFailure(`cannot watch permission mode: ${String(error)}`));
+    return () => unlisten?.();
+  }, [refresh, session]);
 
   if (failure) return <p className="chips-note">{failure}</p>;
   if (!state) return <div className="chips" />;
@@ -59,8 +74,12 @@ export function Chips({ meter }: { meter: Meter }) {
     <div className="chips">
       <Menu
         className={`chip is-mode is-${state.mode}`}
-        label={`${state.mode_staged ? "→ " : ""}${state.mode}`}
-        title="What this conversation may do without asking"
+        label={state.mode_staged ? `→ ${state.mode}` : state.mode}
+        title={
+          state.mode_staged
+            ? `Switches to ${state.mode} at the next permission boundary`
+            : "What this conversation may do without asking"
+        }
       >
         {(close) =>
           state.modes.map((one) => (

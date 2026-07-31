@@ -47,6 +47,18 @@ function targetPath(input: unknown): string | null {
   return null;
 }
 
+export function groupTouchedFiles(files: readonly TouchedFile[]): {
+  changed: TouchedFile[];
+  read: TouchedFile[];
+} {
+  const changed: TouchedFile[] = [];
+  const read: TouchedFile[] = [];
+  for (const file of files) {
+    (file.action === "read" ? read : changed).push(file);
+  }
+  return { changed, read };
+}
+
 export function applyFileEvent(files: TouchedFile[], event: AgentEvent): TouchedFile[] {
   return apply(files, event, null);
 }

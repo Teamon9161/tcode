@@ -130,10 +130,18 @@ const SHOWN: Record<string, string> = {
 };
 
 type WorkspaceKind = "file" | "directory" | "link";
-type WorkspaceNode = { kind: WorkspaceKind; text?: string; revision: number };
+/** `binary` is the `data:` URL the real `workspace_read_binary` would build. A
+ *  node has one or the other, exactly as the two commands do. */
+type WorkspaceNode = { kind: WorkspaceKind; text?: string; binary?: string; revision: number };
 type WorkspaceFixture = { nodes: Record<string, WorkspaceNode>; changedAfterFirstSave: boolean };
 type WorkspaceEntry = { name: string; path: string; kind: WorkspaceKind };
 type WorkspaceText = { path: string; text: string; revision: string; bytes: number; truncated: boolean };
+type WorkspaceBinary = { path: string; url: string; bytes: number };
+
+/** A 64px mark, small enough to sit in the source: what an image in the tree
+ *  looks like once the pane can open one at all. */
+const PNG_FIXTURE =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAABQUlEQVR42uWaOw7CMBBE51w0nISz0yMOAS0SJLazM5snpLS25yXx/nW9XTae5+N+hmdDobYBzsCwLW8foJdhV9sQQBfDiLBRgDzDoKoJgCTDuKQ5gAzDlJ5pADfDrJgVAB/DgpJFAAfDmgwtr6xlWNagg+t71b/XqmSXLvUfAC0Mx09U+Y5J9V8AYgxVp8i6u1v9TwArQ+3Oip1k2lPJt+V4I4p9cdM/qcyd890oBeyG1aYpYLmtFlkZ7+PziYr5f5NHVzKGccRUCkeR5RGh8pFwbUyullykMKNQVz5VldOpMaMtyUjVnpX3A7C/APsOsK0Q2w+wPTE7FmJHo+x8gJ2RsXNidlWCXRdiV+bYtVF2dZrdH2B3aNg9MnaXkt0nZnfq2bMS+GmVf5wXYk9ssWfm2FOL7LlR9uQue3b65NPrL1rOMHuXA4KKAAAAAElFTkSuQmCC";
 
 /**
  * The workspace fixtures use the same relative paths as the workspace wire
@@ -180,6 +188,22 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
         kind: "file",
         revision: 1,
         text: ".workspace-preview { display: grid; gap: var(--s-3); }\n",
+      },
+      // The three files the pane used to get wrong, and the whole reason this
+      // scene exists: a picture (which could not be opened at all), a diagram
+      // that has to render behind the sandbox boundary, and a source file whose
+      // resting state is highlighted rather than a textarea.
+      icons: { kind: "directory", revision: 1 },
+      "icons/mark.png": { kind: "file", revision: 1, binary: PNG_FIXTURE },
+      "icons/mark.svg": {
+        kind: "file",
+        revision: 1,
+        text: [
+          '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">',
+          '  <rect width="64" height="64" fill="#eceadf"/>',
+          '  <path d="M12 52 L32 12 L52 52 Z" fill="none" stroke="#3f5d3a" stroke-width="4"/>',
+          "</svg>",
+        ].join("\n"),
       },
       docs: { kind: "directory", revision: 1 },
       "docs/fixture-notes.md": {
@@ -269,6 +293,17 @@ function readWorkspace(args: Record<string, unknown> | undefined): WorkspaceText
   if (!node) throw new Error(`workspace path '${path}' does not exist`);
   if (node.kind !== "file") throw new Error(`workspace path '${path}' is not a regular file`);
   return textView(session, path, node);
+}
+
+function readWorkspaceBinary(args: Record<string, unknown> | undefined): WorkspaceBinary {
+  const [, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const node = fixture.nodes[path];
+  if (!node) throw new Error(`workspace path '${path}' does not exist`);
+  if (node.kind !== "file" || !node.binary) {
+    throw new Error(`workspace path '${path}' is not a regular file`);
+  }
+  return { path, url: node.binary, bytes: node.binary.length };
 }
 
 function writeWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
@@ -413,6 +448,8 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return listWorkspace(args) as T;
     case "workspace_read_text":
       return readWorkspace(args) as T;
+    case "workspace_read_binary":
+      return readWorkspaceBinary(args) as T;
     case "workspace_write_text":
       return writeWorkspace(args) as T;
     case "workspace_create":

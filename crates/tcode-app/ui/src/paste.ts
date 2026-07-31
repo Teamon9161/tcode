@@ -38,15 +38,34 @@ let counter = 0;
  * are the textarea's own business and must keep landing in it.
  */
 export async function imagesFrom(transfer: DataTransfer | null): Promise<Pasted[]> {
+  return Promise.all(imageFiles(transfer).map(read));
+}
+
+/**
+ * WebKit can expose a pasted screenshot through `items` without populating
+ * `files`, while drag-and-drop commonly supplies both. Read both paths and
+ * preserve each file once so either browser shape reaches the prompt.
+ */
+export function imageFiles(
+  transfer: Pick<DataTransfer, "files" | "items"> | null,
+): File[] {
   if (!transfer) return [];
   const files = Array.from(transfer.files).filter((file) => file.type.startsWith("image/"));
-  return Promise.all(files.map(read));
+  for (const item of Array.from(transfer.items)) {
+    if (item.kind !== "file" || !item.type.startsWith("image/")) continue;
+    const file = item.getAsFile();
+    if (file?.type.startsWith("image/") && !files.includes(file)) files.push(file);
+  }
+  return files;
 }
 
 export function isImagePaste(transfer: DataTransfer | null): boolean {
   if (!transfer) return false;
-  return Array.from(transfer.items).some(
-    (item) => item.kind === "file" && item.type.startsWith("image/"),
+  return (
+    Array.from(transfer.files).some((file) => file.type.startsWith("image/")) ||
+    Array.from(transfer.items).some(
+      (item) => item.kind === "file" && item.type.startsWith("image/"),
+    )
   );
 }
 

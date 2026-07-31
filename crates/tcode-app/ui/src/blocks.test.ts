@@ -27,6 +27,14 @@ const ended = (callId: string, content: string): AgentEvent => ({
 
 const build = (events: AgentEvent[]): Block[] => events.reduce(applyEvent, [] as Block[]);
 
+describe("permission mode records", () => {
+  it("renders the Core boundary event as a visible transcript record", () => {
+    expect(build([{ type: "ModeChanged", data: "accept-edits" }])).toEqual([
+      { kind: "note", text: "permission mode → accept-edits" },
+    ]);
+  });
+});
+
 describe("runPairs", () => {
   // The delegating call and its run are two records of one step; drawn as two
   // rows the step took two lines, the first of them `agent · agent(explore)`.

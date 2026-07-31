@@ -9,7 +9,7 @@ import {
   tally,
   type Row,
 } from "../diff";
-import { highlight, isHighlightable } from "../syntax";
+import { highlight, useGrammar } from "../syntax";
 
 export { isEditShape } from "../diff";
 
@@ -85,6 +85,9 @@ function DiffView({
   dense: boolean;
 }) {
   const [split, setSplit] = useState(false);
+  // Held once for the whole diff rather than per line: every row wants the same
+  // grammar, and this is the subscription that repaints them all when it lands.
+  useGrammar(language);
   const counts = useMemo(() => tally(rows), [rows]);
   // A dense diff inside a conversation shows only what changed; the full view
   // keeps more of the surrounding file because there it is the thing being read.
@@ -256,10 +259,14 @@ function Gap({ count, wide }: { count: number; wide?: boolean }) {
   );
 }
 
-/** A single line, highlighted when the language is one the scanner knows. */
+/** A single line, highlighted once its grammar is loaded (`DiffView` holds the
+ *  subscription that brings it). A line at a time is deliberate here: a diff
+ *  body is not a program — its two sides interleave and its hunks skip — so
+ *  tokenising it as one document would carry state across a gap that is not
+ *  really there. */
 function Source({ text, language }: { text: string; language: string }) {
-  if (!language || !isHighlightable(language)) return <>{text || " "}</>;
-  const tokens = highlight(text, language);
+  const tokens = language ? highlight(text, language) : null;
+  if (!tokens) return <>{text || " "}</>;
   return (
     <>
       {tokens.map((token, index) =>

@@ -13,6 +13,14 @@ use std::path::{Path, PathBuf};
 /// The largest text prefix returned to the webview in one read.
 pub const TEXT_READ_LIMIT: usize = 1024 * 1024;
 
+/// The largest file returned to the webview whole, as bytes.
+///
+/// A prefix of an image is not a smaller image, it is a broken one, so this
+/// read has no truncation to fall back on — it either fits or it is refused.
+/// The bound is what keeps that from being unbounded: the bytes are base64'd
+/// into a `data:` URL and land in the webview's memory in one piece.
+pub const BINARY_READ_LIMIT: u64 = 8 * 1024 * 1024;
+
 /// A root-confined workspace filesystem.
 #[derive(Debug, Clone)]
 pub struct Workspace {
@@ -52,6 +60,18 @@ pub struct TextFile {
     pub truncated: bool,
 }
 
+/// A regular file returned as bytes rather than as text.
+///
+/// It carries no revision and no `truncated`, and that is the point: this is
+/// what the viewer reads to *draw* a file it cannot edit, so there is nothing
+/// to write back and nothing that a prefix would still be useful for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinaryFile {
+    pub path: String,
+    pub bytes: u64,
+    pub data: Vec<u8>,
+}
+
 /// Errors exposed by the workspace boundary.
 #[derive(Debug)]
 pub enum WorkspaceError {
@@ -66,6 +86,10 @@ pub enum WorkspaceError {
     BinaryFile(String),
     InvalidUtf8(String),
     AlreadyExists(String),
+    TooLarge {
+        path: String,
+        bytes: u64,
+    },
     /// The caller must re-read and explicitly decide how to merge its edit.
     RevisionConflict {
         current: String,
@@ -90,6 +114,10 @@ impl fmt::Display for WorkspaceError {
             Self::BinaryFile(path) => write!(f, "workspace file '{path}' contains a NUL byte and is not text"),
             Self::InvalidUtf8(path) => write!(f, "workspace file '{path}' is not valid UTF-8"),
             Self::AlreadyExists(path) => write!(f, "workspace path '{path}' already exists"),
+            Self::TooLarge { path, bytes } => write!(
+                f,
+                "workspace file '{path}' is {bytes} bytes — too large to display whole"
+            ),
             Self::RevisionConflict { current } => write!(
                 f,
                 "revision conflict: the file changed; re-read it before writing (current revision {current})"
@@ -206,6 +234,36 @@ impl Workspace {
         let full = self.resolve_existing_file(path)?;
         let bytes = fs::read(&full).map_err(|source| WorkspaceError::Io { path: full, source })?;
         self.text_response(path, bytes)
+    }
+
+    /// Read a regular file as bytes, for the views that draw a file rather than
+    /// read it — an image, an icon.
+    ///
+    /// It goes through the same `resolve_existing_file` as [`Workspace::read`]
+    /// on purpose: the reason images could not be opened at all was that this
+    /// boundary had one door and it only admitted UTF-8. Adding a second door
+    /// beside it (the `show` viewer's path, which checks containment its own
+    /// way) would have been two definitions of "inside the workspace".
+    pub fn read_binary(&self, path: &str) -> Result<BinaryFile, WorkspaceError> {
+        let full = self.resolve_existing_file(path)?;
+        let size = fs::metadata(&full)
+            .map_err(|source| WorkspaceError::Io {
+                path: full.clone(),
+                source,
+            })?
+            .len();
+        if size > BINARY_READ_LIMIT {
+            return Err(WorkspaceError::TooLarge {
+                path: path.to_owned(),
+                bytes: size,
+            });
+        }
+        let data = fs::read(&full).map_err(|source| WorkspaceError::Io { path: full, source })?;
+        Ok(BinaryFile {
+            path: path.to_owned(),
+            bytes: data.len() as u64,
+            data,
+        })
     }
 
     /// Replace a regular text file only if `revision` still identifies its
@@ -487,14 +545,24 @@ fn validate_name(name: &str) -> Result<(), WorkspaceError> {
     if name.is_empty()
         || matches!(name, "." | "..")
         || name.contains(['/', '\\', '\0'])
-        || name.chars().any(|character| {
-            character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-        })
+        || name.chars().any(char::is_control)
+    {
+        return Err(WorkspaceError::InvalidName(name.to_owned()));
+    }
+
+    // The wire path must accept names the current filesystem can already hold.
+    // Windows-only reserved spellings remain invalid there, while Unix keeps
+    // legitimate names such as a timestamp containing colons usable.
+    #[cfg(windows)]
+    if name
+        .chars()
+        .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
         || name.ends_with(['.', ' '])
         || is_windows_device_name(name)
     {
         return Err(WorkspaceError::InvalidName(name.to_owned()));
     }
+
     Ok(())
 }
 
@@ -504,6 +572,7 @@ fn is_drive_prefixed(path: &str) -> bool {
         .is_some_and(|prefix| prefix[0].is_ascii_alphabetic() && prefix[1] == b':')
 }
 
+#[cfg(windows)]
 fn is_windows_device_name(name: &str) -> bool {
     let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
     matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
@@ -620,7 +689,7 @@ mod tests {
                 "{path}"
             );
         }
-        for name in [".", "..", "a/b", r"a\\b", "NUL.txt", "bad:"] {
+        for name in [".", "..", "a/b", r"a\\b"] {
             assert!(
                 matches!(
                     workspace.create_dir(None, name),
@@ -629,6 +698,35 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_reserved_names_are_rejected() {
+        let (_root, workspace) = workspace();
+        for name in ["NUL.txt", "bad:", "trailing.", "trailing "] {
+            assert!(
+                matches!(
+                    workspace.create_dir(None, name),
+                    Err(WorkspaceError::InvalidName(_))
+                ),
+                "{name}"
+            );
+        }
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_names_with_colons_and_unicode_are_listed_and_reachable() {
+        let (root, workspace) = workspace();
+        let name = "ChatGPT Image 2026年7月31日 09:44:44.png";
+        fs::write(root.path().join(name), "image placeholder").unwrap();
+
+        assert!(matches!(
+            workspace.list(None).unwrap().as_slice(),
+            [WorkspaceEntry { name: listed, path, kind: EntryKind::File }] if listed == name && path == name
+        ));
+        assert_eq!(workspace.read(name).unwrap().text, "image placeholder");
     }
 
     #[test]
@@ -697,6 +795,29 @@ mod tests {
         assert!(matches!(
             workspace.read("binary.dat"),
             Err(WorkspaceError::BinaryFile(_))
+        ));
+    }
+
+    /// The bytes door, and the two things that make it a door rather than a
+    /// hole: it admits exactly what the text door refuses, and it stays inside
+    /// the same root — a link out of the workspace is not readable as an image
+    /// either.
+    #[test]
+    fn binary_reads_return_whole_files_and_keep_the_root() {
+        let (root, workspace) = workspace();
+        fs::write(root.path().join("icon.ico"), b"\0\x01icon bytes").unwrap();
+
+        let read = workspace.read_binary("icon.ico").unwrap();
+        assert_eq!(read.data, b"\0\x01icon bytes");
+        assert_eq!(read.bytes, 12);
+
+        assert!(matches!(
+            workspace.read_binary("../outside.png"),
+            Err(WorkspaceError::InvalidPath(_) | WorkspaceError::OutsideRoot(_))
+        ));
+        assert!(matches!(
+            workspace.read_binary("missing.png"),
+            Err(WorkspaceError::NotFound(_))
         ));
     }
 

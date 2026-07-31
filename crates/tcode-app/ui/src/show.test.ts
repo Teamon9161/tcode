@@ -5,6 +5,7 @@ import { extensionOf, isBinary, parseRows, shownAs } from "./show";
 describe("what a shown file is drawn as", () => {
   it("routes by extension, and anything unknown is still readable as text", () => {
     expect(shownAs("out/report.html", "<p>hi</p>")).toEqual({ as: "sandbox", sandbox: "html" });
+    expect(shownAs("out/plot.svg", "<svg viewBox='0 0 10 10'/>")).toEqual({ as: "sandbox", sandbox: "svg" });
     expect(shownAs("flow.mmd", "graph TD")).toEqual({ as: "sandbox", sandbox: "mermaid" });
     expect(shownAs("pnl.csv", "a,b")).toEqual({ as: "table", separator: "," });
     expect(shownAs("pnl.tsv", "a\tb")).toEqual({ as: "table", separator: "\t" });
@@ -28,6 +29,13 @@ describe("what a shown file is drawn as", () => {
 
   it("knows which files must arrive as bytes before anything is loaded", () => {
     expect(isBinary("a/b/plot.PNG")).toBe(true);
+    // An icon is a picture like any other. It is spelled out because this is
+    // the table both readers consult, and a `.ico` that is not in it arrives as
+    // text — which for an icon means arriving as mojibake.
+    expect(isBinary("icons/icon.ico")).toBe(true);
+    expect(shownAs("icons/icon.ico", "")).toEqual({ as: "image" });
+    // Not an image: an svg is a document that draws, and its source is the
+    // thing a person opens it to change.
     expect(isBinary("plot.svg")).toBe(false);
     expect(isBinary("data.csv")).toBe(false);
   });

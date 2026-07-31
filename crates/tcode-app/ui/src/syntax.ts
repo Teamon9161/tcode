@@ -1,23 +1,36 @@
+import { useEffect, useSyncExternalStore } from "react";
+import type { HighlighterCore, ThemeRegistrationRaw } from "shiki/core";
+
 /**
- * Syntax highlighting, hand-rolled and deliberately small.
+ * Syntax highlighting: a real grammar, still no second palette.
  *
- * The obvious move is to install Shiki or highlight.js. Both were rejected for
- * the same reason: they carry their own themes, so their colours arrive as
- * literal values that no theme pack can reassign. That breaks the rule the
- * whole visual system rests on (`DESIGN.md` § Theme packs — a component may
- * only reference `var(--token)`), and it would put a second, competing palette
- * inside a surface whose entire premise is that chroma means state.
+ * The rule this has to satisfy has never changed (`DESIGN.md` § Theme packs — a
+ * component may only reference `var(--token)`), and it is why a highlighter was
+ * hand-rolled here first: every library ships a *theme*, so its colours arrive
+ * as literal values no theme pack can reassign. What that bought was ~150 lines
+ * and no dependency; what it cost was a scanner that knew twelve languages and
+ * eight token shapes, and was wrong at every edge it did not know about. On a
+ * snippet that is a fair trade. On a whole file open in a pane it is not: the
+ * errors stop being occasional and become the texture of the page.
  *
- * So this emits *semantic classes* and the theme decides what they look like.
- * Porcelain renders them as a printed listing — graphite at four weights with
- * olive for keywords — rather than as a terminal, which is the app's stated
- * anti-reference.
+ * So the split is drawn one level down. Shiki does the *classification* — real
+ * TextMate grammars, the same ones the editor beside this app uses — and the
+ * theme it is handed is not a palette at all: `mark()` paints each of our eight
+ * kinds a sentinel colour, and `kindOf()` reads that sentinel straight back
+ * out. Nothing but an index survives the trip. What reaches the DOM is what
+ * always reached it, a `tok-*` class, and the values stay in `base.css`.
  *
- * It is a scanner, not a parser: it knows comments, strings, numbers, keywords
- * and call sites, and it is wrong at the edges (a `#` inside a shell string, a
- * Rust lifetime that looks like a char literal). That is an acceptable trade
- * for ~150 lines and no dependency, because the job here is making a snippet
- * scannable, not compiling it.
+ * Two consequences worth knowing before changing anything here:
+ *
+ *  - **Tokens are data, never markup.** `codeToTokens` returns an array of
+ *    `{content, color}`; the HTML-producing side of shiki (`codeToHtml`) is
+ *    never called, so rule 10 holds by construction rather than by review.
+ *  - **Everything here loads on demand** — shiki itself, and then one chunk per
+ *    grammar — so `highlight` answers `null` until what it needs has arrived.
+ *    Callers hold `useGrammar` and draw plain text in the meantime: a code
+ *    block is readable unhighlighted, and a loading state for one would be
+ *    worse than the wait it announces. It is also what keeps the cost off the
+ *    window that never opens a file.
  */
 
 export type Token = { text: string; kind: TokenKind };
@@ -31,240 +44,292 @@ export type TokenKind =
   | "call"
   | "punct";
 
-type Language = {
-  /** Line comment openers, longest first. */
-  line: string[];
-  /** `[open, close]` block comment pairs. */
-  block: [string, string][];
-  /** Quote characters that start a string. */
-  quotes: string[];
-  keywords: Set<string>;
-  /** Words that read as types rather than control flow. */
-  types: Set<string>;
+const KINDS: TokenKind[] = [
+  "plain",
+  "comment",
+  "string",
+  "number",
+  "keyword",
+  "type",
+  "call",
+  "punct",
+];
+
+/** `plain` is `#000001`, `comment` is `#000002`, and so on: a colour a theme
+ *  would never contain, carrying an index rather than a hue. */
+const mark = (kind: TokenKind) => `#${String(KINDS.indexOf(kind) + 1).padStart(6, "0")}`;
+
+function kindOf(color: string | undefined): TokenKind {
+  const at = color ? Number.parseInt(color.slice(1), 10) - 1 : -1;
+  return KINDS[at] ?? "plain";
+}
+
+const paints = (kind: TokenKind, ...scope: string[]) => ({
+  scope,
+  settings: { foreground: mark(kind) },
+});
+
+const THEME_NAME = "tcode";
+
+/**
+ * Which TextMate scopes are which of our eight kinds.
+ *
+ * This is the whole mapping, and it is ours rather than a library's on purpose
+ * — shiki's own `css-variables` theme would have worked and buckets scopes
+ * differently than this app draws them (object properties with numeric
+ * constants, tag names with keywords). Order matters: within TextMate theme
+ * resolution the more specific scope wins, so the broad catch-alls go first and
+ * the narrow rules below them take it back.
+ */
+const THEME: ThemeRegistrationRaw = {
+  name: THEME_NAME,
+  type: "dark",
+  colors: { "editor.foreground": mark("plain"), "editor.background": "#000000" },
+  // `settings` rather than `tokenColors`: both name the same list, and this is
+  // the one TextMate itself reads.
+  settings: [
+    paints("plain", "source", "meta", "variable", "text"),
+    paints("punct", "punctuation", "keyword.operator"),
+    paints(
+      "keyword",
+      "keyword",
+      "storage",
+      "constant.language",
+      "variable.language",
+      "entity.name.tag",
+      "markup.heading",
+    ),
+    paints(
+      "type",
+      "entity.name.type",
+      "entity.name.class",
+      "entity.name.namespace",
+      "entity.other.inherited-class",
+      "entity.other.attribute-name",
+      "support.type",
+      "support.class",
+    ),
+    paints(
+      "call",
+      "entity.name.function",
+      "support.function",
+      "meta.function-call",
+      "variable.function",
+    ),
+    paints("number", "constant.numeric", "constant.other"),
+    paints(
+      "string",
+      "string",
+      "punctuation.definition.string",
+      "constant.character.escape",
+      "markup.inline.raw",
+      "markup.fenced_code",
+    ),
+    paints("comment", "comment", "punctuation.definition.comment"),
+  ],
 };
 
-const words = (list: string) => new Set(list.split(/\s+/).filter(Boolean));
-
-const RUST: Language = {
-  line: ["//"],
-  block: [["/*", "*/"]],
-  quotes: ['"'],
-  keywords: words(`as async await break const continue crate dyn else enum extern
-    fn for if impl in let loop match mod move mut pub ref return self Self static
-    struct super trait type unsafe use where while yield union`),
-  types: words(`bool char str String Vec Option Result Some None Ok Err u8 u16 u32
-    u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64 Box Arc Rc RefCell HashMap
-    BTreeMap Path PathBuf`),
+/**
+ * Language tags this app answers to, and the grammar each one wants.
+ *
+ * Aliases are spelled out rather than guessed because both entrances here are
+ * user-facing strings that will not be corrected: a fence's language tag, which
+ * the model wrote, and a file's extension, which somebody else chose. An entry
+ * costs nothing until something asks for it — the import is a chunk of its own.
+ */
+const LANGS: Record<string, () => Promise<unknown>> = {
+  rust: () => import("@shikijs/langs/rust"),
+  ts: () => import("@shikijs/langs/tsx"),
+  tsx: () => import("@shikijs/langs/tsx"),
+  js: () => import("@shikijs/langs/tsx"),
+  jsx: () => import("@shikijs/langs/tsx"),
+  py: () => import("@shikijs/langs/python"),
+  sh: () => import("@shikijs/langs/bash"),
+  json: () => import("@shikijs/langs/json"),
+  jsonc: () => import("@shikijs/langs/jsonc"),
+  toml: () => import("@shikijs/langs/toml"),
+  ini: () => import("@shikijs/langs/ini"),
+  yaml: () => import("@shikijs/langs/yaml"),
+  go: () => import("@shikijs/langs/go"),
+  sql: () => import("@shikijs/langs/sql"),
+  css: () => import("@shikijs/langs/css"),
+  scss: () => import("@shikijs/langs/scss"),
+  html: () => import("@shikijs/langs/html"),
+  xml: () => import("@shikijs/langs/xml"),
+  md: () => import("@shikijs/langs/markdown"),
+  c: () => import("@shikijs/langs/c"),
+  cpp: () => import("@shikijs/langs/cpp"),
+  java: () => import("@shikijs/langs/java"),
+  kotlin: () => import("@shikijs/langs/kotlin"),
+  swift: () => import("@shikijs/langs/swift"),
+  ruby: () => import("@shikijs/langs/ruby"),
+  php: () => import("@shikijs/langs/php"),
+  lua: () => import("@shikijs/langs/lua"),
+  zig: () => import("@shikijs/langs/zig"),
+  dockerfile: () => import("@shikijs/langs/docker"),
+  make: () => import("@shikijs/langs/make"),
+  diff: () => import("@shikijs/langs/diff"),
 };
 
-const TS: Language = {
-  line: ["//"],
-  block: [["/*", "*/"]],
-  quotes: ['"', "'", "`"],
-  keywords: words(`as async await break case catch class const continue debugger
-    default delete do else enum export extends finally for from function get if
-    implements import in instanceof interface let new of return satisfies set
-    static super switch this throw try typeof var void while yield readonly
-    keyof infer declare namespace type`),
-  types: words(`any boolean never null number object string symbol undefined
-    unknown Array Promise Record Partial Readonly Map Set true false`),
+const ALIASES: Record<string, keyof typeof LANGS> = {
+  rs: "rust",
+  typescript: "ts",
+  javascript: "js",
+  mjs: "js",
+  cjs: "js",
+  mts: "ts",
+  cts: "ts",
+  python: "py",
+  bash: "sh",
+  zsh: "sh",
+  shell: "sh",
+  console: "sh",
+  fish: "sh",
+  yml: "yaml",
+  golang: "go",
+  markdown: "md",
+  mdx: "md",
+  svg: "xml",
+  htm: "html",
+  h: "c",
+  hpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  rb: "ruby",
+  kt: "kotlin",
+  patch: "diff",
+  makefile: "make",
 };
 
-const PYTHON: Language = {
-  line: ["#"],
-  block: [],
-  quotes: ['"', "'"],
-  keywords: words(`and as assert async await break class continue def del elif
-    else except finally for from global if import in is lambda nonlocal not or
-    pass raise return try while with yield match case`),
-  types: words(`bool bytes dict float int list None object set str tuple True
-    False self cls`),
-};
-
-const SHELL: Language = {
-  line: ["#"],
-  block: [],
-  quotes: ['"', "'"],
-  keywords: words(`if then elif else fi for while do done case esac in function
-    return export local source alias set unset trap exit`),
-  types: new Set<string>(),
-};
-
-const JSON_LANG: Language = {
-  line: [],
-  block: [],
-  quotes: ['"'],
-  keywords: words("true false null"),
-  types: new Set<string>(),
-};
-
-const TOML: Language = {
-  line: ["#"],
-  block: [],
-  quotes: ['"', "'"],
-  keywords: words("true false"),
-  types: new Set<string>(),
-};
-
-const GO: Language = {
-  line: ["//"],
-  block: [["/*", "*/"]],
-  quotes: ['"', "`"],
-  keywords: words(`break case chan const continue default defer else fallthrough
-    for func go goto if import interface map package range return select struct
-    switch type var`),
-  types: words(`bool byte error float32 float64 int int8 int16 int32 int64 rune
-    string uint uint8 uint16 uint32 uint64 nil true false`),
-};
-
-const SQL: Language = {
-  line: ["--"],
-  block: [["/*", "*/"]],
-  quotes: ["'", '"'],
-  keywords: words(`select from where group by having order limit offset join left
-    right inner outer on as insert into values update set delete create table
-    drop alter index view with union all distinct case when then else end`),
-  types: words("int integer text varchar boolean date timestamp numeric null"),
-};
-
-const CSS_LANG: Language = {
-  line: [],
-  block: [["/*", "*/"]],
-  quotes: ['"', "'"],
-  keywords: words("important from to and not or only media supports keyframes"),
-  types: new Set<string>(),
-};
-
-const BY_NAME: Record<string, Language> = {
-  rust: RUST,
-  rs: RUST,
-  ts: TS,
-  tsx: TS,
-  typescript: TS,
-  js: TS,
-  jsx: TS,
-  javascript: TS,
-  json: JSON_LANG,
-  jsonc: JSON_LANG,
-  py: PYTHON,
-  python: PYTHON,
-  sh: SHELL,
-  bash: SHELL,
-  zsh: SHELL,
-  shell: SHELL,
-  console: SHELL,
-  toml: TOML,
-  ini: TOML,
-  go: GO,
-  sql: SQL,
-  css: CSS_LANG,
-  scss: CSS_LANG,
-};
+/** The grammar a tag names, or null when nothing here draws it. */
+export function languageId(language: string): string | null {
+  const tag = language.toLowerCase();
+  const resolved = ALIASES[tag] ?? tag;
+  return resolved in LANGS ? resolved : null;
+}
 
 export function isHighlightable(language: string): boolean {
-  return language.toLowerCase() in BY_NAME;
+  return languageId(language) !== null;
 }
 
-export function highlight(source: string, language: string): Token[] {
-  const spec = BY_NAME[language.toLowerCase()];
-  if (!spec) return [{ text: source, kind: "plain" }];
+// ------------------------------------------------------- the loaded grammars
+//
+// One highlighter for the window, because a grammar is a large, immutable thing
+// and every pane wants the same handful. The store below is what turns "it
+// arrived" into a re-render: components read `ready` through
+// `useSyncExternalStore`, so a grammar that lands while three panes are open
+// repaints all three and nothing polls.
 
-  const tokens: Token[] = [];
-  let plain = "";
-  let at = 0;
+let core: HighlighterCore | null = null;
+let starting: Promise<HighlighterCore> | null = null;
+const ready = new Set<string>();
+const loading = new Map<string, Promise<void>>();
+const listeners = new Set<() => void>();
 
-  const flush = () => {
-    if (plain) tokens.push({ text: plain, kind: "plain" });
-    plain = "";
-  };
-  const emit = (text: string, kind: TokenKind) => {
-    flush();
-    tokens.push({ text, kind });
-  };
+function announce() {
+  for (const listener of listeners) listener();
+}
 
-  while (at < source.length) {
-    const rest = source.slice(at);
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
 
-    const line = spec.line.find((opener) => rest.startsWith(opener));
-    if (line) {
-      const end = source.indexOf("\n", at);
-      const stop = end === -1 ? source.length : end;
-      emit(source.slice(at, stop), "comment");
-      at = stop;
-      continue;
-    }
+function engine(): Promise<HighlighterCore> {
+  if (core) return Promise.resolve(core);
+  // Imported here rather than at the top, so shiki itself is a chunk like its
+  // grammars are: a window that opens on a conversation with no code in it
+  // never fetches any of this.
+  starting ??= Promise.all([import("shiki/core"), import("shiki/engine/javascript")])
+    .then(([{ createHighlighterCore }, { createJavaScriptRegexEngine }]) =>
+      createHighlighterCore({
+        themes: [THEME],
+        langs: [],
+        // The JavaScript regex engine, not oniguruma's wasm. In a packaged
+        // webview the wasm build is a second asset to fetch and a CSP allowance
+        // to grant (`wasm-unsafe-eval`), and it buys nothing here: `forgiving`
+        // covers the few grammar patterns the JS engine cannot compile by
+        // leaving them unmatched.
+        engine: createJavaScriptRegexEngine({ forgiving: true }),
+      }),
+    )
+    .then((made) => {
+      core = made;
+      return made;
+    });
+  return starting;
+}
 
-    const block = spec.block.find(([open]) => rest.startsWith(open));
-    if (block) {
-      const close = source.indexOf(block[1], at + block[0].length);
-      const stop = close === -1 ? source.length : close + block[1].length;
-      emit(source.slice(at, stop), "comment");
-      at = stop;
-      continue;
-    }
+function load(id: string): Promise<void> {
+  const already = loading.get(id);
+  if (already) return already;
+  const request = engine()
+    .then((highlighter) => highlighter.loadLanguage(LANGS[id]() as never))
+    .then(() => {
+      ready.add(id);
+      announce();
+    })
+    // A grammar that will not load leaves its language unhighlighted forever,
+    // which is exactly what an unknown language already does. It is not worth a
+    // failure state on screen.
+    .catch(() => {});
+  loading.set(id, request);
+  return request;
+}
 
-    const quote = spec.quotes.find((mark) => rest.startsWith(mark));
-    if (quote) {
-      const stop = closingQuote(source, at, quote);
-      emit(source.slice(at, stop), "string");
-      at = stop;
-      continue;
-    }
+/** Loads the grammar a tag needs, resolving when `highlight` can answer for it.
+ *  Components want `useGrammar` instead; this is for the callers that are not
+ *  components — a test, or anything that wants a grammar warm before the pane
+ *  that needs it exists. */
+export function loadGrammar(language: string): Promise<void> {
+  const id = languageId(language);
+  return id === null ? Promise.resolve() : load(id);
+}
 
-    const digits = /^\d[\d_]*(\.\d+)?([eE][+-]?\d+)?[a-zA-Z]*/.exec(rest);
-    if (digits && !isWordChar(source[at - 1] ?? "")) {
-      emit(digits[0], "number");
-      at += digits[0].length;
-      continue;
-    }
+/** Ensures the grammar for `language` is on its way, and re-renders when it
+ *  lands. Returns whether `highlight` can answer yet. */
+export function useGrammar(language: string): boolean {
+  const id = languageId(language);
+  const loaded = useSyncExternalStore(
+    subscribe,
+    () => id !== null && ready.has(id),
+    () => false,
+  );
+  useEffect(() => {
+    if (id !== null && !ready.has(id)) void load(id);
+  }, [id]);
+  return loaded;
+}
 
-    const word = /^[A-Za-z_$][\w$]*/.exec(rest);
-    if (word) {
-      const text = word[0];
-      const after = rest.slice(text.length);
-      const kind: TokenKind = spec.keywords.has(text)
-        ? "keyword"
-        : spec.types.has(text)
-          ? "type"
-          : /^\s*\(/.test(after)
-            ? "call"
-            : /^[A-Z]/.test(text)
-              ? "type"
-              : "plain";
-      if (kind === "plain") plain += text;
-      else emit(text, kind);
-      at += text.length;
-      continue;
-    }
+/**
+ * The tokens for a snippet, or null when there are none to draw yet — an
+ * unknown language, or a grammar still arriving.
+ *
+ * Line breaks are tokens like any other text, so the result stays a flat run
+ * that a `<code>` can hold directly. Callers that want lines can split on them;
+ * nothing here does.
+ */
+export function highlight(source: string, language: string): Token[] | null {
+  const id = languageId(language);
+  if (id === null || !core || !ready.has(id)) return null;
 
-    const punct = /^[{}[\]()<>;,.:=+\-*/%!&|^~?@#]+/.exec(rest);
-    if (punct) {
-      emit(punct[0], "punct");
-      at += punct[0].length;
-      continue;
-    }
-
-    plain += source[at];
-    at += 1;
+  // A grammar is a large piece of somebody else's software running inside a
+  // render, and this app has no way to survive a throw there beyond `Boundary`
+  // taking the whole window. Colouring is the most decorative thing on screen;
+  // it does not get to be the thing that ends the session. Unhighlighted text
+  // is the same text.
+  let tokens;
+  try {
+    ({ tokens } = core.codeToTokens(source, { lang: id, theme: THEME_NAME }));
+  } catch (failure) {
+    console.warn(`could not highlight ${id}:`, failure);
+    return null;
   }
 
-  flush();
-  return tokens;
+  const out: Token[] = [];
+  tokens.forEach((line, at) => {
+    if (at > 0) out.push({ text: "\n", kind: "plain" });
+    for (const token of line) out.push({ text: token.content, kind: kindOf(token.color) });
+  });
+  return out;
 }
-
-/** Walks to the closing quote, honouring backslash escapes. An unterminated
- *  string runs to end of input, which is what a half-streamed snippet needs. */
-function closingQuote(source: string, start: number, quote: string): number {
-  let at = start + quote.length;
-  while (at < source.length) {
-    if (source[at] === "\\") {
-      at += 2;
-      continue;
-    }
-    if (source.startsWith(quote, at)) return at + quote.length;
-    at += 1;
-  }
-  return source.length;
-}
-
-const isWordChar = (character: string) => /[\w$]/.test(character);

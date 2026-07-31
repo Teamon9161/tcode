@@ -1,6 +1,6 @@
 import { useMemo, useRef, type CSSProperties, type RefObject } from "react";
 
-import type { Decision, SessionInfo, Status } from "./types";
+import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
 import { SessionContext, type SessionState } from "./session";
 import {
   canBack,
@@ -14,7 +14,7 @@ import {
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
 import { FolderMenu } from "./FolderMenu";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, FolderIcon, ForwardIcon, PanelIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, CollapseIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon } from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
@@ -64,6 +64,10 @@ export type PaneContext = {
   onNavigate: (pane: string, step: typeof navBack) => void;
   onToggleFiles: (pane: string, session: string) => void;
   onToggleWorkspace: (pane: string, session: string) => void;
+  /** The currently focused content takes the full pane field without changing
+   *  the tiling tree, so leaving focus restores every pane in place. */
+  expanded: string | null;
+  onToggleExpanded: (pane: string) => void;
   onDraft: (session: string, value: string) => void;
   onAttach: (session: string, items: SessionState["attachments"]) => void;
   onDetach: (session: string, id: string) => void;
@@ -72,12 +76,12 @@ export type PaneContext = {
   /** Take one queued prompt back. Index *and* text: the backend refuses a pair
    *  that disagrees rather than dropping whatever now sits at that position. */
   onWithdrawQueued: (session: string, index: number, text: string) => void;
-  /** Stop the turn and send what is queued straight away. */
-  onSendQueuedNow: (session: string) => void;
+  /** Stop the turn that owns this queue and send it straight away. */
+  onSendQueuedNow: (session: string, turn: number) => void;
   /** Ask what going back to this point would cost; `null` withdraws the ask. */
   onAskRewind: (session: string, target: RewindTarget | null) => void;
   onRewind: (session: string, restoreFiles: boolean) => void;
-  onAnswer: (session: string, decision: Decision, comment: string) => void;
+  onAnswer: (session: string, decision: Decision, comment: string, setMode?: ApprovalMode) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
   onSavePlan: (session: string) => void;
@@ -98,17 +102,25 @@ export type PaneContext = {
 export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContext }) {
   const field = useRef<HTMLDivElement>(null);
   const { panes, dividers } = useMemo(() => frames(tiling), [tiling]);
+  const expanded = panes.some(({ leaf }) => leaf.id === context.expanded) ? context.expanded : null;
   if (!tiling.root) return null;
 
   return (
     <div className={`panes${context.split ? " is-split" : ""}`}>
       <div className="panes-field" ref={field}>
-        {panes.map(({ leaf, rect }) => (
-          <div key={leaf.id} className="pane-slot" style={box(rect)}>
-            <Pane leaf={leaf} context={context} />
-          </div>
-        ))}
-        {dividers.map((divider) => (
+        {panes.map(({ leaf, rect }) => {
+          const visible = !expanded || leaf.id === expanded;
+          return (
+            <div
+              key={leaf.id}
+              className={`pane-slot${visible ? "" : " is-hidden"}`}
+              style={box(visible && expanded ? WHOLE : rect)}
+            >
+              <Pane leaf={leaf} context={context} />
+            </div>
+          );
+        })}
+        {!expanded && dividers.map((divider) => (
           <Divider
             key={divider.id}
             divider={divider}
@@ -120,6 +132,8 @@ export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContex
     </div>
   );
 }
+
+const WHOLE: Rect = { left: 0, top: 0, width: 1, height: 1 };
 
 /** A rect of the field as CSS percentages. */
 function box(rect: Rect): CSSProperties {
@@ -232,6 +246,21 @@ function Pane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
   );
 }
 
+function ExpandPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
+  const expanded = context.expanded === leaf.id;
+  return (
+    <button
+      className="icon-btn"
+      onClick={() => context.onToggleExpanded(leaf.id)}
+      aria-pressed={expanded}
+      aria-label={expanded ? "Restore this pane's size" : "Expand this pane"}
+      title={expanded ? "Restore this pane's size" : "Expand this pane"}
+    >
+      {expanded ? <CollapseIcon size={14} /> : <ExpandIcon size={14} />}
+    </button>
+  );
+}
+
 function SessionPane({
   leaf,
   session,
@@ -273,7 +302,7 @@ function SessionPane({
           aria-label={`Files ${info.name} touched`}
           title={`Files ${info.name} touched`}
         >
-          <PanelIcon size={14} />
+          <FileIcon size={14} />
         </button>
         <button
           className="icon-btn"
@@ -283,6 +312,7 @@ function SessionPane({
         >
           <FolderIcon size={14} />
         </button>
+        <ExpandPane leaf={leaf} context={context} />
         <button
           className="icon-btn"
           onClick={() => context.onClosePane(leaf.id)}
@@ -299,6 +329,7 @@ function SessionPane({
         <Transcript
           blocks={state.blocks}
           running={state.running}
+          phase={state.activity}
           rewindTargets={state.rewindTargets}
           onOpen={(value) => context.onOpen(leaf.id, session, value)}
           onRewind={(target) => context.onAskRewind(session, target)}
@@ -311,7 +342,9 @@ function SessionPane({
             request={state.approval}
             plan={state.plan}
             draft={draft}
-            onAnswer={(decision, comment) => context.onAnswer(session, decision, comment)}
+             onAnswer={(decision, comment, setMode) =>
+               context.onAnswer(session, decision, comment, setMode)
+             }
             onDecidePlan={(choice) => context.onDecidePlan(session, choice)}
             onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
           />
@@ -342,7 +375,7 @@ function SessionPane({
         <QueueStrip
           queued={state.queued}
           onWithdraw={(index, text) => context.onWithdrawQueued(session, index, text)}
-          onSendNow={() => context.onSendQueuedNow(session)}
+           onSendNow={(turn) => context.onSendQueuedNow(session, turn)}
         />
 
         {state.plan && !(state.approval && isPlanReview(state.approval.input)) && (
@@ -409,6 +442,7 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
           </button>
         </div>
         <span className="pane-name">{inspectTitle(value)}</span>
+        <ExpandPane leaf={leaf} context={context} />
         <button
           className="icon-btn"
           onClick={() => context.onClosePane(leaf.id)}

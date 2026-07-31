@@ -28,9 +28,10 @@ export function QueueStrip({
 }: {
   queued: Queued[];
   onWithdraw: (index: number, text: string) => void;
-  onSendNow: () => void;
+  onSendNow: (turn: number) => void;
 }) {
   if (queued.length === 0) return null;
+  const turn = queued[0].turn;
 
   return (
     <section className="queue-strip" aria-label="Waiting to be sent">
@@ -40,10 +41,12 @@ export function QueueStrip({
             {queued.length === 1 ? "queued" : `queued · ${queued.length}`}
           </span>
           <span className="queue-note">sent when this turn reaches a safe point</span>
-          <button type="button" className="queue-now" onClick={onSendNow}>
-            <ReturnIcon size={12} />
-            Stop and send now
-          </button>
+          {turn !== null && (
+            <button type="button" className="queue-now" onClick={() => onSendNow(turn)}>
+              <ReturnIcon size={12} />
+              Stop and send now
+            </button>
+          )}
         </div>
 
         <ol className="queue-list">
