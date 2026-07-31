@@ -160,14 +160,15 @@ export function split(
 }
 
 /**
- * What a pane splitting out of the file tree leaves the tree.
+ * The width a navigation list receives when it opens beside another pane.
  *
- * Halves are right when two panes hold comparable things. A list of file names
- * and the file itself are not comparable: the list needs enough width for a name
- * and the file needs all the rest, and an even split spends a third of the
- * window on trailing whitespace. Only a default — the divider is still there.
+ * Halves are right when two panes hold comparable things. A file tree or the
+ * conversation's changed-files index only needs enough width for a name; the
+ * transcript or file it navigates needs all the rest. This is only the initial
+ * split — the divider remains available for a deliberate adjustment.
  */
-const BROWSER_SHARE = 0.34;
+const SIDEBAR_SHARE = 0.34;
+const MAIN_SHARE = 0.66;
 
 /**
  * Removes a node — a leaf, or a whole subtree — and collapses the split that
@@ -304,7 +305,12 @@ export function openAside(
   value: Inspect,
 ): Tiling {
   const leaf = findLeaf(tiling, from);
-  const share = leaf && browsing(leaf.pane) ? BROWSER_SHARE : undefined;
+  const share =
+    leaf && browsing(leaf.pane)
+      ? SIDEBAR_SHARE
+      : value.kind === "files" || value.kind === "workspace-tree"
+        ? MAIN_SHARE
+        : undefined;
   return split(tiling, from, "row", { kind: "inspect", session, nav: navOf(value) }, share);
 }
 

@@ -276,6 +276,17 @@ describe("openInspect", () => {
     expect(at(two)).toBe("tcode:diff");
   });
 
+  it("opens navigation lists as narrow right sidebars", () => {
+    const sidebars: Inspect[] = [{ kind: "files" }, { kind: "workspace-tree" }];
+
+    for (const value of sidebars) {
+      const one = single(talk("tcode"));
+      const two = openInspect(one, id(one, "tcode"), "tcode", value);
+
+      expect(two.root).toMatchObject({ kind: "split", ratio: 0.66 });
+    }
+  });
+
   it("reuses the conversation's pane after that, stacking history", () => {
     const one = single(talk("tcode"));
     const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" });

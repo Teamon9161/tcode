@@ -1385,100 +1385,64 @@
   overflow-wrap: anywhere;
 }
 
-/* The running indicator: a pulsing dot, where the turn is, and a highlight
-   sweeping the row.
+/* The live state is fixed immediately above the composer rather than appended
+   to the scrollable record. Its only motion is the same soft lift the TUI gives
+   each status glyph: a highlight crosses the text without adding a panel behind
+   it. */
+.pane-body.is-stage > .working {
+  flex: none;
+}
 
-   It hugs its content (`align-self: flex-start`) rather than spanning the
-   measure, so the sweep travels the label instead of crossing an empty column —
-   the same scope the TUI shimmers, which is the line's own painted width.
-
-   Wearing the running row's vocabulary: `--brand-wash` behind, `--brand-text`
-   on the words, exactly what `.tool.is-running` wears. This is that state, so
-   it may spend the chroma; the difference is only that this one moves. */
 .working {
-  align-self: flex-start;
-  position: relative;
-  isolation: isolate;
-  overflow: hidden;
   display: flex;
   align-items: center;
   gap: var(--s-2);
-  max-width: 100%;
-  padding: var(--s-1) var(--s-2);
-  margin-inline: calc(var(--s-2) * -1);
-  border-radius: var(--r-sm);
-  background: var(--brand-wash);
+  width: 100%;
+  max-width: var(--measure);
+  margin: 0 auto;
+  padding: 0 var(--s-5) var(--s-2);
   color: var(--brand-text);
   font-size: var(--text-xs);
 }
 
-/* A band of light travelling left to right, then a beat of rest.
-
-   A band over the *surface*, never over the glyphs: `background-clip: text` is
-   banned outright, and it would also have to overwrite the phase's own colour
-   to work — where the whole idea, in the terminal and here, is that a live line
-   is lifted without losing its identity. So the text is one solid colour and
-   the sheet under it is what moves.
-
-   Geometry ported from `theme.rs::shimmer_color`: one soft band, constant
-   speed, and a dwell past the right edge so two passes read as separate events
-   rather than a loop. Constant speed on purpose — an eased sweep would read as
-   something arriving, and nothing arrives here. It is a composited transform
-   over a fixed gradient, so a turn that runs for minutes costs no layout. */
-.working::after {
-  content: "";
-  position: absolute;
-  z-index: -1;
-  top: 0;
-  bottom: 0;
-  left: 0;
-  width: 40%;
-  background: linear-gradient(
-    90deg,
-    transparent,
-    color-mix(in oklab, var(--brand) 16%, transparent),
-    transparent
-  );
-  /* Named for what it belongs to, not for what it does. `@keyframes` is one
-     flat global namespace with no scoping and no warning: a second `sweep`
-     defined later in this file silently replaced this one, and the line went on
-     animating — with the artifact loader's opacity pulse. It looked like a
-     working sweep that had simply lost its travel. */
-  animation: working-sweep var(--dur-sweep) linear infinite;
-}
-
-@keyframes working-sweep {
-  /* Entirely off the left edge, across, then held past the right for the rest
-     between passes — the band's own width is the unit, so a narrow phase and a
-     wide one sweep at the same speed. */
-  0% {
-    transform: translateX(-100%);
-  }
-  72% {
-    transform: translateX(250%);
-  }
-  100% {
-    transform: translateX(250%);
-  }
-}
-
-.working-dot {
+.working-spinner {
   flex: none;
-  width: 7px;
-  height: 7px;
-  border-radius: var(--r-pill);
-  background: var(--brand);
-  animation: breathe 1.4s var(--ease) infinite;
+  color: var(--brand);
 }
 
-/* One line, ellipsized. A phase can be a whole command (`Run · cargo test -p
-   …`), and this line sits under the conversation rather than in it — it may not
-   grow into a paragraph that reflows the column every time a call starts. */
+/* A text-only version of the TUI shimmer. The resting colour remains the
+   status hue; a narrow lift moves across the glyphs and rests off the end. */
 .working-phase {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
+  background: linear-gradient(
+    90deg,
+    var(--brand-text) 0%,
+    var(--brand-text) 42%,
+    color-mix(in oklab, var(--brand-text) 45%, var(--ink)) 50%,
+    var(--brand-text) 58%,
+    var(--brand-text) 100%
+  );
+  background-size: 250% 100%;
+  background-position: 100% 0;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: working-text-sweep var(--dur-sweep) linear infinite;
+}
+
+@keyframes working-text-sweep {
+  0% {
+    background-position: 100% 0;
+  }
+  72% {
+    background-position: 0 0;
+  }
+  100% {
+    background-position: 0 0;
+  }
 }
 
 .first-run {
@@ -5287,25 +5251,6 @@
   color: var(--faint);
   font-size: var(--text-xs);
 }
-
-/* ---- queued input ---- */
-
-/* Typed while the turn ran and delivered at a safe boundary: a real message,
-   marked as one that arrived out of order. */
-.msg-user.is-queued {
-  display: flex;
-  align-items: baseline;
-  gap: var(--s-2);
-  border: 1px dashed var(--line-strong);
-  background: transparent;
-}
-.queued-tag {
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-  letter-spacing: var(--tracking-wide);
-}
-
 
 /* ============================================================ workspace tree */
 

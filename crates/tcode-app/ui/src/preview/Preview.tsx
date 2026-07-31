@@ -79,10 +79,11 @@ const LIMITS: Limits = {
  */
 /* Phases as `activity.ts` produces them, not prose about them: the running one
    is what the live line and the rail both draw, so a fixture that writes a
-   sentence here shows a line the app can never actually be in. `a` is mid-call
-   with a tool named the way `display_name()` names it. */
+    sentence here shows a line the app can never actually be in. `a` is at the
+    generic tool-execution phase, which deliberately leaves the file name in
+    the trace instead of repeating it by the composer. */
 const ACTIVITY: Record<string, string> = {
-  a: "Edit · crates/tcode-core/src/agent/mod.rs",
+  a: "calling a tool",
   b: "waiting on shell",
   c: "done",
 };
@@ -419,7 +420,7 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
     summary: "cargo test -p tcode-core retry",
     input: { command: "cargo test -p tcode-core retry" },
   },
-  { kind: "queued", text: "also add a test for the cap at 30s", attachments: [], entryIndex: 12 },
+  { kind: "user", text: "also add a test for the cap at 30s", entryIndex: 12 },
 ];
 
 /** What the backend would answer for `BLOCKS`: its one real prompt, at the

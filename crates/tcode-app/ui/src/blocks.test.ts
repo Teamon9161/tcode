@@ -27,6 +27,30 @@ const ended = (callId: string, content: string): AgentEvent => ({
 
 const build = (events: AgentEvent[]): Block[] => events.reduce(applyEvent, [] as Block[]);
 
+describe("queued input", () => {
+  it("records a delivered prompt as a normal user message", () => {
+    const blocks = build([
+      {
+        type: "QueuedInput",
+        data: {
+          text: "also add a test for the cap at 30s",
+          attachments: ["data:image/png;base64,queued-image"],
+          entry_index: 12,
+        },
+      },
+    ]);
+
+    expect(blocks).toEqual([
+      {
+        kind: "user",
+        text: "also add a test for the cap at 30s",
+        images: ["data:image/png;base64,queued-image"],
+        entryIndex: 12,
+      },
+    ]);
+  });
+});
+
 describe("permission mode records", () => {
   it("renders the Core boundary event as a visible transcript record", () => {
     expect(build([{ type: "ModeChanged", data: "accept-edits" }])).toEqual([

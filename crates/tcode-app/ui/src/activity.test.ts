@@ -9,9 +9,7 @@ import type { AgentEvent } from "./types";
  * and an event that says nothing about that leaves the previous answer alone.
  */
 
-const NAMES: Record<string, string> = { shell: "Run", read: "Read", edit: "Edit" };
-const toolName = (name: string) => NAMES[name] ?? name;
-const phase = (event: AgentEvent) => phaseOf(event, toolName);
+const phase = (event: AgentEvent) => phaseOf(event);
 
 describe("phaseOf", () => {
   it("distinguishes the places a turn actually spends its time", () => {
@@ -22,22 +20,13 @@ describe("phaseOf", () => {
     expect(phase({ type: "Compacting" })).toBe("compacting history");
   });
 
-  it("names a running call by tool and target", () => {
+  it("keeps a tool call at the shared phase instead of repeating its target", () => {
     const event: AgentEvent = {
       type: "ToolStart",
-      data: { call_id: "c1", name: "shell", summary: "shell", input: { command: "cargo test" } },
+      data: { call_id: "c1", name: "read", summary: "read", input: { file_path: "src/main.rs" } },
     };
-    // `Run`, from core's `display_name()` — never the wire name. Two casings for
-    // one tool in one column is the drift `display_name` travels to prevent.
-    expect(phase(event)).toBe("Run · cargo test");
-  });
 
-  it("says the tool once when the call is about nothing else", () => {
-    const event: AgentEvent = {
-      type: "ToolStart",
-      data: { call_id: "c2", name: "read", summary: "read", input: {} },
-    };
-    expect(phase(event)).toBe("Read");
+    expect(phase(event)).toBe("calling a tool");
   });
 
   it("takes a batch's label from core, which is what its row is headed with", () => {

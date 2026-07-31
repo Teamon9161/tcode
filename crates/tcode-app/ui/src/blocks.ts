@@ -63,8 +63,6 @@ export type Block =
    * and the document is one click away.
    */
   | { kind: "compact"; summary: string }
-  /** Typed while the turn ran, delivered at a safe boundary. */
-  | { kind: "queued"; text: string; attachments: string[]; entryIndex: number }
   | {
       kind: "tool";
       callId: string;
@@ -111,9 +109,9 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
       return [
         ...blocks,
         {
-          kind: "queued",
+          kind: "user",
           text: data.text,
-          attachments: data.attachments ?? [],
+          images: data.attachments?.length ? data.attachments : undefined,
           entryIndex: data.entry_index,
         },
       ];

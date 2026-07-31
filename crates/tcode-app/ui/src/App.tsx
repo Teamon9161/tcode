@@ -133,15 +133,6 @@ export function App() {
   // is missing the promise rejects, and an unhandled rejection would leave a
   // window that accepts messages and renders nothing back.
   useEffect(() => {
-    // The listener's own copy of the tool table, filled by the `tool_views`
-    // call further down this same effect. It cannot come from the `toolMeta`
-    // state: this effect must not re-run (a second subscription doubles every
-    // delta), so a closure over that state would keep reading the empty map it
-    // was registered with, and every phase line would wear a wire name.
-    let names = new Map<string, ToolMeta>();
-    const toolName = (name: string) =>
-      names.get(name)?.display_name || name.charAt(0).toUpperCase() + name.slice(1);
-
     const subscriptions = [
       listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -149,7 +140,7 @@ export function App() {
           blocks: applyEvent(state.blocks, payload.event),
           files: applyFileEvent(state.files, payload.event),
           meter: applyUsage(state.meter, payload.event),
-          activity: phaseOf(payload.event, toolName) ?? state.activity,
+          activity: phaseOf(payload.event) ?? state.activity,
         }));
         const reported = limitsFrom(payload.event);
         if (reported) setLimits(reported);
@@ -210,8 +201,8 @@ export function App() {
     // treatment, which is a duller conversation rather than a broken one.
     invoke<ToolMeta[]>("tool_views")
       .then((list) => {
-        names = new Map(list.map((meta) => [meta.name, meta]));
-        setToolMeta(names);
+        const next = new Map(list.map((meta) => [meta.name, meta]));
+        setToolMeta(next);
       })
       .catch((error) => console.warn("tool_views unavailable:", error));
 

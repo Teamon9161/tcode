@@ -329,7 +329,6 @@ function SessionPane({
         <Transcript
           blocks={state.blocks}
           running={state.running}
-          phase={state.activity}
           rewindTargets={state.rewindTargets}
           onOpen={(value) => context.onOpen(leaf.id, session, value)}
           onRewind={(target) => context.onAskRewind(session, target)}
@@ -388,6 +387,8 @@ function SessionPane({
           />
         )}
 
+        {state.running && <TurnStatus phase={state.activity} />}
+
         <Composer
           value={state.draft}
           running={state.running}
@@ -404,6 +405,22 @@ function SessionPane({
         />
       </div>
     </>
+  );
+}
+
+/**
+ * The turn's live state belongs with the next prompt, not in the record above
+ * it. The transcript is scrollable history; this stays adjacent to the composer
+ * so its answer survives while someone reads earlier messages.
+ */
+function TurnStatus({ phase }: { phase: string }) {
+  return (
+    <p className="working" aria-live="polite">
+      <span className="working-spinner" aria-hidden>
+        ✦
+      </span>
+      <span className="working-phase">{phase.trim() || "working"}</span>
+    </p>
   );
 }
 

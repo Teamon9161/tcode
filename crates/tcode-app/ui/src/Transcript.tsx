@@ -36,17 +36,12 @@ import type { Status } from "./types";
 export function Transcript({
   blocks,
   running,
-  phase,
   rewindTargets,
   onOpen,
   onRewind,
 }: {
   blocks: Block[];
   running: boolean;
-  /** Where the turn is right now — `thinking`, `Run · cargo test`. The same
-   *  string the rail carries for this conversation, because it is the same
-   *  question asked from two distances. */
-  phase?: string;
   /** Where this conversation can go back to, from the backend. Empty while a
    *  turn holds the session, which is also when rewinding is refused. */
   rewindTargets?: RewindTarget[];
@@ -96,7 +91,6 @@ export function Transcript({
         <RewindContext.Provider value={rewinding}>
           <BlockList blocks={blocks} onOpen={onOpen} />
         </RewindContext.Provider>
-        {running && <Working phase={phase} />}
       </div>
     </div>
   );
@@ -232,13 +226,6 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
   switch (block.kind) {
     case "user":
       return <UserMessage block={block} onOpen={onOpen} />;
-    case "queued":
-      return (
-        <div className="msg msg-user is-queued">
-          <span className="queued-tag">queued</span>
-          {block.text}
-        </div>
-      );
     case "assistant":
       return <div className="msg msg-assistant">{rich(block.text)}</div>;
     case "thinking":
@@ -820,29 +807,6 @@ export function runInspect(
 ): Extract<Inspect, { kind: "run" }> {
   const summary = meta.summary.trim() || meta.prompt.split("\n", 1)[0].trim();
   return { kind: "run", run, label: summary ? `${kind} · ${summary}` : kind };
-}
-
-/**
- * Shown while a turn is in flight: the app's one running indicator.
- *
- * It says *where* the turn is, not merely that there is one. `working` for
- * every second of every turn was the least this line could have said — a turn
- * waits on a model, streams a reply, runs a command and sits behind a sub-agent,
- * and which of those it is doing is the question somebody glances over to ask.
- * The words come from `activity.ts`, are the TUI's, and are the same string the
- * rail shows for this conversation, so the two distances agree. `working` stays
- * as the fallback for the instant before the first event lands.
- *
- * `aria-live="polite"` announces the phase changing, which is the point of it;
- * the dot and the sweep are decoration to a screen reader and say so.
- */
-function Working({ phase }: { phase?: string }) {
-  return (
-    <p className="working" aria-live="polite">
-      <span className="working-dot" aria-hidden />
-      <span className="working-phase">{phase?.trim() || "working"}</span>
-    </p>
-  );
 }
 
 /** The empty transcript teaches the surface rather than announcing emptiness. */
