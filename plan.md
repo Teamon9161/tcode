@@ -13,7 +13,7 @@
 | 文件新鲜度追踪 | 长会话重复读未变动的文件 |
 | **自愈式工具错误** | 工具失败后模型花额外 turn 定位原因：edit 的 old_string 不唯一 → 直接附候选位置上下文；read 路径不存在 → 附相近路径；命令不存在 → 附建议。**省一个 turn = 省一次完整前缀读取**，最大宗的 token 节约 |
 | **开局项目地图** | 每会话开头仪式性的 ls / git status / 读 README：启动采集目录树两层 + git 状态 + scratch 路径，注入 system prompt 尾部，进缓存前缀，一次成本 |
-| **尾部自知一行** | 模型不知剩余上下文，无法自主决定 compact 或改派 sub-agent：每条最新用户消息附 `ctx 61% · mode: default · since-compact 34k`，附在尾部所以缓存安全 |
+| **尾部自知一行** | 模型不知剩余上下文与当前权限模式：每条最新用户消息附 `<tcode-status>context ~61% of 200k tokens · permission-mode: default</tcode-status>`（另有 `background running` 与未批准 draft 计划提醒），高占用时改派 sub-agent 的依据；附在尾部所以缓存安全。compact 由 harness 按阈值自动触发，不属模型决定 |
 
 ## 差异化设计（本项目特有）
 
@@ -179,34 +179,6 @@ loop {
 - provider SSE/wire 格式：`tcode-providers/tests/wire.rs`。
 - 每里程碑用真实 API 跑端到端，盯状态行缓存命中数字（对"省 token"的持续验收）。
 
-## 外部借鉴评估：oh-my-pi（omp，2026-07）
-
-逐条对照三条约束（零猜测 / 类型保证缓存 / 注册表插拔）与现有能力后的判定。**记在这里的是设计方向与理由，不是待办**——落地时各自开独立改动。
-
-| omp 特性 | 判定 | 理由 |
-|---|---|---|
-| 原生 ripgrep 链接进程内 | **已有** | grep/glob 早已内嵌 grep-searcher/ignore/globset，无 fork-exec、不依赖系统 rg。 |
-| Hashline 锚点编辑 | **不做**（收益条件性、且与已删行号优化冲突） | 见下。tcode 的 exact-string edit 本就是零 read 标注成本的内容寻址锚点，Hashline 只是把成本从 edit 侧对调到 read 侧。 |
-| 子 agent 类型化返回 | **不做**（无落地场景） | 见下。当前子 agent（general/explore）都是探索+总结，散文才是对的输出；schema 只对"父 agent 机器化汇总多路 fan-out 结果"有用，而现在没有这种用法。 |
-| 统一 read URI（`pr://` / `issue://`） | **候选** | 对齐"统一接口 + 注册表"：URI scheme 是可插拔 resolver，一个 read 读 PR/issue，替代一堆 `gh_*`。但要接 GitHub 凭证，优先级次于上两项。 |
-| `/commit` 原子拆分 | **候选** | 分析 working tree diff，拆依赖排序的原子 commit、跳过 lock 文件。语义作用于 git/文件系统 → 归 core `commands/`，独立小功能。 |
-| 持久 Python/Bun kernel + loopback（kernel 回调 read/search/task） | **暂缓（`show` 之后更弱）** | 重，偏数据分析场景（load CSV → chart）。tcode 已有 shell + 后台任务注册表覆盖编码 harness 的主线；loopback bridge 优雅但需求未明，不为它上马一套常驻 runtime。桌面端的 `show(路径)` 把"load CSV → chart"这条主诉求用**一次性脚本 + 一个路径**接住了（数据不进对话，因此与数据量无关），常驻 runtime 的剩余理由只有跨调用保活状态——那正是最贵的部分。 |
-| Hindsight `retain`/`recall`/mental model | **多数已覆盖** | tcode 自动记忆（`~/.tcode/projects/<id>/memory/` + `MEMORY.md` 索引 + 会话末维护 + 首会话加载）已等价于 mental model。delta 只是一个**显式 `recall` 搜索工具**，让模型执行中主动拉记忆而非仅末尾维护——优先级低，可作精化。 |
-| LSP + DAP debug | **不做** | 稍重，非当前核心。 |
-| ACP/Zed 集成 | **暂缓** | 分发/集成决策，非 harness 内核，等 TUI/桌面 app 稳定后再议。 |
-
-### Hashline 锚点编辑——评估后不采（记录理由，防再次被"61% 缩减"吸引）
-
-omp 的 Hashline：`read` 每行带内容 hash 锚点，`edit` 指锚点 + 新内容、不重述原文，锚点失效则拒绝整批。宣称 Grok 4 Fast 约 61% token 缩减。初看极契合零猜测（old_string 是 harness 已知信息，让模型重打是浪费），但对 tcode 核算后**不采**：
-
-- **read 已删行号 gutter**（`number: false`，见工具表）。任何锚点方案——行号或 hash——都要往 read 输出里塞 read 现在没有的东西，等于把一个**已实现的、每行的** token 优化加回来；行号锚点还额外脆（模型数错行）。
-- **exact-string edit 本身就是零 read 标注成本的内容寻址锚点**：read 既不显行号也不显 hash 时，模型对"位置"唯一的抓手就是内容本身——那正是 `old_string`。锚点是模型已看过的内容，read 侧不加一个字节，失败靠 freshness（文件变没变）+ 非唯一时的候选自愈兜底。安全与自愈这两件 Hashline 卖点，tcode 现状已经有。
-- **Hashline 只是把成本方向对调**：read 侧标注 token ⇄ edit 侧重打 token。tcode 已优化了另一头（read 零标注、edit 付重打）。哪头更优 = 价比 × 编辑密度那道题；对一个**探索多、编辑少**的 harness，现状很可能已是最优，照抄反而拿已实现的优化去换条件性、可能为负的收益。
-- 唯一还站得住的形态是"批量编辑前 opt-in 一次带锚点的 read"，但维护两套 read 模式的复杂度大概率不值——除非未来出现明确的编辑密集工作流数据支撑，否则不开这个口子。
-
-### 子 agent 类型化返回——评估后不采
-
-omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析散文。对 tcode 不采：当前子 agent（`general` / `explore`）的活都是**探索 + 总结**，散文本就是对的输出，硬套 schema 会丢失细微、帮倒忙。类型化返回只在"父 agent fan-out 多路子 agent、要机器化汇总各路结果"时才有价值，而 tcode 没有这种用法。若将来出现该用法，落地要点：schema 声明进 def frontmatter、校验在 `task` 收尾处（主循环不动）、且 **typed ≠ trusted**（字段仍是观察到的数据，不是发给父 agent 的指令）。
 
 ## 改进
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
