@@ -124,9 +124,21 @@ pub(crate) fn shell_command(
         ShellKind::PowerShell => {
             let mut cmd = tokio::process::Command::new("powershell.exe");
             // Force UTF-8 so output survives non-English codepages.
+            //
+            // PowerShell 5.1 turns a native command's stderr (once merged
+            // with `2>&1`) into an ErrorRecord, which flips `$?` to False;
+            // a script that then ends on a cmdlet — the pipe's `Select-Object
+            // -Last N`, say — exits 1 even though the command exited 0.
+            // `$LASTEXITCODE` keeps the real code, so exit on it first, and
+            // fall back to `$?` when the script never ran a native command.
+            // A newline (not `;`) separates the append so a trailing `#`
+            // comment in the script cannot swallow the exit logic.
             let wrapped = format!(
                 "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-                 $OutputEncoding=[System.Text.Encoding]::UTF8; {script}"
+                 $OutputEncoding=[System.Text.Encoding]::UTF8; {script}\n\
+                 $__tcode_q = $?; if ($null -ne $LASTEXITCODE) \
+                 {{ exit $LASTEXITCODE }} elseif ($__tcode_q) {{ exit 0 }} \
+                 else {{ exit 1 }}"
             );
             cmd.args([
                 "-NoProfile",
@@ -705,6 +717,81 @@ mod tests {
             output
                 .content
                 .contains("tcode-no-such-program -> not found"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// PowerShell 5.1 turns a native command's stderr (merged via `2>&1`)
+    /// into an ErrorRecord, flipping `$?` to False even when the command
+    /// exited 0; a script ending on a cmdlet then exits 1. The wrapper must
+    /// exit on `$LASTEXITCODE` so the real code survives.
+    #[tokio::test]
+    async fn powershell_stderr_merge_does_not_fabricate_failure() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 10_000);
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": "cmd /c \"echo oops 1>&2 & exit 0\" 2>&1 | Select-Object -Last 1" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("(exit code 0)"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// Same merge, but a genuinely failing command: the wrapper must report
+    /// the real exit code (7), not the fabricated 1.
+    #[tokio::test]
+    async fn powershell_stderr_merge_keeps_real_failure_code() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 10_000);
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": "cmd /c \"echo oops 1>&2 & exit 7\" 2>&1 | Select-Object -Last 1" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("(exit code 7)"),
+            "{}",
+            output.content
+        );
+    }
+
+    /// A script that ends on a cmdlet without ever running a native command
+    /// has no `$LASTEXITCODE`; the wrapper must fall back to `$?` and report
+    /// the cmdlet's own failure.
+    #[tokio::test]
+    async fn powershell_cmdlet_failure_still_reports_failure() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 10_000);
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": "Get-Item /definitely/not/here -ErrorAction Stop" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error);
+        assert!(
+            output.content.contains("(exit code 1)"),
             "{}",
             output.content
         );

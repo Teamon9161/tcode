@@ -212,4 +212,3 @@ omp 的 `task` 返回 schema-validated 对象、父按字段读，替代解析�
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4.  Tool friction — shell（PowerShell 管道退出码）：cargo test ... 2>&1 | Select-Object -Last N 明明全部测试通过，工具却报 (exit code 1)，我花了两轮额外 shell 调用才确认是 PowerShell 管道吞掉/污染了原生命令退出码的假象（直跑 $LASTEXITCODE 是 0）。避免办法是把 $LASTEXITCODE 的取值约定或「管道到 cmdlet 会丢失退出码」写进 shell 工具说明，或让工具在命令含管道时标注退出码不可靠——否则后续每次跑长测试都要先怀疑一次结果。

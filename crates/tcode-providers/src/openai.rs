@@ -137,6 +137,13 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool, keep_reaso
                     _ => {}
                 }
             }
+            // A turn that produced only reasoning has nothing replayable on
+            // the chat-completions wire: `content: null` with no `tool_calls`
+            // is a hard 400 ("content or tool_calls must be set"). DeepSeek
+            // documents pure-thinking turns as droppable; drop them here too.
+            if text.is_empty() && tool_calls.is_empty() {
+                return;
+            }
             let mut m = json!({ "role": "assistant" });
             m["content"] = if text.is_empty() {
                 Value::Null
@@ -467,6 +474,27 @@ mod tests {
         flatten_message(&tool_turn(), &mut out, true, false);
         assert!(out[0].get("reasoning_content").is_none());
         assert!(out[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn thinking_only_turn_is_dropped_not_nulled() {
+        let mut out = Vec::new();
+        flatten_message(
+            &Message {
+                role: Role::Assistant,
+                content: vec![ContentBlock::Thinking {
+                    thinking: "ponder ponder".into(),
+                    signature: None,
+                }],
+            },
+            &mut out,
+            true,
+            true,
+        );
+        assert!(
+            out.is_empty(),
+            "a pure-thinking assistant turn must not replay as content:null without tool_calls"
+        );
     }
 
     #[test]

@@ -64,7 +64,7 @@ impl AnthropicProvider {
         let mut messages: Vec<Value> = req
             .messages
             .iter()
-            .map(|message| message_to_json(message, self.vision))
+            .filter_map(|message| message_to_json(message, self.vision))
             .collect();
         // Moving cache breakpoint: last content block of the last message.
         // Together with the breakpoint on system this covers the whole
@@ -145,7 +145,7 @@ impl AnthropicProvider {
     }
 }
 
-fn message_to_json(msg: &Message, vision: bool) -> Value {
+fn message_to_json(msg: &Message, vision: bool) -> Option<Value> {
     let role = match msg.role {
         tcode_core::Role::User => "user",
         tcode_core::Role::Assistant => "assistant",
@@ -155,7 +155,13 @@ fn message_to_json(msg: &Message, vision: bool) -> Value {
         .iter()
         .filter_map(|block| block_to_json(block, vision))
         .collect();
-    json!({ "role": role, "content": blocks })
+    // An assistant turn whose only content was reasoning has nothing
+    // replayable here (unsigned thinking is filtered by `block_to_json`);
+    // a `content: []` assistant message is rejected by the API, so drop it.
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(json!({ "role": role, "content": blocks }))
 }
 
 fn block_to_json(block: &ContentBlock, vision: bool) -> Option<Value> {
@@ -400,6 +406,21 @@ mod tests {
         assert_eq!(parts[1]["type"], "image");
         assert_eq!(parts[1]["source"]["media_type"], "image/png");
         assert_eq!(parts[1]["source"]["data"], "AAAA");
+    }
+
+    #[test]
+    fn thinking_only_turn_is_dropped_not_empty_content() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![ContentBlock::Thinking {
+                thinking: "ponder ponder".into(),
+                signature: None,
+            }],
+        };
+        assert!(
+            message_to_json(&msg, true).is_none(),
+            "a pure-thinking assistant turn must not replay as content:[]"
+        );
     }
 
     fn native() -> AnthropicProvider {
