@@ -1531,7 +1531,7 @@ pub mod catalog {
         from_catalog("codex")
     }
 
-    /// DeepSeek's Anthropic-compatible endpoint.
+    /// DeepSeek's OpenAI-compatible Chat Completions endpoint.
     pub fn deepseek(api_key: Option<String>) -> Profile {
         with_key("deepseek", api_key)
     }
@@ -1917,7 +1917,7 @@ mod tests {
         let user: Config = toml::from_str(
             r#"
             [profiles.deepseek]
-            provider = "anthropic"
+            provider = "openai"
             api_key = "sk-test"
 
             [[profiles.deepseek.models]]

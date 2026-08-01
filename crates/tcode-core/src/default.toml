@@ -116,7 +116,7 @@ vision = true
 # (`/api/v1/messages`, which this base_url + the provider's `/v1/messages`
 # suffix produce). It accepts our `x-api-key` auth, streams the standard
 # Anthropic SSE shape, and passes tool calls through, so no new wire is
-# needed — this is the same shape as the DeepSeek profile below.
+# needed — the same Anthropic wire the `anthropic` profile uses.
 # For the OpenAI wire instead, use `provider = "openai"` with
 # `base_url = "https://openrouter.ai/api/v1"`.
 #
@@ -130,11 +130,15 @@ base_url = "https://openrouter.ai/api"
 [[profiles.openrouter.models]]
 name = "tencent/hy3:free"
 
-# DeepSeek's Anthropic-compatible endpoint. Model params live in `[models.*]`.
+# DeepSeek's OpenAI-compatible Chat Completions endpoint (its primary
+# surface, with automatic prefix caching). The Anthropic-compatible endpoint
+# ignores `cache_control` and `thinking.budget_tokens`, which would silently
+# disable tcode's cache breakpoints and the effort dial. Model params live in
+# `[models.*]`.
 [profiles.deepseek]
-provider = "anthropic"
+provider = "openai"
 api_key_env = "DEEPSEEK_API_KEY"
-base_url = "https://api.deepseek.com/anthropic"
+base_url = "https://api.deepseek.com"
 # Text-only: save pasted images to scratch and delegate with view_image.
 vision = false
 models = ["deepseek-v4-pro", "deepseek-v4-flash"]

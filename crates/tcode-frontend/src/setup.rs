@@ -907,7 +907,7 @@ mod tests {
             .merge(config.profiles["deepseek"].clone());
         assert_eq!(
             merged.profiles["deepseek"].provider,
-            Some(ProviderKind::Anthropic)
+            Some(ProviderKind::Openai)
         );
         assert_eq!(config.tcode_state.profile.as_deref(), Some("deepseek"));
     }

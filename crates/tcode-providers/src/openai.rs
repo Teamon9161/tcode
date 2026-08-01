@@ -24,6 +24,11 @@ pub struct OpenAiProvider {
     api_key: String,
     model: String,
     base_url: String,
+    /// True when the backend is DeepSeek's OpenAI-compatible endpoint,
+    /// detected from the base URL. Its V4 models think by default: tool-call
+    /// turns must round-trip `reasoning_content` (the API 400s otherwise) and
+    /// `effort = off` must send `thinking: {type: "disabled"}`.
+    deepseek: bool,
     watchdog: WatchdogConfig,
     vision: bool,
 }
@@ -37,6 +42,9 @@ impl OpenAiProvider {
     ) -> Self {
         Self {
             http: crate::http::client(),
+            deepseek: base_url
+                .as_deref()
+                .is_some_and(|u| u.contains("deepseek.com")),
             api_key,
             model,
             base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.to_string()),
@@ -56,7 +64,7 @@ impl OpenAiProvider {
             messages.push(json!({ "role": "system", "content": suffix }));
         }
         for msg in &req.messages {
-            flatten_message(msg, &mut messages, self.vision);
+            flatten_message(msg, &mut messages, self.vision, self.deepseek);
         }
         let tools: Vec<Value> = req
             .tools
@@ -84,9 +92,14 @@ impl OpenAiProvider {
             body["parallel_tool_calls"] = json!(true);
         }
         // Reasoning models accept an effort dial; "off" means "send
-        // nothing" for endpoints without one.
+        // nothing" for endpoints without one. DeepSeek's V4 models think by
+        // default, so "off" must disable thinking explicitly there.
         if let Some(effort) = req.effort.as_deref() {
-            if effort != "off" {
+            if effort == "off" {
+                if self.deepseek {
+                    body["thinking"] = json!({ "type": "disabled" });
+                }
+            } else {
                 body["reasoning_effort"] = json!(effort);
             }
         }
@@ -96,10 +109,11 @@ impl OpenAiProvider {
 
 /// Our neutral message maps to 1..n OpenAI messages: tool results become
 /// separate `role:"tool"` messages, everything else stays in place.
-fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool) {
+fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool, keep_reasoning: bool) {
     match msg.role {
         Role::Assistant => {
             let mut text = String::new();
+            let mut reasoning = String::new();
             let mut tool_calls: Vec<Value> = Vec::new();
             for block in &msg.content {
                 match block {
@@ -112,7 +126,13 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool) {
                             "arguments": serde_json::to_string(input).unwrap_or_default(),
                         },
                     })),
-                    // Reasoning is not replayable on this API.
+                    // Reasoning is not replayable on OpenAI's own API, but
+                    // DeepSeek requires the reasoning_content of tool-call
+                    // turns to be round-tripped on any later request that
+                    // carries tools (it 400s without it).
+                    ContentBlock::Thinking { thinking, .. } if keep_reasoning => {
+                        reasoning.push_str(thinking)
+                    }
                     ContentBlock::Thinking { .. } => {}
                     _ => {}
                 }
@@ -125,6 +145,9 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool) {
             };
             if !tool_calls.is_empty() {
                 m["tool_calls"] = Value::Array(tool_calls);
+                if keep_reasoning && !reasoning.is_empty() {
+                    m["reasoning_content"] = Value::String(reasoning);
+                }
             }
             out.push(m);
         }
@@ -206,8 +229,12 @@ fn flatten_message(msg: &Message, out: &mut Vec<Value>, vision: bool) {
 
 fn usage_from(v: &Value) -> tcode_core::Usage {
     let prompt = v["prompt_tokens"].as_u64().unwrap_or(0);
-    let cached = v["prompt_tokens_details"]["cached_tokens"]
-        .as_u64()
+    // OpenAI reports cached input under `prompt_tokens_details.cached_tokens`;
+    // DeepSeek uses the top-level `prompt_cache_hit_tokens` field instead.
+    let cached = v["prompt_tokens_details"]
+        .get("cached_tokens")
+        .and_then(|c| c.as_u64())
+        .or_else(|| v.get("prompt_cache_hit_tokens").and_then(|c| c.as_u64()))
         .unwrap_or(0);
     tcode_core::Usage {
         input_tokens: prompt.saturating_sub(cached),
@@ -342,5 +369,126 @@ impl Provider for OpenAiProvider {
         });
 
         Ok(Box::pin(raw.take_until(cancel.cancelled_owned())))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tcode_core::{ContentBlock, Message, Role};
+
+    fn watchdog() -> WatchdogConfig {
+        WatchdogConfig {
+            idle_timeout_secs: 5,
+            connect_timeout_secs: 20,
+            max_retries: 1,
+            initial_backoff_ms: 1,
+            max_backoff_ms: 10,
+        }
+    }
+
+    fn req(effort: Option<&str>) -> Request {
+        Request {
+            model: "deepseek-v4-flash".into(),
+            system: "sys".into(),
+            system_suffix: None,
+            cache_scope: None,
+            messages: vec![Message {
+                role: Role::User,
+                content: vec![ContentBlock::Text { text: "hi".into() }],
+            }],
+            tools: vec![],
+            max_tokens: 1000,
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    fn provider(base_url: &str) -> OpenAiProvider {
+        OpenAiProvider::new(
+            "k".into(),
+            "deepseek-v4-flash".into(),
+            Some(base_url.into()),
+            watchdog(),
+        )
+    }
+
+    #[test]
+    fn deepseek_off_effort_disables_thinking() {
+        let body = provider("https://api.deepseek.com").build_body(&req(Some("off")));
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn deepseek_effort_sends_reasoning_effort_only() {
+        let body = provider("https://api.deepseek.com").build_body(&req(Some("high")));
+        assert_eq!(body["reasoning_effort"], "high");
+        assert!(
+            body.get("thinking").is_none(),
+            "thinking is on by default on DeepSeek"
+        );
+    }
+
+    #[test]
+    fn openai_off_effort_sends_nothing() {
+        let body = provider("https://api.openai.com/v1").build_body(&req(Some("off")));
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+
+    fn tool_turn() -> Message {
+        Message {
+            role: Role::Assistant,
+            content: vec![
+                ContentBlock::Thinking {
+                    thinking: "need the weather".into(),
+                    signature: None,
+                },
+                ContentBlock::ToolUse {
+                    id: "t1".into(),
+                    name: "get_weather".into(),
+                    input: json!({ "city": "beijing" }),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn deepseek_tool_turn_round_trips_reasoning_content() {
+        let mut out = Vec::new();
+        flatten_message(&tool_turn(), &mut out, true, true);
+        assert_eq!(out[0]["reasoning_content"], "need the weather");
+        assert!(out[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn openai_tool_turn_still_drops_reasoning() {
+        let mut out = Vec::new();
+        flatten_message(&tool_turn(), &mut out, true, false);
+        assert!(out[0].get("reasoning_content").is_none());
+        assert!(out[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn usage_reads_deepseek_cache_hit_field() {
+        let u = usage_from(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_cache_hit_tokens": 90,
+        }));
+        assert_eq!(u.cache_read_tokens, 90);
+        assert_eq!(u.input_tokens, 10);
+        assert_eq!(u.output_tokens, 5);
+    }
+
+    #[test]
+    fn usage_reads_openai_cached_tokens_first() {
+        let u = usage_from(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 5,
+            "prompt_tokens_details": { "cached_tokens": 80 },
+        }));
+        assert_eq!(u.cache_read_tokens, 80);
+        assert_eq!(u.input_tokens, 20);
     }
 }

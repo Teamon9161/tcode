@@ -224,6 +224,13 @@ The builtin catalog already contains profiles such as `anthropic`, `openai`,
 or override/add the models actually used. The Codex profile uses its local login
 and runtime model catalog, not an API key.
 
+The builtin `deepseek` profile talks to DeepSeek's OpenAI-compatible endpoint
+(`https://api.deepseek.com`), not its Anthropic-compatible one. V4 models think
+by default, so on that wire tcode round-trips `reasoning_content` on tool-call
+turns (the API returns 400 without it) and maps `effort = off` to disabled
+thinking; that behavior activates when the profile's `base_url` contains
+`deepseek.com`.
+
 Every field of a profile is optional in any single file, because a file is a
 patch, not a whole profile. To add a key to a builtin profile, write only that
 key — `provider`, `base_url` and `models` keep coming from the layer below:
