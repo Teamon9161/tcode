@@ -14,6 +14,7 @@
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::{Line, Span};
 use tcode_core::config::ModelDef;
+use unicode_width::UnicodeWidthStr;
 
 use crate::theme;
 
@@ -591,6 +592,17 @@ impl Hub {
         )])];
         let rows = entries(agents, presets);
         let start = self.start(rows.len());
+        // Agent rows pad their label to the widest label in the hub: a long
+        // installed-agent name (e.g. `impeccable_asset_producer`) must never
+        // touch the model description that follows it. The 12-column floor
+        // keeps short menus looking as they always have.
+        let label_col = agents
+            .roles
+            .iter()
+            .map(|role| UnicodeWidthStr::width(role.label.as_str()) + 2)
+            .max()
+            .unwrap_or(0)
+            .max(12);
         for (index, entry) in rows.iter().enumerate().skip(start).take(WINDOW) {
             let is_sel = index == self.selected;
             let marker = if is_sel { "▸ " } else { "  " };
@@ -634,14 +646,14 @@ impl Hub {
                     },
                     style,
                 ),
-                Entry::Agent(role) => Line::styled(
-                    format!(
-                        "    {marker}{:<12}{}",
-                        agents.roles[*role].label,
-                        agents.describe(*role, menu)
-                    ),
-                    style,
-                ),
+                Entry::Agent(role) => {
+                    let label = agents.roles[*role].label.as_str();
+                    let desc = agents.describe(*role, menu);
+                    Line::styled(
+                        format!("    {marker}{label:<width$}{desc}", width = label_col),
+                        style,
+                    )
+                }
             });
         }
         out.push(Line::styled(
@@ -965,5 +977,58 @@ mod tests {
         ]);
         assert_eq!(a.describe(0, &m), "deepseek-v4-flash[1m] (high)");
         assert_eq!(a.describe(1, &m), "inherit (main model)");
+    }
+
+    /// The hub pads every agent label to the widest one in the list, so a
+    /// long installed-agent name can never touch the model description that
+    /// follows it — and every description starts at the same column.
+    #[test]
+    fn long_agent_labels_never_touch_their_model_description() {
+        let m = menu();
+        let a = AgentMenu {
+            roles: vec![
+                AgentRole {
+                    key: "explore".into(),
+                    label: "explore".into(),
+                    allows_off: false,
+                    section: RoleSection::Task,
+                },
+                AgentRole {
+                    key: "impeccable_asset_producer".into(),
+                    label: "impeccable_asset_producer".into(),
+                    allows_off: false,
+                    section: RoleSection::Task,
+                },
+            ],
+            pins: vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit],
+            pin: Box::new(|_, _| Err("not pinned in tests".into())),
+        };
+        let p = presets(&[], None);
+        let hub = Hub::new(&a, &p, true);
+        let text = hub
+            .render(&ctx(&m, &a, &p))
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // The widest label sets the column: the long name keeps exactly two
+        // spaces before its description instead of running into it.
+        assert!(text.contains("impeccable_asset_producer  inherit (main model)"));
+        let mut columns = text
+            .lines()
+            .filter(|line| line.contains("inherit (main model)"))
+            // `find` yields a byte offset, but "▸" is three bytes; the two
+            // markers have different byte lengths although the same cell
+            // width, so compare by terminal cells instead.
+            .map(|line| {
+                let at = line.find("inherit (main model)").expect("the description");
+                line[..at].chars().count()
+            });
+        let first = columns.next().expect("at least one agent row");
+        assert!(
+            columns.all(|column| column == first),
+            "every description lines up in one column"
+        );
     }
 }

@@ -106,6 +106,13 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 
 const LOGO: [&str; 2] = ["▀█▀ █▀▀ █▀█ █▀▄ █▀▀", " █  █▄▄ █▄█ █▄▀ ██▄"];
 
+/// While a turn runs, repaint at most this often. Streaming deltas can arrive
+/// far faster than a terminal can usefully repaint, and repainting at event
+/// rate makes the status bar's counters and the prompt cursor flicker on
+/// terminals that do not batch frames (the 100ms animation tick is what the
+/// cadence is tied to, so the shimmer never looks choppy).
+const RUNNING_PAINT_INTERVAL: Duration = Duration::from_millis(100);
+
 /// One of these shows per launch, picked at random: a discovery channel
 /// for features nobody reads /help for. Every entry must describe real,
 /// current behaviour — stale tips are worse than none.
@@ -694,8 +701,9 @@ impl App {
         drag_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Drives the shimmer on the main running status and in-flight call
         // headers. Its select arm is gated on `shimmer_active`, so the finer
-        // cadence only runs while a turn is actively executing.
-        let mut anim_tick = tokio::time::interval(Duration::from_millis(100));
+        // cadence only runs while a turn is actively executing. It also owns
+        // the repaint cadence while a turn runs (see `RUNNING_PAINT_INTERVAL`).
+        let mut anim_tick = tokio::time::interval(RUNNING_PAINT_INTERVAL);
         anim_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // Watches an open take: on terminals with no usable key-up, the end of
         // a hold *is* the gap after the last auto-repeat, so it has to be
@@ -704,8 +712,24 @@ impl App {
         let mut voice_tick = tokio::time::interval(Duration::from_millis(60));
         voice_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Streaming deltas can arrive far faster than a terminal can usefully
+        // repaint. Only the agent-event wake-up defers its paint: while a turn
+        // runs it sets `throttle_paint`, and the next tick (the 100ms
+        // animation tick when the status shimmers, the 250ms tick otherwise)
+        // owns the repaint — so a fast API cannot make the status bar and
+        // cursor flicker at event rate. Events still update state on every
+        // wake-up; only the paint is deferred. Every other wake-up (user
+        // input, turn start/end, dialogs) repaints immediately, so typing the
+        // next queued prompt never waits for the animation cadence.
+        let mut last_redraw = Instant::now();
+        let mut throttle_paint = false;
         while !self.should_exit {
-            self.redraw()?;
+            let running = matches!(self.phase, Phase::Running { .. });
+            if should_repaint(running, throttle_paint, last_redraw.elapsed()) {
+                self.redraw()?;
+                last_redraw = Instant::now();
+            }
+            throttle_paint = false;
             // Re-fetch when idle so a rebound registry (resume/import) can't
             // leave a stale handle; while a turn owns the session, the cached
             // clone stays valid because ToolCtx is never rebound mid-turn.
@@ -742,6 +766,9 @@ impl App {
                     self.on_agent_event(ev);
                     // Drain whatever is already queued to batch redraws.
                     self.drain_agent_events();
+                    // Streaming batches are coalesced onto the next tick rather
+                    // than painting once per delta (see the loop head).
+                    throttle_paint = true;
                 }
                 Some((generation, suggestion)) = self.suggest_rx.recv() => {
                     // Keep it even if the user is mid-word: the ghost simply
@@ -1261,6 +1288,18 @@ impl App {
         // note carets, drag selection), driven by geometry it owns.
         if overlay.as_dialog().is_some() {
             self.on_dialog_mouse(mouse);
+            return true;
+        }
+        // The wheel steps a picker the way ↑/↓ do. It reaches the overlay no
+        // matter where the pointer is: a notch is movement, and movement
+        // follows the same rule the arrow keys follow. The resume picker
+        // does not own the mouse, so its wheel still scrolls the transcript.
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) {
+            let up = mouse.kind == MouseEventKind::ScrollUp;
+            self.drive_overlay(|overlay, ctx| overlay.handle_wheel(up, ctx));
             return true;
         }
         // Ask the layout where the panel is rather than reconstructing it: a
@@ -1964,6 +2003,13 @@ async fn recv_opt(rx: &mut Option<mpsc::Receiver<AgentEvent>>) -> Option<AgentEv
         Some(rx) => rx.recv().await,
         None => std::future::pending().await,
     }
+}
+
+/// Whether the loop may repaint on this wake-up. While a turn runs, a paint
+/// deferred by a streaming batch waits for the animation cadence instead of
+/// repainting once per delta; every other wake-up repaints immediately.
+fn should_repaint(running: bool, paint_deferred: bool, since_last: Duration) -> bool {
+    !paint_deferred || !running || since_last >= RUNNING_PAINT_INTERVAL
 }
 
 /// Resolves when the running turn finishes; pends forever when idle.
@@ -3065,6 +3111,60 @@ mod tests {
         let after = app.frame();
         assert!(after.contains("signed in to ChatGPT as dev@example.com"));
         assert!(after.contains("/model"));
+    }
+
+    /// The wheel steps a picker the way the arrow keys do, and it reaches the
+    /// overlay no matter where the pointer is. `/model` opens the hub on the
+    /// main row; one notch down lands on the save row (the presets header is
+    /// not selectable), one notch up returns.
+    #[test]
+    fn wheel_moves_the_model_picker_selection() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app =
+            harness::app_for_plan_handoff(dir.path(), 90, 40, Arc::default(), Arc::default());
+        app.run_slash("/model");
+        let opened = app.frame();
+        assert!(
+            opened.contains("▸ main"),
+            "the hub opens on the main model:\n{opened}"
+        );
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 40,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let after = app.frame();
+        assert!(
+            after.contains("▸ save this line-up as a preset"),
+            "one notch down moved the cursor off main:\n{after}"
+        );
+
+        app.on_term_event(Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 40,
+            row: 30,
+            modifiers: KeyModifiers::NONE,
+        }));
+        let back = app.frame();
+        assert!(
+            back.contains("▸ main"),
+            "one notch up moved the cursor back to main:\n{back}"
+        );
+    }
+
+    /// Streaming batches defer their paint onto the animation cadence while a
+    /// turn runs; everything else paints on the wake-up that changed it.
+    #[test]
+    fn streaming_batches_coalesce_onto_the_animation_cadence() {
+        // A deferred paint (agent event batch) waits for the cadence…
+        assert!(!should_repaint(true, true, Duration::from_millis(10)));
+        // …and the cadence itself always paints, so nothing is ever stuck.
+        assert!(should_repaint(true, true, Duration::from_millis(100)));
+        // Outside a turn, or when nothing was deferred, paint immediately.
+        assert!(should_repaint(false, true, Duration::from_millis(10)));
+        assert!(should_repaint(true, false, Duration::from_millis(10)));
     }
 
     #[test]

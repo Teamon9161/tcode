@@ -10,7 +10,7 @@
 //! Adding a modal means adding a variant here; the compiler then points at
 //! every match that has to account for it.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::text::Line;
 use tcode_core::{Approval, BatchApproval, PermissionMode};
 use tcode_importers::{ExternalSessionInfo, ExternalSource};
@@ -290,6 +290,45 @@ impl Overlay {
         }
     }
 
+    /// The wheel moves a picker the way ↑/↓ do. One notch is one movement,
+    /// never a pick or a dismissal. Sending the same key event the arrows
+    /// would send keeps a single code path deciding where the cursor is, so
+    /// the two inputs can never disagree. Only the movement keys reach the
+    /// handlers here, and every picker answers those with `Pending`, so the
+    /// result is discarded rather than re-routed. The approval dialog never
+    /// arrives (`on_dialog_mouse` owns its wheel) and the resume picker
+    /// declines the mouse entirely (`owns_mouse`).
+    pub fn handle_wheel(&mut self, up: bool, ctx: &OverlayCtx) -> Flow {
+        let key = KeyEvent::from(if up { KeyCode::Up } else { KeyCode::Down });
+        match self {
+            Overlay::View(picker) => {
+                let _ = picker.handle_key(key);
+                Flow::Stay
+            }
+            Overlay::Model(hub) => {
+                let _ = hub.handle_key(key, &ctx.hub());
+                Flow::Stay
+            }
+            Overlay::Mode(picker) => {
+                let _ = picker.handle_key(key);
+                Flow::Stay
+            }
+            Overlay::VoiceModel(picker) => {
+                let _ = picker.handle_key(key);
+                Flow::Stay
+            }
+            Overlay::FolderTrust(picker) => {
+                let _ = picker.handle_key(key);
+                Flow::Stay
+            }
+            Overlay::PlanExecution(_, _, _, picker) => {
+                let _ = picker.handle_key(key);
+                Flow::Stay
+            }
+            Overlay::Resume(_) | Overlay::Provider(_) | Overlay::Approval(..) => Flow::Stay,
+        }
+    }
+
     /// A click on a panel content row. The approval dialog has richer mouse
     /// behaviour (plan panes, note carets, drags) and is driven separately.
     pub fn handle_mouse_row(&mut self, row: usize, ctx: &OverlayCtx) -> Flow {
@@ -457,6 +496,24 @@ mod tests {
         assert!(matches!(
             flow,
             Flow::Act(OverlayAction::SetMode(PermissionMode::Default))
+        ));
+    }
+
+    /// A wheel notch is movement, never a pick or a dismissal: it steps the
+    /// picker through the same handler the arrow keys use.
+    #[test]
+    fn wheel_moves_a_picker_like_the_arrow_keys() {
+        let (menu, agents, presets) = menus();
+        let mut overlay = mode_overlay();
+        assert!(matches!(
+            overlay.handle_wheel(false, &ctx(&menu, &agents, &presets)),
+            Flow::Stay
+        ));
+        // Down moved off "default" (index 0); Enter now lands on "accept edits".
+        let flow = overlay.handle_key(key(KeyCode::Enter), &ctx(&menu, &agents, &presets));
+        assert!(matches!(
+            flow,
+            Flow::Act(OverlayAction::SetMode(PermissionMode::AcceptEdits))
         ));
     }
 
