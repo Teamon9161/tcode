@@ -8,7 +8,7 @@
     "dev": "npm run build:sandbox && vite",
     "build": "npm run build:sandbox && tsc --noEmit && vite build",
     "preview": "vite preview",
-    "preview:ui": "npm run build:sandbox && PREVIEW=1 vite --open=/preview.html",
+    "preview:ui": "npm run build:sandbox && vite --mode preview --open",
     "test": "vitest run"
   },
   "dependencies": {

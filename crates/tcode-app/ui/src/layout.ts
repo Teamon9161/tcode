@@ -41,7 +41,35 @@ export type Pane =
   | { kind: "session"; session: string }
   /** Something belonging to a conversation, looked into. The pane carries its
    *  own back/forward history rather than a bare value — see `inspect.ts`. */
-  | { kind: "inspect"; session: string; nav: Nav };
+  | { kind: "inspect"; session: string; nav: Nav }
+  /**
+   * The window's browser.
+   *
+   * The one pane with **no `session`**, and that absence is the whole design
+   * rather than an omission. You open it to read a doc or watch a dev server;
+   * which conversation happened to be focused at the time is not a fact about
+   * it. Three things follow from carrying no session, and they are the reason
+   * it is shaped this way:
+   *
+   *  - `closeSession` filters on `pane.session`, so closing a conversation
+   *    cannot take the page you are reading with it.
+   *  - Its button belongs on the topbar, which rule 9c reserves for things that
+   *    are the window's rather than one conversation's.
+   *  - There is one of it, so when tabs arrive there is exactly one tab strip
+   *    and no question of which browser a tab belongs to.
+   *
+   * It holds no URL either: the page lives in a native child webview that the
+   * backend owns (`src/browser.rs`), which keeps its own history. Putting a URL
+   * here would make this tree the second, always slightly stale, account of
+   * where the browser is.
+   */
+  | { kind: "web" };
+
+/** Whether a pane belongs to a conversation. The browser is the one that does
+ *  not, so this is the guard everywhere a pane's session is read. */
+export function paneSession(pane: Pane): string | null {
+  return pane.kind === "web" ? null : pane.session;
+}
 
 /** Which way a split lays its two children out, named after the flex axis:
  *  `row` puts them side by side, `col` stacks them. */
@@ -112,7 +140,10 @@ export function panes(tiling: Tiling): Leaf[] {
 /** The distinct sessions with at least one pane on screen, in reading order. */
 export function sessionsInView(tiling: Tiling): string[] {
   const seen = new Set<string>();
-  for (const leaf of panes(tiling)) seen.add(leaf.pane.session);
+  for (const leaf of panes(tiling)) {
+    const session = paneSession(leaf.pane);
+    if (session) seen.add(session);
+  }
   return [...seen];
 }
 
@@ -193,7 +224,9 @@ export function close(tiling: Tiling, id: string): Tiling {
 export function closeSession(tiling: Tiling, session: string): Tiling {
   let out = tiling;
   for (const leaf of panes(tiling)) {
-    if (leaf.pane.session === session) out = close(out, leaf.id);
+    // The browser answers `null` here and is therefore never swept up: it is
+    // the window's, not this conversation's.
+    if (paneSession(leaf.pane) === session) out = close(out, leaf.id);
   }
   return out;
 }
@@ -216,9 +249,12 @@ export function updatePane(tiling: Tiling, id: string, pane: Pane): Tiling {
  * window down to slivers over a working day; a split is something the user asks
  * for explicitly.
  *
- * The one exception is landing on an inspect pane: taking that one over would
- * throw away what it was showing *and* leave its conversation without a place
- * to look into things, so it splits rather than overwrites.
+ * The exceptions are landing on an inspect pane or on the browser: taking
+ * either over would throw away what it was showing, and in the inspect case
+ * would leave its conversation without a place to look into things. Both split
+ * rather than overwrite. The browser is the sharper of the two — it is the
+ * window's only one, so overwriting it would mean a conversation arriving on
+ * screen could silently close the page you were reading.
  */
 export function show(tiling: Tiling, session: string): Tiling {
   const already = panes(tiling).find(
@@ -229,8 +265,36 @@ export function show(tiling: Tiling, session: string): Tiling {
   const pane: Pane = { kind: "session", session };
   if (!tiling.root) return single(pane);
   const seat = focused(tiling) ?? firstLeaf(tiling.root);
-  if (seat.pane.kind === "inspect") return split(tiling, seat.id, "row", pane);
+  if (seat.pane.kind !== "session") return split(tiling, seat.id, "row", pane);
   return { root: mapNode(tiling.root, seat.id, () => ({ ...seat, pane })), focus: seat.id };
+}
+
+/**
+ * Brings the browser on screen, or hides it again if it is already there.
+ *
+ * A toggle, because the button that brings the window-level browser in is the
+ * one natural gesture for taking it away — a second click on "Open the browser"
+ * doing nothing visible is how this looked broken when it only focused. Hiding
+ * is not closing: the native webview stays alive underneath, page and profile
+ * intact, so a re-open shows the page as it was. The pane's own close menu
+ * sends the page back to `about:blank` ("Exit browser") or just hides it
+ * ("Hide for now"); the webview itself is only torn down by the app's exit.
+ *
+ * It splits to the right of the focused pane at an even share: a page and a
+ * conversation are the same order of thing, unlike a column of file names
+ * (`SIDEBAR_SHARE`).
+ */
+export function openWeb(tiling: Tiling): Tiling {
+  const already = panes(tiling).find((leaf) => leaf.pane.kind === "web");
+  if (already) return close(tiling, already.id);
+  if (!tiling.root) return single({ kind: "web" });
+  const seat = focused(tiling) ?? firstLeaf(tiling.root);
+  return split(tiling, seat.id, "row", { kind: "web" });
+}
+
+/** The browser's pane, if the window has one open. */
+export function webPane(tiling: Tiling): Leaf | null {
+  return panes(tiling).find((leaf) => leaf.pane.kind === "web") ?? null;
 }
 
 /**
@@ -248,10 +312,16 @@ export function browsing(pane: Pane): boolean {
   return pane.kind === "inspect" && navValue(pane.nav).kind === "workspace-tree";
 }
 
-/** The pane browsing `session`'s workspace, if one is open. */
+/** The pane browsing `session`'s workspace, if one is open.
+ *
+ *  "Browsing" here is the *file tree*, and predates the web browser by a long
+ *  way — see `webPane` for that one. The names sit close together; the values
+ *  do not. */
 export function browserPane(tiling: Tiling, session: string): Leaf | null {
   return (
-    panes(tiling).find((leaf) => leaf.pane.session === session && browsing(leaf.pane)) ?? null
+    panes(tiling).find(
+      (leaf) => paneSession(leaf.pane) === session && browsing(leaf.pane),
+    ) ?? null
   );
 }
 

@@ -8,8 +8,6 @@ import { Wordmark } from "./components/Mark";
 import { Path } from "./components/Path";
 import { StatusPill } from "./components/Status";
 import { ChevronDown, ChevronRight, FolderIcon, PlusIcon } from "./components/Icons";
-import { WindowControls } from "./components/WindowControls";
-import { DRAG } from "./components/drag";
 
 /**
  * The first screen: what is open, and every folder tcode has worked in.
@@ -68,10 +66,8 @@ export function Launchpad({
       {/* Chrome only. "Open folder" used to live here as an outlined button and
           out-shouted the project list, which is the actual content of this
           screen; it now sits on the list it adds to. */}
-      <header className="topbar" {...DRAG}>
+      <header className="topbar">
         <Wordmark />
-        <span className="topbar-gap" {...DRAG} />
-        <WindowControls />
       </header>
 
       <div className="launchpad-scroll">

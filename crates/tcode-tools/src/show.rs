@@ -47,7 +47,7 @@ impl Tool for ShowTool {
         "Display a file that already exists on disk beside this conversation, in the app's inspect pane. \
 Use this instead of writing a chart, table or HTML document into your reply: write the file first (a script, a query, a plot), then show its path. \
 Nothing about the file's contents enters this conversation, so showing a large result costs the same as showing an empty one — never inline a dataset when you can show the file it came from. \
-Rendered by extension: .html/.svg as a sandboxed artifact, .mermaid/.mmd as a diagram, .csv/.tsv as a table, .png/.jpg/.gif/.webp as an image, .md as prose, anything else as text."
+Rendered by extension: .html as a real page (its own scripts run and it may load its own stylesheets, images and data by relative path, so a self-contained plotly/bokeh/altair report works as written), .svg as a sandboxed artifact, .mermaid/.mmd as a diagram, .csv/.tsv as a table, .png/.jpg/.gif/.webp as an image, .md as prose, anything else as text."
     }
 
     fn input_schema(&self) -> Value {
@@ -139,13 +139,7 @@ Rendered by extension: .html/.svg as a sandboxed artifact, .mermaid/.mmd as a di
 /// It bounds what the *webview* can ask the backend to load on the strength of
 /// a path, and it makes the failure legible instead of a blank pane.
 pub fn is_viewable_path(path: &Path, cwd: &Path) -> Result<(), String> {
-    if is_within(path, cwd) {
-        return Ok(());
-    }
-    if tcode_core::home_dir()
-        .map(|home| is_within(path, &home.join(".tcode")))
-        .unwrap_or(false)
-    {
+    if viewable_within(path, cwd).is_some() {
         return Ok(());
     }
     Err(format!(
@@ -153,6 +147,36 @@ pub fn is_viewable_path(path: &Path, cwd: &Path) -> Result<(), String> {
         path.display(),
         cwd.display()
     ))
+}
+
+/// The same boundary as [`is_viewable_path`], answering *where* rather than
+/// whether: the root the file falls under, and its path relative to that root.
+///
+/// Both halves are needed together and neither can be recomputed by a caller
+/// without repeating this file's rules. The relative half in particular cannot
+/// be had with `strip_prefix`: containment here is component-wise and
+/// case-insensitive on Windows, so `C:\Proj\out\x.html` is inside a session
+/// opened at `c:\proj` — a prefix strip returns `None` for exactly the pairs
+/// this function accepts. It is also computed after `..` and `.` are resolved,
+/// so the result never carries a traversal onwards.
+///
+/// The desktop app serves artifacts over a loopback origin keyed by root, which
+/// is what wanted this shape: the root becomes the mount, the relative path
+/// becomes the URL, and relative references inside a report (`./fig1.png`,
+/// `../data.csv`) resolve back through this same boundary on their own request.
+pub fn viewable_within(path: &Path, cwd: &Path) -> Option<(PathBuf, PathBuf)> {
+    let scratch = tcode_core::home_dir().map(|home| home.join(".tcode"));
+    // The session folder wins when both contain the file (a project living
+    // inside `~/.tcode`), so the mount is the one the reader recognises.
+    let root = [Some(cwd.to_path_buf()), scratch]
+        .into_iter()
+        .flatten()
+        .find(|root| is_within(path, root))?;
+    let relative = normalize(path)
+        .components()
+        .skip(normalize(&root).components().count())
+        .collect();
+    Some((root, relative))
 }
 
 /// Lexical containment. Deliberately not `canonicalize`: it hits the disk for

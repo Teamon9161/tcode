@@ -53,3 +53,68 @@ describe("no second path from model output to markup", () => {
     });
   }
 });
+
+/**
+ * The other structural half: how many frames there are, and which.
+ *
+ * This app has exactly two, isolated by two different mechanisms, and each
+ * mechanism is undone by the attribute the other one needs:
+ *
+ *  - `Sandbox.tsx` has **no origin**. `allow-same-origin` would give it the
+ *    app's, and the app's realm holds `window.__TAURI__`.
+ *  - `Framed.tsx` has **its own origin** (loopback), and needs
+ *    `allow-same-origin` for a report to fetch its own data — which is safe
+ *    precisely because that origin is not this one.
+ *
+ * A third frame written by someone who copied whichever was nearest is the
+ * failure this guards: pasting `Framed`'s attributes onto a frame loading from
+ * `'self'` collapses the boundary silently, and nothing about the diff would
+ * look wrong. Adding a frame here should require reading this comment first.
+ */
+describe("frames are only where the boundary is documented", () => {
+  const FRAME_FILES = [/[\\/]Sandbox\.tsx$/, /[\\/]Framed\.tsx$/];
+
+  /** Frames as *elements*, not as the prose describing them: both files above
+   *  quote their own markup at length in the comments explaining it, and a
+   *  check that cannot tell those apart would be one that has to be relaxed. */
+  const CREATES_FRAME = [/<iframe[\s/>]/, /createElement\(\s*["'`]iframe/];
+
+  it("has no third frame", () => {
+    const offenders = sources(SRC)
+      .filter((path) => !/\.test\.tsx?$/.test(path))
+      .filter((path) => !FRAME_FILES.some((rule) => rule.test(path)))
+      .filter((path) => {
+        const source = readFileSync(path, "utf8");
+        return CREATES_FRAME.some((rule) => rule.test(stripComments(source)));
+      });
+    expect(offenders.map((path) => path.slice(SRC.length + 1))).toEqual([]);
+  });
+
+  it("keeps the opaque-origin frame opaque", () => {
+    // Read off the attribute, so the sentence in the comment above it saying
+    // `allow-same-origin` must never appear here does not itself trip this.
+    expect(sandboxAttributes(readFileSync(join(SRC, "Sandbox.tsx"), "utf8"))).toEqual([
+      "allow-scripts",
+    ]);
+  });
+
+  /** The served frame's own list is pinned by value in `FileBody.test.tsx`;
+   *  here it only has to be a named constant, so there is one place to pin. */
+  it("gives the served frame its capabilities from one named list", () => {
+    expect(sandboxAttributes(readFileSync(join(SRC, "Framed.tsx"), "utf8"))).toEqual([
+      "FRAME_SANDBOX",
+    ]);
+  });
+});
+
+/** Every `sandbox=` attribute's value: the string literal, or the name of the
+ *  expression it was given. */
+function sandboxAttributes(source: string): string[] {
+  return [...stripComments(source).matchAll(/sandbox=(?:"([^"]*)"|\{([A-Za-z_$][\w$]*)\})/g)].map(
+    (found) => found[1] ?? found[2],
+  );
+}
+
+function stripComments(source: string): string {
+  return source.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+}

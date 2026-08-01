@@ -33,7 +33,7 @@ pub use shell_filter::{OutputFilter, ShellFilters};
 /// See `show.rs` and `BootSpec::display_tools`. `is_viewable_path` and
 /// `VIEWER_TEXT_BUDGET` are the same boundary and the same budget the viewer
 /// must apply — one definition, used by the tool and by whoever loads the file.
-pub use show::{is_viewable_path, ShowTool, VIEWER_TEXT_BUDGET};
+pub use show::{is_viewable_path, viewable_within, ShowTool, VIEWER_TEXT_BUDGET};
 pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,

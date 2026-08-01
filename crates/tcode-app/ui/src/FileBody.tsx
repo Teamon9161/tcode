@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 
 import { Code } from "./components/Code";
 import { languageOf } from "./diff";
+import { Framed } from "./Framed";
 import { rich } from "./rich";
 import { Sandbox } from "./Sandbox";
 import { parseRows, shownAs } from "./show";
@@ -24,17 +25,28 @@ export function FileBody({
   path,
   label,
   body,
+  revision,
+  inline = false,
 }: {
   path: string;
   label: string;
-  /** The file's text — or, for the kinds `isBinary` claims, a `data:` URL. */
+  /** The file's text — or, for the kinds `isBinary` claims, a `data:` URL. It
+   *  is empty for the kinds `isServed` claims, which are never read here. */
   body: string;
+  /** Which version of the file this is, for the one view that holds a reference
+   *  to it rather than a copy of it (`Framed`). */
+  revision?: string | number;
+  /** Drawn in the flow of the transcript rather than filling a pane. Only the
+   *  views with no intrinsic height care. */
+  inline?: boolean;
 }) {
   const view = useMemo(() => shownAs(path, body), [path, body]);
 
   switch (view.as) {
     case "sandbox":
       return <Sandbox kind={view.sandbox} source={body} label={label} />;
+    case "framed":
+      return <Framed path={path} label={label} revision={revision} inline={inline} />;
     case "image":
       // `body` is a `data:` URL built by the backend, which is why this needs no
       // asset protocol and no `same-origin` anywhere near it.

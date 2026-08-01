@@ -965,6 +965,109 @@ pub fn shown_file(
     load_shown(Path::new(&path), &handle.cwd, binary)
 }
 
+/// The window's browser, as a small set of verbs over one native child webview.
+///
+/// These take `AppHandle` where the rest of this file takes `Supervisor`, and
+/// that is the documented exception rather than drift: a child webview is a
+/// window's child and has no headless form (see `browser.rs`). What *can* be
+/// decided without a window — turning what somebody typed into a URL — is
+/// `browser::to_url`, a pure function with its own tests.
+///
+/// `browser_open` is `async` on purpose. Tauri's `Window::add_child` documents
+/// that on Windows it deadlocks when called from a synchronous command or event
+/// handler (the IPC callback runs on the main thread, WebView2 controller
+/// creation needs the browser process, and the browser process is waiting for
+/// that same IPC call to return). An async command runs on the runtime's thread
+/// pool, so `add_child` posts its creation work to the main thread instead of
+/// running it inline, and nothing waits on itself. The other browser verbs
+/// navigate or resize an existing webview and never create one, so they stay
+/// synchronous.
+#[tauri::command]
+pub async fn browser_open(
+    app: tauri::AppHandle,
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    rect: crate::browser::Rect,
+) -> Result<(), String> {
+    browser.open(&app, rect)
+}
+
+/// Follow the pane. Called for every layout change, including each frame of a
+/// divider drag, so it stays a bare setter.
+#[tauri::command]
+pub fn browser_bounds(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    rect: crate::browser::Rect,
+) -> Result<(), String> {
+    browser.bounds(rect)
+}
+
+/// Give the window back to the HTML for a moment — see `Browser::visible`.
+#[tauri::command]
+pub fn browser_visible(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    visible: bool,
+) -> Result<(), String> {
+    browser.visible(visible)
+}
+
+/// What the user typed in the address bar. It is data (rule 3): `to_url`
+/// refuses what it cannot read rather than guessing a search query out of it.
+#[tauri::command]
+pub fn browser_navigate(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    url: String,
+) -> Result<(), String> {
+    browser.navigate(&url)
+}
+
+#[tauri::command]
+pub fn browser_step(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    delta: i32,
+) -> Result<(), String> {
+    browser.step(delta)
+}
+
+#[tauri::command]
+pub fn browser_reload(browser: State<'_, Arc<crate::browser::Browser>>) -> Result<(), String> {
+    browser.reload()
+}
+
+#[tauri::command]
+pub fn browser_close(browser: State<'_, Arc<crate::browser::Browser>>) -> Result<(), String> {
+    browser.close()
+}
+
+/// The URL a frame loads to display a file, instead of its bytes.
+///
+/// This is the same request as `shown_file` answered a different way, and which
+/// files take which route is the frontend's one extension table (`show.ts`),
+/// exactly as it is for the text/`data:` split above. A generated HTML report
+/// takes this one because the properties it needs — scripts that run, relative
+/// references that resolve, `fetch` that works — are properties of the origin
+/// it loads from, not of how its bytes are parsed. See `serve.rs`.
+///
+/// The path is data (AGENTS.md rule 3) and is re-checked here through the same
+/// boundary as every other read, inside `Serve::url`.
+#[tauri::command]
+pub fn serve_url(
+    supervisor: State<'_, Arc<Supervisor>>,
+    serve: State<'_, crate::boot::ServeHandle>,
+    session: String,
+    path: String,
+) -> Result<String, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let file = Path::new(&path);
+    let file = if file.is_absolute() {
+        file.to_path_buf()
+    } else {
+        handle.cwd.join(file)
+    };
+    serve.get()?.url(&file, &handle.cwd)
+}
+
 /// The command's whole body, reachable without a window (AGENTS.md rule 2).
 pub fn load_shown(path: &Path, cwd: &Path, as_data_url: bool) -> Result<ShownFile, String> {
     let file = if path.is_absolute() {

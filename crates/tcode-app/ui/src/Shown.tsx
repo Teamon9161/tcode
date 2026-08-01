@@ -6,7 +6,7 @@ import { FileBody } from "./FileBody";
 import { relativeTo } from "./files";
 import type { Inspect } from "./inspect";
 import { useSession } from "./session";
-import { isBinary } from "./show";
+import { isBinary, isServed } from "./show";
 
 /** Mirrors `ShownFile` in `src/commands.rs`. */
 type ShownFile = { body: string; bytes: number; truncated: boolean };
@@ -57,6 +57,15 @@ export function ShownView({
     let live = true;
     setFile(null);
     setFailure(null);
+
+    // A served file is never read here — the frame requests it from the origin
+    // itself. Pre-reading it would buy the bytes twice and, for the reports
+    // this path exists for, truncate them at `VIEWER_TEXT_BUDGET` on the way.
+    if (isServed(value.path)) {
+      setFile({ body: "", bytes: 0, truncated: false });
+      return;
+    }
+
     invoke<ShownFile>("shown_file", {
       session,
       path: value.path,
@@ -70,7 +79,9 @@ export function ShownView({
   }, [session, value.path, reload]);
 
   return (
-    <div className={`shown${inline ? " is-inline" : ""}`}>
+    <div
+      className={`shown${inline ? " is-inline" : ""}${isServed(value.path) ? " is-framed" : ""}`}
+    >
       <div className="shown-bar">
         {!inline && (
           <p className="inspect-path" title={value.path}>
@@ -97,7 +108,15 @@ export function ShownView({
       {failure ? (
         <p className="inspect-empty">{failure}</p>
       ) : file ? (
-        <FileBody path={value.path} label={value.label} body={file.body} />
+        <FileBody
+          path={value.path}
+          label={value.label}
+          body={file.body}
+          // The reload button's whole job, for the one view that holds a
+          // reference to the file rather than a copy of its bytes.
+          revision={reload}
+          inline={inline}
+        />
       ) : (
         <p className="inspect-empty">loading…</p>
       )}

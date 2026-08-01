@@ -20,6 +20,21 @@ import type { SandboxKind } from "./sandbox/protocol";
 export type Shown =
   /** Drawn behind the execution boundary (`Sandbox.tsx`). */
   | { as: "sandbox"; sandbox: SandboxKind }
+  /**
+   * Loaded by a frame from the app's loopback origin (`Framed.tsx`), as a page
+   * rather than as a string of markup.
+   *
+   * This is where a generated report goes, and the reason is that a report is
+   * not markup — it is a document with parts. A plotly file runs a script to
+   * draw itself, a quarto page pulls in a stylesheet, a notebook export asks
+   * for `./fig1.png`, and half of them fetch their own data. None of those are
+   * things the sandbox frame withholds by policy; they are things an opaque
+   * origin cannot do at all, and `innerHTML` does not run `<script>` in any
+   * origin. Served over an origin, all of it simply works, and the frame is
+   * cross-origin to the app — a stronger separation than the sandbox attribute,
+   * because it does not depend on an attribute being spelled right.
+   */
+  | { as: "framed" }
   /** Delimited rows, drawn as a table with a bounded number of them on screen. */
   | { as: "table"; separator: string }
   | { as: "image" }
@@ -27,10 +42,21 @@ export type Shown =
   | { as: "doc" }
   | { as: "text" };
 
+/**
+ * How the bytes reach the view — the question a loader must answer before it
+ * has anything to look at, which is why it lives on the path and not on `Shown`.
+ */
+export type Load =
+  /** Read as text. */
+  | "text"
+  /** Read as a `data:` URL, because it is not text. */
+  | "bytes"
+  /** Not read at all: the frame requests it from the origin itself. */
+  | "served";
+
 type View = {
   ext: string[];
-  /** Fetched as a `data:` URL rather than as text. */
-  binary?: boolean;
+  load?: Load;
   /**
    * A constant, except where the extension genuinely does not settle it. `.json`
    * is a container, not a kind of thing: an echarts option and a config file
@@ -41,14 +67,14 @@ type View = {
 };
 
 const VIEWS: View[] = [
-  { ext: ["html", "htm"], as: { as: "sandbox", sandbox: "html" } },
+  { ext: ["html", "htm"], load: "served", as: { as: "framed" } },
   { ext: ["svg"], as: { as: "sandbox", sandbox: "svg" } },
   { ext: ["mmd", "mermaid"], as: { as: "sandbox", sandbox: "mermaid" } },
   { ext: ["csv"], as: { as: "table", separator: "," } },
   { ext: ["tsv"], as: { as: "table", separator: "\t" } },
   {
     ext: ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"],
-    binary: true,
+    load: "bytes",
     as: { as: "image" },
   },
   { ext: ["md", "markdown"], as: { as: "doc" } },
@@ -69,10 +95,22 @@ export function extensionOf(path: string): string {
   return dot <= 0 ? "" : name.slice(dot + 1).toLowerCase();
 }
 
-/** Whether this file has to arrive as a `data:` URL. Answerable from the path
- *  alone, which is what the loader needs before it has anything to look at. */
+/** How this file's bytes reach the view. Answerable from the path alone, which
+ *  is what the loader needs before it has anything to look at. */
+export function loadOf(path: string): Load {
+  return LOOKUP.get(extensionOf(path))?.load ?? "text";
+}
+
+/** Whether this file has to arrive as a `data:` URL. */
 export function isBinary(path: string): boolean {
-  return LOOKUP.get(extensionOf(path))?.binary === true;
+  return loadOf(path) === "bytes";
+}
+
+/** Whether nothing needs loading: the frame fetches the file itself, so a
+ *  reader that pre-reads it would only be paying for bytes it discards — and,
+ *  for a large report, truncating them on the way. */
+export function isServed(path: string): boolean {
+  return loadOf(path) === "served";
 }
 
 /** How to draw it, once the body is in hand. */

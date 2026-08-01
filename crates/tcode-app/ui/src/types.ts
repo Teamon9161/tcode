@@ -6,6 +6,14 @@
 export const AGENT_EVENT = "tcode://agent-event";
 export const APPROVAL_REQUEST = "tcode://approval-request";
 export const TURN_FINISHED = "tcode://turn-finished";
+/** Mirrors `browser::BROWSER_NAVIGATED`. Where the browser is, reported by the
+ *  webview that owns it — the address bar reads this and never sets it. */
+export const BROWSER_NAVIGATED = "tcode://browser-navigated";
+
+/** Mirrors `browser::Navigated`. `title` is empty on the navigation itself and
+ *  arrives filled in when the document sets one, which is a second event for
+ *  the same page rather than a correction. */
+export type Navigated = { url: string; title: string };
 
 /** `AgentEvent`, adjacently tagged: unit variants carry no `data` at all. */
 export type AgentEvent =

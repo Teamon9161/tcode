@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, type RefObject } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
 /**
  * Anchoring a portalled popover to the control that opened it.
@@ -28,6 +29,27 @@ import { useCallback, useEffect, useLayoutEffect, type RefObject } from "react";
  * and a right-click menu does not become the fourth copy rule 17 exists to
  * prevent.
  */
+/**
+ * How many popovers are open, and therefore whether the browser may be on
+ * screen.
+ *
+ * Counted rather than a boolean because popovers nest — a submenu, a panel that
+ * opens a picker — and the last one closing is what should bring the page back,
+ * not the first. A boolean here would make one closing submenu reveal the page
+ * underneath the menu still open in front of it.
+ */
+let popovers = 0;
+
+function yieldToPopover(open: boolean) {
+  if (!open) return;
+  popovers += 1;
+  if (popovers === 1) invoke("browser_visible", { visible: false }).catch(() => {});
+  return () => {
+    popovers -= 1;
+    if (popovers === 0) invoke("browser_visible", { visible: true }).catch(() => {});
+  };
+}
+
 export function useSeat({
   open,
   trigger,
@@ -67,6 +89,16 @@ export function useSeat({
   useLayoutEffect(() => {
     if (open) place();
   }, [open, place]);
+
+  // A popover cannot be drawn over the browser: its page is a native webview
+  // the OS composites above the whole document, outside any stacking context
+  // CSS can reach. So the browser stands down while one is open.
+  //
+  // This lives here, in the one popover implementation (rule 17), rather than
+  // at each call site — which is the same argument that rule already makes, now
+  // with a failure worse than a mispositioned panel: a menu that opens *behind*
+  // the page looks like a button that does nothing.
+  useEffect(() => yieldToPopover(open), [open]);
 
   useEffect(() => {
     if (!open) return;

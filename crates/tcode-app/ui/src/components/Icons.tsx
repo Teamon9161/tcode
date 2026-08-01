@@ -215,6 +215,16 @@ export const PencilIcon = (props: IconProps) => (
 
 /* Sliders rather than a cog: what this opens is a short list of switches, and a
    cog in a title bar promises the application's whole preferences. */
+/** The browser. A globe rather than a window outline, which in a window full
+ *  of panes would name the wrong thing entirely. */
+export const GlobeIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <circle cx="12" cy="12" r="9" />
+    <path d="M3 12h18" />
+    <path d="M12 3a14 14 0 0 1 0 18a14 14 0 0 1 0-18Z" />
+  </Glyph>
+);
+
 export const SettingsIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M4 8h10M18 8h2M4 16h4M12 16h8" />

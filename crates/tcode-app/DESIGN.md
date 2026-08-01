@@ -285,14 +285,14 @@ One shape per job, used everywhere:
   Focus is a 1px `--brand` ring in the gutter, drawn only when more than one
   pane exists — with one pane, "which is current" is not a question anyone is
   asking, and answering it anyway spends the state colour on nothing.
-- **Title bar** — the app draws it (`decorations: false`). The thinnest band in
-  the window: back, the rail's fold toggle, and the window buttons. Nothing
-  else, and the test for what may join them is whether the thing belongs to the
-  *window* — the rail does, which is why its toggle is here and the files toggle
-  is not. It deliberately carries no title: once the window can hold several
-  conversations, naming one of them at window level is a second and
-  sometimes-wrong answer to a question each pane's own header already answers.
-  No product mark either — the window is already named by the OS.
+- **Title bar** — native window chrome owns the title and the minimize, maximize,
+  and close controls. The app toolbar beneath it is the thinnest app-owned band:
+  back, the rail's fold toggle, and display controls. It carries no conversation
+  title, because once the window can hold several conversations, naming one at
+  app level is a second and sometimes-wrong answer to a question each pane's
+  own header already answers. Native chrome is deliberate: an embedded browser
+  is a child WebView above HTML content, while the platform caption is outside
+  that hit-test region.
 
   The fold toggle is drawn plain in both states. A pressed treatment would spend
   the brand colour saying "the rail is open" while the rail itself is the

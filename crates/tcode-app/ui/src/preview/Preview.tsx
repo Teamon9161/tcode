@@ -6,7 +6,7 @@ import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
 import { BLANK, LimitsContext, type SessionState } from "../session";
 import { NO_METER, type Limits, type Meter } from "../usage";
-import { openInspect, panes, single, split, type Tiling } from "../layout";
+import { openAside, openInspect, openWeb, panes, single, split, type Tiling } from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import type { RewindTarget } from "../rewind";
@@ -101,6 +101,11 @@ const TOOL_META = new Map<string, ToolMeta>(
       { name: "grep", display_name: "Search", route: "transcript", quiet_output: true, hide_success_result: false },
       { name: "agent", display_name: "Agent", route: "transcript", quiet_output: false, hide_success_result: false },
       { name: "skill", display_name: "Skill", route: "transcript", quiet_output: false, hide_success_result: false },
+      // Every field here is what the backend really derives for `ShowTool`, not
+      // a plausible-looking set: `quiet_output` follows from its
+      // `BatchPolicy::ParallelReadOnly`, and `hide_success_result` is false
+      // because `BODY_IS_THE_RESULT` lists only the four editing tools.
+      { name: "show", display_name: "Show", route: "transcript", quiet_output: true, hide_success_result: false },
       { name: "progress", display_name: "Progress", route: "progress", quiet_output: false, hide_success_result: false },
       // The retired name a resumed session still holds, aliased onto the live
       // tool exactly as `RETIRED_NAMES` in `commands.rs` does it. In the fixture
@@ -316,6 +321,24 @@ See [the retry notes](https://example.com/retry) for the original reasoning.`,
         result: { preview: "94 lines", content: "pub enum ContentBlock { /* … */ }", isError: false },
       },
     ],
+  },
+  // A shown report, at its call site — the shape `show` actually produces most
+  // of the time, since an artifact draws where the conversation is and the
+  // pop-out is what moves it (rule 13). It is a `.html`, so this is the inline
+  // half of the framed path: the one place `.shown.is-inline.is-framed` is on
+  // screen, and the one that has to prove a page in the reading column takes a
+  // band of it rather than a scrollbar inside a scrollbar.
+  {
+    kind: "tool",
+    callId: "s1",
+    name: "show",
+    summary: "out/carry.html",
+    input: { path: "/home/teamon/code/py/duck_ext/out/carry.html", label: "Carry report" },
+    result: {
+      preview: "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
+      content: "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
+      isError: false,
+    },
   },
   // A skill call, which used to reach the transcript as the bare word `skill`:
   // core's generic summary has no key for this tool's argument.
@@ -640,6 +663,7 @@ const SCENES = [
   "model",
   "split",
   "shown",
+  "web",
   "empty",
 ] as const;
 type Scene = (typeof SCENES)[number];
@@ -663,15 +687,32 @@ function tiled(): Tiling {
   return openInspect(two, panes(two)[0].id, "a", { kind: "diff", callId: "t2" });
 }
 
-/** A conversation with a file the model put on screen beside it — the state
- *  `show` produces, which is otherwise reachable only by running a script that
- *  writes one. The fixture bodies live in `mock-core.ts`. */
+/**
+ * The two things `show` produces, side by side — the state a script writing a
+ * file gets to, which is otherwise reachable only by running one.
+ *
+ * Two panes rather than one because there are two *renderings*, and they are
+ * nothing alike: a `.csv` is parsed on this side and drawn as DOM, while a
+ * `.html` is a page loaded from the app's loopback origin (`Framed.tsx`) that
+ * runs its own scripts. A scene showing only the table left the entire framed
+ * path with no preview at all — which is how it came to be described in a
+ * handover as something you could look at when you could not.
+ *
+ * The fixture bodies live in `mock-core.ts`, and the HTML one draws itself with
+ * a script on purpose: if that paragraph still reads "replaced by script", the
+ * page is being rendered as inert markup and this whole path has regressed.
+ */
 function showing(): Tiling {
   const one = solo();
-  return openInspect(one, panes(one)[0].id, "a", {
+  const table = openInspect(one, panes(one)[0].id, "a", {
     kind: "shown",
     path: "/home/teamon/code/py/duck_ext/out/carry.csv",
     label: "Carry by tenor",
+  });
+  return openAside(table, panes(table)[1].id, "a", {
+    kind: "shown",
+    path: "/home/teamon/code/py/duck_ext/out/carry.html",
+    label: "Carry report",
   });
 }
 
@@ -683,10 +724,25 @@ function workspace(): Tiling {
   return openInspect(one, panes(one)[0].id, "a", { kind: "workspace-tree" });
 }
 
+/**
+ * A conversation beside the window's browser.
+ *
+ * Only the chrome is real here. The page is a native child webview the OS
+ * composites over the pane body, so in a design preview that rectangle is
+ * empty on purpose — see the `browser_*` cases in `mock-core.ts`. What this
+ * scene is for is the part that *was* designed on this side: the address bar
+ * against the pane header, and the browser sitting in the tiling as a pane
+ * like any other.
+ */
+function web(): Tiling {
+  return openWeb(solo());
+}
+
 /** The window each scene wants. Every scene but the split views is one conversation. */
 function layoutFor(scene: Scene): Tiling {
   if (scene === "split") return tiled();
   if (scene === "shown") return showing();
+  if (scene === "web") return web();
   if (scene === "workspace") return workspace();
   return solo();
 }

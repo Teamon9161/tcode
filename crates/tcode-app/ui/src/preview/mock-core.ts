@@ -3,7 +3,7 @@
  *
  * The preview exists so the interface can be looked at — every state, in a
  * browser, without a provider or a running turn. It is aliased in only when
- * `PREVIEW=1`, so the shipped bundle never contains it.
+ * mode `preview`, so the shipped bundle never contains it.
  */
 import type { Launchpad, OpenedSession, SessionInfo, StoredSession } from "../types";
 import type { PickerState, PinChoice } from "../picker";
@@ -126,8 +126,43 @@ const SHOWN: Record<string, string> = {
     series: [{ type: "line", data: [12, 8, 19, 15, 24], smooth: true }],
   }),
   md: "# Carry report\n\nThe 10Y **outperformed** the futures leg by 4bp.\n",
-  html: "<h2 style='font-family:sans-serif'>rendered artifact</h2>",
+  /**
+   * A report, not a fragment — and it has a script, because a script is the
+   * whole reason this file stopped going through the sandbox frame. If the
+   * fixture were static markup it would look identical either way, and the
+   * preview would go on passing after a change that put reports back behind a
+   * boundary that cannot run them.
+   */
+  html: [
+    "<!doctype html><meta charset='utf-8'>",
+    "<body style='font-family:sans-serif;margin:0;padding:16px'>",
+    "<h2>Carry report</h2><p id='drawn'>this paragraph is replaced by script</p>",
+    "<script>document.getElementById('drawn').textContent =",
+    "'drawn by the page itself, at ' + new Date().toISOString().slice(11, 19);</script>",
+  ].join("\n"),
 };
+
+/**
+ * A URL a frame can really load, standing in for the loopback origin.
+ *
+ * A `blob:` rather than a fake `http://127.0.0.1:…`, because the preview has no
+ * server behind it and a URL that 404s would demonstrate the error state of
+ * every report forever. It differs from production in one way worth knowing: a
+ * blob inherits *this* document's origin, so the frame is same-origin here and
+ * cross-origin in the app. What the preview is for is seeing the thing rendered
+ * at the right size in the right place; the boundary itself is held still by
+ * `FileBody.test.tsx` and `boundary.test.ts`, which do not depend on this.
+ */
+const SERVED = new Map<string, string>();
+
+function servedUrl(path: string): string {
+  const existing = SERVED.get(path);
+  if (existing) return existing;
+  const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "<p>no fixture for this file</p>";
+  const url = URL.createObjectURL(new Blob([body], { type: "text/html" }));
+  SERVED.set(path, url);
+  return url;
+}
 
 type WorkspaceKind = "file" | "directory" | "link";
 /** `binary` is the `data:` URL the real `workspace_read_binary` would build. A
@@ -444,6 +479,24 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "no fixture for this file";
       return { body, bytes: body.length, truncated: false } as T;
     }
+    case "serve_url":
+      return servedUrl(String(args?.path ?? "")) as T;
+    // The browser's verbs all succeed and do nothing, which is the honest
+    // fixture: the page is a native webview the OS composites over the pane,
+    // and a design preview running in an ordinary browser tab has nothing to
+    // composite with. So the scene shows the chrome — which is the part that
+    // was designed here — over the empty rectangle the webview would occupy.
+    // Faking a page inside it with an iframe would be showing something the
+    // app never draws, and would quietly answer the one question this pane
+    // raises (does the native layer land where the DOM says) with a yes.
+    case "browser_open":
+    case "browser_bounds":
+    case "browser_visible":
+    case "browser_navigate":
+    case "browser_step":
+    case "browser_reload":
+    case "browser_close":
+      return undefined as T;
     case "workspace_list":
       return listWorkspace(args) as T;
     case "workspace_read_text":

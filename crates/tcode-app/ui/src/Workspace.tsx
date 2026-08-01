@@ -13,6 +13,8 @@ import {
   navigate,
   openAside,
   openInspect,
+  openWeb,
+  paneSession,
   panes,
   parentSplit,
   rotate,
@@ -25,8 +27,6 @@ import {
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { StatusDot } from "./components/Status";
 import { BackIcon, ChevronDown, ChevronRight, CloseIcon, PlusIcon, SidebarIcon } from "./components/Icons";
-import { WindowControls } from "./components/WindowControls";
-import { DRAG } from "./components/drag";
 import { Panes, type PaneContext } from "./Panes";
 import { DisplayMenu } from "./DisplayMenu";
 import type { Display } from "./display";
@@ -62,12 +62,10 @@ import {
  * folder chip in each pane remains the path for choosing a different folder,
  * while the rail keeps the same-folder action next to the group it names.
  *
- * The title bar spans the whole window rather than sitting inside the field,
- * because it is also the window's own bar (`decorations: false`, see
- * `components/WindowControls.tsx`): window buttons belong at the window's
- * corner. It deliberately carries no title. With the window split, no single
- * conversation is "the" one, and a bar naming one of them would be a second,
- * sometimes-wrong answer to a question each pane's own header already answers.
+ * The system caption owns the window's title and controls so an embedded native
+ * browser webview cannot intercept minimize, maximize, or close. This toolbar
+ * deliberately carries only app-wide navigation and display controls; with the
+ * window split, no single conversation is "the" one to name here.
  */
 export function Workspace({
   tiling,
@@ -275,7 +273,10 @@ export function Workspace({
       // menu.
       if (!event.altKey && !event.shiftKey && (event.key === "n" || event.key === "N")) {
         const seat = focused(tiling);
-        const cwd = sessions.find((open) => open.id === seat?.pane.session)?.cwd;
+        // The browser has no folder, so with focus there this key does nothing
+        // rather than guessing at one of the folders on screen.
+        const held = seat && paneSession(seat.pane);
+        const cwd = sessions.find((open) => open.id === held)?.cwd;
         if (!cwd) return;
         event.preventDefault();
         onOpenFolder(cwd).catch(() => {});
@@ -340,6 +341,7 @@ export function Workspace({
     onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
     onToggleFiles: toggleFiles,
     onToggleWorkspace: toggleWorkspace,
+    onOpenBrowser: () => onTiling(openWeb),
     expanded,
     onToggleExpanded: (pane) => {
       onTiling((current) => focusPane(current, pane));
@@ -370,7 +372,7 @@ export function Workspace({
 
   return (
     <div className={`workspace${rail ? "" : " is-folded"}`}>
-      <header className="topbar" {...DRAG}>
+      <header className="topbar">
         <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
           <BackIcon size={15} />
         </button>
@@ -387,13 +389,12 @@ export function Workspace({
         >
           <SidebarIcon size={15} />
         </button>
-        <span className="topbar-gap" {...DRAG} />
+        <span className="topbar-gap" />
         {/* What the window draws, not what any conversation holds — which is why
             it passes the bar's own test (rule 9c) where a session action would
             not. With the window split, "show reasoning" cannot mean one thing in
             the left pane and another in the right. */}
         <DisplayMenu display={display} onChange={onDisplay} />
-        <WindowControls />
       </header>
 
       {/* Unmounted rather than hidden when folded: it holds no state of its own,

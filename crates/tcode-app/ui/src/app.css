@@ -22,9 +22,9 @@
   gap: var(--s-7);
 }
 
-/* The window is a sheet of `--chrome` with panes laid on it. The top row spans
-   every column because it is also the window's title bar (`decorations:
-   false`): window buttons belong at the window's corner, not at a pane's. */
+/* The window is a sheet of `--chrome` with panes laid on it. The app toolbar
+   spans every column; the platform caption above it owns minimize, maximize,
+   and close so a native child webview cannot intercept those controls. */
 .workspace {
   display: grid;
   grid-template-columns: 196px minmax(0, 1fr);
@@ -249,6 +249,100 @@
   margin: calc(var(--s-3) * -1);
 }
 
+/* The browser's body is deliberately empty and deliberately unpadded: the page
+   is a native webview composited over exactly this rectangle, so any padding
+   here is a strip of app background around a page that thinks it is flush.
+   `--sunken` shows through only while the webview is hidden (a popover is
+   open), which is better than a hole in the window. */
+.pane-body.is-web {
+  flex: 1;
+  min-height: 0;
+  background: var(--sunken);
+}
+
+/* The browser wears two rows like a real browser: a tab strip (page title,
+   expand, close) above a toolbar (history, address, reload). They were one row
+   once, and reload and close sitting side by side read as the same kind of
+   button — which is how "refresh the page" and "leave the browser" became the
+   same question. Closing lives on the tab, refreshing on the toolbar. */
+.pane-head.web-tabstrip {
+  padding-left: var(--s-3);
+  background: var(--chrome);
+  /* The toolbar below already borders the top of its own row; keeping the
+     base `.pane-head` bottom hairline here would draw the two rows apart with
+     a double line. */
+  border-bottom: 0;
+}
+.pane-head.web-toolbar {
+  border-top: 1px solid var(--line);
+}
+
+/* The tab's name: the page title when the page has one, its address otherwise.
+   A tab is a *place*, so it is named the way a pane is — by what it holds. */
+.web-tab-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--body);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.web-close-box {
+  display: flex;
+}
+
+/* The close menu hangs from the tab strip's X, opening downward like the
+   folder menu. Two items, because leaving the browser is a choice: exit
+   destroys the page, hide keeps it. */
+.web-close-menu {
+  right: var(--seat-right, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: min(15rem, calc(100vw - var(--s-6)));
+  max-width: calc(100vw - var(--seat-right, 0px) - var(--s-4));
+  padding: var(--s-1);
+}
+.web-close-head {
+  padding: var(--s-1) var(--s-2) var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+.web-close-note {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* The address bar takes the room the pane name has elsewhere. It is a field,
+   so unlike the rest of this header it says so — a sunken well is the promise
+   that you can type here, and here that promise is true. */
+.web-address {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+}
+.web-address-field {
+  flex: 1;
+  min-width: 0;
+  padding: var(--s-1) var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--body);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+}
+.web-address-field:focus-visible {
+  outline: none;
+  border-color: var(--brand);
+  color: var(--ink);
+}
+
+.web-error {
+  padding: var(--s-2) var(--s-3);
+  color: var(--danger-text);
+  font-size: var(--text-xs);
+}
+
 .pane-empty {
   padding: var(--s-4);
   color: var(--muted);
@@ -284,11 +378,9 @@
 
 /* ============================================================ top bar */
 
-/* Also the title bar: the thinnest band in the window, holding only what the
-   window itself needs. No bottom rule — it is `--chrome` above `--bg`, and one
-   tonal step is already a boundary. It is a drag region, so nothing in it may
-   be selectable: a text selection started on the bar is a drag the window did
-   not get. */
+/* The app toolbar: the thinnest band in the app-owned window content, holding
+   only navigation and display controls. The OS caption owns dragging and window
+   controls because a native child webview can sit above this HTML layer. */
 .topbar {
   display: flex;
   align-items: center;
@@ -3214,6 +3306,47 @@
   top: 0;
   z-index: 1;
   background: var(--bg);
+}
+
+/* A served file is a page, and a page has no intrinsic height to report — its
+   origin is not this one, so nothing here can measure it the way `Sandbox` asks
+   its frame to. It takes the room it is given instead. The floor matters more
+   than it looks: an `<iframe>` with no height is 150px, which is enough of a
+   report to know one is there and not enough to read it. */
+.framed {
+  display: block;
+  width: 100%;
+  height: 100%;
+  min-height: 20rem;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
+
+/* In a pane the report is the pane. `.is-framed` rather than `:has()` so this
+   does not depend on a selector the oldest supported webview may not have. */
+.pane-body.is-inspect > .shown.is-framed {
+  height: 100%;
+}
+.shown.is-framed .framed {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Inline it is a band in the reading column, like every other artifact at a
+   call site — bounded here rather than by `.shown.is-inline`'s scroll, because
+   a frame that scrolls inside a box that also scrolls is two scrollbars for one
+   document. */
+.framed.is-inline {
+  height: 20rem;
+  min-height: 0;
+}
+
+/* …and the box around it gives up its own scroll, for the same reason: the
+   frame is already the scrolling surface for its document. */
+.shown.is-inline.is-framed {
+  max-height: none;
+  overflow: visible;
 }
 
 .shown-image {

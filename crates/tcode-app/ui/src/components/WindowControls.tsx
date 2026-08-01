@@ -4,20 +4,11 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CloseIcon, MaximizeIcon, MinimizeIcon, RestoreIcon } from "./Icons";
 
 /**
- * The window's own buttons, because the app draws its own title bar.
+ * Legacy custom window controls.
  *
- * `decorations: false` is not a stylistic preference. A native caption bar sits
- * above our toolbar as a second horizontal band doing the same job, and it
- * carries an icon and a title the app has nothing to say with — the whole strip
- * is dead space in a window whose top row already names the session and its
- * folder. Removing it means the toolbar *is* the title bar, which is why the
- * bar carries `data-tauri-drag-region` and why these three controls have to
- * exist: without them the window cannot be minimized or closed at all.
- *
- * Failures are logged, not fatal (unlike the event listeners in `App.tsx`): a
- * minimize button that does nothing is a broken button, while a window that
- * refuses to open because of one is a broken app. The likely cause is a missing
- * grant in `capabilities/default.json` — see AGENTS.md rule 6.
+ * The desktop app uses the native caption so an embedded child browser webview
+ * cannot intercept their clicks. Keep this component unrendered unless a
+ * platform-specific native hit-test layer is introduced alongside it.
  */
 export function WindowControls() {
   const [maximized, setMaximized] = useState(false);

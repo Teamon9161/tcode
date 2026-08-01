@@ -3,7 +3,7 @@
  *
  * The window controls are part of the title bar's layout, so the preview has to
  * draw them; there is no window behind them in a browser tab, so every call is
- * a no-op that resolves. Aliased in only when `PREVIEW=1`.
+ * a no-op that resolves. Aliased in only under mode `preview`.
  */
 export function getCurrentWindow() {
   return {

@@ -22,6 +22,28 @@ pub struct Startup {
     pub supervisor: Arc<Supervisor>,
     pub session: Arc<SessionHandle>,
     pub warnings: Vec<String>,
+    pub serve: ServeHandle,
+}
+
+/// The loopback origin for shown artifacts, or why there isn't one.
+///
+/// Deliberately not fatal to startup. Binding loopback essentially always
+/// succeeds, but "essentially" on Windows includes security software that
+/// blocks a process from listening at all — and an app that refuses to open
+/// because one kind of file cannot be displayed would be trading the whole
+/// tool for a feature. The failure is carried instead of dropped so the pane
+/// that needs it can say what happened rather than staying blank.
+pub struct ServeHandle(pub Result<Arc<crate::serve::Serve>, String>);
+
+impl ServeHandle {
+    pub fn get(&self) -> Result<&Arc<crate::serve::Serve>, String> {
+        self.0.as_ref().map_err(|why| {
+            format!(
+                "the local viewer origin could not start ({why}), so HTML files cannot be displayed. \
+Restarting tcode will try again; if it keeps failing, something on this machine is blocking loopback connections."
+            )
+        })
+    }
 }
 
 /// Opens further folders as sessions, after boot.
@@ -156,9 +178,20 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     ));
     supervisor.open(handle.clone());
 
+    let serve = ServeHandle(
+        crate::serve::Serve::start()
+            .await
+            .map_err(|error| error.to_string()),
+    );
+    let mut warnings = booted.warnings;
+    if let Err(why) = &serve.0 {
+        warnings.push(format!("HTML files cannot be displayed: {why}"));
+    }
+
     Ok(Startup {
         supervisor,
         session: handle,
-        warnings: booted.warnings,
+        warnings,
+        serve,
     })
 }

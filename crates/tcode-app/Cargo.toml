@@ -27,11 +27,27 @@ tcode-core = { path = "../tcode-core" }
 tcode-tools = { path = "../tcode-tools" }
 tcode-providers = { path = "../tcode-providers" }
 tcode-frontend = { path = "../tcode-frontend" }
-tauri = { version = "2", features = [] }
+# `unstable` is what exposes `Window::add_child` — multiple webviews in one
+# window, which is the only way to put a real browser in a pane (see
+# `src/browser.rs`). Tauri marks it unstable; that is the entry fee for this
+# feature, as there is no stable alternative.
+tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
+
+# The loopback origin for shown artifacts (`serve.rs`). `ServeDir` rather than
+# hand-rolled file serving: byte ranges, conditional requests, HEAD, directory
+# index and MIME-by-extension are all things a generated report exercises, and
+# all things a second implementation gets subtly wrong.
+hyper = { version = "1", features = ["http1", "server"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["fs"] }
+bytes = "1"
+percent-encoding = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -42,3 +58,6 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 tempfile = "3"
 futures = "0.3"
+# An HTTP client for the serve tests, so they exercise the real thing a webview
+# frame does rather than calling the handler directly.
+reqwest = { version = "0.12", default-features = false }

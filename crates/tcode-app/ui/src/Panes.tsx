@@ -14,10 +14,11 @@ import {
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
 import { FolderMenu } from "./FolderMenu";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, CollapseIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, CollapseIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon } from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
+import { WebPane } from "./WebPane";
 import { Approval } from "./Approval";
 import { ProgressStrip } from "./ProgressStrip";
 import { QueueStrip } from "./QueueStrip";
@@ -64,6 +65,8 @@ export type PaneContext = {
   onNavigate: (pane: string, step: typeof navBack) => void;
   onToggleFiles: (pane: string, session: string) => void;
   onToggleWorkspace: (pane: string, session: string) => void;
+  /** Open the window-owned browser from the local file-navigation tool group. */
+  onOpenBrowser: () => void;
   /** The currently focused content takes the full pane field without changing
    *  the tiling tree, so leaving focus restores every pane in place. */
   expanded: string | null;
@@ -116,7 +119,7 @@ export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContex
               className={`pane-slot${visible ? "" : " is-hidden"}`}
               style={box(visible && expanded ? WHOLE : rect)}
             >
-              <Pane leaf={leaf} context={context} />
+              <Pane leaf={leaf} context={context} expanded={expanded === leaf.id} hidden={!visible} />
             </div>
           );
         })}
@@ -221,7 +224,21 @@ function Divider({
 /** The frame every pane wears. Focus follows the pointer down rather than a
  *  click, so dragging a divider or selecting text in a pane also makes it the
  *  current one — the same moment a window manager would have taken focus. */
-function Pane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
+function Pane({
+  leaf,
+  context,
+  expanded,
+  hidden,
+}: {
+  leaf: Leaf;
+  context: PaneContext;
+  /** This pane is the one filling the field. */
+  expanded: boolean;
+  /** Another pane fills the field and this slot is `visibility: hidden`. The
+   *  browser's native webview needs it told separately (`hidden` in WebPane):
+   *  CSS visibility does not reach it. */
+  hidden: boolean;
+}) {
   const current = context.split && leaf.id === context.focus;
   return (
     <section
@@ -234,14 +251,28 @@ function Pane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
       {/* A pane is where "which conversation" is answered, so it is where the
           answer is published. Leaves that need it — a `show` artifact loading
           its file — read it from here instead of having it threaded through
-          every layer of the transcript. */}
-      <SessionContext.Provider value={leaf.pane.session}>
-        {leaf.pane.kind === "session" ? (
-          <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
-        ) : (
-          <InspectPane leaf={leaf} context={context} />
-        )}
-      </SessionContext.Provider>
+          every layer of the transcript.
+
+          The browser publishes nothing, because it is the window's and not a
+          conversation's: anything under it that asked "which session am I in"
+          would be asking a question with no answer, and an empty string is a
+          worse answer than none. */}
+      {leaf.pane.kind === "web" ? (
+        <WebPane
+          onClose={() => context.onClosePane(leaf.id)}
+          expanded={expanded}
+          onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
+          hidden={hidden}
+        />
+      ) : (
+        <SessionContext.Provider value={leaf.pane.session}>
+          {leaf.pane.kind === "session" ? (
+            <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
+          ) : (
+            <InspectPane leaf={leaf} context={context} />
+          )}
+        </SessionContext.Provider>
+      )}
     </section>
   );
 }
@@ -311,6 +342,14 @@ function SessionPane({
           title={`Browse ${info.name} workspace`}
         >
           <FolderIcon size={14} />
+        </button>
+        <button
+          className="icon-btn"
+          onClick={context.onOpenBrowser}
+          aria-label="Open or close the browser"
+          title="Open or close the browser"
+        >
+          <GlobeIcon size={14} />
         </button>
         <ExpandPane leaf={leaf} context={context} />
         <button

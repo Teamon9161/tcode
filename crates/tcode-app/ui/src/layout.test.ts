@@ -10,6 +10,8 @@ import {
   navigate,
   openAside,
   openInspect,
+  openWeb,
+  webPane,
   browserPane,
   panes,
   parentSplit,
@@ -43,6 +45,7 @@ function shape(tiling: Tiling): string {
 }
 
 function label(pane: Pane): string {
+  if (pane.kind === "web") return "web";
   return pane.kind === "session"
     ? pane.session
     : `${pane.session}:${navValue(pane.nav).kind}`;
@@ -497,5 +500,57 @@ describe("the workspace browser's pane", () => {
 
     expect(found.pane.kind === "inspect" && navValue(found.pane.nav).kind).toBe("workspace-tree");
     expect(browserPane(picked, "duck_ext")).toBeNull();
+  });
+});
+
+/**
+ * The browser, which is the window's rather than any conversation's.
+ *
+ * Everything here follows from it carrying no `session`, so these are the tests
+ * that would catch someone "tidying" that up by giving it one.
+ */
+describe("the browser pane", () => {
+  /** The same button both brings the browser in and takes it away. */
+  it("opens the browser, and the same button closes it again", () => {
+    const first = openWeb(single(talk("tcode")));
+    expect(shape(first)).toBe("row(tcode, web)");
+
+    const again = openWeb(first);
+    expect(shape(again)).toBe("tcode");
+    expect(webPane(again)).toBeNull();
+  });
+
+  /** The point of the whole shape: you are reading a doc, you close the
+   *  conversation you happened to open it from, and the doc stays. */
+  it("survives closing every conversation", () => {
+    const open = openWeb(showBeside(single(talk("tcode")), "duck_ext"));
+    const gone = closeSession(closeSession(open, "tcode"), "duck_ext");
+
+    expect(shape(gone)).toBe("web");
+    expect(webPane(gone)).not.toBeNull();
+  });
+
+  it("is not counted as a conversation on screen", () => {
+    const open = openWeb(single(talk("tcode")));
+    expect(sessionsInView(open)).toEqual(["tcode"]);
+  });
+
+  /** `show` overwrites the focused pane rather than splitting forever. With
+   *  focus on the browser that would close the page being read, which is the
+   *  one pane in the window with nowhere to be reopened from. */
+  it("is never overwritten by a conversation arriving", () => {
+    const open = openWeb(single(talk("tcode")));
+    const arrived = show({ ...open, focus: webPane(open)!.id }, "duck_ext");
+
+    expect(shape(arrived)).toBe("row(tcode, row(web, duck_ext))");
+    expect(webPane(arrived)).not.toBeNull();
+  });
+
+  it("closes from its own header like any other pane", () => {
+    const open = openWeb(single(talk("tcode")));
+    const shut = close(open, webPane(open)!.id);
+
+    expect(shape(shut)).toBe("tcode");
+    expect(webPane(shut)).toBeNull();
   });
 });

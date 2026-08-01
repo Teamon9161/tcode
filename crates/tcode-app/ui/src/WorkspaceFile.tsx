@@ -261,7 +261,11 @@ export function WorkspaceFile({ path }: { path: string }) {
           />
         ) : (
           <div className="workspace-file-body">
-            <FileBody path={path} label={label} body={text} />
+            {/* `revision` is the backend's, so saving this file reloads the
+                frame that is displaying it. Without it a rendered report would
+                keep showing the version from before the save — the one view
+                here that holds a reference rather than the bytes. */}
+            <FileBody path={path} label={label} body={text} revision={file.revision} />
           </div>
         )
       ) : null}

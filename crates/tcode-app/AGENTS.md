@@ -18,7 +18,11 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
-**改界面先开 `npm run preview:ui`。** 它用 `PREVIEW=1` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在 `PREVIEW=1` 下生效，发布产物里没有它们。
+**改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
+
+**开关是 `--mode` 而不是环境变量，这条是踩出来的**：原来写的是 `PREVIEW=1 vite`，那是 POSIX shell 给单条命令设环境变量的语法，在 cmd 与 PowerShell 里是**解析错误**——于是"改界面先开预览"这条规矩在 Windows 上整整一段时间根本执行不了，而失败长得像 npm 坏了。新加需要开关的 script 一律用 CLI flag。
+
+**这个 mode 下 `/` 就是预览本身**（`vite.config.ts` 的 `previewRoot`）。不做这个 rewrite 时根路径照旧发 `index.html`——真 app 的壳，fixture 是别名进来了但没有后端回答它启动时发的那些命令，于是画出一个空窗加一行 console warning，**和"预览坏了"完全分不清**。而它离一个错 URL 永远只有一步：刷新时丢了路径、存了个书签、或者照着 vite 启动时打印的那个 host 直接敲进去。所以 `--open` 不带路径也是对的。
 
 **`tauri.conf.json` 里刻意不配 `devUrl`。** Tauri 在 debug 构建下只要看见 `devUrl` 就去连它，于是 `cargo run` 会撞上 "Connection refused"——而 `cargo run` 正是这里的主流程。不配它，debug 与 release 一样加载 `frontendDist`（`ui/dist`），代价是改前端要重跑一次 `npm run build`。想要 HMR 就临时加回 `devUrl: "http://localhost:5173"` 并同时起 `npm run dev`，别把它留在提交里。
 
@@ -52,9 +56,9 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
-9c. **窗口自己画标题栏**（`decorations: false`）。因此 `.topbar` 是 title bar：它带 `data-tauri-drag-region`（`components/drag.ts` 的 `DRAG`），里面所有惰性元素也要带——Tauri 只看 mousedown 命中的那个元素，不看祖先——而所有可点元素绝不能带，否则拖拽吞掉点击。窗口按钮在 `components/WindowControls.tsx`，对应四条 capability 授权（start-dragging / minimize / toggle-maximize / close），少一条的表现是按钮静默无效（规则 6）。topbar 横跨整个窗口宽度而不是待在窗格里：窗口按钮属于窗口的角，不属于某一个窗格的角。
+9c. **窗口使用系统标题栏**（`decorations: true`）。浏览器是 Windows 上的原生子 webview，它会在 HTML 之上接收命中；系统 caption 位于非客户区，不会被它盖住。因此最小化、最大化、关闭一律由平台提供，`.topbar` 只是 app 工具栏，不带 `data-tauri-drag-region`，也不画 `WindowControls`。
 
-    **topbar 里只放窗口级别的东西**（返回启动台、折叠会话栏、窗口按钮），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于窗口还是属于某个会话"：会话栏属于窗口，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在窗口这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。它看起来空是对的：它是 title bar，不是工具条。
+    **topbar 里只放 app 级别的东西**（返回启动台、折叠会话栏、显示偏好），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于整个 app 还是属于某个会话"：会话栏属于 app，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。
 
 9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。单个调用、连续读、连续编辑、连续命令、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
 
@@ -92,25 +96,56 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     `Pane` 的两个变体都带 `session`，这是承重的：关掉一个会话必须连它开出去的 diff、run、artifact 一起收走，`closeSession` 能写成几行全靠它。inspect 窗格持有的是 `Nav`（整条前进后退历史）而不是一个 `Inspect` 值——历史属于窗格，不属于组件，否则窗格一挪位置历史就没了。
 
+9h. **浏览器窗格是原生子 webview，而且是窗口级单例**（`src/browser.rs` + `ui/src/WebPane.tsx`，`Pane` 的第三个变体 `{kind:"web"}`）。
+
+    **capability 恒为空，这条是全仓库最容易静默破掉的一条。** Tauri 的 capability 按 label 匹配，而 `windows: ["main"]` 的语义是**授予该窗口下的每一个 webview**（tauri-utils 原话：regardless of the value of `webviews`）。浏览器是 `main` 的子 webview，所以那一行等于把 `core:default` 发给任意网页，也就是把 `window.__TAURI__`、也就是本机任意命令，发给任意网页。**破掉时什么都不会坏**：app 正常、浏览器正常、只是每个站点都被信任。`capabilities/default.json` 因此写 `webviews: ["main"]`，`browser.rs` 里有一条测试读那个文件钉住它（已验证改回 `windows` 会红）。这也是回读页面只能走 `eval_with_callback` 的原因——它在 runtime 层（WebView2 的 `ExecuteScript`）而不是 Tauri IPC，所以页面不需要任何权限我们也读得到。永远不要为了"让 agent 能操作页面"去加 `dangerousRemoteDomainIpcAccess`。
+
+    **它不带 `session`，这是承重的不是省事**：`closeSession` 按 `paneSession(pane)` 过滤，浏览器答 `null` 于是永远不会被会话带走——你正在读的文档不该因为关掉一个对话而消失。连带三条：入口放在每个会话窗格的文件/工作区工具组中，方便在找文件时就近打开，但它仍只会聚焦同一个窗口级浏览器；`sessionsInView` 要跳过它；**`show` 落在它上面必须分裂而不是覆盖**——那是窗口里唯一一个覆盖掉就找不回来的窗格。`layout.test.ts` 有一组测试钉这几条。
+
+    **原生 webview 合成在 HTML 之上**，不在任何 CSS 能触达的层叠上下文里，所以**每个 popover 打开时浏览器必须让位**（`seat.ts::yieldToPopover`，计数而非布尔——popover 会嵌套，最后一个关掉才恢复）。挂在 `seat.ts` 而不是各调用点，就是规则 17 那条"只有一份实现"现在多了一个更难查的失败：菜单开在页面**后面**，看起来是按钮没反应。
+
+    **rect 由前端连续上报**（`WebPane` 的 `useLayoutEffect` **不带依赖数组**）：原生 webview 不参与布局，它只待在最后被告知的位置，而窗格会**不改变尺寸地移动**（邻居关闭、远处分隔条被拖），那种情况 `ResizeObserver` 一次都不响。两者都要。
+
+    **地址栏是视图不是真相**：webview 自己拥有"现在在哪"，输入只是请求它去某处，显示的 URL 一律来自 `BROWSER_NAVIGATED` 回报——于是重定向、点链接、`history.back()` 三种情况走同一条路径，没有任何地方需要猜一次导航是否真的发生了。**前进后退按钮不能置灰**：有没有可去之处存在页面自己的历史里，跨源读不到；`history.go` 无处可去时什么都不做，那是无害的方向，而猜一份栈出来只会在 SPA 上错得更难查。
+
+    **`to_url` 里 loopback 走 `http` 不是 `https`**（纯函数，有测试）：这个窗格被要求做出来的头号用途就是看 dev server，而 `localhost:5173` 是明文 HTTP，默认给它 `https` 等于在最常输入的那一行前面立一个 TLS 错误页。**裸词报错而不是搜索**：这个 app 没有搜索提供商，把用户打的字悄悄发给一个他没点名的服务不在选项里。
+
+    **tab 只给 `web` 窗格，别的 inspect 值一个都不给。** `inspect.ts` 那条"单值槽不是 tab 容器"仍然成立，它服务的是**对照**（想同时看两样就分屏）；浏览网页要的是**切换**，同屏摊开五个网页没有意义,而每开一页裂一个窗格会把窗口撑爆。两种窗格要的是不同的东西,所以这是一次有理由的例外,不是先例——发现自己想给 diff 或 run 加 tab 时，回来读这一段。
+
 10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
 
     只有两处豁免，各自在文件里写明理由：`math.tsx`（KaTeX 的产物本身就是 markup 字符串，边界改画在 KaTeX 的 options 上，`trust: false` 是承重的那一条，且 options 被 freeze 且不接受参数）和 `src/sandbox/`（见规则 11）。`src/boundary.test.ts` 机械地扫描 `src/`，除这两处外出现 `dangerouslySetInnerHTML` / `innerHTML =` / `eval` / `new Function` 即失败；`src/rich.test.tsx` 用敌意 markdown 断言输出是文本。**新增第三处豁免之前，先确认它不能改成构造节点。**
 
-11. **artifact 沙箱的三条不变量**（`src/sandbox/`，图表/图示/模型自写 HTML 都在里面渲染）：
+11. **artifact 沙箱的三条不变量**（`src/sandbox/`，图表/图示/**模型在回复里手写的** HTML 都在里面渲染；磁盘上的 `.html` 文件走 11b，别混）：
 
     - **iframe 永远只有 `sandbox="allow-scripts"`，绝不加 `allow-same-origin`**。没有它，frame 是不透明源：`parent.document`、`parent.__TAURI__`、`localStorage` 全部抛 DOMException（实测），于是里面爱怎么 `innerHTML` 都只能毁掉它自己。加上它，这一整套设计当场归零。`rich.test.tsx` 钉住了这个属性。
     - **`tauri.conf.json` 的 `script-src` 永远不许出现 `unsafe-inline` / `unsafe-eval`**。它是规则 10 的第二道防线。（`img-src` 里的 `data:` 是给粘贴图片的缩略图开的，与规则 10 不冲突：`rich.tsx` 把模型输出里的 image token 渲染成文本 chip，模型根本没有产出 `<img>` 的路径。）
     - **沙箱里的脚本必须是经典脚本，不能是 module**。实测：不透明源下 `<script type="module">` 走 CORS，请求带 `Origin: null`，除非服务端显式放行否则**根本不执行**；经典 `<script src>` 是 no-cors，无条件可用。所以 `src/sandbox/*` 由 `vite.sandbox.config.ts` 单独构建成 IIFE 进 `public/`，不走主 module graph。改成 module 会在开发机上"看起来能跑"（若 dev server 恰好发了 ACAO）而在装出来的 app 里静默失效。
 
+11b. **这个 app 有两个 frame，靠两种不同的机制隔离，而各自需要的属性恰好会拆掉对方。** 加第三个之前先读完这条（`boundary.test.ts` 机械地钉住"只有两个"）。
+
+    | | `Sandbox.tsx` | `Framed.tsx` |
+    |---|---|---|
+    | 装的是 | 模型手写的 markup **字符串** | 磁盘上的一个**文件** |
+    | 从哪加载 | app 自己的源（`sandbox.html`） | 本机 origin `http://127.0.0.1:<随机端口>` |
+    | 靠什么隔离 | **没有源**（`allow-scripts` 且**绝不**加 `allow-same-origin`） | **有自己的源**，与 app 不同源 |
+    | 因此 | 加 `allow-same-origin` 当场归零 | 必须给 `allow-same-origin`，报告要 fetch 自己的数据 |
+
+    **两边的 `sandbox` 属性长得相反，而抄错一次没有任何编译或测试之外的迹象。** 把 `Framed` 那串属性贴到一个从 `'self'` 加载的 frame 上，边界当场消失，diff 看起来还完全正常——这就是 `boundary.test.ts` 里那两条按属性值（不是按注释文本）比对的检查存在的理由。
+
+    **为什么 `.html` 文件搬出了规则 11**：它在那里从来就没工作过，而不是工作得不够好。`innerHTML` 按规范**不执行** `<script>`，加上 `sandbox.html` 继承 app 的 `default-src 'self'`，于是 plotly/bokeh/altair 的自包含产物和 CDN 产物**两种都是死的**——一个 python 报告在那条路上永远只是一个空 div。这三件事全是"字节从哪加载"的属性，不是"解析得够不够小心"的属性，所以修法只能是给它一个源（`src/serve.rs`）。
+
+    **它确实弄脏了规则 13 的"一张表两个入口"，这条要睁眼看着**：` ```html ` 围栏仍走 sandbox，`.html` 文件走 framed，这是那张表里**唯一**一处内联与文件不同的条目。理由是这两个位置装的东西对 mermaid/svg 是同一个（同一段源换个地方），对 html 不是：围栏里的是模型手写的 markup，文件是脚本产出的文档。**但这个不对称有个真实的缺口**——模型可以 `write` 一段自己手写的 HTML 到文件再 `show` 它，那段 markup 就换了跑道。缓解写在 `serve.rs` 的 `POLICY` 上（`connect-src 'self'` + `form-action 'none'`，堵外传不堵渲染），**它是纵深不是边界**，理由同样写在那儿：能写 HTML 的前提是能写文件+能跑脚本，而那两件事都过审批，且都是更直接的出口。改这条之前先读那段注释。
+
 12. **沙箱拿到的主题值必须是 sRGB**。主题用 OKLCH 写，而沙箱里的第三方库自己解析颜色（mermaid 的 khroma 直接拒绝 `oklch(...)`）。`Sandbox.tsx` 的 `readTheme()` 负责光栅化转换后再发过去——注意只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回。
 
-13. **`show` 出来的文件与模型自己写的正文同级不可信**（`ui/src/Shown.tsx` + `src/commands.rs::shown_file`）。文件是脚本产出的、不是模型手写的，但那不抬高它的信任等级——它同样是观察到的数据。所以 `.html`/`.svg`/`.mmd`/echarts option **必须走规则 11 那同一个 `sandbox="allow-scripts"` 无 same-origin 的 iframe**，不许因为"这是本机文件"改用 asset 协议、`same-origin` 或直接 `location = file://`。图片走后端返回的 `data:` URL（CSP `img-src` 已有 `data:`），因此也不需要任何新协议。
+13. **`show` 出来的文件与模型自己写的正文同级不可信**（`ui/src/Shown.tsx` + `src/commands.rs::shown_file`）。文件是脚本产出的、不是模型手写的，但那不抬高它的信任等级——它同样是观察到的数据。所以 `.svg`/`.mmd`/echarts option **必须走规则 11 那同一个 `sandbox="allow-scripts"` 无 same-origin 的 iframe**；`.html` 走 11b 的本机 origin（**同样不许**改用 asset 协议、给它 app 的源、或直接 `location = file://`——它拿到的是一个**第三方**源，不是放行）。图片走后端返回的 `data:` URL（CSP `img-src` 已有 `data:`），因此也不需要任何新协议。
 
     **路径来自 webview，所以是数据**（规则 3）：`shown_file` 不因为"模型调 show 时已经查过了"就信它，重新过一遍 `tcode_tools::is_viewable_path`——工具与命令共用**同一个** boundary 定义，两处各写一份必然漂移。`VIEWER_TEXT_BUDGET` 同理：工具说"会被截断"和 viewer 真截断，用的是同一个常量。
 
     **`Inspect` 的 `shown` 是唯一读磁盘的检视值**，与 `Inspector.tsx` 顶上"一切来自 blocks 而非磁盘"刻意相反：其余每一种都在回答"agent 做了什么"，重读文件会把问题换成"现在是什么"；而 `show` 的文件正是为了**不进对话**才写到磁盘的，transcript 里根本没有它的字节。因此陈旧只靠 reload 按钮说清楚，**不要上文件监听**——为一个按钮换一套常驻机制不划算。
 
-    **未做的第二阶段**：让 option 里能写 `{"$file": "pnl.csv"}` 由前端解引用，见 `DATA-BINDING.md`（含承重约束：解引用只能在父窗口做，沙箱读不到文件）。
+    **未做的第二阶段**：让 option 里能写 `{"$file": "pnl.csv"}` 由前端解引用，见 `DATA-BINDING.md`（含承重约束：解引用只能在父窗口做，沙箱读不到文件）。**这条约束对 framed 的 `.html` 不再成立**——它与自己的数据同源，直接 `fetch('./pnl.csv')` 就有，不需要任何解引用协议。那份文档说的仍是沙箱里的 echarts option。
 
     **`ui/src/show.ts` 是 `fences.tsx` 的第二个入口，不是第二张表**：围栏语言与文件扩展名问的是同一个问题，答案重合（mermaid/html/svg/markdown）。分成两套的后果是同一张图内联写和写成文件长得不一样，而 `show` 的全部意义就是"改的只有成本，不是结果"。`.json` 是唯一按内容判定的条目（它是容器不是一种东西），其余在加载任何字节之前就定了。**第三个入口是文件树点开的文件**（`WorkspaceFile.tsx`），同表同渲染（`FileBody.tsx`），理由同上。
 
@@ -155,7 +190,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。右键菜单是同一个弹出层的另一种锚（`at` 传视口坐标当零尺寸矩形），不是第四份实现；子菜单画在父菜单的 DOM 里而不是另开 portal，否则点子菜单会被父菜单判成"点了外面"。
 
-    **`mousedown` 监听必须是捕获阶段。** Tauri 自己的 `drag.js` 在 `document` 上监听 mousedown，命中 `data-tauri-drag-region` 就 `stopImmediatePropagation()`——而按 9c 整条标题栏都是拖拽区，于是冒泡阶段的监听永远听不到"点了标题栏"，而设置菜单的触发器恰好就在那儿：表现是"点旁边关不掉，只能再按一次按钮"。
+    **`mousedown` 监听必须是捕获阶段。** Tauri 自己的 `drag.js` 会在 `document` 上处理命中 `data-tauri-drag-region` 的 `mousedown` 并调用 `stopImmediatePropagation()`；所以任何复用 `DRAG` 的区域旁若有 popover 触发器，冒泡阶段的监听都会漏掉关闭事件。
 
     **Esc 的优先级写在 `Workspace.tsx` 里，不靠挂载顺序。** 它和 `seat.ts` 都在 window 捕获阶段，`stopPropagation` 分不开同一元素上的两个监听，先跑的是先挂的（就是窗格那个）。所以窗格的 Esc 显式让位给两样东西：开着的 `.seated`，以及正在被输入的 input/textarea（树里的重命名、编辑器里没存的改动）。**Esc 永远不许是那个把你正在写的东西扔掉的键。**
 
@@ -185,7 +220,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-- `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`theme/`（token 契约与主题包）、`preview/`（只在 `PREVIEW=1` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
   - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 用量环 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
   - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。
@@ -199,7 +234,9 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **`summary` 回答"哪一个"，参数属于 `detail`。** skill 的 `name` 与 `arguments` 拼成一个字符串时读者看不出名字在哪儿结束（`impeccable audit the trace column`），而行要回答的问题是"加载了哪个 skill"。参数走 shell 命令用的那同一个折叠位。唯一的例外是 `progress`：它的路由**随 input 变**（阶段翻转归计划条，提交的计划是对话要留住的文档），后端送的是工具的默认答案，那一个例外由 `plan.ts::isPlanSubmission` 在调用点认出来——一个字段，紧挨着它读的类型。
   - **批次里的调用没有 summary**：core 的三条并发路径（parallel read / mutation lanes）只发 `ToolBatchStart`，不为每个调用发 `ToolStart`，所以 `(call_id, name, input)` 之外什么都没有。`toolViews.tsx` 的 `describe` 从 input 里取目标补上——展开一个批次看到五行 `read` 而不知道读了什么，等于批次白折叠。真正的修法是 core 把它已经算好的 `summarize_call` 一并放进 `ToolBatchStart`。
-  - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。渲染本体在 `FileBody.tsx`（表格只把有限行放进 DOM，`ROW_STEP` 不是分页而是上限——20 万行 DOM 就是一个冻住的窗口）。
+  - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。
+  - **`show.ts` 的 `Load` 有三个值不是两个**：`text` / `bytes` / `served`。第三个的意思是**根本不读**——frame 自己去 origin 取，所以 `Shown.tsx` 对它跳过 `shown_file`。这不是省一次 IO：走读的那条路会在 `VIEWER_TEXT_BUDGET` 上把一份 10MB 的自包含报告截断，然后把残片交给一个跑不了它脚本的渲染器。**新加一种"前端不该读"的文件时改这个字段，不要在 `Shown.tsx` 里加 `if`。**
+  - **`Framed.tsx` 的 reload 是 React `key`，不是 URL 上的 cache-buster**。跨源没法叫文档自己刷新，所以把手只能是元素本身：换 key → 卸载重建 → 重新请求 → `no-store` 让它是一次真读。写成 `?v=N` 对真 server 也work，但对任何不吃 query 的 URL 就碎了——设计预览里那个 `blob:` 正是这种，这条就是这么发现的。渲染本体在 `FileBody.tsx`（表格只把有限行放进 DOM，`ROW_STEP` 不是分页而是上限——20 万行 DOM 就是一个冻住的窗口）。
   - **文件树点开的文件是那张表的第三个入口，不是第四种画法**（`WorkspaceFile.tsx`）。它和 `Shown.tsx` 共用 `FileBody`，所以一个 `.svg` 是模型 show 出来的还是有人从树里点开的，画出来一模一样。它曾经是 `WorkspaceEditor`：所有文件一律开在灰 textarea 里，旁边挂一个 `source / preview` 开关——而"preview"这个区分只有 Markdown 有，`.rs` 点它没有意义，`.png` 后端根本读不出来（`Workspace::read` 只认 UTF-8）。
 
     **两态是"看"和"改"，不是"源码"和"预览"。** 渲染是静止态（打开一个文件的窗格就是被要求把它显示出来），改是一次点击（改是一个决定）。**读的时候不许有输入框的外观**——沉底的灰井是"这里可以打字"的承诺，静止态给这个承诺就是承诺错了东西；井属于 textarea，跟它一起出现。哪些文件连这个开关都没有也由同一张表说了算：`isBinary` 认下的以 `data:` URL 到达，那是一张图片，图片没有源码可以放进 textarea。
@@ -209,9 +246,13 @@ cargo build && cargo test                 # 后端 + 集成测试
   - **语法高亮：语法来自 Shiki，配色一律不来自它**（`syntax.ts`）。这里曾经是一个手写扫描器，理由是任何库都自带调色板、是字面值、主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色——那条理由至今成立，变的是划线的位置。现在交给 Shiki 的**主题根本不是调色板**：`mark()` 把八种 kind 各涂一个哨兵色（`#000001`…），`kindOf()` 再把它读回来，跨过这趟旅程的只有一个下标。到 DOM 的仍然是 `tok-*` class，值仍然在 `base.css` 的 `--syn-*` 契约里。
 
     三条别改坏：**只调 `codeToTokens`，永远不调 `codeToHtml`**——前者返回数据，后者返回 markup，规则 10 在这里是靠类型成立的，不是靠 review。**scope→kind 的表是我们自己的**，不是 Shiki 的 `css-variables` 主题（它把对象属性和数字归一堆、把标签名和关键字归一堆，跟这个 app 画它们的方式不一样）。**语法是异步按语言懒加载的**，所以 `highlight()` 在拿到之前返回 `null`，调用方拿 `useGrammar` 订阅、这期间画纯文本——一段没上色的代码是完整可读的，为它画个 loading 比等它更差。
+- `src/serve.rs`：`.html` 报告的本机 origin（见 11b）。绑 `127.0.0.1:0`，每个 root 一个不可猜的 token 前缀，边界**复用 `tcode_tools::viewable_within`**——那是 `is_viewable_path` 的同一条规则换个返回值（落在哪个 root 下 + 相对路径），**不许在这里写第三套"在不在工作区里"**。相对路径不能用 `strip_prefix` 自己算：containment 是逐 component 且 Windows 上大小写不敏感的，`c:\proj` 与 `C:\Proj\x.html` 正是它接受而 strip 返回 `None` 的那一对。
+  - **文件服务本体是 `tower_http::ServeDir`，不是手写的**。Range（视频拖动、PDF viewer）、条件请求、HEAD、目录 index、按扩展名的 MIME 全在它那儿，而这些正好是一份生成报告会逐个踩到的东西。**MIME 错一个就是一次"就这个报告显示不出来"**：`.js` 不是 `text/javascript` 时 module script 直接被拒，`.wasm` 不是 `application/wasm` 时 `instantiateStreaming` 失败——`a_report_and_everything_it_pulls_in` 按值钉住了这几个。
+  - 三个自己加的响应头，各有理由：`no-store`（否则 `Shown.tsx` 那个 reload 按钮是个不做事的按钮）、`text/*` 补 `charset=utf-8`（`mime_guess` 只给裸 `text/html`，中文报告靠浏览器猜编码就是乱码）、`POLICY`（见 11b，堵外传）。
+  - `Serve` 起不来**不是致命错误**（`ServeHandle` 带着失败原因走）：Windows 上安全软件拦本机监听是真实存在的，为一类文件显示不了而让整个 app 开不了是拿工具换功能。失败时报告窗格说清原因，其余一切照常。
 - `src/openers.rs`：把工作区里的一个路径交给外面的程序（编辑器 / 文件管理器）。表在这里，边界见上面那条。
 - `src/paths.rs`：`canonical_dir`——app 里唯一一处把用户选的文件夹变成键的地方（见硬规则 9）。
-- `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + 四条 window 授权（自绘标题栏，见 9c）+ `dialog:allow-open`（"打开文件夹"要它）。
+- `capabilities/default.json`：webview 的权限授予（见硬规则 6）。现有 `core:default` + `dialog:allow-open`；窗口控制走系统标题栏，不向 app webview 授予不再使用的 window 能力。
 - `icons/`：由 `icons/mark.svg` 用 `rsvg-convert` 生成，改标记要重新导出全部尺寸。
 
 ## 已知限制
@@ -226,3 +267,10 @@ cargo build && cargo test                 # 后端 + 集成测试
 - 有 `turn started` 无 `turn finished/failed` → 卡在 provider 请求。
 - 两行都有但界面空 → 前端监听侧。九成是 capabilities 或某个没接 catch 的 promise。
 - `could not emit '…'` → 事件名非法（Tauri 只收 `[a-zA-Z0-9-/:_]`）或窗口已关。
+
+**报告是空白的**，先看启动那行 `viewer origin on http://127.0.0.1:<port>`：
+
+- 没有这行 → server 没起来（`ServeHandle` 里有原因，也进了 warnings）。窗格会自己说出来。
+- 有这行 → origin 是好的，问题在 frame。直接 `curl` 那个 URL 就把"服务端发的对不对"和"浏览器画得对不对"分开了。
+- 报告显示但图是空的 → 十有八九是它自己的脚本报错，不是这条链。webview 的 devtools 里那个 frame 有自己的 console。
+- 报告在浏览器里打开正常、在这里空 → 看它是不是在 `fetch` 外部地址：`POLICY` 的 `connect-src 'self'` 会挡，而这是**故意**的（11b）。

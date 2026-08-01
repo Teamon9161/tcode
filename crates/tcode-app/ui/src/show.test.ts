@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
 
-import { extensionOf, isBinary, parseRows, shownAs } from "./show";
+import { extensionOf, isBinary, isServed, parseRows, shownAs } from "./show";
 
 describe("what a shown file is drawn as", () => {
   it("routes by extension, and anything unknown is still readable as text", () => {
-    expect(shownAs("out/report.html", "<p>hi</p>")).toEqual({ as: "sandbox", sandbox: "html" });
+    expect(shownAs("out/report.html", "<p>hi</p>")).toEqual({ as: "framed" });
     expect(shownAs("out/plot.svg", "<svg viewBox='0 0 10 10'/>")).toEqual({ as: "sandbox", sandbox: "svg" });
     expect(shownAs("flow.mmd", "graph TD")).toEqual({ as: "sandbox", sandbox: "mermaid" });
     expect(shownAs("pnl.csv", "a,b")).toEqual({ as: "table", separator: "," });
@@ -38,6 +38,21 @@ describe("what a shown file is drawn as", () => {
     // thing a person opens it to change.
     expect(isBinary("plot.svg")).toBe(false);
     expect(isBinary("data.csv")).toBe(false);
+  });
+
+  /** A served file is the third answer to "how do the bytes get here", and the
+   *  only one whose answer is "they do not". A report that came through the
+   *  reader would be truncated at the text budget and would then be handed to a
+   *  renderer that cannot run its scripts — so this must never quietly fall back
+   *  to one of the other two. */
+  it("knows which files it must not read, because the frame fetches them", () => {
+    expect(isServed("out/report.HTML")).toBe(true);
+    expect(isServed("notebook.htm")).toBe(true);
+    // Everything else still arrives through this process, one way or the other.
+    expect(isServed("plot.svg")).toBe(false);
+    expect(isServed("plot.png")).toBe(false);
+    expect(isServed("notes.md")).toBe(false);
+    expect(isBinary("out/report.html")).toBe(false);
   });
 
   it("does not mistake a dotfile for an extension", () => {

@@ -6,10 +6,12 @@
 
 pub mod boot;
 pub mod bridge;
+pub mod browser;
 pub mod commands;
 pub mod openers;
 pub mod paths;
 pub mod picker;
 pub mod projects;
+pub mod serve;
 pub mod state;
 pub mod workspace;

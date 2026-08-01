@@ -15,12 +15,12 @@
         "minWidth": 760,
         "minHeight": 520,
         "backgroundColor": "#ffffff",
-        "decorations": false,
+        "decorations": true,
         "shadow": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
+      "csp": "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-src 'self' http://127.0.0.1:*"
     }
   },
   "bundle": {
