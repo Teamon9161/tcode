@@ -549,10 +549,141 @@ fn summary_preview(summary: &str) -> String {
         .unwrap_or_else(|| "Compacted conversation".into())
 }
 
+/// The line a picker shows for one `Entry::User`, if it has one at all.
+fn prompt_preview(blocks: &[crate::types::ContentBlock]) -> Option<String> {
+    blocks.iter().find_map(|b| match b {
+        crate::types::ContentBlock::Text { text } if !text.starts_with("<tcode-status>") => {
+            text.lines().next().map(str::to_owned)
+        }
+        _ => None,
+    })
+}
+
+/// One log line, read for its shape and nothing else.
+///
+/// `LogEvent` is internally tagged, so deserializing one buffers the whole line
+/// into a generic tree before re-reading it as a variant — every prompt, every
+/// tool result, every pasted image, twice. That is the right price to resume
+/// one conversation and the wrong one for a picker, which asks the same
+/// question of every log in the project. A plain struct has no buffering step:
+/// serde skips the fields it does not name without allocating them.
+#[derive(Deserialize)]
+struct LineShape {
+    ev: String,
+    /// `Meta`: the log's own name for itself.
+    id: Option<String>,
+    /// `Append`: the entry's kind, its payload skipped.
+    entry: Option<EntryShape>,
+    /// `TruncateTail`.
+    len: Option<usize>,
+    /// `Compact`.
+    summary: Option<String>,
+    upto: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct EntryShape {
+    kind: String,
+}
+
+/// A replayed entry, reduced to the only thing a preview can come from.
+enum Mark {
+    User(String),
+    Summary(String),
+    Other,
+}
+
+/// What the picker shows for one log, without materializing its entries.
+///
+/// A replay and not a scan: `/clear` and rewind are recorded as events, so
+/// reading the appends backwards would resurrect a conversation that was
+/// deliberately cleared. It replays `append` / `truncate_tail` / `compact` and
+/// ignores every other event, which is safe by construction rather than by
+/// enumeration — those three are the only mutations a [`Ledger`] has, so
+/// nothing this build fails to recognize can move the answer. What it keeps
+/// per entry is one `Mark`, so a log full of megabyte tool results costs the
+/// same as one full of one-line notes.
+///
+/// A line that is not valid JSON still drops the whole log, as the full replay
+/// did: a preview taken from half a file is a confident claim about a
+/// conversation that will not open. The one behaviour that changed is the
+/// narrower case of a log carrying an *event type* from a newer format — it is
+/// now listed rather than hidden, and selecting it still reports the real
+/// replay error, which is the recovery path `list` already promises.
+fn preview(path: &Path) -> Option<SessionInfo> {
+    let modified = fs::metadata(path).and_then(|m| m.modified()).ok();
+    let mut id = path.file_stem()?.to_string_lossy().into_owned();
+    let mut entries: Vec<Mark> = Vec::new();
+
+    for line in BufReader::new(File::open(path).ok()?).lines() {
+        let line = line.ok()?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let shape: LineShape = serde_json::from_str(&line).ok()?;
+        match shape.ev.as_str() {
+            "meta" => id = shape.id?,
+            "append" => entries.push(match shape.entry?.kind.as_str() {
+                // Two entry kinds can carry a preview and both are small, so
+                // those lines — and only those — are read a second time with
+                // the real types instead of a re-guessed shape.
+                "user" | "summary" => {
+                    let LogEvent::Append { entry } = serde_json::from_str(&line).ok()? else {
+                        return None;
+                    };
+                    match entry {
+                        Entry::User(blocks) => {
+                            prompt_preview(&blocks).map_or(Mark::Other, Mark::User)
+                        }
+                        Entry::Summary(summary) => Mark::Summary(summary_preview(&summary)),
+                        _ => Mark::Other,
+                    }
+                }
+                _ => Mark::Other,
+            }),
+            "truncate_tail" => entries.truncate(shape.len?),
+            "compact" => {
+                let tail = entries.split_off(shape.upto?.min(entries.len()));
+                entries.clear();
+                entries.push(Mark::Summary(summary_preview(&shape.summary?)));
+                entries.extend(tail);
+            }
+            _ => {}
+        }
+    }
+
+    let last_user_preview = entries
+        .iter()
+        .rev()
+        .find_map(|mark| match mark {
+            Mark::User(text) => Some(text.clone()),
+            _ => None,
+        })
+        // Compaction intentionally removes the historical User entries. The
+        // replayed summary is then the only honest preview source; reading raw
+        // append events would revive cleared history.
+        .or_else(|| {
+            entries.iter().find_map(|mark| match mark {
+                Mark::Summary(text) => Some(text.clone()),
+                _ => None,
+            })
+        })?;
+    Some(SessionInfo {
+        id,
+        last_user_preview,
+        modified,
+    })
+}
+
 impl SessionStore {
     /// List recent non-empty sessions in newest-first order. This is kept
     /// separate from `resume`: starting tcode creates a fresh log first, and
     /// that empty log must not hide the conversations a user can restore.
+    ///
+    /// It reads every log in the project, so it reads them the cheap way
+    /// ([`preview`]) rather than through `resume_path`. A damaged log is
+    /// skipped rather than failing the list: one broken conversation must not
+    /// empty the picker, and selecting it still reports the replay error.
     pub fn list(data_dir: &Path) -> Result<Vec<SessionInfo>, StoreError> {
         let sessions = data_dir.join("sessions");
         let mut files: Vec<PathBuf> = fs::read_dir(&sessions)
@@ -563,56 +694,7 @@ impl SessionStore {
         files.sort();
         files.reverse();
 
-        let mut result = Vec::new();
-        for path in files {
-            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok();
-            // Reuse the normal replay path so `/clear` and rewind events
-            // are respected; scanning raw append events would resurrect
-            // conversations that were deliberately cleared.
-            // A damaged or newer-format log must not hide every other
-            // conversation in the picker. Directly selecting it still reports
-            // the replay error to make recovery actionable.
-            let Ok(resumed) = Self::resume_path(&path) else {
-                continue;
-            };
-            let last_user_preview = resumed
-                .ledger
-                .entries()
-                .iter()
-                .rev()
-                .find_map(|entry| {
-                    let Entry::User(blocks) = entry else {
-                        return None;
-                    };
-                    blocks.iter().find_map(|b| match b {
-                        crate::types::ContentBlock::Text { text }
-                            if !text.starts_with("<tcode-status>") =>
-                        {
-                            text.lines().next().map(str::to_owned)
-                        }
-                        _ => None,
-                    })
-                })
-                // Compaction intentionally removes the historical User entries.
-                // The replayed summary is then the only honest preview source;
-                // reading raw append events would revive cleared history.
-                .or_else(|| {
-                    resumed.ledger.entries().iter().find_map(|entry| {
-                        let Entry::Summary(summary) = entry else {
-                            return None;
-                        };
-                        Some(summary_preview(summary))
-                    })
-                });
-            if let Some(last_user_preview) = last_user_preview {
-                result.push(SessionInfo {
-                    id: resumed.store.id,
-                    last_user_preview,
-                    modified,
-                });
-            }
-        }
-        Ok(result)
+        Ok(files.iter().filter_map(|path| preview(path)).collect())
     }
 
     /// Start a new session log under `data_dir/sessions/`.
@@ -1267,6 +1349,70 @@ mod tests {
             sessions[0].last_user_preview,
             "Restore today's compacted conversation in /resume."
         );
+    }
+
+    /// The picker replays the log rather than scanning it, so the two events
+    /// that *remove* history have to mean the same thing here as in `Ledger`.
+    /// Scanning appends backwards would answer "still here" to both.
+    #[test]
+    fn list_respects_rewind_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("the prompt that stays"));
+        ledger.append(text("the prompt that was rewound away"));
+        ledger.truncate_tail(1);
+        drop(ledger);
+
+        let sessions = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].last_user_preview, "the prompt that stays");
+
+        let cleared = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let id = cleared.id.clone();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(cleared));
+        ledger.append(text("private conversation"));
+        ledger.compact("summary of it".into(), 1);
+        ledger.truncate_tail(0);
+        drop(ledger);
+
+        let sessions = SessionStore::list(dir.path()).unwrap();
+        assert!(
+            !sessions.iter().any(|s| s.id == id),
+            "a cleared conversation must not come back in the picker: {sessions:?}"
+        );
+    }
+
+    /// The preview comes from the last prompt the *person* typed. Everything
+    /// after it — the model's reply, the tool results it produced — is skipped
+    /// without being parsed, and that shortcut must not change the answer.
+    #[test]
+    fn list_previews_the_last_prompt_not_the_last_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("first question"));
+        ledger.append(text("second question\nwith a second line"));
+        ledger.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "an answer".into(),
+        }]));
+        ledger.append(Entry::ToolResults(vec![ContentBlock::ToolResult {
+            tool_use_id: "1".into(),
+            content: "a megabyte of file, in principle".into(),
+            is_error: false,
+            images: Vec::new(),
+        }]));
+        // A status block is harness bookkeeping wearing a user role; the
+        // picker must look past it to the words someone wrote.
+        ledger.append(text("<tcode-status>not a prompt"));
+        drop(ledger);
+
+        let sessions = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].last_user_preview, "second question");
     }
 
     #[test]

@@ -326,22 +326,35 @@ pub struct Launchpad {
     pub home: String,
 }
 
+/// Both launchpad readers scan the session store, so both are `async` with
+/// their work on a blocking thread. A sync command runs on the main thread
+/// (see [`send_message`] for the other half of that rule), and the main thread
+/// is the one drawing: the disclosure that opened a project used to freeze the
+/// whole window — buttons, drag region, the sessions running in the other
+/// panes — for as long as the read took. `spawn_blocking` and not `spawn`,
+/// because this is file IO and the runtime it would otherwise sit on is the
+/// one carrying every running turn.
 #[tauri::command]
-pub fn launchpad() -> Result<Launchpad, String> {
+pub async fn launchpad() -> Result<Launchpad, String> {
     let home = tcode_core::home_dir().ok_or("cannot locate the home directory")?;
-    Ok(Launchpad {
+    let read = move || Launchpad {
         projects: projects::list(&home),
         now: projects::now_unix(),
         home: home.display().to_string(),
-    })
+    };
+    tauri::async_runtime::spawn_blocking(read)
+        .await
+        .map_err(|error| format!("cannot read the project list: {error}"))
 }
 
 /// The resumable conversations inside one project. Separate from [`launchpad`]
 /// because it replays every log to build previews — affordable for the one
 /// project being opened, not for all of them on every launch.
 #[tauri::command]
-pub fn project_sessions(path: String) -> Vec<StoredSession> {
-    projects::sessions(Path::new(&path))
+pub async fn project_sessions(path: String) -> Result<Vec<StoredSession>, String> {
+    tauri::async_runtime::spawn_blocking(move || projects::sessions(Path::new(&path)))
+        .await
+        .map_err(|error| format!("cannot read this project's conversations: {error}"))
 }
 
 /// Open a folder as a session, optionally resuming one of its logs.

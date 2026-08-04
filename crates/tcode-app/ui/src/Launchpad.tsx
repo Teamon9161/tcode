@@ -155,6 +155,7 @@ function ProjectRow({
 }) {
   const [expanded, setExpanded] = useState(false);
   const [history, setHistory] = useState<StoredSession[] | null>(null);
+  const [unreadable, setUnreadable] = useState<string | null>(null);
 
   // Loaded only when the row is opened: building previews replays every log in
   // the project, which is affordable once and not for every folder on launch.
@@ -162,7 +163,7 @@ function ProjectRow({
     if (!expanded || history) return;
     invoke<StoredSession[]>("project_sessions", { path: project.path })
       .then(setHistory)
-      .catch(() => setHistory([]));
+      .catch((error) => setUnreadable(String(error)));
   }, [expanded, history, project.path]);
 
   return (
@@ -205,7 +206,10 @@ function ProjectRow({
             <PlusIcon size={14} />
             New conversation
           </button>
-          {history === null && <p className="history-note">reading history…</p>}
+          {/* An unreadable folder says so. Falling back to the empty-state
+              sentence would tell someone their conversations are gone. */}
+          {unreadable && <p className="history-note">could not read this folder: {unreadable}</p>}
+          {!unreadable && history === null && <p className="history-note">reading history…</p>}
           {history?.length === 0 && (
             <p className="history-note">
               No resumable conversation in this folder yet.

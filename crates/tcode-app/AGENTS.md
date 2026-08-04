@@ -34,6 +34,8 @@ cargo build && cargo test                 # 后端 + 集成测试
 4. **一个会话同时只跑一个 turn，靠所有权保证**：`SessionHandle` 里的 `Session` 被跑 turn 的一方 `take` 走，结束再放回。不许改成"用一个 bool 标记忙"——那会漂移。
 5. **事件名是契约**：`bridge.rs` 的 `AGENT_EVENT`/`APPROVAL_REQUEST`/`TURN_FINISHED` 常量与 `ui/src/types.ts` 里的同名常量必须同时改。`AgentEvent` 的 JSON 信封形状（adjacently tagged，`{type, data}`）由 `tcode-core` 的 `event_wire_tests` 钉住，改它就要同时改 `ui/src/types.ts`。
 6. **用到新的 Tauri 内建能力，先改 `capabilities/default.json`**。自定义 `#[tauri::command]` 默认放行，但 core 插件的命令（event 的 `listen`/`emit`、window、fs、dialog…）必须显式授权，**未授权时前端那侧只是 promise reject，没有任何报错会自己冒出来**。这条是踩出来的：漏了 `core:default` 时，turn 正常跑完、事件正常 emit，界面却全空，看起来和"卡死"一模一样。
+
+    **`core:default` 不等于"窗口能力都有了"，它只给了只读的那一半**：`is-maximized`、`title`、显示器列表、`internal-toggle-maximize` 在里面，而 `minimize` / `toggle-maximize` / `close` / `start-dragging` 不在。这条也是踩出来的，而且比上一条更难看见：自绘标题栏（规则 9c，`decorations: false`）意味着**没有系统标题栏可以退回去**，于是那三个按钮按下去 reject 成一句 `console.warn`、窗口也拖不动，界面其余部分完全正常。所以标题栏调的每一个"会动手的"窗口命令都必须在这个文件里点名——`browser.rs::the_title_bar_is_granted_the_commands_it_calls` 直接从 `WindowControls.tsx` 里扫这些调用来对，新加一个控件要么带着它的授权，要么在那儿失败。
 7. **前端不许有静默 reject 的 promise**。`listen()` / `invoke()` 一律接 `catch`，把原因显示成致命错误屏。第 6 条那个 bug 之所以难查，就是因为它当时是个 unhandled rejection。
 8. **组件里不许出现字面量颜色/圆角/字号/字体栈，一律 `var(--token)`**。`ui/src/theme/base.css` 是 token 契约（含由 `--bg`/`--ink`/`--brand` 推导的兜底值，本身不含任何字面色），`themes/porcelain.css` 是默认主题包，两者的加载顺序就是覆盖顺序。**换主题 = 换 `main.tsx` 里的一行 import**，包括排版、密度、圆角、阴影，不只是配色。token 的**名字**是契约，主题可以改值不能改名。为什么这么严：写死一个 `#1d201b` 不会报错，只会在换主题那天变成一个找不着的污点。设计依据见 `DESIGN.md`，产品判断见 `PRODUCT.md`。
 9. **路径不许用 `direction: rtl` 做前截断**。bidi 重排会把开头的 `/` 挪到结尾——`/home/me/code` 渲染成 `home/me/code/`。这不是外观问题：审批面板里给人看的是一条错的路径。用 `components/Path.tsx`，它按整段省略，一个字符都不改写。
@@ -222,6 +224,12 @@ cargo build && cargo test                 # 后端 + 集成测试
     **转录的 key 按块在对话里的起始位置算，不按 item 下标**（`Transcript.tsx::keyOf`）。分组边界会移动——第二个 edit 一到，一个 item 变成一个两块的组，后面所有 item 往上挪一格，React 于是卸载重建改动点以下的每一步，连带丢掉所有展开状态。
 
     **原生浏览器窗格是这套开销的放大器**（`WebPane.tsx`）。量它的矩形要用 `requestAnimationFrame`，不能在 layout effect 里直接 `getBoundingClientRect()`：那是在一次刚提交、布局还脏的时候读，会强制整篇文档同步布局——开着这个窗格时，窗口里**每一次**渲染都要付这笔钱。**让浏览器暂时让位只有一份实现**（`browserYield.ts` 的计数器，popover 与分隔条拖动共用，见硬规则 17）；拖动分隔条时必须让位，否则每个指针采样都在让平台把另一个进程里的整页重新布局一次。
+
+22. **读文件系统的 command 一律 `async` + `tauri::async_runtime::spawn_blocking`。** 同步 command 跑在**主线程**上（`send_message` 的注释里已经写了这条的另一半），而主线程就是画界面那条线程：`project_sessions` 曾经是同步的，于是启动台上展开一个项目（replay 那个文件夹下每一条 session log 取 preview）会把整个窗口冻住——按钮、拖动区、另外几个窗格里正在跑的会话，一起停到读完为止。debug 构建下九十条对话实测 ~250ms，release ~35ms，冷盘更久，而它**看起来完全像 UI 卡顿而不像后端慢**，因为卡住的确实是 UI。
+
+    **是 `spawn_blocking` 不是 `spawn`**：这是文件 IO，而 `spawn` 落到的那个 runtime 正是每个 turn 跑在上面的那个，占住一个 worker 几百毫秒等于让正在对话的会话陪着一起等。
+
+    连带一条：**picker 的 preview 不许走 `resume_path`**。`SessionStore::list` 现在用 `store.rs::preview` 逐行浅解析（`LogEvent` 是 internally tagged，反序列化一次要先把整行缓冲成一棵泛型树，等于把每条工具结果、每张贴进来的图解析两遍）。它照样是**重放**而不是扫描——`append`/`truncate_tail`/`compact` 三个操作全都实现，少一个 `/clear` 掉的对话就会复活；而"只认这三个"是安全的，因为 `Ledger` 本来就只有这三种变更（根 CLAUDE.md 的设计约束 2）。
 
 ## 现有结构
 

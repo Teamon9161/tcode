@@ -342,6 +342,82 @@ mod tests {
         );
     }
 
+    /// An app-owned title bar has to be granted the commands its controls call.
+    ///
+    /// `core:default` looks like it covers windows, and it does — the *reading*
+    /// half. `is-maximized`, `title`, the monitor list and
+    /// `internal-toggle-maximize` are in it; `minimize`, `toggle-maximize`,
+    /// `close` and `start-dragging` are not. So the three buttons rejected into
+    /// a `console.warn` and the bar could not be dragged, on a window that has
+    /// no system caption to fall back to — the same failure mode rule 6 is
+    /// about, one layer along: nothing throws, nothing is logged where anyone
+    /// looks, the controls are simply inert.
+    ///
+    /// Pinned from the component rather than as a fixed list, so a control
+    /// added later brings its grant with it or fails here.
+    #[test]
+    fn the_title_bar_is_granted_the_commands_it_calls() {
+        /// Window methods that *act*, and the permission each one needs. The
+        /// readers `WindowControls` also uses (`isMaximized`, `onResized`) are
+        /// in `core:default` already and are deliberately absent.
+        const ACTS: &[(&str, &str)] = &[
+            (".minimize()", "core:window:allow-minimize"),
+            (".maximize()", "core:window:allow-maximize"),
+            (".unmaximize()", "core:window:allow-unmaximize"),
+            (".unminimize()", "core:window:allow-unminimize"),
+            (".toggleMaximize()", "core:window:allow-toggle-maximize"),
+            (".close()", "core:window:allow-close"),
+            (".hide()", "core:window:allow-hide"),
+            (".show()", "core:window:allow-show"),
+            (".setTitle(", "core:window:allow-set-title"),
+            (".setFullscreen(", "core:window:allow-set-fullscreen"),
+            (".startDragging()", "core:window:allow-start-dragging"),
+        ];
+
+        let component = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ui/src/components/WindowControls.tsx"
+        ))
+        .expect("ui/src/components/WindowControls.tsx");
+        let text = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/capabilities/default.json"
+        ))
+        .expect("capabilities/default.json");
+        let capability: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let granted: Vec<&str> = capability["permissions"]
+            .as_array()
+            .expect("`permissions` must be a list")
+            .iter()
+            .filter_map(|entry| entry.as_str())
+            .collect();
+
+        for (call, permission) in ACTS {
+            if !component.contains(call) {
+                continue;
+            }
+            assert!(
+                granted.contains(permission),
+                "the title bar calls `{call}` but capabilities/default.json does not grant \
+                 `{permission}` — the control will reject and do nothing"
+            );
+        }
+
+        // Tauri's own drag-region script calls `start_dragging` on pointer-down
+        // over `data-tauri-drag-region`, so the grant is needed even though no
+        // line here calls it (AGENTS.md rule 9c puts that attribute on the bar).
+        assert!(
+            component.contains("data-tauri-drag-region"),
+            "the drag region moved out of WindowControls.tsx — this test and the \
+             `start-dragging` grant below it now pin nothing"
+        );
+        assert!(
+            granted.contains(&"core:window:allow-start-dragging"),
+            "the title bar carries `data-tauri-drag-region` but the window cannot be dragged \
+             without `core:window:allow-start-dragging`"
+        );
+    }
+
     #[test]
     fn app_owned_decorations_keep_system_color_out_of_the_caption() {
         let file = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
