@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, type RefObject } from "react";
-import { invoke } from "@tauri-apps/api/core";
+
+import { yieldBrowser } from "./browserYield";
 
 /**
  * Anchoring a portalled popover to the control that opened it.
@@ -30,24 +31,13 @@ import { invoke } from "@tauri-apps/api/core";
  * prevent.
  */
 /**
- * How many popovers are open, and therefore whether the browser may be on
- * screen.
- *
- * Counted rather than a boolean because popovers nest — a submenu, a panel that
- * opens a picker — and the last one closing is what should bring the page back,
- * not the first. A boolean here would make one closing submenu reveal the page
- * underneath the menu still open in front of it.
+ * A popover cannot be drawn over the browser, so the browser stands down while
+ * one is open. The counting lives in `browserYield.ts` because a divider drag
+ * needs the same thing and the two can overlap.
  */
-let popovers = 0;
-
 function yieldToPopover(open: boolean) {
   if (!open) return;
-  popovers += 1;
-  if (popovers === 1) invoke("browser_visible", { visible: false }).catch(() => {});
-  return () => {
-    popovers -= 1;
-    if (popovers === 0) invoke("browser_visible", { visible: true }).catch(() => {});
-  };
+  return yieldBrowser();
 }
 
 export function useSeat({

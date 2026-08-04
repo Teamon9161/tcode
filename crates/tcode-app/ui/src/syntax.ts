@@ -302,6 +302,23 @@ export function useGrammar(language: string): boolean {
 }
 
 /**
+ * Snippets already tokenised, keyed by grammar and source.
+ *
+ * Running a TextMate grammar is the most expensive thing this app does inside a
+ * render, and it was being done again on every render of anything that held
+ * code: a diff calls this once per line (`components/Diff.tsx`), so a 200-line
+ * change on screen cost ~20ms of tokenising per keystroke elsewhere in the
+ * window. Every caller wanted a `useMemo` it did not have; one cache here fixes
+ * all of them, including the ones added later.
+ *
+ * Only successes are stored. A miss before the grammar arrives means "ask
+ * again once it has", and caching that null would leave the snippet plain
+ * forever.
+ */
+const TOKENS = new Map<string, Token[]>();
+const MAX_TOKENS = 4000;
+
+/**
  * The tokens for a snippet, or null when there are none to draw yet — an
  * unknown language, or a grammar still arriving.
  *
@@ -312,6 +329,16 @@ export function useGrammar(language: string): boolean {
 export function highlight(source: string, language: string): Token[] | null {
   const id = languageId(language);
   if (id === null || !core || !ready.has(id)) return null;
+
+  // A NUL cannot appear in either half, so the pair cannot be forged by a
+  // snippet that happens to contain the separator.
+  const key = `${id}\u0000${source}`;
+  const found = TOKENS.get(key);
+  if (found) {
+    TOKENS.delete(key);
+    TOKENS.set(key, found);
+    return found;
+  }
 
   // A grammar is a large piece of somebody else's software running inside a
   // render, and this app has no way to survive a throw there beyond `Boundary`
@@ -331,5 +358,13 @@ export function highlight(source: string, language: string): Token[] | null {
     if (at > 0) out.push({ text: "\n", kind: "plain" });
     for (const token of line) out.push({ text: token.content, kind: kindOf(token.color) });
   });
+
+  // Insertion order is recency: a hit is re-seated above, so what stays is
+  // what is still being looked at.
+  TOKENS.set(key, out);
+  if (TOKENS.size > MAX_TOKENS) {
+    const oldest = TOKENS.keys().next();
+    if (!oldest.done) TOKENS.delete(oldest.value);
+  }
   return out;
 }

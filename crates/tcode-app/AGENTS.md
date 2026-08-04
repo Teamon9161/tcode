@@ -188,7 +188,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **阈值与 TUI 同源**（context 85/95，额度 75/90）。两个前端在不同时刻变黄，等于同一个契约有两份定义。
 
-17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。右键菜单是同一个弹出层的另一种锚（`at` 传视口坐标当零尺寸矩形），不是第四份实现；子菜单画在父菜单的 DOM 里而不是另开 portal，否则点子菜单会被父菜单判成"点了外面"。
+17. **portal popover 的定位与消解只有一份**（`ui/src/seat.ts` + CSS 的 `.seated`）。窗口里每个弹出层都必须 portal + `position: fixed`：窗格会裁掉它，而 composer 那个 `<form>` 里的输入框按 Enter 会把消息发出去。于是"量触发器的盒子 / resize 时重量 / Esc 与点外面消解"这三件事在每个调用点都一样——`useSeat` 收着，各家只留自己开在哪个角、多宽。**别再抄第四份**：三份里漏掉 resize 监听的那份，只在改窗口大小时才看得出来。右键菜单是同一个弹出层的另一种锚（`at` 传视口坐标当零尺寸矩形），不是第四份实现；子菜单画在父菜单的 DOM 里而不是另开 portal，否则点子菜单会被父菜单判成"点了外面"。**浏览器让位的计数器不在这里，在 `browserYield.ts`**——分隔条拖动要用同一个计数（硬规则 21），两份计数会让一个关掉的子菜单把还开着的父菜单底下的页面放出来。
 
     **`mousedown` 监听必须是捕获阶段。** Tauri 自己的 `drag.js` 会在 `document` 上处理命中 `data-tauri-drag-region` 的 `mousedown` 并调用 `stopImmediatePropagation()`；所以任何复用 `DRAG` 的区域旁若有 popover 触发器，冒泡阶段的监听都会漏掉关闭事件。
 
@@ -212,6 +212,17 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **rewind 之后重放，不要就地截断**。webview 有四份从事件流派生的东西（转录、文件索引、用量、rewind 点），手工截四次就是四次漏掉一处的机会——所以 `rewind` 命令返回整个 `OpenedSession`，前端走已经存在且已经正确的 `replayLedger`。
 
+21. **窗口里最贵的两样东西是转录和检视窗格，它们靠 `memo` 跳过重绘——所有上游必须为此保持引用稳定。** 这条是踩出来的：整个 app 一份 `states`，全树零 memo，于是**每一次按键、每一个流式 token、拖动分隔条的每一帧**都会把所有会话的全部转录重新渲染一遍（含每条 assistant 消息重跑一次 markdown lex）。实测 120 轮对话下一次无关的父级 state 变化要 49ms，且随对话长度线性增长——中文输入法面板疯狂闪烁的根因也是它：受控 `<textarea>` 的 `value` 在 preedit 中被重新赋值会打断合成态。落实它的四道防线，删任何一道都会静默退化回去：
+
+    - **`App` 的回调一律 `useCallback` 且不依赖 `states`**（读 `held.current` 那个 ref），`Workspace` 的 `PaneContext` 走 `useMemo`，`Panes` 的 `SessionPane`/`InspectPane` 在组件里绑好交给子组件的闭包。**JSX 里现写一个箭头函数 = 这个 memo 不存在了**，而且不报错、只是慢回去。
+    - **草稿归 composer 自己所有**（`Composer.tsx`）：按键只动本地 state，200ms 空闲、失焦、提交时才上抛；合成态期间什么都不上抛，高度只涨不缩（把高度清成 `auto` 再读 `scrollHeight` 会让光标矩形一次按键跳两次，候选窗跟着跳，那就是闪烁）。因此 **`onSubmit` 必须把文本带上**——回头去读 `states[id].draft` 会读到 200ms 前的内容。
+    - **`rich()` 与 `highlight()` 各有一份按源文本的缓存**（`rich.tsx` / `syntax.ts`）。`Diff.tsx` 逐行调 `highlight`，200 行的 diff 在屏幕上就是每次渲染 20ms 的 TextMate 分词。**别把缓存挪进某个组件的 `useMemo`**：调用点有五个，以后还会更多。
+    - **`blocks.ts` 的 reducer 必须复用没变的块对象**（`extend` 只换最后一个、`updateCall`/`updateRun` 的 `map` 对不匹配的原样返回）。`BlockView`/`RunCall` 的 memo 全靠这一点：一旦哪次改动开始顺手复制块，流式输出会静默退回"每个 token 重绘整场对话"。
+
+    **转录的 key 按块在对话里的起始位置算，不按 item 下标**（`Transcript.tsx::keyOf`）。分组边界会移动——第二个 edit 一到，一个 item 变成一个两块的组，后面所有 item 往上挪一格，React 于是卸载重建改动点以下的每一步，连带丢掉所有展开状态。
+
+    **原生浏览器窗格是这套开销的放大器**（`WebPane.tsx`）。量它的矩形要用 `requestAnimationFrame`，不能在 layout effect 里直接 `getBoundingClientRect()`：那是在一次刚提交、布局还脏的时候读，会强制整篇文档同步布局——开着这个窗格时，窗口里**每一次**渲染都要付这笔钱。**让浏览器暂时让位只有一份实现**（`browserYield.ts` 的计数器，popover 与分隔条拖动共用，见硬规则 17）；拖动分隔条时必须让位，否则每个指针采样都在让平台把另一个进程里的整页重新布局一次。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。
@@ -220,7 +231,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`browserYield.ts`（让原生浏览器窗格暂时让位的唯一计数器）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
   - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 用量环 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
   - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。

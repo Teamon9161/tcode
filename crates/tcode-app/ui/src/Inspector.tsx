@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 
 import { findRun, findToolCall, reportOf, type Block } from "./blocks";
 import { Diff } from "./components/Diff";
@@ -35,8 +35,13 @@ import { draftOf, type Plan, type PlanDraft } from "./plan";
  *
  * The frame around it — header, history buttons, close — belongs to
  * `Panes.tsx`, because it is the same frame every pane wears.
+ *
+ * Memoized for the same reason the transcript is: what it draws is a whole file
+ * or a whole diff, tokenised by a real grammar, and none of that changes when a
+ * character is typed into a composer in the pane beside it. `Panes.tsx` binds
+ * its handlers per pane so the comparison has something to compare.
  */
-export function InspectView({
+export const InspectView = memo(function InspectView({
   value,
   blocks,
   files,
@@ -124,7 +129,7 @@ export function InspectView({
         </p>
       );
   }
-}
+});
 
 /**
  * A file as one call saw it.

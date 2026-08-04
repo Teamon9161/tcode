@@ -108,7 +108,7 @@ export function Workspace({
   onDraft: (session: string, value: string) => void;
   onAttach: (session: string, items: SessionState["attachments"]) => void;
   onDetach: (session: string, id: string) => void;
-  onSend: (session: string) => void;
+  onSend: PaneContext["onSend"];
   onInterrupt: (session: string) => void;
   onWithdrawQueued: PaneContext["onWithdrawQueued"];
   onSendQueuedNow: PaneContext["onSendQueuedNow"];
@@ -332,48 +332,124 @@ export function Workspace({
     return () => window.removeEventListener("keydown", onKey);
   }, [sessions, tiling, onTiling, onOpenFolder]);
 
-  const context: PaneContext = {
-    sessions,
-    stateOf,
-    statusOf,
-    focus: tiling.focus,
-    split: leaves.length > 1 && !narrow && !expanded,
-    onFocus: (pane) => onTiling((current) => focusPane(current, pane)),
-    onClosePane: (pane) => onTiling((current) => close(current, pane)),
-    onRatio: (divider, ratio) => onTiling((current) => setRatio(current, divider, ratio)),
-    onOpen: (pane, session, value) =>
+  // Each of these is written once rather than rebuilt in the object literal
+  // below, and that is not tidiness: a pane compares the handlers it was given
+  // to decide whether it has to redraw, and a fresh arrow every render answers
+  // "yes" every time — which is how a keystroke in one conversation came to
+  // re-render the transcript of another.
+  const focusOn = useCallback(
+    (pane: string) => onTiling((current) => focusPane(current, pane)),
+    [onTiling],
+  );
+  const closePane = useCallback(
+    (pane: string) => onTiling((current) => close(current, pane)),
+    [onTiling],
+  );
+  const ratio = useCallback(
+    (divider: string, value: number) => onTiling((current) => setRatio(current, divider, value)),
+    [onTiling],
+  );
+  const open = useCallback(
+    (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
       onTiling((current) => openInspect(current, pane, session, value)),
-    onOpenAside: (pane, session, value) =>
+    [onTiling],
+  );
+  const openBeside = useCallback(
+    (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
       onTiling((current) => openAside(current, pane, session, value)),
-    onMention: mention,
-    onNavigate: (pane, step) => onTiling((current) => navigate(current, pane, step)),
-    onToggleFiles: toggleFiles,
-    onToggleWorkspace: toggleWorkspace,
-    onOpenBrowser: () => onTiling(openWeb),
-    expanded,
-    onToggleExpanded: (pane) => {
+    [onTiling],
+  );
+  const goTo = useCallback(
+    (pane: string, step: Parameters<PaneContext["onNavigate"]>[1]) =>
+      onTiling((current) => navigate(current, pane, step)),
+    [onTiling],
+  );
+  const openBrowser = useCallback(() => onTiling(openWeb), [onTiling]);
+  const toggleExpanded = useCallback(
+    (pane: string) => {
       onTiling((current) => focusPane(current, pane));
       setExpanded((current) => (current === pane ? null : pane));
     },
-    onDraft,
-    onAttach,
-    onDetach,
-    onSend,
-    onInterrupt,
-    onWithdrawQueued,
-    onSendQueuedNow,
-    onResume,
-    onDismissResume,
-    onAskRewind,
-    onRewind,
-    onAnswer,
-    onDecidePlan,
-    onPlanDraft,
-    onSavePlan,
-    onPlanOpen,
-    onPlanFirst,
-    onOpenFolder,
-  };
+    [onTiling],
+  );
+
+  const split = leaves.length > 1 && !narrow && !expanded;
+  const context: PaneContext = useMemo(
+    () => ({
+      sessions,
+      stateOf,
+      statusOf,
+      focus: tiling.focus,
+      split,
+      onFocus: focusOn,
+      onClosePane: closePane,
+      onRatio: ratio,
+      onOpen: open,
+      onOpenAside: openBeside,
+      onMention: mention,
+      onNavigate: goTo,
+      onToggleFiles: toggleFiles,
+      onToggleWorkspace: toggleWorkspace,
+      onOpenBrowser: openBrowser,
+      expanded,
+      onToggleExpanded: toggleExpanded,
+      onDraft,
+      onAttach,
+      onDetach,
+      onSend,
+      onInterrupt,
+      onWithdrawQueued,
+      onSendQueuedNow,
+      onResume,
+      onDismissResume,
+      onAskRewind,
+      onRewind,
+      onAnswer,
+      onDecidePlan,
+      onPlanDraft,
+      onSavePlan,
+      onPlanOpen,
+      onPlanFirst,
+      onOpenFolder,
+    }),
+    [
+      sessions,
+      stateOf,
+      statusOf,
+      tiling.focus,
+      split,
+      focusOn,
+      closePane,
+      ratio,
+      open,
+      openBeside,
+      mention,
+      goTo,
+      toggleFiles,
+      toggleWorkspace,
+      openBrowser,
+      expanded,
+      toggleExpanded,
+      onDraft,
+      onAttach,
+      onDetach,
+      onSend,
+      onInterrupt,
+      onWithdrawQueued,
+      onSendQueuedNow,
+      onResume,
+      onDismissResume,
+      onAskRewind,
+      onRewind,
+      onAnswer,
+      onDecidePlan,
+      onPlanDraft,
+      onSavePlan,
+      onPlanOpen,
+      onPlanFirst,
+      onOpenFolder,
+    ],
+  );
 
   // Below the threshold the tree stops being shown and only the current pane
   // is: two panes in 700px are two unreadable panes. Structural, not fluid —

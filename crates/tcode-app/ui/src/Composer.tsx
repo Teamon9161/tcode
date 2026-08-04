@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import {
@@ -27,6 +27,25 @@ import type { Meter } from "./usage";
  *  conversation behind it. */
 const MAX_HEIGHT = 220;
 
+/**
+ * How long a keystroke stays local before the window is told about it.
+ *
+ * The draft lives here, not in the window's state, and this is why. A
+ * controlled field whose value round-trips through `App` re-renders every pane
+ * on every keystroke, and with a long conversation on screen that is tens of
+ * milliseconds of markdown re-lexing before the character appears — but the
+ * cost that actually broke input is the round-trip itself: reassigning
+ * `textarea.value` during an IME preedit cancels the composition, so the
+ * candidate window flickers on every keystroke in Chinese, Japanese and Korean.
+ *
+ * The window still needs the draft — the file tree appends `@path` to it, a
+ * rewind puts a prompt back into it — so it is published on an idle, on blur,
+ * and on submit, rather than never. Nothing reads it faster than that: sending
+ * carries the text with it (`onSubmit`), and blur lands before the click that
+ * would mention a file.
+ */
+const PUBLISH_IDLE = 200;
+
 export function Composer({
   value,
   running,
@@ -54,12 +73,88 @@ export function Composer({
   onChange: (value: string) => void;
   onAttach: (items: Pasted[]) => void;
   onDetach: (id: string) => void;
-  onSubmit: () => void;
+  /** The text goes with it. Reading it back out of the window's state would
+   *  race the publish above: a prompt typed and sent inside one idle window
+   *  would send whatever the state still held. */
+  onSubmit: (text: string) => void;
   onInterrupt: () => void;
 }) {
   const field = useRef<HTMLTextAreaElement>(null);
   const [dropping, setDropping] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+
+  // What is in the field, and what the window was last told is in it. They
+  // differ only between a keystroke and the publish that follows it.
+  const [text, setText] = useState(value);
+  const latest = useRef(value);
+  const published = useRef(value);
+  const idle = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // True between `compositionstart` and `compositionend`. A preedit is not a
+  // draft — it is the IME's working area — so nothing leaves this component
+  // and nothing resizes underneath it until the candidate is accepted.
+  const composing = useRef(false);
+
+  const publish = useCallback(() => {
+    if (idle.current) {
+      clearTimeout(idle.current);
+      idle.current = null;
+    }
+    if (latest.current === published.current) return;
+    published.current = latest.current;
+    onChange(latest.current);
+  }, [onChange]);
+
+  // Someone else wrote the draft: a rewind putting a prompt back, the file tree
+  // appending `@path`, a send clearing it. What we published ourselves comes
+  // back identical and must not clobber anything typed since.
+  useEffect(() => {
+    if (value === published.current) return;
+    if (idle.current) {
+      clearTimeout(idle.current);
+      idle.current = null;
+    }
+    published.current = value;
+    latest.current = value;
+    setText(value);
+  }, [value]);
+
+  // An unmount with a keystroke still pending would lose it — closing a pane
+  // must not throw away what was typed into it.
+  useEffect(() => () => publish(), [publish]);
+
+  const change = (next: string) => {
+    latest.current = next;
+    setText(next);
+    if (composing.current) return;
+    if (idle.current) clearTimeout(idle.current);
+    idle.current = setTimeout(publish, PUBLISH_IDLE);
+  };
+
+  /**
+   * Grow with the content up to a ceiling, then scroll.
+   *
+   * `grow` is the IME's version. Measuring normally means clearing the height
+   * to `auto` first, which collapses the field to one row for the instant it
+   * takes to read `scrollHeight` — invisible at 60fps, but it moves the caret
+   * rect twice per keystroke, and the candidate window is positioned from that
+   * rect. That is the flicker. While a composition is open the height is left
+   * where it is and only ever raised, so the caret does not move.
+   *
+   * The overflow is switched with the height rather than left on `auto`: a
+   * field sized to exactly its content still renders a scrollbar under `auto`
+   * in this webview, and a one-line prompt box with a scroll track down its
+   * side is the kind of detail that makes an app look assembled rather than
+   * built.
+   */
+  const resize = useCallback((grow: boolean) => {
+    const node = field.current;
+    if (!node) return;
+    if (!grow) node.style.height = "auto";
+    const wanted = node.scrollHeight;
+    if (grow && wanted <= node.clientHeight) return;
+    node.style.height = `${Math.min(wanted, MAX_HEIGHT)}px`;
+    node.style.overflowY = wanted > MAX_HEIGHT ? "auto" : "hidden";
+  }, []);
 
   // Focus returns whenever the turn ends, so a conversation is typed without
   // ever reaching for the mouse.
@@ -67,22 +162,9 @@ export function Composer({
     if (!running && !disabled) field.current?.focus();
   }, [running, disabled]);
 
-  // Grow with the content up to a ceiling, then scroll. Set before paint so a
-  // pasted block never flashes at one row first.
-  //
-  // The overflow is switched with the height rather than left on `auto`: a
-  // field sized to exactly its content still renders a scrollbar under `auto`
-  // in this webview, and a one-line prompt box with a scroll track down its
-  // side is the kind of detail that makes an app look assembled rather than
-  // built.
   useEffect(() => {
-    const node = field.current;
-    if (!node) return;
-    node.style.height = "auto";
-    const wanted = node.scrollHeight;
-    node.style.height = `${Math.min(wanted, MAX_HEIGHT)}px`;
-    node.style.overflowY = wanted > MAX_HEIGHT ? "auto" : "hidden";
-  }, [value]);
+    resize(composing.current);
+  }, [text, resize]);
 
   const take = (transfer: DataTransfer | null) => {
     setFailure(null);
@@ -110,14 +192,29 @@ export function Composer({
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };
 
-  const sendable = (value.trim().length > 0 || attachments.length > 0) && !disabled;
+  const sendable = (text.trim().length > 0 || attachments.length > 0) && !disabled;
+
+  /** Hand the text over and empty the field in the same beat. The window
+   *  clears the draft too, which arrives as an external write this has already
+   *  agreed with. */
+  const submit = () => {
+    if (idle.current) {
+      clearTimeout(idle.current);
+      idle.current = null;
+    }
+    const sending = latest.current;
+    latest.current = "";
+    published.current = "";
+    setText("");
+    onSubmit(sending);
+  };
 
   return (
     <form
       className={`composer${dropping ? " is-dropping" : ""}`}
       onSubmit={(event) => {
         event.preventDefault();
-        if (sendable) onSubmit();
+        if (sendable) submit();
       }}
       onDragOver={(event) => {
         if (!isImagePaste(event.dataTransfer)) return;
@@ -160,7 +257,7 @@ export function Composer({
       <div className="composer-row">
         <textarea
           ref={field}
-          value={value}
+          value={text}
           rows={1}
           placeholder={
             running
@@ -170,7 +267,26 @@ export function Composer({
                 : "Ask for something in this folder"
           }
           disabled={disabled}
-          onChange={(event) => onChange(event.target.value)}
+          onChange={(event) => change(event.target.value)}
+          onCompositionStart={() => {
+            composing.current = true;
+            if (idle.current) {
+              clearTimeout(idle.current);
+              idle.current = null;
+            }
+          }}
+          onCompositionEnd={(event) => {
+            composing.current = false;
+            // The accepted candidate is the first thing about this word that is
+            // a draft, so it is the first thing published and the first thing
+            // the field is measured for.
+            change(event.currentTarget.value);
+            resize(false);
+          }}
+          // Leaving the field settles it: whatever reads the draft next — the
+          // file tree's mention, a slash command in another pane — sees what is
+          // on screen rather than what was on screen 200ms ago.
+          onBlur={publish}
           onPaste={(event) => {
             // Text stays native. The final branch catches the empty WebKitGTK
             // clipboard event shape, which can still be a system image paste.
@@ -194,7 +310,7 @@ export function Composer({
               // This used to refuse outright while a turn ran, which made the
               // most ordinary thing in the app (seeing where it is going and
               // saying one more thing) impossible.
-              if (sendable) onSubmit();
+              if (sendable) submit();
               return;
             }
             if (event.key === "Escape" && running) {

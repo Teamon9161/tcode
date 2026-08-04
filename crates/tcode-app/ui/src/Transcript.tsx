@@ -1,4 +1,4 @@
-import { useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
 
 import { runPairs, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
@@ -32,8 +32,18 @@ import type { Status } from "./types";
  * Blocks nest (a sub-agent run holds its own), so the renderer recurses. The
  * same list component draws a run's contents inside the panel, which is what
  * keeps a delegated turn from needing a second, subtly different transcript.
+ *
+ * **Memoized, and everything above it is arranged so that it can be.** This is
+ * far and away the most expensive thing the window draws — a hundred turns is
+ * some tens of milliseconds of markdown, grammars and reconciliation — and
+ * almost nothing that happens in this app is about it. A keystroke in the
+ * composer, a divider moving, another conversation streaming: all of them used
+ * to redraw every message here, because the window holds one state object and
+ * this sat underneath it. The comparison is only worth anything while its props
+ * hold still, which is why `App` keeps its handlers constant and `Panes` binds
+ * these two per pane rather than in the JSX.
  */
-export function Transcript({
+export const Transcript = memo(function Transcript({
   blocks,
   running,
   rewindTargets,
@@ -94,7 +104,7 @@ export function Transcript({
       </div>
     </div>
   );
-}
+});
 
 export function isAtBottom({
   scrollHeight,
@@ -130,39 +140,64 @@ export function BlockList({
     [blocks, thinking, pairs],
   );
 
-  const items = groupExploration
-    ? groupTranscriptBlocks(shown)
-    : shown.map((block) => ({ kind: "block" as const, block }));
+  const items = useMemo(
+    () =>
+      groupExploration
+        ? groupTranscriptBlocks(shown)
+        : shown.map((block, at) => ({ kind: "block" as const, block, at })),
+    [shown, groupExploration],
+  );
+
   return (
     <>
-      {items.map((item, index) =>
+      {items.map((item) =>
         item.kind === "exploration" ? (
-          <ExplorationGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+          <ExplorationGroup key={keyOf(item)} blocks={item.blocks} onOpen={onOpen} />
         ) : item.kind === "changes" ? (
-          <ChangesGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+          <ChangesGroup key={keyOf(item)} blocks={item.blocks} onOpen={onOpen} />
         ) : item.kind === "commands" ? (
-          <CommandsGroup key={index} blocks={item.blocks} onOpen={onOpen} />
+          <CommandsGroup key={keyOf(item)} blocks={item.blocks} onOpen={onOpen} />
         ) : item.block.kind === "run" ? (
           <RunCall
-            key={index}
+            key={keyOf(item)}
             block={item.block}
             report={pairs.report.get(item.block.run)}
             onOpen={onOpen}
           />
         ) : (
-          <BlockView key={index} block={item.block} onOpen={onOpen} />
+          <BlockView key={keyOf(item)} block={item.block} onOpen={onOpen} />
         ),
       )}
     </>
   );
 }
 
+/**
+ * A key that survives the list around it changing shape.
+ *
+ * Keyed by position in the *list of items* — which is what an index key does —
+ * a step's identity moved every time a group formed: the moment a second edit
+ * arrives, one item becomes two blocks' worth of one item and everything after
+ * it shifts up a slot. React then unmounts and rebuilds every step below the
+ * change, which during a burst of edits is most of the conversation, repeatedly,
+ * and takes every open disclosure with it.
+ *
+ * Keyed by where the step *starts* in the conversation, only the item that
+ * genuinely changed kind gets a new key. Its neighbours keep theirs, because a
+ * conversation is appended to and their starting points do not move.
+ */
+function keyOf(item: TranscriptItem): string {
+  return `${item.kind}:${item.at}`;
+}
+
 type ToolBlock = Extract<Block, { kind: "tool" }>;
+/** `at` is where this step begins in the list it was grouped from — its
+ *  identity across renders, see `keyOf`. */
 export type TranscriptItem =
-  | { kind: "block"; block: Block }
-  | { kind: "exploration"; blocks: ToolBlock[] }
-  | { kind: "changes"; blocks: ToolBlock[] }
-  | { kind: "commands"; blocks: ToolBlock[] };
+  | { kind: "block"; block: Block; at: number }
+  | { kind: "exploration"; blocks: ToolBlock[]; at: number }
+  | { kind: "changes"; blocks: ToolBlock[]; at: number }
+  | { kind: "commands"; blocks: ToolBlock[]; at: number };
 
 /** Consecutive low-risk inspection calls are one trace step, not a stack of
  * cards.
@@ -177,52 +212,82 @@ export type TranscriptItem =
  * would have answered by hiding it. */
 export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
   const grouped: TranscriptItem[] = [];
+  // Where each run of like steps began, which is the resulting item's identity
+  // (`keyOf`). Held alongside the blocks rather than derived afterwards: once a
+  // group is closed there is nothing left that says where it started.
   let exploration: ToolBlock[] = [];
   let changes: ToolBlock[] = [];
   let commands: ToolBlock[] = [];
+  let explorationAt = 0;
+  let changesAt = 0;
+  let commandsAt = 0;
   const flushExploration = () => {
-    if (exploration.length > 0) grouped.push({ kind: "exploration", blocks: exploration });
+    if (exploration.length > 0) {
+      grouped.push({ kind: "exploration", blocks: exploration, at: explorationAt });
+    }
     exploration = [];
   };
   const flushChanges = () => {
-    if (changes.length === 1) grouped.push({ kind: "block", block: changes[0] });
-    else if (changes.length > 1) grouped.push({ kind: "changes", blocks: changes });
+    if (changes.length === 1) grouped.push({ kind: "block", block: changes[0], at: changesAt });
+    else if (changes.length > 1) grouped.push({ kind: "changes", blocks: changes, at: changesAt });
     changes = [];
   };
   const flushCommands = () => {
-    if (commands.length === 1) grouped.push({ kind: "block", block: commands[0] });
-    else if (commands.length > 1) grouped.push({ kind: "commands", blocks: commands });
+    if (commands.length === 1) grouped.push({ kind: "block", block: commands[0], at: commandsAt });
+    else if (commands.length > 1) {
+      grouped.push({ kind: "commands", blocks: commands, at: commandsAt });
+    }
     commands = [];
   };
 
-  for (const block of blocks) {
+  blocks.forEach((block, at) => {
     const group = block.kind === "tool" ? transcriptGroupFor(block.name) : undefined;
     if (block.kind === "tool" && group === "exploration") {
       flushChanges();
       flushCommands();
+      if (exploration.length === 0) explorationAt = at;
       exploration.push(block);
     } else if (block.kind === "tool" && group === "changes") {
       flushExploration();
       flushCommands();
+      if (changes.length === 0) changesAt = at;
       changes.push(block);
     } else if (block.kind === "tool" && group === "commands") {
       flushExploration();
       flushChanges();
+      if (commands.length === 0) commandsAt = at;
       commands.push(block);
     } else {
       flushExploration();
       flushChanges();
       flushCommands();
-      grouped.push({ kind: "block", block });
+      grouped.push({ kind: "block", block, at });
     }
-  }
+  });
   flushExploration();
   flushChanges();
   flushCommands();
   return grouped;
 }
 
-function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) => void }) {
+/**
+ * One thing that happened, drawn.
+ *
+ * Memoized because a conversation is appended to: a streaming delta replaces
+ * the block it is extending and leaves every earlier one exactly as it was, so
+ * the identity check here is the difference between redrawing the last message
+ * and redrawing all of them, several times a second, for the length of a turn.
+ * `blocks.ts` is what makes it true — its reducers rebuild the list and reuse
+ * the blocks — so a change there that starts copying blocks on the way past
+ * silently costs this.
+ */
+const BlockView = memo(function BlockView({
+  block,
+  onOpen,
+}: {
+  block: Block;
+  onOpen: (value: Inspect) => void;
+}) {
   switch (block.kind) {
     case "user":
       return <UserMessage block={block} onOpen={onOpen} />;
@@ -249,7 +314,7 @@ function BlockView({ block, onOpen }: { block: Block; onOpen: (value: Inspect) =
     case "run":
       return <RunCall block={block} onOpen={onOpen} />;
   }
-}
+});
 
 /**
  * Images that rode with a prompt, at a size that says which one it was.
@@ -718,7 +783,7 @@ function BatchCall({
  * in flight, "what was this one for" is the only question worth answering at a
  * glance.
  */
-function RunCall({
+const RunCall = memo(function RunCall({
   block,
   report,
   onOpen,
@@ -774,7 +839,7 @@ function RunCall({
       )}
     </div>
   );
-}
+});
 
 /**
  * `TaskRunStatus` (`tcode_core::task_trace`), snake_cased on the wire.

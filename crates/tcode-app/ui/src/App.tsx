@@ -78,6 +78,23 @@ export function App() {
   );
 
   /**
+   * The conversations, readable from a handler without being a dependency of
+   * it.
+   *
+   * Every callback that needed `states` was rebuilt on every event of every
+   * session, which is what stopped the panes below from being able to skip a
+   * render: a new function identity is a changed prop, and a changed prop
+   * reaches through `memo` to redraw a transcript that did not change. Reading
+   * the current value here instead makes those handlers constant.
+   *
+   * Only ever read from an event handler or an awaited continuation, never
+   * during a render — a render must see the `states` it was given, or React's
+   * output stops being a function of its input.
+   */
+  const held = useRef(states);
+  held.current = states;
+
+  /**
    * Re-read one conversation's plan.
    *
    * Called at the three moments a plan can have changed — a `progress` call
@@ -349,13 +366,17 @@ export function App() {
    * A queued prompt has not happened yet — the transcript is a record, and a
    * message that might still be taken back does not belong in one. Core puts it
    * there for real (`QueuedInput`) at the boundary where it is delivered.
+   *
+   * The text is an argument rather than a read of `states[id].draft`: the
+   * composer holds the draft and publishes it on an idle (`Composer.tsx`), so
+   * a prompt typed and sent inside that window is not in the state yet.
    */
   const send = useCallback(
-    async (id: string) => {
-      const text = (states[id]?.draft ?? "").trim();
-      const attachments = states[id]?.attachments ?? [];
+    async (id: string, draft: string) => {
+      const text = draft.trim();
+      const attachments = held.current[id]?.attachments ?? [];
       if (!text && attachments.length === 0) return;
-      const planFirst = states[id]?.planFirst ?? false;
+      const planFirst = held.current[id]?.planFirst ?? false;
       patch(id, (state) => ({
         ...state,
         draft: "",
@@ -414,7 +435,7 @@ export function App() {
         }));
       }
     },
-    [states, patch, dispatchSlash],
+    [patch, dispatchSlash],
   );
 
   const resume = useCallback(
@@ -504,8 +525,8 @@ export function App() {
    */
   const rewind = useCallback(
     async (id: string, restoreFiles: boolean) => {
-      const ask = states[id]?.rewindAsk;
-      if (!ask || states[id]?.rewinding) return;
+      const ask = held.current[id]?.rewindAsk;
+      if (!ask || held.current[id]?.rewinding) return;
       patch(id, (state) => ({ ...state, rewinding: true }));
       try {
         const done = await invoke<Rewound>("rewind", {
@@ -553,12 +574,12 @@ export function App() {
         }));
       }
     },
-    [states, patch],
+    [patch],
   );
 
   const answer = useCallback(
     async (id: string, decision: Decision, comment: string, setMode?: ApprovalMode) => {
-      const pending = states[id]?.approval;
+      const pending = held.current[id]?.approval;
       if (!pending) return;
       patch(id, (state) => ({ ...state, approval: null }));
       try {
@@ -574,7 +595,7 @@ export function App() {
         }));
       }
     },
-    [states, patch],
+    [patch],
   );
 
   /**
@@ -587,7 +608,7 @@ export function App() {
    */
   const decidePlan = useCallback(
     async (id: string, choice: PlanDecision) => {
-      const pending = states[id]?.approval;
+      const pending = held.current[id]?.approval;
       if (!pending) return;
       patch(id, (state) => ({
         ...state,
@@ -616,12 +637,12 @@ export function App() {
         }));
       }
     },
-    [states, patch],
+    [patch],
   );
 
   const savePlan = useCallback(
     async (id: string) => {
-      const draft = states[id]?.planDraft;
+      const draft = held.current[id]?.planDraft;
       if (!draft) return;
       try {
         const plan = await invoke<Plan>("write_plan", {
@@ -636,7 +657,7 @@ export function App() {
         }));
       }
     },
-    [states, patch],
+    [patch],
   );
 
   /**
@@ -696,6 +717,44 @@ export function App() {
 
   const stateOf = useCallback((id: string) => states[id] ?? BLANK, [states]);
 
+  // The plain field writers. Constant, like everything else handed down: these
+  // are the props a memoized pane compares itself against, and an arrow written
+  // inline in the JSX below is a different function on every render — which is
+  // the same as having no memo at all.
+  const setDraft = useCallback(
+    (id: string, draft: string) => patch(id, (was) => ({ ...was, draft })),
+    [patch],
+  );
+  const attach = useCallback(
+    (id: string, items: SessionState["attachments"]) =>
+      patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] })),
+    [patch],
+  );
+  const detach = useCallback(
+    (id: string, item: string) =>
+      patch(id, (was) => ({
+        ...was,
+        attachments: was.attachments.filter((entry) => entry.id !== item),
+      })),
+    [patch],
+  );
+  const interrupt = useCallback((id: string) => {
+    invoke("interrupt", { session: id }).catch(() => {});
+  }, []);
+  const setPlanDraft = useCallback(
+    (id: string, draft: PlanDraft) => patch(id, (was) => ({ ...was, planDraft: draft })),
+    [patch],
+  );
+  const setPlanOpen = useCallback(
+    (id: string, open: boolean) => patch(id, (was) => ({ ...was, planOpen: open })),
+    [patch],
+  );
+  const setPlanFirst = useCallback(
+    (id: string, on: boolean) => patch(id, (was) => ({ ...was, planFirst: on })),
+    [patch],
+  );
+  const goHome = useCallback(() => setTiling(EMPTY), []);
+
   if (fault) return <Fault reason={fault} />;
 
   if (!tiling.root) {
@@ -724,21 +783,12 @@ export function App() {
             sessions={sessions}
             stateOf={stateOf}
             statusOf={statusOf}
-            onTiling={(step) => setTiling(step)}
-            onDraft={(id, draft) => patch(id, (was) => ({ ...was, draft }))}
-            onAttach={(id, items) =>
-              patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] }))
-            }
-            onDetach={(id, item) =>
-              patch(id, (was) => ({
-                ...was,
-                attachments: was.attachments.filter((entry) => entry.id !== item),
-              }))
-            }
+            onTiling={setTiling}
+            onDraft={setDraft}
+            onAttach={attach}
+            onDetach={detach}
             onSend={send}
-            onInterrupt={(id) => {
-              invoke("interrupt", { session: id }).catch(() => {});
-            }}
+            onInterrupt={interrupt}
             onWithdrawQueued={withdrawQueued}
             onSendQueuedNow={sendQueuedNow}
             onResume={resume}
@@ -747,12 +797,12 @@ export function App() {
             onRewind={rewind}
             onAnswer={answer}
             onDecidePlan={decidePlan}
-            onPlanDraft={(id, draft) => patch(id, (was) => ({ ...was, planDraft: draft }))}
+            onPlanDraft={setPlanDraft}
             onSavePlan={savePlan}
-            onPlanOpen={(id, open) => patch(id, (was) => ({ ...was, planOpen: open }))}
-            onPlanFirst={(id, on) => patch(id, (was) => ({ ...was, planFirst: on }))}
+            onPlanOpen={setPlanOpen}
+            onPlanFirst={setPlanFirst}
             onCloseSession={closeSession}
-            onHome={() => setTiling(EMPTY)}
+            onHome={goHome}
             onOpenFolder={openFolder}
           />
         </LimitsContext.Provider>

@@ -75,6 +75,10 @@ export function WebPane({
   const hiddenRef = useRef(hidden);
   hiddenRef.current = hidden;
 
+  /** The frame a pending measurement is booked for, so the render that follows
+   *  a keystroke does not book a second one. */
+  const booked = useRef(0);
+
   /** Measure, and only cross the bridge when it actually moved. This runs on
    *  every render and on every resize, so it is the one place that has to stay
    *  cheap. */
@@ -98,16 +102,48 @@ export function WebPane({
       .catch((error) => setFailure(String(error)));
   }, []);
 
+  /**
+   * Book the measurement for the next frame, at most once.
+   *
+   * Measuring is `getBoundingClientRect`, and calling it in a layout effect —
+   * straight after a commit, while the layout it would read is dirty — forces
+   * the platform to lay the whole document out synchronously before it can
+   * answer. With this pane open that bill was paid after *every* render in the
+   * window, including the one behind each keystroke in a composer three panes
+   * away, on a document holding a conversation hundreds of blocks long.
+   *
+   * A frame later the layout is already computed and the same call is a read.
+   * Nothing is lost by the wait: the webview is composited by the OS, so it was
+   * never going to move in the same frame as the HTML underneath it anyway.
+   */
+  const schedule = useCallback(
+    (first: boolean) => {
+      if (booked.current) return;
+      booked.current = requestAnimationFrame(() => {
+        booked.current = 0;
+        place(first);
+      });
+    },
+    [place],
+  );
+
   useLayoutEffect(() => {
-    place(placed.current === "");
+    schedule(placed.current === "");
   });
 
   useLayoutEffect(() => {
     if (!body.current) return;
-    const watch = new ResizeObserver(() => place(false));
+    const watch = new ResizeObserver(() => schedule(false));
     watch.observe(body.current);
     return () => watch.disconnect();
-  }, [place]);
+  }, [schedule]);
+
+  useEffect(
+    () => () => {
+      if (booked.current) cancelAnimationFrame(booked.current);
+    },
+    [],
+  );
 
   // The pane is going away — hidden by the same button that opened it, by the
   // close menu, or because another pane fills the field. Either way the

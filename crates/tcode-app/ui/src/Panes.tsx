@@ -1,4 +1,4 @@
-import { useMemo, useRef, type CSSProperties, type RefObject } from "react";
+import { useCallback, useMemo, useRef, type CSSProperties, type RefObject } from "react";
 
 import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
 import { SessionContext, type SessionState } from "./session";
@@ -12,6 +12,7 @@ import {
   type Inspect,
 } from "./inspect";
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
+import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
@@ -76,7 +77,10 @@ export type PaneContext = {
   onDraft: (session: string, value: string) => void;
   onAttach: (session: string, items: SessionState["attachments"]) => void;
   onDetach: (session: string, id: string) => void;
-  onSend: (session: string) => void;
+  /** The text comes from the composer rather than from this session's state:
+   *  the draft is published on an idle, and a prompt typed and sent inside one
+   *  would otherwise send the previous contents (`Composer.tsx`). */
+  onSend: (session: string, text: string) => void;
   onInterrupt: (session: string) => void;
   /** Take one queued prompt back. Index *and* text: the backend refuses a pair
    *  that disagrees rather than dropping whatever now sits at that position. */
@@ -162,6 +166,19 @@ function box(rect: Rect): CSSProperties {
  * pointer went down. That way the divider stays exactly under the cursor even
  * after the clamp in `setRatio` has refused to go any further — a delta would
  * accumulate the refused movement and leave the handle behind the pointer.
+ *
+ * Two things keep it at the pointer's speed rather than the layout's:
+ *
+ *  - **One ratio per frame.** A pointer reports at the device's rate, which is
+ *    well over 100Hz on current hardware, and every sample used to commit a new
+ *    tiling and re-render the window. Frames are the rate at which any of that
+ *    can be seen, so the samples in between are coalesced and the last one
+ *    wins — dropping a sample costs nothing, since the next one carries the
+ *    absolute position anyway.
+ *  - **The browser stands down.** Following a pane means moving and resizing a
+ *    native webview, which on this platform re-lays-out a whole page in another
+ *    process. It is hidden for the length of the drag and shown again on
+ *    release, which is what `browser.rs` has always said should happen here.
  */
 function Divider({
   divider,
@@ -179,20 +196,40 @@ function Divider({
     const area = field.current?.getBoundingClientRect();
     if (!area) return;
     event.currentTarget.setPointerCapture(event.pointerId);
+    const restore = yieldBrowser();
+    let frame = 0;
+    let wanted: number | null = null;
+
+    const commit = () => {
+      frame = 0;
+      if (wanted !== null) onRatio(id, wanted);
+      wanted = null;
+    };
     const move = (moved: PointerEvent) => {
       const onField = row
         ? (moved.clientX - area.left) / area.width
         : (moved.clientY - area.top) / area.height;
       const span = row ? within.width : within.height;
       const start = row ? within.left : within.top;
-      if (span > 0) onRatio(id, (onField - start) / span);
+      if (span <= 0) return;
+      wanted = (onField - start) / span;
+      if (!frame) frame = requestAnimationFrame(commit);
     };
     const stop = () => {
       window.removeEventListener("pointermove", move);
       window.removeEventListener("pointerup", stop);
+      window.removeEventListener("pointercancel", stop);
+      // The last sample must land even if the pointer went up before its frame
+      // did, or the divider settles one frame behind where it was let go.
+      if (frame) cancelAnimationFrame(frame);
+      commit();
+      restore();
     };
     window.addEventListener("pointermove", move);
     window.addEventListener("pointerup", stop);
+    // A drag the platform takes away — a window switch, a touch cancelled —
+    // still has to give the browser back.
+    window.addEventListener("pointercancel", stop);
   };
 
   const place: CSSProperties = row
@@ -316,6 +353,21 @@ function SessionPane({
     () => state.planDraft ?? (state.plan ? draftOf(state.plan) : null),
     [state.planDraft, state.plan],
   );
+
+  // The transcript is the expensive thing in this window and it is memoized, so
+  // these two are the props that decide whether it gets to skip a render. Bound
+  // once per pane rather than in the JSX, where they would be new functions
+  // every time anything in the window changed.
+  const { onOpen, onAskRewind } = context;
+  const openHere = useCallback(
+    (value: Inspect) => onOpen(leaf.id, session, value),
+    [onOpen, leaf.id, session],
+  );
+  const askRewind = useCallback(
+    (target: RewindTarget) => onAskRewind(session, target),
+    [onAskRewind, session],
+  );
+
   if (!info) return <p className="pane-empty">this conversation was closed</p>;
 
   return (
@@ -375,8 +427,8 @@ function SessionPane({
           blocks={state.blocks}
           running={state.running}
           rewindTargets={state.rewindTargets}
-          onOpen={(value) => context.onOpen(leaf.id, session, value)}
-          onRewind={(target) => context.onAskRewind(session, target)}
+          onOpen={openHere}
+          onRewind={askRewind}
         />
 
         {/* Docked, not modal: every other pane stays readable while this one
@@ -452,7 +504,7 @@ function SessionPane({
           onChange={(value) => context.onDraft(session, value)}
           onAttach={(items) => context.onAttach(session, items)}
           onDetach={(id) => context.onDetach(session, id)}
-          onSubmit={() => context.onSend(session)}
+          onSubmit={(text) => context.onSend(session, text)}
           onInterrupt={() => context.onInterrupt(session)}
         />
       </div>
@@ -484,6 +536,27 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
     () => state.planDraft ?? (state.plan ? draftOf(state.plan) : null),
     [state.planDraft, state.plan],
   );
+
+  // Bound once, for the same reason the transcript's are: what is inside can be
+  // a whole file run through a grammar, and it is memoized so that typing in
+  // the pane beside it does not tokenise the file again.
+  const held = pane?.session ?? "";
+  const { onOpen, onOpenAside, onMention, onPlanDraft, onSavePlan } = context;
+  const openHere = useCallback(
+    (next: Inspect) => onOpen(leaf.id, held, next),
+    [onOpen, leaf.id, held],
+  );
+  const openAside = useCallback(
+    (next: Inspect) => onOpenAside(leaf.id, held, next),
+    [onOpenAside, leaf.id, held],
+  );
+  const mention = useCallback((path: string) => onMention(held, path), [onMention, held]);
+  const changeDraft = useCallback(
+    (next: PlanDraft) => onPlanDraft(held, next),
+    [onPlanDraft, held],
+  );
+  const save = useCallback(() => onSavePlan(held), [onSavePlan, held]);
+
   if (!pane) return null;
   const { session, nav } = pane;
   const value = navValue(nav);
@@ -529,11 +602,11 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
           cwd={info?.cwd ?? ""}
           plan={state.plan}
           planDraft={draft}
-          onOpen={(next) => context.onOpen(leaf.id, session, next)}
-          onOpenAside={(next) => context.onOpenAside(leaf.id, session, next)}
-          onMention={(path) => context.onMention(session, path)}
-          onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
-          onSavePlan={() => context.onSavePlan(session)}
+          onOpen={openHere}
+          onOpenAside={openAside}
+          onMention={mention}
+          onPlanDraft={changeDraft}
+          onSavePlan={save}
         />
       </div>
     </>
