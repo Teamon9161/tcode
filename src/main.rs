@@ -733,12 +733,19 @@ async fn main() -> anyhow::Result<()> {
                         drop(tx);
                         let _ = printer.await;
                         match outcome {
-                            Ok(()) => {
+                            Ok(true) => {
                                 let u = &session.turn_usage;
                                 println!(
                                     "{DIM}history compacted · in {} | out {}{RESET}",
                                     u.input_tokens, u.output_tokens
                                 );
+                            }
+                            // An empty summary, or an attempt that was stopped:
+                            // either way the history is untouched, and saying
+                            // "compacted" would be a lie about what the model
+                            // can still see.
+                            Ok(false) => {
+                                println!("{DIM}nothing was compacted{RESET}")
                             }
                             Err(e) => eprintln!("{DIM}compact failed: {e}{RESET}"),
                         }

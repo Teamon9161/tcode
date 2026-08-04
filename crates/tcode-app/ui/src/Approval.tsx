@@ -62,7 +62,7 @@ export function Approval({
 
   return (
     <section
-      className={`approval${questions ? " is-question" : ""}${review ? " is-plan" : ""}`}
+      className={`dock approval${questions ? " is-question" : ""}${review ? " is-plan" : ""}`}
       role="region"
       aria-label={review ? "A plan for you to review" : questions ? "A question for you" : "Approval needed"}
     >

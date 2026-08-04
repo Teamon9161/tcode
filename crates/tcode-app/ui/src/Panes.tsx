@@ -195,7 +195,22 @@ function Divider({
   const drag = (event: React.PointerEvent<HTMLDivElement>) => {
     const area = field.current?.getBoundingClientRect();
     if (!area) return;
+    // A pointer going down on the seam must not also start a text selection.
+    // Without this the default action runs, and a drag that passes over a
+    // transcript leaves it highlighted from wherever the pointer entered — the
+    // "it selected things while I resized" that made resizing feel unsafe.
+    // Suppressing the default takes focus with it, so the handle asks for it
+    // back; the ring is `:focus-visible`, so nothing appears for the pointer.
+    event.preventDefault();
+    event.currentTarget.focus({ preventScroll: true });
     event.currentTarget.setPointerCapture(event.pointerId);
+    // The default action is only the *start* of a selection. A selection that
+    // was already on screen extends under a drag in some engines, so the whole
+    // window stops being selectable for the length of it — and anything
+    // already highlighted is dropped, because that highlight is what would
+    // otherwise grow.
+    document.body.classList.add("is-resizing");
+    window.getSelection()?.removeAllRanges();
     const restore = yieldBrowser();
     let frame = 0;
     let wanted: number | null = null;
@@ -223,6 +238,7 @@ function Divider({
       // did, or the divider settles one frame behind where it was let go.
       if (frame) cancelAnimationFrame(frame);
       commit();
+      document.body.classList.remove("is-resizing");
       restore();
     };
     window.addEventListener("pointermove", move);
@@ -497,6 +513,7 @@ function SessionPane({
           value={state.draft}
           running={state.running}
           disabled={false}
+          current={leaf.id === context.focus}
           attachments={state.attachments}
           meter={state.meter}
           planFirst={state.planFirst}

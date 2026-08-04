@@ -321,6 +321,31 @@ function listWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntr
     .map(([entryPath, node]) => entryFor(entryPath, node));
 }
 
+/** The completion menu's source, filtered exactly as `Workspace::complete`
+ *  filters it — a fixture that matched more loosely would make the menu look
+ *  better here than it is. */
+function completeWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry[] {
+  const prefix = typeof args?.prefix === "string" ? args.prefix : "";
+  const cut = prefix.lastIndexOf("/");
+  const directory = cut === -1 ? "" : prefix.slice(0, cut);
+  const fragment = (cut === -1 ? prefix : prefix.slice(cut + 1)).toLowerCase();
+  const [, fixture] = workspaceFor(args);
+  if (directory && fixture.nodes[directory]?.kind !== "directory") return [];
+  return Object.entries(fixture.nodes)
+    .filter(([entryPath]) => parentOf(entryPath) === directory)
+    .map(([entryPath, node]) => entryFor(entryPath, node))
+    .filter((entry) => entry.name.toLowerCase().startsWith(fragment))
+    .slice(0, 12);
+}
+
+/** Which mentions resolve. The backend answers with the subset that exists, so
+ *  a path nobody has is simply absent — the tint arrives, or it does not. */
+function presentWorkspace(args: Record<string, unknown> | undefined): string[] {
+  const paths = Array.isArray(args?.paths) ? (args.paths as string[]) : [];
+  const [, fixture] = workspaceFor(args);
+  return paths.filter((path) => Boolean(fixture.nodes[path]));
+}
+
 function readWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
   const [session, fixture] = workspaceFor(args);
   const path = relativePath(args?.path, "path");
@@ -499,6 +524,18 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return undefined as T;
     case "workspace_list":
       return listWorkspace(args) as T;
+    case "workspace_complete":
+      return completeWorkspace(args) as T;
+    case "workspace_present":
+      return presentWorkspace(args) as T;
+    // The desktop surface implements exactly these three, and core's own help
+    // is the text beside them (`commands.rs::slash_commands`).
+    case "slash_commands":
+      return [
+        { name: "/compact", help: "summarize history · /compact <focus>" },
+        { name: "/clear", help: "start a fresh conversation" },
+        { name: "/resume", help: "resume a session: /resume <id>" },
+      ] as T;
     case "workspace_read_text":
       return readWorkspace(args) as T;
     case "workspace_read_binary":

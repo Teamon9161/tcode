@@ -24,7 +24,7 @@ const onChange = vi.fn<(value: string) => void>();
  *  restoring a prompt, the file tree appending a path. */
 let publishFromOutside: (value: string) => void = () => {};
 
-function Harness() {
+function Harness({ current = true, running = false }: { current?: boolean; running?: boolean }) {
   const [value, setValue] = useState("");
   publishFromOutside = setValue;
   const publish = (next: string) => {
@@ -34,8 +34,9 @@ function Harness() {
   return (
     <Composer
       value={value}
-      running={false}
+      running={running}
       disabled={false}
+      current={current}
       attachments={[]}
       meter={{ context: 0, estimated: false, turn: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0, cache_write_tokens: 0 } }}
       planFirst={false}
@@ -54,6 +55,16 @@ function render() {
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => root.render(<Harness />));
+}
+
+/** A composer in a pane that is not the current one, mounted while a turn runs
+ *  so that the turn ending is what the test observes. */
+function renderBackground() {
+  container = document.createElement("div");
+  document.body.appendChild(container);
+  root = createRoot(container);
+  act(() => root.render(<Harness current={false} running />));
+  return (running: boolean) => act(() => root.render(<Harness current={false} running={running} />));
 }
 
 function field() {
@@ -94,6 +105,21 @@ beforeEach(() => {
   onChange.mockReset();
   mocks.onAttach.mockReset();
   mocks.invoke.mockReset();
+  // Answer by command name, the way the backend does. A single blanket return
+  // would hand the file menu a list of commands, which is a shape the wire
+  // never carries and a test that stops meaning anything.
+  mocks.invoke.mockImplementation((command: string) => {
+    switch (command) {
+      case "slash_commands":
+        return Promise.resolve([{ name: "/compact", help: "summarize history" }]);
+      case "workspace_complete":
+        return Promise.resolve([{ name: "main.rs", path: "src/main.rs", kind: "file" }]);
+      case "workspace_present":
+        return Promise.resolve(["src/main.rs"]);
+      default:
+        return Promise.resolve(null);
+    }
+  });
   render();
 });
 
@@ -219,6 +245,60 @@ describe("the composer input", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("does not take the caret when a turn ends in a pane that is not current", () => {
+    act(() => root.unmount());
+    container.remove();
+    const elsewhere = document.createElement("textarea");
+    document.body.appendChild(elsewhere);
+    elsewhere.focus();
+
+    const setRunning = renderBackground();
+    setRunning(false);
+
+    // The other pane finishing must not cancel an IME composition here.
+    expect(document.activeElement).toBe(elsewhere);
+    elsewhere.remove();
+  });
+
+  it("tints only the mentions this folder really has", async () => {
+    type("read @src/main.rs and @gone.rs");
+    // The check is debounced, then answered.
+    await act(async () => {
+      await new Promise((settle) => setTimeout(settle, 120));
+    });
+
+    const tinted = [...container.querySelectorAll(".composer-mention")].map(
+      (node) => node.textContent,
+    );
+    // A path that does not resolve is drawn like the prose around it, not
+    // marked as an error: it may be about to exist.
+    expect(tinted).toEqual(["@src/main.rs"]);
+    // The layer behind the field carries the whole draft, or the tint sits
+    // over the wrong characters.
+    expect(container.querySelector(".composer-mirror")!.textContent).toContain(
+      "read @src/main.rs and @gone.rs",
+    );
+  });
+
+  it("finishes an @path from the menu without disturbing the rest of the draft", async () => {
+    type("read @src/ma later");
+    // The caret is at the end after `type`, so put it back inside the token —
+    // which is also the case that must not eat the words after it.
+    const input = field();
+    act(() => {
+      input.setSelectionRange(10, 10);
+      input.dispatchEvent(new Event("select", { bubbles: true }));
+    });
+    await act(async () => {
+      await new Promise((settle) => setTimeout(settle, 120));
+    });
+
+    const enter = keydown("Tab");
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(field().value).toBe("read @src/main.rs later");
   });
 
   it("leaves Shift+Enter available for a newline", () => {

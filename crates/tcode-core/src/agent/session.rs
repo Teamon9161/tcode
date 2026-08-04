@@ -227,6 +227,13 @@ pub struct Session {
     recorded_progress: Option<String>,
     /// Prompt size of the latest request (for the context status line).
     pub last_prompt_tokens: u64,
+    /// An automatic compaction ran and produced nothing, so the window is as
+    /// full as it was. Set to stop the harness re-attempting it at every
+    /// boundary from here on — each attempt is a whole-context request, which
+    /// is the most expensive one this session can make, and it fires exactly
+    /// when the prefix is at its largest. Cleared by a compaction that lands,
+    /// including one the user asks for with `/compact`.
+    pub(super) auto_compact_declined: bool,
     pub turn_usage: Usage,
     /// `/dogfood`: also report harness tool defects while working.
     dogfood: bool,
@@ -306,6 +313,7 @@ impl Session {
             progress_injection_pending: false,
             recorded_progress: None,
             last_prompt_tokens: 0,
+            auto_compact_declined: false,
             turn_usage: Usage::default(),
             dogfood: false,
             suggestions: false,

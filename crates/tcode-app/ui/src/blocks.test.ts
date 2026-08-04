@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { applyEvent, reportOf, runPairs, type Block } from "./blocks";
+import { applyEvent, reportOf, runPairs, runSteps, type Block } from "./blocks";
 import type { AgentEvent } from "./types";
 
 const started = (run: string, parentCall: string): AgentEvent => ({
@@ -92,6 +92,44 @@ describe("runPairs", () => {
 
     expect(pairs.superseded.size).toBe(0);
     expect(pairs.report.size).toBe(0);
+  });
+});
+
+describe("runSteps", () => {
+  const step: Block = { kind: "tool", callId: "t1", name: "grep", summary: "grep", input: {} };
+  const said = (text: string): Block => ({ kind: "assistant", text });
+
+  // Core builds the report out of the run's final assistant entry, so drawing
+  // both puts the same paragraphs on screen twice.
+  it("drops the last message when it is the report", () => {
+    expect(runSteps([step, said("two hits, both in retry")], "two hits, both in retry")).toEqual([
+      step,
+    ]);
+  });
+
+  // A resumable run's result is prefixed with a header naming the run, and the
+  // report is what follows it.
+  it("recognizes the report behind the header a resumable run carries", () => {
+    const report = "[explore sub-agent r1 on opus: found it]\ntwo hits, both in retry";
+    expect(runSteps([step, said("two hits, both in retry")], report)).toEqual([step]);
+  });
+
+  // Cancelled, failed, or an older log with no `parent_call`: there is no
+  // report, so every step stays where it is.
+  it("keeps every step when nothing came back", () => {
+    const blocks = [step, said("two hits, both in retry")];
+    expect(runSteps(blocks, undefined)).toBe(blocks);
+    expect(runSteps(blocks, "   ")).toBe(blocks);
+  });
+
+  it("keeps a last message the report does not account for", () => {
+    const blocks = [step, said("still looking")];
+    expect(runSteps(blocks, "cancelled before it answered")).toBe(blocks);
+  });
+
+  it("leaves a run whose last block is a step of its own", () => {
+    const blocks = [said("here is what I found"), step];
+    expect(runSteps(blocks, "here is what I found")).toBe(blocks);
   });
 });
 

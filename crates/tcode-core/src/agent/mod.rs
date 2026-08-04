@@ -517,10 +517,22 @@ impl Agent {
 
     fn should_auto_compact(&self, session: &Session, model: &crate::provider::ActiveModel) -> bool {
         self.auto_compact
+            && !session.auto_compact_declined
             && session.last_prompt_tokens
                 >= model.context_window * u64::from(self.auto_compact_percent.clamp(1, 100)) / 100
     }
 
+    /// Compact if the window says so — and, when the attempt comes back with
+    /// nothing, say so once and stop trying.
+    ///
+    /// A compaction that produces no summary leaves the ledger untouched, so
+    /// the threshold that fired is still tripped and the next boundary fires it
+    /// again: a whole-context request per attempt, at the point in the session
+    /// where that request is at its largest, with nothing on screen but
+    /// "compacting history" over and over. An interrupted attempt is not that —
+    /// the user stopped it and may well want it again — so only a failure that
+    /// nobody asked for disarms the automatic path. `/compact` always tries,
+    /// and a compaction that lands re-arms it.
     async fn auto_compact_if_needed(
         &self,
         session: &mut Session,
@@ -528,10 +540,21 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
-        if self.should_auto_compact(session, model) {
-            self.emit(events, AgentEvent::Compacting).await?;
-            self.compact(session, events, cancel).await?;
+        if !self.should_auto_compact(session, model) {
+            return Ok(());
         }
+        self.emit(events, AgentEvent::Compacting).await?;
+        if self.compact(session, events, cancel).await? || cancel.is_cancelled() {
+            return Ok(());
+        }
+        session.auto_compact_declined = true;
+        session.ledger.append(Entry::Note(
+            "Automatic history compaction produced no summary, so nothing was \
+             summarized and the context window is still as full as it was. The \
+             harness will not retry it on its own. Tell the user they can run \
+             /compact, and keep new context small until then."
+                .to_string(),
+        ));
         Ok(())
     }
 
@@ -680,10 +703,8 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
         let model = self.model.snapshot();
-        if self.should_auto_compact(session, &model) {
-            self.emit(events, AgentEvent::Compacting).await?;
-            self.compact(session, events, &cancel).await?;
-        }
+        self.auto_compact_if_needed(session, &model, events, &cancel)
+            .await?;
         if self.note_background(session, events).await? == 0 {
             return Ok(false);
         }
@@ -770,14 +791,21 @@ impl Agent {
             // queued prompt may deliver the final mode explanation.
             self.note_background(session, events).await?;
             self.commit_mode(session, events).await?;
-            self.deliver_pending_input(session, events).await?;
-            self.deliver_deferred_context(session);
             // A tool batch can add most of the context in one turn. Re-estimate
             // the next complete request here rather than waiting for the user
             // to submit another prompt after the window has already overflowed.
             session.last_prompt_tokens = self.estimate_context_tokens(session);
             self.auto_compact_if_needed(session, model, events, cancel)
                 .await?;
+            // *After* the compaction, and that order is the point: a prompt
+            // typed while the turn was running used to be appended first and
+            // then swallowed by the summary written in the same breath, so
+            // what the model finally read was somebody's paraphrase of the
+            // sentence the user had just finished typing. Delivered here it is
+            // the first thing after the summary, verbatim — which is also what
+            // `user_turn` does with the prompt that starts a turn.
+            self.deliver_pending_input(session, events).await?;
+            self.deliver_deferred_context(session);
         }
         // Runaway guard tripped. The ledger is consistent (the last tool
         // batch committed its results), so end the turn instead of erroring:

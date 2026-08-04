@@ -43,7 +43,7 @@ impl Ledger {
 - System prompt + 工具定义会话内定死不变。
 - Anthropic：`cache_control` 断点——system+tools 后固定一个，消息尾部滑动一个，控制在 4 断点预算内。
 - OpenAI 兼容：隐式前缀缓存，append-only 天然命中。
-- Compact 仅显式触发（`/compact` 或 token 逼近上限），子请求生成摘要。
+- Compact 仅显式触发（`/compact` 或 token 逼近上限），子请求生成摘要。**一次压缩要么替换历史、要么什么都没发生，`compact()` 返回的就是这个事实**：没产出摘要时 ledger 一字未动，触发它的阈值仍然成立，所以自动路径必须停手（写一条 Note 说明，`/compact` 手动仍可再试），否则每个安全边界都会重来一次——而那是这个会话最贵的一种请求，且恰好在前缀最大的时刻发出。同理，**队列里的用户消息在压缩之后才投递**：先投再压等于把用户刚打完的那句话压成别人的转述。
 - **Progress 文件是外部可变状态，不是历史**：`~/.tcode/projects/<id>/progress/*.md` 可以被用户随手改，ledger 里只记模型发过的 `progress` 工具调用。二者不冲突——"文件可改"不等于"历史可改"，这份文件记的是**现在为真**的东西，ledger 记的是**当时发生过**的事。用户改过之后下一次工具调用返回自愈冲突（附他们的原文），而不是悄悄覆盖。
 - **Compact 移出模型上下文的条目进 `archived`，不销毁**：`entries()` / `as_messages()` 语义一字不变（模型只见 Summary），但 transcript 与 `/export` 走 `history()` = archived + entries，resume 后仍看得到压缩前的对话。archived 没有合法 `truncate_tail` 索引（rewind 进不去被压缩的历史）；`truncate_tail(0)`（`/clear`）连它一起清空。
 
@@ -184,4 +184,9 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4. app特别卡,在长时间对话之后,以及prompt框输入中文疯狂闪烁,然后窗格调整宽度什么的也特别卡,性能问题很大.
+4. 窗格有没有可能能做一个自适应的重排呢,比如我打开文件panel, 再打开某个文件,右边两个就挤在一起了,但其实应该压缩一下左边的session. 还有就是窗格能不能做到上下分呢.
+5. plan模式比如execute in a new session, detail的内容感觉是在太少了,不像以前plan mode那样,plan是特别详细的,这是为什么呢, 没什么detail的plan感觉作用不大吧,等于new session又要重新探索.
+6. read：读取 Curves.tsx 时，工具返回“文件未变更，内容已在上下文中”，但压缩后的可见上下文并没有该文件内容，导致必须追加一次 force=true 读取。若上下文经过压缩，read 应返回所请求的片段而非“已在上下文”提示，可避免这次额外调用。
+7. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
+8. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
+9. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.

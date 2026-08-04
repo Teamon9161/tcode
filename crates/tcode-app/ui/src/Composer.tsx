@@ -1,5 +1,10 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+
+import { Completions } from "./Completions";
+import { segments } from "./completion";
+import { useCompletions, useKnownMentions } from "./useCompletions";
+import { useSession } from "./session";
 
 import {
   imageFromNativeClipboard,
@@ -46,10 +51,24 @@ const MAX_HEIGHT = 220;
  */
 const PUBLISH_IDLE = 200;
 
+/** Whether taking the caret away from this node would interrupt somebody. A
+ *  focus change ends an open IME composition, so "is a field being typed into"
+ *  is the question, not "is it a form control". */
+function isTyping(node: Element | null): boolean {
+  if (!node) return false;
+  const name = node.tagName;
+  return (
+    name === "TEXTAREA" ||
+    name === "INPUT" ||
+    (node as HTMLElement).isContentEditable === true
+  );
+}
+
 export function Composer({
   value,
   running,
   disabled,
+  current,
   attachments,
   meter,
   planFirst,
@@ -63,6 +82,9 @@ export function Composer({
   value: string;
   running: boolean;
   disabled: boolean;
+  /** This composer's pane is the current one. Only that pane's field may take
+   *  the caret back when a turn ends — see the effect below. */
+  current: boolean;
   attachments: Pasted[];
   /** What this conversation occupies and what its last turn cost, for the ring
    *  on the strip below the field. */
@@ -79,9 +101,16 @@ export function Composer({
   onSubmit: (text: string) => void;
   onInterrupt: () => void;
 }) {
+  const session = useSession();
   const field = useRef<HTMLTextAreaElement>(null);
+  const row = useRef<HTMLDivElement>(null);
+  const mirror = useRef<HTMLDivElement>(null);
   const [dropping, setDropping] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  /** Where the caret is, or `null` while the field does not have it. It is the
+   *  other half of "what is being typed": the same text with the caret in two
+   *  places is two different tokens. */
+  const [caret, setCaret] = useState<number | null>(null);
 
   // What is in the field, and what the window was last told is in it. They
   // differ only between a keystroke and the publish that follows it.
@@ -130,6 +159,35 @@ export function Composer({
     idle.current = setTimeout(publish, PUBLISH_IDLE);
   };
 
+  /** Put text in the field and the caret in it, in one beat. The selection has
+   *  to be written to the DOM after React has rendered the new value, or the
+   *  browser puts the caret at the end of it. */
+  const write = ({ text: next, caret: at }: { text: string; caret: number }) => {
+    change(next);
+    setCaret(at);
+    requestAnimationFrame(() => {
+      const node = field.current;
+      if (!node) return;
+      node.focus();
+      node.setSelectionRange(at, at);
+    });
+  };
+
+  // The menu is off while a composition is open — a popover over the candidate
+  // window is in the way of the very thing it is meant to help with, and a
+  // preedit is not a path. The tint is not: the mirror renders whatever the
+  // field renders, preedit included, so it stays aligned throughout and simply
+  // has nothing to mark until a path is actually there.
+  const completions = useCompletions({
+    session,
+    text,
+    caret,
+    enabled: !composing.current,
+  });
+  const known = useKnownMentions(session, text);
+  const listId = useId();
+  const open = completions.items.length > 0;
+
   /**
    * Grow with the content up to a ceiling, then scroll.
    *
@@ -154,12 +212,40 @@ export function Composer({
     if (grow && wanted <= node.clientHeight) return;
     node.style.height = `${Math.min(wanted, MAX_HEIGHT)}px`;
     node.style.overflowY = wanted > MAX_HEIGHT ? "auto" : "hidden";
+    // The layer behind the field has to break its lines in exactly the same
+    // places, and a scrollbar changes where those are — so it takes the same
+    // height and the same reserved track, or the tint drifts off the path it
+    // is drawn under as soon as the draft gets long.
+    const behind = mirror.current;
+    if (!behind) return;
+    behind.style.height = node.style.height;
+    behind.style.overflowY = node.style.overflowY;
   }, []);
 
-  // Focus returns whenever the turn ends, so a conversation is typed without
-  // ever reaching for the mouse.
+  /**
+   * Focus returns whenever the turn ends, so a conversation is typed without
+   * ever reaching for the mouse — but only in the pane you are actually in.
+   *
+   * With two conversations on screen this used to be every composer's claim:
+   * the moment the *other* pane's turn ended, its field called `focus()` and
+   * took the caret out of the one being typed in. A focus change cancels an
+   * open IME composition, so in Chinese that is a preedit dropped and a
+   * candidate window jumping back to the other pane mid-word, which is exactly
+   * as often as the other conversation happens to finish.
+   *
+   * Two guards, because they answer different questions. `current` is read
+   * through a ref so that merely making a pane current does not yank the caret
+   * out of whatever was clicked there; `isTyping` covers every other field in
+   * the window — the tree's rename box, the plan editor, the file editor —
+   * none of which should lose what is half-typed in them because a turn ended.
+   */
+  const isCurrent = useRef(current);
+  isCurrent.current = current;
   useEffect(() => {
-    if (!running && !disabled) field.current?.focus();
+    if (running || disabled || !isCurrent.current) return;
+    const active = document.activeElement;
+    if (active !== field.current && isTyping(active)) return;
+    field.current?.focus();
   }, [running, disabled]);
 
   useEffect(() => {
@@ -192,6 +278,30 @@ export function Composer({
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };
 
+  /**
+   * The draft cut into plain runs and `@path` runs, for the layer behind the
+   * field.
+   *
+   * A path that resolves in this folder is tinted; one that does not is drawn
+   * like the prose around it rather than marked as wrong. Nothing is wrong
+   * about it — the file may be about to exist, or the sentence may just contain
+   * an `@` — and an error colour on half-typed text turns the field into
+   * something that argues with you while you use it.
+   */
+  const marks = useMemo(
+    () =>
+      segments(text).map((piece, at) =>
+        piece.mention !== null && known.has(piece.mention) ? (
+          <mark key={at} className="composer-mention">
+            {piece.text}
+          </mark>
+        ) : (
+          <span key={at}>{piece.text}</span>
+        ),
+      ),
+    [text, known],
+  );
+
   const sendable = (text.trim().length > 0 || attachments.length > 0) && !disabled;
 
   /** Hand the text over and empty the field in the same beat. The window
@@ -206,6 +316,7 @@ export function Composer({
     latest.current = "";
     published.current = "";
     setText("");
+    setCaret(0);
     onSubmit(sending);
   };
 
@@ -254,11 +365,42 @@ export function Composer({
         </p>
       )}
 
-      <div className="composer-row">
+      <div className="composer-row" ref={row}>
+        {/* The draft again, behind the field, drawn only to tint the paths in
+            it. The text here is transparent — the real glyphs are the
+            textarea's, which is what keeps an IME preedit visible and the caret
+            where the platform put it — so all this layer contributes is a
+            coloured ground under each `@path`. That is why it cannot be the
+            usual trick of a highlighted mirror with an invisible input: a
+            transparent textarea would hide the preedit, which is the one thing
+            somebody typing Chinese has to be able to see.
+
+            It is `aria-hidden` because it is the same text a screen reader
+            already has from the field. */}
+        <div className="composer-field">
+        <div className="composer-mirror" ref={mirror} aria-hidden="true">
+          {marks}
+          {/* A draft ending in a newline needs something after it or the last
+              line has no height and the tint above it sits one row too low. */}
+          {"​"}
+        </div>
         <textarea
           ref={field}
           value={text}
           rows={1}
+          aria-autocomplete="list"
+          aria-controls={open ? listId : undefined}
+          aria-expanded={open}
+          aria-activedescendant={open ? `${listId}-${completions.active}` : undefined}
+          onScroll={(event) => {
+            const behind = mirror.current;
+            if (behind) behind.scrollTop = event.currentTarget.scrollTop;
+          }}
+          // Every route the caret can move by: typing, clicking, arrow keys,
+          // a selection dragged. `selectionchange` on the document would catch
+          // the same thing once, but it fires for every field in the window.
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+          onFocus={(event) => setCaret(event.currentTarget.selectionStart)}
           placeholder={
             running
               ? "running — type to queue, Esc to stop"
@@ -267,7 +409,15 @@ export function Composer({
                 : "Ask for something in this folder"
           }
           disabled={disabled}
-          onChange={(event) => change(event.target.value)}
+          onChange={(event) => {
+            change(event.target.value);
+            // The input event is the one thing that always carries the new
+            // caret. `onSelect` covers moving it without typing — clicking,
+            // arrow keys — but it does not fire for every keystroke, and a
+            // menu offered for where the caret was two characters ago is a
+            // menu that completes the wrong token.
+            setCaret(event.target.selectionStart);
+          }}
           onCompositionStart={() => {
             composing.current = true;
             if (idle.current) {
@@ -286,7 +436,13 @@ export function Composer({
           // Leaving the field settles it: whatever reads the draft next — the
           // file tree's mention, a slash command in another pane — sees what is
           // on screen rather than what was on screen 200ms ago.
-          onBlur={publish}
+          onBlur={() => {
+            publish();
+            // No caret, no token, no menu. The menu's own rows keep focus here
+            // (`onMouseDown` preventing default), so this only ever fires when
+            // the field is genuinely being left.
+            setCaret(null);
+          }}
           onPaste={(event) => {
             // Text stays native. The final branch catches the empty WebKitGTK
             // clipboard event shape, which can still be a system image paste.
@@ -301,6 +457,34 @@ export function Composer({
             // WebKit can report composition after the keydown, where 229 is the
             // compatible signal for the same event.
             if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+
+            // The completion menu, while it is up. It takes only the keys it
+            // has an answer for, so a draft with a menu open is otherwise typed
+            // exactly like one without: every one of these falls through when
+            // there is nothing to complete.
+            if (open) {
+              if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                completions.move(event.key === "ArrowDown" ? 1 : -1);
+                return;
+              }
+              if (event.key === "Tab" || event.key === "Enter") {
+                const next = completions.accept();
+                if (next) {
+                  event.preventDefault();
+                  write(next);
+                  return;
+                }
+              }
+              if (event.key === "Escape") {
+                event.preventDefault();
+                // Only the menu. A turn running behind it is stopped by the
+                // next Escape, which is the same order every other popover in
+                // this window observes.
+                completions.close();
+                return;
+              }
+            }
 
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
@@ -319,6 +503,7 @@ export function Composer({
             }
           }}
         />
+        </div>
         {/* Inside the field's own box, not a filled button beside it. What sends
             a message here is the return key; the glyph is a reminder of that
             and a target for the pointer, so it shows the key rather than
@@ -348,6 +533,18 @@ export function Composer({
           </button>
         )}
       </div>
+
+      <Completions
+        anchor={row}
+        items={completions.items}
+        active={completions.active}
+        listId={listId}
+        onChoose={(item) => {
+          const next = completions.choose(item);
+          if (next) write(next);
+        }}
+        onClose={completions.close}
+      />
 
       {/* Under the field, not above it and not in a settings screen: everything
           on this row is a property of the message about to be sent or of what

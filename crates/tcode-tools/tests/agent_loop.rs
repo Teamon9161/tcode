@@ -1643,6 +1643,59 @@ async fn monitor_wake_uses_the_configured_auto_compact_threshold() {
     ));
 }
 
+/// An automatic compaction that comes back with no summary must not be tried
+/// again on its own.
+///
+/// Nothing is replaced, so the threshold that fired is still tripped, and the
+/// next boundary fires it again — a whole-context request per attempt, at the
+/// point in the session where that request is the largest there will ever be,
+/// with nothing on screen but "compacting history" over and over. The harness
+/// says so once, in the ledger, and leaves the retry to `/compact`.
+#[tokio::test]
+async fn a_compaction_that_produces_nothing_is_not_retried_automatically() {
+    let dir = tempfile::tempdir().unwrap();
+    // Two scripted answers, but only one may ever be asked for.
+    let compact = MockProvider::named("compact-1", vec![text_done("   "), text_done("late")]);
+    let mut agent = agent(MockProvider::new(vec![]));
+    agent
+        .models
+        .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
+    agent.model.swap(ActiveModel {
+        provider: MockProvider::new(vec![]),
+        max_tokens: 1024,
+        context_window: 1_000,
+        effort: None,
+    });
+    agent.auto_compact_percent = 50;
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.last_prompt_tokens = 600;
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "history pending compaction".into(),
+    }]));
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+    for _ in 0..2 {
+        agent
+            .monitor_turn(&mut session, &tx, &approver, CancellationToken::new())
+            .await
+            .expect("a compaction that summarized nothing is not a turn failure");
+    }
+
+    assert_eq!(
+        compact.requests.lock().unwrap().len(),
+        1,
+        "the second boundary must not pay for the same whole-context request again"
+    );
+    // The history is untouched — a `Summary` here would mean the empty answer
+    // had wiped the conversation — and the note explains the state it is in.
+    assert!(
+        matches!(session.ledger.entries(), [Entry::User(_), Entry::Note(note)] if note.contains("/compact")),
+        "{:?}",
+        session.ledger.entries()
+    );
+}
+
 /// A monitor's output lines become events; when they arrive while the session
 /// is idle, `monitor_turn` delivers them as notes (legal because `Entry::Note`
 /// renders as a user-role message) and the model reacts. A second wake with

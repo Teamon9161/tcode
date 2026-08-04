@@ -58,6 +58,8 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
+    **转录与 composer 之间那一摞是一条带子，只画一根缝**（`.dock`）。审批、rewind 问句、队列、resume 选择器、计划条各自带 `border-top` 时单独看都对，摞起来就不对：队列上面一条、计划条上面又一条，中间夹着的那个看起来成了一个框。规则是 `.dock { border-top }` + `.dock ~ .dock { border-top: 0 }`——最靠上的那个画缝，后面几个不画，加第六个不需要新规则。**新加一个停在 composer 上方的东西就带上 `dock` 类，别自己画线。**
+
 9c. **窗口使用 app 自绘标题栏**（`decorations: false`）。`.topbar` 与其 `--chrome` 背景是应用主题的一部分，不能继承系统 caption 颜色；最小化、最大化、关闭由 `WindowControls` 调用 Tauri window API，`WindowDragRegion` 将 `data-tauri-drag-region` 只放在不含交互控件的 `.topbar-gap`，并保留双击最大化。浏览器是原生子 webview，会在 HTML 之上接收命中，因此它只能由 pane body 的 DOM rect 定位在标题栏下方，绝不能覆盖 drag region 或窗口控制。
 
     **topbar 里只放 app 级别的东西**（返回启动台、折叠会话栏、显示偏好），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于整个 app 还是属于某个会话"：会话栏属于 app，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。
@@ -221,9 +223,15 @@ cargo build && cargo test                 # 后端 + 集成测试
     - **`rich()` 与 `highlight()` 各有一份按源文本的缓存**（`rich.tsx` / `syntax.ts`）。`Diff.tsx` 逐行调 `highlight`，200 行的 diff 在屏幕上就是每次渲染 20ms 的 TextMate 分词。**别把缓存挪进某个组件的 `useMemo`**：调用点有五个，以后还会更多。
     - **`blocks.ts` 的 reducer 必须复用没变的块对象**（`extend` 只换最后一个、`updateCall`/`updateRun` 的 `map` 对不匹配的原样返回）。`BlockView`/`RunCall` 的 memo 全靠这一点：一旦哪次改动开始顺手复制块，流式输出会静默退回"每个 token 重绘整场对话"。
 
+    **合成态还有第二个杀手，而它只在分屏时出现：抢焦点。** `Composer` 的"回合结束把光标要回来"曾经是**每个** composer 的主张，于是右边窗格正在打字时，左边那个会话一跑完就 `focus()`——焦点一换，正在合成的 preedit 当场作废、候选窗跳回另一个窗格。所以那个 effect 有两道闸：`current`（只有当前窗格的输入框有资格，且经 ref 读，免得"把窗格变成当前"这件事本身就抢光标）与 `isTyping(document.activeElement)`（窗口里任何一个正在被输入的字段都不许被打断——树里的重命名、计划编辑器、文件编辑器）。`Composer.test.tsx` 有一条钉住它。
+
     **转录的 key 按块在对话里的起始位置算，不按 item 下标**（`Transcript.tsx::keyOf`）。分组边界会移动——第二个 edit 一到，一个 item 变成一个两块的组，后面所有 item 往上挪一格，React 于是卸载重建改动点以下的每一步，连带丢掉所有展开状态。
 
     **原生浏览器窗格是这套开销的放大器**（`WebPane.tsx`）。量它的矩形要用 `requestAnimationFrame`，不能在 layout effect 里直接 `getBoundingClientRect()`：那是在一次刚提交、布局还脏的时候读，会强制整篇文档同步布局——开着这个窗格时，窗口里**每一次**渲染都要付这笔钱。**让浏览器暂时让位只有一份实现**（`browserYield.ts` 的计数器，popover 与分隔条拖动共用，见硬规则 17）；拖动分隔条时必须让位，否则每个指针采样都在让平台把另一个进程里的整页重新布局一次。
+
+21b. **composer 的补全层只画底，绝不画字**（`Composer.tsx` 的 `.composer-mirror` + `completion.ts`）。让 `@path` 有颜色的通行做法是"镜像层画高亮的字 + textarea 文字透明"——**这条路在这里是封死的**：透明的 textarea 连 IME 的 preedit 一起藏掉，而那正是打中文的人唯一要看的东西。所以镜像层文字 `color: transparent`，只贡献 `@path` 底下那块 `--brand-wash`，真正的字形自始至终是 textarea 的。代价是两层的**每一个影响换行的度量必须一致**（字体、字号、行高、padding、宽度、`white-space`、以及 `resize()` 里同步过去的高度与滚动条 gutter）——错一点，色块就落在它标注的路径旁边，比不上色更糟。
+
+    配套三条：**补全菜单 portal + `useSeat`**（硬规则 17，composer 在 `<form>` 里，且窗格会裁掉它），**焦点永不离开输入框**（菜单行 `onMouseDown` preventDefault；键盘在输入框里处理，靠 `aria-activedescendant` 关联），**桌面端支持哪些斜杠命令只有一份名单**（`commands.rs::DESKTOP_COMMANDS`，dispatch 与菜单同读；两份名单会让菜单推荐一个 dispatcher 拒绝的命令）。补全与 `@path` 校验两个 command 都是 `async` + `spawn_blocking`（规则 22）——它们在**打字过程中**跑，同步版本会把画界面的那条线程按住。
 
 22. **读文件系统的 command 一律 `async` + `tauri::async_runtime::spawn_blocking`。** 同步 command 跑在**主线程**上（`send_message` 的注释里已经写了这条的另一半），而主线程就是画界面那条线程：`project_sessions` 曾经是同步的，于是启动台上展开一个项目（replay 那个文件夹下每一条 session log 取 preview）会把整个窗口冻住——按钮、拖动区、另外几个窗格里正在跑的会话，一起停到读完为止。debug 构建下九十条对话实测 ~250ms，release ~35ms，冷盘更久，而它**看起来完全像 UI 卡顿而不像后端慢**，因为卡住的确实是 UI。
 

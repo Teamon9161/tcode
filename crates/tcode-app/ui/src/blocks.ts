@@ -357,6 +357,32 @@ export function runPairs(blocks: Block[]): {
   return { report, superseded };
 }
 
+/**
+ * A run's own steps, without the message that *is* its report.
+ *
+ * A sub-agent's report is not a separate artefact it composes at the end: core
+ * takes the text of the final assistant entry in the run's ledger and returns
+ * that as the tool result (`tcode-tools/src/agent/mod.rs`, "the report = text
+ * of the final assistant entry"). So the same paragraphs arrived twice — as the
+ * last thing the run said, and again under "Reported back" — and a reader had
+ * to compare them word by word to discover they were one thing.
+ *
+ * The report is the copy that is kept, because it is the one the parent
+ * conversation actually received. Matching is by text, not by position: the
+ * result carries a header line for a resumable run, and a run that ended some
+ * other way (cancelled, failed, an older log with no `parent_call`) has no
+ * report at all, in which case every step stays exactly where it is.
+ */
+export function runSteps(blocks: Block[], report: string | undefined): Block[] {
+  const wanted = report?.trim();
+  if (!wanted) return blocks;
+  const last = blocks[blocks.length - 1];
+  if (!last || last.kind !== "assistant") return blocks;
+  const said = last.text.trim();
+  if (!said || !wanted.endsWith(said)) return blocks;
+  return blocks.slice(0, -1);
+}
+
 /** What a run came back with: the result of the call that started it, found
  *  anywhere in the tree. Null for a log recorded before runs carried their
  *  parent call, and while the run is still going. */

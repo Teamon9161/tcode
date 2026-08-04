@@ -228,6 +228,56 @@ impl Workspace {
         Ok(entries)
     }
 
+    /// Entries that could finish a partly-typed workspace path.
+    ///
+    /// `prefix` is what the person has typed after an `@`: everything up to the
+    /// last `/` names the directory to look in, and what follows is matched
+    /// against the names in it. So `src/wo` lists `src` and keeps `workspace.rs`
+    /// and `workspaceTree.ts`; `src/` lists `src` whole; `` lists the root.
+    ///
+    /// Matching is case-insensitive because a completion that refuses to match
+    /// `readme` against `README.md` is a completion the typist has to work
+    /// around. A directory that does not exist is not an error — it is a path
+    /// still being typed — so it comes back empty.
+    ///
+    /// [`Self::list`] does the walking, which is what keeps every name here
+    /// inside the root and representable on the wire; this only chooses among
+    /// what it returned.
+    pub fn complete(&self, prefix: &str, limit: usize) -> Vec<WorkspaceEntry> {
+        let (directory, fragment) = match prefix.rsplit_once('/') {
+            Some((directory, fragment)) => (directory, fragment),
+            None => ("", prefix),
+        };
+        let directory = (!directory.is_empty()).then_some(directory);
+        let Ok(mut entries) = self.list(directory) else {
+            return Vec::new();
+        };
+        let wanted = fragment.to_lowercase();
+        entries.retain(|entry| entry.name.to_lowercase().starts_with(&wanted));
+        // Names that start with a dot are real answers but rarely the one being
+        // typed, so they sort after the rest instead of filling the list. An
+        // explicit leading dot in the fragment puts them back at the front by
+        // being the only thing that matches at all.
+        entries.sort_by(|left, right| {
+            let hidden = |entry: &WorkspaceEntry| entry.name.starts_with('.');
+            hidden(left)
+                .cmp(&hidden(right))
+                .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
+        });
+        entries.truncate(limit);
+        entries
+    }
+
+    /// Whether this wire path names something that is really here.
+    ///
+    /// It answers through the same resolution as every read, so "exists" means
+    /// what it means everywhere else on this boundary: no component is a link,
+    /// and the whole path canonicalizes inside the root. A path that is merely
+    /// unreadable, unrepresentable, or outside is simply not here.
+    pub fn exists(&self, path: &str) -> bool {
+        self.resolve_existing_entry(path).is_ok()
+    }
+
     /// Read a regular UTF-8 file. Text beyond [`TEXT_READ_LIMIT`] is omitted
     /// from the response but still contributes to its revision.
     pub fn read(&self, path: &str) -> Result<TextFile, WorkspaceError> {
@@ -669,6 +719,39 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let workspace = Workspace::open(root.path()).unwrap();
         (root, workspace)
+    }
+
+    #[test]
+    fn completion_matches_the_fragment_after_the_last_slash() {
+        let (root, workspace) = workspace();
+        fs::create_dir(root.path().join("src")).unwrap();
+        fs::write(root.path().join("src/workspace.rs"), "").unwrap();
+        fs::write(root.path().join("src/workspaceTree.ts"), "").unwrap();
+        fs::write(root.path().join("src/main.rs"), "").unwrap();
+        fs::write(root.path().join("README.md"), "").unwrap();
+        fs::write(root.path().join(".env"), "").unwrap();
+
+        let names = |prefix: &str| -> Vec<String> {
+            workspace
+                .complete(prefix, 12)
+                .into_iter()
+                .map(|entry| entry.path)
+                .collect()
+        };
+
+        assert_eq!(
+            names("src/wo"),
+            ["src/workspace.rs", "src/workspaceTree.ts"],
+            "the directory is what precedes the last slash"
+        );
+        // A partly-typed name is not a missing directory, and it is not an error.
+        assert!(names("nope/th").is_empty());
+        // Case-insensitive, or `readme` never finds `README.md`.
+        assert_eq!(names("read"), ["README.md"]);
+        // Dotfiles are real answers that are rarely the one being typed, so they
+        // sort last — unless the dot is what was typed.
+        assert_eq!(names(""), ["README.md", "src", ".env"]);
+        assert_eq!(names("."), [".env"]);
     }
 
     #[test]

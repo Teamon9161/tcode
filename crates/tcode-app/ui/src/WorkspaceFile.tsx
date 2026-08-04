@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { PencilIcon, RefreshIcon } from "./components/Icons";
+import { Path } from "./components/Path";
 import { FileBody } from "./FileBody";
 import { MOD } from "./keys";
 import { useSession } from "./session";
@@ -186,22 +187,29 @@ export function WorkspaceFile({ path }: { path: string }) {
       }}
     >
       <header className="workspace-file-bar">
-        <p className="inspect-path" title={path}>
-          {path}
-        </p>
+        <Path className="inspect-path" path={path} keep={2} />
         <div className="workspace-file-actions">
           {/* Nothing here says "preview": there is no second reading of a file,
               only the file and the text behind it. A picture has neither, so it
               gets no control rather than a disabled one. */}
+          {/* The mode is said in a word, not spelled by dimming the file.
+              The two states used to be told apart by the body: rendered and
+              legible, or a grey well in a smaller face. That reads as "this
+              file is off" rather than "you are editing it" — and for a source
+              file, whose read view is already its text, the difference between
+              the two states looked like nothing happened at all, which is why
+              only Markdown and CSV seemed editable. The body is now the same
+              in both; this control is what changes. */}
           {!drawn && (
             <button
-              className={`icon-btn${editing ? " is-on" : ""}`}
+              type="button"
+              className={`chip is-toggle${editing ? " is-on" : ""}`}
               onClick={() => setEditing((was) => !was)}
               aria-pressed={editing}
-              aria-label={editing ? "Stop editing" : "Edit this file"}
               title={editing ? "Stop editing" : "Edit this file"}
             >
-              <PencilIcon size={14} />
+              <PencilIcon size={12} />
+              {editing ? "editing" : "edit"}
             </button>
           )}
           {/* Reading the file again is a repeatable action with nothing to

@@ -17,7 +17,7 @@ export function ResumePicker({
   onCancel: () => void;
 }) {
   return (
-    <section className="resume-strip" aria-label="Resume a conversation">
+    <section className="dock resume-strip" aria-label="Resume a conversation">
       <div className="resume-body">
         <div className="resume-head">
           <strong>Resume a conversation</strong>

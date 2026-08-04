@@ -1,6 +1,6 @@
 import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
 
-import { runPairs, type Block, type RunMeta } from "./blocks";
+import { runPairs, runSteps, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
 import { useDisplay } from "./display";
 import { RewindContext, rewindPoints, useRewinding, type RewindTarget } from "./rewind";
@@ -798,6 +798,10 @@ const RunCall = memo(function RunCall({
   const status = block.meta.status;
   const state = runState(status);
   const kind = agentKind(block.meta.kind);
+  const steps = useMemo(
+    () => runSteps(block.blocks, report?.result?.content),
+    [block.blocks, report],
+  );
 
   return (
     <div className={`run is-${state}${open ? " is-open" : ""}`}>
@@ -830,7 +834,10 @@ const RunCall = memo(function RunCall({
       </div>
       {open && (
         <div className="run-body">
-          <BlockList blocks={block.blocks} onOpen={onOpen} />
+          {/* The run's last message and its report are the same text (see
+              `runSteps`), so the steps stop short of it and the report below
+              is the single copy. */}
+          <BlockList blocks={steps} onOpen={onOpen} />
           {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
           {report?.result?.content && (
             <div className="run-report">{rich(report.result.content)}</div>

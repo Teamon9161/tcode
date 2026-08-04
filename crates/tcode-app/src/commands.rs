@@ -454,6 +454,56 @@ fn session_workspace(supervisor: &Supervisor, session: &str) -> Result<Workspace
     Workspace::open(&handle.cwd).map_err(|error| error.to_string())
 }
 
+/// How many completions a menu shows before the answer is "keep typing".
+const COMPLETION_LIMIT: usize = 12;
+
+/// Entries that could finish an `@path` the composer is part-way through.
+///
+/// Async and off the main thread, unlike its neighbours: this one runs while
+/// somebody is typing, and the main thread is the one drawing the window (see
+/// AGENTS.md rule 22). A directory read that blocks it would stall the caret in
+/// the field that asked for it.
+#[tauri::command]
+pub async fn workspace_complete(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    prefix: String,
+) -> Result<Vec<WorkspaceEntryView>, String> {
+    let workspace = session_workspace(&supervisor, &session)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workspace
+            .complete(&prefix, COMPLETION_LIMIT)
+            .into_iter()
+            .map(WorkspaceEntryView::from)
+            .collect()
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
+/// Which of these `@path` mentions name something that is really in this
+/// folder, so the composer can draw the ones that resolve differently from the
+/// ones that do not.
+///
+/// The whole draft is asked about in one call and answered off the main thread,
+/// for the same reason as `workspace_complete`: this runs while somebody types.
+#[tauri::command]
+pub async fn workspace_present(
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    paths: Vec<String>,
+) -> Result<Vec<String>, String> {
+    let workspace = session_workspace(&supervisor, &session)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        paths
+            .into_iter()
+            .filter(|path| workspace.exists(path))
+            .collect()
+    })
+    .await
+    .map_err(|error| error.to_string())
+}
+
 /// List the direct children of the session workspace root or one of its directories.
 #[tauri::command]
 pub fn workspace_list(
@@ -659,6 +709,40 @@ pub enum SlashResult {
     },
 }
 
+/// The core commands whose semantics fit this desktop surface.
+///
+/// One list, read by both the dispatcher below and the menu the composer
+/// offers. Two lists would let the menu advertise a command the dispatcher
+/// answers with "unsupported desktop command" — a completion for something
+/// that cannot be completed.
+const DESKTOP_COMMANDS: [&str; 3] = ["clear", "compact", "resume"];
+
+/// What the composer offers after a `/`.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct SlashCommandView {
+    /// With its leading slash, as core writes it.
+    pub name: String,
+    pub help: String,
+}
+
+/// The slash commands this window can run, with core's own one-line help.
+///
+/// The help text is core's rather than the webview's for the same reason tool
+/// names are (`Tool::display_name`): `/help` in the terminal and this menu
+/// describe the same command, and two descriptions of one thing is one of them
+/// being wrong.
+#[tauri::command]
+pub fn slash_commands() -> Vec<SlashCommandView> {
+    tcode_core::commands::CommandRegistry::builtin()
+        .entries()
+        .filter(|(name, _)| DESKTOP_COMMANDS.contains(&name.trim_start_matches('/')))
+        .map(|(name, help)| SlashCommandView {
+            name: name.to_string(),
+            help: help.to_string(),
+        })
+        .collect()
+}
+
 fn slash_name(line: &str) -> Option<&str> {
     let rest = line.trim().strip_prefix('/')?;
     Some(rest.split_whitespace().next().unwrap_or_default())
@@ -677,10 +761,15 @@ pub fn slash_command(
     line: String,
 ) -> Result<SlashResult, String> {
     match slash_name(&line) {
-        Some("clear" | "compact" | "resume") => {}
+        Some(name) if DESKTOP_COMMANDS.contains(&name) => {}
         Some(_) => {
             return Err(format!(
-                "unsupported desktop command {line} — use /resume, /clear, or /compact"
+                "unsupported desktop command {line} — use {}",
+                DESKTOP_COMMANDS
+                    .iter()
+                    .map(|name| format!("/{name}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))
         }
         None => return Err("a slash command must start with '/'".into()),

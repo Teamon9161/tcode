@@ -224,9 +224,13 @@ impl App {
         let agent = self.agent.clone();
         let cancel2 = cancel.clone();
         let handle = tokio::spawn(async move {
+            // The turn channel carries `Result<(), _>`; whether the summary
+            // landed is already on screen — `Compacted` bakes it, and nothing
+            // baked means nothing was replaced.
             let result = agent
                 .compact_with_focus(&mut session, focus.as_deref(), &tx, &cancel2)
-                .await;
+                .await
+                .map(|_| ());
             (session, result)
         });
         self.phase = Phase::Running {

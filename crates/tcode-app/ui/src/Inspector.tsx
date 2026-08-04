@@ -1,6 +1,6 @@
 import { memo, useMemo } from "react";
 
-import { findRun, findToolCall, reportOf, type Block } from "./blocks";
+import { findRun, findToolCall, reportOf, runSteps, type Block } from "./blocks";
 import { Diff } from "./components/Diff";
 import { Code } from "./components/Code";
 import { languageOf } from "./diff";
@@ -247,6 +247,9 @@ function RunView({
 }) {
   const found = findRun(blocks, run);
   const report = useMemo(() => reportOf(blocks, run), [blocks, run]);
+  // "Did" and "Reported back" were printing the same paragraphs twice: a run's
+  // report *is* the last thing it said (see `runSteps`).
+  const steps = useMemo(() => runSteps(found?.blocks ?? [], report ?? undefined), [found, report]);
   if (!found) return <p className="inspect-empty">that run is no longer in this conversation</p>;
 
   const calls = found.meta.toolCalls;
@@ -288,8 +291,12 @@ function RunView({
       <section className="inspect-part">
         <h4 className="inspect-part-head">Did</h4>
         <div className="inspect-transcript">
-          <BlockList blocks={found.blocks} onOpen={onOpen} />
-          {found.blocks.length === 0 && <p className="inspect-empty">nothing recorded yet</p>}
+          <BlockList blocks={steps} onOpen={onOpen} />
+          {steps.length === 0 && (
+            <p className="inspect-empty">
+              {found.blocks.length === 0 ? "nothing recorded yet" : "it answered without any steps"}
+            </p>
+          )}
         </div>
       </section>
 

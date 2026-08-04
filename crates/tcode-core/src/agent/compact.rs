@@ -15,12 +15,17 @@ const COMPACT_PROMPT: &str = include_str!("../../prompts/agent/compact.md");
 impl Agent {
     /// Summarize the whole ledger into one entry — the single deliberate
     /// cache-invalidating operation. Also used by `/compact`.
+    ///
+    /// Returns whether the history was actually replaced. It can legitimately
+    /// come back `false` — an empty ledger, an interrupted attempt, a model
+    /// that answered with no text — and the caller has to know, because the
+    /// window is then exactly as full as it was.
     pub async fn compact(
         &self,
         session: &mut Session,
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         self.compact_with_focus(session, None, events, cancel).await
     }
 
@@ -37,9 +42,9 @@ impl Agent {
         focus: Option<&str>,
         events: &mpsc::Sender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<(), AgentError> {
+    ) -> Result<bool, AgentError> {
         if session.ledger.is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let mut messages = session.ledger.as_messages();
         messages.push(crate::Message {
@@ -87,7 +92,7 @@ impl Agent {
                     {
                         continue 'retry;
                     }
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(error.into()),
             };
@@ -108,7 +113,7 @@ impl Agent {
                         {
                             continue 'retry;
                         }
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -125,7 +130,7 @@ impl Agent {
             .join("\n");
         // A cancelled or empty summary must not wipe the history.
         if cancel.is_cancelled() || summary.trim().is_empty() {
-            return Ok(());
+            return Ok(false);
         }
         let upto = session.ledger.len();
         session.ledger.compact(summary.clone(), upto);
@@ -148,8 +153,11 @@ impl Agent {
         session.turn_usage.cache_write_tokens += usage.cache_write_tokens;
         // Unknown until the next request reports it.
         session.last_prompt_tokens = 0;
+        // A compaction that landed re-arms the automatic one, whatever an
+        // earlier attempt did.
+        session.auto_compact_declined = false;
         self.emit(events, AgentEvent::Compacted(summary)).await?;
-        Ok(())
+        Ok(true)
     }
 }
 

@@ -568,7 +568,14 @@ pub async fn run_compact(
         .compact_with_focus(&mut session, focus.as_deref(), &tx, &cancel)
         .await;
     match &result {
-        Ok(()) => eprintln!("tcode-app: compaction finished on session {}", handle.id),
+        // `false` means the summary never arrived (an empty answer, or the user
+        // stopped it): the ledger is untouched, which the transcript already
+        // shows by having no compaction boundary in it.
+        Ok(landed) => eprintln!(
+            "tcode-app: compaction finished on session {} ({})",
+            handle.id,
+            if *landed { "history replaced" } else { "nothing compacted" }
+        ),
         Err(error) => eprintln!(
             "tcode-app: compaction failed on session {}: {error}",
             handle.id

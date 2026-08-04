@@ -1,3 +1,5 @@
+import { useState } from "react";
+
 import { STATUS_MARK, currentPhase, phaseRows, type Plan } from "./plan";
 import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
 import { rich } from "./rich";
@@ -42,9 +44,12 @@ export function ProgressStrip({
 }) {
   const current = currentPhase(plan.phases);
   const rows = expanded ? phaseRows(plan.phases) : [];
+  /** Which phases the reader has opened or closed by hand, keyed by path.
+   *  Absent means "whatever this phase's status implies". */
+  const [shown, setShown] = useState<Record<string, boolean>>({});
 
   return (
-    <section className={`progress-strip${expanded ? " is-open" : ""}`} aria-label="Plan progress">
+    <section className={`dock progress-strip${expanded ? " is-open" : ""}`} aria-label="Plan progress">
       <div className="strip-body">
         <div className="strip-line">
           <button
@@ -93,21 +98,46 @@ export function ProgressStrip({
 
         {expanded && (
           <ol className="strip-phases">
-            {rows.map((row) => (
-              <li
-                key={row.path.join(".")}
-                className={`strip-phase is-${row.status}${row.depth > 0 ? " is-nested" : ""}`}
-              >
-                <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
-                <span className="strip-phase-name">{row.phase}</span>
-                {/* Only the running phase's prose, which is the same budget the
-                    terminal's pane keeps: what a finished or not-yet-started
-                    phase breaks down into is not read at a glance. */}
-                {row.status === "in_progress" && row.detail && (
-                  <div className="strip-detail">{rich(row.detail)}</div>
-                )}
-              </li>
-            ))}
+            {rows.map((row) => {
+              const key = row.path.join(".");
+              // The running phase's prose is open because that is the one being
+              // read at a glance; the rest are one click, not nowhere. The
+              // detail is the plan — a phase title is only its index (see the
+              // `progress` tool) — so "what does this phase actually mean" had
+              // no answer here at all until the phase happened to be running.
+              const open = shown[key] ?? row.status === "in_progress";
+              const detail = row.detail.trim();
+              return (
+                <li
+                  key={key}
+                  className={`strip-phase is-${row.status}${row.depth > 0 ? " is-nested" : ""}`}
+                >
+                  {detail ? (
+                    <button
+                      type="button"
+                      className="strip-phase-line"
+                      onClick={() => setShown((was) => ({ ...was, [key]: !open }))}
+                      aria-expanded={open}
+                      title={open ? "Hide what this phase covers" : "Show what this phase covers"}
+                    >
+                      <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
+                      <span className="strip-phase-name">{row.phase}</span>
+                      <span className="strip-phase-chevron" aria-hidden="true">
+                        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                      </span>
+                    </button>
+                  ) : (
+                    // Nothing to open, so nothing that looks openable: a phase
+                    // with no prose gets no control rather than a dead one.
+                    <span className="strip-phase-line is-plain">
+                      <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
+                      <span className="strip-phase-name">{row.phase}</span>
+                    </span>
+                  )}
+                  {open && detail && <div className="strip-detail">{rich(detail)}</div>}
+                </li>
+              );
+            })}
           </ol>
         )}
       </div>

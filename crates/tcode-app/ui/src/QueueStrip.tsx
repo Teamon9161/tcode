@@ -34,7 +34,7 @@ export function QueueStrip({
   const turn = queued[0].turn;
 
   return (
-    <section className="queue-strip" aria-label="Waiting to be sent">
+    <section className="dock queue-strip" aria-label="Waiting to be sent">
       <div className="queue-body">
         <div className="queue-head">
           <span className="queue-title">

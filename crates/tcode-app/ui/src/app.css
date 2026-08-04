@@ -92,9 +92,19 @@
 .divider {
   position: absolute;
   z-index: var(--z-sticky);
+  /* The drag is driven from pointer events, so the platform must not also
+     interpret it as a pan. */
+  touch-action: none;
   background: transparent;
   transition: background var(--dur-fast) var(--ease);
 }
+/* While a seam is being dragged the window is not a document to select from.
+   Set for the length of the drag by `Panes.tsx`, cleared on pointerup and on
+   the cancel the platform can send instead. */
+body.is-resizing {
+  user-select: none;
+}
+
 .divider.is-row {
   width: var(--gutter);
   margin-left: calc(var(--gutter) / -2);
@@ -213,6 +223,23 @@
 .pane-body.is-stage > .transcript {
   flex: 1 1 0;
   min-height: 0;
+}
+
+/* Everything docked between the conversation and the composer — an approval,
+   a rewind question, the queue, the resume picker, the plan strip — is one
+   band, so it is drawn with one seam.
+
+   Each of them used to carry its own `border-top`, which is right on its own
+   and wrong together: with a queue above a plan strip the stack grew a second
+   hairline a few pixels down, and the two of them read as a box around
+   whichever one sat between. The general sibling combinator says "any dock
+   that has a dock before it", so the first one under the transcript keeps the
+   line however many follow it, and adding a sixth needs no rule of its own. */
+.dock {
+  border-top: 1px solid var(--line);
+}
+.dock ~ .dock {
+  border-top: 0;
 }
 
 .pane-body.is-stage > .approval {
@@ -2031,9 +2058,18 @@
   background: var(--bg);
 }
 
-.composer textarea {
+/* The field and the layer behind it share one box, so the two occupy exactly
+   the same rectangle and break their lines in the same places. */
+.composer-field {
+  position: relative;
   flex: 1;
   min-width: 0;
+}
+
+.composer textarea {
+  display: block;
+  position: relative;
+  width: 100%;
   resize: none;
   overflow-y: hidden;
   padding: var(--s-1) 0;
@@ -2043,11 +2079,112 @@
   font-size: var(--text-base);
   line-height: var(--lh-normal);
 }
+
+/* Every metric that decides where a glyph lands is repeated here, because the
+   two layers agreeing is not a nicety — a tint half a line off the path it
+   belongs to is worse than no tint. Height and the scrollbar gutter are set
+   from `resize()` for the same reason. */
+.composer-mirror {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  padding: var(--s-1) 0;
+  font-size: var(--text-base);
+  line-height: var(--lh-normal);
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  /* The glyphs are the textarea's. This layer contributes ground, nothing else,
+     so an IME preedit stays visible and no text is ever drawn twice. */
+  color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+
+/* A path this folder really has. Ground rather than ink, because the ink here
+   belongs to the field above: the same reason the terminal colours the token
+   and this cannot. `--brand-wash` is the app's "this resolves" tint, already
+   used for the step that is running. */
+.composer-mention {
+  border-radius: var(--r-xs);
+  background: var(--brand-wash);
+  color: transparent;
+}
 .composer textarea::placeholder {
   color: var(--muted);
 }
 .composer textarea:focus {
   outline: none;
+}
+
+/* ---- finishing a /command or an @path --------------------------------------
+
+   It opens upward out of the field, aligned to the field's left edge, because
+   the field is at the bottom of a pane and a list below it would be off the
+   screen. The width follows the field rather than the longest path in it: a
+   menu that changes width as you type is a menu that moves under the pointer.
+
+   Nothing here takes focus (`Completions.tsx`) — the caret stays in the field,
+   because you are still typing. */
+.completions {
+  left: var(--seat-left, var(--s-4));
+  bottom: calc(var(--seat-bottom, var(--s-6)) + var(--s-2));
+  width: min(28rem, calc(100vw - var(--s-6)));
+  max-height: min(15rem, calc(var(--seat-room, 100vh) - var(--s-4)));
+}
+
+.completion-list {
+  list-style: none;
+  margin: 0;
+  padding: var(--s-1);
+  overflow-y: auto;
+}
+
+.completion {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-1) var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--body);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+
+/* One row is the one Enter takes, and the keyboard is what moves it — so the
+   marker is the selected background, not a hover tint that would put two rows
+   in the same state as soon as the pointer crossed the list. */
+.completion.is-active {
+  background: var(--selected);
+  color: var(--ink);
+}
+
+.completion svg {
+  flex: none;
+  align-self: center;
+  color: var(--faint);
+}
+
+/* A name is a name: machine text, in the machine face, like every path and
+   tool name in this window. */
+.completion-label {
+  flex: none;
+  font-family: var(--font-mono);
+}
+
+/* What it is, in our words — so it is set in ours. Truncated rather than
+   wrapped: it is the second thing on the row, and a row that grows to two
+   lines makes the list jump as you move through it. */
+.completion-hint {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 /* The return key, shown where it acts. No fill, no border, no radius until it
@@ -3612,7 +3749,6 @@
   min-width: 0;
   min-height: 0;
   padding: var(--s-4) 0;
-  border-top: 1px solid var(--line);
   background: var(--bg);
   animation: rise var(--dur-slow) var(--ease);
 }
@@ -4534,7 +4670,6 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  border-top: 1px solid var(--line);
   background: var(--bg);
   overflow: hidden;
 }
@@ -4675,7 +4810,6 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  border-top: 1px solid var(--line);
   background: var(--bg);
   overflow: hidden;
 }
@@ -4794,7 +4928,6 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  border-top: 1px solid var(--line);
   background: var(--amber-wash);
 }
 
@@ -4880,7 +5013,6 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
-  border-top: 1px solid var(--line);
   background: var(--bg);
   overflow: hidden;
 }
@@ -5002,14 +5134,55 @@
   font-size: var(--text-base);
 }
 .strip-phase {
-  display: grid;
-  grid-template-columns: auto 1fr;
-  gap: var(--s-2);
+  display: flex;
+  flex-direction: column;
   color: var(--body);
 }
 .strip-phase.is-nested {
   padding-left: var(--s-4);
 }
+
+/* The row itself is the disclosure, so it is a full-width button with no
+   surface of its own — the same "a line, not a panel" the strip is built on.
+   Grid rather than flex so the prose below can start on the title's column
+   without measuring the mark. */
+.strip-phase-line {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: baseline;
+  gap: var(--s-2);
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+button.strip-phase-line {
+  cursor: pointer;
+}
+button.strip-phase-line:hover .strip-phase-name {
+  color: var(--ink);
+}
+
+/* Hover-only, like every other expander in the window: a column of permanent
+   chevrons is a second left edge made out of noise. Keyboard focus and the
+   open state both keep it, because a control you have opened is a control you
+   can see how to close. */
+.strip-phase-chevron {
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  opacity: 0;
+  transition: opacity var(--dur-fast) var(--ease);
+}
+.strip-phase-line:hover .strip-phase-chevron,
+.strip-phase-line:focus-visible .strip-phase-chevron,
+.strip-phase-line[aria-expanded="true"] .strip-phase-chevron {
+  opacity: 1;
+}
+
 .strip-phase.is-completed .strip-phase-name {
   color: var(--muted);
 }
@@ -5017,8 +5190,10 @@
   color: var(--ink);
 }
 .strip-detail {
-  grid-column: 2;
   max-width: 72ch;
+  /* The mark's column plus the row gap, so the prose hangs under the title
+     rather than under the glyph that labels the title's state. */
+  padding-left: calc(1em + var(--s-2));
   color: var(--muted);
 }
 
@@ -5712,9 +5887,18 @@
   border-bottom: 1px solid var(--line);
 }
 
+/* One line. `overflow-wrap: anywhere` is right where the path is a view's own
+   heading with the width to itself; on this row it shares the width with the
+   controls, so a deep path wrapped to five lines and pushed them down the
+   pane. It is a `Path` now, which elides by whole segments and keeps the tail
+   — the file's own name is the part worth reading, and the full path is in the
+   tooltip (rule 9). */
 .workspace-file-bar .inspect-path {
   min-width: 0;
   margin-bottom: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .workspace-file-actions {
@@ -5748,30 +5932,35 @@
   color: var(--danger-text);
 }
 
+/* The same file, in the same face, in the same place. A source file's read view
+   is a code block with no card and no chip (see below), so its editor matches
+   it: no well, no border, no smaller type. Switching modes must not look like
+   the file was swapped for a worse copy of itself — the chip in the header is
+   what says which mode this is, and the caret is what proves it. */
 .workspace-file-source {
   display: block;
   width: 100%;
   min-height: calc(var(--s-8) * 4);
-  padding: var(--s-3);
-  border: 1px solid var(--line);
-  border-radius: var(--r-sm);
-  background: var(--sunken);
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--ink);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   line-height: var(--lh-normal);
-  resize: vertical;
+  resize: none;
 }
 
+/* Nothing on focus: the field fills the pane, so a ring around it is a ring
+   around the window. Whether it has the caret is answered by the caret. */
 .workspace-file-source:focus {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-color: var(--line-strong);
-  background: var(--bg);
+  outline: none;
 }
 
+/* Read-only happens for one reason — the response was only the file's prefix —
+   and the banner above says so in a sentence. Greying the text as well makes
+   the file itself look like the problem. */
 .workspace-file-source:read-only {
-  color: var(--muted);
   cursor: default;
 }
 

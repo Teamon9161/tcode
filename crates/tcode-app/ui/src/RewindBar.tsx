@@ -39,7 +39,7 @@ export function RewindBar({
   const messages = preview.dropped === 1 ? "1 message" : `${preview.dropped} messages`;
 
   return (
-    <section className="rewind-bar" aria-label="Go back to an earlier message">
+    <section className="dock rewind-bar" aria-label="Go back to an earlier message">
       <div className="rewind-body">
         <p className="rewind-question">
           <RewindIcon size={13} />
