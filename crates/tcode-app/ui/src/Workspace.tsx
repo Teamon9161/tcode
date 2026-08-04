@@ -25,6 +25,7 @@ import {
   type Tiling,
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
+import { fieldAspect } from "./field";
 import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
 import { BackIcon, ChevronDown, ChevronRight, CloseIcon, PlusIcon, SidebarIcon } from "./components/Icons";
@@ -174,7 +175,7 @@ export function Workspace({
         );
         return sibling
           ? close(current, sibling.id)
-          : openInspect(current, pane, session, { kind: "files" });
+          : openInspect(current, pane, session, { kind: "files" }, fieldAspect());
       });
     },
     [onTiling],
@@ -194,7 +195,7 @@ export function Workspace({
         const browser = browserPane(current, session);
         return browser
           ? close(current, browser.id)
-          : openInspect(current, pane, session, { kind: "workspace-tree" });
+          : openInspect(current, pane, session, { kind: "workspace-tree" }, fieldAspect());
       });
     },
     [onTiling],
@@ -297,7 +298,9 @@ export function Workspace({
         if (!pick) return;
         event.preventDefault();
         onTiling((current) =>
-          event.shiftKey ? showBeside(current, pick.id) : show(current, pick.id),
+          event.shiftKey
+            ? showBeside(current, pick.id, fieldAspect())
+            : show(current, pick.id, fieldAspect()),
         );
         return;
       }
@@ -351,12 +354,15 @@ export function Workspace({
   );
   const open = useCallback(
     (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
-      onTiling((current) => openInspect(current, pane, session, value)),
+      // Measured at the click rather than closed over: these handlers are bound
+      // once for the memoized panes' sake (rule 21), and the window's shape
+      // changes under them.
+      onTiling((current) => openInspect(current, pane, session, value, fieldAspect())),
     [onTiling],
   );
   const openBeside = useCallback(
     (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
-      onTiling((current) => openAside(current, pane, session, value)),
+      onTiling((current) => openAside(current, pane, session, value, fieldAspect())),
     [onTiling],
   );
   const goTo = useCallback(
@@ -364,7 +370,19 @@ export function Workspace({
       onTiling((current) => navigate(current, pane, step)),
     [onTiling],
   );
-  const openBrowser = useCallback(() => onTiling(openWeb), [onTiling]);
+  const openBrowser = useCallback(
+    () => onTiling((current) => openWeb(current, fieldAspect())),
+    [onTiling],
+  );
+  // The one control that *asks* for a direction, as opposed to `dirFor`
+  // guessing one when a pane opens. It acts on the seam rather than on either
+  // pane, which is why the handle rides on the divider and this takes a divider
+  // id — `Mod+Alt+R` is the same operation reached from whichever pane has
+  // focus, and it is the one that has to look the seam up.
+  const turnSeam = useCallback(
+    (seam: string) => onTiling((current) => rotate(current, seam)),
+    [onTiling],
+  );
   const toggleExpanded = useCallback(
     (pane: string) => {
       onTiling((current) => focusPane(current, pane));
@@ -383,6 +401,7 @@ export function Workspace({
       split,
       onFocus: focusOn,
       onClosePane: closePane,
+      onRotate: turnSeam,
       onRatio: ratio,
       onOpen: open,
       onOpenAside: openBeside,
@@ -420,6 +439,7 @@ export function Workspace({
       split,
       focusOn,
       closePane,
+      turnSeam,
       ratio,
       open,
       openBeside,
@@ -512,7 +532,7 @@ export function Workspace({
                   })
                 }
                 onMove={(to) => move(group.path, to)}
-                onShow={(id) => onTiling((current) => show(current, id))}
+                onShow={(id) => onTiling((current) => show(current, id, fieldAspect()))}
                 onCloseSession={onCloseSession}
                 onOpenFolder={onOpenFolder}
               />

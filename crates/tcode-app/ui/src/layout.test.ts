@@ -4,6 +4,7 @@ import {
   EMPTY,
   close,
   closeSession,
+  dirFor,
   focusPane,
   focused,
   frames,
@@ -58,6 +59,22 @@ function history(tiling: Tiling): string[] {
   if (!leaf || leaf.pane.kind !== "inspect") throw new Error("no inspect pane");
   const { entries, at } = leaf.pane.nav;
   return entries.map((entry, index) => (index === at ? `[${entry.kind}]` : entry.kind));
+}
+
+/** Every pane's share of the window's width, by label — the number the person
+ *  actually sees, as opposed to a ratio that only means something relative to
+ *  whatever pane happened to be split. */
+function widths(tiling: Tiling): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const { leaf, rect } of frames(tiling).panes) out[label(leaf.pane)] = rect.width;
+  return out;
+}
+
+/** One split's ratio, for asserting that a drag somewhere else survived. */
+function ratioOf(tiling: Tiling, split: string): number {
+  const walk = (node: Layout): number | null =>
+    node.kind === "leaf" ? null : node.id === split ? node.ratio : (walk(node.a) ?? walk(node.b));
+  return (tiling.root && walk(tiling.root)) ?? NaN;
 }
 
 function at(tiling: Tiling): string {
@@ -367,6 +384,108 @@ describe("dividers", () => {
     const one = single(talk("tcode"));
     expect(setRatio(one, id(one, "tcode"), 0.3)).toBe(one);
     expect(rotate(one, id(one, "tcode"))).toBe(one);
+  });
+});
+
+/**
+ * Room, which is the difference between a share of the window and a share of
+ * whatever pane was split.
+ */
+describe("making room", () => {
+  const file = (path: string): Inspect => ({ kind: "workspace-file", path });
+
+  it("takes a nested pane's width off the conversation, not off its neighbour", () => {
+    const one = single(talk("tcode"));
+    const tree = openInspect(one, id(one, "tcode"), "tcode", { kind: "workspace-tree" });
+    const picked = openInspect(tree, id(tree, "tcode:workspace-tree"), "tcode", file("a.rs"));
+
+    // Without this the file landed in a third of the tree's third — 22% of the
+    // window — while the conversation kept two thirds of it untouched.
+    const wide = widths(picked);
+    expect(wide["tcode:workspace-file"]).toBeCloseTo(0.3);
+    expect(wide["tcode:workspace-tree"]).toBeCloseTo(0.14);
+    expect(wide["tcode"]).toBeCloseTo(0.56);
+  });
+
+  it("leaves a layout that already fits exactly as it was", () => {
+    const one = single(talk("tcode"));
+    const tree = openInspect(one, id(one, "tcode"), "tcode", { kind: "workspace-tree" });
+
+    expect(tree.root).toMatchObject({ kind: "split", ratio: 0.66 });
+  });
+
+  it("does not undo a drag in a subtree it did not open into", () => {
+    const two = showBeside(single(talk("tcode")), "duck_ext");
+    const three = openInspect(two, id(two, "duck_ext"), "duck_ext", {
+      kind: "diff",
+      callId: "e1",
+    });
+    const seam = parentSplit(three, id(three, "duck_ext:diff"))!;
+    const dragged = setRatio(three, seam, 0.8);
+
+    const elsewhere = openInspect(dragged, id(dragged, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e2",
+    });
+    expect(ratioOf(elsewhere, seam)).toBe(0.8);
+  });
+
+  it("gives what it can when the window is out of room, rather than refusing", () => {
+    let tiling = single(talk("a"));
+    for (const name of ["b", "c", "d", "e"]) tiling = showBeside(tiling, name);
+
+    const wide = widths(tiling);
+    expect(Object.keys(wide)).toHaveLength(5);
+    expect(Object.values(wide).reduce((sum, part) => sum + part, 0)).toBeCloseTo(1);
+    for (const part of Object.values(wide)) expect(part).toBeGreaterThan(0);
+  });
+});
+
+/**
+ * Which way a split cuts. The tree has always been able to stack — `Dir` has
+ * had `col` since the beginning and `rotate` flips one — but every call site
+ * asked for `row`, so nothing ever opened that way on its own.
+ */
+describe("split direction", () => {
+  const wide = 16 / 9;
+
+  it("stacks rather than shaving another column off a half-width pane", () => {
+    const one = single(talk("tcode"));
+    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" }, wide);
+    expect(shape(two)).toBe("row(tcode, tcode:diff)");
+
+    const three = openAside(two, id(two, "tcode:diff"), "tcode", { kind: "output", callId: "e1" }, wide);
+    expect(shape(three)).toBe("row(tcode, col(tcode:diff, tcode:output))");
+  });
+
+  it("keeps a list beside what it opens however narrow the pane", () => {
+    const two = showBeside(single(talk("tcode")), "duck_ext", wide);
+    const tree = openInspect(two, id(two, "duck_ext"), "duck_ext", { kind: "workspace-tree" }, wide);
+    expect(shape(tree)).toBe("row(tcode, row(duck_ext, duck_ext:workspace-tree))");
+
+    const picked = openInspect(
+      tree,
+      id(tree, "duck_ext:workspace-tree"),
+      "duck_ext",
+      { kind: "workspace-file", path: "a.rs" },
+      wide,
+    );
+    expect(shape(picked)).toBe(
+      "row(tcode, row(duck_ext, row(duck_ext:workspace-tree, duck_ext:workspace-file)))",
+    );
+  });
+
+  it("answers row for a caller with no field to measure", () => {
+    const one = single(talk("tcode"));
+    expect(dirFor(one, id(one, "tcode"))).toBe("row");
+    expect(dirFor(one, "pane-does-not-exist", wide)).toBe("row");
+  });
+
+  it("reads the field's shape, not the tree's", () => {
+    const one = single(talk("tcode"));
+    // The same single pane: wide window beside, tall window under.
+    expect(dirFor(one, id(one, "tcode"), 16 / 9)).toBe("row");
+    expect(dirFor(one, id(one, "tcode"), 9 / 16)).toBe("col");
   });
 });
 

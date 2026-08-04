@@ -38,6 +38,7 @@ import { adoptContext, applyUsage, limitsFrom, NO_USAGE, type Limits } from "./u
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { phaseOf } from "./activity";
 import { DisplayContext, loadDisplay, saveDisplay, type Display } from "./display";
+import { fieldAspect } from "./field";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
 import { Mark, Wordmark } from "./components/Mark";
@@ -267,7 +268,7 @@ export function App() {
         activity: history.length > 0 ? "resumed" : BLANK.activity,
       },
     }));
-    setTiling((current) => show(current, session.id));
+    setTiling((current) => show(current, session.id, fieldAspect()));
     // A resumed conversation may already be working through a plan — it is on
     // disk, and the session adopted it — so the strip must not wait for the next
     // turn to find that out.
@@ -692,7 +693,7 @@ export function App() {
           }));
           // Beside, not instead: the plan came from the conversation next to it,
           // and both are worth watching while one works.
-          setTiling((current) => showBeside(current, session.id));
+          setTiling((current) => showBeside(current, session.id, fieldAspect()));
         })
         .catch((error) =>
           patch(id, (was) => ({

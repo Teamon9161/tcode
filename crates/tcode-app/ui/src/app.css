@@ -89,9 +89,18 @@
 /* The divider sits on the seam, centred on it, and paints nothing at rest: a
    permanent line between panes would be the border this design decided not to
    draw. */
-.divider {
+/* The seam positions; the bar inside it is what gets dragged, and the handle
+   that turns the split rides along. Two elements rather than one because a
+   button inside a `role="separator"` is not a thing screen readers can present,
+   and because the handle overflows the bar in both directions. */
+.seam {
   position: absolute;
   z-index: var(--z-sticky);
+}
+
+.divider {
+  position: absolute;
+  inset: 0;
   /* The drag is driven from pointer events, so the platform must not also
      interpret it as a pan. */
   touch-action: none;
@@ -105,12 +114,12 @@ body.is-resizing {
   user-select: none;
 }
 
-.divider.is-row {
+.seam.is-row {
   width: var(--gutter);
   margin-left: calc(var(--gutter) / -2);
   cursor: col-resize;
 }
-.divider.is-col {
+.seam.is-col {
   height: var(--gutter);
   margin-top: calc(var(--gutter) / -2);
   cursor: row-resize;
@@ -123,14 +132,16 @@ body.is-resizing {
   content: "";
   position: absolute;
 }
-.divider.is-row::after {
+.seam.is-row .divider::after {
   inset: 0 -4px;
 }
-.divider.is-col::after {
+.seam.is-col .divider::after {
   inset: -4px 0;
 }
 
-.divider:hover {
+/* Hover reaches the seam through the grab area's own hover, so the bar tints
+   whether the pointer is on it, near it, or on the handle. */
+.seam:hover .divider {
   background: var(--line-strong);
 }
 /* The global focus ring is a 2px outline offset by 2px, which on a 4px bar
@@ -138,6 +149,39 @@ body.is-resizing {
 .divider:focus-visible {
   outline: none;
   background: var(--brand);
+}
+
+/* Turns the split this seam is. It sits *on* the seam and overflows it in both
+   directions, because a 4px strip cannot hold a target anybody can hit — the
+   same reason the grab area reaches into both panes. Hidden until the pointer
+   is here: a permanent chip on every seam is furniture on a window whose whole
+   subject is what the panes contain. */
+.seam-turn {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  background: var(--chrome);
+  color: var(--ink-muted);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.seam:hover .seam-turn,
+.seam-turn:focus-visible {
+  opacity: 1;
+}
+.seam-turn:hover {
+  color: var(--ink);
 }
 
 /* A pane is a sheet: content surface, small radius, no border. Everything

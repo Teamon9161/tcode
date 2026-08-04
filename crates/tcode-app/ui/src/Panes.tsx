@@ -16,7 +16,7 @@ import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, CollapseIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, CollapseIcon, ColumnsIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon, RowsIcon } from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
@@ -56,6 +56,8 @@ export type PaneContext = {
   split: boolean;
   onFocus: (pane: string) => void;
   onClosePane: (pane: string) => void;
+  /** Turn a seam: the two panes it separates swap between beside and stacked. */
+  onRotate: (divider: string) => void;
   onRatio: (divider: string, ratio: number) => void;
   onOpen: (pane: string, session: string, value: Inspect) => void;
   /** Show it *as well*, in a pane of its own — the deliberate "keep this one and
@@ -139,6 +141,7 @@ export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContex
             divider={divider}
             field={field}
             onRatio={context.onRatio}
+            onRotate={context.onRotate}
           />
         ))}
       </div>
@@ -179,15 +182,23 @@ function box(rect: Rect): CSSProperties {
  *    native webview, which on this platform re-lays-out a whole page in another
  *    process. It is hidden for the length of the drag and shown again on
  *    release, which is what `browser.rs` has always said should happen here.
+ *
+ * It also carries the one control that *asks* for a direction. `dirFor` picks
+ * one when a pane opens; turning it afterwards acts on the split, not on either
+ * pane, so the button belongs here rather than in a pane header — where it
+ * would be a sixth icon competing for room in exactly the narrow panes this
+ * change exists to widen. It appears on hover, over the seam it turns.
  */
 function Divider({
   divider,
   field,
   onRatio,
+  onRotate,
 }: {
   divider: PlacedDivider;
   field: RefObject<HTMLDivElement | null>;
   onRatio: (divider: string, ratio: number) => void;
+  onRotate: (divider: string) => void;
 }) {
   const { id, dir, ratio, within } = divider;
   const row = dir === "row";
@@ -260,23 +271,39 @@ function Divider({
         width: `${within.width * 100}%`,
       };
 
+  const turn = row ? "Stack these panes" : "Put these panes side by side";
+
   return (
-    <div
-      className={`divider is-${dir}`}
-      style={place}
-      role="separator"
-      aria-orientation={row ? "vertical" : "horizontal"}
-      aria-label="Resize these panes"
-      aria-valuenow={Math.round(ratio * 100)}
-      tabIndex={0}
-      onPointerDown={drag}
-      onKeyDown={(event) => {
-        const less = row ? "ArrowLeft" : "ArrowUp";
-        const more = row ? "ArrowRight" : "ArrowDown";
-        if (event.key === less) onRatio(id, ratio - 0.02);
-        if (event.key === more) onRatio(id, ratio + 0.02);
-      }}
-    />
+    <div className={`seam is-${dir}`} style={place}>
+      <div
+        className="divider"
+        role="separator"
+        aria-orientation={row ? "vertical" : "horizontal"}
+        aria-label="Resize these panes"
+        aria-valuenow={Math.round(ratio * 100)}
+        tabIndex={0}
+        onPointerDown={drag}
+        onKeyDown={(event) => {
+          const less = row ? "ArrowLeft" : "ArrowUp";
+          const more = row ? "ArrowRight" : "ArrowDown";
+          if (event.key === less) onRatio(id, ratio - 0.02);
+          if (event.key === more) onRatio(id, ratio + 0.02);
+        }}
+      />
+      <button
+        type="button"
+        className="seam-turn"
+        // The seam under it starts a drag on pointer-down, and a click is a
+        // pointer-down first: without this, pressing the button resizes the
+        // panes by however far the pointer drifted before it came back up.
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={() => onRotate(id)}
+        aria-label={turn}
+        title={turn}
+      >
+        {row ? <RowsIcon size={13} /> : <ColumnsIcon size={13} />}
+      </button>
+    </div>
   );
 }
 

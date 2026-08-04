@@ -6,6 +6,140 @@
 //! No 2D typesetting: fractions flatten to `a/b`, scripts convert only
 //! when every character has a Unicode super-/subscript form.
 
+/// Rewrite the TeX delimiters `\[…\]` and `\(…\)` into the `$$…$$` / `$…$`
+/// that the Markdown parser recognizes as math.
+///
+/// Not cosmetic: `\[` is a CommonMark backslash escape, so left alone the
+/// delimiters are *eaten* and the formula arrives as a bare bracket wrapped
+/// around unrendered TeX source. Several providers emit only this spelling,
+/// so without this pass their math never reaches [`prettify`] at all.
+///
+/// Rewrites are paired and scoped, because a lone `\[` in prose is an escaped
+/// bracket and must stay one: a delimiter is replaced only once its partner is
+/// found, code (fenced and inline) is copied through untouched, and a blank
+/// line cancels an unclosed opener — a formula that straddled a paragraph
+/// break would not parse as math anyway.
+pub fn normalize_delimiters(src: &str) -> std::borrow::Cow<'_, str> {
+    let mut scan = Scan::default();
+    let mut edits: Vec<(usize, &'static str)> = Vec::new();
+    let mut at = 0usize;
+
+    for line in src.split_inclusive('\n') {
+        let start = at;
+        at += line.len();
+        if scan.fence_line(line) {
+            continue;
+        }
+        if scan.fence.is_some() {
+            continue;
+        }
+        if line.trim().is_empty() {
+            scan.bracket = None;
+            scan.paren = None;
+            continue;
+        }
+        scan.line(line, start, &mut edits);
+    }
+
+    if edits.is_empty() {
+        return std::borrow::Cow::Borrowed(src);
+    }
+    edits.sort_unstable_by_key(|&(at, _)| at);
+    let mut out = String::with_capacity(src.len());
+    let mut cut = 0usize;
+    for (at, with) in edits {
+        out.push_str(&src[cut..at]);
+        out.push_str(with);
+        cut = at + 2; // every delimiter this pass replaces is `\` plus one char
+    }
+    out.push_str(&src[cut..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Where the delimiter scan currently stands: which spans are code (and so
+/// off-limits), and which openers are still waiting for a partner.
+#[derive(Default)]
+struct Scan {
+    /// Open fence: its character and the length of its run.
+    fence: Option<(u8, usize)>,
+    /// Open inline code span: the length of its backtick run.
+    code: Option<usize>,
+    bracket: Option<usize>,
+    paren: Option<usize>,
+}
+
+impl Scan {
+    /// Consume `line` if it opens or closes a fence, reporting whether it did.
+    fn fence_line(&mut self, line: &str) -> bool {
+        let body = line.trim_start_matches(' ');
+        if line.len() - body.len() > 3 {
+            return false;
+        }
+        let Some(marker) = body
+            .as_bytes()
+            .first()
+            .copied()
+            .filter(|c| matches!(c, b'`' | b'~'))
+        else {
+            return false;
+        };
+        let run = body.bytes().take_while(|&c| c == marker).count();
+        if run < 3 {
+            return false;
+        }
+        match self.fence {
+            None => self.fence = Some((marker, run)),
+            // A closer matches its opener's character, is at least as long, and
+            // carries no info string.
+            Some((open, len)) if open == marker && run >= len && body[run..].trim().is_empty() => {
+                self.fence = None;
+            }
+            Some(_) => return false,
+        }
+        true
+    }
+
+    fn line(&mut self, line: &str, start: usize, edits: &mut Vec<(usize, &'static str)>) {
+        let bytes = line.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'`' {
+                let run = bytes[i..].iter().take_while(|&&c| c == b'`').count();
+                match self.code {
+                    Some(open) if open == run => self.code = None,
+                    Some(_) => {}
+                    None => self.code = Some(run),
+                }
+                i += run;
+                continue;
+            }
+            if self.code.is_some() || bytes[i] != b'\\' || i + 1 >= bytes.len() {
+                i += 1;
+                continue;
+            }
+            match bytes[i + 1] {
+                b'[' => self.bracket = Some(start + i),
+                b'(' => self.paren = Some(start + i),
+                b']' => {
+                    if let Some(open) = self.bracket.take() {
+                        edits.push((open, "$$"));
+                        edits.push((start + i, "$$"));
+                    }
+                }
+                b')' => {
+                    if let Some(open) = self.paren.take() {
+                        edits.push((open, "$"));
+                        edits.push((start + i, "$"));
+                    }
+                }
+                // Any other escape, `\\[` included: consumed, never an opener.
+                _ => {}
+            }
+            i += 2;
+        }
+    }
+}
+
 /// Linearize one math expression (the content between `$…$` / `$$…$$`).
 pub fn prettify(tex: &str) -> String {
     let mut out = String::new();
@@ -438,7 +572,36 @@ fn symbol(name: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use super::prettify;
+    use super::{normalize_delimiters, prettify};
+
+    #[test]
+    fn tex_delimiters_become_dollars() {
+        assert_eq!(
+            normalize_delimiters("\\[\n\\sum_i |p_i| \\leq 0.5\n\\]"),
+            "$$\n\\sum_i |p_i| \\leq 0.5\n$$"
+        );
+        assert_eq!(
+            normalize_delimiters("cash \\(C_t\\) at t"),
+            "cash $C_t$ at t"
+        );
+    }
+
+    #[test]
+    fn unpaired_and_quoted_delimiters_are_left_alone() {
+        // A lone escape is an escaped bracket, not half a formula.
+        for src in [
+            "an escaped \\[ bracket",
+            "`\\(x\\)` in code",
+            "```\n\\(x\\)\n```",
+            "\\[\n\nblank line between\n\\]",
+            "\\\\[not an opener\\]",
+        ] {
+            assert!(
+                matches!(normalize_delimiters(src), std::borrow::Cow::Borrowed(_)),
+                "rewrote {src:?}"
+            );
+        }
+    }
 
     #[test]
     fn symbols_scripts_and_fractions_linearize() {

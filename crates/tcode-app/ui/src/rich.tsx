@@ -30,29 +30,53 @@ import { Math as TeX } from "./math";
 
 const marked = new Marked({ gfm: true, breaks: true });
 
-/** `$$…$$` on its own, and `$…$` inline.
+/** Display math as `$$…$$` or `\[…\]`, inline math as `$…$` or `\(…\)`.
  *
- *  Inline math is a heuristic and is guarded accordingly: a run of digits is
+ *  Both spellings are needed because both are what models emit: the TeX
+ *  delimiters are the house style of several providers, and without a tokenizer
+ *  claiming them first they are not merely unstyled — `\[` is a CommonMark
+ *  backslash escape, so the formula loses its delimiters and renders as a bare
+ *  bracket around source.
+ *
+ *  Only `$…$` is a heuristic, and it is guarded accordingly: a run of digits is
  *  money, not algebra, and `costs $5 and $10 total` must not typeset. The
- *  unambiguous forms — a ```math fence and `$$…$$` — carry no such guess. */
+ *  explicit forms — a ```math fence, `$$…$$`, `\[…\]`, `\(…\)` — carry no such
+ *  guess and take their contents verbatim. */
+const BLOCK_MATH = /^(?:\$\$([\s\S]+?)\$\$|\\\[([\s\S]+?)\\\])(?:\n+|$)/;
+const INLINE_TEX = /^\\\(([\s\S]+?)\\\)/;
+const INLINE_DOLLAR = /^\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/;
+
+/** Leftmost of several openers, or -1 when none appear. marked ignores a
+ *  negative `start`, so "not found" and "found nothing first" agree. */
+function leftmost(src: string, ...openers: string[]): number {
+  let at = -1;
+  for (const opener of openers) {
+    const found = src.indexOf(opener);
+    if (found >= 0 && (at < 0 || found < at)) at = found;
+  }
+  return at;
+}
+
 marked.use({
   extensions: [
     {
       name: "blockMath",
       level: "block",
-      start: (src: string) => src.indexOf("$$"),
+      start: (src: string) => leftmost(src, "$$", "\\["),
       tokenizer(src: string) {
-        const match = /^\$\$([\s\S]+?)\$\$(?:\n+|$)/.exec(src);
-        if (match) return { type: "blockMath", raw: match[0], text: match[1].trim() };
-        return undefined;
+        const match = BLOCK_MATH.exec(src);
+        if (!match) return undefined;
+        return { type: "blockMath", raw: match[0], text: (match[1] ?? match[2]).trim() };
       },
     },
     {
       name: "inlineMath",
       level: "inline",
-      start: (src: string) => src.indexOf("$"),
+      start: (src: string) => leftmost(src, "$", "\\("),
       tokenizer(src: string) {
-        const match = /^\$(?!\s)([^$\n]+?)(?<!\s)\$(?![\d$])/.exec(src);
+        const tex = INLINE_TEX.exec(src);
+        if (tex) return { type: "inlineMath", raw: tex[0], text: tex[1].trim() };
+        const match = INLINE_DOLLAR.exec(src);
         if (!match) return undefined;
         const body = match[1];
         if (/^[\d,.\s]+$/.test(body)) return undefined; // currency, not math

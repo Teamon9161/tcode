@@ -113,6 +113,117 @@ const nextId = () => `pane-${(seq += 1)}`;
  *  panes' own min sizes, which are a rendering concern, not this file's. */
 const MIN_RATIO = 0.1;
 
+/**
+ * How much of the field a pane needs to be worth opening, along the axis it is
+ * being squeezed on.
+ *
+ * A conversation and a file want most of a column; a list of file names wants
+ * enough for a name and not a pixel more. These are fractions of the whole
+ * window rather than of the pane something opened out of, and that difference
+ * is the entire point of `makeRoom` — see it for why.
+ *
+ * They are fractions rather than pixels because nothing else in this file knows
+ * what a pixel is. The cost is that a very small window scales the floors down
+ * with it; the alternative is threading a size through every layout operation
+ * to serve a case the tiling is already too small for.
+ */
+function roomFor(pane: Pane): number {
+  if (pane.kind === "session") return 0.28;
+  // A column of names, not a column of content: the file tree and the changed
+  // files index are read by their left edge.
+  if (pane.kind === "inspect") {
+    const kind = navValue(pane.nav).kind;
+    if (kind === "workspace-tree" || kind === "files") return 0.14;
+  }
+  return 0.3;
+}
+
+/** The least a subtree can live in, along `axis`. Children of a split that cuts
+ *  the other way share their parent's whole extent here, so they take the
+ *  larger of the two rather than the sum. */
+function needs(node: Layout, axis: Dir): number {
+  if (node.kind === "leaf") return roomFor(node.pane);
+  const a = needs(node.a, axis);
+  const b = needs(node.b, axis);
+  return node.dir === axis ? a + b : Math.max(a, b);
+}
+
+/**
+ * Gives a pane that just opened the room it needs, out of whichever neighbour
+ * can spare it.
+ *
+ * `split` only ever subdivides its target's own rectangle, so the space for a
+ * new pane comes from the pane it opened out of and from nothing else. That is
+ * right for two peers and wrong for everything nested: opening the file tree
+ * beside a conversation, then a file out of the tree, left the file with a
+ * third of a third — the two panes on the right crammed into 34% of the window
+ * while the conversation, which nobody asked to keep, held the other 66%.
+ *
+ * So the shares in this file are shares of the *window*, not of the pane that
+ * happened to be split. This walks the splits between the root and the new leaf
+ * and, at each one, moves the shortfall across from the side that has slack —
+ * which is how the deficit reaches a neighbour several levels away. Only that
+ * path is touched: a subtree off to the side keeps its internal ratios exactly
+ * as they were dragged, and is protected from being squeezed below the sum of
+ * what it holds by `needs`.
+ *
+ * Only the axis of the new split is fixed up. A stacked split changes nobody's
+ * width, so there is nothing to settle there.
+ */
+function makeRoom(root: Layout, axis: Dir, opened: string): Layout {
+  const fit = (node: Layout, size: number): Layout => {
+    if (node.kind === "leaf") return node;
+    const inA = !!findNode(node.a, opened);
+    if (!inA && !findNode(node.b, opened)) return node;
+    if (node.dir !== axis) {
+      // Both children span the parent's whole extent along this axis, so there
+      // is nothing to divide here — only the branch holding the new pane is
+      // followed down.
+      const a = inA ? fit(node.a, size) : node.a;
+      const b = inA ? node.b : fit(node.b, size);
+      return a === node.a && b === node.b ? node : { ...node, a, b };
+    }
+
+    let sa = size * node.ratio;
+    let sb = size - sa;
+    const wantA = needs(node.a, axis);
+    const wantB = needs(node.b, axis);
+    // At most one side is short — the other is the one that just gave up space
+    // to it, or there is no room here and the shortfall passes further up.
+    const move = Math.min(Math.max(wantA - sa, 0), Math.max(sb - wantB, 0));
+    const back = Math.min(Math.max(wantB - sb, 0), Math.max(sa - wantA, 0));
+    sa += move - back;
+    sb -= move - back;
+
+    const ratio = size > 0 ? Math.min(Math.max(sa / size, MIN_RATIO), 1 - MIN_RATIO) : node.ratio;
+    const a = inA ? fit(node.a, sa) : node.a;
+    const b = inA ? node.b : fit(node.b, sb);
+    return a === node.a && b === node.b && ratio === node.ratio ? node : { ...node, ratio, a, b };
+  };
+  return fit(root, 1);
+}
+
+/**
+ * Which way to cut a pane in two: across its longer side, so panes tend toward
+ * squares instead of slivers.
+ *
+ * `aspect` is the field's width ÷ height in pixels — the one fact about the
+ * screen this file cannot derive from its own tree, and the reason the answer
+ * is a function here rather than a constant `"row"` at four call sites. A
+ * caller that has no field to measure (a test, a fixture) leaves it out and
+ * gets side by side, which is what this window did before any of this.
+ *
+ * The judgement is only about shape, so callers that know the *meaning* of the
+ * two panes overrule it: a list of file names belongs beside what it opens, at
+ * whatever aspect, never stacked above it.
+ */
+export function dirFor(tiling: Tiling, target: string, aspect = Infinity): Dir {
+  if (!Number.isFinite(aspect) || aspect <= 0) return "row";
+  const placed = frames(tiling).panes.find(({ leaf }) => leaf.id === target);
+  if (!placed) return "row";
+  return placed.rect.width * aspect >= placed.rect.height ? "row" : "col";
+}
+
 export function leafOf(pane: Pane): Leaf {
   return { kind: "leaf", id: nextId(), pane };
 }
@@ -166,6 +277,10 @@ export function focusPane(tiling: Tiling, id: string): Tiling {
  * Splits `target` in two and puts `pane` in the new half, which takes focus —
  * you asked for it, so you are looking at it.
  *
+ * `ratio` divides the target's own rectangle; `makeRoom` then settles the
+ * result against the window, so a pane opened deep in the tree is not left with
+ * a sliver of a sliver.
+ *
  * Splitting an unknown target is a no-op rather than an append: the caller
  * named a pane that is gone, and guessing where they meant instead is worse
  * than doing nothing.
@@ -179,7 +294,7 @@ export function split(
 ): Tiling {
   if (!tiling.root) return single(pane);
   const added = leafOf(pane);
-  const root = mapNode(tiling.root, target, (node) => ({
+  const grown = mapNode(tiling.root, target, (node) => ({
     kind: "split",
     id: nextId(),
     dir,
@@ -187,7 +302,8 @@ export function split(
     a: node,
     b: added,
   }));
-  return root === tiling.root ? tiling : { root, focus: added.id };
+  if (grown === tiling.root) return tiling;
+  return { root: makeRoom(grown, dir, added.id), focus: added.id };
 }
 
 /**
@@ -256,7 +372,7 @@ export function updatePane(tiling: Tiling, id: string, pane: Pane): Tiling {
  * window's only one, so overwriting it would mean a conversation arriving on
  * screen could silently close the page you were reading.
  */
-export function show(tiling: Tiling, session: string): Tiling {
+export function show(tiling: Tiling, session: string, aspect?: number): Tiling {
   const already = panes(tiling).find(
     (leaf) => leaf.pane.kind === "session" && leaf.pane.session === session,
   );
@@ -265,7 +381,8 @@ export function show(tiling: Tiling, session: string): Tiling {
   const pane: Pane = { kind: "session", session };
   if (!tiling.root) return single(pane);
   const seat = focused(tiling) ?? firstLeaf(tiling.root);
-  if (seat.pane.kind !== "session") return split(tiling, seat.id, "row", pane);
+  if (seat.pane.kind !== "session")
+    return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), pane);
   return { root: mapNode(tiling.root, seat.id, () => ({ ...seat, pane })), focus: seat.id };
 }
 
@@ -280,16 +397,17 @@ export function show(tiling: Tiling, session: string): Tiling {
  * sends the page back to `about:blank` ("Exit browser") or just hides it
  * ("Hide for now"); the webview itself is only torn down by the app's exit.
  *
- * It splits to the right of the focused pane at an even share: a page and a
- * conversation are the same order of thing, unlike a column of file names
- * (`SIDEBAR_SHARE`).
+ * It splits off the focused pane at an even share: a page and a conversation
+ * are the same order of thing, unlike a column of file names (`SIDEBAR_SHARE`).
+ * Being the same order of thing is also why it takes the automatic direction —
+ * beside a full-height pane, under a wide one.
  */
-export function openWeb(tiling: Tiling): Tiling {
+export function openWeb(tiling: Tiling, aspect?: number): Tiling {
   const already = panes(tiling).find((leaf) => leaf.pane.kind === "web");
   if (already) return close(tiling, already.id);
   if (!tiling.root) return single({ kind: "web" });
   const seat = focused(tiling) ?? firstLeaf(tiling.root);
-  return split(tiling, seat.id, "row", { kind: "web" });
+  return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), { kind: "web" });
 }
 
 /** The browser's pane, if the window has one open. */
@@ -344,6 +462,7 @@ export function openInspect(
   from: string,
   session: string,
   value: Inspect,
+  aspect?: number,
 ): Tiling {
   const existing = panes(tiling).find(
     (leaf) =>
@@ -356,7 +475,7 @@ export function openInspect(
     });
     return { ...grown, focus: existing.id };
   }
-  return openAside(tiling, from, session, value);
+  return openAside(tiling, from, session, value, aspect);
 }
 
 /**
@@ -373,15 +492,17 @@ export function openAside(
   from: string,
   session: string,
   value: Inspect,
+  aspect?: number,
 ): Tiling {
   const leaf = findLeaf(tiling, from);
-  const share =
-    leaf && browsing(leaf.pane)
-      ? SIDEBAR_SHARE
-      : value.kind === "files" || value.kind === "workspace-tree"
-        ? MAIN_SHARE
-        : undefined;
-  return split(tiling, from, "row", { kind: "inspect", session, nav: navOf(value) }, share);
+  const list = value.kind === "files" || value.kind === "workspace-tree";
+  const share = leaf && browsing(leaf.pane) ? SIDEBAR_SHARE : list ? MAIN_SHARE : undefined;
+  // A navigation list and what it navigates are a row whatever the shape of the
+  // pane: a column of names stacked above a file is a column of names with its
+  // width wasted and its length cut off. Everything else is two comparable
+  // things, so it takes the automatic direction.
+  const dir = list || (leaf && browsing(leaf.pane)) ? "row" : dirFor(tiling, from, aspect);
+  return split(tiling, from, dir, { kind: "inspect", session, nav: navOf(value) }, share);
 }
 
 /** Steps one inspect pane's history — back, forward, or on to something new. */
@@ -398,7 +519,7 @@ export function navigate(tiling: Tiling, id: string, step: (nav: Nav) => Nav): T
  *
  * A conversation that already has a pane is focused rather than opened twice.
  */
-export function showBeside(tiling: Tiling, session: string): Tiling {
+export function showBeside(tiling: Tiling, session: string, aspect?: number): Tiling {
   const already = panes(tiling).find(
     (leaf) => leaf.pane.kind === "session" && leaf.pane.session === session,
   );
@@ -406,7 +527,7 @@ export function showBeside(tiling: Tiling, session: string): Tiling {
 
   const seat = focused(tiling);
   if (!tiling.root || !seat) return single({ kind: "session", session });
-  return split(tiling, seat.id, "row", { kind: "session", session });
+  return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), { kind: "session", session });
 }
 
 /** The split holding a node, for rotating it. The root has none. */

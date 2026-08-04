@@ -96,6 +96,28 @@ export const SidebarIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/**
+ * Two equal panes, beside and stacked.
+ *
+ * The divider is *centred*, which is what keeps them out of `PanelIcon` and
+ * `SidebarIcon`'s territory: an off-centre line means "a panel on that edge",
+ * these mean "this seam, turned". The control that flips a split shows the one
+ * it is about to produce rather than the one already on screen.
+ */
+export const ColumnsIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+    <path d="M12 4.5v15" />
+  </Glyph>
+);
+
+export const RowsIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="3.5" y="4.5" width="17" height="15" rx="2" />
+    <path d="M3.5 12h17" />
+  </Glyph>
+);
+
 export const ExpandIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M9 5H5v4" />

@@ -159,8 +159,13 @@ impl Renderer {
             out.push(Line::from(line_spans));
         };
 
+        // `\[…\]` / `\(…\)` are math to every model that emits them and escaped
+        // brackets to CommonMark; rendering them needs the delimiters spelled
+        // the way `ENABLE_MATH` reads them. Display only — `split_blocks` hands
+        // back verbatim source and must keep its offsets into the original.
+        let text = crate::mathfmt::normalize_delimiters(text);
         let parser = Parser::new_ext(
-            text,
+            &text,
             Options::ENABLE_STRIKETHROUGH
                 | Options::ENABLE_TABLES
                 | Options::ENABLE_TASKLISTS
@@ -373,16 +378,23 @@ impl Renderer {
                     if !spans.is_empty() {
                         flush(&mut spans, &mut out, quote_depth);
                     }
-                    let mut math = Vec::new();
-                    if quote_depth > 0 {
-                        math.push(Span::styled("▎ ".repeat(quote_depth), theme::dim()));
+                    // A display formula routinely arrives spread over several
+                    // source lines. A `Line` holding a newline draws as a gap
+                    // the layout never accounted for, so each row is its own
+                    // line and only the first wears the marker.
+                    let body = crate::mathfmt::prettify(&t);
+                    for (row, text) in body.trim().lines().enumerate() {
+                        let mut math = Vec::new();
+                        if quote_depth > 0 {
+                            math.push(Span::styled("▎ ".repeat(quote_depth), theme::dim()));
+                        }
+                        math.push(Span::styled(
+                            if row == 0 { "∑ " } else { "  " },
+                            theme::accent(),
+                        ));
+                        math.push(Span::styled(text.trim().to_string(), theme::math_block()));
+                        out.push(Line::from(math));
                     }
-                    math.push(Span::styled("∑ ", theme::accent()));
-                    math.push(Span::styled(
-                        crate::mathfmt::prettify(&t),
-                        theme::math_block(),
-                    ));
-                    out.push(Line::from(math));
                     display_math = true;
                 }
                 Event::SoftBreak | Event::HardBreak => {
@@ -943,6 +955,24 @@ mod tests {
 
         assert!(text.iter().any(|line| line.contains("Energy is E = mc².")));
         assert!(text.iter().any(|line| line == "∑ a/b = c"));
+    }
+
+    #[test]
+    fn renders_tex_delimited_formulae_too() {
+        let lines =
+            Renderer::default().render("cash \\(C_t\\) is\n\n\\[\n\\sum_i |p_i| \\leq 0.5\n\\]");
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect();
+
+        assert!(text.iter().any(|line| line.contains("cash Cₜ is")));
+        assert!(text.iter().any(|line| line == "∑ ∑ᵢ |pᵢ| ≤ 0.5"));
     }
 
     #[test]

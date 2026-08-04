@@ -184,9 +184,11 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4. 窗格有没有可能能做一个自适应的重排呢,比如我打开文件panel, 再打开某个文件,右边两个就挤在一起了,但其实应该压缩一下左边的session. 还有就是窗格能不能做到上下分呢.
-5. plan模式比如execute in a new session, detail的内容感觉是在太少了,不像以前plan mode那样,plan是特别详细的,这是为什么呢, 没什么detail的plan感觉作用不大吧,等于new session又要重新探索.
-6. read：读取 Curves.tsx 时，工具返回“文件未变更，内容已在上下文中”，但压缩后的可见上下文并没有该文件内容，导致必须追加一次 force=true 读取。若上下文经过压缩，read 应返回所请求的片段而非“已在上下文”提示，可避免这次额外调用。
-7. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
-8. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
-9. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
+4. plan模式比如execute in a new session, detail的内容感觉是在太少了,不像以前plan mode那样,plan是特别详细的,这是为什么呢, 没什么detail的plan感觉作用不大吧,等于new session又要重新探索.
+5. read：读取 Curves.tsx 时，工具返回“文件未变更，内容已在上下文中”，但压缩后的可见上下文并没有该文件内容，导致必须追加一次 force=true 读取。若上下文经过压缩，read 应返回所请求的片段而非“已在上下文”提示，可避免这次额外调用。
+6. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
+7. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
+8. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
+9. show html的时候记录中能不能自动放缩下,比如有的html里面只有一张交互式图片,但是现在在主对话中都看不全,这块能不能看下怎么调整更好
+10. app terminal窗格, 类似ide, 主题跟随tcode app, 支持ctrl+j调出.
+11. app ai给的markdown返回中可能有链接,可能是网页, 图片, csv等,这个能不能点击打开,目前点击没反应,因为我们已经有对应的窗格可以渲染了.

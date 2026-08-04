@@ -100,6 +100,10 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     `Pane` 的两个变体都带 `session`，这是承重的：关掉一个会话必须连它开出去的 diff、run、artifact 一起收走，`closeSession` 能写成几行全靠它。inspect 窗格持有的是 `Nav`（整条前进后退历史）而不是一个 `Inspect` 值——历史属于窗格，不属于组件，否则窗格一挪位置历史就没了。
 
+    **份额是窗口的份额，不是被裂那个窗格的份额**（`makeRoom` + `roomFor`）。`split` 只切 target 自己那块矩形，于是新窗格的地全从它开出来的那个窗格身上出——两个平级窗格这样对，嵌套之后全错：会话旁边开文件树（66/34），再从树里点开一个文件，文件拿到的是三分之一的三分之一（22%），而没人要求留着的那个会话稳坐 66%。所以 `split` 之后走一遍 `makeRoom`：沿根到新叶子的那条路径逐层把缺口挪给有余量的一侧，缺口因此能传到几层之外的邻居身上。两条边界是承重的——**只走那条路径**（旁边的子树保留它被拖成的比例，一次开窗格不许把人拖过的分隔条推回去），**只结算新分裂的那根轴**（竖着分不改变任何人的宽度）。底线由 `roomFor` 一张表说了算，单位是窗口的分数不是像素：这个文件不知道像素是什么，为一个"窗口本来就太小"的场景把尺寸串进每个布局函数不值得。
+
+    **方向由 `dirFor` 按被裂窗格的长边挑，不是四处写死 `"row"`**。`Dir` 从第一天就有 `col`，`frames`、分隔条、`rotate` 也一直支持，但四个调用点全写死 row，于是"上下分"只能先裂再转、且只有键盘上一个没人找得到的 `Mod+Alt+R`。`aspect`（场地宽÷高）是这个纯文件唯一算不出来的事实，由 `field.ts` 在点击那一刻量——不许闭包捕获，那些回调为了 memo 只绑一次（规则 21），而窗口会变。**知道语义的调用方压过它**：文件树与 files 索引永远是 row，一列文件名摞在文件上面等于宽度浪费、长度截断。想要另一种方向就转那道缝：唯一"明说方向"的控件是分隔条上 hover 才现身的 `.seam-turn`，画的是**按下去会变成的样子**而不是现在的样子。**它长在缝上而不是窗格 header 上，这是量出来的**：`rotate` 收的本来就是 split 的 id、不是窗格的 id，而 header 上再加第六个图标恰好会在最窄的那个窗格里把关闭键挤出边界——正是这次改动要救的那种窗格（`.pane-head` 在 147px 宽时 scrollWidth 176）。为此 `.divider` 拆成 `.seam`（定位、光标、hover）+ 里面的 `.divider`（role="separator"、拖动、::after 抓取区），因为 `role="separator"` 里塞一个 button 读屏出不来。不许为每个"打开"的动词再各配一个"往下打开"——那是四个动词乘两个方向，而一道缝一个控件对所有窗格都成立。
+
 9h. **浏览器窗格是原生子 webview，而且是窗口级单例**（`src/browser.rs` + `ui/src/WebPane.tsx`，`Pane` 的第三个变体 `{kind:"web"}`）。
 
     **capability 恒为空，这条是全仓库最容易静默破掉的一条。** Tauri 的 capability 按 label 匹配，而 `windows: ["main"]` 的语义是**授予该窗口下的每一个 webview**（tauri-utils 原话：regardless of the value of `webviews`）。浏览器是 `main` 的子 webview，所以那一行等于把 `core:default` 发给任意网页，也就是把 `window.__TAURI__`、也就是本机任意命令，发给任意网页。**破掉时什么都不会坏**：app 正常、浏览器正常、只是每个站点都被信任。`capabilities/default.json` 因此写 `webviews: ["main"]`，`browser.rs` 里有一条测试读那个文件钉住它（已验证改回 `windows` 会红）。这也是回读页面只能走 `eval_with_callback` 的原因——它在 runtime 层（WebView2 的 `ExecuteScript`）而不是 Tauri IPC，所以页面不需要任何权限我们也读得到。永远不要为了"让 agent 能操作页面"去加 `dangerousRemoteDomainIpcAccess`。

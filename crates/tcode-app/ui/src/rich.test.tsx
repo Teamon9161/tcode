@@ -81,6 +81,18 @@ describe("rich() still renders the document", () => {
     expect(render("$$x^2$$")).toContain("katex");
     expect(render("it costs $30 and $40 total")).not.toContain("katex");
   });
+
+  it("typesets the TeX delimiters models actually emit", () => {
+    // Without a tokenizer of its own this loses the backslashes to CommonMark
+    // escaping and renders as a bracket around raw source.
+    const block = render("\\[\n\\sum_{i} |p_i| \\leq 0.5\n\\]");
+    expect(block).toContain("katex");
+    expect(block).not.toContain("sum_");
+
+    const inline = render("cash \\(C_t\\) at time t");
+    expect(inline).toContain("katex");
+    expect(inline).not.toContain("C_t\\");
+  });
 });
 
 describe("the artifact frame stays an opaque origin", () => {
