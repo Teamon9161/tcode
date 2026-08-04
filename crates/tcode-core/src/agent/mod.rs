@@ -38,6 +38,27 @@ use crate::types::{ContentBlock, RateLimits, StopReason, Usage};
 /// ceiling that distorts its work. Configurable via `limits.max_steps_per_turn`.
 pub const DEFAULT_MAX_STEPS: usize = 500;
 
+/// Combined output ceiling for one parallel read-only batch.
+///
+/// `read`/`grep`/`glob` opt out of the per-call blob gate on purpose: each has
+/// its own cap and the model picked the range, so re-cutting a result it asked
+/// for costs a round-trip to undo. What nothing bounded was their *sum*, and
+/// these are exactly the tools the model issues three to six of at once. Six
+/// `read`s of a long-line file (a session JSONL, minified JS) is ~750 KB —
+/// most of a 256k window, spent in one batch, before anything gets to judge
+/// it. Charged in model order: calls up to the budget arrive untouched, and
+/// from the first overrun on the rest spill to a file the same tools can page,
+/// so what gets cut is what the model asked for last rather than an arbitrary
+/// slice of everything.
+const PARALLEL_BATCH_TOKENS: usize = 40_000;
+
+/// Consecutive `max_tokens` truncations before the turn stops retrying. The
+/// first one is ordinary — the model wrote a long answer and got clipped, and
+/// being told so is all it needs to finish in fewer words. A second one in a
+/// row means the ceiling is genuinely too low for what is being asked, which
+/// no number of retries fixes and every retry bills a full prefix for.
+const MAX_TRUNCATED_STEPS: usize = 2;
+
 /// Appended to the system prompt while `/dogfood` is on.
 const DOGFOOD_SYSTEM: &str = include_str!("../../prompts/agent/dogfood.md");
 
@@ -210,8 +231,6 @@ pub enum AgentEvent {
 pub enum AgentError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
-    #[error("event channel closed")]
-    ChannelClosed,
 }
 
 pub struct Agent {
@@ -727,6 +746,7 @@ impl Agent {
         cancel: &CancellationToken,
     ) -> Result<(), AgentError> {
         let max_steps = self.max_steps.max(1);
+        let mut truncated_streak = 0usize;
         for _ in 0..max_steps {
             let (blocks, usage, stop) = self.stream_step(model, session, events, cancel).await?;
             session.last_prompt_tokens = usage.total_input() + usage.output_tokens;
@@ -755,14 +775,81 @@ impl Agent {
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
+            // A reply that ran out of `max_tokens` is not a finished answer,
+            // and with a reasoning model the whole budget can go into thinking:
+            // the step then produces no text and no tool call, which on the
+            // wire is indistinguishable from a model deciding it was done.
+            // Ending the turn there is the wrong call twice over — the user
+            // sees it stop for no reason, and the work is abandoned mid-thought
+            // for a reason nobody has to accept. Tell the model what happened
+            // and let it go again: it knows what it was in the middle of, and
+            // knowing about the ceiling is what lets it aim under it.
+            if stop == Some(StopReason::MaxTokens) {
+                truncated_streak += 1;
+                // A tool call inside a truncated reply is itself unfinished,
+                // and every committed tool_use still owes a result (API
+                // invariant) before the next request can be made.
+                let cut = session.ledger.close_dangling_tool_calls(
+                    "No result: the reply hit max_tokens before it was complete, so this call \
+                     never ran and changed nothing.",
+                );
+                // Retrying forever is the failure mode to avoid: a model that
+                // cannot fit inside the cap will not discover that by being
+                // asked again, and each attempt bills a full prefix. Two tries
+                // is enough to tell "wrote too much once" from "cannot fit".
+                let give_up = truncated_streak >= MAX_TRUNCATED_STEPS;
+                let mut msg = String::from(
+                    "The previous reply hit its per-response output cap (max_tokens) and was cut \
+                     off mid-generation — whatever came after that point was never produced. \
+                     Reasoning tokens count against this cap too, so a long think can spend it \
+                     before any answer is written.",
+                );
+                if !cut.is_empty() {
+                    msg.push_str(&format!(
+                        " Tool call(s) cut off and not run: {}.",
+                        cut.join(", ")
+                    ));
+                }
+                msg.push_str(if give_up {
+                    " This has now happened twice in a row, so the turn stops here rather than \
+                     retrying again. Raise `max_tokens` for this profile or model in the tcode \
+                     config, or ask for the work in smaller pieces."
+                } else {
+                    " Continue from where it stopped, and keep this reply short enough to finish \
+                     inside the cap: answer in fewer words, or take one step at a time and let \
+                     the next reply carry the rest."
+                });
+                session.ledger.append(Entry::Note(msg.clone()));
+                self.emit(events, AgentEvent::Note(msg)).await?;
+                if give_up {
+                    self.emit(events, AgentEvent::TurnEnd).await?;
+                    return Ok(());
+                }
+                // Same boundary work as after a tool batch: the truncated reply
+                // is in the ledger and counts against the window, and anything
+                // the user typed meanwhile is delivered before the retry.
+                session.last_prompt_tokens = self.estimate_context_tokens(session);
+                self.auto_compact_if_needed(session, model, events, cancel)
+                    .await?;
+                self.deliver_pending_input(session, events).await?;
+                continue;
+            }
+            truncated_streak = 0;
             if tool_calls.is_empty() || stop != Some(StopReason::ToolUse) {
                 self.emit(events, AgentEvent::TurnEnd).await?;
                 return Ok(());
             }
 
-            let outcome = self
+            let outcome = match self
                 .run_tools(session, &tool_calls, events, approver, cancel)
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.seal_failed_tool_batch(session);
+                    return Err(error);
+                }
+            };
             if outcome.interrupted {
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
@@ -1408,6 +1495,9 @@ impl Agent {
                 })),
             )
             .await?;
+        // The batch's shared ceiling. `prepared` is in model call order, so
+        // charging as we walk it is deterministic despite the concurrent run.
+        let mut spent = 0usize;
         for ((id, name, input, _), mut output) in prepared.into_iter().zip(outputs) {
             let post = self
                 .hooks
@@ -1423,6 +1513,7 @@ impl Agent {
                 output.content.push_str(&format!("\n[hook] {note}"));
             }
             let output = self.gate(session, &name, &input, output);
+            let output = self.charge_batch_budget(session, &name, output, &mut spent);
             self.emit(
                 events,
                 AgentEvent::ToolEnd {
@@ -2343,6 +2434,23 @@ impl Agent {
         })
     }
 
+    /// Seal an internal executor failure after its assistant tool-use turn was
+    /// persisted. Individual calls may already have run, so state is unknown
+    /// rather than falsely described as a user cancellation.
+    fn seal_failed_tool_batch(&self, session: &mut Session) {
+        let calls = session.ledger.close_dangling_tool_calls(
+            "No result: tcode stopped while this call was in flight. Whether it \
+             took effect is unknown — verify before assuming either way.",
+        );
+        if !calls.is_empty() {
+            session.ledger.append(Entry::Note(format!(
+                "Tool execution ended before {} had a recorded result. Its state is unknown; \
+                 verify before relying on any outcome.",
+                calls.join(", ")
+            )));
+        }
+    }
+
     /// Interrupt contract: tell the model exactly what happened so it
     /// never wastes tokens re-verifying state after an interrupt.
     fn commit_interrupt(
@@ -2584,6 +2692,42 @@ impl Agent {
         }
     }
 
+    /// Charge one result against the batch's shared ceiling
+    /// (`PARALLEL_BATCH_TOKENS`), spilling to the blob store once it is spent.
+    ///
+    /// This runs *after* the per-call gate, so a tool that gates already fits
+    /// its own budget and simply gets charged; a tool that opted out is here
+    /// for the only reason the opt-out did not anticipate — several of them in
+    /// one batch. `spent` is carried across the batch by the caller rather than
+    /// living on the session: it means nothing outside this batch, and the
+    /// order it is charged in is the model's call order, which makes the cut
+    /// reproducible even though the calls ran concurrently.
+    fn charge_batch_budget(
+        &self,
+        session: &Session,
+        tool: &str,
+        output: ToolOutput,
+        spent: &mut usize,
+    ) -> ToolOutput {
+        let cost = crate::blobs::approx_tokens(&output.content);
+        if *spent + cost <= PARALLEL_BATCH_TOKENS {
+            *spent += cost;
+            return output;
+        }
+        let remaining = PARALLEL_BATCH_TOKENS.saturating_sub(*spent);
+        *spent = PARALLEL_BATCH_TOKENS;
+        let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
+        let content = blobs.gate_within(remaining, tool, output.content, output.is_error);
+        ToolOutput {
+            content: format!(
+                "{content}\n[batch output budget spent: this call shared one batch with earlier \
+                 ones that used it up. Re-run it on its own, or narrow it, to get the whole result]"
+            ),
+            is_error: output.is_error,
+            images: output.images,
+        }
+    }
+
     async fn persist_approval_rule(
         &self,
         session: &mut Session,
@@ -2644,7 +2788,10 @@ impl Agent {
         events: &mpsc::Sender<AgentEvent>,
         ev: AgentEvent,
     ) -> Result<(), AgentError> {
-        events.send(ev).await.map_err(|_| AgentError::ChannelClosed)
+        // Frontends observe the durable session; losing an observer must not
+        // interrupt an accepted provider response or tool batch.
+        let _ = events.send(ev).await;
+        Ok(())
     }
 
     /// Run one tool call (or a whole concurrent batch) while forwarding

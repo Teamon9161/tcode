@@ -50,7 +50,7 @@ impl Provider for MockVision {
 fn model(provider: Arc<MockVision>) -> ModelCell {
     ModelCell::new(ActiveModel {
         provider,
-        max_tokens: 4096,
+        max_tokens: Some(4096),
         context_window: 128_000,
         effort: None,
     })

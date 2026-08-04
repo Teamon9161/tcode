@@ -39,7 +39,7 @@ impl tcode_core::Provider for TextOnlyProvider {
 fn text_only_model() -> tcode_core::ModelCell {
     tcode_core::ModelCell::new(tcode_core::ActiveModel {
         provider: Arc::new(TextOnlyProvider),
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 16_000,
         effort: None,
     })

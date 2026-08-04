@@ -25,7 +25,14 @@ pub struct Request {
     pub cache_scope: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDef>,
-    pub max_tokens: u32,
+    /// Ceiling on this response's output tokens. `None` means "no ceiling from
+    /// us" — the endpoint's own limit applies, which is what a working agent
+    /// wants: a cap the model can hit is a cap that truncates an answer
+    /// mid-sentence, and reasoning tokens are spent against it before a single
+    /// word of the answer is written. Set it only where a short reply is the
+    /// point (the Auto Mode classifier, the next-prompt guess). Providers whose
+    /// wire format requires the field resolve `None` to their own default.
+    pub max_tokens: Option<u32>,
     /// Reasoning effort; None = provider default. Each provider maps it
     /// to its own dial (thinking budget / reasoning.effort).
     pub effort: Option<String>,
@@ -102,12 +109,23 @@ pub enum CacheStrategy {
 #[derive(Clone)]
 pub struct ActiveModel {
     pub provider: std::sync::Arc<dyn Provider>,
-    pub max_tokens: u32,
+    /// Configured output ceiling, or `None` for the endpoint's own limit.
+    /// Uncapped is the default: see `Request::max_tokens`.
+    pub max_tokens: Option<u32>,
     pub context_window: u64,
     pub effort: Option<String>,
 }
 
 impl ActiveModel {
+    /// This model's ceiling, tightened to `at_most`, for helper roles whose
+    /// whole job is a short answer (a page summary, an image description).
+    /// Uncapped means "as much as the endpoint allows" for a chat turn, but
+    /// not for these: they always get the ceiling, so the result is never
+    /// `None`.
+    pub fn output_ceiling(&self, at_most: u32) -> Option<u32> {
+        Some(self.max_tokens.map_or(at_most, |cap| cap.min(at_most)))
+    }
+
     /// e.g. `deepseek-v4-flash[1m] (high)` — for status lines.
     pub fn describe(&self) -> String {
         match &self.effort {

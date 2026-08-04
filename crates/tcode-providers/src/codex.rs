@@ -579,7 +579,7 @@ mod tests {
             cache_scope: cache_scope.map(String::from),
             messages: vec![],
             tools: vec![],
-            max_tokens: 16,
+            max_tokens: Some(16),
             effort: effort.map(String::from),
         }
     }

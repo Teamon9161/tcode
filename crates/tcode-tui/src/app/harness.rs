@@ -181,7 +181,7 @@ pub(super) fn app_for_plan_handoff(
                 switch: Box::new(move |_, _| {
                     Ok(ActiveModel {
                         provider: Arc::new(PendingProvider(captured_requests.clone())),
-                        max_tokens: 1024,
+                        max_tokens: Some(1024),
                         context_window: 200_000,
                         effort: None,
                     })
@@ -258,7 +258,7 @@ fn app_with_provider(
     let agent = Agent {
         model: ModelCell::new(ActiveModel {
             provider,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),

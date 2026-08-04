@@ -427,6 +427,23 @@ fn upgrade_legacy_entry(entry: Entry) -> Entry {
     }
 }
 
+/// Close an interrupted tool batch before replay admits another entry. This
+/// preserves the provider-required adjacency between an assistant's tool calls
+/// and their results even when a later prompt was persisted after the failure.
+fn close_replayed_tool_batch(ledger: &mut Ledger) {
+    let cut_off = ledger.close_dangling_tool_calls(
+        "No result: tcode stopped while this call was in flight. Whether it \
+         took effect is unknown — verify before assuming either way.",
+    );
+    if !cut_off.is_empty() {
+        ledger.append(Entry::Note(format!(
+            "The previous tool batch ended before {} had a recorded result. Its state is \
+             unknown; re-check what it may have changed before continuing.",
+            cut_off.join(", ")
+        )));
+    }
+}
+
 /// The run id in a background sub-agent's dispatch line or completion note:
 /// `[background <kind> sub-agent <id> …]`.
 fn background_agent_run_id(text: &str) -> Option<&str> {
@@ -808,7 +825,17 @@ impl SessionStore {
                 // unambiguous legacy shape while replaying so resumed
                 // transcripts show the person's own words, just like live
                 // annotations and newly-created sessions.
-                LogEvent::Append { entry } => ledger.append(upgrade_legacy_entry(entry)),
+                LogEvent::Append { entry } => {
+                    // A failed live batch can leave the assistant's tool calls
+                    // durable while a later user entry still reaches the log.
+                    // Close it before that ordinary entry, never at replay end,
+                    // so OpenAI receives the tool results immediately after
+                    // the assistant message that requested them.
+                    if !matches!(&entry, Entry::ToolResults(_)) {
+                        close_replayed_tool_batch(&mut ledger);
+                    }
+                    ledger.append(upgrade_legacy_entry(entry));
+                }
                 LogEvent::TruncateTail { len } => ledger.truncate_tail(len),
                 LogEvent::Compact { summary, upto } => ledger.compact(summary, upto),
                 LogEvent::Checkpoint {
@@ -829,20 +856,9 @@ impl SessionStore {
                 | LogEvent::Batch { .. } => {}
             }
         }
-        // A session killed mid-batch left its last tool calls unanswered, which
-        // no provider will accept. Close them, and say so: whether those calls
-        // ran is exactly the thing the model must not have to guess.
-        let cut_off = ledger.close_dangling_tool_calls(
-            "No result: tcode exited while this call was in flight. Whether it \
-             took effect is unknown — verify before assuming either way.",
-        );
-        if !cut_off.is_empty() {
-            ledger.append(Entry::Note(format!(
-                "The previous session ended while {} was still running. Its result was never \
-                 recorded; re-check the state it would have produced before continuing.",
-                cut_off.join(", ")
-            )));
-        }
+        // A log that truly ends mid-batch has no later entry to trigger the
+        // boundary repair above, so close it here too.
+        close_replayed_tool_batch(&mut ledger);
         // Background processes don't survive a restart. Zero-guessing: tell
         // the model which watches are gone instead of letting it discover a
         // dead task id. Derived from the replayed ledger (not persisted), so
@@ -1282,6 +1298,50 @@ mod tests {
         assert!(matches!(
             resumed.ledger.entries(),
             [Entry::Instruction(text)] if text == "current-format instruction"
+        ));
+    }
+
+    #[test]
+    fn resume_closes_interrupted_tool_calls_before_a_later_user_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("inspect the project"));
+        ledger.append(Entry::Assistant(vec![ContentBlock::ToolUse {
+            id: "call-1".into(),
+            name: "grep".into(),
+            input: serde_json::json!({"pattern": "TODO"}),
+        }]));
+        // This is the shape produced if the live executor fails after the
+        // assistant response is durable but before its results are committed.
+        ledger.append(text("continue with the next task"));
+        drop(ledger);
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        assert!(matches!(
+            resumed.ledger.entries(),
+            [
+                Entry::User(_),
+                Entry::Assistant(_),
+                Entry::ToolResults(results),
+                Entry::Note(_),
+                Entry::User(_),
+            ] if matches!(&results[..], [ContentBlock::ToolResult { tool_use_id, is_error: true, .. }] if tool_use_id == "call-1")
+        ));
+
+        // `as_messages` keeps the repair in the user turn immediately after
+        // the assistant call, so provider adapters flatten tool results before
+        // the later human input.
+        let messages = resumed.ledger.as_messages();
+        assert_eq!(messages.len(), 3);
+        assert!(matches!(
+            &messages[2].content[0],
+            ContentBlock::ToolResult { tool_use_id, is_error: true, .. }
+                if tool_use_id == "call-1"
+        ));
+        assert!(messages[2].content.iter().any(
+            |block| matches!(block, ContentBlock::Text { text } if text.contains("continue with the next task"))
         ));
     }
 

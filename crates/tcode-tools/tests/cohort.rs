@@ -31,7 +31,7 @@ fn req_text(req: &Request) -> String {
 fn cell(provider: Arc<MockProvider>) -> ModelCell {
     ModelCell::new(ActiveModel {
         provider,
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 200_000,
         effort: None,
     })

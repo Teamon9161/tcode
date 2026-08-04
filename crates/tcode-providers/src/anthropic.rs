@@ -16,6 +16,13 @@ use crate::retry::connect_once;
 
 const API_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
+/// What an unset `max_tokens` becomes, because the Messages API rejects a
+/// request without the field. High enough that no honest answer reaches it —
+/// current Claude models top out at 64k output — and still leaves room under
+/// that ceiling for the largest thinking budget this provider asks for
+/// (24576), which is added on top. A backend with a lower limit of its own
+/// needs `max_tokens` in its model entry.
+const DEFAULT_MAX_TOKENS: u32 = 32_000;
 
 pub struct AnthropicProvider {
     http: reqwest::Client,
@@ -95,9 +102,13 @@ impl AnthropicProvider {
         if let Some(suffix) = &req.system_suffix {
             system.push(json!({ "type": "text", "text": suffix }));
         }
+        // The Messages API requires the field, so "uncapped" has to become a
+        // number here. It is the one place a default is unavoidable, and it
+        // belongs to the wire format rather than to configuration.
+        let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
         let mut body = json!({
             "model": req.model,
-            "max_tokens": req.max_tokens,
+            "max_tokens": max_tokens,
             "stream": true,
             // Breakpoint after the stable system prefix; classifier stages put
             // their differing instruction into an uncached tail block.
@@ -138,7 +149,7 @@ impl AnthropicProvider {
                 body["thinking"] = json!({ "type": "enabled", "budget_tokens": budget });
                 // The API requires max_tokens > budget_tokens; keep the
                 // configured amount available for the answer itself.
-                body["max_tokens"] = json!(req.max_tokens.saturating_add(budget));
+                body["max_tokens"] = json!(max_tokens.saturating_add(budget));
             }
         }
         body
@@ -383,7 +394,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: "hi".into() }],
             }],
             tools: vec![],
-            max_tokens: 1000,
+            max_tokens: Some(1000),
             effort: effort.map(str::to_string),
         }
     }
@@ -463,6 +474,26 @@ mod tests {
         assert_eq!(blocks[0]["cache_control"]["type"], "ephemeral");
         assert_eq!(blocks[1]["text"], "stage-specific verdict instruction");
         assert!(blocks[1].get("cache_control").is_none());
+    }
+
+    /// Unlike the OpenAI path, this one cannot simply drop the field — the
+    /// Messages API rejects a request without it — so "uncapped" resolves to a
+    /// default high enough that no honest answer reaches it, and the thinking
+    /// budget is still added on top of that.
+    #[test]
+    fn an_unset_cap_resolves_to_the_wire_default() {
+        let mut request = req(None);
+        request.max_tokens = None;
+        for p in [native(), compatible()] {
+            assert_eq!(p.build_body(&request)["max_tokens"], json!(32_000));
+        }
+        let mut thinking = req(Some("medium"));
+        thinking.max_tokens = None;
+        assert_eq!(
+            compatible().build_body(&thinking)["max_tokens"],
+            json!(32_000 + 12288),
+            "the budget is added to the resolved default, not to zero"
+        );
     }
 
     #[test]

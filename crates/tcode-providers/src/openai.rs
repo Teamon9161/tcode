@@ -82,11 +82,18 @@ impl OpenAiProvider {
             .collect();
         let mut body = json!({
             "model": req.model,
-            "max_tokens": req.max_tokens,
             "stream": true,
             "stream_options": { "include_usage": true },
             "messages": messages,
         });
+        // Optional here, unlike Anthropic: omitting it leaves the endpoint's
+        // own output limit in force, which is the right default for a chat
+        // turn. Sending one anyway used to cut long answers — and on backends
+        // that think by default (DeepSeek) the reasoning is spent against the
+        // same budget, so the cap could be gone before the answer started.
+        if let Some(max_tokens) = req.max_tokens {
+            body["max_tokens"] = json!(max_tokens);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
             body["parallel_tool_calls"] = json!(true);
@@ -405,7 +412,7 @@ mod tests {
                 content: vec![ContentBlock::Text { text: "hi".into() }],
             }],
             tools: vec![],
-            max_tokens: 1000,
+            max_tokens: Some(1000),
             effort: effort.map(str::to_string),
         }
     }
@@ -417,6 +424,20 @@ mod tests {
             Some(base_url.into()),
             watchdog(),
         )
+    }
+
+    /// The field is optional here, and omitting it is the point: it leaves the
+    /// endpoint's own output limit in force instead of a number of ours that
+    /// the model's reasoning would be spent against first.
+    #[test]
+    fn an_unset_cap_sends_no_max_tokens_at_all() {
+        let mut request = req(None);
+        request.max_tokens = None;
+        let body = provider("https://api.deepseek.com").build_body(&request);
+        assert!(body.get("max_tokens").is_none(), "{body}");
+
+        let capped = provider("https://api.deepseek.com").build_body(&req(None));
+        assert_eq!(capped["max_tokens"], json!(1000));
     }
 
     #[test]

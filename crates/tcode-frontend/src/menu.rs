@@ -91,12 +91,26 @@ pub type PresetUpdate = (ModelMenu, AgentMenu, String, Vec<String>);
 /// Apply a named preset.
 pub type ApplyPresetFn = Box<dyn Fn(&str) -> Result<PresetUpdate, String> + Send + Sync>;
 
+/// What `/model save` just did, so a frontend can say more than "saved":
+/// whether the name replaced an existing line-up and which roles changed.
+pub struct PresetSaveOutcome {
+    /// The name already named a `[presets.<name>]` table and it was replaced.
+    pub replaced: bool,
+    /// Per-role lines like `explore: inherit → deepseek-v4-flash`, empty when
+    /// the saved line-up is identical to the one already under that name.
+    pub changes: Vec<String>,
+}
+
 /// Write the live line-up out as `[presets.<name>]` and hand back the updated
-/// list plus the index of the preset now in force. The menu travels with the
-/// draft because the draft is expressed in its indices: they mean nothing
-/// against a menu rebuilt since.
+/// list, the index of the preset now in force, and what the write did. The
+/// menu travels with the draft because the draft is expressed in its indices:
+/// they mean nothing against a menu rebuilt since.
 pub type SavePresetFn = Box<
-    dyn Fn(&str, &PresetDraft, &ModelMenu) -> Result<(Vec<PresetOption>, usize), String>
+    dyn Fn(
+            &str,
+            &PresetDraft,
+            &ModelMenu,
+        ) -> Result<(Vec<PresetOption>, usize, PresetSaveOutcome), String>
         + Send
         + Sync,
 >;

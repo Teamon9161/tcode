@@ -356,7 +356,7 @@ pub fn save_preset(menus: &mut Pickers, model: &ModelCell, name: &str) -> Result
             .map(|(role, pin)| (role.key.clone(), pin.clone()))
             .collect(),
     };
-    let (options, current) = (menus.presets.save)(name, &draft, &menus.models)?;
+    let (options, current, _outcome) = (menus.presets.save)(name, &draft, &menus.models)?;
     menus.presets.options = options;
     // Saving switches to what was saved: the ad-hoc pins it was captured from
     // are now spelled out under a name, so the preset is what is in force.

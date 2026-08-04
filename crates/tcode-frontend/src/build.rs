@@ -4,12 +4,12 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Selection};
+use tcode_core::config::{AgentConfig, Config, ConfigError, ModelState, Preset, Selection};
 use tcode_core::{ActiveModel, AgentModels, AgentRole, ModelCell};
 
 use crate::menu::{
     AgentMenu, AgentModelChoice, AgentRole as MenuAgentRole, ApplyPresetFn, ModelMenu, ModelOption,
-    PinFn, PresetMenu, PresetOption, ProviderSetup, RoleSection, SavePresetFn,
+    PinFn, PresetMenu, PresetOption, PresetSaveOutcome, ProviderSetup, RoleSection, SavePresetFn,
 };
 
 /// The selected model and menus rebuilt from a config-file change.
@@ -316,6 +316,52 @@ fn preset_options(config: &Config) -> Vec<PresetOption> {
         .collect()
 }
 
+/// How one role's entry in a preset reads in a one-line summary. A role the
+/// preset stays silent about inherits at apply time, so `None` reads "inherit".
+fn role_assignment(preset: Option<&AgentConfig>) -> String {
+    let Some(agent) = preset else {
+        return "inherit".into();
+    };
+    match (&agent.model, agent.enabled) {
+        (None, Some(false)) => "off".into(),
+        (None, _) => "inherit".into(),
+        (Some(model), _) => match &agent.effort {
+            Some(effort) => format!("{model} ({effort})"),
+            None => model.clone(),
+        },
+    }
+}
+
+/// The main model line of a preset, in the same shape as `role_assignment`.
+fn main_assignment(preset: &Preset) -> String {
+    match &preset.model {
+        Some(model) => match &preset.effort {
+            Some(effort) => format!("{model} ({effort})"),
+            None => model.clone(),
+        },
+        None => "inherit".into(),
+    }
+}
+
+/// One line per role whose assignment changed between two line-ups, `main:`
+/// first. Empty when they describe the same line-up.
+fn preset_changes(old: &Preset, new: &Preset) -> Vec<String> {
+    let mut out = Vec::new();
+    let old_main = main_assignment(old);
+    let new_main = main_assignment(new);
+    if old_main != new_main {
+        out.push(format!("main: {old_main} → {new_main}"));
+    }
+    for (kind, agent) in &new.agents {
+        let before = role_assignment(old.agents.get(kind));
+        let after = role_assignment(Some(agent));
+        if before != after {
+            out.push(format!("{kind}: {before} → {after}"));
+        }
+    }
+    out
+}
+
 /// `/model`'s preset strip: switch to a line-up, or capture the live one as a
 /// new preset. Both are config writes plus a rebuild, so both live here.
 pub fn build_preset_menu(
@@ -370,7 +416,7 @@ pub fn build_preset_menu(
                 .get(option)
                 .ok_or_else(|| "selected model disappeared".to_string())
         };
-        let mut preset = tcode_core::config::Preset::default();
+        let mut preset = Preset::default();
         if let Some(option) = draft.main {
             let option = named(option)?;
             preset.profile = Some(option.profile.clone());
@@ -396,6 +442,16 @@ pub fn build_preset_menu(
             };
             preset.agents.insert(kind.clone(), entry);
         }
+        // The name may already name a line-up: `/model save` replaces that
+        // table, and the reply should say the update happened and what moved.
+        let before = Config::load_at(&config_file, &cwd).map_err(|error| error.to_string())?;
+        let old = before.presets.get(name);
+        let outcome = PresetSaveOutcome {
+            replaced: old.is_some(),
+            changes: old
+                .map(|old| preset_changes(old, &preset))
+                .unwrap_or_default(),
+        };
         Config::upsert_preset(&config_file, name, &preset).map_err(|error| error.to_string())?;
         // The line-up just saved becomes the one in force, so the ad-hoc pins
         // it was captured from can go: the preset now says the same thing.
@@ -406,7 +462,7 @@ pub fn build_preset_menu(
             .iter()
             .position(|option| option.key == name)
             .ok_or_else(|| "the saved preset is not readable back".to_string())?;
-        Ok((options, current))
+        Ok((options, current, outcome))
     });
 
     PresetMenu {
@@ -499,5 +555,42 @@ mod tests {
         assert!(pinned.get("explore").is_none());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("[agents.explore] ignored: unknown profile 'typo'"));
+    }
+
+    /// The overwrite reply lists only what actually moved: a role that stayed
+    /// silent becomes "inherit" and a repeated save of the same line-up is
+    /// empty — the write still happened, but there is nothing to narrate.
+    #[test]
+    fn preset_changes_report_only_the_roles_that_moved() {
+        let old = Preset {
+            model: Some("deepseek-v4-plus".into()),
+            effort: Some("medium".into()),
+            agents: std::collections::BTreeMap::from([(
+                "explore".to_string(),
+                AgentConfig::from_shorthand("deepseek-v4-plus"),
+            )]),
+            ..Preset::default()
+        };
+        let mut new = old.clone();
+        new.agents.insert(
+            "explore".to_string(),
+            AgentConfig::from_shorthand("deepseek-v4-flash"),
+        );
+        new.agents.insert(
+            "general".to_string(),
+            AgentConfig::from_shorthand("inherit"),
+        );
+        new.effort = Some("high".into());
+
+        assert_eq!(
+            preset_changes(&old, &new),
+            vec![
+                "main: deepseek-v4-plus (medium) → deepseek-v4-plus (high)".to_string(),
+                "explore: deepseek-v4-plus → deepseek-v4-flash".to_string(),
+            ]
+        );
+        // The freshly-written `general = "inherit"` spells out what the old
+        // silence already meant, so it is not a change.
+        assert!(preset_changes(&old, &old).is_empty());
     }
 }

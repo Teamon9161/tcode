@@ -190,3 +190,5 @@ loop {
 7. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
 8. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
 9. app terminal窗格, 类似ide, 主题跟随tcode app, 支持ctrl+j调出.
+10. skill命令不会出现在app的/slash command提示中，这个能做吗
+11. Tool friction — shell: 一个测试命令超时被 harness 杀掉后，Windows 的常规 target 中 agent_loop*.exe 持续被 linker 报为已锁定，即使随后未发现 cargo、rustc 或测试进程。为完成验证，我不得不使用会话私有的 CARGO_TARGET_DIR 重编译并在结束后删除。shell 超时时若能终止完整子进程树并等待句柄释放，可避免这一额外编译与目标目录切换。

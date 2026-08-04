@@ -156,10 +156,20 @@ impl App {
                 .collect(),
         };
         match (self.presets.save)(name, &draft, &self.menu) {
-            Ok((options, current)) => {
+            Ok((options, current, outcome)) => {
                 self.presets.options = options;
                 self.presets.current = Some(current);
-                self.reply(format!("saved preset {name} — /model switches to it"));
+                if outcome.replaced {
+                    let mut text = format!("updated preset {name}:");
+                    for change in &outcome.changes {
+                        text.push('\n');
+                        text.push_str(change);
+                    }
+                    text.push_str("\n— /model switches to it");
+                    self.reply(text);
+                } else {
+                    self.reply(format!("saved preset {name} — /model switches to it"));
+                }
             }
             Err(e) => self.reply_error(format!("cannot save preset '{name}': {e}")),
         }

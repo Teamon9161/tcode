@@ -1683,7 +1683,7 @@ mod tests {
     fn null_model() -> super::ModelCell {
         super::ModelCell::new(tcode_core::ActiveModel {
             provider: std::sync::Arc::new(NullProvider),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 100_000,
             effort: None,
         })
@@ -1716,7 +1716,7 @@ mod tests {
     fn named_model(id: &'static str, effort: Option<&str>) -> tcode_core::ActiveModel {
         tcode_core::ActiveModel {
             provider: std::sync::Arc::new(NamedProvider(id)),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 100_000,
             effort: effort.map(str::to_string),
         }

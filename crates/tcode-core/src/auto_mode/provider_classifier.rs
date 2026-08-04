@@ -97,9 +97,10 @@ impl ProviderSafetyClassifier {
             cache_scope: Some(request.cache_scope.clone()),
             messages,
             tools: vec![],
-            // Providers without an output cap (Codex 400s on `max_output_tokens`)
-            // get their brevity from the verdict prompt alone.
-            max_tokens,
+            // A verdict is a word; the cap is deliberate here, unlike a chat
+            // turn. Providers that cannot take one (Codex 400s on
+            // `max_output_tokens`) get their brevity from the prompt alone.
+            max_tokens: Some(max_tokens),
             effort,
         };
         let mut stream = model
@@ -407,7 +408,7 @@ mod tests {
         let provider = Arc::new(ScriptedProvider::new(scripts));
         let model = ActiveModel {
             provider: provider.clone(),
-            max_tokens: 1_024,
+            max_tokens: Some(1_024),
             context_window: 32_768,
             effort: None,
         };

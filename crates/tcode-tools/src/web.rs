@@ -619,7 +619,7 @@ async fn summarize_page(
             }],
         }],
         tools: Vec::new(),
-        max_tokens: model.max_tokens.min(2048),
+        max_tokens: model.output_ceiling(2048),
         effort: model.effort.clone(),
     };
     let mut stream = model
@@ -1429,7 +1429,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockFetchModel::default());
         let primary = ModelCell::new(ActiveModel {
             provider,
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             context_window: 128_000,
             effort: None,
         });
@@ -1450,7 +1450,7 @@ mod tests {
         let provider = std::sync::Arc::new(MockFetchModel::default());
         let model = ActiveModel {
             provider: provider.clone(),
-            max_tokens: 4096,
+            max_tokens: Some(4096),
             context_window: 128_000,
             effort: None,
         };

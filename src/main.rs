@@ -108,10 +108,18 @@ fn run_model_command(
                 .collect(),
         };
         match (presets.save)(name, &draft, menu) {
-            Ok((options, current)) => {
+            Ok((options, current, outcome)) => {
                 presets.options = options;
                 presets.current = Some(current);
-                println!("{DIM}saved preset {name}{RESET}");
+                if outcome.replaced {
+                    println!("{DIM}updated preset {name}:{RESET}");
+                    for change in outcome.changes {
+                        println!("{DIM}{change}{RESET}");
+                    }
+                    println!("{DIM}/model switches to it{RESET}");
+                } else {
+                    println!("{DIM}saved preset {name} — /model switches to it{RESET}");
+                }
             }
             Err(e) => println!("{DIM}cannot save preset '{name}': {e}{RESET}"),
         }

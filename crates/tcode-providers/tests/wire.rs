@@ -108,7 +108,7 @@ fn request() -> Request {
             content: vec![ContentBlock::Text { text: "hi".into() }],
         }],
         tools: vec![],
-        max_tokens: 128,
+        max_tokens: Some(128),
         effort: None,
     }
 }

@@ -31,12 +31,26 @@ impl BlobStore {
     /// tail, where compilers and test runners normally print diagnostics and
     /// their final summary.
     pub fn gate(&mut self, tool: &str, full: String, is_error: bool) -> String {
-        if approx_tokens(&full) <= self.budget_tokens {
+        self.gate_within(self.budget_tokens, tool, full, is_error)
+    }
+
+    /// The same gate against a budget the caller supplies, for when several
+    /// outputs share one ceiling and a call's allowance is whatever the calls
+    /// before it left. The store's own `budget_tokens` still decides the
+    /// single-call case; this only changes where the line is drawn.
+    pub fn gate_within(
+        &mut self,
+        budget_tokens: usize,
+        tool: &str,
+        full: String,
+        is_error: bool,
+    ) -> String {
+        if approx_tokens(&full) <= budget_tokens {
             return full;
         }
         let lines: Vec<&str> = full.lines().collect();
         let total_lines = lines.len();
-        let budget_chars = self.budget_tokens * 3;
+        let budget_chars = budget_tokens * 3;
         // Build/test failures usually put the useful diagnostics and final
         // summary at the end. Keep enough of the beginning to identify early
         // startup errors, but spend the rest of the preview budget on the tail.

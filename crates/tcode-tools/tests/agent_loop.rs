@@ -18,7 +18,7 @@ use tcode_core::{
 fn cell(provider: Arc<MockProvider>) -> ModelCell {
     ModelCell::new(ActiveModel {
         provider,
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 200_000,
         effort: None,
     })
@@ -236,6 +236,18 @@ fn api_error() -> Vec<StreamEvent> {
     Vec::new()
 }
 
+/// A reply the provider cut off at `max_tokens`. The model was mid-thought, so
+/// there is no answer text and no finished tool call — on the wire it is
+/// indistinguishable from a model that simply had nothing more to say.
+fn truncated_at_max_tokens() -> Vec<StreamEvent> {
+    vec![
+        StreamEvent::Started,
+        StreamEvent::ThinkingDelta("weighing the two approaches, and".into()),
+        StreamEvent::Usage(Usage::default()),
+        StreamEvent::Done(StopReason::MaxTokens),
+    ]
+}
+
 fn agent(provider: Arc<MockProvider>) -> Agent {
     Agent {
         model: cell(provider),
@@ -274,7 +286,7 @@ async fn the_next_prompt_guess_grows_a_prose_conversation_of_its_own() {
         "suggest",
         ActiveModel {
             provider: small.clone(),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         },
@@ -465,7 +477,7 @@ fn auto_agent(main: Arc<MockProvider>, classifier: Arc<MockProvider>) -> Agent {
         "auto",
         ActiveModel {
             provider: classifier,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         },
@@ -648,6 +660,112 @@ async fn loop_runs_tool_and_feeds_result_back() {
         .iter()
         .any(|e| matches!(e, AgentEvent::ToolStart { name, .. } if name == "read")));
     assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
+}
+
+#[tokio::test]
+async fn closed_event_receiver_does_not_abort_a_tool_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("one.txt"), "first\n").unwrap();
+    std::fs::write(dir.path().join("two.txt"), "second\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            ("call-1", "read", r#"{"path":"one.txt"}"#),
+            ("call-2", "read", r#"{"path":"two.txt"}"#),
+        ]),
+        text_done("read both files"),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+    let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+    {
+        let turn = agent.user_turn(
+            &mut session,
+            vec![ContentBlock::Text {
+                text: "read both files".into(),
+            }],
+            &tx,
+            &approver,
+            CancellationToken::new(),
+        );
+        tokio::pin!(turn);
+
+        // Wait until the assistant tool-use entry is durable, then detach the
+        // frontend receiver before the batch begins.
+        loop {
+            tokio::select! {
+                event = rx.recv() => match event {
+                    Some(AgentEvent::Usage(_)) => break,
+                    Some(_) => {}
+                    None => panic!("turn ended before reporting usage"),
+                },
+                result = turn.as_mut() => panic!("turn ended before reporting usage: {result:?}"),
+            }
+        }
+        drop(rx);
+
+        turn.as_mut()
+            .await
+            .expect("a detached frontend must not abort tool execution");
+    }
+
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|(_, is_error)| !is_error), "{results:?}");
+    assert!(results[0].0.contains("first"), "{}", results[0].0);
+    assert!(results[1].0.contains("second"), "{}", results[1].0);
+    assert!(session.ledger.entries().iter().any(
+        |entry| matches!(entry, Entry::Assistant(blocks) if blocks.iter().any(|block| matches!(block, ContentBlock::Text { text } if text == "read both files")))
+    ));
+    assert!(!session.ledger.entries().iter().any(|entry| matches!(
+        entry,
+        Entry::Note(text) if text.contains("Tool execution ended")
+    )));
+}
+
+#[tokio::test]
+async fn failed_tool_result_is_visible_and_durable() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("missing-read", "read", r#"{"path":"missing.txt"}"#),
+        text_done("reported the read failure"),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "read missing.txt").await;
+
+    let (preview, content) = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::ToolEnd {
+                call_id,
+                name,
+                preview,
+                content,
+                is_error: true,
+            } if call_id == "missing-read" && name == "read" => {
+                Some((preview.as_str(), content.as_str()))
+            }
+            _ => None,
+        })
+        .expect("a failed tool must emit a visible ToolEnd event");
+    assert!(!preview.is_empty());
+    assert!(content.contains("missing.txt"), "{content}");
+
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 1);
+    assert!(
+        results[0].1,
+        "failed tool result must be marked as an error"
+    );
+    assert_eq!(results[0].0, content);
+    assert_eq!(provider.requests.lock().unwrap().len(), 2);
+    assert!(events
+        .iter()
+        .any(|event| matches!(event, AgentEvent::TurnEnd)));
 }
 
 #[tokio::test]
@@ -1613,7 +1731,7 @@ async fn monitor_wake_uses_the_configured_auto_compact_threshold() {
         .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
     agent.model.swap(ActiveModel {
         provider: MockProvider::new(vec![]),
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 1_000,
         effort: None,
     });
@@ -1662,7 +1780,7 @@ async fn a_compaction_that_produces_nothing_is_not_retried_automatically() {
         .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
     agent.model.swap(ActiveModel {
         provider: MockProvider::new(vec![]),
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 1_000,
         effort: None,
     });
@@ -2203,7 +2321,7 @@ async fn retry_backoff_stops_immediately_when_cancelled() {
         models: AgentModels::default(),
         model: ModelCell::new(ActiveModel {
             provider,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),
@@ -2270,7 +2388,7 @@ async fn connect_failure_is_retried_and_reported() {
         models: AgentModels::default(),
         model: ModelCell::new(ActiveModel {
             provider,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),
@@ -2364,7 +2482,7 @@ async fn partial_stream_output_is_retained_but_not_replayed_to_provider() {
         models: AgentModels::default(),
         model: ModelCell::new(ActiveModel {
             provider: provider.clone(),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),
@@ -2806,7 +2924,7 @@ async fn auto_mode_fast_allow_runs_shell_with_one_classifier_request() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].effort.as_deref(), Some("off"));
     // A cap that only fits the verdict truncates models that think first.
-    assert_eq!(requests[0].max_tokens, 1_024);
+    assert_eq!(requests[0].max_tokens, Some(1_024));
     // The classifier runs on the agent's provider but not its prefix.
     assert!(requests[0]
         .cache_scope
@@ -3817,7 +3935,7 @@ async fn compact_retries_retryable_failure_before_replacing_history() {
         AgentRole::Compact.key(),
         ActiveModel {
             provider: compact,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         },
@@ -3857,6 +3975,144 @@ async fn compact_retries_retryable_failure_before_replacing_history() {
     ));
 }
 
+/// A reply cut off at `max_tokens` produces no text and no tool call, which on
+/// the wire looks exactly like a model that decided it was done. The turn must
+/// not end there: the model is told what happened and goes again, which is all
+/// it needs to finish in fewer words.
+#[tokio::test]
+async fn a_reply_cut_off_at_max_tokens_is_explained_and_retried() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        truncated_at_max_tokens(),
+        text_done("short version: use the second approach"),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "compare the approaches").await;
+
+    let shown = events
+        .iter()
+        .find_map(|event| match event {
+            AgentEvent::Note(text) if text.contains("max_tokens") => Some(text.clone()),
+            _ => None,
+        })
+        .expect("the user learns the reply was cut off");
+    assert!(shown.contains("cut off"), "{shown}");
+    assert!(
+        session
+            .ledger
+            .entries()
+            .iter()
+            .any(|entry| matches!(entry, Entry::Note(text) if text == &shown)),
+        "the model reads the same explanation on its next step"
+    );
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        2,
+        "the turn continued instead of ending"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::TextDelta(text) if text.contains("short version")
+    )));
+}
+
+/// A cap too low for what is being asked cannot be retried out of, and every
+/// attempt bills a whole prefix. Two in a row hands the turn back.
+#[tokio::test]
+async fn repeated_truncation_stops_instead_of_retrying_forever() {
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        truncated_at_max_tokens(),
+        truncated_at_max_tokens(),
+        text_done("never reached"),
+    ]);
+    let agent = agent(provider.clone());
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "write the whole thing").await;
+
+    assert_eq!(
+        provider.requests.lock().unwrap().len(),
+        2,
+        "one retry, then it gives up"
+    );
+    let last = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentEvent::Note(text) if text.contains("max_tokens") => Some(text.clone()),
+            _ => None,
+        })
+        .next_back()
+        .expect("the user is told why it stopped");
+    assert!(last.contains("twice in a row"), "{last}");
+    assert!(events.iter().any(|e| matches!(e, AgentEvent::TurnEnd)));
+}
+
+/// `read`/`grep`/`glob` skip the per-call output gate by design, so before the
+/// batch budget nothing stopped one parallel batch of them from spending a
+/// quarter of the context window at once.
+#[tokio::test]
+async fn one_parallel_read_batch_cannot_spend_the_whole_context_window() {
+    let dir = tempfile::tempdir().unwrap();
+    // ~66 KB each: two fit the 40k-token batch budget, the third does not.
+    let body: String = (0..2_000)
+        .map(|i| format!("line {i} of filler text\n"))
+        .collect();
+    for name in ["a.txt", "b.txt", "c.txt"] {
+        std::fs::write(dir.path().join(name), &body).unwrap();
+    }
+    let provider = MockProvider::new(vec![
+        tool_uses(&[
+            ("r1", "read", r#"{"path":"a.txt"}"#),
+            ("r2", "read", r#"{"path":"b.txt"}"#),
+            ("r3", "read", r#"{"path":"c.txt"}"#),
+        ]),
+        text_done("read them"),
+    ]);
+    let agent = agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "read all three").await;
+
+    let results: Vec<(String, String)> = session
+        .ledger
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::ToolResults(blocks) => Some(blocks),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                ..
+            } => Some((tool_use_id.clone(), content.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 3);
+    let spilled = "batch output budget spent";
+    assert!(!results[0].1.contains(spilled), "first call arrives intact");
+    assert!(!results[1].1.contains(spilled), "second still fits");
+    assert!(
+        results[2].1.contains(spilled),
+        "the third overruns and is told why: {}",
+        results[2].1
+    );
+    let total: usize = results
+        .iter()
+        .map(|(_, content)| tcode_core::blobs::approx_tokens(content))
+        .sum();
+    assert!(total < 45_000, "batch stayed near its budget, got {total}");
+}
+
 #[tokio::test]
 async fn auto_compacts_after_a_tool_batch_before_the_next_model_request() {
     let dir = tempfile::tempdir().unwrap();
@@ -3876,7 +4132,7 @@ async fn auto_compacts_after_a_tool_batch_before_the_next_model_request() {
         .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
     agent.model.swap(ActiveModel {
         provider: provider.clone(),
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 100_000,
         effort: None,
     });

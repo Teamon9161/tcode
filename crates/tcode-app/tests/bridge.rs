@@ -172,7 +172,7 @@ fn agent(provider: Arc<MockProvider>, cwd: &std::path::Path) -> Arc<Agent> {
     Arc::new(Agent {
         model: ModelCell::new(ActiveModel {
             provider,
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),
@@ -243,7 +243,7 @@ fn factory_at(config: PathBuf) -> tcode_app::boot::SessionFactory {
         config,
         ModelCell::new(ActiveModel {
             provider: MockProvider::new(Vec::new()),
-            max_tokens: 1024,
+            max_tokens: Some(1024),
             context_window: 200_000,
             effort: None,
         }),
@@ -1437,7 +1437,7 @@ async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
 fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
     let cell = ModelCell::new(ActiveModel {
         provider: MockProvider::new(Vec::new()),
-        max_tokens: 1024,
+        max_tokens: Some(1024),
         context_window: 200_000,
         effort: None,
     });
@@ -1449,7 +1449,7 @@ fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
     let switch = Box::new(|_: &tcode_frontend::ModelOption, effort: Option<&str>| {
         Ok(ActiveModel {
             provider: MockProvider::new(Vec::new()),
-            max_tokens: 2048,
+            max_tokens: Some(2048),
             context_window: 400_000,
             effort: effort.map(String::from),
         })

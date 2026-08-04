@@ -168,6 +168,15 @@ Use `models` when model metadata matters: `context_window`, `max_tokens`,
 `vision`, and valid `efforts`. Do not invent a context window or effort level;
 leave unknown metadata unset.
 
+**`max_tokens` caps one response's output and is unset by default**, which means
+"no cap from tcode — use whatever the endpoint allows". Leave it unset unless
+the endpoint needs a lower number than its own limit: a cap the model can reach
+truncates a reply mid-sentence, and on models that think by default the
+reasoning is spent against the same budget before a word of the answer is
+written. (The Anthropic API requires the field, so an unset value becomes 32000
+on that wire; other providers simply omit it.) When a reply is cut off, tcode
+tells the model and lets it retry once in fewer words, then stops and says so.
+
 ### The known-model catalog (`[models.<id>]`)
 
 A model's intrinsic properties belong to the model id, not to the endpoint that
@@ -204,7 +213,7 @@ context_window = 400000             # only this differs; label/efforts inherited
 - A profile's `models` list may mix bare strings and full tables. An explicit
   field on a profile's model entry always wins over the catalog; the catalog
   wins over the profile-level `context_window` / `max_tokens` / `vision`
-  fallbacks; those win over built-in defaults (200k context, 8192 max_tokens).
+  fallbacks; those win over the built-in default (200k context).
 - A model id absent from the catalog passes through verbatim with no inherited
   metadata — the endpoint may serve models tcode has not catalogued.
 - The catalog merges across layers by id (built-in → user → project); a later

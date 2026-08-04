@@ -80,11 +80,11 @@ pub fn build_active(
     let provider = build(&selection.profile, profile, &selection.model, watchdog)?;
     Ok(ActiveModel {
         provider,
-        max_tokens: selection
-            .model
-            .max_tokens
-            .or(profile.max_tokens)
-            .unwrap_or(8192),
+        // No fallback: unset means uncapped, not 8192. A global default here
+        // silently truncates every model whose real limit is higher, and the
+        // symptom (a reply that stops mid-thought) looks nothing like its
+        // cause. A model that genuinely needs a cap says so in its own entry.
+        max_tokens: selection.model.max_tokens.or(profile.max_tokens),
         context_window: selection
             .model
             .context_window

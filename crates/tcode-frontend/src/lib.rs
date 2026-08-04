@@ -21,8 +21,8 @@ pub use build::{
 };
 pub use menu::{
     AgentMenu, AgentModelChoice, AgentRole, ApplyPresetFn, MenuUpdate, ModelMenu, ModelOption,
-    PinFn, PresetDraft, PresetMenu, PresetOption, PresetUpdate, ProviderSetup, RoleSection,
-    SavePresetFn, SwitchFn,
+    PinFn, PresetDraft, PresetMenu, PresetOption, PresetSaveOutcome, PresetUpdate, ProviderSetup,
+    RoleSection, SavePresetFn, SwitchFn,
 };
 pub use session::{open_session, ResumeSpec, SessionSpec};
 // `Key`/`View`/`Progress` etc. stay behind `setup::` — they only read right

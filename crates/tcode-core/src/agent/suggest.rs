@@ -142,7 +142,7 @@ impl Agent {
             cache_scope: Some(SUGGEST_SCOPE.to_string()),
             messages: req.messages,
             tools: Vec::new(),
-            max_tokens: SUGGEST_MAX_TOKENS,
+            max_tokens: Some(SUGGEST_MAX_TOKENS),
             effort: Some("off".into()),
         };
         let expected_script = req.expected_script;

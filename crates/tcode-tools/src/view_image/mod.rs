@@ -148,7 +148,7 @@ impl Tool for ViewImageTool {
                 content,
             }],
             tools: Vec::new(),
-            max_tokens: model.max_tokens.min(2048),
+            max_tokens: model.output_ceiling(2048),
             effort: model.effort.clone(),
         };
         let mut stream = match model.provider.stream(request, cancel.clone()).await {

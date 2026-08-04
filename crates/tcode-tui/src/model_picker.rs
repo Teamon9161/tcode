@@ -306,6 +306,11 @@ enum Entry {
     Header(&'static str),
     Main,
     Preset(usize),
+    /// Overwrite the preset currently in force with the live line-up — the
+    /// row that makes "I tweaked the line-up, bake it back into this preset"
+    /// one keypress instead of retyping the name. Carries the current
+    /// preset's index for the label and the key the pick reports.
+    UpdatePreset(usize),
     SavePreset,
     Agent(usize),
 }
@@ -322,6 +327,12 @@ impl Entry {
 fn entries(agents: &AgentMenu, presets: &PresetMenu) -> Vec<Entry> {
     let mut out = vec![Entry::Main, Entry::Header("presets")];
     out.extend((0..presets.options.len()).map(Entry::Preset));
+    if let Some(current) = presets
+        .current
+        .filter(|index| *index < presets.options.len())
+    {
+        out.push(Entry::UpdatePreset(current));
+    }
     out.push(Entry::SavePreset);
     for (header, section) in [
         ("sub-agents", RoleSection::Task),
@@ -456,6 +467,12 @@ impl Hub {
                 HubPick::Pending
             }
             Entry::Preset(option) => HubPick::Preset(presets.options[*option].key.clone()),
+            Entry::UpdatePreset(option) => {
+                // Same save path as naming the preset: the name already exists,
+                // so the save closure reports it as an update and the reply
+                // says what moved.
+                HubPick::SavePreset(presets.options[*option].key.clone())
+            }
             Entry::SavePreset => {
                 self.naming = Some(String::new());
                 HubPick::Pending
@@ -639,6 +656,13 @@ impl Hub {
                         style,
                     )
                 }
+                Entry::UpdatePreset(option) => Line::styled(
+                    format!(
+                        "    {marker}update preset {} from this line-up",
+                        presets.options[*option].label
+                    ),
+                    style,
+                ),
                 Entry::SavePreset => Line::styled(
                     match &self.naming {
                         Some(name) => format!("    {marker}name it: {name}▏"),
@@ -933,6 +957,31 @@ mod tests {
         assert!(matches!(
             hub.handle_key(KeyEvent::from(KeyCode::Enter), &c),
             HubPick::SavePreset(name) if name == "gpt"
+        ));
+    }
+
+    /// The active preset gets an update row next to the save row: baking the
+    /// tweaked line-up back into "the preset I'm on" is one keypress, and it
+    /// flows through the same save path, so the reply names the changed roles.
+    #[test]
+    fn updating_the_active_preset_is_one_row_and_reports_its_name() {
+        let m = menu();
+        let a = agents(vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit]);
+        let p = presets(&["deepseek", "gpt"], Some(0));
+        let mut hub = Hub::new(&a, &p, false);
+        let c = ctx(&m, &a, &p);
+
+        assert!(hub.render(&c).iter().any(|line| line
+            .to_string()
+            .contains("update preset deepseek from this line-up")));
+
+        // main → presets header → deepseek → gpt → update deepseek
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        hub.handle_key(KeyEvent::from(KeyCode::Down), &c);
+        assert!(matches!(
+            hub.handle_key(KeyEvent::from(KeyCode::Enter), &c),
+            HubPick::SavePreset(name) if name == "deepseek"
         ));
     }
 

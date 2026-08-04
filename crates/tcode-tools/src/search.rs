@@ -147,6 +147,38 @@ struct Group {
     lines: Vec<Line>,
 }
 
+/// Cut a group down to `take` matches starting at its `skip`-th, so a group
+/// that straddles a page edge contributes only the matches inside the window.
+///
+/// The kept matches keep their context: the cut runs from `before` lines ahead
+/// of the first one to `after` lines past the last, which is exactly the block
+/// those matches would have produced had they been the only ones in the file.
+/// Nothing dangles at either end.
+fn clip_to_window(g: &mut Group, skip: usize, take: usize, before: usize, after: usize) {
+    if skip == 0 && take >= g.matches {
+        return;
+    }
+    let match_at: Vec<usize> = g
+        .lines
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_match)
+        .map(|(i, _)| i)
+        .collect();
+    let Some(&first) = match_at.get(skip) else {
+        g.lines.clear();
+        g.matches = 0;
+        return;
+    };
+    let last = match_at[(skip + take - 1).min(match_at.len() - 1)];
+    let lo = first.saturating_sub(before);
+    let hi = (last + after).min(g.lines.len() - 1);
+    g.lines.drain(hi + 1..);
+    g.lines.drain(..lo);
+    g.first = g.lines[0].lnum;
+    g.matches = take.min(match_at.len() - skip);
+}
+
 /// Collects all matches and their context from one file. The parallel walk
 /// appends completed groups to shared storage; global sorting and pagination
 /// happen only after the walk has finished or reached its deadline.
@@ -469,19 +501,37 @@ impl Tool for GrepTool {
             let skipped_oversized = skipped_oversized.load(Ordering::Relaxed);
             let timed_out = timed_out.load(Ordering::Relaxed);
 
-            // Page by *matches*: keep whole groups that overlap the window so
-            // context blocks stay intact.
+            // Page by *matches*, cutting the groups that straddle a window edge
+            // instead of keeping them whole. Keeping them whole is what the
+            // per-file cap above already learned not to do: with no context
+            // lines a file's every match merges into one group, so a group is
+            // usually the whole file and "keep whole groups" degenerates into
+            // "ignore head_limit". `grep pattern head_limit=5` over a file with
+            // 40 hits returned all of them, and then advertised `offset=30` as
+            // the next page — a limit the model cannot use and a cursor that
+            // does not match what it was given.
+            let window_end = offset.saturating_add(limit);
             let mut seen = 0usize;
             let mut selected: Vec<Group> = Vec::new();
-            for g in groups {
+            for mut g in groups {
                 let start = seen;
                 seen += g.matches;
-                if start >= offset + limit {
+                if start >= window_end {
                     break;
                 }
-                if seen > offset {
-                    selected.push(g);
+                if seen <= offset {
+                    continue;
                 }
+                if start < offset || seen > window_end {
+                    clip_to_window(
+                        &mut g,
+                        offset.saturating_sub(start),
+                        seen.min(window_end) - offset.max(start),
+                        before,
+                        after,
+                    );
+                }
+                selected.push(g);
             }
             let shown: usize = selected.iter().map(|g| g.matches).sum();
 
@@ -511,25 +561,36 @@ impl Tool for GrepTool {
                 }
                 return m;
             }
-            let joiner = if before > 0 || after > 0 {
-                "\n--\n"
-            } else {
-                "\n"
-            };
-            let mut out = selected
-                .iter()
-                .map(|g| {
-                    g.lines
-                        .iter()
-                        .map(|l| {
-                            let sep = if l.is_match { ':' } else { '-' };
-                            format!("{}:{}{sep} {}", g.file, l.lnum, l.text)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                })
-                .collect::<Vec<_>>()
-                .join(joiner);
+            // A path is needed to locate a hit, but repeating it on every
+            // line is costly for files with many matches or context lines.
+            // Groups are sorted by file and line, so emit one heading per file
+            // and retain the `--` separator only between disjoint context
+            // blocks in that same file.
+            let with_context = before > 0 || after > 0;
+            let mut out = String::new();
+            let mut previous_file: Option<&str> = None;
+            for g in &selected {
+                let same_file = previous_file == Some(g.file.as_str());
+                if !out.is_empty() {
+                    if same_file && with_context {
+                        out.push_str("\n--\n");
+                    } else {
+                        out.push('\n');
+                    }
+                }
+                if !same_file {
+                    out.push_str(&g.file);
+                    out.push_str(":\n");
+                }
+                for (index, line) in g.lines.iter().enumerate() {
+                    if index > 0 {
+                        out.push('\n');
+                    }
+                    let sep = if line.is_match { ':' } else { '-' };
+                    out.push_str(&format!("{}{sep} {}", line.lnum, line.text));
+                }
+                previous_file = Some(&g.file);
+            }
             if timed_out {
                 out.push_str(&format!(
                     "\n[search timed out after {}s — partial results; narrow the path or glob]",
@@ -819,7 +880,7 @@ mod tests {
     async fn no_context_returns_bare_match() {
         let dir = scratch("bare", BODY);
         let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
-        assert_eq!(out, "a.rs:3: TARGET");
+        assert_eq!(out, "a.rs:\n3: TARGET");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -827,7 +888,7 @@ mod tests {
     async fn context_wraps_match_with_dash_lines() {
         let dir = scratch("ctx", BODY);
         let out = grep(&dir, json!({ "pattern": "TARGET", "context": 1 })).await;
-        assert_eq!(out, "a.rs:2- line2\na.rs:3: TARGET\na.rs:4- line4");
+        assert_eq!(out, "a.rs:\n2- line2\n3: TARGET\n4- line4");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -839,13 +900,13 @@ mod tests {
             json!({ "pattern": "TARGET", "before": 1, "after": 0 }),
         )
         .await;
-        assert_eq!(before, "a.rs:2- line2\na.rs:3: TARGET");
+        assert_eq!(before, "a.rs:\n2- line2\n3: TARGET");
         let after = grep(
             &dir,
             json!({ "pattern": "TARGET", "after": 2, "before": 0 }),
         )
         .await;
-        assert_eq!(after, "a.rs:3: TARGET\na.rs:4- line4\na.rs:5- line5");
+        assert_eq!(after, "a.rs:\n3: TARGET\n4- line4\n5- line5");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -861,7 +922,7 @@ mod tests {
             json!({ "pattern": "TARGET", "path": "src", "glob": "app.rs" }),
         )
         .await;
-        assert!(out.ends_with("app.rs:1: TARGET"), "{out}");
+        assert!(out.ends_with("app.rs:\n1: TARGET"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -872,7 +933,7 @@ mod tests {
         std::fs::write(dir.join("large.rs"), content).unwrap();
 
         let out = grep(&dir, json!({ "pattern": "TARGET", "glob": "large.rs" })).await;
-        assert!(out.ends_with("large.rs:2: TARGET"), "{out}");
+        assert!(out.ends_with("large.rs:\n2: TARGET"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -902,7 +963,7 @@ mod tests {
         }
 
         let grep_out = grep(&dir, json!({ "pattern": "TARGET" })).await;
-        assert!(grep_out.contains("a.rs:1: TARGET"), "{grep_out}");
+        assert!(grep_out.contains("a.rs:\n1: TARGET"), "{grep_out}");
         for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
             assert!(!grep_out.contains(cache), "{grep_out}");
         }
@@ -933,9 +994,100 @@ mod tests {
         )
         .await;
 
-        assert!(first.starts_with("a.rs:1: TARGET a1"), "{first}");
-        assert!(second.starts_with("b.rs:1: TARGET b1"), "{second}");
-        assert!(third.starts_with("z.rs:1: TARGET z1"), "{third}");
+        assert!(first.starts_with("a.rs:\n1: TARGET a1"), "{first}");
+        assert!(second.starts_with("b.rs:\n1: TARGET b1"), "{second}");
+        assert!(third.starts_with("z.rs:\n1: TARGET z1"), "{third}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Matches inside one file merge into a single group when no context is
+    /// asked for, so paging that keeps whole groups ignores head_limit
+    /// entirely — the case that used to return all 8 hits for head_limit=3.
+    #[tokio::test]
+    async fn head_limit_counts_matches_inside_one_file() {
+        let body: String = (1..=8).map(|i| format!("TARGET {i}\n")).collect();
+        let dir = scratch("within-file", &body);
+
+        let page = grep(&dir, json!({ "pattern": "TARGET", "head_limit": 3 })).await;
+        assert_eq!(
+            page,
+            "a.rs:\n1: TARGET 1\n2: TARGET 2\n3: TARGET 3\
+             \n[more matches beyond this page — raise head_limit or set offset=3]"
+        );
+
+        let next = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "head_limit": 3, "offset": 3 }),
+        )
+        .await;
+        assert_eq!(
+            next,
+            "a.rs:\n4: TARGET 4\n5: TARGET 5\n6: TARGET 6\
+             \n[more matches beyond this page — raise head_limit or set offset=6]"
+        );
+
+        let last = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "head_limit": 3, "offset": 6 }),
+        )
+        .await;
+        assert_eq!(last, "a.rs:\n7: TARGET 7\n8: TARGET 8");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A clipped page keeps each surviving match's context and drops the rest,
+    /// so no context line dangles without the match it belongs to.
+    #[tokio::test]
+    async fn a_clipped_page_keeps_the_context_of_the_matches_it_kept() {
+        let dir = scratch(
+            "clip-ctx",
+            "x1\nTARGET a\nx3\nx4\nTARGET b\nx6\nx7\nTARGET c\nx9\n",
+        );
+
+        let first = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "context": 1, "head_limit": 1 }),
+        )
+        .await;
+        assert_eq!(
+            first,
+            "a.rs:\n1- x1\n2: TARGET a\n3- x3\
+             \n[more matches beyond this page — raise head_limit or set offset=1]"
+        );
+
+        let middle = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "context": 1, "head_limit": 1, "offset": 1 }),
+        )
+        .await;
+        assert_eq!(
+            middle,
+            "a.rs:\n4- x4\n5: TARGET b\n6- x6\
+             \n[more matches beyond this page — raise head_limit or set offset=2]"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The window can open inside one file and close inside the next: both
+    /// edges get cut, and the count in between is exactly head_limit.
+    #[tokio::test]
+    async fn a_page_can_straddle_two_files() {
+        let body: String = (1..=4).map(|i| format!("TARGET a{i}\n")).collect();
+        let dir = scratch("straddle", &body);
+        let other: String = (1..=4).map(|i| format!("TARGET b{i}\n")).collect();
+        std::fs::write(dir.join("b.rs"), &other).unwrap();
+
+        let out = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "head_limit": 4, "offset": 2 }),
+        )
+        .await;
+        assert_eq!(
+            out,
+            "a.rs:\n3: TARGET a3\n4: TARGET a4\n\
+             b.rs:\n1: TARGET b1\n2: TARGET b2\
+             \n[more matches beyond this page — raise head_limit or set offset=6]"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1021,12 +1173,15 @@ mod tests {
 
         let lower = grep(&dir, json!({ "pattern": "target" })).await;
         assert_eq!(
-            lower, "a.rs:1: Target\na.rs:2: TARGET\na.rs:3: target",
+            lower, "a.rs:\n1: Target\n2: TARGET\n3: target",
             "an all-lowercase pattern should match every casing"
         );
 
         let mixed = grep(&dir, json!({ "pattern": "Target" })).await;
-        assert_eq!(mixed, "a.rs:1: Target", "uppercase in the pattern is exact");
+        assert_eq!(
+            mixed, "a.rs:\n1: Target",
+            "uppercase in the pattern is exact"
+        );
 
         // The explicit knob still wins over smart case.
         let forced = grep(
@@ -1034,7 +1189,7 @@ mod tests {
             json!({ "pattern": "Target", "case_insensitive": true }),
         )
         .await;
-        assert_eq!(forced, "a.rs:1: Target\na.rs:2: TARGET\na.rs:3: target");
+        assert_eq!(forced, "a.rs:\n1: Target\n2: TARGET\n3: target");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1050,11 +1205,18 @@ mod tests {
 
         let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
         assert_eq!(
-            out.lines().filter(|l| l.starts_with("a.rs:")).count(),
+            out.lines()
+                .skip(1)
+                .take_while(|line| *line != "z.rs:")
+                .filter(|line| line
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_digit()))
+                .count(),
             MAX_MATCHES_PER_FILE
         );
         assert!(
-            out.contains("z.rs:1: TARGET tail"),
+            out.contains("z.rs:\n1: TARGET tail"),
             "the other file must survive the crowded one: {out}"
         );
         assert!(
@@ -1075,7 +1237,13 @@ mod tests {
 
         let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
         assert_eq!(
-            out.lines().filter(|l| l.starts_with("a.rs:")).count(),
+            out.lines()
+                .skip(1)
+                .filter(|line| line
+                    .as_bytes()
+                    .first()
+                    .is_some_and(|byte| byte.is_ascii_digit()))
+                .count(),
             MAX_MATCHES_PER_FILE + 5,
             "nothing can be crowded out when there is only one file: {out}"
         );
@@ -1099,7 +1267,7 @@ mod tests {
         let dir = scratch("break", "hit\nx\nx\nx\nx\nx\nhit\n");
         let out = grep(&dir, json!({ "pattern": "hit", "context": 1 })).await;
         // Two matches far apart: distinct blocks joined by `--`.
-        assert_eq!(out, "a.rs:1: hit\na.rs:2- x\n--\na.rs:6- x\na.rs:7: hit");
+        assert_eq!(out, "a.rs:\n1: hit\n2- x\n--\n6- x\n7: hit");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
