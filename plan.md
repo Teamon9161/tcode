@@ -189,6 +189,6 @@ loop {
 6. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
 7. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
 8. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
-9. show html的时候记录中能不能自动放缩下,比如有的html里面只有一张交互式图片,但是现在在主对话中都看不全,这块能不能看下怎么调整更好
+9. ~~show html的时候记录中能不能自动放缩下,比如有的html里面只有一张交互式图片,但是现在在主对话中都看不全,这块能不能看下怎么调整更好~~ **已做**：inline 的 framed 报告改成"选视口再缩放"——按 1000px 逻辑宽布局、缩到阅读列宽，band 高度随之按 16:10 得出（760 列 ≈ 445px，原来是写死 320px）。跨源测不到高，所以竖向仍在 frame 内滚；原尺寸走已有的 PopOut。见 `crates/tcode-app/AGENTS.md` 规则 11b。
 10. app terminal窗格, 类似ide, 主题跟随tcode app, 支持ctrl+j调出.
-11. app ai给的markdown返回中可能有链接,可能是网页, 图片, csv等,这个能不能点击打开,目前点击没反应,因为我们已经有对应的窗格可以渲染了.
+11. ~~app ai给的markdown返回中可能有链接,可能是网页, 图片, csv等,这个能不能点击打开,目前点击没反应,因为我们已经有对应的窗格可以渲染了.~~ **已做**：点击没反应的原因是 `<a target="_blank">` 在这个 webview 里没人接管新窗口。现在正文链接经 `links.ts` 路由——http(s) 进窗口那个浏览器窗格，路径进 `show` 用的同一个 viewer（csv/图片/报告各按 `show.ts` 那张表画），认不出的一律不动。见 `crates/tcode-app/AGENTS.md` 规则 10。

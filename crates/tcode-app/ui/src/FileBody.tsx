@@ -3,7 +3,7 @@ import { useMemo, useState } from "react";
 import { Code } from "./components/Code";
 import { languageOf } from "./diff";
 import { Framed } from "./Framed";
-import { rich } from "./rich";
+import { Prose } from "./Prose";
 import { Sandbox } from "./Sandbox";
 import { parseRows, shownAs } from "./show";
 
@@ -52,7 +52,7 @@ export function FileBody({
       // asset protocol and no `same-origin` anywhere near it.
       return <img className="shown-image" src={body} alt={label} />;
     case "doc":
-      return <div className="doc">{rich(body)}</div>;
+      return <Prose className="doc" text={body} />;
     case "table":
       return <Table body={body} separator={view.separator} />;
     case "text":

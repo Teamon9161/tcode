@@ -22,6 +22,7 @@ import {
   setRatio,
   show,
   showBeside,
+  webPane,
   type Tiling,
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
@@ -141,6 +142,10 @@ export function Workspace({
   // A temporary viewing mode, not a layout operation: keeping it here preserves
   // the full tiling tree and every pane's local state for the return trip.
   const [expanded, setExpanded] = useState<string | null>(null);
+  // The page the browser has been asked for, if any. Window-level like the
+  // browser itself: a link is followed *into* the one browser this window has,
+  // whichever conversation it was written in.
+  const [webRequest, setWebRequest] = useState<{ url: string; at: number } | null>(null);
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
@@ -374,6 +379,24 @@ export function Workspace({
     () => onTiling((current) => openWeb(current, fieldAspect())),
     [onTiling],
   );
+  // Following a link, as opposed to reaching for the browser. It must not go
+  // through `openWeb`: that one is a toggle, so asking it for a page while the
+  // browser is already open would put the browser away instead.
+  const openUrl = useCallback(
+    (url: string) => {
+      onTiling((current) => {
+        const already = webPane(current);
+        return already
+          ? focusPane(current, already.id)
+          : openWeb(current, fieldAspect());
+      });
+      // A serial rather than the address alone: clicking the same link twice is
+      // two requests, and the second one has to reach a pane that has already
+      // seen the first.
+      setWebRequest((last) => ({ url, at: (last?.at ?? 0) + 1 }));
+    },
+    [onTiling],
+  );
   // The one control that *asks* for a direction, as opposed to `dirFor`
   // guessing one when a pane opens. It acts on the seam rather than on either
   // pane, which is why the handle rides on the divider and this takes a divider
@@ -410,6 +433,8 @@ export function Workspace({
       onToggleFiles: toggleFiles,
       onToggleWorkspace: toggleWorkspace,
       onOpenBrowser: openBrowser,
+      onOpenUrl: openUrl,
+      webRequest,
       expanded,
       onToggleExpanded: toggleExpanded,
       onDraft,
@@ -448,6 +473,8 @@ export function Workspace({
       toggleFiles,
       toggleWorkspace,
       openBrowser,
+      openUrl,
+      webRequest,
       expanded,
       toggleExpanded,
       onDraft,

@@ -9,7 +9,7 @@ import { relativeTo, type TouchedFile } from "./files";
 import { FilesView } from "./FilePanel";
 import { WorkspaceFiles } from "./WorkspaceFiles";
 import { WorkspaceFile } from "./WorkspaceFile";
-import { rich } from "./rich";
+import { Prose } from "./Prose";
 import { Sandbox } from "./Sandbox";
 import { ShownView } from "./Shown";
 import { agentKind, BlockList } from "./Transcript";
@@ -104,7 +104,7 @@ export const InspectView = memo(function InspectView({
     case "shown":
       return <ShownView value={value} cwd={cwd} />;
     case "doc":
-      return <div className="doc">{rich(value.text)}</div>;
+      return <Prose className="doc" text={value.text} />;
     case "plan":
       // Room to work: the same editor the review dock mounts, on the same draft,
       // with the whole height of a pane instead of half of one. Editing a plan
@@ -305,7 +305,7 @@ function RunView({
       {report && (
         <section className="inspect-part">
           <h4 className="inspect-part-head">Reported back</h4>
-          <div className="run-report">{rich(report)}</div>
+          <Prose className="run-report" text={report} />
         </section>
       )}
     </div>

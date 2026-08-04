@@ -122,6 +122,8 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
 
+    **正文里的链接由 `links.ts` 路由，`rich()` 永远不收回调**（`Prose.tsx`）。点击是委托在容器上认 `a.prose-link` 的，因为 `rich()` 是按源文本全局缓存的纯函数（规则 21）——给它传 onOpen 等于让两个窗格抢同一条缓存。取 `href` 只能用 `getAttribute`，`.href` 属性会按 app 自己的 URL 解析，把 `out/plot.csv` 变成 `tauri://localhost/…`。落点也不是新地方：http(s) 进那个 capability 恒空的浏览器窗格，路径进 `show` 用的同一个 viewer（后端照样重验 `is_viewable_path`）。**认不出的一律 `none` 且照样 `preventDefault`**——`mailto:`/`tel:` 是把模型输出交给另一个应用，那是比"让正文可点"大得多的决定；而 `target="_blank"` 保留着，它是万一没被handler 接住时 app 自己不会被导航走的兜底。
+
     只有两处豁免，各自在文件里写明理由：`math.tsx`（KaTeX 的产物本身就是 markup 字符串，边界改画在 KaTeX 的 options 上，`trust: false` 是承重的那一条，且 options 被 freeze 且不接受参数）和 `src/sandbox/`（见规则 11）。`src/boundary.test.ts` 机械地扫描 `src/`，除这两处外出现 `dangerouslySetInnerHTML` / `innerHTML =` / `eval` / `new Function` 即失败；`src/rich.test.tsx` 用敌意 markdown 断言输出是文本。**新增第三处豁免之前，先确认它不能改成构造节点。**
 
 11. **artifact 沙箱的三条不变量**（`src/sandbox/`，图表/图示/**模型在回复里手写的** HTML 都在里面渲染；磁盘上的 `.html` 文件走 11b，别混）：
@@ -142,6 +144,8 @@ cargo build && cargo test                 # 后端 + 集成测试
     **两边的 `sandbox` 属性长得相反，而抄错一次没有任何编译或测试之外的迹象。** 把 `Framed` 那串属性贴到一个从 `'self'` 加载的 frame 上，边界当场消失，diff 看起来还完全正常——这就是 `boundary.test.ts` 里那两条按属性值（不是按注释文本）比对的检查存在的理由。
 
     **为什么 `.html` 文件搬出了规则 11**：它在那里从来就没工作过，而不是工作得不够好。`innerHTML` 按规范**不执行** `<script>`，加上 `sandbox.html` 继承 app 的 `default-src 'self'`，于是 plotly/bokeh/altair 的自包含产物和 CDN 产物**两种都是死的**——一个 python 报告在那条路上永远只是一个空 div。这三件事全是"字节从哪加载"的属性，不是"解析得够不够小心"的属性，所以修法只能是给它一个源（`src/serve.rs`）。
+
+    **inline 的 framed 是"选视口"不是"给高度"**（`Framed.tsx::fit` + `.framed-fit`）。它曾是阅读列宽 × 写死 20rem，于是一张按 1000×600 画的交互图两个方向一起裁，读的人只能在 iframe 自己的滚动条里摸——而报告的形状恰恰就是它要说的话。跨源既测不到高、又不许在这边解析它的字节（本条上面那半），所以剩下的唯一手段是**替它选一个视口**：frame 按 `FIT_VIEWPORT`(1000px) 布局、用 CSS 缩到列宽，页面以为自己在桌面上，读的人看得见整个桌面的宽度。两个数必须同源——外层预留的 band 与 frame 的逻辑尺寸都从 `fit()` 出，样式表里再写一个 `height` 就是"被某张 CSS 裁掉一条"的经典形态。**竖向仍在 frame 内滚**：报告可以任意长，会长到贴合内容的 band 就不是 band 了。另外这个文件里**只许有一个 `<iframe>` 元素**（两种取景共用它，`boundary.test.ts` 数这个文件里 `sandbox=` 出现几次、取值是不是那个具名常量）：分成两个分支就意味着 capability 串抄了两份，而 11b 那张表说的正是抄错一次没有任何迹象。
 
     **它确实弄脏了规则 13 的"一张表两个入口"，这条要睁眼看着**：` ```html ` 围栏仍走 sandbox，`.html` 文件走 framed，这是那张表里**唯一**一处内联与文件不同的条目。理由是这两个位置装的东西对 mermaid/svg 是同一个（同一段源换个地方），对 html 不是：围栏里的是模型手写的 markup，文件是脚本产出的文档。**但这个不对称有个真实的缺口**——模型可以 `write` 一段自己手写的 HTML 到文件再 `show` 它，那段 markup 就换了跑道。缓解写在 `serve.rs` 的 `POLICY` 上（`connect-src 'self'` + `form-action 'none'`，堵外传不堵渲染），**它是纵深不是边界**，理由同样写在那儿：能写 HTML 的前提是能写文件+能跑脚本，而那两件事都过审批，且都是更直接的出口。改这条之前先读那段注释。
 

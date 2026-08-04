@@ -12,6 +12,9 @@ import {
   type Inspect,
 } from "./inspect";
 import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
+import { linkTarget } from "./links";
+import { LinkContext, type Follow } from "./Prose";
+import { basename } from "./show";
 import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
@@ -72,6 +75,15 @@ export type PaneContext = {
   onToggleWorkspace: (pane: string, session: string) => void;
   /** Open the window-owned browser from the local file-navigation tool group. */
   onOpenBrowser: () => void;
+  /** Send the window's browser to a page — what following a link in prose does.
+   *  Distinct from `onOpenBrowser`, which is a toggle and would put the browser
+   *  away exactly when somebody asked it for something. */
+  onOpenUrl: (url: string) => void;
+  /** The address the window has been asked to visit, and a serial so asking for
+   *  the same page twice is two requests. It travels to the pane rather than
+   *  going straight to the backend because the native webview does not exist
+   *  until `WebPane` mounts and opens it — see the note there. */
+  webRequest: { url: string; at: number } | null;
   /** The currently focused content takes the full pane field without changing
    *  the tiling tree, so leaving focus restores every pane in place. */
   expanded: string | null;
@@ -326,6 +338,30 @@ function Pane({
   hidden: boolean;
 }) {
   const current = context.split && leaf.id === context.focus;
+  const session = leaf.pane.kind === "web" ? "" : leaf.pane.session;
+  const cwd = context.sessions.find((open) => open.id === session)?.cwd ?? "";
+
+  // Where a link in this pane's prose goes. Bound per pane because that is the
+  // fact the router is missing: an `href` is relative to the conversation it
+  // was written in, and "which conversation" is what a pane answers.
+  const { onOpen, onOpenAside, onOpenUrl } = context;
+  const follow = useCallback<Follow>(
+    (href, aside) => {
+      const target = linkTarget(href, cwd);
+      if (target.kind === "web") return onOpenUrl(target.url);
+      if (target.kind === "none") return;
+      // The same viewer `show` opens into, reached the same way anything else
+      // in the transcript is: one `open`, and the pane decides how to draw it.
+      const value: Inspect = {
+        kind: "shown",
+        path: target.path,
+        label: basename(target.path),
+      };
+      (aside ? onOpenAside : onOpen)(leaf.id, session, value);
+    },
+    [onOpen, onOpenAside, onOpenUrl, cwd, leaf.id, session],
+  );
+
   return (
     <section
       className={`pane${current ? " is-focused" : ""}`}
@@ -349,14 +385,17 @@ function Pane({
           expanded={expanded}
           onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
           hidden={hidden}
+          request={context.webRequest}
         />
       ) : (
         <SessionContext.Provider value={leaf.pane.session}>
-          {leaf.pane.kind === "session" ? (
-            <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
-          ) : (
-            <InspectPane leaf={leaf} context={context} />
-          )}
+          <LinkContext.Provider value={follow}>
+            {leaf.pane.kind === "session" ? (
+              <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
+            ) : (
+              <InspectPane leaf={leaf} context={context} />
+            )}
+          </LinkContext.Provider>
         </SessionContext.Provider>
       )}
     </section>

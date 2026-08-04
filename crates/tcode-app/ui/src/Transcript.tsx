@@ -4,7 +4,7 @@ import { runPairs, runSteps, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
 import { useDisplay } from "./display";
 import { RewindContext, rewindPoints, useRewinding, type RewindTarget } from "./rewind";
-import { rich } from "./rich";
+import { Prose } from "./Prose";
 import { readChanges } from "./diff";
 import { isPlanSubmission } from "./plan";
 import { MOD } from "./keys";
@@ -292,7 +292,7 @@ const BlockView = memo(function BlockView({
     case "user":
       return <UserMessage block={block} onOpen={onOpen} />;
     case "assistant":
-      return <div className="msg msg-assistant">{rich(block.text)}</div>;
+      return <Prose className="msg msg-assistant" text={block.text} />;
     case "thinking":
       return <Thinking text={block.text} />;
     case "note":
@@ -456,7 +456,7 @@ function CompactMark({ summary }: { summary: string }) {
         </span>
         <span className="compact-rule" aria-hidden="true" />
       </button>
-      {open && has && <div className="compact-body">{rich(summary)}</div>}
+      {open && has && <Prose className="compact-body" text={summary} />}
     </section>
   );
 }
@@ -840,7 +840,7 @@ const RunCall = memo(function RunCall({
           <BlockList blocks={steps} onOpen={onOpen} />
           {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
           {report?.result?.content && (
-            <div className="run-report">{rich(report.result.content)}</div>
+            <Prose className="run-report" text={report.result.content} />
           )}
         </div>
       )}

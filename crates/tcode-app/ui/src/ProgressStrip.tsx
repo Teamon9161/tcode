@@ -2,7 +2,7 @@ import { useState } from "react";
 
 import { STATUS_MARK, currentPhase, phaseRows, type Plan } from "./plan";
 import { ChevronDown, ChevronRight, PanelIcon } from "./components/Icons";
-import { rich } from "./rich";
+import { Prose } from "./Prose";
 
 /**
  * Where the plan lives while work is happening: one line above the composer.
@@ -134,7 +134,7 @@ export function ProgressStrip({
                       <span className="strip-phase-name">{row.phase}</span>
                     </span>
                   )}
-                  {open && detail && <div className="strip-detail">{rich(detail)}</div>}
+                  {open && detail && <Prose className="strip-detail" text={detail} />}
                 </li>
               );
             })}

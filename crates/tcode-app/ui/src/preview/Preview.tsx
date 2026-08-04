@@ -205,6 +205,12 @@ const BLOCKS: Block[] = [
     },
     result: { preview: "progress updated", content: "", isError: false },
   },
+  // The long answer: every rich block the transcript can draw, and — at the end
+  // — one link of each kind there is. Both are here because a link is the one
+  // affordance whose failure is silence: it looked identical before anything
+  // answered a click, so a scene without one could not tell the two apart. The
+  // page goes to the window's browser, the path to the same viewer `show` opens
+  // (`links.ts`).
   {
     kind: "assistant",
     text: `Found it on line 604. The fix threads a \`Sleeper\` through so tests can pass an instant one.
@@ -248,7 +254,8 @@ flowchart LR
 - [ ] thread the clock
 - [ ] cover it with a test
 
-See [the retry notes](https://example.com/retry) for the original reasoning.`,
+See [the retry notes](https://example.com/retry) for the original reasoning, and
+[the measurements](out/carry.csv) for what the delay costs today.`,
   },
   {
     kind: "tool",

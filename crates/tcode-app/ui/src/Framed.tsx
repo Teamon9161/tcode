@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 
 import { useSession } from "./session";
@@ -43,8 +43,29 @@ import { useSession } from "./session";
  *
  * Height cannot be measured across an origin, so unlike `Sandbox` there is no
  * message protocol to ask for it — the frame fills what CSS gives it. In a pane
- * that is the pane; inline it is a fixed band. A report is a page, and a page
- * takes the room it is given rather than reporting an intrinsic size.
+ * that is the pane. Inline it is a *fitted* band, and that is the one piece of
+ * geometry here worth explaining.
+ *
+ * A report is authored for a desktop window: a plotly figure defaults to
+ * 700×450, a dashboard is laid out at a thousand pixels or more. The reading
+ * column is `--measure`, and inline this used to be that width by a flat
+ * `20rem` — so a chart arrived clipped on both axes, with the frame's own
+ * scrollbars as the only way through it and the report's whole shape (which is
+ * the thing a chart *is*) never on screen at once.
+ *
+ * Neither side of that can be fixed by asking: the page cannot be measured, and
+ * its bytes must not be parsed on this side (see 11b). What is left is to
+ * choose the viewport rather than inherit it. The frame is laid out at
+ * `FIT_VIEWPORT` logical pixels — the width these documents were written for —
+ * and scaled by CSS to whatever the column happens to be. The page believes it
+ * is on a desktop, and the reader sees all of that desktop's width. Vertical
+ * overflow still scrolls inside the frame, because a report can be any length
+ * and a band that grew to fit one would stop being a band.
+ *
+ * The cost is honest and bounded: text at roughly 0.7×, which is a thumbnail
+ * that shows the whole thing rather than a full-size window onto a corner of
+ * it. Full size is one click away and always was — the pop-out on the row above
+ * puts the same component in a pane at scale 1.
  */
 /**
  * The frame's capabilities, as one string so a test can hold them still.
@@ -55,6 +76,38 @@ import { useSession } from "./session";
  * yet. `FileBody.test.tsx` pins the omissions against this constant.
  */
 export const FRAME_SANDBOX = "allow-scripts allow-same-origin allow-forms allow-downloads";
+
+/** The width an inline report is laid out at, whatever the column is.
+ *
+ *  A guess, and the only one available — the document cannot be asked. It is
+ *  the width these files are written for: matplotlib and plotly save around
+ *  700–1000 CSS px, quarto and notebook exports set a container near 1000, and
+ *  a responsive page given 1000 lays out as the desktop page it was checked
+ *  against rather than collapsing to its phone stacking. */
+export const FIT_VIEWPORT = 1000;
+
+/** The band's shape. 16:10 rather than the 4:3 a chart tends to be, because
+ *  the same band also holds documents, and for those every row of the ratio is
+ *  another paragraph before the scroll starts. */
+export const FIT_ASPECT = 0.625;
+
+/**
+ * The inline frame's geometry for a column `width` wide.
+ *
+ * Pure, exported and tested, because the two numbers have to agree: the wrapper
+ * reserves `band` and the frame paints `logical × logical * FIT_ASPECT` scaled
+ * by `scale`, and a disagreement is a strip of the report cut off or a strip of
+ * empty page under it.
+ *
+ * A column wider than the viewport is not magnified — `logical` grows instead,
+ * so the report gets the extra room as room. Scaling *up* would be the one
+ * result nobody asked for: a blurry page that fits just as well at 1:1.
+ */
+export function fit(width: number): { logical: number; scale: number; band: number } {
+  const logical = Math.max(FIT_VIEWPORT, width);
+  const scale = width > 0 ? width / logical : 1;
+  return { logical, scale, band: Math.round(logical * FIT_ASPECT * scale) };
+}
 
 export function Framed({
   path,
@@ -81,6 +134,24 @@ export function Framed({
   const session = useSession();
   const [url, setUrl] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
+  const box = useRef<HTMLDivElement>(null);
+  const [width, setWidth] = useState(0);
+
+  // Measured rather than read from a media query: the column is a pane's share
+  // of the window, so it moves with every divider drag and every split, and no
+  // breakpoint knows what it currently is. A layout effect so the first paint
+  // is already at the right scale — the alternative flashes a 1000px page in a
+  // 700px box. Bounded work: this fires on mount and on resize, never per
+  // render (`WebPane`'s note on why that distinction matters here).
+  useLayoutEffect(() => {
+    const node = box.current;
+    if (!node) return;
+    const measure = () => setWidth(node.getBoundingClientRect().width);
+    measure();
+    const watch = new ResizeObserver(measure);
+    watch.observe(node);
+    return () => watch.disconnect();
+  }, [inline]);
 
   useEffect(() => {
     let live = true;
@@ -94,10 +165,16 @@ export function Framed({
     };
   }, [session, path]);
 
-  if (failure) return <p className="inspect-empty">{failure}</p>;
-  if (!url) return <p className="inspect-empty">loading…</p>;
+  const { logical, scale, band } = fit(width);
 
-  return (
+  // One `<iframe>` in this file, in both framings. The alternative — a branch
+  // per framing, each with its own element — is how the two frames in this app
+  // swap attributes (11b): the capability list would appear twice, and a change
+  // to one copy is invisible in review. `boundary.test.ts` reads this file for
+  // exactly that.
+  const body = failure ? (
+    <p className="inspect-empty">{failure}</p>
+  ) : url ? (
     <iframe
       key={revision}
       className={`framed${inline ? " is-inline" : ""}`}
@@ -106,6 +183,31 @@ export function Framed({
       // and why top-level navigation is not.
       sandbox={FRAME_SANDBOX}
       title={label}
+      // Inline, the page is laid out at the viewport it was written for and
+      // scaled to the column. In a pane it takes the pane, at 1:1.
+      style={
+        inline
+          ? {
+              width: logical,
+              height: Math.round(logical * FIT_ASPECT),
+              transform: `scale(${scale})`,
+            }
+          : undefined
+      }
     />
+  ) : (
+    <p className="inspect-empty">loading…</p>
+  );
+
+  if (!inline) return body;
+
+  // The wrapper is rendered before there is anything to put in it, and that is
+  // deliberate: it is what gets measured, and it holds the band's height from
+  // the first frame, so a report arriving does not shove the rest of the
+  // conversation down the screen.
+  return (
+    <div className="framed-fit" ref={box} style={{ height: band }}>
+      {body}
+    </div>
   );
 }

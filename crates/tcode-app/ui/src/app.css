@@ -3523,9 +3523,28 @@ body.is-resizing {
 /* Inline it is a band in the reading column, like every other artifact at a
    call site — bounded here rather than by `.shown.is-inline`'s scroll, because
    a frame that scrolls inside a box that also scrolls is two scrollbars for one
-   document. */
+   document.
+
+   The band holds a page laid out wider than itself and scaled down to fit
+   (`fit()` in `Framed.tsx`, which owns both numbers). The height comes from
+   there too, so this must not set one: a `height` here and a `height` there is
+   the arrangement where a report is cut off by a stylesheet that thinks it
+   knows the ratio. */
+.framed-fit {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--r-sm);
+  background: var(--bg);
+}
 .framed.is-inline {
-  height: 20rem;
+  position: absolute;
+  top: 0;
+  left: 0;
+  /* The scale is applied from the corner the band starts at, so the visible
+     rectangle is the top-left of the page rather than a crop around its
+     middle. */
+  transform-origin: top left;
   min-height: 0;
 }
 

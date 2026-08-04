@@ -54,6 +54,7 @@ export function WebPane({
   expanded,
   onToggleExpanded,
   hidden,
+  request,
 }: {
   onClose: () => void;
   /** This pane is the one filling the field. */
@@ -62,6 +63,16 @@ export function WebPane({
   /** Another pane is filling the field and this one is `visibility: hidden`.
    *  The native webview does not participate in CSS, so it has to be told. */
   hidden: boolean;
+  /**
+   * A page the window was asked for — a link followed in a conversation.
+   *
+   * It arrives here rather than going straight to the backend because the
+   * native webview does not exist until this pane mounts and creates it, and
+   * `browser_navigate` on a webview that is not there fails. The pane is the
+   * only side that knows when it exists, so it is the side that sends this on.
+   * The serial is what distinguishes "again" from "still".
+   */
+  request?: { url: string; at: number } | null;
 }) {
   const body = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
@@ -72,6 +83,11 @@ export function WebPane({
   const [failure, setFailure] = useState<string | null>(null);
   /** The address whose navigation has not round-tripped yet, if any. */
   const pending = useRef<string | null>(null);
+  /** True once the backend has confirmed the webview exists. Until then there
+   *  is nothing to navigate, and a request has to wait rather than fail. */
+  const [live, setLive] = useState(false);
+  /** The serial of the last request acted on, so a re-render is not a re-visit. */
+  const visited = useRef(0);
   const hiddenRef = useRef(hidden);
   hiddenRef.current = hidden;
 
@@ -91,6 +107,7 @@ export function WebPane({
     placed.current = key;
     invoke(first ? "browser_open" : "browser_bounds", { rect })
       .then(() => {
+        setLive(true);
         // `browser_open` shows the webview it (re)creates, and a pane mounted
         // while another one is expanded must end up hidden — re-assert it here,
         // after creation, not just in the visibility effect that ran before the
@@ -198,6 +215,19 @@ export function WebPane({
         setFailure(String(error));
       });
   };
+
+  // A link followed elsewhere in the window. It waits for `live` rather than
+  // racing the pane's own first `browser_open`: on the mount that a link
+  // *causes*, the webview is still being created when this request arrives, and
+  // navigating early fails with "the browser is not open" — an error about our
+  // own ordering, shown to somebody who just clicked a link.
+  useEffect(() => {
+    if (!live || !request || request.at === visited.current) return;
+    visited.current = request.at;
+    // `go` is re-made every render and is deliberately not a dependency: what
+    // decides whether to navigate is the serial, which is the point of it.
+    go(request.url);
+  }, [live, request]);
 
   const act = (command: string, args?: Record<string, unknown>) => {
     invoke(command, args).catch((error) => setFailure(String(error)));

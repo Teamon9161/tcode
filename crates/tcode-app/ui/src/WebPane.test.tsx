@@ -47,14 +47,24 @@ let root: Root;
 let container: HTMLDivElement;
 let unmounted: boolean;
 
-function render(onClose: () => void = () => {}, hidden = false) {
+function render(
+  onClose: () => void = () => {},
+  hidden = false,
+  request?: { url: string; at: number },
+) {
   unmounted = false;
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
   act(() => {
     root.render(
-      <WebPane onClose={onClose} expanded={false} onToggleExpanded={() => {}} hidden={hidden} />,
+      <WebPane
+        onClose={onClose}
+        expanded={false}
+        onToggleExpanded={() => {}}
+        hidden={hidden}
+        request={request}
+      />,
     );
   });
 }
@@ -241,5 +251,70 @@ describe("the browser pane's hide vs close", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
     expect(mocks.invoke).not.toHaveBeenCalledWith("browser_close");
+  });
+});
+
+describe("following a link into the browser", () => {
+  /** The pane's rectangle is measured a frame after each render, and the
+   *  webview is created from that measurement — so "a frame later" is when the
+   *  browser starts existing. Holding the frames here is what lets the test see
+   *  the gap a link click falls into. */
+  function heldFrames() {
+    const frames: FrameRequestCallback[] = [];
+    const real = globalThis.requestAnimationFrame;
+    globalThis.requestAnimationFrame = ((fn: FrameRequestCallback) =>
+      frames.push(fn)) as typeof requestAnimationFrame;
+    return {
+      run: async () => {
+        await act(async () => {
+          for (const frame of frames.splice(0)) frame(0);
+          // `browser_open` resolves in a microtask, and only then is there a
+          // webview to navigate.
+          await Promise.resolve();
+        });
+      },
+      restore: () => {
+        globalThis.requestAnimationFrame = real;
+      },
+    };
+  }
+
+  it("waits for the webview to exist rather than failing into an error banner", async () => {
+    const frames = heldFrames();
+    try {
+      act(() => root.unmount());
+      render(() => {}, false, { url: "https://example.com/report", at: 1 });
+
+      // The mount that a link *causes*: the webview is still being created, and
+      // navigating now would answer the click with "the browser is not open".
+      expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
+
+      await frames.run();
+      expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
+        url: "https://example.com/report",
+      });
+    } finally {
+      frames.restore();
+    }
+  });
+
+  it("visits once per request, however often the pane re-renders", async () => {
+    const frames = heldFrames();
+    try {
+      act(() => root.unmount());
+      const request = { url: "https://example.com/report", at: 1 };
+      render(() => {}, false, request);
+      await frames.run();
+
+      // A title change from the page, a divider moving — any of these re-render
+      // the pane, and none of them are a second click.
+      navigate("https://example.com/report");
+      await frames.run();
+
+      const visits = mocks.invoke.mock.calls.filter(([name]) => name === "browser_navigate");
+      expect(visits).toHaveLength(1);
+    } finally {
+      frames.restore();
+    }
   });
 });

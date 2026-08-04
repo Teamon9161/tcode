@@ -5,7 +5,7 @@ import { Diff } from "./components/Diff";
 import { isEditShape } from "./diff";
 import type { Inspect } from "./inspect";
 import { planBody } from "./plan";
-import { rich } from "./rich";
+import { Prose } from "./Prose";
 import { basename } from "./show";
 import { ShownView } from "./Shown";
 
@@ -403,7 +403,7 @@ export function transcriptGroupFor(name: string): ToolView["transcriptGroup"] {
 function PlanDocument({ input }: { input: unknown }) {
   const body = planBody(input);
   if (!body) return <Phases input={input} />;
-  return <div className="plan-document">{rich(body)}</div>;
+  return <Prose className="plan-document" text={body} />;
 }
 
 function planSummary(input: unknown): string | null {
