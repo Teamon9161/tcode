@@ -66,3 +66,9 @@ export function phaseOf(event: AgentEvent): string | null {
       return null;
   }
 }
+
+/** Render a phase as status copy without changing the canonical event vocabulary. */
+export function statusLabel(phase: string): string {
+  const trimmed = phase.trim();
+  return trimmed ? trimmed.charAt(0).toUpperCase() + trimmed.slice(1) : "Working";
+}

@@ -41,6 +41,20 @@ export async function imagesFrom(transfer: DataTransfer | null): Promise<Pasted[
   return Promise.all(imageFiles(transfer).map(read));
 }
 
+/** The native command's narrow response when WebKitGTK has no DOM `File`. */
+export type NativeClipboardImage = {
+  media_type: string;
+  data: string;
+};
+
+/** Turn a normalized native clipboard response into the same draft chip as a DOM File. */
+export function imageFromNativeClipboard(image: NativeClipboardImage): Pasted {
+  if (!image.media_type.startsWith("image/") || image.data.length === 0) {
+    throw new Error("the system clipboard returned an invalid image");
+  }
+  return pasted(image.media_type, image.data);
+}
+
 /**
  * WebKit can expose a pasted screenshot through `items` without populating
  * `files`, while drag-and-drop commonly supplies both. Read both paths and
@@ -59,7 +73,9 @@ export function imageFiles(
   return files;
 }
 
-export function isImagePaste(transfer: DataTransfer | null): boolean {
+export function isImagePaste(
+  transfer: Pick<DataTransfer, "files" | "items"> | null,
+): boolean {
   if (!transfer) return false;
   return (
     Array.from(transfer.files).some((file) => file.type.startsWith("image/")) ||
@@ -69,16 +85,42 @@ export function isImagePaste(transfer: DataTransfer | null): boolean {
   );
 }
 
+/**
+ * Whether this paste needs the image path rather than the textarea's native
+ * text path. Some WebKitGTK builds provide only an image MIME type, or no DOM
+ * clipboard entries at all, for a screenshot; either shape needs a native read.
+ */
+export function needsNativeImageRead(
+  transfer: Pick<DataTransfer, "types" | "files" | "items"> | null,
+): boolean {
+  if (!transfer) return false;
+  const types = Array.from(transfer.types);
+  const hasText = types.some((type) => type === "text/plain" || type === "text/html");
+  return (
+    isImagePaste(transfer) ||
+    types.some((type) => type.startsWith("image/")) ||
+    (!hasText && types.length === 0 && transfer.files.length === 0 && transfer.items.length === 0)
+  );
+}
+
 async function read(file: File): Promise<Pasted> {
   const url = await asDataUrl(file);
   const shrunk = await shrink(url, file.type);
+  return pasted(
+    shrunk.mediaType,
+    shrunk.url.slice(shrunk.url.indexOf(",") + 1),
+    file.name || undefined,
+  );
+}
+
+function pasted(mediaType: string, data: string, name?: string): Pasted {
   counter += 1;
   return {
     id: `paste-${counter}`,
-    mediaType: shrunk.mediaType,
-    data: shrunk.url.slice(shrunk.url.indexOf(",") + 1),
-    url: shrunk.url,
-    name: file.name || `pasted image ${counter}`,
+    mediaType,
+    data,
+    url: `data:${mediaType};base64,${data}`,
+    name: name || `pasted image ${counter}`,
   };
 }
 

@@ -25,11 +25,6 @@ import { rich } from "./rich";
  * while the line above them stayed on the composer's axis. The wider the pane
  * (the rail folded away, say) the further apart the two axes drifted.
  *
- * **The meter runs inside a visible track** of exactly that width. A bar with no
- * visible end is a length nobody can read a proportion out of, and this one was a
- * fraction of the *pane* rather than of anything on screen — which is why it read
- * as a green line of arbitrary length rather than as "three of five".
- *
  * **It says what it is.** A title, a phase and a fraction with no word naming the
  * thing they belong to is legible only to somebody who already knows this app has
  * plans in it.
@@ -37,25 +32,19 @@ import { rich } from "./rich";
 export function ProgressStrip({
   plan,
   expanded,
-  running,
   onToggle,
   onOpen,
 }: {
   plan: Plan;
   expanded: boolean;
-  running: boolean;
   onToggle: () => void;
   onOpen: () => void;
 }) {
   const current = currentPhase(plan.phases);
   const rows = expanded ? phaseRows(plan.phases) : [];
-  const fraction = plan.total === 0 ? 0 : plan.done / plan.total;
 
   return (
-    <section
-      className={`progress-strip${expanded ? " is-open" : ""}${running ? " is-running" : ""}`}
-      aria-label="Plan progress"
-    >
+    <section className={`progress-strip${expanded ? " is-open" : ""}`} aria-label="Plan progress">
       <div className="strip-body">
         <div className="strip-line">
           <button
@@ -100,21 +89,6 @@ export function ProgressStrip({
           >
             <PanelIcon size={12} />
           </button>
-        </div>
-
-        {/* The fill's extent is a measurement, so it is an inline value rather
-            than a token; the track is what makes that measurement readable. It
-            rides on `scaleX` because a transition of `width` is a transition that
-            runs layout every frame. */}
-        <div
-          className="strip-track"
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={plan.total}
-          aria-valuenow={plan.done}
-          aria-label="Phases done"
-        >
-          <div className="strip-meter" style={{ transform: `scaleX(${fraction})` }} />
         </div>
 
         {expanded && (

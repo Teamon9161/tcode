@@ -137,10 +137,7 @@ impl Browser {
         .on_document_title_changed({
             let app = app.clone();
             move |webview, title| {
-                let url = webview
-                    .url()
-                    .map(|url| url.to_string())
-                    .unwrap_or_default();
+                let url = webview.url().map(|url| url.to_string()).unwrap_or_default();
                 emit(&app, Navigated { url, title });
             }
         });
@@ -246,10 +243,7 @@ fn place(webview: &Webview<Wry>, rect: Rect) -> Result<(), String> {
     // A zero dimension is a legal CSS rect (a pane mid-collapse) and an illegal
     // webview size on some platforms.
     webview
-        .set_size(LogicalSize::new(
-            rect.width.max(1.0),
-            rect.height.max(1.0),
-        ))
+        .set_size(LogicalSize::new(rect.width.max(1.0), rect.height.max(1.0)))
         .map_err(|error| error.to_string())
 }
 
@@ -274,7 +268,10 @@ pub fn to_url(input: &str) -> Result<String, String> {
         return Err("type an address".into());
     }
     if let Some((scheme, _)) = text.split_once("://") {
-        if scheme.chars().all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-') {
+        if scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
+        {
             return Ok(text.to_string());
         }
     }
@@ -346,20 +343,23 @@ mod tests {
     }
 
     #[test]
-    fn native_decorations_keep_child_browser_from_covering_window_controls() {
+    fn app_owned_decorations_keep_system_color_out_of_the_caption() {
         let file = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
         let text = std::fs::read_to_string(file).expect("tauri.conf.json");
         let config: serde_json::Value = serde_json::from_str(&text).expect("valid tauri config");
 
         assert_eq!(
-            config["app"]["windows"][0]["decorations"], true,
-            "the native caption must remain enabled: a child browser webview can intercept HTML controls"
+            config["app"]["windows"][0]["decorations"], false,
+            "the app-owned title bar must not inherit the operating system's caption color"
         );
     }
 
     #[test]
     fn an_explicit_scheme_is_left_alone() {
-        assert_eq!(to_url("https://github.com/x").unwrap(), "https://github.com/x");
+        assert_eq!(
+            to_url("https://github.com/x").unwrap(),
+            "https://github.com/x"
+        );
         assert_eq!(to_url("http://example.com").unwrap(), "http://example.com");
         assert_eq!(to_url("about:blank").unwrap(), "about:blank");
         assert_eq!(to_url("file:///tmp/x.html").unwrap(), "file:///tmp/x.html");
@@ -370,7 +370,10 @@ mod tests {
     #[test]
     fn a_dev_server_is_plain_http() {
         assert_eq!(to_url("localhost:5173").unwrap(), "http://localhost:5173");
-        assert_eq!(to_url("127.0.0.1:8080/app").unwrap(), "http://127.0.0.1:8080/app");
+        assert_eq!(
+            to_url("127.0.0.1:8080/app").unwrap(),
+            "http://127.0.0.1:8080/app"
+        );
         assert_eq!(to_url("LOCALHOST:3000").unwrap(), "http://LOCALHOST:3000");
         // …and a real host still is not.
         assert_eq!(to_url("github.com").unwrap(), "https://github.com");

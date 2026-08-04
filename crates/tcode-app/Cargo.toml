@@ -36,6 +36,11 @@ tauri-plugin-dialog = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
+# WebKitGTK can announce a clipboard image without exposing a DOM File. Read
+# that one user-initiated paste through the native clipboard as a fallback.
+# The desktop app also runs natively under Wayland, so the default X11-only
+# backend cannot see the clipboard that WebKitGTK just pasted from.
+arboard = { version = "3", features = ["wayland-data-control"] }
 
 # The loopback origin for shown artifacts (`serve.rs`). `ServeDir` rather than
 # hand-rolled file serving: byte ranges, conditional requests, HEAD, directory

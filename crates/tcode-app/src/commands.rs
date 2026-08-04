@@ -15,8 +15,48 @@ use tcode_core::ContentBlock;
 
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
 use crate::projects::{self, ProjectInfo, StoredSession};
-use crate::state::{run_turn, Supervisor};
+use crate::state::{run_compact, run_turn, Supervisor};
 use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry};
+
+/// A normalized image read from the system clipboard for the webview.
+///
+/// The caller only reaches this after a user paste, when WebKitGTK advertised
+/// image data but did not provide a DOM `File` to decode itself.
+#[derive(Serialize)]
+pub struct ClipboardImage {
+    pub media_type: String,
+    pub data: String,
+}
+
+/// Read an image from the native clipboard when the webview cannot materialize
+/// its promised image MIME type as a DOM file.
+#[tauri::command]
+pub fn clipboard_image() -> Result<Option<ClipboardImage>, String> {
+    let mut clipboard = arboard::Clipboard::new()
+        .map_err(|error| format!("cannot open the system clipboard: {error}"))?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
+        Err(error) => return Err(format!("cannot read the system clipboard image: {error}")),
+    };
+    clipboard_image_from_rgba(image.width, image.height, image.bytes.into_owned()).map(Some)
+}
+
+fn clipboard_image_from_rgba(
+    width: usize,
+    height: usize,
+    rgba: Vec<u8>,
+) -> Result<ClipboardImage, String> {
+    use base64::Engine as _;
+
+    let width = u32::try_from(width).map_err(|_| "clipboard image is too wide")?;
+    let height = u32::try_from(height).map_err(|_| "clipboard image is too tall")?;
+    let image = tcode_core::images::normalize_rgba(width, height, rgba)?;
+    Ok(ClipboardImage {
+        media_type: image.media_type.to_string(),
+        data: base64::engine::general_purpose::STANDARD.encode(image.bytes),
+    })
+}
 
 /// What the frontend needs to render a session before any turn has run.
 #[derive(Serialize)]
@@ -582,6 +622,108 @@ fn queue_of(handle: &crate::state::SessionHandle) -> Vec<QueuedView> {
             turn,
         })
         .collect()
+}
+
+/// Result of a core-owned slash command.
+///
+/// A command either replaced the conversation (which the frontend must replay
+/// from the authoritative ledger), started asynchronous compaction, needs the
+/// existing resume picker, or has a one-line status response.
+#[derive(Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SlashResult {
+    Conversation {
+        opened: OpenedSession,
+        notice: Option<String>,
+    },
+    CompactStarted,
+    ResumePicker {
+        sessions: Vec<StoredSession>,
+    },
+    Notice {
+        text: String,
+        error: bool,
+    },
+}
+
+fn slash_name(line: &str) -> Option<&str> {
+    let rest = line.trim().strip_prefix('/')?;
+    Some(rest.split_whitespace().next().unwrap_or_default())
+}
+
+/// Dispatch the core commands whose semantics fit this desktop surface.
+///
+/// The webview sends text, not an operation: parsing and all session mutations
+/// remain in Core's command registry. Effects that only a frontend can perform
+/// are interpreted here, where the existing turn lifecycle is available.
+#[tauri::command]
+pub fn slash_command(
+    app: AppHandle,
+    supervisor: State<'_, Arc<Supervisor>>,
+    session: String,
+    line: String,
+) -> Result<SlashResult, String> {
+    match slash_name(&line) {
+        Some("clear" | "compact" | "resume") => {}
+        Some(_) => {
+            return Err(format!(
+                "unsupported desktop command {line} — use /resume, /clear, or /compact"
+            ))
+        }
+        None => return Err("a slash command must start with '/'".into()),
+    }
+    let tcode_core::commands::CommandOutcome { messages, effects } =
+        supervisor.dispatch_slash(&session, &line)?;
+    for effect in effects {
+        match effect {
+            tcode_core::commands::CommandEffect::ConversationCleared
+            | tcode_core::commands::CommandEffect::ConversationReplaced => {
+                let handle = supervisor
+                    .get(&session)
+                    .ok_or_else(|| format!("session '{session}' is not open"))?;
+                let notice = messages.first().map(|message| message.text.clone());
+                return Ok(SlashResult::Conversation {
+                    opened: OpenedSession::of(&handle, &supervisor.agent()),
+                    notice,
+                });
+            }
+            tcode_core::commands::CommandEffect::Compact { focus } => {
+                let handle = supervisor
+                    .get(&session)
+                    .ok_or_else(|| format!("session '{session}' is not open"))?;
+                let agent = supervisor.agent();
+                let emit: Arc<dyn Emit> = Arc::new(app);
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) =
+                        run_compact(agent, handle.clone(), emit.clone(), focus).await
+                    {
+                        emit.emit(
+                            TURN_FINISHED,
+                            serde_json::json!({ "session": handle.id, "error": error.to_string() }),
+                        );
+                    }
+                });
+                return Ok(SlashResult::CompactStarted);
+            }
+            tcode_core::commands::CommandEffect::OpenResumePicker => {
+                let handle = supervisor
+                    .get(&session)
+                    .ok_or_else(|| format!("session '{session}' is not open"))?;
+                return Ok(SlashResult::ResumePicker {
+                    sessions: projects::sessions(&handle.cwd),
+                });
+            }
+            _ => return Err("that command is not available in the desktop app".into()),
+        }
+    }
+    let message = messages
+        .into_iter()
+        .next()
+        .ok_or("command returned no result")?;
+    Ok(SlashResult::Notice {
+        error: matches!(message.kind, tcode_core::commands::MessageKind::Error),
+        text: message.text,
+    })
 }
 
 /// Start a turn — or queue the prompt when one is already running.
@@ -1333,6 +1475,26 @@ mod tests {
             panic!("expected a note");
         };
         assert!(text.contains("could not be saved"), "{text}");
+    }
+
+    #[test]
+    fn native_clipboard_pixels_become_a_provider_image() {
+        use base64::Engine as _;
+
+        let image = clipboard_image_from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .unwrap();
+        assert_eq!(
+            tcode_core::images::detect_image_mime(&bytes),
+            Some(image.media_type.as_str())
+        );
+    }
+
+    #[test]
+    fn malformed_native_clipboard_pixels_are_refused() {
+        let result = clipboard_image_from_rgba(1, 1, vec![1, 2, 3]);
+        assert!(matches!(result, Err(error) if error.contains("RGBA buffer")));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { imageFiles, isImagePaste } from "./paste";
+import { imageFiles, isImagePaste, needsNativeImageRead } from "./paste";
 
 describe("imageFiles", () => {
   it("reads an image exposed only through clipboard items", () => {
@@ -34,5 +34,33 @@ describe("imageFiles", () => {
     } as unknown as DataTransfer;
 
     expect(imageFiles(transfer)).toEqual([image]);
+  });
+
+  it("recognizes an image item even when WebKit cannot materialize its File", () => {
+    const transfer = {
+      types: ["image/png"],
+      files: { length: 0, item: () => null },
+      items: [
+        {
+          kind: "file",
+          type: "image/png",
+          getAsFile: () => null,
+        },
+      ],
+    } as unknown as DataTransfer;
+
+    expect(isImagePaste(transfer)).toBe(true);
+    expect(imageFiles(transfer)).toEqual([]);
+    expect(needsNativeImageRead(transfer)).toBe(true);
+  });
+
+  it("does not intercept an ordinary text paste", () => {
+    const transfer = {
+      types: ["text/plain"],
+      files: { length: 0, item: () => null },
+      items: [],
+    } as unknown as DataTransfer;
+
+    expect(needsNativeImageRead(transfer)).toBe(false);
   });
 });

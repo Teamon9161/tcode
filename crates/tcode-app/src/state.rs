@@ -16,7 +16,10 @@ use std::sync::{Arc, Mutex};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::progress::{Progress, ProgressState};
-use tcode_core::{Agent, AgentError, ContentBlock, Session};
+use tcode_core::{
+    commands::{CommandCtx, CommandOutcome, CommandRegistry, EnvironmentFn, OpeningContextFn},
+    Agent, AgentError, AgentEvent, ContentBlock, Session,
+};
 
 use crate::boot::SessionFactory;
 use crate::bridge::{pump_events, Emit, Pending, TurnFinished, WebviewApprover, TURN_FINISHED};
@@ -226,9 +229,33 @@ impl SessionHandle {
             .unwrap_or_default()
     }
 
-    /// What this conversation occupies in the model window, and whether that
-    /// figure is still an estimate.
+    /// Run a core slash command while this conversation is idle.
     ///
+    /// The webview supplies only the line. Command lookup, argument parsing and
+    /// ledger mutation remain in Core, and a running turn refuses the request
+    /// rather than racing a command against its append-only ledger.
+    pub fn dispatch_slash(
+        &self,
+        registry: &CommandRegistry,
+        opening_context: &OpeningContextFn,
+        environment: &EnvironmentFn,
+        line: &str,
+    ) -> Result<CommandOutcome, String> {
+        let mut held = self.session.lock().unwrap();
+        let session = held
+            .as_mut()
+            .ok_or("this conversation is busy; wait for the current turn to finish")?;
+        let mut ctx = CommandCtx {
+            session,
+            opening_context,
+            environment,
+            turn_usage: tcode_core::Usage::default(),
+        };
+        registry
+            .dispatch(&mut ctx, line)
+            .ok_or_else(|| format!("unknown command {line} — use /resume, /clear, or /compact"))
+    }
+
     /// The same two lines the TUI runs at every turn end and every conversation
     /// reset (`app/turn.rs`, `app/views.rs`), and deliberately *not* something
     /// the webview can work out for itself. Two reasons, both load-bearing:
@@ -419,6 +446,9 @@ pub fn hand_off_plan(
 pub struct Supervisor {
     agent: Arc<Agent>,
     factory: SessionFactory,
+    commands: CommandRegistry,
+    opening_context: OpeningContextFn,
+    environment: EnvironmentFn,
     /// The model/preset menus the composer's chips read and write. Process-wide
     /// rather than per-session: they act on the shared `ModelCell` and on the
     /// selected config file, both of which every conversation in this window
@@ -432,9 +462,13 @@ pub struct Supervisor {
 
 impl Supervisor {
     pub fn new(agent: Arc<Agent>, factory: SessionFactory, menus: crate::picker::Menus) -> Self {
+        let (opening_context, environment) = factory.command_context();
         Self {
             agent,
             factory,
+            commands: CommandRegistry::builtin(),
+            opening_context,
+            environment,
             menus,
             sessions: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
@@ -495,9 +529,86 @@ impl Supervisor {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
+    /// Dispatch a core-owned command for one idle conversation. UI-only commands
+    /// deliberately have no route through this boundary.
+    pub fn dispatch_slash(&self, id: &str, line: &str) -> Result<CommandOutcome, String> {
+        let handle = self
+            .get(id)
+            .ok_or_else(|| format!("session '{id}' is not open"))?;
+        handle.dispatch_slash(
+            &self.commands,
+            &self.opening_context,
+            &self.environment,
+            line,
+        )
+    }
+
     pub fn ids(&self) -> Vec<String> {
         self.order.lock().unwrap().clone()
     }
+}
+
+/// Run a manually requested history compaction through the same event, cancel
+/// and queue lifecycle as an ordinary turn.
+pub async fn run_compact(
+    agent: Arc<Agent>,
+    handle: Arc<SessionHandle>,
+    emit: Arc<dyn Emit>,
+    focus: Option<String>,
+) -> Result<(), TurnError> {
+    let Some(mut session) = handle.take() else {
+        return Err(TurnError::Busy(handle.id.clone()));
+    };
+    let (turn, cancel) = handle.begin_turn();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
+    eprintln!("tcode-app: compaction started on session {}", handle.id);
+    let _ = tx.send(AgentEvent::Compacting).await;
+    let result = agent
+        .compact_with_focus(&mut session, focus.as_deref(), &tx, &cancel)
+        .await;
+    match &result {
+        Ok(()) => eprintln!("tcode-app: compaction finished on session {}", handle.id),
+        Err(error) => eprintln!(
+            "tcode-app: compaction failed on session {}: {error}",
+            handle.id
+        ),
+    }
+    if let Some(mode) = session.commit_pending_mode() {
+        let _ = tx.send(AgentEvent::ModeChanged(mode)).await;
+    }
+    drop(tx);
+    let _ = pump.await;
+    handle.pending.clear();
+
+    let (next_session, waiting) = handle.put_back_or_take_queued(session);
+    handle.finish_turn(turn);
+    if let Some(session) = next_session {
+        let message = merge_queued(waiting).expect("non-empty queue reserves the session");
+        return run_owned_turn(
+            agent,
+            handle,
+            emit,
+            session,
+            message.blocks,
+            message.instructions,
+            Some((message.text, message.attachments)),
+        )
+        .await;
+    }
+
+    let (context_tokens, context_estimated) = handle.context(&agent);
+    emit.emit(
+        TURN_FINISHED,
+        serde_json::to_value(TurnFinished {
+            session: &handle.id,
+            error: result.as_ref().err().map(describe_error),
+            context_tokens,
+            context_estimated,
+        })
+        .unwrap_or(serde_json::Value::Null),
+    );
+    Ok(())
 }
 
 /// Run one turn to completion, streaming its events to `emit`.

@@ -218,6 +218,13 @@ export type OpenedSession = {
   context_estimated: boolean;
 };
 
+/** Mirrors `commands.rs::SlashResult`. */
+export type SlashResult =
+  | { kind: "conversation"; opened: OpenedSession; notice: string | null }
+  | { kind: "compact_started" }
+  | { kind: "resume_picker"; sessions: StoredSession[] }
+  | { kind: "notice"; text: string; error: boolean };
+
 /** A folder tcode has held a conversation in. */
 export type ProjectInfo = {
   path: string;

@@ -16,6 +16,7 @@ import {
   type RewindPreview,
   type Rewound,
   type SessionInfo,
+  type SlashResult,
   type Status,
   type TurnFinished,
 } from "./types";
@@ -39,7 +40,8 @@ import { phaseOf } from "./activity";
 import { DisplayContext, loadDisplay, saveDisplay, type Display } from "./display";
 import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
-import { Mark } from "./components/Mark";
+import { Mark, Wordmark } from "./components/Mark";
+import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 
 export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -278,6 +280,62 @@ export function App() {
     [sessions],
   );
 
+  const dispatchSlash = useCallback(
+    async (id: string, line: string) => {
+      try {
+        const result = await invoke<SlashResult>("slash_command", { session: id, line });
+        switch (result.kind) {
+          case "conversation": {
+            const replayed = replayLedger(result.opened.history);
+            patch(id, () => ({
+              ...BLANK,
+              ...replayed,
+              meter: adoptContext(
+                BLANK.meter,
+                result.opened.context_tokens,
+                result.opened.context_estimated,
+              ),
+              activity: result.notice ?? (result.opened.history.length > 0 ? "resumed" : "cleared"),
+            }));
+            readPlan(id);
+            refreshTurnState(id);
+            return;
+          }
+          case "compact_started":
+            patch(id, (state) => ({
+              ...state,
+              resumePicker: null,
+              running: true,
+              failed: false,
+              meter: { ...state.meter, turn: NO_USAGE },
+              activity: "compacting history",
+            }));
+            return;
+          case "resume_picker":
+            patch(id, (state) => ({ ...state, resumePicker: result.sessions }));
+            return;
+          case "notice":
+            patch(id, (state) => ({
+              ...state,
+              blocks: [
+                ...state.blocks,
+                result.error ? errorBlock(result.text) : noteBlock(result.text),
+              ],
+            }));
+            return;
+        }
+      } catch (error) {
+        patch(id, (state) => ({
+          ...state,
+          running: false,
+          failed: true,
+          blocks: [...state.blocks, errorBlock(String(error))],
+        }));
+      }
+    },
+    [patch, readPlan, refreshTurnState],
+  );
+
   /**
    * Send, or queue when a turn is already running.
    *
@@ -305,6 +363,10 @@ export function App() {
         planFirst: false,
       }));
       try {
+        if (text.startsWith("/") && attachments.length === 0) {
+          await dispatchSlash(id, text);
+          return;
+        }
         // `plan` is a flag, never the instruction text: the words come from core
         // (the same ones `/plan` submits), so the webview cannot author model
         // context that claims to be the harness speaking.
@@ -352,7 +414,17 @@ export function App() {
         }));
       }
     },
-    [states, patch],
+    [states, patch, dispatchSlash],
+  );
+
+  const resume = useCallback(
+    (id: string, stored: string) => dispatchSlash(id, `/resume ${stored}`),
+    [dispatchSlash],
+  );
+
+  const dismissResume = useCallback(
+    (id: string) => patch(id, (state) => ({ ...state, resumePicker: null })),
+    [patch],
   );
 
   const withdrawQueued = useCallback(
@@ -669,6 +741,8 @@ export function App() {
             }}
             onWithdrawQueued={withdrawQueued}
             onSendQueuedNow={sendQueuedNow}
+            onResume={resume}
+            onDismissResume={dismissResume}
             onAskRewind={askRewind}
             onRewind={rewind}
             onAnswer={answer}
@@ -720,7 +794,13 @@ function rebase(draft: PlanDraft | null, plan: Plan | null): PlanDraft | null {
  */
 function Fault({ reason }: { reason: string }) {
   return (
-    <div className="fault">
+    <div className="fault-shell">
+      <header className="topbar">
+        <Wordmark />
+        <WindowDragRegion />
+        <WindowControls />
+      </header>
+      <div className="fault">
       <Mark size={22} state="failed" />
       <h1>tcode could not start</h1>
       <p>{reason}</p>
@@ -728,6 +808,7 @@ function Fault({ reason }: { reason: string }) {
         If no provider is configured yet, run <code>tcode</code> in a terminal
         once to set one up.
       </p>
+      </div>
     </div>
   );
 }

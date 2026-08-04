@@ -1,6 +1,14 @@
 import { useEffect, useRef, useState } from "react";
+import { invoke } from "@tauri-apps/api/core";
 
-import { imagesFrom, isImagePaste, type Pasted } from "./paste";
+import {
+  imageFromNativeClipboard,
+  imagesFrom,
+  isImagePaste,
+  needsNativeImageRead,
+  type NativeClipboardImage,
+  type Pasted,
+} from "./paste";
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
 import type { Meter } from "./usage";
@@ -83,6 +91,25 @@ export function Composer({
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };
 
+  const takeClipboardImage = (transfer: DataTransfer | null) => {
+    setFailure(null);
+    // Prefer the browser's File when it has one. WebKitGTK sometimes advertises
+    // an image MIME but provides no File, in which case the native clipboard is
+    // the only source that can still fulfill this user-initiated paste.
+    imagesFrom(transfer)
+      .catch(() => [])
+      .then(async (images) => {
+        if (images.length > 0) {
+          onAttach(images);
+          return;
+        }
+        const image = await invoke<NativeClipboardImage | null>("clipboard_image");
+        if (!image) throw new Error("the system clipboard did not provide an image");
+        onAttach([imageFromNativeClipboard(image)]);
+      })
+      .catch((error) => setFailure(`could not read that image: ${String(error)}`));
+  };
+
   const sendable = (value.trim().length > 0 || attachments.length > 0) && !disabled;
 
   return (
@@ -145,12 +172,20 @@ export function Composer({
           disabled={disabled}
           onChange={(event) => onChange(event.target.value)}
           onPaste={(event) => {
-            // Only intercept images; a text paste stays the textarea's.
-            if (!isImagePaste(event.clipboardData)) return;
+            // Text stays native. The final branch catches the empty WebKitGTK
+            // clipboard event shape, which can still be a system image paste.
+            if (!needsNativeImageRead(event.clipboardData)) return;
             event.preventDefault();
-            take(event.clipboardData);
+            takeClipboardImage(event.clipboardData);
           }}
           onKeyDown={(event) => {
+            // An IME uses Enter to accept the current candidate. That key must
+            // stay native: cancelling it or sending here resets composition and
+            // makes Chinese, Japanese, and Korean input visibly flicker.
+            // WebKit can report composition after the keydown, where 229 is the
+            // compatible signal for the same event.
+            if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+
             if (event.key === "Enter" && !event.shiftKey) {
               event.preventDefault();
               // Enter sends while idle and queues while running — the same key

@@ -56,7 +56,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
-9c. **窗口使用系统标题栏**（`decorations: true`）。浏览器是 Windows 上的原生子 webview，它会在 HTML 之上接收命中；系统 caption 位于非客户区，不会被它盖住。因此最小化、最大化、关闭一律由平台提供，`.topbar` 只是 app 工具栏，不带 `data-tauri-drag-region`，也不画 `WindowControls`。
+9c. **窗口使用 app 自绘标题栏**（`decorations: false`）。`.topbar` 与其 `--chrome` 背景是应用主题的一部分，不能继承系统 caption 颜色；最小化、最大化、关闭由 `WindowControls` 调用 Tauri window API，`WindowDragRegion` 将 `data-tauri-drag-region` 只放在不含交互控件的 `.topbar-gap`，并保留双击最大化。浏览器是原生子 webview，会在 HTML 之上接收命中，因此它只能由 pane body 的 DOM rect 定位在标题栏下方，绝不能覆盖 drag region 或窗口控制。
 
     **topbar 里只放 app 级别的东西**（返回启动台、折叠会话栏、显示偏好），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于整个 app 还是属于某个会话"：会话栏属于 app，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。
 

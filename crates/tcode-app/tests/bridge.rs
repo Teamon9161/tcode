@@ -23,7 +23,7 @@ use tcode_core::{
 };
 
 use tcode_app::bridge::{ApprovalAnswer, Emit, AGENT_EVENT, APPROVAL_REQUEST, TURN_FINISHED};
-use tcode_app::state::{run_turn, SessionHandle, Supervisor};
+use tcode_app::state::{run_compact, run_turn, SessionHandle, Supervisor};
 
 // ---------------------------------------------------------------- the webview
 
@@ -1487,4 +1487,86 @@ fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
     // nothing about the live model moves.
     assert!(tcode_app::picker::choose_model(&mut menus, &cell, 7, None).is_err());
     assert_eq!(cell.snapshot().effort.as_deref(), Some("high"));
+}
+
+/// Desktop slash commands keep their ledger semantics in Core: the bridge only
+/// selects the current session and interprets frontend-only effects.
+#[tokio::test]
+async fn desktop_slash_commands_clear_the_current_ledger_and_open_the_resume_picker() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(vec![text_done("answer")]), cwd.path());
+    let handle = handle("s1", cwd.path().to_path_buf());
+    let supervisor = Supervisor::new(agent.clone(), factory(), menus());
+    supervisor.open(handle.clone());
+
+    run_turn(
+        agent,
+        handle.clone(),
+        Arc::new(Sink(Arc::new(Collector::default()))),
+        say("hello"),
+        plain(),
+    )
+    .await
+    .unwrap();
+    assert!(!handle.history().is_empty());
+
+    let cleared = supervisor.dispatch_slash("s1", "/clear").unwrap();
+    assert!(matches!(
+        cleared.effects.as_slice(),
+        [tcode_core::commands::CommandEffect::ConversationCleared]
+    ));
+    assert!(
+        handle.history().is_empty(),
+        "/clear must also remove archived history"
+    );
+
+    let picker = supervisor.dispatch_slash("s1", "/resume").unwrap();
+    assert!(matches!(
+        picker.effects.as_slice(),
+        [tcode_core::commands::CommandEffect::OpenResumePicker]
+    ));
+}
+
+/// Manual compaction is a real turn boundary for the desktop bridge: it streams
+/// its dedicated events and settles the session before reporting completion.
+#[tokio::test]
+async fn desktop_compaction_streams_its_result_and_finishes_the_turn() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![text_done("answer"), text_done("compact summary")]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let handle = handle("s1", cwd.path().to_path_buf());
+
+    run_turn(
+        agent.clone(),
+        handle.clone(),
+        emit.clone(),
+        say("hello"),
+        plain(),
+    )
+    .await
+    .unwrap();
+    run_compact(
+        agent,
+        handle.clone(),
+        emit,
+        Some("keep the decision".into()),
+    )
+    .await
+    .unwrap();
+
+    let types = collector.event_types("s1");
+    assert!(types.contains(&"Compacting".to_string()), "got {types:?}");
+    assert!(types.contains(&"Compacted".to_string()), "got {types:?}");
+    assert!(handle.history().iter().any(
+        |entry| matches!(entry, tcode_core::Entry::Summary(summary) if summary == "compact summary")
+    ));
+    let finished = collector.payloads(TURN_FINISHED);
+    assert_eq!(finished.len(), 2, "normal turn and compaction each finish");
+    assert_eq!(finished.last().unwrap()["error"], Value::Null);
 }

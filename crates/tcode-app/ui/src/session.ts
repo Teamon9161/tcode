@@ -4,7 +4,7 @@ import type { Block } from "./blocks";
 import type { TouchedFile } from "./files";
 import type { Pasted } from "./paste";
 import type { Plan, PlanDraft } from "./plan";
-import type { ApprovalRequest, Queued, RewindPreview } from "./types";
+import type { ApprovalRequest, Queued, RewindPreview, StoredSession } from "./types";
 import type { RewindTarget } from "./rewind";
 import { NO_METER, type Limits, type Meter } from "./usage";
 
@@ -72,6 +72,8 @@ export type SessionState = {
    *  waits for the planning turn to *end*, because the `progress` tool still has
    *  to mark the plan active before another session may adopt it. */
   handoffPending: boolean;
+  /** Histories available to a bare `/resume`, or `null` when no picker is open. */
+  resumePicker: StoredSession[] | null;
   /** What this conversation occupies, what the last turn cost, and what the
    *  subscription has left. Folded from the event stream by `usage.ts`. */
   meter: Meter;
@@ -129,5 +131,6 @@ export const BLANK: SessionState = {
   planDraft: null,
   planOpen: false,
   handoffPending: false,
+  resumePicker: null,
   meter: NO_METER,
 };

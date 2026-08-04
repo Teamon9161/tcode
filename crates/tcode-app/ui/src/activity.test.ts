@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { phaseOf } from "./activity";
+import { phaseOf, statusLabel } from "./activity";
 import type { AgentEvent } from "./types";
 
 /**
@@ -54,6 +54,12 @@ describe("phaseOf", () => {
     expect(
       phase({ type: "TaskRunEvent", data: { run: "r1", event: { type: "ThinkingDelta", data: "…" } } }),
     ).toBeNull();
+  });
+
+  it("uses a leading capital when a phase is rendered as status copy", () => {
+    expect(statusLabel("calling a tool")).toBe("Calling a tool");
+    expect(statusLabel("Read 3 files")).toBe("Read 3 files");
+    expect(statusLabel("  ")).toBe("Working");
   });
 
   it("leaves the phase standing for events that are not about it", () => {

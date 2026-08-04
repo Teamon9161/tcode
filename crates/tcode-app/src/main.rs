@@ -66,6 +66,8 @@ fn main() -> anyhow::Result<()> {
         .invoke_handler(tauri::generate_handler![
             tcode_app::commands::sessions,
             tcode_app::commands::send_message,
+            tcode_app::commands::slash_command,
+            tcode_app::commands::clipboard_image,
             tcode_app::commands::respond_approval,
             tcode_app::commands::interrupt,
             tcode_app::commands::queued,

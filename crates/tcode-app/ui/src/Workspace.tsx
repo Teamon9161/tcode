@@ -25,11 +25,14 @@ import {
   type Tiling,
 } from "./layout";
 import { nearestPane, type Box, type Dir4 } from "./focus";
+import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
 import { BackIcon, ChevronDown, ChevronRight, CloseIcon, PlusIcon, SidebarIcon } from "./components/Icons";
 import { Panes, type PaneContext } from "./Panes";
 import { DisplayMenu } from "./DisplayMenu";
 import type { Display } from "./display";
+import { Wordmark } from "./components/Mark";
+import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import {
   loadOrder,
   moveProject,
@@ -62,10 +65,11 @@ import {
  * folder chip in each pane remains the path for choosing a different folder,
  * while the rail keeps the same-folder action next to the group it names.
  *
- * The system caption owns the window's title and controls so an embedded native
- * browser webview cannot intercept minimize, maximize, or close. This toolbar
- * deliberately carries only app-wide navigation and display controls; with the
- * window split, no single conversation is "the" one to name here.
+ * The app-owned caption uses the same theme token as the rest of the window.
+ * The browser child webview is confined to pane bodies below this bar, so it
+ * cannot intercept the window controls. This toolbar deliberately carries only
+ * app-wide navigation and display controls; with the window split, no single
+ * conversation is "the" one to name here.
  */
 export function Workspace({
   tiling,
@@ -80,6 +84,8 @@ export function Workspace({
   onInterrupt,
   onWithdrawQueued,
   onSendQueuedNow,
+  onResume,
+  onDismissResume,
   onAskRewind,
   onRewind,
   onAnswer,
@@ -106,6 +112,8 @@ export function Workspace({
   onInterrupt: (session: string) => void;
   onWithdrawQueued: PaneContext["onWithdrawQueued"];
   onSendQueuedNow: PaneContext["onSendQueuedNow"];
+  onResume: PaneContext["onResume"];
+  onDismissResume: PaneContext["onDismissResume"];
   onAskRewind: PaneContext["onAskRewind"];
   onRewind: PaneContext["onRewind"];
   onAnswer: (session: string, decision: Decision, comment: string, setMode?: ApprovalMode) => void;
@@ -354,6 +362,8 @@ export function Workspace({
     onInterrupt,
     onWithdrawQueued,
     onSendQueuedNow,
+    onResume,
+    onDismissResume,
     onAskRewind,
     onRewind,
     onAnswer,
@@ -373,6 +383,7 @@ export function Workspace({
   return (
     <div className={`workspace${rail ? "" : " is-folded"}`}>
       <header className="topbar">
+        <Wordmark />
         <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
           <BackIcon size={15} />
         </button>
@@ -389,12 +400,13 @@ export function Workspace({
         >
           <SidebarIcon size={15} />
         </button>
-        <span className="topbar-gap" />
         {/* What the window draws, not what any conversation holds — which is why
             it passes the bar's own test (rule 9c) where a session action would
             not. With the window split, "show reasoning" cannot mean one thing in
             the left pane and another in the right. */}
+        <WindowDragRegion />
         <DisplayMenu display={display} onChange={onDisplay} />
+        <WindowControls />
       </header>
 
       {/* Unmounted rather than hidden when folded: it holds no state of its own,
@@ -575,7 +587,7 @@ function RailProject({
                   <StatusDot status={statusOf(entry.id)} />
                   <span className="rail-lines">
                     <span className="rail-name">{title}</span>
-                    <span className="rail-activity">{state.activity}</span>
+                    <span className="rail-activity">{statusLabel(state.activity)}</span>
                   </span>
                 </button>
                 <button

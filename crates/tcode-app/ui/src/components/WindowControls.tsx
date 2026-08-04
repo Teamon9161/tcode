@@ -4,12 +4,22 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { CloseIcon, MaximizeIcon, MinimizeIcon, RestoreIcon } from "./Icons";
 
 /**
- * Legacy custom window controls.
+ * Controls for the app-owned title bar.
  *
- * The desktop app uses the native caption so an embedded child browser webview
- * cannot intercept their clicks. Keep this component unrendered unless a
- * platform-specific native hit-test layer is introduced alongside it.
+ * The native browser webview is confined to pane bodies below the title bar, so
+ * it cannot cover these controls even though native child webviews compose over
+ * the document.
  */
+export function WindowDragRegion() {
+  return (
+    <span
+      className="topbar-gap"
+      data-tauri-drag-region=""
+      onDoubleClick={() => getCurrentWindow().toggleMaximize().catch(complain)}
+    />
+  );
+}
+
 export function WindowControls() {
   const [maximized, setMaximized] = useState(false);
 

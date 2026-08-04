@@ -5,7 +5,9 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { Launchpad as LaunchpadData, ProjectInfo, SessionInfo, Status, StoredSession } from "./types";
 import { ago } from "./time";
 import { Wordmark } from "./components/Mark";
+import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import { Path } from "./components/Path";
+import { statusLabel } from "./activity";
 import { StatusPill } from "./components/Status";
 import { ChevronDown, ChevronRight, FolderIcon, PlusIcon } from "./components/Icons";
 
@@ -68,6 +70,8 @@ export function Launchpad({
           screen; it now sits on the list it adds to. */}
       <header className="topbar">
         <Wordmark />
+        <WindowDragRegion />
+        <WindowControls />
       </header>
 
       <div className="launchpad-scroll">
@@ -98,7 +102,7 @@ export function Launchpad({
                       home={data?.home ?? null}
                       keep={3}
                     />
-                    <span className="card-line">{activityOf(session.id)}</span>
+                    <span className="card-line">{statusLabel(activityOf(session.id))}</span>
                   </button>
                 ))}
               </div>

@@ -60,6 +60,8 @@ pub struct SessionFactory {
     config_file: PathBuf,
     model_cell: ModelCell,
     shell_filters: Arc<ShellFilters>,
+    opening_context: tcode_core::commands::OpeningContextFn,
+    environment: tcode_core::commands::EnvironmentFn,
 }
 
 impl SessionFactory {
@@ -74,7 +76,18 @@ impl SessionFactory {
             config_file,
             model_cell,
             shell_filters,
+            opening_context: Arc::new(tcode_tools::startup_context_with_scratch),
+            environment: Arc::new(tcode_tools::environment_snapshot),
         }
+    }
+
+    pub fn command_context(
+        &self,
+    ) -> (
+        tcode_core::commands::OpeningContextFn,
+        tcode_core::commands::EnvironmentFn,
+    ) {
+        (self.opening_context.clone(), self.environment.clone())
     }
 
     /// Open `cwd` as a conversation. `resume` names an existing session log to
@@ -95,8 +108,8 @@ impl SessionFactory {
                 None => tcode_frontend::ResumeSpec::New,
             },
             shell_filters: self.shell_filters.clone(),
-            opening_context: Arc::new(tcode_tools::startup_context_with_scratch),
-            environment: Arc::new(tcode_tools::environment_snapshot),
+            opening_context: self.opening_context.clone(),
+            environment: self.environment.clone(),
         })
     }
 }

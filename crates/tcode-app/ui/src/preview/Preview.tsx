@@ -906,6 +906,8 @@ export function Preview() {
                   setQueued((was) => was.filter((_item, at) => at !== index))
                 }
                 onSendQueuedNow={() => setQueued([])}
+                onResume={() => {}}
+                onDismissResume={() => {}}
                 onAskRewind={(_, target) =>
                   setRewindAsk(
                     target
