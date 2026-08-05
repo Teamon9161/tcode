@@ -11,7 +11,7 @@ import {
   navValue,
   type Inspect,
 } from "./inspect";
-import { frames, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
+import { frames, paneSession, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
 import { linkTarget } from "./links";
 import { LinkContext, type Follow } from "./Prose";
 import { basename } from "./show";
@@ -19,11 +19,13 @@ import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, CollapseIcon, ColumnsIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon, RowsIcon } from "./components/Icons";
+import { BackIcon, CloseIcon, CollapseIcon, ColumnsIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon, RowsIcon, TerminalIcon } from "./components/Icons";
+import { MOD } from "./keys";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
 import { WebPane } from "./WebPane";
+import { TermPane } from "./TermPane";
 import { Approval } from "./Approval";
 import { ProgressStrip } from "./ProgressStrip";
 import { QueueStrip } from "./QueueStrip";
@@ -75,6 +77,13 @@ export type PaneContext = {
   onToggleWorkspace: (pane: string, session: string) => void;
   /** Open the window-owned browser from the local file-navigation tool group. */
   onOpenBrowser: () => void;
+  /** Show, focus or hide the window's terminals — the three states `Mod+J`
+   *  steps through (`toggleTerminal` in `layout.ts`). */
+  onToggleTerminal: () => void;
+  /** Where a new terminal tab starts. The focused conversation's folder, since
+   *  with the window split "the current folder" is otherwise a guess — the same
+   *  reason `Mod+N` reads it off the focused pane (AGENTS.md rule 9c). */
+  terminalCwd: string;
   /** Send the window's browser to a page — what following a link in prose does.
    *  Distinct from `onOpenBrowser`, which is a toggle and would put the browser
    *  away exactly when somebody asked it for something. */
@@ -338,7 +347,7 @@ function Pane({
   hidden: boolean;
 }) {
   const current = context.split && leaf.id === context.focus;
-  const session = leaf.pane.kind === "web" ? "" : leaf.pane.session;
+  const session = paneSession(leaf.pane) ?? "";
   const cwd = context.sessions.find((open) => open.id === session)?.cwd ?? "";
 
   // Where a link in this pane's prose goes. Bound per pane because that is the
@@ -386,6 +395,14 @@ function Pane({
           onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
           hidden={hidden}
           request={context.webRequest}
+        />
+      ) : leaf.pane.kind === "terminal" ? (
+        <TermPane
+          cwd={context.terminalCwd}
+          onClose={() => context.onClosePane(leaf.id)}
+          expanded={expanded}
+          onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
+          focused={leaf.id === context.focus}
         />
       ) : (
         <SessionContext.Provider value={leaf.pane.session}>
@@ -490,6 +507,18 @@ function SessionPane({
           title="Open or close the browser"
         >
           <GlobeIcon size={14} />
+        </button>
+        {/* Beside the browser rather than in the title bar: both are the
+            window's, but this row is where the window's other surfaces are
+            reached from, and a key nobody has been told about is a feature
+            nobody finds. */}
+        <button
+          className="icon-btn"
+          onClick={context.onToggleTerminal}
+          aria-label="Open or hide the terminals"
+          title={`Terminals (${MOD}+J)`}
+        >
+          <TerminalIcon size={14} />
         </button>
         <ExpandPane leaf={leaf} context={context} />
         <button

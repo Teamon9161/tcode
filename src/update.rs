@@ -5,7 +5,7 @@
 //! SHA-256 digest, then atomically replace the installed executable.
 
 use std::{
-    io::{IsTerminal as _, Write as _},
+    io::Write as _,
     path::{Path, PathBuf},
 };
 
@@ -297,7 +297,7 @@ async fn download_asset(client: &reqwest::Client, url: &str, asset: &str) -> Res
         .error_for_status()
         .with_context(|| format!("GitHub returned an error for {url}"))?;
     let total = response.content_length();
-    let mut progress = DownloadProgress::new(asset, total);
+    let mut progress = DownloadProgress::new(asset);
     let mut bytes = Vec::with_capacity(total.unwrap_or(0).try_into().unwrap_or(0));
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -308,106 +308,50 @@ async fn download_asset(client: &reqwest::Client, url: &str, asset: &str) -> Res
                 return Err(error).with_context(|| format!("cannot read {url}"));
             }
         };
-        progress.advance(chunk.len() as u64);
         bytes.extend_from_slice(&chunk);
     }
     progress.finish();
     Ok(bytes)
 }
 
-/// One-line download feedback that stays readable in redirected output.
+/// One-line download feedback that stays readable in redirected output and
+/// cannot flood a terminal. The whole report is "Downloading …" printed once,
+/// then " done" when the bytes land: a per-percent `\r`-based bar scrolls the
+/// screen in any terminal that does not treat carriage return as "back to the
+/// start of this line" (and in logs that split on it), so this path never
+/// emits one.
 struct DownloadProgress {
     asset: String,
-    total: Option<u64>,
-    downloaded: u64,
-    interactive: bool,
-    last_percent: Option<u8>,
+    printed: bool,
 }
 
 impl DownloadProgress {
-    fn new(asset: &str, total: Option<u64>) -> Self {
-        let interactive = std::io::stdout().is_terminal();
+    fn new(asset: &str) -> Self {
         let mut progress = Self {
             asset: asset.to_string(),
-            total,
-            downloaded: 0,
-            interactive,
-            last_percent: None,
+            printed: false,
         };
         progress.render();
         progress
     }
 
-    fn advance(&mut self, len: u64) {
-        self.downloaded += len;
-        self.render();
-    }
-
     fn finish(&mut self) {
-        if !self.interactive {
-            println!(" done");
-            return;
-        }
-        self.render_final();
+        println!(" done");
     }
 
+    /// A failed download gets its error on its own line instead of glued to
+    /// the un-terminated "Downloading …".
     fn abort(&self) {
-        if self.interactive {
-            println!();
-        }
+        println!();
     }
 
     fn render(&mut self) {
-        if !self.interactive {
-            if self.last_percent.is_none() {
-                print!("Downloading {}...", self.asset);
-                let _ = std::io::stdout().flush();
-                self.last_percent = Some(0);
-            }
-            return;
+        if !self.printed {
+            print!("Downloading {}...", self.asset);
+            let _ = std::io::stdout().flush();
+            self.printed = true;
         }
-        let Some(percent) = self.percent() else {
-            if self.last_percent.is_none() {
-                print!("Downloading {}...", self.asset);
-                let _ = std::io::stdout().flush();
-                self.last_percent = Some(0);
-            }
-            return;
-        };
-        if self.last_percent == Some(percent) {
-            return;
-        }
-        self.last_percent = Some(percent);
-        print!(
-            "\rDownloading {}  [{}] {:>3}%",
-            self.asset,
-            progress_bar(percent),
-            percent
-        );
-        let _ = std::io::stdout().flush();
     }
-
-    fn render_final(&self) {
-        let percent = self.percent().unwrap_or(100);
-        println!(
-            "\rDownloading {}  [{}] {:>3}%",
-            self.asset,
-            progress_bar(percent),
-            percent
-        );
-    }
-
-    fn percent(&self) -> Option<u8> {
-        self.total
-            .filter(|total| *total > 0)
-            .map(|total| ((self.downloaded * 100) / total).min(100) as u8)
-    }
-}
-
-fn progress_bar(percent: u8) -> String {
-    const WIDTH: usize = 24;
-    let filled = usize::from(percent) * WIDTH / 100;
-    format!("{}{}", "#".repeat(filled), "-".repeat(WIDTH - filled))
 }
 
 fn checksum_for(checksums: &str, asset: &str) -> Option<String> {
@@ -478,22 +422,16 @@ mod tests {
     }
 
     #[test]
-    fn progress_bar_has_a_fixed_width() {
-        assert_eq!(progress_bar(0), "------------------------");
-        assert_eq!(progress_bar(50), "############------------");
-        assert_eq!(progress_bar(100), "########################");
-    }
-
-    #[test]
-    fn progress_percent_caps_at_complete() {
-        let progress = DownloadProgress {
-            asset: "tcode.exe".into(),
-            total: Some(100),
-            downloaded: 125,
-            interactive: false,
-            last_percent: None,
-        };
-        assert_eq!(progress.percent(), Some(100));
+    fn progress_reports_once() {
+        // The download report is a single line with no `\r` updates: a
+        // per-percent bar scrolls the screen in any environment that does not
+        // treat carriage return as "back to the start of this line". Rendering
+        // again must not add a second line.
+        let mut progress = DownloadProgress::new("tcode-x86_64-linux");
+        progress.render();
+        progress.render();
+        assert!(progress.printed);
+        progress.finish();
     }
 
     #[test]

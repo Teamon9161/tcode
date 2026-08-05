@@ -925,6 +925,10 @@ function FirstRun() {
           <dt>{MOD} + W</dt>
           <dd>close this pane</dd>
         </div>
+        <div>
+          <dt>{MOD} + J</dt>
+          <dd>terminals</dd>
+        </div>
       </dl>
     </div>
   );

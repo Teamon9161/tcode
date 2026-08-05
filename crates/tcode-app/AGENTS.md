@@ -18,7 +18,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
-**改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
+**改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / web / terminal / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
 
 **开关是 `--mode` 而不是环境变量，这条是踩出来的**：原来写的是 `PREVIEW=1 vite`，那是 POSIX shell 给单条命令设环境变量的语法，在 cmd 与 PowerShell 里是**解析错误**——于是"改界面先开预览"这条规矩在 Windows 上整整一段时间根本执行不了，而失败长得像 npm 坏了。新加需要开关的 script 一律用 CLI flag。
 
@@ -120,6 +120,24 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **tab 只给 `web` 窗格，别的 inspect 值一个都不给。** `inspect.ts` 那条"单值槽不是 tab 容器"仍然成立，它服务的是**对照**（想同时看两样就分屏）；浏览网页要的是**切换**，同屏摊开五个网页没有意义,而每开一页裂一个窗格会把窗口撑爆。两种窗格要的是不同的东西,所以这是一次有理由的例外,不是先例——发现自己想给 diff 或 run 加 tab 时，回来读这一段。
 
+9i. **终端窗格是窗口级单例，但和浏览器不是同一类东西**（`src/terminal.rs` + `ui/src/termHost.ts` + `ui/src/TermPane.tsx`，`Pane` 的第四个变体 `{kind:"terminal"}`）。规则 9h 那些坑这里一个都没有——它是 DOM，不是原生子 webview，所以不用让位给 popover、不用连续上报 rect、也不需要任何 capability。反过来，它有一组自己的。
+
+    **终端是用户的，模型碰不到。** 没有任何工具能往 PTY 里写字节，也不许加：模型跑命令的唯一入口是 `shell` 工具，那条路上有审批面板，而一个模型能驱动的终端就是第二条没有面板的路。任何"从别处取字节喂进终端"的新代码都破这条，无论看起来多顺手。
+
+    **它同样不带 `session`，而且比浏览器更硬**：那里面有东西在**跑**。关掉一个对话不该顺手杀掉你的 `npm run dev`，而 `closeSession` 按 `paneSession` 过滤，所以答 `null` 就是全部防线。`Mod+J` 收起也只是关窗格，PTY 一律不动（"hiding is not closing"，与浏览器同一句话）。
+
+    **`Mod+J` 是三态不是开关**（`layout.ts::toggleTerminal`，有测试）：没开→开+聚焦；开着但焦点不在→聚焦；焦点在里面→收起。中间那态是日常最常发生的一次，纯 toggle 会在这里把终端收走。它 split 的是 **root** 而不是聚焦窗格——这一条就是"IDE 底部横贯一条"与"塞在某个窗格下面"的全部差别，而 `split` 本来就接受任意节点 id，所以不需要新机制。
+
+    **xterm 实例活在 React 之外**（`termHost.ts` 的 module registry）：host 元素挂载时搬进窗格、卸载时搬出来，**永远不重建**。`Mod+J` 收起就是卸载组件；实例放在 React state 里，这一下清空每个 tab 的 scrollback，而 shell 还在跑——再打开是一片空白配一个正在输出的进程。tab 列表同理在这里，不在窗格树里（那棵树只有 `{kind:"terminal"}`，纯数据那条 9d 不变）。
+
+    **PTY 的字节永远是字节。** 读边界经常落在 UTF-8 序列或转义序列中间，两侧都不许 `from_utf8_lossy` 或 `atob`→string，一律 base64 过桥交给 xterm 拼。字符串化不是把那半个字符延后，是销毁它。
+
+    **输出必须在后端合流再发**（`FLUSH_WINDOW` 16ms / `MAX_CHUNK` 64KB，reader 线程只负责读、pump 线程持时钟）。一次 read 一个事件时，`yes` 或任何带进度条的命令每秒能发几千个 event，webview 直接停止重绘——症状是整个窗口卡死，不是"输出有点慢"。
+
+    **`terminal_open` 返回 id 之前后端就已经在读了**，shell 的提示符经常先到。早到的 chunk 进 `pending`，注册后回放；删掉这段的表现是"偶尔看不到第一行提示符"，而且只在快的机器上出现。
+
+    **终端里的键盘绝大部分不属于这个 app**（`keys.ts::appOwnedInTerminal`，xterm 与窗口两侧读**同一个**谓词）。`Ctrl+C/D/Z/R/W/U` 全是 shell 的，一个抢走它们的 app 是没法在里面干活的 app；留给 app 的只有 `Mod+J`（进得去就得出得来）、`Mod+Alt+方向/R`、以及 `Mod+Shift+T/W` 两个 tab 动词。**两份名单等于一个键既发给 shell 又被 app 执行**——`Mod+J` 破这条时的表现是收起窗格的同时给 shell 发一个换行，也就是把你刚打了一半的东西执行掉。
+
 10. **模型输出永远不许变成 markup**。`rich.tsx` 只用 marked 取 token，再**构造**白名单内的 React 元素；认不出的 token、原始 HTML token、不在协议白名单里的链接，一律按字面文本渲染。理由不是洁癖：这个 webview 里跑起来的脚本能拿到 `window.__TAURI__`，等于本机任意命令，而模型输出里天然混着文件内容、抓取的网页和 MCP 结果——按信任边界那条，它们是**观察到的数据**，不是指令。
 
     **正文里的链接由 `links.ts` 路由，`rich()` 永远不收回调**（`Prose.tsx`）。点击是委托在容器上认 `a.prose-link` 的，因为 `rich()` 是按源文本全局缓存的纯函数（规则 21）——给它传 onOpen 等于让两个窗格抢同一条缓存。取 `href` 只能用 `getAttribute`，`.href` 属性会按 app 自己的 URL 解析，把 `out/plot.csv` 变成 `tauri://localhost/…`。落点也不是新地方：http(s) 进那个 capability 恒空的浏览器窗格，路径进 `show` 用的同一个 viewer（后端照样重验 `is_viewable_path`）。**认不出的一律 `none` 且照样 `preventDefault`**——`mailto:`/`tel:` 是把模型输出交给另一个应用，那是比"让正文可点"大得多的决定；而 `target="_blank"` 保留着，它是万一没被handler 接住时 app 自己不会被导航走的兜底。
@@ -149,7 +167,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **它确实弄脏了规则 13 的"一张表两个入口"，这条要睁眼看着**：` ```html ` 围栏仍走 sandbox，`.html` 文件走 framed，这是那张表里**唯一**一处内联与文件不同的条目。理由是这两个位置装的东西对 mermaid/svg 是同一个（同一段源换个地方），对 html 不是：围栏里的是模型手写的 markup，文件是脚本产出的文档。**但这个不对称有个真实的缺口**——模型可以 `write` 一段自己手写的 HTML 到文件再 `show` 它，那段 markup 就换了跑道。缓解写在 `serve.rs` 的 `POLICY` 上（`connect-src 'self'` + `form-action 'none'`，堵外传不堵渲染），**它是纵深不是边界**，理由同样写在那儿：能写 HTML 的前提是能写文件+能跑脚本，而那两件事都过审批，且都是更直接的出口。改这条之前先读那段注释。
 
-12. **沙箱拿到的主题值必须是 sRGB**。主题用 OKLCH 写，而沙箱里的第三方库自己解析颜色（mermaid 的 khroma 直接拒绝 `oklch(...)`）。`Sandbox.tsx` 的 `readTheme()` 负责光栅化转换后再发过去——注意只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回。
+12. **主题值交给别人画之前必须转成 sRGB，而转换只有一处**（`ui/src/color.ts::asColor`）。主题用 OKLCH 写，而有两个消费者自己解析颜色：沙箱里的第三方库（mermaid 的 khroma 直接拒绝 `oklch(...)`）与终端（xterm 要一张颜色表，不是样式表）。`Sandbox.tsx::readTheme()` 与 `termHost.ts::readTheme()` 都调同一个函数，**不许各写一份**——只读 `fillStyle` 是不够的，Chrome 会把 `oklch()` 原样序列化回来，必须真画一个像素读回，而抄第二遍踩到它时的表现是颜色不对，不是报错。
 
 13. **`show` 出来的文件与模型自己写的正文同级不可信**（`ui/src/Shown.tsx` + `src/commands.rs::shown_file`）。文件是脚本产出的、不是模型手写的，但那不抬高它的信任等级——它同样是观察到的数据。所以 `.svg`/`.mmd`/echarts option **必须走规则 11 那同一个 `sandbox="allow-scripts"` 无 same-origin 的 iframe**；`.html` 走 11b 的本机 origin（**同样不许**改用 asset 协议、给它 app 的源、或直接 `location = file://`——它拿到的是一个**第三方**源，不是放行）。图片走后端返回的 `data:` URL（CSP `img-src` 已有 `data:`），因此也不需要任何新协议。
 

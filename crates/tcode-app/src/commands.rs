@@ -1282,6 +1282,55 @@ pub fn browser_close(browser: State<'_, Arc<crate::browser::Browser>>) -> Result
     browser.close()
 }
 
+/// Start a shell for a new terminal tab.
+///
+/// The folder is data (rule 3) and takes the same canonicalizing path every
+/// other folder in this app does, so a tab cannot be opened on `\\?\C:\…` or on
+/// a path that no longer exists. A terminal is the *user's*, so there is no
+/// permission question here — but there is still a "does this folder exist"
+/// question, and answering it here beats a shell that starts in `/` because its
+/// `cwd` was rejected silently.
+#[tauri::command]
+pub fn terminal_open(
+    app: AppHandle,
+    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    cwd: String,
+    cols: u16,
+    rows: u16,
+) -> Result<String, String> {
+    let dir = crate::paths::canonical_dir(Path::new(&cwd))
+        .map_err(|error| format!("cannot open a terminal in {cwd}: {error}"))?;
+    terminals.open(Arc::new(app), &dir, cols, rows)
+}
+
+/// Keystrokes, base64. See `terminal.rs` for why they are not a string.
+#[tauri::command]
+pub fn terminal_write(
+    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    id: String,
+    data: String,
+) -> Result<(), String> {
+    terminals.write(&id, &data)
+}
+
+#[tauri::command]
+pub fn terminal_resize(
+    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    id: String,
+    cols: u16,
+    rows: u16,
+) -> Result<(), String> {
+    terminals.resize(&id, cols, rows)
+}
+
+#[tauri::command]
+pub fn terminal_close(
+    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    id: String,
+) -> Result<(), String> {
+    terminals.close(&id)
+}
+
 /// The URL a frame loads to display a file, instead of its bytes.
 ///
 /// This is the same request as `shown_file` answered a different way, and which

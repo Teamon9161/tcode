@@ -14,4 +14,5 @@ pub mod picker;
 pub mod projects;
 pub mod serve;
 pub mod state;
+pub mod terminal;
 pub mod workspace;

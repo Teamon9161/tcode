@@ -184,11 +184,9 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4. plan模式比如execute in a new session, detail的内容感觉是在太少了,不像以前plan mode那样,plan是特别详细的,这是为什么呢, 没什么detail的plan感觉作用不大吧,等于new session又要重新探索.
 5. read：读取 Curves.tsx 时，工具返回“文件未变更，内容已在上下文中”，但压缩后的可见上下文并没有该文件内容，导致必须追加一次 force=true 读取。若上下文经过压缩，read 应返回所请求的片段而非“已在上下文”提示，可避免这次额外调用。
 6. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
 7. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
 8. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
-9. app terminal窗格, 类似ide, 主题跟随tcode app, 支持ctrl+j调出.
 10. skill命令不会出现在app的/slash command提示中，这个能做吗
 11. Tool friction — shell: 一个测试命令超时被 harness 杀掉后，Windows 的常规 target 中 agent_loop*.exe 持续被 linker 报为已锁定，即使随后未发现 cargo、rustc 或测试进程。为完成验证，我不得不使用会话私有的 CARGO_TARGET_DIR 重编译并在结束后删除。shell 超时时若能终止完整子进程树并等待句柄释放，可避免这一额外编译与目标目录切换。

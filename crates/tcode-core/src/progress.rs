@@ -945,10 +945,41 @@ pub fn review_copy(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<Value, S
         .map_err(|conflict| conflict.message())?;
     progress.apply_content(input)?;
     progress.save()?;
+    if let Some(error) = undetailed(progress.phases()) {
+        return Err(error);
+    }
     let mut review = input.clone();
     review[REVIEW_BODY_FIELD] = Value::String(progress.body());
     review[REVIEW_PATH_FIELD] = Value::String(progress.path().display().to_string());
     Ok(review)
+}
+
+/// The submission's phases that carry no prose, as the error refusing them.
+///
+/// A draft is the one shape of progress file whose reader is someone other than
+/// the conversation that wrote it: the person about to approve it, and often a
+/// session handed the file and nothing else. Both are the reason `detail`
+/// exists, so submission is the one moment where its absence is a defect rather
+/// than a budget decision — everywhere else a phase without prose is a model
+/// tracking work it can still see. Enforced here rather than asked for in the
+/// tool description because the description is what the model economizes on:
+/// prose costs output tokens now and pays a reader it will never meet.
+///
+/// Only top-level phases. A sub-phase is read inside its parent's detail, and
+/// demanding prose under each of them buys repetition, not context.
+fn undetailed(phases: &[Phase]) -> Option<String> {
+    let missing: Vec<&str> = phases
+        .iter()
+        .filter(|phase| phase.detail.trim().is_empty())
+        .map(|phase| phase.phase.as_str())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Not submitted, and the user was not asked: these phases have no `detail` — {}. A plan under review is read by someone who was not in this conversation, and may be executed by a session that has this file and nothing else, so every phase needs its reasoning written down: the files and symbols it touches, what you found in them that decides the approach, what you ruled out and why, why it comes at this point, and what could break. Re-send `phases` with that written out; the phases that already have detail can leave it out to keep it.",
+        missing.join(", ")
+    ))
 }
 
 /// Apply an ordinary (or approved) `progress` call to the session's file.
@@ -1726,7 +1757,8 @@ mod tests {
         review_copy(
             &ctx,
             &json!({ "title": "Rewrite the resume path", "state": "active",
-                     "phases": [{ "phase": "survey the callers again", "status": "pending" }] }),
+                     "phases": [{ "phase": "survey the callers again", "status": "pending",
+                                  "detail": "read only" }] }),
         )
         .unwrap();
         assert_eq!(ctx.progress.lock().unwrap().as_ref().unwrap().path(), first);
@@ -1741,6 +1773,49 @@ mod tests {
         assert_eq!(progress.phases()[0].phase, "what the user wants");
     }
 
+    /// The two tiers of detail, which are a function of `state` and not of the
+    /// model's read on the task: a plan submitted for review is read by a human
+    /// and possibly executed by a session with nothing but the file, so a phase
+    /// with nothing written under it bounces before the reviewer is asked
+    /// anything; a file tracking this conversation's own work never is.
+    #[test]
+    fn a_submission_needs_detail_under_every_phase() {
+        let ctx = test_ctx();
+        let submit = |migrate: Value| {
+            json!({
+                "title": "Rewrite the resume path",
+                "state": "active",
+                "phases": [
+                    { "phase": "survey the callers", "status": "pending", "detail": "read only" },
+                    migrate
+                ]
+            })
+        };
+        let error = review_copy(
+            &ctx,
+            &submit(json!({ "phase": "migrate them", "status": "pending" })),
+        )
+        .unwrap_err();
+        assert!(error.contains("migrate them"), "{error}");
+        assert!(!error.contains("survey the callers"), "{error}");
+
+        // The retry is not a blind rewrite: nothing was ever stored under it.
+        review_copy(
+            &ctx,
+            &submit(json!({ "phase": "migrate them", "status": "pending",
+                            "detail": "callers live in session.rs" })),
+        )
+        .unwrap();
+
+        // Tracking your own work is not a submission, and is not gated.
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it",
+                     "phases": [{ "phase": "do it", "status": "in_progress" }] }),
+        )
+        .unwrap();
+    }
+
     /// A session can retain a declined draft, but the next task's title must
     /// select a new tracker rather than mutating the abandoned file in place.
     #[test]
@@ -1751,7 +1826,7 @@ mod tests {
             &json!({
                 "title": "Functional test plan",
                 "state": "active",
-                "phases": [{ "phase": "run tests", "status": "pending" }]
+                "phases": [{ "phase": "run tests", "status": "pending", "detail": "cargo test" }]
             }),
         )
         .unwrap();
@@ -1766,7 +1841,8 @@ mod tests {
             &json!({
                 "title": "Fix plan review flow",
                 "state": "active",
-                "phases": [{ "phase": "write regression", "status": "pending" }]
+                "phases": [{ "phase": "write regression", "status": "pending",
+                             "detail": "cover the declined path" }]
             }),
         )
         .unwrap();

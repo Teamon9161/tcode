@@ -10,10 +10,29 @@ export const TURN_FINISHED = "tcode://turn-finished";
  *  webview that owns it — the address bar reads this and never sets it. */
 export const BROWSER_NAVIGATED = "tcode://browser-navigated";
 
+/** Mirrors `terminal::TERMINAL_OUTPUT`. Chunks of one terminal's output,
+ *  coalesced on the backend — see `terminal.rs` for why a flood must not be one
+ *  event per read. */
+export const TERMINAL_OUTPUT = "tcode://terminal-output";
+/** Mirrors `terminal::TERMINAL_EXIT`. The program ended; the tab does not. */
+export const TERMINAL_EXIT = "tcode://terminal-exit";
+
 /** Mirrors `browser::Navigated`. `title` is empty on the navigation itself and
  *  arrives filled in when the document sets one, which is a second event for
  *  the same page rather than a correction. */
 export type Navigated = { url: string; title: string };
+
+/**
+ * A chunk of a terminal's output.
+ *
+ * `data` is base64, and that is not a wrapper anybody chose for convenience: a
+ * PTY read lands wherever the kernel put it, routinely inside a UTF-8 sequence
+ * or an escape sequence, so the bytes have to cross intact and be reassembled
+ * by the emulator. Decoding to a string on either side destroys the split
+ * character rather than delaying it.
+ */
+export type TerminalOutput = { id: string; data: string };
+export type TerminalExit = { id: string; code: number };
 
 /** `AgentEvent`, adjacently tagged: unit variants carry no `data` at all. */
 export type AgentEvent =

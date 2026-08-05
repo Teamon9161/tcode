@@ -12,6 +12,10 @@ import "@fontsource/ibm-plex-mono/500.css";
 // Swapping the theme import here swaps the entire look.
 import "./theme/base.css";
 import "./theme/porcelain.css";
+// The emulator's structural CSS — cell geometry and the viewport, not colour;
+// its palette comes from `--term-*` through `termHost.ts`. Ahead of `app.css`
+// so this app's rules for that pane win (`.pane-body.is-term`).
+import "@xterm/xterm/css/xterm.css";
 import "./app.css";
 
 import { App } from "./App";

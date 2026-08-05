@@ -247,6 +247,15 @@ export const GlobeIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/** A prompt and a caret: the one shape that means "you type here, and a
+ *  program answers" without borrowing a screen bezel from a 1980s icon set. */
+export const TerminalIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M5 7.5 9.5 12 5 16.5" />
+    <path d="M12.5 16.5H19" />
+  </Glyph>
+);
+
 export const SettingsIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M4 8h10M18 8h2M4 16h4M12 16h8" />

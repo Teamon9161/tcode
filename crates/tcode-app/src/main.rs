@@ -41,6 +41,7 @@ fn main() -> anyhow::Result<()> {
         .manage(startup.supervisor)
         .manage(startup.serve)
         .manage(tcode_app::browser::Browser::new())
+        .manage(tcode_app::terminal::Terminals::new())
         .setup(|app| {
             // The browser is a child webview of the main window. WebView2 hangs
             // when the parent HWND is destroyed while its controller is still
@@ -54,11 +55,20 @@ fn main() -> anyhow::Result<()> {
                 .state::<Arc<tcode_app::browser::Browser>>()
                 .inner()
                 .clone();
+            // The same reason, one layer along: a terminal holds a child
+            // process, and the window closing is not something any pane can
+            // intercept. Without this the shells — and anything they were
+            // running — outlive the app that started them.
+            let terminals = app
+                .state::<Arc<tcode_app::terminal::Terminals>>()
+                .inner()
+                .clone();
             app.get_window("main")
                 .expect("the main window is open")
                 .on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
                         let _ = browser.close();
+                        terminals.close_all();
                     }
                 });
             Ok(())
@@ -105,6 +115,10 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::browser_step,
             tcode_app::commands::browser_reload,
             tcode_app::commands::browser_close,
+            tcode_app::commands::terminal_open,
+            tcode_app::commands::terminal_write,
+            tcode_app::commands::terminal_resize,
+            tcode_app::commands::terminal_close,
             tcode_app::commands::picker_state,
             tcode_app::commands::choose_model,
             tcode_app::commands::choose_preset,

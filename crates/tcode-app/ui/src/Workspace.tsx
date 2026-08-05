@@ -22,9 +22,11 @@ import {
   setRatio,
   show,
   showBeside,
+  toggleTerminal,
   webPane,
   type Tiling,
 } from "./layout";
+import { inTerminal } from "./keys";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
 import { statusLabel } from "./activity";
@@ -270,14 +272,37 @@ export function Workspace({
    *   Mod+Alt+←↑↓→     move focus to the pane that way
    *   Mod+W            close this pane (the conversation keeps running)
    *   Mod+Alt+R        turn this split from side-by-side to stacked
+   *   Mod+J            show, focus, or hide the terminals
    *
    * Digits are read from `event.code`, not `event.key`: with Shift down the
    * key is "!" on a US layout and something else again elsewhere, so the digit
    * is only reliably in the physical code.
+   *
+   * Inside a terminal almost none of this applies, and that is the point of
+   * `appOwnedInTerminal` in `keys.ts`: `Mod+W` deletes a word there, `Mod+N`
+   * steps the history, and an app that takes them is an app you cannot work in.
+   * What survives is the pair with no readline meaning — `Mod+J`, which is the
+   * way back out, and the `Mod+Alt` moves.
    */
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey)) return;
+      const shell = inTerminal(event.target);
+
+      // First, because it is the one binding that has to work from anywhere —
+      // including from inside the terminal it hides.
+      if (!event.altKey && !event.shiftKey && (event.key === "j" || event.key === "J")) {
+        event.preventDefault();
+        onTiling(toggleTerminal);
+        return;
+      }
+
+      // Everything below this line is given back to the shell, and only the
+      // `Mod+Alt` pair survives — nothing in a terminal uses that modifier
+      // combination, while every bare `Mod` chord below means something to
+      // readline. The tab verbs are answered by the pane itself (`TermPane`),
+      // which is where "which tab" is a question with an answer.
+      if (shell && !event.altKey) return;
 
       // A new conversation in *this pane's* folder, which is the only folder the
       // keyboard can name without guessing: with the window split there are two
@@ -379,6 +404,20 @@ export function Workspace({
     () => onTiling((current) => openWeb(current, fieldAspect())),
     [onTiling],
   );
+  // No aspect: the terminals are a dock across the bottom whatever shape the
+  // window is, which is what makes it read as an IDE's rather than as another
+  // pane that landed wherever there was room (`toggleTerminal`).
+  const openTerminal = useCallback(() => onTiling(toggleTerminal), [onTiling]);
+  // The folder a new tab starts in. Read off the focused pane for the reason
+  // rule 9c gives: with the window split, "the current folder" is a guess, and
+  // the pane you are in is what makes it answerable. Falling back to the first
+  // conversation covers the case where focus is on the browser or the terminal
+  // itself — some folder beats none, and it is the one the rail leads with.
+  const terminalCwd = useMemo(() => {
+    const seat = focused(tiling);
+    const held = seat && paneSession(seat.pane);
+    return sessions.find((open) => open.id === held)?.cwd ?? sessions[0]?.cwd ?? "";
+  }, [tiling, sessions]);
   // Following a link, as opposed to reaching for the browser. It must not go
   // through `openWeb`: that one is a toggle, so asking it for a page while the
   // browser is already open would put the browser away instead.
@@ -433,6 +472,8 @@ export function Workspace({
       onToggleFiles: toggleFiles,
       onToggleWorkspace: toggleWorkspace,
       onOpenBrowser: openBrowser,
+      onToggleTerminal: openTerminal,
+      terminalCwd,
       onOpenUrl: openUrl,
       webRequest,
       expanded,
@@ -473,6 +514,8 @@ export function Workspace({
       toggleFiles,
       toggleWorkspace,
       openBrowser,
+      openTerminal,
+      terminalCwd,
       openUrl,
       webRequest,
       expanded,

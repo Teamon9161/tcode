@@ -471,6 +471,81 @@ One shape per job, used everywhere:
   that paragraph — which is what they are there to do. The quote is also exactly
   what the model receives, so what is on screen is what is sent.
 
+## The terminal
+
+The one surface in this app that *is* a terminal, in an app whose first
+anti-reference is the terminal look. Both hold, because the terminal here is a
+**document lying on this surface** rather than a window from somewhere else: it
+runs on the app's paper, in the app's mono face, at the app's density, and
+everything around it — the strip, the tabs, the labels — stays in the UI face.
+What it is not allowed to bring with it is the phosphor palette and the black
+rectangle.
+
+**The palette is the theme's, all sixteen slots** (`--term-*` in `base.css`,
+values in the theme pack). A program writing into a PTY addresses ANSI colours
+by number — `ls`, `git`, every prompt theme — so they are tokens like everything
+else, and `termHost.ts` resolves them to sRGB for xterm through the same
+converter the artifact sandbox uses (`color.ts`).
+
+Porcelain renders them light, which is the whole difficulty: the sixteen were
+designed against black, and a program asking for "bright white" means *shout*,
+not *disappear*. So lightness is spent on the background and chroma carries the
+distinctions — the bright half gains saturation and stays dark enough to read
+(4.5:1 or better on `--term-bg`, except ANSI 7, the dim grey at 3.5:1 that
+programs use for rules rather than for text). Green is the olive, red is the
+failure red, yellow is the amber that means "parked on you": the three the app
+already owns keep their identity, so a `git status` reads as this app's palette
+rather than as three borrowed colours.
+
+The surface itself is `--term-bg`, one step off the page — the same "inset into
+a surface" move `--sunken` makes for code wells — with the padding a printed
+listing has. A first column flush against the pane's edge is the single most
+terminal-emulator thing a layout can do.
+
+**Tabs are segments of one strip, divided by a hairline.** The strip is a pane
+header like any other: `--bg`, the hairline every `.pane-head` draws, 32px.
+Tabs abut — no gaps, no backgrounds, no radii — with a 1px `--line` between
+them, which is the separator this app already uses wherever two regions share a
+tone. The current one is `--ink` at medium weight with a 2px `--brand` bar
+across its full width at the bottom edge: the brand spent on "the current
+selection", one of the three jobs it has, and unmistakable for status, because
+status is a dot in a gutter and this is a rule under a segment.
+
+Two earlier versions were wrong in opposite directions and both are worth
+remembering. The first gave every tab a tinted, top-rounded rectangle — a row of
+little cards, exactly what "earn density with alignment and whitespace rhythm
+rather than with rules, borders and boxes" rules out, and the only thing in the
+window that looked imported from another application. The second dropped the
+boxes but tinted a tab on hover, to say which tab the close control at its right
+edge belonged to; that is a box again, appearing only when you look at it, which
+is worse. The hairline answers the same question permanently and costs nothing.
+
+There was also a plain defect underneath both: this app has no global `button`
+reset — every component states its own — and the tab's label and close control
+never did, so they carried the platform's grey fill and a 2px outset bevel. Half
+of "the tabs look ugly" was that, not the design.
+
+**The close control appears on hover, and its space is held open.** Same rule as
+the transcript's disclosures — a cross on every tab at rest is six crosses
+competing with the six names the strip exists to show — with the addition that
+the name's right padding reserves the slot whether or not it is filled, so the
+strip never re-flows under the pointer. The cross is a mark rather than a
+button: no plate, no radius, no fill on hover, just ink getting darker.
+
+`Mod` + `J` is three states rather than a switch: closed opens it and puts the
+cursor in it, open-but-elsewhere focuses it, focused hides it. The middle state
+is the common one by a long way, and a plain toggle answers it by taking the
+terminal away. Hiding is not closing — the shells and anything running in them
+are untouched, so the next `Mod` + `J` shows the same scrollback with the same
+dev server still going.
+
+Inside a terminal the app gives the keyboard back. `Ctrl+C`, `Ctrl+D`,
+`Ctrl+R`, `Ctrl+W`, `Ctrl+U` are the shell's, and an app that keeps them is an
+app you cannot work in; what stays is `Mod` + `J`, the `Mod` + `Alt` pane moves,
+and `Mod` + `Shift` + `T` / `W` for tabs. The cost is honest and worth naming:
+`Ctrl+J` can no longer be sent to a shell as a bare line feed. It buys the one
+key that gets you back out.
+
 ## Keyboard
 
 The window is arranged from the keyboard, and every binding carries `Mod`
@@ -484,6 +559,8 @@ in a composer nearly all the time, so a bare key is text.
 | `Mod` + `Alt` + `← ↑ ↓ →` | move focus to the pane that way |
 | `Mod` + `W` | close this pane — the conversation keeps running |
 | `Mod` + `Alt` + `R` | turn this split from side-by-side to stacked |
+| `Mod` + `J` | show, focus, or hide the terminals |
+| `Mod` + `Shift` + `T` / `W` | new terminal tab / close this one |
 | `Esc` | close the pane you are looking into |
 
 Directional focus is decided by the panes' boxes, not by the tree: `row(a,

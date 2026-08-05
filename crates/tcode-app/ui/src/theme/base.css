@@ -70,6 +70,48 @@
   --diff-add-ink: var(--brand-text);
   --diff-del-ink: var(--danger-text);
 
+  /* ---- Terminal ------------------------------------------------------- */
+  /* The one surface in this app whose colours are chosen by somebody else:
+     what a program writes into a PTY are the sixteen ANSI slots, and `ls`,
+     `git` and every prompt theme address them by number. So they are tokens
+     like everything else, and `termHost.ts` reads them out of here — the
+     terminal is themed by the app rather than carrying a palette of its own,
+     which is what "the terminal follows the theme" has to mean when the theme
+     is a *light* one and the standard sixteen assume a black background.
+
+     Bright is therefore not "lighter". On a paper theme the bright half stays
+     dark enough to read and gains chroma instead, the way every light terminal
+     scheme resolves the same conflict; a literal reading of "bright" would put
+     white text on white paper for every program that uses it as an emphasis.
+
+     Blue, magenta and cyan have no source in the core a theme must supply, so
+     their fallback is the achromatic text ramp — the same choice, for the same
+     reason, that the syntax section above makes. A theme that wants a coloured
+     terminal overrides these sixteen names; porcelain does. */
+  --term-bg: var(--sunken);
+  --term-fg: var(--syn-plain);
+  --term-cursor: var(--brand);
+  --term-cursor-text: var(--bg);
+  --term-selection: var(--selected);
+
+  --term-ansi-black: var(--ink);
+  --term-ansi-red: var(--danger-text);
+  --term-ansi-green: var(--brand-text);
+  --term-ansi-yellow: var(--amber-text);
+  --term-ansi-blue: var(--syn-plain);
+  --term-ansi-magenta: var(--syn-plain);
+  --term-ansi-cyan: var(--syn-plain);
+  --term-ansi-white: var(--muted);
+
+  --term-ansi-bright-black: var(--faint);
+  --term-ansi-bright-red: var(--danger);
+  --term-ansi-bright-green: var(--brand);
+  --term-ansi-bright-yellow: var(--amber);
+  --term-ansi-bright-blue: var(--muted);
+  --term-ansi-bright-magenta: var(--muted);
+  --term-ansi-bright-cyan: var(--muted);
+  --term-ansi-bright-white: var(--body);
+
   /* ---- Interactive ---------------------------------------------------- */
   --hover: color-mix(in oklab, var(--bg) 95%, var(--ink));
   --pressed: color-mix(in oklab, var(--bg) 90%, var(--ink));

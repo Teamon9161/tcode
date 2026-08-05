@@ -75,6 +75,45 @@
   --diff-add-ink: oklch(0.44 0.115 132); /* 6.6:1 on --diff-add-wash */
   --diff-del-ink: oklch(0.49 0.19 27); /* 6.3:1 on --diff-del-wash */
 
+  /* ---- Terminal ------------------------------------------------------- */
+  /* A light terminal, which is the whole difficulty: the sixteen ANSI slots
+     were designed against black, and a program that asks for "bright white"
+     means "shout", not "become invisible". So lightness is spent on the
+     background and chroma carries the distinctions — the bright half is one
+     step lighter and more saturated than the normal half, never lighter than
+     the paper. Every one of these clears 4.5:1 on --term-bg except the one
+     grey noted, which programs use for rules and dimmed text rather than for
+     anything that has to be read.
+
+     The three the app already owns keep their identity: green is the olive,
+     red is the failure red, yellow is the amber that means "parked on you".
+     Blue, magenta and cyan are new here and are the same lightness family, so
+     a `git status` or an `ls` reads as one palette rather than as this app's
+     colours plus three borrowed ones. */
+  --term-bg: oklch(0.985 0.003 130); /* one step off paper: the well, not the page */
+  --term-fg: oklch(0.34 0.012 130); /* 11.2:1 */
+  --term-cursor: oklch(0.47 0.125 132);
+  --term-cursor-text: oklch(1 0 0);
+  --term-selection: oklch(0.93 0.045 132);
+
+  --term-ansi-black: oklch(0.28 0.012 130); /* 13.9:1 */
+  --term-ansi-red: oklch(0.5 0.19 27);
+  --term-ansi-green: oklch(0.46 0.125 132);
+  --term-ansi-yellow: oklch(0.5 0.11 65);
+  --term-ansi-blue: oklch(0.48 0.14 255);
+  --term-ansi-magenta: oklch(0.48 0.16 325);
+  --term-ansi-cyan: oklch(0.47 0.085 210);
+  --term-ansi-white: oklch(0.62 0.008 130); /* the dim grey, 3.5:1 — rules and hints */
+
+  --term-ansi-bright-black: oklch(0.55 0.01 130); /* 4.6:1 — comments, timestamps */
+  --term-ansi-bright-red: oklch(0.56 0.21 27);
+  --term-ansi-bright-green: oklch(0.53 0.14 132);
+  --term-ansi-bright-yellow: oklch(0.55 0.13 68);
+  --term-ansi-bright-blue: oklch(0.55 0.16 255);
+  --term-ansi-bright-magenta: oklch(0.55 0.18 325);
+  --term-ansi-bright-cyan: oklch(0.54 0.1 210);
+  --term-ansi-bright-white: oklch(0.32 0.012 130); /* 12.1:1 — "shout" is darker here, not paler */
+
   /* ---- Interactive ---------------------------------------------------- */
   --hover: oklch(0.968 0.004 130);
   --pressed: oklch(0.945 0.005 130);

@@ -63,12 +63,29 @@ export type Pane =
    * here would make this tree the second, always slightly stale, account of
    * where the browser is.
    */
-  | { kind: "web" };
+  | { kind: "web" }
+  /**
+   * The window's terminals.
+   *
+   * Session-less for the same reason the browser is, and here the consequence
+   * is sharper: something is *running* in it. A conversation you close must not
+   * take the dev server you started with it, and `closeSession` reads
+   * `paneSession`, so answering `null` here is what prevents that.
+   *
+   * It holds no tab list either. The tabs are shells with their own scrollback
+   * and their own child processes, which outlive this pane going away and
+   * coming back (`Mod+J` twice); putting them in the tiling tree would make
+   * this file's job "keep half a terminal emulator alive across a close",
+   * which it cannot be. `termHost.ts` owns them, exactly as `browser.rs` owns
+   * where the browser is.
+   */
+  | { kind: "terminal" };
 
-/** Whether a pane belongs to a conversation. The browser is the one that does
- *  not, so this is the guard everywhere a pane's session is read. */
+/** Whether a pane belongs to a conversation. The browser and the terminals are
+ *  the ones that do not, so this is the guard everywhere a pane's session is
+ *  read. */
 export function paneSession(pane: Pane): string | null {
-  return pane.kind === "web" ? null : pane.session;
+  return pane.kind === "web" || pane.kind === "terminal" ? null : pane.session;
 }
 
 /** Which way a split lays its two children out, named after the flex axis:
@@ -129,6 +146,12 @@ const MIN_RATIO = 0.1;
  */
 function roomFor(pane: Pane): number {
   if (pane.kind === "session") return 0.28;
+  // A terminal is measured in rows, not in paragraphs: a dozen lines and a
+  // prompt is a working terminal, and the conversation above it is what the
+  // window is actually for. It is also the one pane that routinely opens
+  // *under* everything else, so a generous floor here would shove every
+  // conversation up the moment it appeared.
+  if (pane.kind === "terminal") return 0.16;
   // A column of names, not a column of content: the file tree and the changed
   // files index are read by their left edge.
   if (pane.kind === "inspect") {
@@ -365,12 +388,13 @@ export function updatePane(tiling: Tiling, id: string, pane: Pane): Tiling {
  * window down to slivers over a working day; a split is something the user asks
  * for explicitly.
  *
- * The exceptions are landing on an inspect pane or on the browser: taking
- * either over would throw away what it was showing, and in the inspect case
- * would leave its conversation without a place to look into things. Both split
- * rather than overwrite. The browser is the sharper of the two — it is the
- * window's only one, so overwriting it would mean a conversation arriving on
- * screen could silently close the page you were reading.
+ * The exceptions are landing on an inspect pane, on the browser or on the
+ * terminals: taking any of them over would throw away what it was showing, and
+ * in the inspect case would leave its conversation without a place to look into
+ * things. All three split rather than overwrite. The window-level two are the
+ * sharper case — there is one of each, so overwriting would mean a conversation
+ * arriving on screen could silently close the page you were reading or the
+ * shell you were typing in.
  */
 export function show(tiling: Tiling, session: string, aspect?: number): Tiling {
   const already = panes(tiling).find(
@@ -413,6 +437,51 @@ export function openWeb(tiling: Tiling, aspect?: number): Tiling {
 /** The browser's pane, if the window has one open. */
 export function webPane(tiling: Tiling): Leaf | null {
   return panes(tiling).find((leaf) => leaf.pane.kind === "web") ?? null;
+}
+
+/** How much of the window's height the terminals take when they appear. The
+ *  rest is the conversation, which is what you are reading while you type down
+ *  there — an even split would make the terminal the main event, and it is not
+ *  (`roomFor` is the floor a drag cannot cross; this is the opening position). */
+const TERMINAL_SHARE = 0.7;
+
+/**
+ * Brings the terminals on screen, focuses them, or puts them away — the three
+ * states one key steps through.
+ *
+ * `Mod+J` is one key with three jobs, and getting them in this order is what
+ * makes it feel like an IDE's rather than like a switch:
+ *
+ *  - **Not on screen** → open it, under everything, and put the cursor in it.
+ *    Opening a terminal you then have to click into is opening half a terminal.
+ *  - **On screen, focus elsewhere** → focus it. This is the common case by a
+ *    long way — the terminal is visible, you are typing in a composer, and you
+ *    want the shell. Closing it here would be answering a question nobody asked.
+ *  - **On screen and focused** → put it away. Hiding, not closing: the shells
+ *    and everything running in them are untouched (`termHost.ts`), so the next
+ *    `Mod+J` shows the same scrollback with the same `npm run dev` still going.
+ *
+ * It splits the **root**, not the focused pane, and that is the whole of the
+ * IDE shape: a dock across the bottom of the window rather than a box under
+ * whichever pane happened to be current. `split` takes any node id, so this
+ * needs no mechanism of its own — and everything downstream (dividers, focus
+ * keys, expand, `frames`) keeps working because it is still just a split.
+ */
+export function toggleTerminal(tiling: Tiling): Tiling {
+  const already = panes(tiling).find((leaf) => leaf.pane.kind === "terminal");
+  if (already) {
+    return tiling.focus === already.id
+      ? close(tiling, already.id)
+      : { ...tiling, focus: already.id };
+  }
+  const pane: Pane = { kind: "terminal" };
+  if (!tiling.root) return single(pane);
+  return split(tiling, tiling.root.id, "col", pane, TERMINAL_SHARE);
+}
+
+/** The terminals' pane, if the window has it on screen. */
+export function terminalPane(tiling: Tiling): Leaf | null {
+  return panes(tiling).find((leaf) => leaf.pane.kind === "terminal") ?? null;
 }
 
 /**

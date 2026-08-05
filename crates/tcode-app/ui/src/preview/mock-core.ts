@@ -7,6 +7,8 @@
  */
 import type { Launchpad, OpenedSession, SessionInfo, StoredSession } from "../types";
 import type { PickerState, PinChoice } from "../picker";
+import { TERMINAL_OUTPUT } from "../types";
+import { deliver } from "./mock-event";
 
 const NOW = Math.floor(Date.now() / 1000);
 
@@ -438,6 +440,84 @@ function deleteWorkspace(args: Record<string, unknown> | undefined): void {
   delete fixture.nodes[path];
 }
 
+// ------------------------------------------------------------- the terminal
+
+/** SGR by name, so the fixture below reads as output rather than as escapes. */
+const SGR = {
+  reset: "\u001b[0m",
+  bold: "\u001b[1m",
+  dim: "\u001b[2m",
+  red: "\u001b[31m",
+  green: "\u001b[32m",
+  yellow: "\u001b[33m",
+  blue: "\u001b[34m",
+  magenta: "\u001b[35m",
+  cyan: "\u001b[36m",
+  brightBlack: "\u001b[90m",
+};
+
+/**
+ * A session with something in it.
+ *
+ * Chosen to touch the slots that are actually hard on a light background —
+ * green and red side by side, a dim grey that still has to be readable, a
+ * bright colour used as emphasis rather than as "lighter". A prompt and a
+ * blinking cursor would look fine and prove none of that.
+ */
+function mockSession(cwd: string): string {
+  const name = cwd.slice(cwd.lastIndexOf("/") + 1);
+  const prompt = `${SGR.green}${SGR.bold}~/code/${name}${SGR.reset} ${SGR.brightBlack}❯${SGR.reset} `;
+  return [
+    `${prompt}cargo test -p tcode-core\r\n`,
+    `${SGR.brightBlack}   Compiling${SGR.reset} tcode-core v0.2.3\r\n`,
+    `${SGR.green}${SGR.bold}    Finished${SGR.reset} test profile in 4.21s\r\n`,
+    `\r\n`,
+    `running 148 tests\r\n`,
+    `${SGR.dim}test ledger::tests::compact_keeps_the_prefix ... ${SGR.reset}${SGR.green}ok${SGR.reset}\r\n`,
+    `${SGR.dim}test memory::tests::discovers_nested_agents_md ... ${SGR.reset}${SGR.green}ok${SGR.reset}\r\n`,
+    `${SGR.dim}test watchdog::tests::two_waiters_one_clock ... ${SGR.reset}${SGR.red}FAILED${SGR.reset}\r\n`,
+    `\r\n`,
+    `${SGR.red}${SGR.bold}failures:${SGR.reset}\r\n`,
+    `    ${SGR.yellow}watchdog::tests::two_waiters_one_clock${SGR.reset}\r\n`,
+    `\r\n`,
+    `test result: ${SGR.red}FAILED${SGR.reset}. 147 passed; ${SGR.red}1 failed${SGR.reset}\r\n`,
+    `\r\n`,
+    `${prompt}git status ${SGR.brightBlack}--short${SGR.reset}\r\n`,
+    ` ${SGR.red}M${SGR.reset} crates/tcode-core/src/watchdog.rs\r\n`,
+    ` ${SGR.green}A${SGR.reset} ${SGR.cyan}crates/tcode-app/src/terminal.rs${SGR.reset}\r\n`,
+    ` ${SGR.magenta}??${SGR.reset} ${SGR.blue}scratch/notes.md${SGR.reset}\r\n`,
+    `\r\n`,
+    prompt,
+  ].join("");
+}
+
+let mockTerminals = 0;
+
+function openMockTerminal(cwd: string): string {
+  const id = `preview-term-${(mockTerminals += 1)}`;
+  // A tick later, the way a real shell answers after the PTY exists — the
+  // frontend holds early chunks for exactly this reason, and a fixture that
+  // answered synchronously would never exercise it.
+  setTimeout(() => {
+    deliver(TERMINAL_OUTPUT, { id, data: base64(mockSession(cwd)) });
+  }, 0);
+  return id;
+}
+
+function echoMockTerminal(id: string, data: string) {
+  // Carriage return alone leaves the cursor on the same line in a terminal, so
+  // Enter has to be answered with both halves — the same thing every shell does.
+  const typed = atob(data).replace(/\r/g, "\r\n");
+  deliver(TERMINAL_OUTPUT, { id, data: btoa(typed) });
+}
+
+function base64(text: string): string {
+  const bytes = new TextEncoder().encode(text);
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
 export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   switch (command) {
     case "launchpad":
@@ -521,6 +601,21 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
     case "browser_step":
     case "browser_reload":
     case "browser_close":
+      return undefined as T;
+    // The terminal is the opposite case to the browser above: it *is* drawn on
+    // this side, by an emulator painting the app's own palette, so a fixture
+    // can show the real thing. What it plays back is a session with colour in
+    // it — that is the part being designed, and an empty prompt would prove
+    // nothing about sixteen ANSI slots on a paper background.
+    case "terminal_open":
+      return openMockTerminal(String(args?.cwd ?? "")) as T;
+    case "terminal_write":
+      // Echo, so the preview can be typed into. A real PTY echoes because the
+      // shell does; here it is the shortest way to make the cursor real.
+      echoMockTerminal(String(args?.id ?? ""), String(args?.data ?? ""));
+      return undefined as T;
+    case "terminal_resize":
+    case "terminal_close":
       return undefined as T;
     case "workspace_list":
       return listWorkspace(args) as T;

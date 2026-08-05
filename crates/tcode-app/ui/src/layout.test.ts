@@ -13,6 +13,8 @@ import {
   openInspect,
   openWeb,
   webPane,
+  toggleTerminal,
+  terminalPane,
   browserPane,
   panes,
   parentSplit,
@@ -47,6 +49,7 @@ function shape(tiling: Tiling): string {
 
 function label(pane: Pane): string {
   if (pane.kind === "web") return "web";
+  if (pane.kind === "terminal") return "term";
   return pane.kind === "session"
     ? pane.session
     : `${pane.session}:${navValue(pane.nav).kind}`;
@@ -671,5 +674,73 @@ describe("the browser pane", () => {
 
     expect(shape(shut)).toBe("tcode");
     expect(webPane(shut)).toBeNull();
+  });
+});
+
+describe("the terminals", () => {
+  /** The IDE shape: a dock across the *window*, not a box under whichever pane
+   *  happened to be focused when the key was pressed. */
+  it("opens across the bottom of the window, whatever is focused", () => {
+    const one = single(talk("tcode"));
+    const two = split(one, id(one, "tcode"), "row", talk("duck_ext"));
+    const open = toggleTerminal(two);
+
+    expect(shape(open)).toBe("col(row(tcode, duck_ext), term)");
+    expect(at(open)).toBe("term");
+  });
+
+  it("is the whole window when there was nothing else", () => {
+    expect(shape(toggleTerminal(EMPTY))).toBe("term");
+  });
+
+  /** One key, three jobs. The middle one is the common case and the one a
+   *  plain toggle gets wrong: visible, focus in a composer, you want the shell. */
+  it("focuses before it hides", () => {
+    const open = toggleTerminal(single(talk("tcode")));
+    const away = { ...open, focus: id(open, "tcode") };
+
+    const back = toggleTerminal(away);
+    expect(shape(back)).toBe("col(tcode, term)");
+    expect(at(back)).toBe("term");
+
+    const hidden = toggleTerminal(back);
+    expect(shape(hidden)).toBe("tcode");
+    expect(terminalPane(hidden)).toBeNull();
+  });
+
+  it("takes most of the window for the conversation above it", () => {
+    const open = toggleTerminal(single(talk("tcode")));
+    const heights: Record<string, number> = {};
+    for (const { leaf, rect } of frames(open).panes) heights[label(leaf.pane)] = rect.height;
+
+    expect(heights.tcode).toBeGreaterThan(heights.term);
+  });
+
+  /** The reason it carries no session. Something is *running* in there. */
+  it("survives closing every conversation, dev server and all", () => {
+    const one = single(talk("tcode"));
+    const two = split(one, id(one, "tcode"), "row", talk("duck_ext"));
+    const open = toggleTerminal(two);
+    const gone = closeSession(closeSession(open, "tcode"), "duck_ext");
+
+    expect(shape(gone)).toBe("term");
+    expect(terminalPane(gone)).not.toBeNull();
+  });
+
+  it("is not counted as a conversation on screen", () => {
+    expect(sessionsInView(toggleTerminal(single(talk("tcode"))))).toEqual(["tcode"]);
+  });
+
+  it("is never overwritten by a conversation arriving", () => {
+    const open = toggleTerminal(single(talk("tcode")));
+    const arrived = show({ ...open, focus: terminalPane(open)!.id }, "duck_ext");
+
+    expect(shape(arrived)).toBe("col(tcode, row(term, duck_ext))");
+    expect(terminalPane(arrived)).not.toBeNull();
+  });
+
+  it("closes from its own header like any other pane", () => {
+    const open = toggleTerminal(single(talk("tcode")));
+    expect(shape(close(open, terminalPane(open)!.id))).toBe("tcode");
   });
 });

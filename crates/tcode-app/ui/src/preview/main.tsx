@@ -6,6 +6,7 @@ import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
 import "../theme/base.css";
 import "../theme/porcelain.css";
+import "@xterm/xterm/css/xterm.css";
 import "../app.css";
 import "./preview.css";
 

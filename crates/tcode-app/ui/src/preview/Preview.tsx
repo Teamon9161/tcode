@@ -6,7 +6,16 @@ import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
 import { BLANK, LimitsContext, type SessionState } from "../session";
 import { NO_METER, type Limits, type Meter } from "../usage";
-import { openAside, openInspect, openWeb, panes, single, split, type Tiling } from "../layout";
+import {
+  openAside,
+  openInspect,
+  openWeb,
+  panes,
+  single,
+  split,
+  toggleTerminal,
+  type Tiling,
+} from "../layout";
 import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import type { RewindTarget } from "../rewind";
@@ -671,6 +680,7 @@ const SCENES = [
   "split",
   "shown",
   "web",
+  "terminal",
   "empty",
 ] as const;
 type Scene = (typeof SCENES)[number];
@@ -745,11 +755,25 @@ function web(): Tiling {
   return openWeb(solo());
 }
 
+/**
+ * A conversation over the terminals — the shape `Mod+J` produces.
+ *
+ * Unlike the browser scene, everything here is real: the emulator is the one
+ * that ships, drawing the app's own ANSI palette (`--term-*`), and `mock-core`
+ * plays a session through it with colour in it. So this scene is where the
+ * light-terminal palette is actually judged, which is the part of this pane
+ * with a design decision in it.
+ */
+function terminal(): Tiling {
+  return toggleTerminal(solo());
+}
+
 /** The window each scene wants. Every scene but the split views is one conversation. */
 function layoutFor(scene: Scene): Tiling {
   if (scene === "split") return tiled();
   if (scene === "shown") return showing();
   if (scene === "web") return web();
+  if (scene === "terminal") return terminal();
   if (scene === "workspace") return workspace();
   return solo();
 }

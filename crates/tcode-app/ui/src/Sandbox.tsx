@@ -7,6 +7,7 @@ import {
   type SandboxKind,
   type SandboxTheme,
 } from "./sandbox/protocol";
+import { asColor } from "./color";
 
 /**
  * A model-authored artifact, rendered behind an execution boundary.
@@ -123,42 +124,3 @@ function readTheme(): SandboxTheme {
   return theme;
 }
 
-/** Converts any CSS colour the browser understands into `#rrggbb`, and returns
- *  null for values that are not colours at all (the font and size tokens).
- *
- *  Two steps, both needed. The sentinel probe establishes that the value *is* a
- *  colour: an invalid assignment leaves `fillStyle` untouched, so starting from
- *  black and from white and getting the same answer means it parsed. Then the
- *  colour is actually painted and read back, because reading `fillStyle` alone
- *  does not convert — Chrome serialises `oklch(…)` straight back out, which is
- *  exactly the value the sandbox cannot use. */
-function asColor(value: string): string | null {
-  const ctx = paint();
-  if (!ctx) return null;
-
-  ctx.fillStyle = "#000000";
-  ctx.fillStyle = value;
-  const fromBlack = ctx.fillStyle;
-  ctx.fillStyle = "#ffffff";
-  ctx.fillStyle = value;
-  if (fromBlack !== ctx.fillStyle) return null;
-
-  ctx.clearRect(0, 0, 1, 1);
-  ctx.fillStyle = value;
-  ctx.fillRect(0, 0, 1, 1);
-  const [red, green, blue, alpha] = ctx.getImageData(0, 0, 1, 1).data;
-  const hex = (channel: number) => channel.toString(16).padStart(2, "0");
-  return alpha === 255
-    ? `#${hex(red)}${hex(green)}${hex(blue)}`
-    : `rgba(${red}, ${green}, ${blue}, ${(alpha / 255).toFixed(3)})`;
-}
-
-let scratch: CanvasRenderingContext2D | null | undefined;
-function paint() {
-  if (scratch === undefined) {
-    scratch = document
-      .createElement("canvas")
-      .getContext("2d", { willReadFrequently: true });
-  }
-  return scratch;
-}

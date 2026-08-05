@@ -33,6 +33,11 @@ tcode-frontend = { path = "../tcode-frontend" }
 # feature, as there is no stable alternative.
 tauri = { version = "2", features = ["unstable"] }
 tauri-plugin-dialog = "2"
+# Real PTYs for the terminal pane (`src/terminal.rs`). A pipe is not a
+# terminal: without a tty the shell drops its prompt, `vim` refuses to start
+# and nothing sees a `SIGWINCH`. This is wezterm's abstraction over the three
+# platform APIs, ConPTY included, which is the part that has no shortcut.
+portable-pty = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
