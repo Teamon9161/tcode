@@ -407,7 +407,10 @@ pub struct PermissionsConfig {
 }
 
 /// `[ui]`: frontend behaviour that costs tokens, so it must be refusable.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Both switches default to off, and that is the point rather than an
+/// accident: anything here spends tokens or screen, so it is opted into.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiConfig {
     /// Offer a greyed-out guess at the next instruction when the turn ends
@@ -417,15 +420,6 @@ pub struct UiConfig {
     /// Show provider reasoning summaries in the transcript. Reasoning remains
     /// in the persisted ledger for provider replay regardless of this setting.
     pub show_reasoning: bool,
-}
-
-impl Default for UiConfig {
-    fn default() -> Self {
-        Self {
-            suggest_next: false,
-            show_reasoning: false,
-        }
-    }
 }
 
 /// `[instructions]`: human-maintained instruction discovery.

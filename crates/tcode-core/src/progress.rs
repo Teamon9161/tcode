@@ -1254,7 +1254,7 @@ fn inventory_at(dir: &Path, now: SystemTime) -> Vec<InventoryEntry> {
             })
         })
         .collect();
-    entries.sort_by(|a, b| b.modified.cmp(&a.modified));
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.modified));
     entries
 }
 

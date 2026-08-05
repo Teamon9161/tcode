@@ -179,7 +179,22 @@ impl SessionHandle {
             .lock()
             .unwrap()
             .as_ref()
-            .map(|session| session.rewind_targets())
+            .map(|session| {
+                session
+                    .rewind_targets()
+                    .into_iter()
+                    .map(|mut target| {
+                        // Folded here as well as in `history`, and with the same
+                        // function: the webview pairs targets to prompts by
+                        // their text, so folding one side only would quietly
+                        // cost every skill invocation its rewind control.
+                        if let Some(folded) = folded_prompt(&target.text) {
+                            target.text = folded;
+                        }
+                        target
+                    })
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -212,7 +227,9 @@ impl SessionHandle {
     }
 
     /// A display-only copy of the durable conversation. Project instructions
-    /// remain model context and never cross into the webview transcript.
+    /// remain model context and never cross into the webview transcript, and a
+    /// `/name` skill invocation crosses as the line the person typed rather
+    /// than as the file it loaded (`folded_prompt`).
     pub fn history(&self) -> Vec<tcode_core::Entry> {
         self.session
             .lock()
@@ -223,7 +240,12 @@ impl SessionHandle {
                     .ledger
                     .history()
                     .filter(|entry| !matches!(entry, tcode_core::Entry::Instruction(_)))
-                    .cloned()
+                    .map(|entry| match entry {
+                        tcode_core::Entry::User(blocks) => {
+                            tcode_core::Entry::User(blocks.iter().map(fold_skill_block).collect())
+                        }
+                        other => other.clone(),
+                    })
                     .collect()
             })
             .unwrap_or_default()
@@ -410,6 +432,36 @@ impl SessionHandle {
     }
 }
 
+/// A `/name` skill invocation, folded back to the line the person typed.
+///
+/// The ledger holds the *rendered skill body* wearing a user message's clothes
+/// (`tcode_tools::wrap_skill_echo`): that is what the model must receive, what
+/// resume replays, and what `/export` keeps. A transcript that printed it would
+/// put a repository file where a prompt belongs — thousands of lines the reader
+/// never wrote, in the one place that answers "what did I ask".
+///
+/// `None` for ordinary prompts, which pass through untouched. Recognition is
+/// `tcode_tools::parse_skill_echo` and nothing else: that function is the single
+/// place that knows this format, and a second reader of it in this crate (or in
+/// the webview) would be a second definition to keep in step.
+pub fn folded_prompt(text: &str) -> Option<String> {
+    let echo = tcode_tools::parse_skill_echo(text)?;
+    Some(match echo.args.is_empty() {
+        true => format!("/{}", echo.name),
+        false => format!("/{} {}", echo.name, echo.args),
+    })
+}
+
+fn fold_skill_block(block: &tcode_core::ContentBlock) -> tcode_core::ContentBlock {
+    match block {
+        tcode_core::ContentBlock::Text { text } => match folded_prompt(text) {
+            Some(folded) => tcode_core::ContentBlock::Text { text: folded },
+            None => block.clone(),
+        },
+        other => other.clone(),
+    }
+}
+
 /// Open a second conversation on the same folder to execute an approved plan, and return it with the instruction its first turn carries.
 ///
 /// Separate from the command that calls it because it is the whole decision:
@@ -454,6 +506,11 @@ pub struct Supervisor {
     /// selected config file, both of which every conversation in this window
     /// already shares.
     menus: crate::picker::Menus,
+    /// The skills `/name` can load, discovered once at boot and shared with the
+    /// `skill` tool (`tcode_frontend::Booted::skills`). Reading the same list
+    /// the tool got is the whole point: a menu built from a second discovery
+    /// would offer this window a skill the agent does not have.
+    skills: Vec<tcode_tools::Skill>,
     sessions: Mutex<HashMap<String, Arc<SessionHandle>>>,
     /// Insertion order, so the session rail does not reshuffle on every read.
     /// A `HashMap` alone would hand the UI a different order each time.
@@ -461,7 +518,12 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
-    pub fn new(agent: Arc<Agent>, factory: SessionFactory, menus: crate::picker::Menus) -> Self {
+    pub fn new(
+        agent: Arc<Agent>,
+        factory: SessionFactory,
+        menus: crate::picker::Menus,
+        skills: Vec<tcode_tools::Skill>,
+    ) -> Self {
         let (opening_context, environment) = factory.command_context();
         Self {
             agent,
@@ -470,9 +532,14 @@ impl Supervisor {
             opening_context,
             environment,
             menus,
+            skills,
             sessions: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn skills(&self) -> &[tcode_tools::Skill] {
+        &self.skills
     }
 
     pub fn agent(&self) -> Arc<Agent> {
@@ -574,7 +641,11 @@ pub async fn run_compact(
         Ok(landed) => eprintln!(
             "tcode-app: compaction finished on session {} ({})",
             handle.id,
-            if *landed { "history replaced" } else { "nothing compacted" }
+            if *landed {
+                "history replaced"
+            } else {
+                "nothing compacted"
+            }
         ),
         Err(error) => eprintln!(
             "tcode-app: compaction failed on session {}: {error}",

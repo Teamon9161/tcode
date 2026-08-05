@@ -25,10 +25,16 @@ pub enum Entry {
     /// freshness notices, background-task completions...). Machine-authored:
     /// the text is the whole fact.
     Note(String),
-    /// Project instructions discovered after the session started. They reach
-    /// the model at a legal append boundary and persist for resume/compaction,
-    /// but are context rather than conversation history and stay out of the
+    /// Context the model is owed that the human is not: project instructions
+    /// discovered after the session started, and a background sub-agent's
+    /// returning report (whose human-facing copy is the run itself). It reaches
+    /// the model at a legal append boundary and persists for resume/compaction,
+    /// but is context rather than conversation history and stays out of the
     /// human transcript.
+    ///
+    /// Hiding it here rather than per frontend is what makes live rendering and
+    /// replay agree: both walk the same entries, so nothing can be visible in
+    /// one and gone in the other.
     Instruction(String),
     /// The human's own words attached to a tool decision. The ledger keeps
     /// the fact — whose words, about which call — rather than a pre-baked

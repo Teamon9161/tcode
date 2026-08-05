@@ -3,6 +3,7 @@ import { useMemo, useState } from "react";
 import type { ApprovalMode, ApprovalRequest, Decision } from "./types";
 import { Code } from "./components/Code";
 import { Diff, isEditShape } from "./components/Diff";
+import { GrowingText } from "./components/GrowingText";
 import { Path } from "./components/Path";
 import { StatusDot } from "./components/Status";
 import { PlanEditor, type PlanDecision } from "./PlanEditor";
@@ -225,11 +226,11 @@ function Consent({
         )}
       </div>
 
-      <input
+      <GrowingText
         className="approval-comment"
         value={comment}
         placeholder="Optional note — guidance for a yes, a reason for a no"
-        onChange={(event) => setComment(event.target.value)}
+        onChange={setComment}
       />
 
       <div className="approval-actions">
@@ -379,7 +380,11 @@ function QuestionForm({
                 <pre className="option-preview">{question.options[focused[index]].preview}</pre>
               )}
             </div>
-            <input
+            {/* A note here is as long as the answer needs to be — and when
+                "Something else" is picked it *is* the answer, which is the case
+                a one-line box hides worst: the text scrolls sideways out of
+                view and the person sends what they cannot read back. */}
+            <GrowingText
               className="approval-comment"
               value={notes[index]}
               placeholder={
@@ -387,10 +392,8 @@ function QuestionForm({
                   ? "Your answer — this replaces the options"
                   : "Optional note"
               }
-              onChange={(event) =>
-                setNotes((was) =>
-                  was.map((note, i) => (i === index ? event.target.value : note)),
-                )
+              onChange={(text) =>
+                setNotes((was) => was.map((note, i) => (i === index ? text : note)))
               }
             />
           </fieldset>

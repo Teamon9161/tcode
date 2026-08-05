@@ -364,12 +364,17 @@ pub fn save_preset(menus: &mut Pickers, model: &ModelCell, name: &str) -> Result
     Ok(())
 }
 
-/// Remember the mode for new sessions — except `unsafe`, which is deliberately
-/// not sticky: a one-off bypass must not silently arm every future session. The
-/// TUI's `/mode` makes exactly the same exception, and the two must not drift.
+/// Remember the mode for new sessions — every mode, `unsafe` included.
+///
+/// `unsafe` used to be excluded so a one-off bypass could not arm later
+/// sessions. The cost of that was paid by the people who actually work that
+/// way: one re-pick per session, of a choice they had already made. The mode
+/// chip says what is in force at all times and switches in one click, which is
+/// where that reminder belongs. The TUI's `/mode` persists the same way
+/// (`persist_mode`), and the two must not drift.
 pub fn remember_mode(config_file: &std::path::Path, mode: PermissionMode) {
     Config::update_tcode_state(config_file, move |state| {
-        state.mode = (mode != PermissionMode::Unsafe).then_some(mode);
+        state.mode = Some(mode);
     });
 }
 

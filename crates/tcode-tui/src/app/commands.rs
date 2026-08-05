@@ -40,12 +40,21 @@ impl App {
         self.set_mode(base.cycle());
     }
 
-    /// Persist the chosen mode as the default for new sessions — except Unsafe:
-    /// a one-off flip to it must not silently arm every future session, so
-    /// landing there clears the stored choice instead.
+    /// Persist the chosen mode as the default for new sessions — every mode,
+    /// `unsafe` included.
+    ///
+    /// It used to be the one exception, on the theory that a one-off bypass
+    /// must not arm later sessions. What that produced in practice was a
+    /// person who works in `unsafe` re-picking it at the start of every
+    /// session, and the re-pick is not a decision — it is the same decision
+    /// they already made, so the prompt teaches nothing and only costs
+    /// keystrokes. The mode is on screen at all times and one `shift+tab`
+    /// away, which is the honest place for that reminder. Kept identical in
+    /// the desktop app (`picker::remember_mode`); two front ends disagreeing
+    /// about what a session starts in is worse than either answer.
     pub(super) fn persist_mode(&self, mode: tcode_core::PermissionMode) {
         self.state_store.update(move |state| {
-            state.mode = (mode != tcode_core::PermissionMode::Unsafe).then_some(mode);
+            state.mode = Some(mode);
         });
     }
 

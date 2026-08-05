@@ -2495,6 +2495,11 @@ impl Agent {
     /// check and surface each one to the frontend. Only called at safe
     /// boundaries (turn start, after a completed tool batch, an idle wake)
     /// so history stays append-only. Returns how many notes landed.
+    ///
+    /// A `model_only` note (a background sub-agent handing back its report)
+    /// lands as `Entry::Instruction` and raises no event: the entry type is
+    /// what keeps the live transcript and a resumed one showing the same
+    /// thing, where an event a frontend chose to drop would not.
     async fn note_background(
         &self,
         session: &mut Session,
@@ -2508,8 +2513,12 @@ impl Agent {
             .take_notes();
         let count = notes.len();
         for note in notes {
-            session.ledger.append(Entry::Note(note.clone()));
-            self.emit(events, AgentEvent::Note(note)).await?;
+            if note.model_only {
+                session.ledger.append(Entry::Instruction(note.text));
+                continue;
+            }
+            session.ledger.append(Entry::Note(note.text.clone()));
+            self.emit(events, AgentEvent::Note(note.text)).await?;
         }
         Ok(count)
     }

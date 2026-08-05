@@ -67,6 +67,18 @@ const MEMBER_PREAMBLE: &str = include_str!("../../prompts/cohort-member.md");
 /// The finalize instruction, sent as the last activation.
 const FINALIZE_PROMPT: &str = include_str!("../../prompts/cohort-finalize.md");
 
+/// A validated `cohort` launch, as `parse` hands it to `build_cohort`.
+///
+/// Named rather than returned as `(Vec<(String, String, String)>, usize, bool)`:
+/// three anonymous strings nested inside two anonymous scalars is a shape you
+/// have to go read `parse` to decode, every time.
+struct Launch {
+    /// `(agent kind, task, summary)` per member, in the order given.
+    members: Vec<(String, String, String)>,
+    max_rounds: usize,
+    detached_reports: bool,
+}
+
 /// One message on a cohort's shared channel. Append-only; `seq` starts at 1.
 /// `Deserialize` too so the log reloads from its JSONL on crash recovery (§11).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -565,7 +577,7 @@ impl CohortTool {
     }
 
     /// Parse and validate `members`/`tasks`/`summaries`/`max_rounds`.
-    fn parse(&self, input: &Value) -> Result<(Vec<(String, String, String)>, usize, bool), String> {
+    fn parse(&self, input: &Value) -> Result<Launch, String> {
         let members = input["members"]
             .as_array()
             .ok_or("`members` must be an array of agent-kind strings")?;
@@ -617,7 +629,11 @@ impl CohortTool {
             Some(Value::Bool(value)) => *value,
             Some(_) => return Err("`detached` must be true or false".to_string()),
         };
-        Ok((pairs, max_rounds, detached_reports))
+        Ok(Launch {
+            members: pairs,
+            max_rounds,
+            detached_reports,
+        })
     }
 
     /// A concise roster snapshot. Members receive it on their first turn and
@@ -792,12 +808,17 @@ impl CohortTool {
         ctx: &ToolCtx,
         cancel: &CancellationToken,
     ) -> ToolOutput {
-        let (pairs, max_rounds, detached_reports) = match self.parse(input) {
+        let launch = match self.parse(input) {
             Ok(parsed) => parsed,
             Err(reason) => return ToolOutput::err(reason),
         };
-        let mut cohort = match self.build_cohort(pairs, max_rounds, detached_reports, call_id, ctx)
-        {
+        let mut cohort = match self.build_cohort(
+            launch.members,
+            launch.max_rounds,
+            launch.detached_reports,
+            call_id,
+            ctx,
+        ) {
             Ok(cohort) => cohort,
             Err(out) => return out,
         };
@@ -1052,9 +1073,11 @@ impl CohortTool {
                 id: meta.id.clone(),
                 kind: meta.kind.clone(),
                 task: meta.task.clone(),
-                summary: (!meta.summary.is_empty())
-                    .then(|| meta.summary.clone())
-                    .unwrap_or_else(|| meta.task.clone()),
+                // Older meta files predate `summary`; the task stands in.
+                summary: match meta.summary.is_empty() {
+                    true => meta.task.clone(),
+                    false => meta.summary.clone(),
+                },
                 agent,
                 session,
                 model_name,

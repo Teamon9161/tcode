@@ -180,7 +180,7 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     let factory = SessionFactory::new(config_file, model_cell, booted.shell_filters.clone());
     let session = factory.open(&cwd, None)?;
 
-    let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus));
+    let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus, booted.skills));
     // The session id is the app's handle for this conversation, independent of
     // the JSONL log id: a resumed log and a fresh one are both just "a session"
     // to the frontend.

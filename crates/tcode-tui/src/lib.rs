@@ -55,13 +55,17 @@ pub use model_picker::{
 pub use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
 pub use tcode_frontend::{CodexLogin, LoginUpdate, ProviderSetup};
 
+/// One read-modify-write of the selected config's `[tcode_state]`. Boxed
+/// because the edit crosses a `dyn Fn` boundary, and `FnOnce` because it is
+/// applied exactly once — the writer owns the read and the write around it.
+type StateEdit = Box<dyn FnOnce(&mut ModelState) + Send>;
+
 /// Runtime-state access is injected by the binary so every frontend action
 /// writes the config file selected at startup, never a hard-coded home path.
 #[derive(Clone)]
 pub struct StateStore {
     load: Arc<dyn Fn() -> Result<ModelState, String> + Send + Sync>,
-    update:
-        Arc<dyn Fn(Box<dyn FnOnce(&mut ModelState) + Send>) -> Result<(), String> + Send + Sync>,
+    update: Arc<dyn Fn(StateEdit) -> Result<(), String> + Send + Sync>,
 }
 
 impl StateStore {

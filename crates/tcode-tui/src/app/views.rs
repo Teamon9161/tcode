@@ -303,19 +303,19 @@ impl App {
                 view.feed_event(event, &mut ctx);
             }
             seen_runs.insert(run_id.clone(), events.len());
-        } else if status != tcode_core::TaskRunStatus::Running {
-            if path.is_some_and(|path| path.exists()) {
-                let mut traces = tcode_core::TaskTraces::default();
-                traces.bind_root(self.task_trace_root.clone());
-                match traces.restore_load(&run_id) {
-                    Some(load) => {
-                        view.replay_task_ledger(load.ledger.entries(), &load.batch_labels, &mut ctx)
-                    }
-                    None => view.bake(vec![Line::styled(
-                        "could not load trace",
-                        theme::error_highlight(),
-                    )]),
+        } else if status != tcode_core::TaskRunStatus::Running
+            && path.is_some_and(|path| path.exists())
+        {
+            let mut traces = tcode_core::TaskTraces::default();
+            traces.bind_root(self.task_trace_root.clone());
+            match traces.restore_load(&run_id) {
+                Some(load) => {
+                    view.replay_task_ledger(load.ledger.entries(), &load.batch_labels, &mut ctx)
                 }
+                None => view.bake(vec![Line::styled(
+                    "could not load trace",
+                    theme::error_highlight(),
+                )]),
             }
         }
         self.active_view = id;

@@ -21,6 +21,7 @@ import {
 } from "./plan";
 import { commentTarget, normalizeQuote, type BubbleAt } from "./selection";
 import { SelectionBubble } from "./components/SelectionBubble";
+import { GrowingText } from "./components/GrowingText";
 import { TextDiff } from "./components/Diff";
 import { ChevronDown, ChevronRight, CloseIcon, PlusIcon } from "./components/Icons";
 
@@ -573,52 +574,4 @@ function label(change: PlanChange): string {
     case "detail":
       return "detail";
   }
-}
-
-/**
- * A text field that looks like the text it holds.
- *
- * A `<textarea>` rather than `contenteditable`, which is not a detail: the text
- * in it is model output, and a plain textarea has no path from that to markup
- * (rule 10). It grows with its content because a plan's prose is two lines for
- * one phase and eight for another, and a fixed box would either clip the second
- * or leave a hole under the first.
- */
-function GrowingText({
-  value,
-  onChange,
-  className,
-  placeholder,
-  rows,
-  ...data
-}: {
-  value: string;
-  onChange: (value: string) => void;
-  className: string;
-  placeholder: string;
-  rows: number;
-  "data-phase-path": string;
-  "data-phase-field": PhaseField;
-}) {
-  const field = useRef<HTMLTextAreaElement>(null);
-
-  useEffect(() => {
-    const node = field.current;
-    if (!node) return;
-    node.style.height = "auto";
-    node.style.height = `${node.scrollHeight}px`;
-  }, [value]);
-
-  return (
-    <textarea
-      {...data}
-      ref={field}
-      className={className}
-      value={value}
-      rows={rows}
-      placeholder={placeholder}
-      spellCheck={false}
-      onChange={(event) => onChange(event.target.value)}
-    />
-  );
 }

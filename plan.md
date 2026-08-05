@@ -19,7 +19,7 @@
 
 1. **类型强制的 append-only Ledger**——缓存命中是编译期保证：历史只有三个合法操作 `append` / `truncate_tail`（rewind）/ `compact`（显式断点原子重写），全部缓存友好。
 2. **中断契约**——Esc 中断时注入一条精确状态说明：哪些 tool call 完成、哪些被取消、文件是否被改动。
-3. **文件新鲜度追踪**——记录每个已读文件的 (path, mtime, hash, 读取范围)。重复读未变动文件 → 返回一行 stub；被外部改动 → 才返回新内容并附说明。
+3. **文件新鲜度追踪**——记录每个已读文件的 (path, mtime, hash, 读取范围)。重复读未变动文件 → 返回一行 stub；被外部改动 → 才返回新内容并附说明。**stub 的前提是"那次读还在上下文里"**，所以 rewind 与 compact 都走同一个 `Session::forget_seen_files` 清空它：条目一旦离开模型的窗口，"你已经有了"就是假话。
 
 
 ## 三个贯穿全局的机制
@@ -112,6 +112,8 @@ loop {
 
 **规则**：global + project 两级 `config.toml`，`allow`/`deny` 列表，匹配 `工具名(参数 pattern)`（`*` 是唯一通配），如 `shell(cargo *)`、`edit(src/**)`。交互中选 "Yes, don't ask again" 自动写入 project 规则。
 
+**交互选中的模式一律记进 `[tcode_state]` 当新会话默认，`unsafe` 也不例外**（TUI `persist_mode` 与 app `picker::remember_mode`，两处必须一致）。`unsafe` 曾是唯一例外，理由是"一次性放行不得静默武装以后每个会话"；实际代价全落在真按那个模式工作的人身上——每开一个会话重选一次自己早就做过的决定，而重选不是决定。当前模式一直显示在状态行/chip 上、一个键就能改，提醒该由它承担。
+
 **Tab 补充意见**：确认对话任意选项上按 Tab 展开内联输入框。"Yes + 意见" → 批准并把意见作为 user message 追加在 tool result 后；"No + 理由" → 拒绝原因进上下文。纯 append，缓存安全。
 
 **模式切换即时生效于下一次权限判定**：shift+tab 切的模式只改闸门、不入 ledger。闸门在每个权限判定点提交（回合始、`run_tools` 入口、串行批每个待批调用前、批边界、回合末），所以切到 unsafe/auto 后，模型这一步吐出的调用、乃至同批后续调用立刻按新模式判定，不必等一整个来回到下一批边界。**模式从不作为 note 写进 ledger**：模型看到的当前模式由 `status_block` 每回合重新导出到 user turn 的 tail，所以裸切键既不用追加什么、也没有什么需要撤回。曾经的 plan enter/exit note 是唯一的例外，随 plan mode 一起删除。
@@ -153,7 +155,7 @@ loop {
 | `shell` | Windows: PowerShell 为主 + 检测到 Git Bash 时提供 `bash`；`run_in_background` 进后台注册表，日志流到文件，`kill_task` 停 |
 | `monitor` | 后台监视（对齐 claude-code 的 Monitor）：跑平台主 shell 脚本，stdout 每行即一个事件（512B 截断），安全边界作为 `Entry::Note` 注入、空闲时前端按 quiet 合流窗口唤醒 `monitor_turn`（每次空闲唤醒 = 一次完整前缀 cache read，合流即省钱）；事件是 Note 不是 User，Auto Mode 授权判定天然不把事件当用户授权（claude-code 靠 prompt 纪律，这里靠类型）；洪水自动停（120 事件/60s，附"收紧过滤器"自愈提示）；与 shell 共用注册表、日志管道、`kill_task` 与权限规则域（`run(...)`）；默认 5min 超时，`persistent` 免超时；resume 时未终结的任务/监视注入一条"未恢复"Note（零猜测） |
 | `grep` / `glob` | 内嵌 grep-searcher/ignore/globset；每行截 512B、`max_filesize` 上限、并行 + 按 (path,line) 排序、deadline 兜底给 partial 标记、剪 VCS/缓存目录、搜 dotfiles + offset 分页 |
-| `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced Note 唤醒主 agent（见改进 5），非交互 |
+| `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced `Entry::Instruction` 唤醒主 agent——**模型收得到、转录里不出现**（人这边对应的是那次 run 本身），非交互 |
 | `web_fetch` / `web_search` | 见下 Web 节 |
 | `progress` | 一个任务一份耐久的工作分解文件（`~/.tcode/projects/<id>/progress/`，`draft`/`active`/`done`），也是前端进度面板的数据源。**它是该文件唯一的写入者**——模型不得用 `edit` 改它。返回值只回显刚翻成 `[>]` 的那一阶段的 `detail`，所以十二阶段的计划任何时刻只有一个阶段的正文在上下文里。`state: "active"` 就是"提交给用户审批"这一动作本身，因此 `permission()` 是输入的纯函数；用户手改文件后下次更新返回自愈冲突（附他们的原文）。不可代替方案、结论或交接记录。 |
 | `ask_user` | 必须由用户选择才能继续的阻塞分歧；支持多问题分页。不可用于可由代码、项目上下文或现有用户要求确定的细节。 |
@@ -184,9 +186,4 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-5. read：读取 Curves.tsx 时，工具返回“文件未变更，内容已在上下文中”，但压缩后的可见上下文并没有该文件内容，导致必须追加一次 force=true 读取。若上下文经过压缩，read 应返回所请求的片段而非“已在上下文”提示，可避免这次额外调用。
-6. app askUser我在给选项增加note的时候,回答比较长, note的框不会自动拓展.
-7. app background sub-agent finished怎么还会显示到主页面上,这个应该是给主agent看就好了吧.
-8. tui和app都保留记录unsafe状态吧,之前好像特殊实现,unsafe状态不会被记录,每次要重新选.
-10. skill命令不会出现在app的/slash command提示中，这个能做吗
 11. Tool friction — shell: 一个测试命令超时被 harness 杀掉后，Windows 的常规 target 中 agent_loop*.exe 持续被 linker 报为已锁定，即使随后未发现 cargo、rustc 或测试进程。为完成验证，我不得不使用会话私有的 CARGO_TARGET_DIR 重编译并在结束后删除。shell 超时时若能终止完整子进程树并等待句柄释放，可避免这一额外编译与目标目录切换。

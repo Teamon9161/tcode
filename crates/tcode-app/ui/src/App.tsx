@@ -341,6 +341,25 @@ export function App() {
               ],
             }));
             return;
+          // A skill is a prompt, so this lands exactly where `send` lands: the
+          // queue decides, and the optimistic block appears only on the sending
+          // path. What it shows is the backend's `prompt` — the `/name` line —
+          // and never the rendered file behind it, which is model context this
+          // side does not have and would not be a prompt if it did.
+          case "skill_loaded":
+            patch(id, (state) =>
+              result.queued.length > 0
+                ? { ...state, queued: result.queued }
+                : {
+                    ...state,
+                    running: true,
+                    failed: false,
+                    meter: { ...state.meter, turn: NO_USAGE },
+                    blocks: [...state.blocks, userBlock(result.prompt, [])],
+                    activity: "sending",
+                  },
+            );
+            return;
         }
       } catch (error) {
         patch(id, (state) => ({

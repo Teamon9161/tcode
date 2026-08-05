@@ -209,6 +209,37 @@ struct Task {
     notified: bool,
 }
 
+/// An undelivered harness note plus who it is for.
+///
+/// Most notes are facts about the session the human is watching — a monitor
+/// fired, a background command exited — and belong on screen as much as in the
+/// prompt. A background sub-agent's completion is not one of them: it is
+/// another agent's whole report, quoted inside a fence, addressed to the model
+/// that dispatched it. The human's copy of that work is the run itself (its
+/// trace, its steps, its status), so printing the fenced text in the
+/// conversation is the same output twice, in its least readable form.
+///
+/// `model_only` notes land as [`Entry::Instruction`](crate::Entry::Instruction)
+/// rather than `Entry::Note`, which is what keeps live rendering and replay
+/// agreeing: the entry type decides, not each frontend's own list of prefixes
+/// to hide.
+#[derive(Clone, Debug)]
+pub struct HarnessNote {
+    pub text: String,
+    /// Kept out of the human transcript, live and on resume.
+    pub model_only: bool,
+}
+
+impl HarnessNote {
+    /// A note the human should see alongside the model.
+    fn shared(text: String) -> Self {
+        Self {
+            text,
+            model_only: false,
+        }
+    }
+}
+
 /// A cheap, clonable handle a detached producer (currently a background
 /// sub-agent) keeps to deliver a completion note back into an idle session and
 /// wake it — the same notify+drain path a finished monitor uses, without the
@@ -216,7 +247,7 @@ struct Task {
 /// spawned it, so it carries only `Arc`s, never a borrow of the session.
 #[derive(Clone, Debug)]
 pub struct HarnessNoteSink {
-    inbox: Arc<Mutex<Vec<String>>>,
+    inbox: Arc<Mutex<Vec<HarnessNote>>>,
     signal: Arc<Notify>,
     /// In-flight background runs, `run id → cancel token`. The map is both the
     /// running set (its size is the count) and how `kill_task` reaches a run.
@@ -235,11 +266,18 @@ impl HarnessNoteSink {
 
     /// Deliver `note`, clear this run from the in-flight set, and wake an idle
     /// session to read it. Delivery is the same append the agent loop makes for
-    /// a monitor completion: `take_notes` drains it into an `Entry::Note` at the
-    /// next boundary or idle wake.
+    /// a monitor completion, except that the note is `model_only` (see
+    /// [`HarnessNote`]): it is the dispatched run's report coming back to the
+    /// agent that asked for it, and the human already has the run.
     pub fn finish(&self, run_id: &str, note: String) {
         self.runs.lock().expect("background runs").remove(run_id);
-        self.inbox.lock().expect("harness note inbox").push(note);
+        self.inbox
+            .lock()
+            .expect("harness note inbox")
+            .push(HarnessNote {
+                text: note,
+                model_only: true,
+            });
         self.signal.notify_one();
     }
 }
@@ -256,7 +294,7 @@ pub struct BackgroundTasks {
     /// Completion notes from detached producers (background sub-agents),
     /// undelivered until `take_notes` drains them. Shared with every
     /// `HarnessNoteSink` this registry hands out.
-    inbox: Arc<Mutex<Vec<String>>>,
+    inbox: Arc<Mutex<Vec<HarnessNote>>>,
     /// In-flight background sub-agent runs, `run id → cancel token`, shared with
     /// every `HarnessNoteSink`. Both the running set and `kill_task`'s handle.
     runs: Arc<Mutex<HashMap<String, CancellationToken>>>,
@@ -413,11 +451,11 @@ impl BackgroundTasks {
     /// Undelivered notes: detached background-agent completions first, then
     /// monitor events and task completions the model has not heard about.
     /// Called by the agent loop at safe append boundaries (and by an idle wake).
-    pub fn take_notes(&mut self) -> Vec<String> {
+    pub fn take_notes(&mut self) -> Vec<HarnessNote> {
         let mut notes = std::mem::take(&mut *self.inbox.lock().expect("harness note inbox"));
         for task in &mut self.tasks {
             if let Some(event_note) = drain_monitor_events(task) {
-                notes.push(event_note);
+                notes.push(HarnessNote::shared(event_note));
             }
             if task.notified {
                 continue;
@@ -427,10 +465,10 @@ impl BackgroundTasks {
                 continue;
             }
             task.notified = true;
-            notes.push(match &task.shared.monitor {
+            notes.push(HarnessNote::shared(match &task.shared.monitor {
                 Some(monitor) => monitor_completion_note(task, monitor, status),
                 None => completion_note(task, status),
-            });
+            }));
         }
         notes
     }
@@ -519,6 +557,12 @@ fn monitor_completion_note(task: &Task, monitor: &MonitorState, status: TaskStat
 mod tests {
     use super::*;
 
+    /// The note texts, for the assertions that only care what was said.
+    /// `model_only` is asserted on its own where it is the point of the test.
+    fn texts(notes: Vec<HarnessNote>) -> Vec<String> {
+        notes.into_iter().map(|note| note.text).collect()
+    }
+
     fn reg() -> BackgroundTasks {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
@@ -538,7 +582,7 @@ mod tests {
 
         shared.append_output("line1\nline2\n");
         shared.set_status(TaskStatus::Exited(0));
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("b1"));
         assert!(notes[0].contains("exited with code 0"));
@@ -572,7 +616,7 @@ mod tests {
         let deadline = reg.monitor_wake_deadline().unwrap();
         assert!(deadline <= Instant::now() + Duration::from_millis(50));
 
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes, vec!["background explore t1 finished".to_string()]);
         // Delivered exactly once.
         assert!(reg.take_notes().is_empty());
@@ -597,7 +641,7 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&shared.log_path).unwrap(), "");
 
         shared.set_status(TaskStatus::Exited(1));
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("0 output lines"));
         assert!(notes[0].contains("No output was captured by tcode"));
@@ -640,7 +684,7 @@ mod tests {
         shared.push_line("ERROR one");
         shared.push_line("ERROR two");
         assert!(reg.monitor_wake_deadline().is_some());
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 1, "{notes:?}");
         assert!(notes[0].contains("m1"));
         assert!(notes[0].contains("errors in app.log"));
@@ -684,7 +728,7 @@ mod tests {
         // Finished monitor: wake now, not after the quiet window.
         let deadline = reg.monitor_wake_deadline().unwrap();
         assert!(deadline <= Instant::now() + Duration::from_millis(50));
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].contains("done: success"));
         assert!(notes[1].contains("Monitor m1 (ci status) exited with code 0"));
@@ -702,7 +746,7 @@ mod tests {
         }
         assert!(shared.kill.is_cancelled());
         shared.set_status(TaskStatus::Killed);
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         // Pending events (capped) still deliver, then the stop explanation.
         assert_eq!(notes.len(), 2, "{}", notes.len());
         assert!(notes[0].contains(&format!(
@@ -721,7 +765,7 @@ mod tests {
             .register_monitor("watch", "d", Duration::from_millis(100))
             .unwrap();
         shared.push_line(&"x".repeat(2 * MAX_EVENT_LINE_BYTES));
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert!(notes[0].contains('…'));
         // The log keeps the full line even though the event was truncated.
         assert!(std::fs::read_to_string(&shared.log_path)
@@ -738,7 +782,7 @@ mod tests {
             .unwrap();
         shared.mark_timed_out();
         shared.set_status(TaskStatus::Killed);
-        let notes = reg.take_notes();
+        let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("timeout"));
         assert!(notes[0].contains("persistent=true"));

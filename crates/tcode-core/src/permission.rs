@@ -229,6 +229,14 @@ pub enum BatchApproval {
 }
 
 /// UI-side implementation of the interactive approval prompt.
+///
+/// `ask_with_call` carries one argument past what clippy will accept, and the
+/// lint is declined rather than answered: these fields already travel together
+/// as [`crate::tool::DelegatedApprovalRequest`], so the real fix is that struct
+/// becoming the parameter — a change to seven implementations across three
+/// frontends and the ACP adapter, not a signature tidy-up. Bundling them here
+/// alone would leave two shapes for one call.
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait Approver: Send + Sync {
     /// `input` is included so an interactive front end can show the exact

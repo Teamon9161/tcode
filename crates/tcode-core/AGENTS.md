@@ -17,6 +17,7 @@
 - **turn 运行中用户提交的 prompt 只能在工具批次边界投递**：`Entry::Assistant`(tool_use) 与其 `Entry::ToolResults` 之间不许插任何东西（否则请求非法），所以队列（`Session::pending` / `PendingInput`，前端持克隆句柄）由 agent loop 在"批次结果已提交"那一点 drain，append 成真正的 `Entry::User`——`as_messages` 会把它与同位置的 tool_result 合并进同一条 user message，仍是纯 append，模型下一步就读到。它是 `Entry::User` 而非 `Entry::Note`，因为 Auto Mode 的授权判定只认用户消息。循环没走到边界就结束的（收尾发言期间入队、或 ctrl+c 打断），由前端在 turn 结束时立刻起新 turn 发出去。
 - **可逆的 harness 状态不许由控制操作直接写进 `Entry::Note`**：mode、`/memory on|off`、`/cd` 等先立即更新本地运行时状态；连续改动在 `Session` 的 pending 槽内覆盖合并。只有真实用户交互到达合法投递点（新 prompt、批次边界投递的排队 prompt、审批完成）才把**最终**状态 append 给模型；纯 UI 键、命令和 monitor wake 不得产生该类 Note。环境另分"已观察"与"已投递"两个 JSONL snapshot，resume 用后者作为模型已知基线；旧日志的 `EnvironmentChanged` 兼容地视作已投递。工具结果、hooks、monitor、中断、compact 等已发生事实仍立即 append，不能错误延迟。
 - **monitor 事件是 `Entry::Note`，不是 `Entry::User`**：Auto Mode 授权判定只认用户消息，所以监控事件在结构上永远不可能被当成用户授权（claude-code 靠 prompt 纪律解决的问题，这里靠类型解决）——不得把事件改成 User 注入。事件注入分两种价位：turn 进行中搭批次边界的车（纯 append，免费）；空闲时每次唤醒 = 一次完整前缀 cache read，所以必须合流——前端等 quiet 窗口（deadline = 首个未投递事件 + quiet_ms，锚定首个事件保证有界延迟）后调 `Agent::monitor_turn`，无事件待投递时它不发任何请求。
+- **后台 sub-agent 交回的 report 是 `Entry::Instruction`，不是 `Entry::Note`**（`background.rs::HarnessNote` 的 `model_only`）：monitor 事件、后台命令退出是**这个人正在看的会话里发生的事**，该上屏；一份 report 是另一个 agent 的整篇输出、裹在围栏里、寄给派它出去的模型，而人这边对应的是那次 run 本身（trace、步骤、状态）。差别落在**条目类型**而不是各前端各自维护一张"要藏的前缀表"：转录与 replay 走的是同一串 entries，靠事件藏会藏成"live 看不见、resume 又冒出来"。`note_background` 因此对 `model_only` 只 append、不发 `AgentEvent::Note`。
 - **`SKILL_ECHO_OPEN` 归 core（`ledger.rs`）而非 tools**：`/name` 触发的 skill 正文以 `Entry::User` 进 ledger（省一轮），但正文是仓库文件、不是用户的话。`ClassifierTranscript` 必须能在不反向依赖 tools 的前提下认出它并打成 `<skill-body>` 而非 `<user>`；Auto Mode 的授权判定只认 `<user>`。这条链断一环，clone 来的仓库就能靠一个诱人的命令名（`/test`、`/build`）拿到用户授权。格式本身仍只有 `wrap_skill_echo` / `parse_skill_echo` 知道。
 - **Auto Mode 分类器判决按批缓存，不按调用**：`ClassifierRequest` 只有 policy / cache_scope / 整份转录，而承载这一批全部 tool_use 的 assistant 条目在第一次权限检查前就已在 ledger 里——逐个调用发的是字节相同的请求。`BatchClassification` 缓存的是**已解析的 `Decision`** 而非原始判决，这样暂停计数与 mode 变更事件每批恰好发生一次（缓存原始判决会让一批 N 个调用把连续 block 计数放大 N 倍）。
 
@@ -45,6 +46,7 @@
 ## compact 与人类记录
 
 - **compact 缩的是模型上下文，不是用户的记录**：被替换掉的条目进 `Ledger::archived`，`entries()` / `as_messages()` 完全不变（索引不偏移，checkpoint 与 rewind 的 `ledger_len` 不受影响），transcript 与 `/export` 走 `history()` = archived + entries。别让前端自己攒一份平行历史——只有 ledger 知道 compact 拿走了什么，攒平行历史必然在 resume 上漂移（这正是原来 resume 后看不到 compact 之前对话的原因）。
+- **compact 落地就清 freshness**（`Session::forget_seen_files`，与 rewind 同一个方法）：freshness 回答的是"这个文件你已经拿到了"，而那个"拿到"指的是历史里的某条工具结果——被摘要替换掉的一刻这句话就成了假话。少这一步的表现是：压缩之后 `read` 一个摘要没抄进去的文件，返回"未变更，已在上下文"，模型得花一整轮才发现自己手上没有、再补一次 `force` 读。代价只是一次重读，别为了省它加什么"摘要里提到过就算看过"的判断——摘要里没有字节。
 - archived 里的条目**没有合法的 `truncate_tail` 索引**：replay 不给它们打 entry tag，rewind 因此进不去被压缩的历史——那本来就是 compact 的语义。反过来 `truncate_tail(0)`（`/clear`）会连 archived 一起清空：summary 一走，它代表的那段历史就不再属于这个会话，否则"清掉的对话"会在 resume 时复活。
 
 ## 磁盘回收

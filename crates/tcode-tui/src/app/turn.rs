@@ -909,6 +909,12 @@ impl App {
     /// A sub-agent run began. Ordinary task cards hang off their parent call;
     /// cohort activations instead reuse the persistent member-owned card that
     /// the typed roster event created.
+    ///
+    /// The parameter list is one past clippy's limit and stays that way: it is
+    /// `AgentEvent::TaskRunStarted`'s fields, one for one. That variant is a
+    /// wire contract (`event_wire_tests`), so a local bundle to shorten this
+    /// signature would be a second shape for the same event to keep in step.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn on_task_run_started(
         &mut self,
         run: String,

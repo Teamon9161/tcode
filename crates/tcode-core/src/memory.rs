@@ -884,8 +884,7 @@ fn normalize(path: PathBuf) -> PathBuf {
             path
         }
     };
-    #[cfg(not(windows))]
-    let path = path;
+    // Everywhere else the argument is already the ordinary spelling.
 
     let mut out = PathBuf::new();
     for component in path.components() {

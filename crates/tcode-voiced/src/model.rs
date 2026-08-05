@@ -153,8 +153,8 @@ impl Model {
             return Ok(vocab.display().to_string());
         }
         let source = self.root.join(bpe);
-        let bytes = fs::read(&source)
-            .map_err(|e| format!("cannot read {}: {e}", source.display()))?;
+        let bytes =
+            fs::read(&source).map_err(|e| format!("cannot read {}: {e}", source.display()))?;
         let text = crate::bpe::export(&bytes)
             .map_err(|reason| format!("cannot read {}: {reason}", source.display()))?;
         fs::write(&vocab, text).map_err(|e| format!("cannot write {}: {e}", vocab.display()))?;
@@ -323,8 +323,10 @@ fn fetch_into(
         std::io::Write::write_all(&mut file, &buffer[..read])
             .map_err(|e| Stopped::Final(format!("cannot write {}: {e}", temp.display())))?;
         done += read as u64;
-        if total > 0 {
-            let pct = ((done * 100) / total).min(100) as u8;
+        // `None` when the server sent no content length: there is no
+        // percentage to report, not a zero one.
+        if let Some(pct) = (done * 100).checked_div(total) {
+            let pct = pct.min(100) as u8;
             // Only on change: one event per percent, not per 256KB.
             if pct != last_pct {
                 last_pct = pct;

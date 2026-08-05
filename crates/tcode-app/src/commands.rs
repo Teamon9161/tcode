@@ -703,6 +703,16 @@ pub enum SlashResult {
     ResumePicker {
         sessions: Vec<StoredSession>,
     },
+    /// A `/name` skill was loaded. Loading one is not a command that answers —
+    /// it is a prompt — so this reports what `send_message` reports: the queue
+    /// as it now stands, empty when the turn is already running. `prompt` is
+    /// the line to show in the transcript, composed here rather than in the
+    /// webview because the message the model received is the rendered file and
+    /// no frontend may author its own account of that.
+    SkillLoaded {
+        prompt: String,
+        queued: Vec<QueuedView>,
+    },
     Notice {
         text: String,
         error: bool,
@@ -731,8 +741,15 @@ pub struct SlashCommandView {
 /// names are (`Tool::display_name`): `/help` in the terminal and this menu
 /// describe the same command, and two descriptions of one thing is one of them
 /// being wrong.
+///
+/// Skills come after them, exactly as `/help` orders them in the terminal.
+/// `/name` is shorthand for loading that skill — the same fallback
+/// `App::dispatch_skill` implements there — so leaving them out of this menu
+/// did not make them unavailable, it made them undiscoverable: a person had to
+/// already know the name to type it. The dispatcher below reads this same
+/// list, so the menu still cannot advertise something it would refuse.
 #[tauri::command]
-pub fn slash_commands() -> Vec<SlashCommandView> {
+pub fn slash_commands(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SlashCommandView> {
     tcode_core::commands::CommandRegistry::builtin()
         .entries()
         .filter(|(name, _)| DESKTOP_COMMANDS.contains(&name.trim_start_matches('/')))
@@ -740,12 +757,20 @@ pub fn slash_commands() -> Vec<SlashCommandView> {
             name: name.to_string(),
             help: help.to_string(),
         })
+        .chain(supervisor.skills().iter().map(|skill| SlashCommandView {
+            name: format!("/{}", skill.name),
+            help: skill.description.clone(),
+        }))
         .collect()
 }
 
-fn slash_name(line: &str) -> Option<&str> {
+/// A slash line's name and everything after it, as the skill table reads them.
+fn slash_parts(line: &str) -> Option<(&str, &str)> {
     let rest = line.trim().strip_prefix('/')?;
-    Some(rest.split_whitespace().next().unwrap_or_default())
+    Some(match rest.split_once(char::is_whitespace) {
+        Some((name, args)) => (name, args.trim()),
+        None => (rest, ""),
+    })
 }
 
 /// Dispatch the core commands whose semantics fit this desktop surface.
@@ -753,6 +778,10 @@ fn slash_name(line: &str) -> Option<&str> {
 /// The webview sends text, not an operation: parsing and all session mutations
 /// remain in Core's command registry. Effects that only a frontend can perform
 /// are interpreted here, where the existing turn lifecycle is available.
+///
+/// A line that is no command falls back to the skill table, exactly as
+/// `App::dispatch_skill` does in the terminal: `/name` is shorthand for loading
+/// that skill. The fallback is last, so a skill can never shadow a command.
 #[tauri::command]
 pub fn slash_command(
     app: AppHandle,
@@ -760,8 +789,11 @@ pub fn slash_command(
     session: String,
     line: String,
 ) -> Result<SlashResult, String> {
-    match slash_name(&line) {
-        Some(name) if DESKTOP_COMMANDS.contains(&name) => {}
+    match slash_parts(&line) {
+        Some((name, _)) if DESKTOP_COMMANDS.contains(&name) => {}
+        Some((name, args)) if supervisor.skills().iter().any(|skill| skill.name == name) => {
+            return load_skill(app, &supervisor, &session, name, args)
+        }
         Some(_) => {
             return Err(format!(
                 "unsupported desktop command {line} — use {}",
@@ -776,7 +808,12 @@ pub fn slash_command(
     }
     let tcode_core::commands::CommandOutcome { messages, effects } =
         supervisor.dispatch_slash(&session, &line)?;
-    for effect in effects {
+    // At most one effect, and every one of them is a whole answer for this
+    // surface — so this takes the first rather than iterating. It was written
+    // as a `for` that returned on its first pass, which clippy's `never_loop`
+    // was right to call out: the loop implied later effects might be handled,
+    // and they never were.
+    if let Some(effect) = effects.into_iter().next() {
         match effect {
             tcode_core::commands::CommandEffect::ConversationCleared
             | tcode_core::commands::CommandEffect::ConversationReplaced => {
@@ -826,6 +863,114 @@ pub fn slash_command(
         error: matches!(message.kind, tcode_core::commands::MessageKind::Error),
         text: message.text,
     })
+}
+
+/// The prompt a `/name` line loads: the skill's rendered body, wrapped in the
+/// sentinel that marks it as a repository file rather than the person speaking.
+///
+/// `/name` is not a command that answers; it is a cheaper way to spend a turn —
+/// one round trip less than making the model call the `skill` tool. Every step
+/// of it (find, read, render, wrap) happens here rather than in the webview for
+/// the same reason `plan` is a flag on `send_message`: no frontend may author
+/// context that claims to be the harness. Kept free of `AppHandle` so the whole
+/// decision is testable without a window (AGENTS.md rule 2); the command below
+/// is left with the sending.
+pub fn skill_prompt(
+    supervisor: &Supervisor,
+    handle: &crate::state::SessionHandle,
+    name: &str,
+    args: &str,
+) -> Result<String, String> {
+    let skill = supervisor
+        .skills()
+        .iter()
+        .find(|skill| skill.name == name)
+        .ok_or_else(|| format!("no skill named '{name}'"))?;
+    // One small file, read because the user just asked for it by name. Not the
+    // class of read AGENTS.md rule 22 is about (a folder of session logs
+    // replayed for previews): it is the same blocking read the terminal does at
+    // the same moment, and it is over before the click is.
+    let body = match &skill.source {
+        tcode_tools::SkillSource::Dir(dir) => {
+            let path = dir.join("SKILL.md");
+            std::fs::read_to_string(&path)
+                .map_err(|error| format!("cannot read {}: {error}", path.display()))?
+        }
+        tcode_tools::SkillSource::Builtin(body) => body.to_string(),
+    };
+    // The session's own scratch directory when it is not mid-turn; otherwise the
+    // project's, which is that directory's parent and equally writable. A skill
+    // body that mentions scratch gets a real path either way.
+    let scratch = handle
+        .scratch_dir()
+        .unwrap_or_else(|| tcode_core::store::scratchpad_dir(&handle.cwd));
+    let rendered = tcode_tools::render_skill(skill, &body, args, &handle.cwd, &scratch);
+    Ok(tcode_tools::wrap_skill_echo(name, args, &rendered))
+}
+
+/// Load a skill and send it as this conversation's next prompt. Runs whether or
+/// not a turn is in flight — a prompt queues, where a registry command would
+/// need the `&mut Session` a running turn holds.
+fn load_skill(
+    app: AppHandle,
+    supervisor: &Supervisor,
+    session: &str,
+    name: &str,
+    args: &str,
+) -> Result<SlashResult, String> {
+    let handle = supervisor
+        .get(session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let text = skill_prompt(supervisor, &handle, name, args)?;
+    // What the transcript shows: the line the person typed. The body is in the
+    // ledger, in the export and in the model's context — it is just not a prompt.
+    let prompt = crate::state::folded_prompt(&text)
+        .expect("a wrapped skill echo is what `folded_prompt` recognizes");
+    let queued = deliver(
+        app,
+        supervisor.agent(),
+        handle,
+        tcode_core::PendingMessage {
+            text: text.clone(),
+            attachments: Vec::new(),
+            blocks: vec![ContentBlock::Text { text }],
+            instructions: Vec::new(),
+        },
+    );
+    Ok(SlashResult::SkillLoaded { prompt, queued })
+}
+
+/// Hand a composed message to a session: start its turn, or leave it queued.
+///
+/// The one place either kind of prompt — typed or loaded from a skill — meets
+/// the turn lifecycle, and the only part of that which needs an `AppHandle`.
+/// Returns the queue as it now stands, so an empty answer means "this is being
+/// sent" and a non-empty one is exactly what to draw above the composer.
+fn deliver(
+    app: AppHandle,
+    agent: Arc<tcode_core::Agent>,
+    handle: Arc<crate::state::SessionHandle>,
+    message: tcode_core::PendingMessage,
+) -> Vec<QueuedView> {
+    let Some(message) = handle.send_or_queue(message) else {
+        return queue_of(&handle);
+    };
+    let (input, instructions) = (message.blocks, message.instructions);
+    let emit: Arc<dyn Emit> = Arc::new(app);
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
+        {
+            // `Busy` still reaches here: `send_or_queue` closed the ordinary
+            // race, but two sends can both find the session free before either
+            // spawned task has taken it. The command already returned, so the
+            // only way to tell the user is the channel the turn would have used.
+            emit.emit(
+                TURN_FINISHED,
+                serde_json::json!({ "session": handle.id, "error": error.to_string() }),
+            );
+        }
+    });
+    Vec::new()
 }
 
 /// Start a turn — or queue the prompt when one is already running.
@@ -878,31 +1023,17 @@ pub fn send_message(
     // The queued path carries `instructions` too: core appends them as
     // `Entry::Instruction` immediately before the prompt when it delivers, so
     // "plan this first" means the same thing whether the turn was free or busy.
-    let Some(message) = handle.send_or_queue(tcode_core::PendingMessage {
-        text,
-        attachments: Vec::new(),
-        blocks: input,
-        instructions,
-    }) else {
-        return Ok(queue_of(&handle));
-    };
-    let (input, instructions) = (message.blocks, message.instructions);
-
-    let emit: Arc<dyn Emit> = Arc::new(app);
-    tauri::async_runtime::spawn(async move {
-        if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
-        {
-            // `Busy` still reaches here: `send_or_queue` closed the ordinary
-            // race, but two sends can both find the session free before either
-            // spawned task has taken it. The command already returned, so the
-            // only way to tell the user is the channel the turn would have used.
-            emit.emit(
-                TURN_FINISHED,
-                serde_json::json!({ "session": handle.id, "error": error.to_string() }),
-            );
-        }
-    });
-    Ok(Vec::new())
+    Ok(deliver(
+        app,
+        agent,
+        handle,
+        tcode_core::PendingMessage {
+            text,
+            attachments: Vec::new(),
+            blocks: input,
+            instructions,
+        },
+    ))
 }
 
 /// What this conversation still owes the model, for the strip above the

@@ -1717,7 +1717,11 @@ async fn kill_task_stops_a_background_process() {
     }
     let notes = session.tool_ctx.background.lock().unwrap().take_notes();
     assert_eq!(notes.len(), 1, "{notes:?}");
-    assert!(notes[0].contains("killed"), "{}", notes[0]);
+    assert!(notes[0].text.contains("killed"), "{}", notes[0].text);
+    assert!(
+        !notes[0].model_only,
+        "a killed monitor is the human's news too"
+    );
 }
 
 #[tokio::test]
@@ -1759,6 +1763,66 @@ async fn monitor_wake_uses_the_configured_auto_compact_threshold() {
         session.ledger.entries(),
         [Entry::Summary(summary)] if summary == "monitor summary"
     ));
+}
+
+/// A compaction that lands forgets which files the model has seen.
+///
+/// Freshness answers "unchanged, already in context" about a *tool result*, and
+/// a compaction is precisely the moment those results stop being in context.
+/// Left alone, the next `read` of a file the summary did not quote returns a
+/// stub pointing at nothing — costing a turn to notice plus a `force` read to
+/// undo, which is the waste the zero-guessing principle exists to prevent.
+#[tokio::test]
+async fn compaction_forgets_the_reads_it_removed_from_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let compact = MockProvider::named("compact-1", vec![text_done("what happened so far")]);
+    let mut agent = agent(MockProvider::new(vec![]));
+    agent
+        .models
+        .pin(AgentRole::Compact.key(), cell(compact.clone()).snapshot());
+    agent.model.swap(ActiveModel {
+        provider: MockProvider::new(vec![]),
+        max_tokens: Some(1024),
+        context_window: 1_000,
+        effort: None,
+    });
+    agent.auto_compact_percent = 50;
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.last_prompt_tokens = 600;
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "history pending compaction".into(),
+    }]));
+    let seen = dir.path().join("Curves.tsx");
+    let hash = tcode_core::freshness::content_hash(b"export function Curves() {}");
+    session
+        .tool_ctx
+        .freshness
+        .lock()
+        .unwrap()
+        .record_read(&seen, hash, None);
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(16);
+    agent
+        .monitor_turn(
+            &mut session,
+            &tx,
+            &ScriptedApprover::new(ApprovalDecision::Yes, None),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("compacting at a monitor boundary is not a turn failure");
+
+    assert!(matches!(session.ledger.entries(), [Entry::Summary(_)]));
+    assert_eq!(
+        session
+            .tool_ctx
+            .freshness
+            .lock()
+            .unwrap()
+            .check_read(&seen, hash, None),
+        tcode_core::freshness::ReadStatus::New,
+        "a read the summary replaced must not still answer 'you already have this'"
+    );
 }
 
 /// An automatic compaction that comes back with no summary must not be tried
@@ -3512,7 +3576,11 @@ fn tool_result_text(session: &Session) -> String {
 }
 
 /// Poll the session's background inbox until a detached run files its note.
-async fn wait_for_background_note(session: &Session) -> String {
+///
+/// The note comes back whole rather than as its text: a background report is
+/// `model_only`, and that half of it is what keeps the report out of the human
+/// transcript, so a caller must be able to assert it.
+async fn wait_for_background_note(session: &Session) -> tcode_core::background::HarnessNote {
     for _ in 0..200 {
         let note = session
             .tool_ctx
@@ -3577,15 +3645,19 @@ async fn a_background_agent_returns_at_once_and_delivers_a_fenced_report_note() 
 
     // The completion arrives later as a fenced note that would wake an idle turn.
     let note = wait_for_background_note(&session).await;
+    let text = note.text;
     assert!(
-        note.contains("background explore sub-agent t1 finished on scout-1"),
-        "{note}"
+        text.contains("background explore sub-agent t1 finished on scout-1"),
+        "{text}"
     );
-    assert!(note.contains("<background-report run=\"t1\" agent=\"explore\">"));
-    assert!(note.contains("found one function"));
+    assert!(text.contains("<background-report run=\"t1\" agent=\"explore\">"));
+    assert!(text.contains("found one function"));
     // The report cannot close its own fence: exactly one real closer.
-    assert!(note.contains("<\\/background-report> HA"));
-    assert_eq!(note.matches("</background-report>").count(), 1);
+    assert!(text.contains("<\\/background-report> HA"));
+    assert_eq!(text.matches("</background-report>").count(), 1);
+    // It is the model's mail, not the transcript's: the human's copy of this
+    // work is the run itself, so the note lands as `Entry::Instruction`.
+    assert!(note.model_only);
 }
 
 /// An API failure mid-run must not throw the run away. Everything the

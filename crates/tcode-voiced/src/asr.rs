@@ -30,7 +30,12 @@ impl Recognizer {
     /// `hotwords` are whole words or phrases. Empty means no biasing at all,
     /// which for the transducer also means the faster decoder — nobody should
     /// pay for beam search they are not using.
-    pub fn load(model: &Model, language: &str, hotwords: &[String], scratch: &Path) -> Result<Self, String> {
+    pub fn load(
+        model: &Model,
+        language: &str,
+        hotwords: &[String],
+        scratch: &Path,
+    ) -> Result<Self, String> {
         let mut config = OfflineRecognizerConfig::default();
         let mut hotwords_file = None;
         // Every family fills exactly one slot; sherpa picks the recogniser by

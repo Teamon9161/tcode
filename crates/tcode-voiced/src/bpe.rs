@@ -179,7 +179,10 @@ mod tests {
             panic!("download the zh-en model first");
         };
         let vocab = export(&model).expect("a real bpe.model parses");
-        let pieces: Vec<&str> = vocab.lines().map(|l| l.split('\t').next().unwrap()).collect();
+        let pieces: Vec<&str> = vocab
+            .lines()
+            .map(|l| l.split('\t').next().unwrap())
+            .collect();
 
         let tokens = std::fs::read_to_string(root.join("tokens.txt")).expect("tokens.txt");
         let tokens: Vec<&str> = tokens
@@ -195,6 +198,10 @@ mod tests {
             "only {shared} of {} pieces appear in tokens.txt — the parse is wrong",
             pieces.len()
         );
-        assert!(pieces.len() > 500, "suspiciously few pieces: {}", pieces.len());
+        assert!(
+            pieces.len() > 500,
+            "suspiciously few pieces: {}",
+            pieces.len()
+        );
     }
 }

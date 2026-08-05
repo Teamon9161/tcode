@@ -242,7 +242,12 @@ export type SlashResult =
   | { kind: "conversation"; opened: OpenedSession; notice: string | null }
   | { kind: "compact_started" }
   | { kind: "resume_picker"; sessions: StoredSession[] }
-  | { kind: "notice"; text: string; error: boolean };
+  | { kind: "notice"; text: string; error: boolean }
+  /** A `/name` skill was loaded and sent. It is a prompt, so it answers like
+   *  `send_message`: `queued` empty means the turn is already running, and
+   *  `prompt` is the line to show for it — the backend composes that, because
+   *  what the model received is a rendered file this side never sees. */
+  | { kind: "skill_loaded"; prompt: string; queued: Queued[] };
 
 /** A folder tcode has held a conversation in. */
 export type ProjectInfo = {

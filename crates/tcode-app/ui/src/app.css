@@ -4176,13 +4176,22 @@ body.is-resizing {
   overflow-wrap: anywhere;
 }
 
+/* A textarea, not an input: the note is one clause some days and a paragraph
+   others, and a single-line field hides the long one by scrolling it sideways
+   out of view. `GrowingText` owns the height; everything here has to make the
+   box look like the field it replaced — a textarea otherwise brings its own
+   monospace stack, a resize grip, and a scroll track it does not need. */
 .approval-comment {
+  width: 100%;
   padding: var(--s-2) var(--s-3);
   border: 1px solid var(--line-strong);
   border-radius: var(--r-sm);
   background: var(--bg);
   color: var(--ink);
+  font-family: var(--font-ui);
   font-size: var(--text-sm);
+  resize: none;
+  overflow-y: hidden;
 }
 .approval-comment::placeholder {
   color: var(--muted);

@@ -339,7 +339,7 @@ pub fn sweep_old_sessions(data_dir: &Path) {
             Some((modified, id, path))
         })
         .collect();
-    logs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    logs.sort_by_key(|(modified, ..)| std::cmp::Reverse(*modified)); // newest first
 
     let now = SystemTime::now();
     let cutoff = now.checked_sub(KEEP_FOR).unwrap_or(UNIX_EPOCH);
@@ -790,7 +790,7 @@ impl SessionStore {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
-        for line in BufReader::new(File::open(&path)?).lines() {
+        for line in BufReader::new(File::open(path)?).lines() {
             let line = line?;
             if line.trim().is_empty() {
                 continue;
@@ -866,7 +866,7 @@ impl SessionStore {
         if let Some(note) = lost_background_note(&ledger) {
             ledger.append(Entry::Note(note));
         }
-        let file = OpenOptions::new().append(true).open(&path)?;
+        let file = OpenOptions::new().append(true).open(path)?;
         Ok(Resumed {
             store: Self {
                 id,

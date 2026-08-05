@@ -25,8 +25,9 @@ Use these locations deliberately:
   only this table through a comment-preserving `toml_edit` read-modify-write;
   do not use it for normal handwritten defaults or project policy. The single
   exception is `/model save`, which adds or replaces one `[presets.<name>]`
-  table the same way. `unsafe` mode is deliberately never persisted, so a
-  one-off unsafe session cannot arm later sessions.
+  table the same way. Every permission mode picked interactively is persisted
+  here, `unsafe` included; edit or remove `[tcode_state].mode` to change what
+  new sessions start in.
 - `.tcode/config.toml` is the project overlay. It is appropriate for
   project-specific profiles, model catalog entries, presets, non-`auto`
   sub-agent pins, permission rules, instruction discovery, hooks, and MCP
@@ -493,9 +494,10 @@ routine prompts but deny rules still apply. Prefer `default` or `accept-edits`
 for normal work.
 
 The effective permission mode is `--mode` (when supplied), then
-`[tcode_state].mode`, then the selected user's `[permissions].mode`. The TUI
-persists modes chosen interactively except `unsafe`; remove or change the state
-through the mode picker if a hand-written default appears ignored. A project
+`[tcode_state].mode`, then the selected user's `[permissions].mode`. The TUI and
+the desktop app persist every mode chosen interactively, `unsafe` included;
+remove or change the state through the mode picker if a hand-written default
+appears ignored. A project
 `.tcode/config.toml` may append `allow`, `ask`, and `deny` rules, but its
 `[permissions].mode` is ignored so a checked-out repository cannot choose the
 user's approval posture.

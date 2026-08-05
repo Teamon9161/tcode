@@ -220,8 +220,10 @@ async fn fetch_into(
         written += chunk.len() as u64;
         // Streamed for the progress report: this is tens of megabytes, and a
         // silent wait is indistinguishable from a hang.
-        if total > 0 {
-            let pct = ((written * 100) / total).min(100) as u8;
+        // `None` when the server sent no content length: there is no
+        // percentage to report, not a zero one.
+        if let Some(pct) = (written * 100).checked_div(total) {
+            let pct = pct.min(100) as u8;
             if pct != last {
                 last = pct;
                 progress(pct);

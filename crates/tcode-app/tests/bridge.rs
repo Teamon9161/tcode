@@ -514,7 +514,7 @@ async fn concurrent_sessions_never_cross_streams() {
 
     let agent_one = agent(MockProvider::new(vec![text_done("from one")]), one.path());
     let agent_two = agent(MockProvider::new(vec![text_done("from two")]), two.path());
-    let supervisor = Supervisor::new(agent_one.clone(), factory(), menus());
+    let supervisor = Supervisor::new(agent_one.clone(), factory(), menus(), Vec::new());
     let handle_one = handle("s1", one.path().to_path_buf());
     let handle_two = handle("s2", two.path().to_path_buf());
     supervisor.open(handle_one.clone());
@@ -1387,7 +1387,12 @@ async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
     let collector = Arc::new(Collector::default());
     let emit = sink(&collector);
     let session = handle("s1", cwd.path().to_path_buf());
-    let supervisor = Supervisor::new(agent.clone(), working_factory(cwd.path()), menus());
+    let supervisor = Supervisor::new(
+        agent.clone(),
+        working_factory(cwd.path()),
+        menus(),
+        Vec::new(),
+    );
     supervisor.open(session.clone());
 
     let turn = tokio::spawn({
@@ -1497,7 +1502,7 @@ async fn desktop_slash_commands_clear_the_current_ledger_and_open_the_resume_pic
     let cwd = tempfile::tempdir().unwrap();
     let agent = agent(MockProvider::new(vec![text_done("answer")]), cwd.path());
     let handle = handle("s1", cwd.path().to_path_buf());
-    let supervisor = Supervisor::new(agent.clone(), factory(), menus());
+    let supervisor = Supervisor::new(agent.clone(), factory(), menus(), Vec::new());
     supervisor.open(handle.clone());
 
     run_turn(
@@ -1569,4 +1574,87 @@ async fn desktop_compaction_streams_its_result_and_finishes_the_turn() {
     let finished = collector.payloads(TURN_FINISHED);
     assert_eq!(finished.len(), 2, "normal turn and compaction each finish");
     assert_eq!(finished.last().unwrap()["error"], Value::Null);
+}
+
+/// `/name` loads a skill here exactly as it does in the terminal, and the
+/// transcript shows the line the person typed rather than the file it loaded.
+///
+/// Both halves matter. Skills were reachable by the `skill` tool but had no
+/// slash route at all in this window, so a name you knew was still a way to
+/// spend a whole extra round trip. And the rendered body is what goes to the
+/// model — the ledger keeps it, `/export` keeps it — but a transcript that
+/// printed it would answer "what did I ask" with a repository file.
+#[tokio::test]
+async fn a_skill_loads_as_a_prompt_and_shows_as_the_line_that_asked_for_it() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let dir = cwd.path().join(".tcode/skills/survey");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        "---\nname: survey\ndescription: look around\n---\n\nWalk the tree first.\n",
+    )
+    .unwrap();
+    let skills = tcode_tools::discover_skills(cwd.path());
+    assert!(skills.iter().any(|skill| skill.name == "survey"));
+
+    let agent = agent(MockProvider::new(vec![text_done("done")]), cwd.path());
+    let handle = handle("s1", cwd.path().to_path_buf());
+    let supervisor = Supervisor::new(agent.clone(), factory(), menus(), skills);
+    supervisor.open(handle.clone());
+
+    let prompt =
+        tcode_app::commands::skill_prompt(&supervisor, &handle, "survey", "the ledger").unwrap();
+    assert!(
+        prompt.contains("Walk the tree first."),
+        "the model gets the rendered file: {prompt}"
+    );
+    let echo = tcode_tools::parse_skill_echo(&prompt).expect("wrapped as a skill echo");
+    assert_eq!(
+        (echo.name.as_str(), echo.args.as_str()),
+        ("survey", "the ledger")
+    );
+
+    // The ledger keeps the body; the display copy keeps the ask.
+    run_turn(
+        agent,
+        handle.clone(),
+        Arc::new(Sink(Arc::new(Collector::default()))),
+        say(&prompt),
+        plain(),
+    )
+    .await
+    .unwrap();
+    let shown = handle.history();
+    assert!(
+        matches!(
+            shown.first(),
+            Some(tcode_core::Entry::User(blocks))
+                if matches!(&blocks[0], ContentBlock::Text { text } if text == "/survey the ledger")
+        ),
+        "{shown:?}"
+    );
+    // Rewind pairs targets to prompts by text, so both sides fold or neither.
+    assert_eq!(
+        handle
+            .rewind_targets()
+            .into_iter()
+            .map(|target| target.text)
+            .collect::<Vec<_>>(),
+        ["/survey the ledger"]
+    );
+}
+
+/// An unknown name is still refused. The skill fallback widens what `/` can
+/// mean; it must not turn a typo into something that runs.
+#[test]
+fn a_name_that_is_neither_a_command_nor_a_skill_stays_unknown() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(Vec::new()), cwd.path());
+    let handle = handle("s1", cwd.path().to_path_buf());
+    let supervisor = Supervisor::new(agent, factory(), menus(), Vec::new());
+    supervisor.open(handle.clone());
+
+    assert!(tcode_app::commands::skill_prompt(&supervisor, &handle, "nope", "").is_err());
 }

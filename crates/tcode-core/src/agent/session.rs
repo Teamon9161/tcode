@@ -550,16 +550,29 @@ impl Session {
         restore_files: bool,
     ) -> Vec<(std::path::PathBuf, crate::checkpoint::Restore)> {
         self.ledger.truncate_tail(index);
-        self.tool_ctx
-            .freshness
-            .lock()
-            .expect("freshness lock")
-            .clear();
+        self.forget_seen_files();
         self.last_prompt_tokens = 0;
         match restore_files {
             true => self.checkpoints.restore_to(index),
             false => Vec::new(),
         }
+    }
+
+    /// Forget which file contents the model has seen. Belongs to every
+    /// operation that removes reads from the model's context — a rewind
+    /// truncates them away, a compaction replaces them with a summary — and
+    /// exists as one method because the two are the same invariant: freshness
+    /// answers "you already have this file" about a tool result, and that
+    /// answer is a lie the moment the result leaves the model's window. The
+    /// cost is one re-read of a file that is still on screen for the human;
+    /// the alternative is a stub pointing at content nobody can see, which
+    /// costs a whole extra turn to discover and a `force` read to fix.
+    pub(super) fn forget_seen_files(&mut self) {
+        self.tool_ctx
+            .freshness
+            .lock()
+            .expect("freshness lock")
+            .clear();
     }
 
     /// Take over a progress file found on disk (`/plan resume`, or a resumed

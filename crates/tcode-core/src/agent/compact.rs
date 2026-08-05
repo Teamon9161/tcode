@@ -134,6 +134,14 @@ impl Agent {
         }
         let upto = session.ledger.len();
         session.ledger.compact(summary.clone(), upto);
+        // Every read in the replaced prefix is gone from the model's context,
+        // so the freshness cache is now answering about content the model
+        // cannot see: the same reset a rewind does, for the same reason.
+        // Without it a post-compaction `read` returns "unchanged, already in
+        // context" about a file whose bytes the summary did not carry, and the
+        // model has to spend a turn discovering that and a `force` read to
+        // undo it — the exact waste the zero-guessing principle exists to stop.
+        session.forget_seen_files();
         // The `progress` calls that carried the plan just left the history, so
         // the model no longer has it. This is one of the three moments the
         // harness re-describes the file rather than assuming the model kept it.

@@ -1211,6 +1211,11 @@ impl App {
                         MouseEventKind::Moved => {
                             dialog.question_mouse_moved(row);
                         }
+                        // Clippy would fold the `if` into a match guard. It
+                        // must not: `question_mouse_down` *handles* the click
+                        // and reports whether it took it, and a guard is the
+                        // one place a reader cannot see that something ran.
+                        #[allow(clippy::collapsible_match)]
                         MouseEventKind::Down(MouseButton::Left) => {
                             if !dialog.question_mouse_down(row) {
                                 dialog.note_mouse_down(row, col, width);
@@ -1499,6 +1504,12 @@ impl App {
             // Releases are reported on Windows always, and elsewhere only once
             // voice asks for them (`crate::set_key_release_reporting`). Nothing
             // but push-to-talk has any use for them.
+            // The arm swallows every release, not just the one voice wants —
+            // which is why clippy's suggestion (fold `matches_release` into the
+            // guard) is refused: a release that failed the guard would fall
+            // through to `on_key` below, and Windows reports a release for
+            // every keystroke. That is the whole keyboard arriving twice.
+            #[allow(clippy::collapsible_match)]
             Event::Key(key) if key.kind == crossterm::event::KeyEventKind::Release => {
                 if self.voice.matches_release(key.code) {
                     let outcome = self.voice.on_release();
