@@ -211,6 +211,13 @@ struct Task {
 
 /// An undelivered harness note plus who it is for.
 ///
+/// **Every note's first line is a standalone headline**; anything after it is
+/// detail. That is a structural promise the note builders below keep, not
+/// something a reader may parse for: it is what lets a frontend show "a monitor
+/// fired" without also putting the whole command, the log path and the model's
+/// self-healing hints on screen. Adding a note that buries its point in line
+/// three quietly breaks every folded rendering of it.
+///
 /// Most notes are facts about the session the human is watching — a monitor
 /// fired, a background command exited — and belong on screen as much as in the
 /// prompt. A background sub-agent's completion is not one of them: it is
@@ -519,11 +526,11 @@ fn completion_note(task: &Task, status: TaskStatus) -> String {
         " Read that file (with offset) if relevant."
     };
     format!(
-        "Background task {} ({}) {} after {}s; {lines} output lines in {}.{output_hint}",
+        "Background task {} {} after {}s.\nCommand: {}\n{lines} output lines in {}.{output_hint}",
         task.id,
-        task.command,
         status.label(),
         task.started.elapsed().as_secs(),
+        task.command,
         task.shared.log_path.display(),
     )
 }
@@ -544,7 +551,7 @@ fn monitor_completion_note(task: &Task, monitor: &MonitorState, status: TaskStat
         String::new()
     };
     format!(
-        "Monitor {} ({}) {} after {}s; full log: {}.{cause}",
+        "Monitor {} ({}) {} after {}s.\nFull log: {}.{cause}",
         task.id,
         monitor.description,
         status.label(),
@@ -588,6 +595,13 @@ mod tests {
         assert!(notes[0].contains("exited with code 0"));
         assert!(notes[0].contains("2 output lines"));
         assert!(notes[0].contains("b1.log"));
+        assert!(notes[0].contains("cargo watch"));
+        // The headline stands alone: a frontend folding to line one shows what
+        // happened without the command, the log path, or the model's hints.
+        let headline = notes[0].lines().next().unwrap();
+        assert!(headline.starts_with("Background task b1 exited with code 0 after "));
+        assert!(!headline.contains("cargo watch"));
+        assert!(!headline.contains("b1.log"));
         // Delivered exactly once.
         assert!(reg.take_notes().is_empty());
         assert!(reg.running().is_empty());

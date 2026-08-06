@@ -25,6 +25,11 @@ use tcode_core::{
 /// hard-codes the same strings; a typo here is a silently dead UI.
 pub const AGENT_EVENT: &str = "tcode://agent-event";
 pub const APPROVAL_REQUEST: &str = "tcode://approval-request";
+/// A turn began. The composer already flips its own pane to running when the
+/// person presses enter, so this is redundant for prompts — and load-bearing
+/// for every turn nobody typed: a monitor wake, a queued successor, a plan
+/// handoff. Without it those run invisibly and the transcript grows on its own.
+pub const TURN_STARTED: &str = "tcode://turn-started";
 pub const TURN_FINISHED: &str = "tcode://turn-finished";
 
 /// Somewhere to send an event. `AppHandle` is the real implementation; tests
@@ -53,6 +58,16 @@ impl Emit for tauri::AppHandle {
 pub struct SessionEvent<'a> {
     pub session: &'a str,
     pub event: &'a AgentEvent,
+}
+
+/// A turn began, and why. `kind` is what the pane shows before the first token
+/// arrives — "monitor" is the difference between a transcript that appears to
+/// grow by itself and one that says a watch fired.
+#[derive(Serialize)]
+pub struct TurnStarted<'a> {
+    pub session: &'a str,
+    /// `prompt` | `monitor` | `compact`.
+    pub kind: &'a str,
 }
 
 /// A turn ended. `error` is `None` on a clean finish; the frontend needs this
@@ -381,6 +396,25 @@ mod tests {
             phases: None,
             notes: vec![],
             fresh_session: false,
+        }
+    }
+
+    /// The event names are a contract with a file in another language (AGENTS.md
+    /// rule 5), and nothing else checks it: the backend emits fine, the listener
+    /// registers fine, and the pane simply never hears about the turn. The same
+    /// mechanical check `terminal.rs` runs, for the events this file owns.
+    #[test]
+    fn the_event_names_match_the_frontend() {
+        let types =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/types.ts"))
+                .expect("ui/src/types.ts");
+
+        for name in [AGENT_EVENT, APPROVAL_REQUEST, TURN_STARTED, TURN_FINISHED] {
+            assert!(
+                types.contains(&format!("\"{name}\"")),
+                "ui/src/types.ts does not carry `{name}` — the frontend is listening on a \
+                 different event and will never receive anything"
+            );
         }
     }
 

@@ -22,8 +22,10 @@ use tcode_core::{
     StreamEvent, ToolCtx, Usage,
 };
 
-use tcode_app::bridge::{ApprovalAnswer, Emit, AGENT_EVENT, APPROVAL_REQUEST, TURN_FINISHED};
-use tcode_app::state::{run_compact, run_turn, SessionHandle, Supervisor};
+use tcode_app::bridge::{
+    ApprovalAnswer, Emit, AGENT_EVENT, APPROVAL_REQUEST, TURN_FINISHED, TURN_STARTED,
+};
+use tcode_app::state::{run_compact, run_turn, watch_monitors, SessionHandle, Supervisor};
 
 // ---------------------------------------------------------------- the webview
 
@@ -1657,4 +1659,85 @@ fn a_name_that_is_neither_a_command_nor_a_skill_stays_unknown() {
     supervisor.open(handle.clone());
 
     assert!(tcode_app::commands::skill_prompt(&supervisor, &handle, "nope", "").is_err());
+}
+
+/// A monitor firing while nobody is typing must reach the model on its own.
+///
+/// This is the whole point of the tool: `monitor` says "tell me when this
+/// happens", and core answers by making an idle session's wake time readable
+/// (`monitor_wake_deadline`). The terminal has always honoured it; the desktop
+/// app did not, so every event sat in the registry until the user happened to
+/// send a message — the watch fired, and the window showed nothing at all.
+#[tokio::test]
+async fn a_monitor_event_wakes_an_idle_conversation_by_itself() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![text_done("the service is refusing connections")]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+
+    let session = session(cwd.path().to_path_buf());
+    let (id, watch) = session
+        .tool_ctx
+        .background
+        .lock()
+        .unwrap()
+        .register_monitor(
+            "tail -F app.log",
+            "errors in app.log",
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+    assert_eq!(id, "m1");
+    let handle = handle_of("s1", cwd.path().to_path_buf(), session);
+    let watcher = tokio::spawn(watch_monitors(agent, handle.clone(), emit));
+
+    // Nobody types anything. The line alone has to start a turn.
+    watch.push_line("ERROR connection refused");
+
+    let note = collector
+        .wait_for(AGENT_EVENT, |payload| payload["event"]["type"] == "Note")
+        .await;
+    let text = note["event"]["data"].as_str().unwrap();
+    assert!(text.contains("ERROR connection refused"), "{text}");
+    assert!(text.contains("errors in app.log"), "{text}");
+
+    let finished = collector
+        .wait_for(TURN_FINISHED, |payload| payload["session"] == "s1")
+        .await;
+    assert_eq!(finished["error"], Value::Null);
+    // The pane is told a turn began, and that it was not one anybody typed.
+    let started = collector.payloads(TURN_STARTED);
+    assert_eq!(started.len(), 1, "{started:?}");
+    assert_eq!(started[0]["kind"], "monitor");
+    // The model was actually asked, and answered.
+    let types = collector.event_types("s1");
+    assert!(types.contains(&"TextDelta".to_string()), "got {types:?}");
+
+    watcher.abort();
+}
+
+/// Closing a pane ends its watch. A session nothing can display must not keep
+/// starting turns against the model — and the watcher parks on a `Notify`, so
+/// cancelling without waking it would leave it asleep forever.
+#[tokio::test]
+async fn closing_a_conversation_stops_its_monitor_watch() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(MockProvider::new(Vec::new()), cwd.path());
+    let collector = Arc::new(Collector::default());
+    let handle = handle("s1", cwd.path().to_path_buf());
+    let supervisor = Supervisor::new(agent.clone(), factory(), menus(), Vec::new());
+    supervisor.open(handle.clone());
+
+    let watcher = tokio::spawn(watch_monitors(agent, handle, sink(&collector)));
+    assert!(supervisor.close("s1"));
+
+    tokio::time::timeout(std::time::Duration::from_secs(5), watcher)
+        .await
+        .expect("the watcher returns once its session is closed")
+        .unwrap();
 }

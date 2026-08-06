@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
+use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::progress::{Progress, ProgressState};
@@ -22,7 +24,10 @@ use tcode_core::{
 };
 
 use crate::boot::SessionFactory;
-use crate::bridge::{pump_events, Emit, Pending, TurnFinished, WebviewApprover, TURN_FINISHED};
+use crate::bridge::{
+    pump_events, Emit, Pending, TurnFinished, TurnStarted, WebviewApprover, TURN_FINISHED,
+    TURN_STARTED,
+};
 
 struct TurnControl {
     id: Option<u64>,
@@ -54,6 +59,19 @@ pub struct SessionHandle {
     /// boundary, so a mid-turn switch can gate the next call rather than merely
     /// changing the mode once the turn returns.
     pending_mode: tcode_core::PendingMode,
+    /// Fires whenever a monitor produces a line or a detached background run
+    /// delivers its report. Cloned out of the background registry at open —
+    /// held here for the same reason `progress` and `queue` are: the watcher
+    /// has to keep listening while a turn owns the `Session`.
+    monitor_signal: Arc<Notify>,
+    /// Fires when the session comes back to the idle pool. The watcher needs it
+    /// because `monitor_wake_deadline` is unreadable while a turn holds the
+    /// session, so "a monitor fired mid-turn" is only actionable at turn end.
+    idle: Arc<Notify>,
+    /// Cancelled when the conversation is closed, which is how its monitor
+    /// watcher learns to stop. A closed pane's watch must not keep starting
+    /// turns against a session nothing can display.
+    closed: CancellationToken,
 }
 
 /// A turn could not start.
@@ -67,12 +85,21 @@ pub enum TurnError {
 
 impl SessionHandle {
     pub fn new(id: String, cwd: PathBuf, session: Session) -> Self {
+        let monitor_signal = session
+            .tool_ctx
+            .background
+            .lock()
+            .expect("background lock")
+            .monitor_signal();
         Self {
             id,
             cwd,
             progress: session.tool_ctx.progress_cell(),
             queue: session.pending.clone(),
             pending_mode: session.pending_mode.clone(),
+            monitor_signal,
+            idle: Arc::new(Notify::new()),
+            closed: CancellationToken::new(),
             session: Mutex::new(Some(session)),
             turn: Mutex::new(TurnControl {
                 id: None,
@@ -387,6 +414,21 @@ impl SessionHandle {
         self.session.lock().unwrap().take()
     }
 
+    /// When this conversation should wake itself to hand the model monitor
+    /// activity it has not heard about. `None` while a turn owns the session —
+    /// that turn delivers pending notes at its own safe boundaries, and the
+    /// `idle` signal brings the watcher back once it is over.
+    fn monitor_wake_deadline(&self) -> Option<Instant> {
+        self.session.lock().unwrap().as_ref().and_then(|session| {
+            session
+                .tool_ctx
+                .background
+                .lock()
+                .expect("background lock")
+                .monitor_wake_deadline()
+        })
+    }
+
     /// Return the session to the idle pool only when there is no queued prompt
     /// to continue with. Holding it through this decision means a foreground
     /// submission cannot claim it between destructive queue drain and successor
@@ -399,6 +441,11 @@ impl SessionHandle {
         let queued = self.queue.take_for_next_turn();
         if queued.is_empty() {
             *held = Some(session);
+            drop(held);
+            // The monitor watcher could not read this session's registry while
+            // the turn held it. Anything that fired in the meantime is
+            // deliverable now.
+            self.idle.notify_one();
             (None, queued)
         } else {
             (Some(session), queued)
@@ -429,6 +476,15 @@ impl SessionHandle {
     pub fn interrupt(&self) {
         self.turn.lock().unwrap().cancel.cancel();
         self.pending.clear();
+    }
+
+    /// Retire this conversation: stop its turn and end its monitor watch.
+    fn shut_down(&self) {
+        self.interrupt();
+        self.closed.cancel();
+        // The watcher parks on these; cancelling alone would leave it asleep.
+        self.monitor_signal.notify_waiters();
+        self.idle.notify_waiters();
     }
 }
 
@@ -515,6 +571,12 @@ pub struct Supervisor {
     /// Insertion order, so the session rail does not reshuffle on every read.
     /// A `HashMap` alone would hand the UI a different order each time.
     order: Mutex<Vec<String>>,
+    /// Where a harness-started turn sends its events. Late-bound because the
+    /// supervisor is built during boot, before there is a window to emit into,
+    /// and the first session is already open by then. `attach_emitter` is the
+    /// one place that closes that gap — see it for what happens to the sessions
+    /// opened first.
+    emit: Mutex<Option<Arc<dyn Emit>>>,
 }
 
 impl Supervisor {
@@ -535,7 +597,29 @@ impl Supervisor {
             skills,
             sessions: Mutex::new(HashMap::new()),
             order: Mutex::new(Vec::new()),
+            emit: Mutex::new(None),
         }
+    }
+
+    /// Give the supervisor somewhere to emit, and start the monitor watch on
+    /// every conversation — the ones already open included, since the folder the
+    /// app launched on becomes a session during boot, well before a window
+    /// exists. Called once, from the Tauri `setup` hook.
+    pub fn attach_emitter(&self, emit: Arc<dyn Emit>) {
+        *self.emit.lock().unwrap() = Some(emit);
+        let open: Vec<Arc<SessionHandle>> =
+            self.sessions.lock().unwrap().values().cloned().collect();
+        for handle in open {
+            self.watch(handle);
+        }
+    }
+
+    /// Spawn this session's monitor watch, if there is anywhere to emit yet.
+    fn watch(&self, handle: Arc<SessionHandle>) {
+        let Some(emit) = self.emit.lock().unwrap().clone() else {
+            return;
+        };
+        tauri::async_runtime::spawn(watch_monitors(self.agent.clone(), handle, emit));
     }
 
     pub fn skills(&self) -> &[tcode_tools::Skill] {
@@ -555,7 +639,8 @@ impl Supervisor {
         self.sessions
             .lock()
             .unwrap()
-            .insert(handle.id.clone(), handle);
+            .insert(handle.id.clone(), handle.clone());
+        self.watch(handle);
     }
 
     /// Open `cwd` as a new session and register it. `resume` replays an
@@ -585,7 +670,7 @@ impl Supervisor {
         self.order.lock().unwrap().retain(|open| open != id);
         match removed {
             Some(handle) => {
-                handle.interrupt();
+                handle.shut_down();
                 true
             }
             None => false,
@@ -615,6 +700,118 @@ impl Supervisor {
     }
 }
 
+/// Watch one conversation's monitors and wake it when they have something to
+/// say. Runs for the life of the session.
+///
+/// This is the desktop half of a contract core already wrote: `monitor` output
+/// is an *event*, and `BackgroundTasks::monitor_wake_deadline` is core telling
+/// a frontend when an idle session should start a turn to deliver it. The TUI
+/// has always honoured it in its select loop; without this the desktop app
+/// silently held every monitor event and background sub-agent report until the
+/// user happened to type something, which is precisely the case a watch exists
+/// to cover — nobody is watching.
+///
+/// Written against [`Emit`] and spawned per session (AGENTS.md rule 2), so a
+/// test can drive it with a collector.
+pub async fn watch_monitors(agent: Arc<Agent>, handle: Arc<SessionHandle>, emit: Arc<dyn Emit>) {
+    let signal = handle.monitor_signal.clone();
+    let idle = handle.idle.clone();
+    let closed = handle.closed.clone();
+    // Only ever used unarmed, to give `select!` a branch it will not take.
+    let never = std::time::Duration::from_secs(3600);
+    loop {
+        let due = handle.monitor_wake_deadline();
+        let deadline = due
+            .map(tokio::time::Instant::from_std)
+            .unwrap_or_else(|| tokio::time::Instant::now() + never);
+        tokio::select! {
+            _ = closed.cancelled() => return,
+            // Recompute: a new event moves the deadline, and a finished monitor
+            // or a delivered sub-agent report brings it to now.
+            _ = signal.notified() => {}
+            // The session is back; whatever fired during the turn is now
+            // readable, and deliverable.
+            _ = idle.notified() => {}
+            _ = tokio::time::sleep_until(deadline), if due.is_some() => {
+                // Busy means a turn started between the deadline being computed
+                // and now — it delivers the same notes at its own boundaries,
+                // and `idle` brings us back if anything is left.
+                let _ = run_monitor_turn(agent.clone(), handle.clone(), emit.clone()).await;
+            }
+        }
+    }
+}
+
+/// A turn nobody typed, carrying whatever the monitors have to report.
+///
+/// The same lifecycle as any other turn — one pump, one approver, the queued
+/// successor, one `TURN_FINISHED` — because it *is* one: the model answers, and
+/// it may call tools. Core returns `false` when the registry turned out to be
+/// empty (a turn reached a boundary and drained it between the deadline being
+/// computed and the session being taken); that turn ends without asking the
+/// model anything, which the pane sees as a start and a finish with nothing in
+/// between.
+async fn run_monitor_turn(
+    agent: Arc<Agent>,
+    handle: Arc<SessionHandle>,
+    emit: Arc<dyn Emit>,
+) -> Result<(), TurnError> {
+    let Some(mut session) = handle.take() else {
+        return Err(TurnError::Busy(handle.id.clone()));
+    };
+    let (turn, cancel) = handle.begin_turn();
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
+    let approver = WebviewApprover::new(handle.id.clone(), emit.clone(), handle.pending());
+    emit.emit(
+        TURN_STARTED,
+        serde_json::to_value(TurnStarted {
+            session: &handle.id,
+            kind: "monitor",
+        })
+        .unwrap_or(serde_json::Value::Null),
+    );
+    eprintln!("tcode-app: monitor wake on session {}", handle.id);
+    let result = agent
+        .monitor_turn(&mut session, &tx, &approver, cancel)
+        .await;
+    if let Some(mode) = session.commit_pending_mode() {
+        let _ = tx.send(AgentEvent::ModeChanged(mode)).await;
+    }
+    drop(tx);
+    let _ = pump.await;
+    handle.pending.clear();
+
+    let (next_session, waiting) = handle.put_back_or_take_queued(session);
+    handle.finish_turn(turn);
+    if let Some(session) = next_session {
+        let message = merge_queued(waiting).expect("non-empty queue reserves the session");
+        return run_owned_turn(
+            agent,
+            handle,
+            emit,
+            session,
+            message.blocks,
+            message.instructions,
+            Some((message.text, message.attachments)),
+        )
+        .await;
+    }
+
+    let (context_tokens, context_estimated) = handle.context(&agent);
+    emit.emit(
+        TURN_FINISHED,
+        serde_json::to_value(TurnFinished {
+            session: &handle.id,
+            error: result.as_ref().err().map(describe_error),
+            context_tokens,
+            context_estimated,
+        })
+        .unwrap_or(serde_json::Value::Null),
+    );
+    Ok(())
+}
+
 /// Run a manually requested history compaction through the same event, cancel
 /// and queue lifecycle as an ordinary turn.
 pub async fn run_compact(
@@ -629,6 +826,14 @@ pub async fn run_compact(
     let (turn, cancel) = handle.begin_turn();
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
+    emit.emit(
+        TURN_STARTED,
+        serde_json::to_value(TurnStarted {
+            session: &handle.id,
+            kind: "compact",
+        })
+        .unwrap_or(serde_json::Value::Null),
+    );
     eprintln!("tcode-app: compaction started on session {}", handle.id);
     let _ = tx.send(AgentEvent::Compacting).await;
     let result = agent
@@ -746,6 +951,14 @@ async fn run_owned_turn(
                 .await;
         }
 
+        emit.emit(
+            TURN_STARTED,
+            serde_json::to_value(TurnStarted {
+                session: &handle.id,
+                kind: "prompt",
+            })
+            .unwrap_or(serde_json::Value::Null),
+        );
         // The turn's lifecycle goes to stderr as well as to the webview: when the
         // frontend shows nothing, these two lines are what distinguish "never
         // started" from "started and produced no events".

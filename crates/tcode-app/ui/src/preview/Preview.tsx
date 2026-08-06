@@ -452,6 +452,17 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
     blocks: [{ kind: "assistant", text: "Found two so far — the step deadline and…" }],
   },
   { kind: "note", text: "retrying (1/3): connection reset by peer" },
+  // A folded harness note, in the shape core actually emits it: headline first,
+  // the model-facing remainder after the newline. Without one here the fold has
+  // no state to be seen in, which is how it went un-designed for so long.
+  {
+    kind: "note",
+    text:
+      "Monitor m1 (test failures in the watch log): 2 new event lines:\n" +
+      "FAILED tcode_core::watchdog::step_deadline_trips\n" +
+      "FAILED tcode_core::watchdog::cap_is_thirty_seconds\n" +
+      "Full log: /home/me/.tcode/projects/tcode/scratchpad/tool-output/m1.log",
+  },
   {
     kind: "tool",
     callId: "t3",

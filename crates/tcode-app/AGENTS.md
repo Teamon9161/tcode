@@ -236,6 +236,14 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **撤回按位置 + 文本双验证**。队列只会整体 drain，所以陈旧下标通常落在空队列上；但"入队 → 看着它被发出 → 再入队"之后，一次迟到的撤回就会删掉用户想留的那条。文本比对是免费的，`PendingInput::withdraw` 因此收两个参数。
 
+19b. **不是每个 turn 都有人按下过回车，前端必须听后端说 turn 开始了**（`state.rs::watch_monitors` + `bridge.rs::TURN_STARTED`）。`monitor` 工具的全部意义就是"没人盯着的时候告诉我"，core 把这件事表达成 `BackgroundTasks::monitor_wake_deadline`——**一个闲着的会话该在什么时候自己开一个 turn**。TUI 一直在它的 select 循环里遵守；这边曾经完全没实现，于是每一条 monitor 事件、每一份后台 sub-agent 报告都躺在 registry 里，直到用户碰巧再说一句话才被捎带发出去：**手表响了，窗口一片安静**。
+
+    落实它的三处，少一处就退回原样：watcher 是**每会话一个** spawn（`Supervisor::open` 起，`close` 时靠 `closed` token + `notify_waiters` 唤醒它退出——只 cancel 不唤醒它会一直睡着）；`monitor_wake_deadline` 在 turn 持有 session 时读不到，所以 `put_back_or_take_queued` 必须敲 `idle`，否则"turn 期间响的表"要等下一次事件才被发现；而 `TURN_STARTED` 是前端唯一能知道"这个 turn 不是我开的"的途径——composer 自己会把窗格翻成 running，harness 开的 turn 没有那一下，缺了它转录会自己长出内容而窗格声称空闲。
+
+    **`Emit` 的 late-bound 只有 `attach_emitter` 一处**。supervisor 在 boot 时就造好了（第一个会话那时已经开着），窗口还不存在；那一处负责补上 emitter 并给已开的会话补 watcher。别为此把 `AppHandle` 塞进 supervisor（硬规则 2）。
+
+19c. **harness note 折到第一行，剩下的收起来**（`Transcript.tsx::HarnessNote`）。这些 note 是**写给模型的**：要重跑的命令、要带 offset 读的日志路径、关于重定向的提示。整段印在对话里，人拿到的是一堵 `cd … && rm -f …`，而他们真正想要的那句话是开头六个词。core 保证了它这一侧——**每条 harness note 的第一行都是一句能独立成立的话**（`background.rs`），所以这里是"折"，不是"解析"；展开的部分逐字放进 `<pre>`，那是机器文本，被当散文重排的路径没人能用。
+
 20. **rewind 的截断点只能是后端给的 ledger 下标**（`Session::rewind_targets` / `rewind_to`，两个前端共用）。前端**不许自己数**：转录是从 `history()`（archived ++ entries）重放的，而 core 明说 archived 段**没有任何合法的 truncate 索引**——压缩掉的那段正是 rewind 不进去的地方，所以"转录里的第 N 条 user 块"根本不是一个 ledger 下标。webview 拿后端的目标列表，按**文本顺序配对**到屏幕上的 prompt（`ui/src/rewind.ts::rewindPoints`，按 block 对象作 key，因为分组与过滤会挪动位置）。配不上就不画按钮，后端收到下标还要再验一遍——**失败模式必须是"少一个按钮"，绝不能是"截在没人指的地方"**。
 
     **truncate + freshness 清空 + 可选文件回滚是一个操作**（`Session::rewind_to`）。freshness 是最容易漏的那个：它记着"模型已经看过这个文件"，而那些 read 就在刚被删掉的历史里——不清空，下一次 read 会对着模型再也看不见的调用回答"你已经有了"。**文件回滚是另一个决定**，由调用方传参：忘掉说过的话重打一遍就有了，把文件推回去可能丢掉之后手改的东西。所以 UI 上那个勾**默认不勾**，而且那段历史没动过文件时**整条不出现**。

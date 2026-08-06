@@ -296,7 +296,7 @@ const BlockView = memo(function BlockView({
     case "thinking":
       return <Thinking text={block.text} />;
     case "note":
-      return <p className="msg-note">{block.text}</p>;
+      return <HarnessNote text={block.text} />;
     case "compact":
       return <CompactMark summary={block.summary} />;
     case "error":
@@ -436,6 +436,46 @@ function Thinking({ text }: { text: string }) {
  * like any other model-authored prose (rule 10); it is a summary of a
  * conversation that contained file contents and fetched pages, so it is data.
  */
+/**
+ * Something the harness is telling both of you: a monitor fired, a background
+ * command exited, a dispatched run came back.
+ *
+ * Folded to its first line, because the note is written to the model and the
+ * rest of it is addressed to the model — the command it re-runs, the log path it
+ * reads with an offset, the hint about redirection. Printing all of that in the
+ * conversation put a wall of `cd … && rm -f …` where a sentence belonged, and
+ * the one fact a person wanted from it ("the watch fired") was the first six
+ * words. Core keeps its side of this: every harness note's first line is a
+ * standalone headline (`background.rs`), so this is a fold, not a parse.
+ *
+ * The detail is verbatim in a `<pre>` rather than prose — it is machine text,
+ * and a path that got re-wrapped as a paragraph is a path nobody can use.
+ */
+function HarnessNote({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const split = text.indexOf("\n");
+  // The trailing colon introduces the lines that follow, and folded there is
+  // nothing for it to introduce — a sentence left mid-promise.
+  const headline = (split === -1 ? text : text.slice(0, split)).replace(/:\s*$/, "");
+  const detail = split === -1 ? "" : text.slice(split + 1).trim();
+  return (
+    <section className={`note${open ? " is-open" : ""}`}>
+      <button
+        type="button"
+        className="note-line"
+        onClick={() => detail && setOpen((was) => !was)}
+        aria-expanded={detail ? open : undefined}
+        disabled={!detail}
+      >
+        <span className="note-mark" aria-hidden="true" />
+        <span className="note-headline">{headline}</span>
+        {detail && (open ? <ChevronDown size={12} /> : <ChevronRight size={12} />)}
+      </button>
+      {open && detail && <pre className="note-detail">{detail}</pre>}
+    </section>
+  );
+}
+
 function CompactMark({ summary }: { summary: string }) {
   const [open, setOpen] = useState(false);
   const has = summary.trim().length > 0;

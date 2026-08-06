@@ -5,6 +5,7 @@
 
 export const AGENT_EVENT = "tcode://agent-event";
 export const APPROVAL_REQUEST = "tcode://approval-request";
+export const TURN_STARTED = "tcode://turn-started";
 export const TURN_FINISHED = "tcode://turn-finished";
 /** Mirrors `browser::BROWSER_NAVIGATED`. Where the browser is, reported by the
  *  webview that owns it — the address bar reads this and never sets it. */
@@ -136,6 +137,16 @@ export type SessionEvent = { session: string; event: AgentEvent };
 /** Mirrors `bridge.rs::TurnFinished`. The context pair is the backend's
  *  authoritative reading of what the conversation now occupies — see
  *  `usage.ts::adoptContext` for why a turn boundary is where it is needed. */
+/** Mirrors `bridge.rs::TurnStarted`. The composer already flips its own pane
+ *  when the person presses enter, so this matters for the turns nobody typed:
+ *  a monitor waking the session, a queued successor, a plan handoff. Without it
+ *  those paint as a transcript growing on its own. */
+export type TurnStarted = {
+  session: string;
+  /** `prompt` | `monitor` | `compact`. */
+  kind: string;
+};
+
 export type TurnFinished = {
   session: string;
   error: string | null;

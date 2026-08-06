@@ -5,6 +5,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   AGENT_EVENT,
   APPROVAL_REQUEST,
+  TURN_STARTED,
   TURN_FINISHED,
   type AgentEvent,
   type ApprovalMode,
@@ -19,6 +20,7 @@ import {
   type SlashResult,
   type Status,
   type TurnFinished,
+  type TurnStarted,
 } from "./types";
 import { applyEvent, errorBlock, noteBlock, userBlock } from "./blocks";
 import type { RewindTarget } from "./rewind";
@@ -181,6 +183,18 @@ export function App() {
         // where the editor gets the phases — with every phase's detail, not just
         // the ones the model happened to resend in this call.
         readPlan(payload.session);
+      }),
+      // The backend is the authority on "a turn is running", and for a turn
+      // nobody typed it is the only one: a monitor firing starts a turn with no
+      // click behind it, and without this the pane would grow a transcript
+      // while claiming to be idle.
+      listen<TurnStarted>(TURN_STARTED, ({ payload }) => {
+        patch(payload.session, (state) => ({
+          ...state,
+          running: true,
+          failed: false,
+          activity: payload.kind === "monitor" ? "monitor event" : state.activity,
+        }));
       }),
       listen<TurnFinished>(TURN_FINISHED, ({ payload }) => {
         patch(payload.session, (state) => ({

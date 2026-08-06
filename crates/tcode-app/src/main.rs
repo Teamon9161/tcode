@@ -43,6 +43,12 @@ fn main() -> anyhow::Result<()> {
         .manage(tcode_app::browser::Browser::new())
         .manage(tcode_app::terminal::Terminals::new())
         .setup(|app| {
+            // Turns nobody typed — a monitor firing, a background sub-agent
+            // reporting back — need somewhere to send their events, and the
+            // supervisor was built before this window existed. This is where it
+            // gets one, and where every open conversation starts watching.
+            app.state::<Arc<tcode_app::state::Supervisor>>()
+                .attach_emitter(Arc::new(app.handle().clone()));
             // The browser is a child webview of the main window. WebView2 hangs
             // when the parent HWND is destroyed while its controller is still
             // alive (tauri#13534 is the same teardown for owned windows), so

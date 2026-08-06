@@ -1600,9 +1600,70 @@ body.is-resizing {
   margin: 0;
 }
 
-.msg-note {
+/* A harness note: one quiet line saying what happened, with the model-facing
+   remainder folded away (see `Transcript.tsx::HarnessNote`). It is neither a
+   message nor a step the agent took, so it borrows neither vocabulary — a dash
+   in the margin, the same weight as the compaction mark, and nothing else. */
+.note {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  max-width: var(--measure);
+}
+
+.note-line {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
   color: var(--muted);
   font-size: var(--text-xs);
+  line-height: var(--lh-snug);
+  text-align: left;
+  cursor: pointer;
+}
+.note-line:disabled {
+  cursor: default;
+}
+.note-line:hover:not(:disabled),
+.note-line:focus-visible {
+  color: var(--body);
+}
+
+/* The margin dash. A glyph would be one more thing to learn; a rule the width
+   of an em says "this line is not the conversation" and stops there. */
+.note-mark {
+  flex: none;
+  align-self: center;
+  width: 1em;
+  height: 1px;
+  background: var(--line);
+}
+
+.note-headline {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+
+/* Verbatim, and monospaced, because it is machine text: the command as it was
+   run, the log path as it must be typed. Prose reflow would make both unusable. */
+.note-detail {
+  margin: 0;
+  padding: var(--s-3);
+  margin-inline-start: calc(1em + var(--s-2));
+  max-height: 320px;
+  overflow: auto;
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-normal);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 /* The compaction boundary: a rule across the column with its label sitting in
