@@ -13,7 +13,6 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde::Serialize;
 use serde_json::Value;
-use tauri::Emitter;
 use tokio::sync::oneshot;
 
 use tcode_core::progress::{self, PlanNote};
@@ -32,10 +31,10 @@ pub const APPROVAL_REQUEST: &str = "tcode://approval-request";
 pub const TURN_STARTED: &str = "tcode://turn-started";
 pub const TURN_FINISHED: &str = "tcode://turn-finished";
 /// The window was maximized or restored. Emitted by **the shell**, not by
-/// anything below it — `main.rs` under Tauri, `electron/main.js` after that —
-/// because a window is the one thing the backend deliberately knows nothing
-/// about. It is named here anyway so every event the frontend listens on has
-/// one list, and so the check below covers it.
+/// anything below it — `electron/main.js` — because a window is the one thing
+/// the backend deliberately knows nothing about. It is named here anyway so
+/// every event the frontend listens on has one list, and so the check below
+/// covers it.
 ///
 /// It exists because the state changes without a button here being pressed: a
 /// snap gesture, a double-click on the title bar, the OS restoring the window.
@@ -43,23 +42,11 @@ pub const TURN_FINISHED: &str = "tcode://turn-finished";
 /// rather than the last click.
 pub const WINDOW_STATE: &str = "tcode://window-state";
 
-/// Somewhere to send an event. `AppHandle` is the real implementation; tests
-/// substitute a collector so no webview is needed to assert on the stream.
+/// Somewhere to send an event. The Electron shell's main process implements it
+/// by pushing a JSON frame down the pipe; tests substitute a collector so no
+/// window is needed to assert on the stream.
 pub trait Emit: Send + Sync + 'static {
     fn emit(&self, event: &str, payload: Value);
-}
-
-impl Emit for tauri::AppHandle {
-    fn emit(&self, event: &str, payload: Value) {
-        // A closed window is the ordinary way this fails, and it is not the
-        // agent loop's problem: the turn keeps running and keeps recording to
-        // the ledger, which is what a resume will read. But it is never
-        // swallowed — a silently dropped event stream looks exactly like a
-        // hung turn from the frontend, and that is not a debuggable failure.
-        if let Err(error) = Emitter::emit(self, event, payload) {
-            eprintln!("tcode-app: could not emit '{event}': {error}");
-        }
-    }
 }
 
 /// Every event carries its session id. Phase 1 has one session, but the

@@ -104,13 +104,13 @@ export function useSeat({
       event.stopPropagation();
       onEscape();
     };
-    // Capture, and that is load-bearing rather than tidy: Tauri's own drag-region
-    // script listens for `mousedown` on `document` and calls
-    // `stopImmediatePropagation()` on anything that hits a `data-tauri-drag-region`
-    // element (rule 9c puts that attribute on the whole title bar). A bubble-phase
-    // listener therefore never hears a click on the bar — which is exactly where
-    // the display menu's own trigger sits, so the one popover most likely to be
-    // dismissed by clicking beside it was the one that could not be.
+    // Capture-phase, matching what the popover dismissal is racing against. A
+    // drag region consumes the `mousedown` in the window system before the
+    // document sees it, so a click on the title bar never reaches here at all —
+    // which is the behaviour the display menu was designed around (its trigger
+    // sits in that bar, and clicking beside it must not close it by accident).
+    // Capture is also what keeps this listener ahead of anything that stops
+    // propagation on its own.
     window.addEventListener("mousedown", onDown, true);
     window.addEventListener("keydown", onKey, true);
     window.addEventListener("resize", place);

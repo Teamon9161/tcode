@@ -164,10 +164,9 @@ impl Registry {
     ///
     /// The browser verbs are **deliberately not here**: a browser tab is a
     /// native view owned by the shell, so `browser_*` is registered by whoever
-    /// owns one — `main.rs` under Tauri today, the Electron main process after
-    /// the migration. See `MIGRATION-ELECTRON.md`; `browser_commands_are_the_
-    /// shell_s_own` pins the omission so it reads as a decision rather than a
-    /// gap.
+    /// owns one — the Electron main process (`electron/browser.js`). See
+    /// `AGENTS.md` rule 9h; `the_shell_s_own_verbs_are_not_in_the_portable_
+    /// table` pins the omission so it reads as a decision rather than a gap.
     pub fn builtin() -> Self {
         let mut t: HashMap<&'static str, Handler> = HashMap::new();
         use crate::commands as c;
@@ -286,8 +285,8 @@ impl Registry {
         result!(t, "serve_url", c::serve_url[supervisor, serve](session, path));
 
         // The terminal. The PTY stays on this side of the pipe — see
-        // `MIGRATION-ELECTRON.md`, and rule 9i for why it is worth keeping
-        // behind the same audited boundary.
+        // `AGENTS.md` rule 9i for why it is worth keeping behind the same
+        // audited boundary.
         result!(t, "terminal_open", c::terminal_open[emit, terminals](cwd, cols, rows));
         result!(t, "terminal_write", c::terminal_write[terminals](id, data));
         result!(
@@ -372,12 +371,7 @@ mod tests {
     /// Where a shell registers the verbs only it can answer: a native view, a
     /// window, a file dialog. A command named in one of these is answered even
     /// though [`Registry::builtin`] does not have it.
-    const SHELL_REGISTRARS: [&str; 4] = [
-        "src/main.rs",
-        "src/browser/commands.rs",
-        "electron/main.js",
-        "electron/browser.js",
-    ];
+    const SHELL_REGISTRARS: [&str; 2] = ["electron/main.js", "electron/browser.js"];
 
     /// The registry is the contract with `ui/src`, and nothing else checks it:
     /// a command that loses its line here still compiles, and the pane that
@@ -436,14 +430,13 @@ mod tests {
         }
     }
 
-    /// Both shells answer every shell-owned verb, or one of them has a title
-    /// bar whose buttons do nothing and a browser pane that cannot open a tab.
+    /// The one shell answers every shell-owned verb, or it has a title bar
+    /// whose buttons do nothing and a browser pane that cannot open a tab.
     ///
-    /// This is the check the migration is actually exposed to: the frontend
-    /// calls one name, two processes in two languages have to recognize it, and
-    /// nothing else compares them.
+    /// The frontend calls one name; the Electron main process and the browser
+    /// views have to recognize it, and nothing else compares them.
     #[test]
-    fn both_shells_answer_every_shell_owned_verb() {
+    fn the_shell_answers_every_shell_owned_verb() {
         const VERBS: &[&str] = &[
             "window_minimize",
             "window_close",
@@ -462,24 +455,232 @@ mod tests {
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        // Each shell is however many files it takes; what is compared is the
-        // set of names it answers, not where it happens to keep them.
-        for shell in [
-            ["src/main.rs", "src/browser/commands.rs"],
-            ["electron/main.js", "electron/browser.js"],
-        ] {
-            let text: String = shell
-                .iter()
-                .map(|file| std::fs::read_to_string(root.join(file)).expect(file))
-                .collect();
-            for verb in VERBS {
-                assert!(
-                    text.contains(verb),
-                    "{shell:?} does not answer `{verb}` — that shell is missing a verb the \
-                     frontend calls on both"
-                );
-            }
+        // `main.js` answers the window verbs and forwards the rest to the
+        // sidecar; `browser.js` answers the browser verbs. What is compared is
+        // the set of names the shell answers, not where it happens to keep
+        // them.
+        let text: String = ["electron/main.js", "electron/browser.js"]
+            .iter()
+            .map(|file| std::fs::read_to_string(root.join(file)).expect(file))
+            .collect();
+        for verb in VERBS {
+            assert!(
+                text.contains(verb),
+                "the Electron shell does not answer `{verb}` — that verb is missing \
+                 from the one shell the frontend calls it on"
+            );
         }
+    }
+
+    /// A browser tab is a page of someone else's, pointed at an arbitrary URL.
+    /// What keeps that reasonable is that it carries none of this app's
+    /// privileges: no `preload`, no node, an isolated context, a sandbox, and
+    /// its own partition rather than the app session. (The Tauri shell used to
+    /// say the same sentence as "granted no capabilities, ever" in
+    /// `capabilities/default.json`; that file is gone with it.) The migration
+    /// doc's rule 9h row; the same style of check as the ones that read source
+    /// files for their invariants.
+    #[test]
+    fn the_browser_views_are_isolated_from_the_app() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/electron/browser.js"
+        ))
+        .expect("electron/browser.js");
+
+        // Scan the `webPreferences` block rather than the whole file: the
+        // file's own header explains why there is no preload, and would trip a
+        // whole-file scan. A `preload:` property is the failure; the word in a
+        // comment is the explanation.
+        let view = source
+            .find("new WebContentsView({")
+            .expect("browser.js creates a WebContentsView");
+        let create = &source[view..];
+        let block = &create[..create
+            .find("\n    });")
+            .expect("the view creation block ends")];
+
+        assert!(
+            !block.contains("preload:"),
+            "a browser tab gained a `preload` — that script runs inside every page \
+             the browser visits, with this app's privileges"
+        );
+        for required in [
+            "nodeIntegration: false",
+            "contextIsolation: true",
+            "sandbox: true",
+            "session: session.fromPartition(PARTITION)",
+        ] {
+            assert!(
+                block.contains(required),
+                "the browser view's webPreferences lost `{required}` — a tab must be \
+                 sandboxed, isolated and on its own partition"
+            );
+        }
+    }
+
+    /// The app document is never navigated and never opens a window. Tauri had
+    /// these as defaults; Electron does not, so `main.js` reinstates them in
+    /// `createWindow`. Pinned because the failure mode — a stray `<a href>`
+    /// that escaped the frontend's own handler replaces the whole app, or a
+    /// `target="_blank"` opens a frameless window carrying this app's preload —
+    /// reads as a bug in something else entirely.
+    #[test]
+    fn the_app_renderer_cannot_be_navigated_away_or_open_a_window() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/electron/main.js"
+        ))
+        .expect("electron/main.js");
+
+        assert!(
+            source.contains("will-navigate") && source.contains("preventDefault"),
+            "the app renderer lost its `will-navigate` guard — a link or redirect can \
+             replace the whole app with a page of someone else's choosing"
+        );
+        assert!(
+            source.contains("setWindowOpenHandler")
+                && source.contains("action: \"deny\""),
+            "the app renderer lost its `setWindowOpenHandler` deny — \
+             `target=\"_blank\"` opens a frameless window carrying this app's preload"
+        );
+    }
+
+    /// A page in the browser can call `window.open` too, and it must not get a
+    /// frameless Electron window. Same-tab loading is the honest interim: it
+    /// never silently does nothing, and the page could have navigated itself
+    /// there anyway (see AGENTS.md rule 9h).
+    #[test]
+    fn a_browser_tab_cannot_open_a_window() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/electron/browser.js"
+        ))
+        .expect("electron/browser.js");
+
+        assert!(
+            source.contains("setWindowOpenHandler")
+                && source.contains("action: \"deny\"")
+                && source.contains("contents.loadURL(url)"),
+            "a browser tab can open an Electron window — `setWindowOpenHandler` must \
+             deny and load the URL in the same tab"
+        );
+    }
+
+    /// A page in the browser can ask for the camera, the microphone,
+    /// geolocation or notifications. Chromium's default is a prompt — and
+    /// there is no user here to answer a prompt about a page that came from
+    /// the open web. The partition denies them all, once, at boot.
+    #[test]
+    fn the_browser_partition_denies_permission_requests() {
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/electron/browser.js"
+        ))
+        .expect("electron/browser.js");
+
+        assert!(
+            source.contains("setPermissionRequestHandler"),
+            "the browser partition lost its permission handler — Chromium will prompt \
+             a page in a tab for the camera, microphone, geolocation and notifications"
+        );
+        assert!(
+            source.contains("callback(false)"),
+            "the permission handler no longer denies — a page in a tab could be \
+             granted camera or geolocation access"
+        );
+    }
+
+    /// The app's one policy sentence, and the one shell left to say it.
+    ///
+    /// Under Tauri it was a field in `tauri.conf.json` and a test compared the
+    /// two copies; that shell is gone, so this pins the Electron copy — a
+    /// header the `app://` handler writes on every response — and the rule
+    /// that never changed: no `script-src`, so scripts fall back to
+    /// `default-src 'self'`, which carries neither unsafe token. Adding the
+    /// directive at all is the change that needs looking at, whatever value it
+    /// is given.
+    #[test]
+    fn the_app_serves_the_content_security_policy() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        // `const CSP = "…" + "…";` — a concatenation of literals, so what is
+        // inside the quotes is the policy.
+        let main =
+            std::fs::read_to_string(root.join("electron/main.js")).expect("electron/main.js");
+        let start = main
+            .find("const CSP =")
+            .expect("electron/main.js declares CSP");
+        let declaration = &main[start..];
+        // `";` and not `;`, because the policy itself is full of semicolons and
+        // a literal cannot contain an unescaped quote.
+        let end = declaration.find("\";").expect("the declaration ends") + 1;
+        let declaration = &declaration[..end];
+        let policy: String = declaration.split('"').skip(1).step_by(2).collect();
+
+        assert!(
+            !policy.contains("script-src"),
+            "the policy grew a `script-src`. Scripts used to fall back to `default-src \
+             'self'`; whatever this directive says now, it is the one change rule 11 is about"
+        );
+        assert!(
+            !policy.contains("unsafe-eval"),
+            "`unsafe-eval` in the app's policy — see rule 11 and `ui/src/math.tsx`"
+        );
+    }
+
+    /// An app-owned title bar must not reach the window through the webview.
+    ///
+    /// The controls go through `invoke`, answered by whichever shell owns the
+    /// window — today that is `electron/main.js` — and a component both shells
+    /// used to render must know nothing about windows beyond those command
+    /// names. What it pins is the invariant that replaced the grants: no
+    /// window call from the frontend. (The Tauri half of this test read
+    /// `capabilities/default.json` for the grants those calls used to need;
+    /// the file and the shell are gone.) The drag surface is the one thing the
+    /// component still carries for the shell: the attribute `app.css` matches
+    /// to make the bar draggable, and losing it is a title bar that cannot be
+    /// moved.
+    #[test]
+    fn the_title_bar_does_not_reach_the_window_from_the_webview() {
+        /// Window methods that *act*. Their presence in the component is the
+        /// failure; each one is a shell command instead.
+        const ACTS: &[&str] = &[
+            ".minimize()",
+            ".maximize()",
+            ".unmaximize()",
+            ".unminimize()",
+            ".toggleMaximize()",
+            ".close()",
+            ".hide()",
+            ".show()",
+            ".setTitle(",
+            ".setFullscreen(",
+            ".startDragging()",
+        ];
+
+        let component = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/ui/src/components/WindowControls.tsx"
+        ))
+        .expect("ui/src/components/WindowControls.tsx");
+
+        assert!(
+            !component.contains("from \"@tauri-apps"),
+            "the title bar imports a Tauri API — there is no Tauri shell to answer it, \
+             and the window belongs to Electron (see `electron/main.js`)"
+        );
+        for call in ACTS {
+            assert!(
+                !component.contains(call),
+                "the title bar calls `{call}` directly — that reaches the shell's window API from \
+                 a component. Add a `window_*` command to the shell instead."
+            );
+        }
+        assert!(
+            component.contains("data-drag-region"),
+            "the drag surface attribute moved out of WindowControls.tsx — the title bar is no \
+             longer draggable, and this test and the CSS that matches it now pin nothing"
+        );
     }
 
     /// Every shell registrar's text, concatenated. Missing files are an error

@@ -727,26 +727,19 @@ body.is-resizing {
   align-self: stretch;
 }
 
-/* The same drag surface, said the way the other shell listens for it.
+/* The drag surface, the way the one remaining shell listens for it.
 
-   Tauri injects a script that starts a window drag when the element under the
-   pointer *itself* carries `data-tauri-drag-region`; Electron reads
-   `-webkit-app-region` off the computed style and has no script. So the
-   attribute is the selector here on purpose — matching exactly the elements
-   Tauri already drags is what keeps one title bar and not two.
-
-   Scoped to the shell (`main.tsx` sets `data-shell`) rather than applied
-   unconditionally: whether WebView2 honours `-webkit-app-region` is not
-   something this file should be betting on, and a bar that took both
-   mechanisms would swallow the clicks of the menus that live in it. */
-[data-shell="electron"] [data-tauri-drag-region] {
+   Electron reads `-webkit-app-region` off the computed style and starts a
+   window drag when the element under the pointer *itself* carries
+   `data-drag-region` (`components/drag.ts`). No script involved, and no second
+   shell left to scope for — the attribute is the selector. */
+[data-drag-region] {
   -webkit-app-region: drag;
 }
 /* `-webkit-app-region` inherits, so anything clickable inside a drag region has
    to opt out or the drag eats its click. Interactive elements never carry the
    attribute themselves (`components/drag.ts`); this covers being nested in one. */
-[data-shell="electron"]
-  [data-tauri-drag-region]
+[data-drag-region]
   :is(button, input, a, [role="button"], [role="menuitem"]) {
   -webkit-app-region: no-drag;
 }

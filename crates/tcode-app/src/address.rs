@@ -8,7 +8,7 @@
 //!
 //! Reached from the Electron shell as the `resolve_url` command: a backend
 //! command rather than a `browser_*` verb, because deciding what a string means
-//! needs no view. See `MIGRATION-ELECTRON.md`.
+//! needs no view. See `AGENTS.md` rule 9h.
 
 /// What someone typed in the address bar, as a URL.
 ///

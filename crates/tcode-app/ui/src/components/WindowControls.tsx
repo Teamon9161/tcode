@@ -12,22 +12,19 @@ import { CloseIcon, MaximizeIcon, MinimizeIcon, RestoreIcon } from "./Icons";
  * the document.
  *
  * **The window is the shell's, so these go through `invoke` like everything
- * else.** They used to call Tauri's window API directly, which made this one of
- * two files that knew which shell was hosting the app; both shells now answer
- * `window_*` in the same command table (`main.rs::register_shell`,
- * `electron/main.js`), and this file knows nothing about either. A test pins
- * the absence — see `browser.rs::the_title_bar_does_not_reach_the_window_from_
- * the_webview` for what it used to check instead.
+ * else.** The Electron main process answers `window_*` in the shell's command
+ * table (`electron/main.js`), and this file knows nothing about windows beyond
+ * those names. A test pins the absence — see
+ * `dispatch.rs::the_title_bar_does_not_reach_the_window_from_the_webview`.
  */
 export function WindowDragRegion() {
   return (
     <span
       className="topbar-gap"
-      data-tauri-drag-region=""
-      // Fires under Tauri only: an Electron drag region consumes mouse events
-      // before the document sees them, and the platform's own caption
-      // behaviour — double-click to maximize — applies instead. Same gesture,
-      // different owner, so there is nothing here to branch on.
+      data-drag-region=""
+      // Electron's drag region consumes mouse events before the document sees
+      // them, and the platform's own caption behaviour — double-click to
+      // maximize — applies instead.
       onDoubleClick={() => invoke("window_toggle_maximize").catch(complain)}
     />
   );

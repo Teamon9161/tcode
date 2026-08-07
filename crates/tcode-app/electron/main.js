@@ -1,16 +1,15 @@
 // The Electron shell: a window, a pipe, and nothing else.
 //
-// The rule this file exists under (`../MIGRATION-ELECTRON.md`): **no business
-// logic here.** If something in this file starts deciding which session to
-// open, validating a path, or shaping a menu, that code belongs in Rust and
-// this process should be forwarding a command instead. The only state it is
-// allowed to own is state that genuinely lives in Electron — the window, and
-// later the tab-to-`WebContentsView` map the browser pane needs.
+// The rule this file exists under (`../AGENTS.md`): **no business logic here.**
+// If something in this file starts deciding which session to open, validating
+// a path, or shaping a menu, that code belongs in Rust and this process should
+// be forwarding a command instead. The only state it is allowed to own is
+// state that genuinely lives in Electron — the window, and the
+// tab-to-`WebContentsView` map the browser pane needs.
 //
 // Everything the app can ask for arrives as one method name and one argument
 // object. A handful are about this window and are answered here; the rest go
-// down the pipe to `tcode-sidecar`, which is the same Rust backend the Tauri
-// shell drives through `invoke`. Neither side knows which shell it has.
+// down the pipe to `tcode-sidecar`, which is the Rust backend.
 
 const { spawn } = require("node:child_process");
 const path = require("node:path");
@@ -29,7 +28,7 @@ const DIST = path.join(ROOT, "ui", "dist");
 /** Mirrors `bridge::WINDOW_STATE`, which mirrors `ui/src/types.ts`. */
 const WINDOW_STATE = "tcode://window-state";
 
-// Verbatim from `tauri.conf.json`. Rule 11: `script-src` falls back to
+// The app's one Content-Security-Policy. Rule 11: `script-src` falls back to
 // `default-src 'self'` and must never gain `unsafe-inline` or `unsafe-eval` —
 // that is the layer stopping KaTeX's and the markdown renderer's output from
 // executing. `frame-src` names the loopback origin `serve.rs` binds, which is
@@ -106,9 +105,9 @@ function startSidecar(deliver) {
     };
   }
 
-  // The working directory *is* the folder to open, exactly as under Tauri.
-  // Which folder that is stays the shell's decision, and this is the whole of
-  // it — no path handling here, because path handling is the backend's.
+  // The working directory *is* the folder to open. Which folder that is stays
+  // the shell's decision, and this is the whole of it — no path handling here,
+  // because path handling is the backend's.
   const cwd = process.env.TCODE_CWD || process.cwd();
   const child = spawn(binary, [], { cwd, stdio: ["pipe", "pipe", "pipe"] });
 
@@ -339,7 +338,7 @@ app.whenReady().then(() => {
 
   // The one door, and the only place that decides who answers. A shell verb is
   // handled here; everything else is a method name and an argument object going
-  // down a pipe, which is all `#[tauri::command]` ever was.
+  // down a pipe to the sidecar's command registry.
   ipcMain.handle("tcode:invoke", async (_event, method, args) => {
     const own = verbs[method];
     if (!own) return sidecar.call(method, args);

@@ -11,7 +11,7 @@
 //! is [`crate::dispatch`], which is also what lets a JSON-RPC line on stdin
 //! reach them. The `browser_*` verbs are not here at all for the same reason:
 //! a browser tab is a native view, so they live with whoever owns the views
-//! (`crate::browser::commands`, and `MIGRATION-ELECTRON.md` on where they go).
+//! (`electron/browser.js`; see `AGENTS.md` rule 9h).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

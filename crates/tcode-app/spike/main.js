@@ -1,6 +1,8 @@
 /**
- * Phase 0 of `MIGRATION-ELECTRON.md`. Throwaway code: it answers four
- * questions, writes `results.json`, and gets deleted.
+ * Phase 0 of the Tauri→Electron migration (now in `../AGENTS.md` rule 9h).
+ * Throwaway code: it answers four questions, writes `results.json`, and gets
+ * deleted. The Linux/Wayland half (question 2) is still pending — see the
+ * migration notes in `results.json`.
  *
  * The questions, and why each one can change the plan:
  *
@@ -148,7 +150,7 @@ async function main() {
   await appView.webContents.loadFile(path.join(__dirname, "app.html"));
 
   // A browser tab: no preload at all, its own partition. This is the shape the
-  // security section of `MIGRATION-ELECTRON.md` assumes.
+  // security section of `AGENTS.md` rule 9h assumes.
   const browserView = new WebContentsView({
     webPreferences: {
       partition: PARTITION,

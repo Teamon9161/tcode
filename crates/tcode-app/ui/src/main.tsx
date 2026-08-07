@@ -22,12 +22,11 @@ import { SHELL } from "@ipc";
 import { App } from "./App";
 import { Boundary } from "./Boundary";
 
-// The title bar is app-drawn (rule 9c), and the two shells make a region
-// draggable by opposite means: Tauri watches for `data-tauri-drag-region` from
-// a script it injects, Electron reads `-webkit-app-region` off the computed
-// style. Set before the first paint and scoped in `app.css`, so neither shell
-// is ever offered the other's mechanism — a title bar that took both would
-// swallow the clicks of the menus that live in it.
+// The title bar is app-drawn (rule 9c). Electron makes a region draggable by
+// reading `-webkit-app-region` off the computed style, so the drag surface is
+// an attribute (`components/drag.ts`) that `app.css` matches. Set before the
+// first paint; the design preview answers "preview" instead, so a preview never
+// inherits a drag region it has no window for.
 document.documentElement.dataset.shell = SHELL;
 
 const root = document.getElementById("root");

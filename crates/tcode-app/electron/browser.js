@@ -67,6 +67,16 @@ const PARTITION = "persist:tcode-browser";
  * tests, and is deliberately not reimplemented here.
  */
 function browserVerbs({ window, emit, resolveUrl }) {
+  // A page in a tab can ask for the camera, the microphone, geolocation or
+  // notifications. Chromium's answer would be a prompt, and there is nobody
+  // here to answer a prompt about a page that came from the open web — so the
+  // answer is always no, set once for the partition every tab shares.
+  session
+    .fromPartition(PARTITION)
+    .setPermissionRequestHandler((_webContents, _permission, callback) =>
+      callback(false),
+    );
+
   /** @type {{ id: string, view: import("electron").WebContentsView }[]} */
   const tabs = [];
   /** The tab on screen. Empty before the first one exists. */

@@ -2,44 +2,34 @@
 name = "tcode-app"
 version = "0.1.22"
 edition = "2021"
-description = "Desktop frontend for tcode: a Tauri shell over the shared agent harness"
+description = "Desktop backend for tcode: the sidecar an Electron shell spawns"
 
-# Deliberately NOT a workspace member, for the same reason as `tcode-voiced`:
-# Tauri links the platform webview (webkit2gtk + libsoup on Linux), which is a
-# system dependency `cargo build --workspace` must not start requiring of
-# everyone working on the terminal frontend. Build it from this directory.
+# Deliberately NOT a workspace member. The reason is not the old one — the
+# Tauri webview dependency that forced it is gone — but the conclusion is
+# unchanged: this crate builds the binary an Electron shell spawns as a child
+# process, and its artifact is referenced by that shell's packaging. Keeping it
+# out of `cargo build --workspace` means the terminal frontend's build never
+# needs this crate's heavier dependencies (portable-pty, hyper), and nothing in
+# the workspace has to know how the desktop app is assembled. Build it from
+# this directory.
 
 [lib]
 name = "tcode_app"
-# The Tauri binary and the integration tests both consume the lib; only
-# `main.rs` ever starts a webview.
+# The sidecar binary and the integration tests both consume the lib.
 path = "src/lib.rs"
 
-[[bin]]
-name = "tcode-app"
-path = "src/main.rs"
-
-# The same backend with a pipe instead of a window: what the Electron shell
-# spawns. Named explicitly because auto-discovery would call it `sidecar`, and
-# a binary on someone's PATH should say whose it is.
+# The backend with a pipe instead of a window: what the Electron shell spawns.
+# Named explicitly because auto-discovery would call it `sidecar`, and a binary
+# on someone's PATH should say whose it is.
 [[bin]]
 name = "tcode-sidecar"
 path = "src/bin/sidecar.rs"
-
-[build-dependencies]
-tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tcode-core = { path = "../tcode-core" }
 tcode-tools = { path = "../tcode-tools" }
 tcode-providers = { path = "../tcode-providers" }
 tcode-frontend = { path = "../tcode-frontend" }
-# `unstable` is what exposes `Window::add_child` — multiple webviews in one
-# window, which is the only way to put a real browser in a pane (see
-# `src/browser.rs`). Tauri marks it unstable; that is the entry fee for this
-# feature, as there is no stable alternative.
-tauri = { version = "2", features = ["unstable"] }
-tauri-plugin-dialog = "2"
 # Real PTYs for the terminal pane (`src/terminal.rs`). A pipe is not a
 # terminal: without a tty the shell drops its prompt, `vim` refuses to start
 # and nothing sees a `SIGWINCH`. This is wezterm's abstraction over the three
@@ -48,10 +38,9 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
-# WebKitGTK can announce a clipboard image without exposing a DOM File. Read
-# that one user-initiated paste through the native clipboard as a fallback.
-# The desktop app also runs natively under Wayland, so the default X11-only
-# backend cannot see the clipboard that WebKitGTK just pasted from.
+# The clipboard image fallback for a user-initiated paste. The desktop app can
+# run natively under Wayland, so the default X11-only backend cannot see the
+# clipboard that WebKitGTK just pasted from.
 arboard = { version = "3", features = ["wayland-data-control"] }
 
 # The loopback origin for shown artifacts (`serve.rs`). `ServeDir` rather than
@@ -71,17 +60,6 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
-
-# The browser pane's geometry, on this platform only (`src/browser/gtk.rs`).
-#
-# Tauri builds a child webview here by packing it into the window's vertical
-# `GtkBox`, which stacks it under the app and ignores every rect — there is no
-# positioning to be had through the Tauri API at all on Linux. So the app takes
-# the container over itself: one `GtkOverlay` holding a `GtkFixed`, which is the
-# shape wry *does* honour. Version and features track tauri's own `gtk`
-# dependency exactly, because these are the same widgets it hands us back.
-[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
-gtk = { version = "0.18", features = ["v3_24"] }
 
 [dev-dependencies]
 tempfile = "3"
