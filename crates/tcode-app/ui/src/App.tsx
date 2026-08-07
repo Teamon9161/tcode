@@ -36,12 +36,22 @@ import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
 import type { PlanDecision } from "./PlanEditor";
 import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
-import { adoptContext, applyUsage, limitsFrom, NO_USAGE, type Limits } from "./usage";
+import {
+  adoptContext,
+  applyUsage,
+  limitsFrom,
+  NO_USAGE,
+  type Limits,
+} from "./usage";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
 import { phaseOf } from "./activity";
-import { DisplayContext, loadDisplay, saveDisplay, type Display } from "./display";
+import {
+  DisplayContext,
+  loadDisplay,
+  saveDisplay,
+  type Display,
+} from "./display";
 import { fieldAspect } from "./field";
-import { Launchpad } from "./Launchpad";
 import { Workspace } from "./Workspace";
 import { Mark, Wordmark } from "./components/Mark";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
@@ -135,7 +145,9 @@ export function App() {
     (id: string) => {
       Promise.all([
         invoke<Queued[]>("queued", { session: id }).catch(() => null),
-        invoke<RewindTarget[]>("rewind_targets", { session: id }).catch(() => null),
+        invoke<RewindTarget[]>("rewind_targets", { session: id }).catch(
+          () => null,
+        ),
       ]).then(([queued, rewindTargets]) =>
         patch(id, (state) => ({
           ...state,
@@ -171,7 +183,8 @@ export function App() {
         if (touchedPlan(payload.event)) readPlan(payload.session);
         // A delivered queued prompt leaves the backend queue before its
         // successor starts. Re-read so a stale strip cannot target that turn.
-        if (payload.event.type === "QueuedInput") refreshTurnState(payload.session);
+        if (payload.event.type === "QueuedInput")
+          refreshTurnState(payload.session);
       }),
       listen<ApprovalRequest>(APPROVAL_REQUEST, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -193,7 +206,8 @@ export function App() {
           ...state,
           running: true,
           failed: false,
-          activity: payload.kind === "monitor" ? "monitor event" : state.activity,
+          activity:
+            payload.kind === "monitor" ? "monitor event" : state.activity,
         }));
       }),
       listen<TurnFinished>(TURN_FINISHED, ({ payload }) => {
@@ -207,7 +221,11 @@ export function App() {
           // total can have gone wrong and cannot recover on its own: an
           // auto-compaction rewrites the window after the last `Usage` event
           // the webview saw, and no event says how big the summary came out.
-          meter: adoptContext(state.meter, payload.context_tokens, payload.context_estimated),
+          meter: adoptContext(
+            state.meter,
+            payload.context_tokens,
+            payload.context_estimated,
+          ),
           blocks: payload.error
             ? [...state.blocks, errorBlock(payload.error)]
             : state.blocks,
@@ -259,38 +277,47 @@ export function App() {
     [states],
   );
 
-  const openFolder = useCallback(async (path: string, resume?: string) => {
-    const opened = await invoke<OpenedSession>("open_folder", {
-      path,
-      resume: resume ?? null,
-    });
-    const { session, history } = opened;
-    const replayed = replayLedger(history);
-    setSessions((current) =>
-      current.some((open) => open.id === session.id) ? current : [...current, session],
-    );
-    setStates((current) => ({
-      ...current,
-      [session.id]: {
-        ...BLANK,
-        ...replayed,
-        // The backend measured the prompt it would actually send. Sizing this
-        // from `history` was wrong in both directions at once: short by the
-        // system prompt and the tool schemas, and long by every entry a
-        // compaction had already moved out of the window.
-        meter: adoptContext(BLANK.meter, opened.context_tokens, opened.context_estimated),
-        activity: history.length > 0 ? "resumed" : BLANK.activity,
-      },
-    }));
-    setTiling((current) => show(current, session.id, fieldAspect()));
-    // A resumed conversation may already be working through a plan — it is on
-    // disk, and the session adopted it — so the strip must not wait for the next
-    // turn to find that out.
-    readPlan(session.id);
-    // Same reasoning for going back: a resumed conversation's earlier prompts
-    // are rewind points from the moment it opens, not once a turn has run.
-    refreshTurnState(session.id);
-  }, [readPlan, refreshTurnState]);
+  const openFolder = useCallback(
+    async (path: string, resume?: string) => {
+      const opened = await invoke<OpenedSession>("open_folder", {
+        path,
+        resume: resume ?? null,
+      });
+      const { session, history } = opened;
+      const replayed = replayLedger(history);
+      setSessions((current) =>
+        current.some((open) => open.id === session.id)
+          ? current
+          : [...current, session],
+      );
+      setStates((current) => ({
+        ...current,
+        [session.id]: {
+          ...BLANK,
+          ...replayed,
+          // The backend measured the prompt it would actually send. Sizing this
+          // from `history` was wrong in both directions at once: short by the
+          // system prompt and the tool schemas, and long by every entry a
+          // compaction had already moved out of the window.
+          meter: adoptContext(
+            BLANK.meter,
+            opened.context_tokens,
+            opened.context_estimated,
+          ),
+          activity: history.length > 0 ? "resumed" : BLANK.activity,
+        },
+      }));
+      setTiling((current) => show(current, session.id, fieldAspect()));
+      // A resumed conversation may already be working through a plan — it is on
+      // disk, and the session adopted it — so the strip must not wait for the next
+      // turn to find that out.
+      readPlan(session.id);
+      // Same reasoning for going back: a resumed conversation's earlier prompts
+      // are rewind points from the moment it opens, not once a turn has run.
+      refreshTurnState(session.id);
+    },
+    [readPlan, refreshTurnState],
+  );
 
   const closeSession = useCallback(
     async (id: string) => {
@@ -315,7 +342,10 @@ export function App() {
   const dispatchSlash = useCallback(
     async (id: string, line: string) => {
       try {
-        const result = await invoke<SlashResult>("slash_command", { session: id, line });
+        const result = await invoke<SlashResult>("slash_command", {
+          session: id,
+          line,
+        });
         switch (result.kind) {
           case "conversation": {
             const replayed = replayLedger(result.opened.history);
@@ -327,7 +357,9 @@ export function App() {
                 result.opened.context_tokens,
                 result.opened.context_estimated,
               ),
-              activity: result.notice ?? (result.opened.history.length > 0 ? "resumed" : "cleared"),
+              activity:
+                result.notice ??
+                (result.opened.history.length > 0 ? "resumed" : "cleared"),
             }));
             readPlan(id);
             refreshTurnState(id);
@@ -484,9 +516,11 @@ export function App() {
 
   const withdrawQueued = useCallback(
     async (id: string, index: number, text: string) => {
-      const queued = await invoke<Queued[]>("withdraw_queued", { session: id, index, text }).catch(
-        () => null,
-      );
+      const queued = await invoke<Queued[]>("withdraw_queued", {
+        session: id,
+        index,
+        text,
+      }).catch(() => null);
       // A refusal is not an error worth a banner: the queue is re-read either
       // way, and the answer to "why is it still there" is that it was already
       // delivered.
@@ -498,7 +532,10 @@ export function App() {
   const sendQueuedNow = useCallback(
     async (id: string, turn: number) => {
       try {
-        const interrupted = await invoke<boolean>("interrupt_and_send", { session: id, turn });
+        const interrupted = await invoke<boolean>("interrupt_and_send", {
+          session: id,
+          turn,
+        });
         if (interrupted) {
           patch(id, (state) => ({ ...state, queued: [] }));
         } else {
@@ -532,7 +569,10 @@ export function App() {
           session: id,
           entryIndex: target.index,
         });
-        patch(id, (state) => ({ ...state, rewindAsk: { ...preview, index: target.index } }));
+        patch(id, (state) => ({
+          ...state,
+          rewindAsk: { ...preview, index: target.index },
+        }));
       } catch (error) {
         patch(id, (state) => ({
           ...state,
@@ -569,9 +609,9 @@ export function App() {
           restoreFiles,
         });
         const replayed = replayLedger(done.session.history);
-        const targets = await invoke<RewindTarget[]>("rewind_targets", { session: id }).catch(
-          () => [],
-        );
+        const targets = await invoke<RewindTarget[]>("rewind_targets", {
+          session: id,
+        }).catch(() => []);
         patch(id, (state) => ({
           ...state,
           ...replayed,
@@ -612,14 +652,24 @@ export function App() {
   );
 
   const answer = useCallback(
-    async (id: string, decision: Decision, comment: string, setMode?: ApprovalMode) => {
+    async (
+      id: string,
+      decision: Decision,
+      comment: string,
+      setMode?: ApprovalMode,
+    ) => {
       const pending = held.current[id]?.approval;
       if (!pending) return;
       patch(id, (state) => ({ ...state, approval: null }));
       try {
         await invoke("respond_approval", {
           session: id,
-          answer: { id: pending.id, decision, comment: comment || null, set_mode: setMode ?? null },
+          answer: {
+            id: pending.id,
+            decision,
+            comment: comment || null,
+            set_mode: setMode ?? null,
+          },
         });
       } catch (error) {
         patch(id, (state) => ({
@@ -657,7 +707,10 @@ export function App() {
             decision: choice.decision,
             comment: choice.note || null,
             phases: choice.phases,
-            notes: choice.comments.map((entry) => ({ quote: entry.quote, text: entry.text })),
+            notes: choice.comments.map((entry) => ({
+              quote: entry.quote,
+              text: entry.text,
+            })),
             fresh_session: choice.fresh,
           },
         });
@@ -712,7 +765,9 @@ export function App() {
           const { session, history } = opened;
           const replayed = replayLedger(history);
           setSessions((current) =>
-            current.some((open) => open.id === session.id) ? current : [...current, session],
+            current.some((open) => open.id === session.id)
+              ? current
+              : [...current, session],
           );
           setStates((current) => ({
             ...current,
@@ -721,12 +776,18 @@ export function App() {
               ...replayed,
               running: true,
               activity: "executing the plan",
-              meter: adoptContext(BLANK.meter, opened.context_tokens, opened.context_estimated),
+              meter: adoptContext(
+                BLANK.meter,
+                opened.context_tokens,
+                opened.context_estimated,
+              ),
             },
           }));
           // Beside, not instead: the plan came from the conversation next to it,
           // and both are worth watching while one works.
-          setTiling((current) => showBeside(current, session.id, fieldAspect()));
+          setTiling((current) =>
+            showBeside(current, session.id, fieldAspect()),
+          );
         })
         .catch((error) =>
           patch(id, (was) => ({
@@ -737,9 +798,10 @@ export function App() {
     }
   }, [states, patch]);
 
-  // A session that needs an answer pulls the view to itself, but only from the
-  // launchpad: yanking someone out of a conversation they are reading would be
-  // worse than the delay in noticing.
+  // A session that needs an answer pulls the view to itself, but only into an
+  // empty field: yanking someone out of a conversation they are reading would
+  // be worse than the delay in noticing, and the rail is already saying so in
+  // words next to the folder it belongs to.
   const waiting = sessions.find((open) => states[open.id]?.approval);
   const alerted = useRef<string | null>(null);
   useEffect(() => {
@@ -761,7 +823,10 @@ export function App() {
   );
   const attach = useCallback(
     (id: string, items: SessionState["attachments"]) =>
-      patch(id, (was) => ({ ...was, attachments: [...was.attachments, ...items] })),
+      patch(id, (was) => ({
+        ...was,
+        attachments: [...was.attachments, ...items],
+      })),
     [patch],
   );
   const detach = useCallback(
@@ -776,33 +841,25 @@ export function App() {
     invoke("interrupt", { session: id }).catch(() => {});
   }, []);
   const setPlanDraft = useCallback(
-    (id: string, draft: PlanDraft) => patch(id, (was) => ({ ...was, planDraft: draft })),
+    (id: string, draft: PlanDraft) =>
+      patch(id, (was) => ({ ...was, planDraft: draft })),
     [patch],
   );
   const setPlanOpen = useCallback(
-    (id: string, open: boolean) => patch(id, (was) => ({ ...was, planOpen: open })),
+    (id: string, open: boolean) =>
+      patch(id, (was) => ({ ...was, planOpen: open })),
     [patch],
   );
   const setPlanFirst = useCallback(
-    (id: string, on: boolean) => patch(id, (was) => ({ ...was, planFirst: on })),
+    (id: string, on: boolean) =>
+      patch(id, (was) => ({ ...was, planFirst: on })),
     [patch],
   );
-  const goHome = useCallback(() => setTiling(EMPTY), []);
-
   if (fault) return <Fault reason={fault} />;
 
-  if (!tiling.root) {
-    return (
-      <Launchpad
-        open={sessions}
-        statusOf={statusOf}
-        activityOf={(id) => states[id]?.activity ?? BLANK.activity}
-        onEnter={(id) => setTiling((current) => show(current, id))}
-        onOpenFolder={openFolder}
-      />
-    );
-  }
-
+  // No branch on `tiling.root` any more: an empty field is a state of the
+  // workspace rather than a different screen, so the rail stays put and every
+  // conversation this process holds stays one click away (`FieldEmpty`).
   return (
     <ToolMetaProvider meta={toolMeta}>
       {/* Wraps the whole window, which is what makes a sub-agent's reasoning obey
@@ -836,7 +893,6 @@ export function App() {
             onPlanOpen={setPlanOpen}
             onPlanFirst={setPlanFirst}
             onCloseSession={closeSession}
-            onHome={goHome}
             onOpenFolder={openFolder}
           />
         </LimitsContext.Provider>
@@ -885,13 +941,13 @@ function Fault({ reason }: { reason: string }) {
         <WindowControls />
       </header>
       <div className="fault">
-      <Mark size={22} state="failed" />
-      <h1>tcode could not start</h1>
-      <p>{reason}</p>
-      <p className="fault-hint">
-        If no provider is configured yet, run <code>tcode</code> in a terminal
-        once to set one up.
-      </p>
+        <Mark size={22} state="failed" />
+        <h1>tcode could not start</h1>
+        <p>{reason}</p>
+        <p className="fault-hint">
+          If no provider is configured yet, run <code>tcode</code> in a terminal
+          once to set one up.
+        </p>
       </div>
     </div>
   );

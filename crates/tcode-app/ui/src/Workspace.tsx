@@ -26,54 +26,44 @@ import {
   webPane,
   type Tiling,
 } from "./layout";
-import { inTerminal } from "./keys";
+import { inTerminal, MOD } from "./keys";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
-import { statusLabel } from "./activity";
-import { StatusDot } from "./components/Status";
-import { BackIcon, ChevronDown, ChevronRight, CloseIcon, PlusIcon, SidebarIcon } from "./components/Icons";
+import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
+import { sessionTitle, type FoundSession } from "./rail";
+import { Finder } from "./Finder";
 import { Panes, type PaneContext } from "./Panes";
 import { DisplayMenu } from "./DisplayMenu";
 import type { Display } from "./display";
-import { Wordmark } from "./components/Mark";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
-import {
-  loadOrder,
-  moveProject,
-  railGroups,
-  saveOrder,
-  sessionTitle,
-  type RailGroup,
-} from "./rail";
+import { Rail } from "./Rail";
+import { FieldEmpty } from "./FieldEmpty";
 
 /**
- * The window: a rail of conversations on the left, a tiled field of panes
- * beside it, and a title bar over both.
+ * The window: the rail on the left, a tiled field of panes beside it, and a
+ * title bar over both. It is the only screen the app has.
  *
- * The rail lists every conversation the process is holding, on screen or not —
- * the panes show a few, the rail accounts for all of them. It is shown by
- * default rather than being a drawer: knowing that another session needs you is
- * the reason this app exists, and information you have to open a menu to see is
- * information you will miss. It can still be folded away from the title bar,
- * for the stretch where one conversation is the whole job — the toggle lives
- * there because the rail is the window's, not any pane's, which is the same rule
- * that keeps session actions out of the bar (AGENTS.md rule 9c).
+ * That is recent. There used to be a launchpad in front of it — a full screen
+ * of open sessions and every project, which every conversation was reached
+ * *through* and which the title bar kept a back arrow for. Its "Open" section
+ * was the rail drawn a second time, and the two parts that were genuinely only
+ * there (folders with nothing open, and each folder's earlier conversations)
+ * are things the rail can hold. So they moved into it (`Rail.tsx`) and the
+ * screen went, along with the back arrow and the mode it led to.
  *
- * It groups by folder (`rail.ts`), and that is not a nicety: a conversation is
- * named after its folder, so two in one folder were two identical rows and the
- * list could account for both without saying which was which. The folder is a
- * heading and each conversation is named by what it was asked to do — the two
- * facts a reader needs are different facts, so they are different elements.
- *
- * Each folder heading also starts a new conversation in that folder. The
- * folder chip in each pane remains the path for choosing a different folder,
- * while the rail keeps the same-folder action next to the group it names.
+ * The rail accounts for every conversation this process is holding, on screen or
+ * not. It is shown by default rather than being a drawer: knowing that another
+ * session needs you is the reason this app exists, and information you have to
+ * open a menu to see is information you will miss. It can still be folded away
+ * from the title bar, for the stretch where one conversation is the whole job —
+ * the toggle lives there because the rail is the window's, not any pane's, which
+ * is the same rule that keeps session actions out of the bar (AGENTS.md rule 9c).
  *
  * The app-owned caption uses the same theme token as the rest of the window.
  * The browser child webview is confined to pane bodies below this bar, so it
  * cannot intercept the window controls. This toolbar deliberately carries only
- * app-wide navigation and display controls; with the window split, no single
- * conversation is "the" one to name here.
+ * app-wide display controls; with the window split, no single conversation is
+ * "the" one to name here.
  */
 export function Workspace({
   tiling,
@@ -99,7 +89,6 @@ export function Workspace({
   onPlanOpen,
   onPlanFirst,
   onCloseSession,
-  onHome,
   onOpenFolder,
   display,
   onDisplay,
@@ -120,51 +109,71 @@ export function Workspace({
   onDismissResume: PaneContext["onDismissResume"];
   onAskRewind: PaneContext["onAskRewind"];
   onRewind: PaneContext["onRewind"];
-  onAnswer: (session: string, decision: Decision, comment: string, setMode?: ApprovalMode) => void;
+  onAnswer: (
+    session: string,
+    decision: Decision,
+    comment: string,
+    setMode?: ApprovalMode,
+  ) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
   onSavePlan: (session: string) => void;
   onPlanOpen: (session: string, open: boolean) => void;
   onPlanFirst: (session: string, on: boolean) => void;
   onCloseSession: (session: string) => void;
-  onHome: () => void;
-  onOpenFolder: (path: string) => Promise<void>;
+  /** `resume` replays a stored log rather than starting a fresh conversation;
+   *  the rail's earlier-conversation rows are the only caller that passes it. */
+  onOpenFolder: (path: string, resume?: string) => Promise<void>;
   display: Display;
   onDisplay: (next: Display) => void;
 }) {
   const narrow = useNarrow();
   const [rail, setRail] = useState(true);
-  // The arrangement of folders persists; which ones are folded does not. An
-  // order is something you set once and then rely on, while a fold is a thing
-  // you do to get a long list out of the way for the next few minutes — coming
-  // back to a rail with half of it collapsed by a decision you made last week is
-  // the opposite of accounting for every conversation.
-  const [order, setOrder] = useState<string[]>(loadOrder);
-  const [folded, setFolded] = useState<Set<string>>(() => new Set());
   // A temporary viewing mode, not a layout operation: keeping it here preserves
   // the full tiling tree and every pane's local state for the return trip.
   const [expanded, setExpanded] = useState<string | null>(null);
   // The page the browser has been asked for, if any. Window-level like the
   // browser itself: a link is followed *into* the one browser this window has,
   // whichever conversation it was written in.
-  const [webRequest, setWebRequest] = useState<{ url: string; at: number } | null>(null);
+  const [webRequest, setWebRequest] = useState<{
+    url: string;
+    at: number;
+  } | null>(null);
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
-  const groups = useMemo(() => railGroups(sessions, order), [sessions, order]);
 
   useEffect(() => {
     if (expanded && !findLeaf(tiling, expanded)) setExpanded(null);
   }, [expanded, tiling]);
 
-  const move = useCallback(
-    (path: string, to: number) => {
-      const next = moveProject(groups, path, to);
-      setOrder(next);
-      saveOrder(next);
-    },
-    [groups],
+  // Bound once rather than written inline in the rail's props, for the reason
+  // every handler here is: a fresh arrow each render is a changed prop.
+  const showHere = useCallback(
+    (session: string) =>
+      onTiling((current) => show(current, session, fieldAspect())),
+    [onTiling],
   );
+
+  // What the finder can take you to, named by the rail's own rules so the two
+  // lists cannot end up calling one conversation two different things. Built
+  // here rather than inside the rail because the finder sits in the title bar,
+  // which is what lets it survive the rail being folded away.
+  const findable: FoundSession[] = useMemo(
+    () =>
+      sessions.map((session) => {
+        const state = stateOf(session.id);
+        return {
+          kind: "session",
+          session,
+          title: sessionTitle(state.blocks) ?? state.activity,
+          activity: state.activity,
+          status: statusOf(session.id),
+        };
+      }),
+    [sessions, stateOf, statusOf],
+  );
+  const home = sessions[0]?.home ?? "";
 
   // The files index is the one inspect view not reached by pointing at
   // something in the transcript, so it keeps a button — on the conversation's
@@ -178,11 +187,18 @@ export function Workspace({
     (pane: string, session: string) => {
       onTiling((current) => {
         const sibling = panes(current).find(
-          (leaf) => leaf.pane.kind === "inspect" && leaf.pane.session === session,
+          (leaf) =>
+            leaf.pane.kind === "inspect" && leaf.pane.session === session,
         );
         return sibling
           ? close(current, sibling.id)
-          : openInspect(current, pane, session, { kind: "files" }, fieldAspect());
+          : openInspect(
+              current,
+              pane,
+              session,
+              { kind: "files" },
+              fieldAspect(),
+            );
       });
     },
     [onTiling],
@@ -202,7 +218,13 @@ export function Workspace({
         const browser = browserPane(current, session);
         return browser
           ? close(current, browser.id)
-          : openInspect(current, pane, session, { kind: "workspace-tree" }, fieldAspect());
+          : openInspect(
+              current,
+              pane,
+              session,
+              { kind: "workspace-tree" },
+              fieldAspect(),
+            );
       });
     },
     [onTiling],
@@ -216,7 +238,10 @@ export function Workspace({
     (session: string, path: string) => {
       const quoted = /\s/.test(path) ? `@"${path}"` : `@${path}`;
       const draft = stateOf(session).draft;
-      onDraft(session, draft.trim() ? `${draft.replace(/\s+$/, "")} ${quoted} ` : `${quoted} `);
+      onDraft(
+        session,
+        draft.trim() ? `${draft.replace(/\s+$/, "")} ${quoted} ` : `${quoted} `,
+      );
     },
     [stateOf, onDraft],
   );
@@ -291,7 +316,11 @@ export function Workspace({
 
       // First, because it is the one binding that has to work from anywhere —
       // including from inside the terminal it hides.
-      if (!event.altKey && !event.shiftKey && (event.key === "j" || event.key === "J")) {
+      if (
+        !event.altKey &&
+        !event.shiftKey &&
+        (event.key === "j" || event.key === "J")
+      ) {
         event.preventDefault();
         onTiling(toggleTerminal);
         return;
@@ -310,7 +339,11 @@ export function Workspace({
       // (AGENTS.md rule 9c) — the focused pane is what makes it answerable.
       // Same destination as the folder chip's first item, reached without the
       // menu.
-      if (!event.altKey && !event.shiftKey && (event.key === "n" || event.key === "N")) {
+      if (
+        !event.altKey &&
+        !event.shiftKey &&
+        (event.key === "n" || event.key === "N")
+      ) {
         const seat = focused(tiling);
         // The browser has no folder, so with focus there this key does nothing
         // rather than guessing at one of the folders on screen.
@@ -338,7 +371,9 @@ export function Workspace({
       if (event.altKey && ARROWS[event.key]) {
         event.preventDefault();
         const boxes = new Map<string, Box>();
-        for (const node of document.querySelectorAll<HTMLElement>("[data-pane]")) {
+        for (const node of document.querySelectorAll<HTMLElement>(
+          "[data-pane]",
+        )) {
           const id = node.dataset.pane;
           if (id) boxes.set(id, node.getBoundingClientRect());
         }
@@ -356,7 +391,11 @@ export function Workspace({
         return;
       }
 
-      if (!event.altKey && !event.shiftKey && (event.key === "w" || event.key === "W")) {
+      if (
+        !event.altKey &&
+        !event.shiftKey &&
+        (event.key === "w" || event.key === "W")
+      ) {
         event.preventDefault();
         onTiling((current) => close(current, current.focus));
       }
@@ -379,20 +418,33 @@ export function Workspace({
     [onTiling],
   );
   const ratio = useCallback(
-    (divider: string, value: number) => onTiling((current) => setRatio(current, divider, value)),
+    (divider: string, value: number) =>
+      onTiling((current) => setRatio(current, divider, value)),
     [onTiling],
   );
   const open = useCallback(
-    (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
+    (
+      pane: string,
+      session: string,
+      value: Parameters<PaneContext["onOpen"]>[2],
+    ) =>
       // Measured at the click rather than closed over: these handlers are bound
       // once for the memoized panes' sake (rule 21), and the window's shape
       // changes under them.
-      onTiling((current) => openInspect(current, pane, session, value, fieldAspect())),
+      onTiling((current) =>
+        openInspect(current, pane, session, value, fieldAspect()),
+      ),
     [onTiling],
   );
   const openBeside = useCallback(
-    (pane: string, session: string, value: Parameters<PaneContext["onOpen"]>[2]) =>
-      onTiling((current) => openAside(current, pane, session, value, fieldAspect())),
+    (
+      pane: string,
+      session: string,
+      value: Parameters<PaneContext["onOpen"]>[2],
+    ) =>
+      onTiling((current) =>
+        openAside(current, pane, session, value, fieldAspect()),
+      ),
     [onTiling],
   );
   const goTo = useCallback(
@@ -416,7 +468,9 @@ export function Workspace({
   const terminalCwd = useMemo(() => {
     const seat = focused(tiling);
     const held = seat && paneSession(seat.pane);
-    return sessions.find((open) => open.id === held)?.cwd ?? sessions[0]?.cwd ?? "";
+    return (
+      sessions.find((open) => open.id === held)?.cwd ?? sessions[0]?.cwd ?? ""
+    );
   }, [tiling, sessions]);
   // Following a link, as opposed to reaching for the browser. It must not go
   // through `openWeb`: that one is a toggle, so asking it for a page while the
@@ -548,11 +602,13 @@ export function Workspace({
 
   return (
     <div className={`workspace${rail ? "" : " is-folded"}`}>
+      {/* No wordmark and no back arrow. The arrow went with the launchpad —
+          there is nowhere behind this any more — and the wordmark went because
+          it was a whole row saying the name of the application you are looking
+          at, over a rail whose first row already says which folder you are in.
+          What is left are the two controls that act on the rail itself, at the
+          rail's own edge, and the window's controls at the other. */}
       <header className="topbar">
-        <Wordmark />
-        <button className="icon-btn" onClick={onHome} aria-label="Back to all projects">
-          <BackIcon size={15} />
-        </button>
         {/* No "on" styling: the rail being open is already answered by the rail
             being there, and spending the brand colour on a control whose state
             is the largest object on screen is exactly what the palette rule
@@ -561,10 +617,48 @@ export function Workspace({
           className="icon-btn"
           onClick={() => setRail((shown) => !shown)}
           aria-pressed={rail}
-          aria-label={rail ? "Hide the conversation list" : "Show the conversation list"}
-          title={rail ? "Hide the conversation list" : "Show the conversation list"}
+          aria-label={
+            rail ? "Hide the conversation list" : "Show the conversation list"
+          }
+          title={
+            rail ? "Hide the conversation list" : "Show the conversation list"
+          }
         >
           <SidebarIcon size={15} />
+        </button>
+        {/* Beside the fold toggle rather than inside the rail, and that is what
+            makes it work when the rail is folded: finding a conversation is the
+            way back to one, so it must not be inside the thing you put away. It
+            is the window's either way — a conversation in another folder is not
+            a question any pane can answer — which is the same test the display
+            switches pass to sit here. */}
+        <Finder
+          sessions={findable}
+          home={home}
+          onShow={showHere}
+          onOpenFolder={onOpenFolder}
+        />
+        {/* The window's other two surfaces, beside the two above for the same
+            reason: there is one browser and one terminal dock per window, so
+            neither is a conversation's to offer. They were on every pane's
+            header, which meant a split view drew two browser buttons that
+            toggled the same browser — and put six icons in the corner of a
+            window whose whole argument is that density is earned. */}
+        <button
+          className="icon-btn"
+          onClick={openBrowser}
+          aria-label="Open or close the browser"
+          title="Open or close the browser"
+        >
+          <GlobeIcon size={15} />
+        </button>
+        <button
+          className="icon-btn"
+          onClick={openTerminal}
+          aria-label="Open or hide the terminals"
+          title={`Terminals (${MOD}+J)`}
+        >
+          <TerminalIcon size={15} />
         </button>
         {/* What the window draws, not what any conversation holds — which is why
             it passes the bar's own test (rule 9c) where a session action would
@@ -575,200 +669,25 @@ export function Workspace({
         <WindowControls />
       </header>
 
-      {/* Unmounted rather than hidden when folded: it holds no state of its own,
-          and a `display: none` rail is still a grid column somebody has to
-          remember to zero. */}
+      {/* Unmounted rather than hidden when folded: a `display: none` rail is
+          still a grid column somebody has to remember to zero. */}
       {rail && (
-        <nav className="rail">
-          {/* No home button here: the title bar's back arrow already goes there,
-              and the mark that used to sit in this corner was a second status
-              light for the session the rail is already showing. */}
-          <ul className="rail-list">
-            {groups.map((group, at) => (
-              <RailProject
-                key={group.path}
-                group={group}
-                at={at}
-                total={groups.length}
-                folded={folded.has(group.path)}
-                onScreen={onScreen}
-                stateOf={stateOf}
-                statusOf={statusOf}
-                onFold={() =>
-                  setFolded((was) => {
-                    const next = new Set(was);
-                    if (!next.delete(group.path)) next.add(group.path);
-                    return next;
-                  })
-                }
-                onMove={(to) => move(group.path, to)}
-                onShow={(id) => onTiling((current) => show(current, id, fieldAspect()))}
-                onCloseSession={onCloseSession}
-                onOpenFolder={onOpenFolder}
-              />
-            ))}
-          </ul>
-        </nav>
+        <Rail
+          sessions={sessions}
+          onScreen={onScreen}
+          stateOf={stateOf}
+          statusOf={statusOf}
+          onShow={showHere}
+          onCloseSession={onCloseSession}
+          onOpenFolder={onOpenFolder}
+        />
       )}
 
-      <Panes tiling={shown} context={context} />
+      {/* The field, or what stands in for it. An empty tiling used to swap the
+          whole window for the launchpad; now it is a state of the field, which
+          is what it always was — the rail beside it is unchanged either way. */}
+      {shown.root ? <Panes tiling={shown} context={context} /> : <FieldEmpty />}
     </div>
-  );
-}
-
-/**
- * One folder and the conversations in it.
- *
- * The heading is the folder; the rows are conversations, each named by the first
- * thing it was asked to do. The count stays visible while the group is folded,
- * which is what keeps folding from hiding the fact the rail exists to publish —
- * and a folded group whose conversation needs an answer still shows it, because
- * that is the one thing that must never be foldable away.
- *
- * Reordering is Alt+arrow and two buttons that appear on hover, which is the
- * vocabulary the plan editor already uses for the same act. Drag was the obvious
- * alternative and buys nothing here: five rows, and a keyboard path for free.
- */
-function RailProject({
-  group,
-  at,
-  total,
-  folded,
-  onScreen,
-  stateOf,
-  statusOf,
-  onFold,
-  onMove,
-  onShow,
-  onCloseSession,
-  onOpenFolder,
-}: {
-  group: RailGroup;
-  at: number;
-  total: number;
-  folded: boolean;
-  onScreen: Set<string>;
-  stateOf: (session: string) => SessionState;
-  statusOf: (session: string) => Status;
-  onFold: () => void;
-  onMove: (to: number) => void;
-  onShow: (session: string) => void;
-  onCloseSession: (session: string) => void;
-  onOpenFolder: (path: string) => Promise<void>;
-}) {
-  const [failure, setFailure] = useState<string | null>(null);
-  const needs = group.sessions.filter((entry) => statusOf(entry.id) === "waiting").length;
-  const running = group.sessions.some((entry) => statusOf(entry.id) === "running");
-
-  return (
-    <li
-      className={`rail-group${folded ? " is-folded" : ""}`}
-      onKeyDown={(event) => {
-        if (!event.altKey || (event.key !== "ArrowUp" && event.key !== "ArrowDown")) return;
-        event.preventDefault();
-        event.stopPropagation();
-        onMove(event.key === "ArrowUp" ? at - 1 : at + 1);
-      }}
-    >
-      <div className="rail-project">
-        <button
-          type="button"
-          className="rail-project-head"
-          onClick={onFold}
-          aria-expanded={!folded}
-          title={group.path}
-        >
-          {folded ? <ChevronRight size={12} /> : <ChevronDown size={12} />}
-          <span className="rail-project-name">{group.name}</span>
-          {/* Folded, the group has to keep answering the rail's whole question.
-              A conversation waiting on a human is said in words rather than a
-              count, because it is the one state worth interrupting for. */}
-          {needs > 0 ? (
-            <span className="rail-needs">{needs === 1 ? "needs you" : `${needs} need you`}</span>
-          ) : (
-            folded && (
-              <span className="rail-count">
-                {running && <span className="rail-live" aria-label="running" />}
-                {group.sessions.length}
-              </span>
-            )
-          )}
-        </button>
-        <span className="rail-project-tools">
-          <button
-            type="button"
-            className="icon-btn"
-            title={`New conversation in ${group.name}`}
-            aria-label={`New conversation in ${group.name}`}
-            onClick={() =>
-              onOpenFolder(group.path).catch((error) => setFailure(String(error)))
-            }
-          >
-            <PlusIcon size={14} />
-          </button>
-          <button
-            type="button"
-            className="icon-btn"
-            title="Move up (Alt+↑)"
-            aria-label={`Move ${group.name} up`}
-            disabled={at === 0}
-            onClick={() => onMove(at - 1)}
-          >
-            ↑
-          </button>
-          <button
-            type="button"
-            className="icon-btn"
-            title="Move down (Alt+↓)"
-            aria-label={`Move ${group.name} down`}
-            disabled={at === total - 1}
-            onClick={() => onMove(at + 1)}
-          >
-            ↓
-          </button>
-        </span>
-      </div>
-
-      {failure && (
-        <p className="rail-new-failure" role="alert">
-          {failure}
-        </p>
-      )}
-
-      {!folded && (
-        <ul className="rail-sessions">
-          {group.sessions.map((entry) => {
-            const state = stateOf(entry.id);
-            // The first prompt, and the activity line only until there is one:
-            // "not started" is the whole truth about a conversation nobody has
-            // typed into yet, and a stale first line beats no line at all.
-            const title = sessionTitle(state.blocks) ?? state.activity;
-            return (
-              <li key={entry.id}>
-                <button
-                  className={`rail-item${onScreen.has(entry.id) ? " is-onscreen" : ""}`}
-                  onClick={() => onShow(entry.id)}
-                  title={title}
-                >
-                  <StatusDot status={statusOf(entry.id)} />
-                  <span className="rail-lines">
-                    <span className="rail-name">{title}</span>
-                    <span className="rail-activity">{statusLabel(state.activity)}</span>
-                  </span>
-                </button>
-                <button
-                  className="rail-close"
-                  onClick={() => onCloseSession(entry.id)}
-                  aria-label={`Close this conversation in ${group.name}`}
-                >
-                  <CloseIcon size={13} />
-                </button>
-              </li>
-            );
-          })}
-        </ul>
-      )}
-    </li>
   );
 }
 

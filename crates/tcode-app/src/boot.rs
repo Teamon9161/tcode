@@ -48,7 +48,7 @@ Restarting tcode will try again; if it keeps failing, something on this machine 
 
 /// Opens further folders as sessions, after boot.
 ///
-/// The launchpad can open any folder, and each one is its own conversation
+/// The rail can open any folder, and each one is its own conversation
 /// with its own `ToolCtx` — but they all share the one `Arc<Agent>`, which is
 /// stateless. What this holds is the small amount of per-app context that
 /// `tcode_frontend::open_session` needs and that the agent does not carry.

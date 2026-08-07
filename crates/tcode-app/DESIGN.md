@@ -26,7 +26,7 @@ a component.
 
 | Token | Value | Use |
 |---|---|---|
-| `--bg` | `oklch(1 0 0)` | Content: transcript, launchpad body, dialogs |
+| `--bg` | `oklch(1 0 0)` | Content: transcript, panes, dialogs |
 | `--chrome` | `oklch(0.972 0.004 130)` | Second layer: title bar, rails, side panels |
 | `--sunken` | `oklch(0.955 0.006 130)` | Insets: inputs, code wells, tool output |
 | `--line` | `oklch(0.905 0.005 130)` | Hairline separators |
@@ -123,7 +123,7 @@ DPI; a heading that shrinks inside a narrow rail looks worse, not responsive.
 | `--text-sm` | 13px / 1.55 | Controls, rail items, tool cards |
 | `--text-base` | 14px / 1.65 | Transcript body |
 | `--text-md` | 16px / 1.4 | Card titles, section headings |
-| `--text-lg` | 20px / 1.3 | Launchpad heading |
+| `--text-lg` | 20px / 1.3 | The empty field's heading |
 | `--text-xl` | 26px / 1.2 | Greeting |
 
 Prose caps at 72ch. Monospace blocks may run wider.
@@ -143,6 +143,13 @@ approval dock and the composer. It is one token because those three have to
 agree: the dock once carried its own wider number and sat visibly off-axis from
 the very change it was asking about. Anything that lines up with the
 conversation reads the token instead of repeating the figure.
+
+`--rail-w` (232px) is the second such token, for the second pair that has to
+agree: the rail's column, and the finder in the title bar above it. The finder
+sits over the rail's column because that is the column it searches, so its width
+is `--rail-w` minus the fold toggle beside it — written once. Repeated as a
+figure in both places it drifts by two pixels, which does not read as a
+different width, it reads as a mistake.
 
 Radii climb with the element's size (`--r-xs` 4px … `--r-lg` 12px) so a pill
 inside a card never looks flatter than its container. Nested cards are banned
@@ -200,8 +207,12 @@ One shape per job, used everywhere:
   on the screen you actually type into.
 - **Status pill** — dot + word, wash background. The only place state color
   appears as a fill.
-- **Card** — used for sessions on the launchpad, where "a discrete resumable
-  thing" genuinely is the affordance. Not used for lists, not nested.
+- **Card** — nothing uses one. It was the launchpad's affordance for an open
+  session, and when that screen folded into the rail the cards went with it:
+  the rail is a list, and a list of conversations is rows. Kept in the
+  vocabulary as the shape a *discrete resumable thing* would take if one ever
+  needed drawing, and as a reminder that it is not the answer to "several of
+  something on a surface".
 - **Row** — the default list affordance: hairline-separated, hover-tinted, full
   width. Projects, files and sessions in the rail are rows, not cards.
 
@@ -212,8 +223,64 @@ One shape per job, used everywhere:
   *what for* — the first thing the conversation was asked to do, over what it is
   doing now. Folding a group keeps its count, and keeps "needs you" in words,
   because the one fact this rail exists to publish must not be foldable away.
-  Reordering is Alt+arrow plus two buttons on hover, the same vocabulary the plan
-  editor uses for the same act.
+- **Rail** — the app's only navigation surface, and the reason it has only one
+  screen. There used to be a **launchpad** in front of the window: a full page of
+  open sessions as cards and every project as a row, which every conversation was
+  reached *through* and which the title bar kept a back arrow for. Its "Open"
+  section was the rail drawn a second time, so the whole screen was buying two
+  things — folders with nothing open in them, and each folder's earlier
+  conversations — at the price of a navigation mode. Both are list-shaped. They
+  moved into the rail and the screen went.
+
+  So a **group heading is the project**, not "a folder that happens to hold a
+  live conversation", and the column has a head and two bands:
+
+  - **live** — projects with a conversation open, in the order the reader
+    arranged, expanded by default. Nothing may push this down the column; it is
+    the product's whole question.
+   - **`Recent`** — folders visited and closed, newest first, collapsed by
+    default and **capped**. The column scrolls, so the cap is not about room —
+    it is about the *first screen*: forty folders above the fold means "what
+    needs me" arrives under a list of where you have been. The rest are one
+    click below (`N more`, which lifts the cap for the sitting and is not
+    remembered) or one search away.
+
+  One rule covers both: the disclosure means *show me more of this project*, and
+  the two resting states come from what a project has rather than from which band
+  it is in. Opening a group shows its live conversations and, behind one more
+  row (`Earlier · 14`), the ones it can go back to. That row is not a fold being
+  coy — building those previews replays every log in the folder, so the count is
+  stated before the click, and a project with nothing live skips the row because
+  history is all it has.
+
+  **A conversation appears once.** A live session and the log it is writing to are
+  the same conversation, and the stored row for it says `open` and does nothing —
+  resuming it would put a second ledger on one file. That is what `log_id` on the
+  wire is for.
+
+  A project's own acts are one hover `+` (a conversation here) and one `⋯`. The
+  menu is where reordering went: two permanent arrow buttons were taking width in
+  the one list that has none to spare, for something you do once and then rely on
+  for weeks. Alt+arrow still works — a menu is where a rare act is *found*, not
+  the only way to do it — and the items differ by band, because arranging is
+  meaningless where the order is a timestamp.
+- **Finder** — `Ctrl`+`P`, or the field-shaped button in the title bar. It
+  searches open conversations and every folder, which is the pair the rail shows;
+  what it deliberately does not search is stored conversations, because a preview
+  costs a log replay and searching them means replaying every log in every
+  project on each keystroke. Matching is plain case-insensitive substring, not
+  fuzzy: the corpus is tens of items, and what the plain version buys is that no
+  results means the thing is not there rather than that you spelled it in a way
+  the scorer disliked.
+
+  It sits in the title bar rather than in the rail, and that is the one placement
+  decision worth keeping: finding a conversation is the way *back* to one, so it
+  must not live inside the thing you folded away. Its width reads `--rail-w` so
+  it ends on the rail's own edge. `New conversation` went the other way, into the
+  rail's head, because it is the list's own act — it adds to what is below it.
+  It is a plain row, not a filled button: this column is scanned for what is
+  running, chroma and weight mean state here, and a permanent control is never
+  state.
 - **Trace row** — every step in the transcript, whatever kind: one call, a run of
   reads, a run of edits, a concurrent batch, a delegated sub-agent. Chevron,
   label, state; expandable, and its contents indent beneath it. No border, no
@@ -277,6 +344,13 @@ One shape per job, used everywhere:
   put something in it), never "nothing here". It sits on the column's own left
   edge, not centred: it is the first thing in the conversation, and the
   conversation has one axis.
+
+  The **empty field** — the window with no pane on it — is one of these rather
+  than a screen, which is exactly what the launchpad got wrong. It draws no
+  sheet, starts on the same `--measure` axis every pane starts on, and says *no
+  conversation on screen* rather than *nothing open*: conversations can be
+  running in this window with no pane showing one, and a heading claiming
+  otherwise would be the window contradicting the rail beside it.
 - **Pane** — a sheet of `--bg` at `--r-sm`, holding a thin header over a body.
   Every pane wears the same frame whatever is inside it, which is what makes a
   diff and a conversation read as two of the same thing rather than a panel
@@ -285,9 +359,21 @@ One shape per job, used everywhere:
   Focus is a 1px `--brand` ring in the gutter, drawn only when more than one
   pane exists — with one pane, "which is current" is not a question anyone is
   asking, and answering it anyway spends the state colour on nothing.
+
+  **"It never carries window-level controls" was aspirational for a while.** The
+  header held six icons, two of which — the browser and the terminals — are the
+  window's: there is one of each per window, so a split view drew two browser
+  buttons that toggled the same browser, and maximised, the six sat in the
+  corner of a product whose principle is that density is *earned*. They moved to
+  the title bar's left, beside the rail's toggle and the finder, which is now
+  one coherent group: **which surfaces this window is showing.** Expanding a
+  pane went conditional in the same pass — it is relative to neighbours, so with
+  one pane it was a control whose job you had to guess. Three icons remain, and
+  all three are this conversation's: its files, its tree, and hiding it.
 - **Title bar** — native window chrome owns the title and the minimize, maximize,
   and close controls. The app toolbar beneath it is the thinnest app-owned band:
-  back, the rail's fold toggle, and display controls. It carries no conversation
+  the rail's fold toggle, the finder, the browser and the terminals on the left,
+  and display controls on the right. It carries no conversation
   title, because once the window can hold several conversations, naming one at
   app level is a second and sometimes-wrong answer to a question each pane's
   own header already answers. Native chrome is deliberate: an embedded browser
@@ -554,6 +640,7 @@ in a composer nearly all the time, so a bare key is text.
 
 | Key | Does |
 |---|---|
+| `Mod` + `P` | find a conversation or a folder |
 | `Mod` + `1…9` | show that conversation in this pane |
 | `Mod` + `Shift` + `1…9` | open it beside this one |
 | `Mod` + `Alt` + `← ↑ ↓ →` | move focus to the pane that way |
@@ -569,9 +656,15 @@ is about where the eye is. Ties break toward straight ahead — drift across the
 axis costs double — so from a tall pane the neighbour level with your eye wins
 over one that is technically nearer.
 
-They are listed on the empty conversation, which is the one screen with room
-for them and the one moment nobody is mid-task. A shortcut nothing ever mentions
-is a shortcut nobody uses.
+`Mod`+`P` and not `Mod`+`K`: this goes to a *place*, and the app's other jump —
+`Mod`+`1…9` — is the same verb with the list already memorised. `Mod`+`K` would
+promise a command palette this app does not have.
+
+They are listed on the empty field and on an empty conversation, which are the
+two screens with room for them and the two moments nobody is mid-task. A shortcut
+nothing ever mentions is a shortcut nobody uses. The empty field lists only the
+keys that move you *between* conversations; the pane verbs belong to a window
+that has panes in it.
 
 ## Theme packs
 

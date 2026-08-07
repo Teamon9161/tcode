@@ -31,6 +31,26 @@ export const FolderIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/** Three dots: the platform's word for "the rest of this thing's actions".
+ *  Filled rather than stroked — at 14px a 2.2 stroke around a 1-unit circle is a
+ *  smudge, and the mark has to read as three separate dots or it reads as
+ *  nothing. */
+export const MoreIcon = ({ size = 16, className }: IconProps) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="currentColor"
+    className={className}
+    aria-hidden="true"
+    focusable="false"
+  >
+    <circle cx="5.5" cy="12" r="1.7" />
+    <circle cx="12" cy="12" r="1.7" />
+    <circle cx="18.5" cy="12" r="1.7" />
+  </svg>
+);
+
 export const ChevronRight = (props: IconProps) => (
   <Glyph {...props}>
     <path d="m9.5 5.5 6.5 6.5-6.5 6.5" />

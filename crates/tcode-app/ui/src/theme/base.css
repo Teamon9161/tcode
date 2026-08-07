@@ -139,6 +139,13 @@
      1px ring sits inside it without touching either neighbour. */
   --gutter: 4px;
 
+  /* The rail's width, read by the rail and by the one control in the title bar
+     that lines up with it (the finder, which sits over the rail's column
+     because that is the column it searches). One token for the same reason
+     `--measure` is one: two places that must agree, and a figure repeated in
+     both is a figure that drifts by two pixels and looks like a mistake. */
+  --rail-w: 232px;
+
   /* ---- Density -------------------------------------------------------- */
   /* One multiplier over the whole spacing rhythm. A compact theme ships 0.85,
      a roomy one 1.15; no component changes. */
@@ -179,9 +186,11 @@
   /* ---- Elevation ------------------------------------------------------ */
   /* Ink-tinted rather than pure black, so shadows belong to the theme. */
   --shadow-color: color-mix(in oklab, var(--ink) 100%, transparent);
-  --shadow-rest: 0 1px 2px -1px color-mix(in oklab, var(--shadow-color) 10%, transparent),
+  --shadow-rest:
+    0 1px 2px -1px color-mix(in oklab, var(--shadow-color) 10%, transparent),
     0 2px 6px -2px color-mix(in oklab, var(--shadow-color) 7%, transparent);
-  --shadow-lift: 0 4px 12px -4px color-mix(in oklab, var(--shadow-color) 16%, transparent),
+  --shadow-lift:
+    0 4px 12px -4px color-mix(in oklab, var(--shadow-color) 16%, transparent),
     0 16px 40px -12px color-mix(in oklab, var(--shadow-color) 14%, transparent);
 
   /* ---- Motion --------------------------------------------------------- */

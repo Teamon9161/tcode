@@ -253,6 +253,12 @@ pub struct Session {
     /// A sub-agent shares its parent's provider but not its prefix, so it must
     /// not share its cache id.
     cache_scope: Option<String>,
+    /// The session log this conversation is appending to, once one is bound.
+    /// A frontend that lists both live conversations and resumable logs needs
+    /// it to tell the two apart: the same conversation appearing twice is not
+    /// merely untidy, because "resume" on the second copy opens a *second*
+    /// ledger writing into one file.
+    log_id: Option<String>,
     /// The user-selected local trust level of the current canonical cwd.
     /// It is runtime state, not a ledger entry: the classifier receives it as
     /// trusted harness context and a `/cd` can change it without rewriting the
@@ -321,6 +327,7 @@ impl Session {
             auto_total_denials: 0,
             auto_consecutive_unavailable: 0,
             cache_scope: None,
+            log_id: None,
             folder_trust: FolderTrust::Untrusted,
             folder_trust_known: false,
             environment: None,
@@ -709,7 +716,14 @@ impl Session {
                 .map(|dir| dir.join("tasks").join(session_id)),
         );
         self.cache_scope = Some(format!("main:{session_id}"));
+        self.log_id = Some(session_id.to_string());
         self.prompt_variables = Self::capture_prompt_variables(&self.tool_ctx);
+    }
+
+    /// The session log this conversation appends to, if it is persisted at all.
+    /// `None` when there is no project data directory to write into.
+    pub fn log_id(&self) -> Option<&str> {
+        self.log_id.as_deref()
     }
 
     /// Record a fresh runtime environment immediately, but defer its

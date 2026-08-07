@@ -5,14 +5,19 @@
  * browser, without a provider or a running turn. It is aliased in only when
  * mode `preview`, so the shipped bundle never contains it.
  */
-import type { Launchpad, OpenedSession, SessionInfo, StoredSession } from "../types";
+import type {
+  ProjectList,
+  OpenedSession,
+  SessionInfo,
+  StoredSession,
+} from "../types";
 import type { PickerState, PinChoice } from "../picker";
 import { TERMINAL_OUTPUT } from "../types";
 import { deliver } from "./mock-event";
 
 const NOW = Math.floor(Date.now() / 1000);
 
-const PROJECTS: Launchpad = {
+const PROJECTS: ProjectList = {
   now: NOW,
   home: "/home/teamon",
   projects: [
@@ -44,13 +49,48 @@ const PROJECTS: Launchpad = {
       last_active: NOW - 60 * 60 * 24 * 94,
       exists: false,
     },
+    // A tail, so the rail's `Recent` band is drawn in the state it is designed
+    // for rather than the comfortable one: past the cap, with the `N more` row
+    // under it and the column actually scrolling. Four projects proved none of
+    // that — and "does this still read at forty folders" is the question the
+    // whole two-band arrangement exists to answer.
+    ...[
+      ["multi-asset-alloc", "/home/teamon/work/multi-asset-alloc", 9],
+      ["pl_ext", "/home/teamon/code/py/pl_ext", 17],
+      ["short_term_rs", "/home/teamon/code/rust/short_term_rs", 4],
+      ["bond-curve", "/home/teamon/work/bond-curve", 31],
+      ["tcode-voiced", "/home/teamon/code/rust/tcode/crates/tcode-voiced", 3],
+      ["dotfiles", "/home/teamon/dotfiles", 1],
+      ["notes", "/home/teamon/notes", 12],
+      ["irs-pricing", "/home/teamon/work/irs-pricing", 8],
+      ["l2-replay", "/home/teamon/work/l2-replay", 22],
+      ["scratch", "/home/teamon/scratch", 5],
+    ].map(([name, path, count], at) => ({
+      path: path as string,
+      name: name as string,
+      session_count: count as number,
+      last_active: NOW - 60 * 60 * 24 * (2 + at * 3),
+      exists: true,
+    })),
   ],
 };
 
 const HISTORY: StoredSession[] = [
-  { id: "0193f0", preview: "refactor the agent loop so retries are testable", modified: NOW - 720 },
-  { id: "0193ef", preview: "why does /resume drop the last tool result?", modified: NOW - 60 * 60 * 5 },
-  { id: "0193ee", preview: "add a test for the ledger compact path", modified: NOW - 60 * 60 * 30 },
+  {
+    id: "0193f0",
+    preview: "refactor the agent loop so retries are testable",
+    modified: NOW - 720,
+  },
+  {
+    id: "0193ef",
+    preview: "why does /resume drop the last tool result?",
+    modified: NOW - 60 * 60 * 5,
+  },
+  {
+    id: "0193ee",
+    preview: "add a test for the ledger compact path",
+    modified: NOW - 60 * 60 * 30,
+  },
 ];
 
 const OPEN: SessionInfo[] = [];
@@ -61,7 +101,10 @@ const OPEN: SessionInfo[] = [];
 const MODES = [
   { key: "default", detail: "Rules decide; anything else asks you." },
   { key: "accept-edits", detail: "File edits go through; commands still ask." },
-  { key: "auto", detail: "Runs without prompting; a safety classifier reviews the rest." },
+  {
+    key: "auto",
+    detail: "Runs without prompting; a safety classifier reviews the rest.",
+  },
   {
     key: "unsafe",
     detail: "Nothing asks. Deny rules still apply. For isolated environments.",
@@ -77,8 +120,16 @@ const MODES = [
  */
 const PICKER: PickerState = {
   models: [
-    { profile: "anthropic", label: "Opus 5", efforts: ["low", "medium", "high"] },
-    { profile: "anthropic", label: "Sonnet 5", efforts: ["low", "medium", "high"] },
+    {
+      profile: "anthropic",
+      label: "Opus 5",
+      efforts: ["low", "medium", "high"],
+    },
+    {
+      profile: "anthropic",
+      label: "Sonnet 5",
+      efforts: ["low", "medium", "high"],
+    },
     { profile: "openai", label: "gpt-5.1-codex", efforts: ["medium", "high"] },
     { profile: "deepseek", label: "deepseek-v4-flash[1m]", efforts: [] },
   ],
@@ -91,20 +142,55 @@ const PICKER: PickerState = {
   ],
   preset: 0,
   roles: [
-    { key: "explore", label: "explore", helper: false, allows_off: false,
-      pin: { kind: "model", index: 3, effort: null } },
-    { key: "general", label: "general", helper: false, allows_off: false,
-      pin: { kind: "inherit" } },
-    { key: "auto", label: "auto", helper: true, allows_off: false,
-      pin: { kind: "model", index: 1, effort: "low" } },
-    { key: "compact", label: "compact", helper: true, allows_off: false,
-      pin: { kind: "inherit" } },
-    { key: "suggest", label: "suggest", helper: true, allows_off: false,
-      pin: { kind: "inherit" } },
-    { key: "vision", label: "vision", helper: true, allows_off: false,
-      pin: { kind: "inherit" } },
-    { key: "fetch", label: "web-fetch", helper: true, allows_off: true,
-      pin: { kind: "off" } },
+    {
+      key: "explore",
+      label: "explore",
+      helper: false,
+      allows_off: false,
+      pin: { kind: "model", index: 3, effort: null },
+    },
+    {
+      key: "general",
+      label: "general",
+      helper: false,
+      allows_off: false,
+      pin: { kind: "inherit" },
+    },
+    {
+      key: "auto",
+      label: "auto",
+      helper: true,
+      allows_off: false,
+      pin: { kind: "model", index: 1, effort: "low" },
+    },
+    {
+      key: "compact",
+      label: "compact",
+      helper: true,
+      allows_off: false,
+      pin: { kind: "inherit" },
+    },
+    {
+      key: "suggest",
+      label: "suggest",
+      helper: true,
+      allows_off: false,
+      pin: { kind: "inherit" },
+    },
+    {
+      key: "vision",
+      label: "vision",
+      helper: true,
+      allows_off: false,
+      pin: { kind: "inherit" },
+    },
+    {
+      key: "fetch",
+      label: "web-fetch",
+      helper: true,
+      allows_off: true,
+      pin: { kind: "off" },
+    },
   ],
   modes: MODES,
   mode: "accept-edits",
@@ -160,7 +246,9 @@ const SERVED = new Map<string, string>();
 function servedUrl(path: string): string {
   const existing = SERVED.get(path);
   if (existing) return existing;
-  const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "<p>no fixture for this file</p>";
+  const body =
+    SHOWN[path.slice(path.lastIndexOf(".") + 1)] ??
+    "<p>no fixture for this file</p>";
   const url = URL.createObjectURL(new Blob([body], { type: "text/html" }));
   SERVED.set(path, url);
   return url;
@@ -169,10 +257,24 @@ function servedUrl(path: string): string {
 type WorkspaceKind = "file" | "directory" | "link";
 /** `binary` is the `data:` URL the real `workspace_read_binary` would build. A
  *  node has one or the other, exactly as the two commands do. */
-type WorkspaceNode = { kind: WorkspaceKind; text?: string; binary?: string; revision: number };
-type WorkspaceFixture = { nodes: Record<string, WorkspaceNode>; changedAfterFirstSave: boolean };
+type WorkspaceNode = {
+  kind: WorkspaceKind;
+  text?: string;
+  binary?: string;
+  revision: number;
+};
+type WorkspaceFixture = {
+  nodes: Record<string, WorkspaceNode>;
+  changedAfterFirstSave: boolean;
+};
 type WorkspaceEntry = { name: string; path: string; kind: WorkspaceKind };
-type WorkspaceText = { path: string; text: string; revision: string; bytes: number; truncated: boolean };
+type WorkspaceText = {
+  path: string;
+  text: string;
+  revision: string;
+  bytes: number;
+  truncated: boolean;
+};
 type WorkspaceBinary = { path: string; url: string; bytes: number };
 
 /** A 64px mark, small enough to sit in the source: what an image in the tree
@@ -216,7 +318,7 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
           "  return `workspace for ${session}`;",
           "}",
           "",
-          "const focused = new Set([\"workspace-tree\", \"workspace-file\"]);",
+          'const focused = new Set(["workspace-tree", "workspace-file"]);',
           "export const hasWorkspaceView = (view: string) => focused.has(view);",
         ].join("\n"),
       },
@@ -252,15 +354,31 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
       "outside-workspace": { kind: "link", revision: 1 },
     }),
     b: workspace({
-      "README.md": { kind: "file", revision: 1, text: "# duck_ext\n\nA separate session fixture.\n" },
+      "README.md": {
+        kind: "file",
+        revision: 1,
+        text: "# duck_ext\n\nA separate session fixture.\n",
+      },
       src: { kind: "directory", revision: 1 },
-      "src/curve.py": { kind: "file", revision: 1, text: "def load_curve(date):\n    return date\n" },
+      "src/curve.py": {
+        kind: "file",
+        revision: 1,
+        text: "def load_curve(date):\n    return date\n",
+      },
       cache: { kind: "directory", revision: 1 },
     }),
     c: workspace({
-      "README.md": { kind: "file", revision: 1, text: "# pybond\n\nIndependent workspace fixture.\n" },
+      "README.md": {
+        kind: "file",
+        revision: 1,
+        text: "# pybond\n\nIndependent workspace fixture.\n",
+      },
       pybond: { kind: "directory", revision: 1 },
-      "pybond/pricing.rs": { kind: "file", revision: 1, text: "pub fn price() -> f64 { 100.0 }\n" },
+      "pybond/pricing.rs": {
+        kind: "file",
+        revision: 1,
+        text: "pub fn price() -> f64 { 100.0 }\n",
+      },
     }),
   };
 }
@@ -272,7 +390,9 @@ export function resetPreviewFixtures(): void {
   WORKSPACES = fixtureWorkspaces();
 }
 
-function workspaceFor(args: Record<string, unknown> | undefined): [string, WorkspaceFixture] {
+function workspaceFor(
+  args: Record<string, unknown> | undefined,
+): [string, WorkspaceFixture] {
   const session = typeof args?.session === "string" ? args.session : "";
   const fixture = WORKSPACES[session];
   if (!fixture) throw new Error(`session '${session}' is not open`);
@@ -280,10 +400,19 @@ function workspaceFor(args: Record<string, unknown> | undefined): [string, Works
 }
 
 function relativePath(value: unknown, label: string): string {
-  if (typeof value !== "string" || value.length === 0 || value.startsWith("/") || value.includes("\\")) {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    value.startsWith("/") ||
+    value.includes("\\")
+  ) {
     throw new Error(`${label} must be a non-empty workspace-relative path`);
   }
-  if (value.split("/").some((part) => part === "" || part === "." || part === "..")) {
+  if (
+    value
+      .split("/")
+      .some((part) => part === "" || part === "." || part === "..")
+  ) {
     throw new Error(`${label} must be a normalized workspace-relative path`);
   }
   return value;
@@ -302,7 +431,11 @@ function revision(session: string, path: string, number: number): string {
   return `fixture:${session}:${path}:${number}`;
 }
 
-function textView(session: string, path: string, node: WorkspaceNode): WorkspaceText {
+function textView(
+  session: string,
+  path: string,
+  node: WorkspaceNode,
+): WorkspaceText {
   const text = node.text ?? "";
   return {
     path,
@@ -313,11 +446,18 @@ function textView(session: string, path: string, node: WorkspaceNode): Workspace
   };
 }
 
-function listWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry[] {
+function listWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceEntry[] {
   const [, fixture] = workspaceFor(args);
-  const path = args?.path === null || args?.path === undefined ? "" : relativePath(args.path, "path");
-  if (path && fixture.nodes[path]?.kind !== "directory") throw new Error(`workspace path '${path}' is not a directory`);
-  if (path && !fixture.nodes[path]) throw new Error(`workspace path '${path}' does not exist`);
+  const path =
+    args?.path === null || args?.path === undefined
+      ? ""
+      : relativePath(args.path, "path");
+  if (path && fixture.nodes[path]?.kind !== "directory")
+    throw new Error(`workspace path '${path}' is not a directory`);
+  if (path && !fixture.nodes[path])
+    throw new Error(`workspace path '${path}' does not exist`);
   return Object.entries(fixture.nodes)
     .filter(([entryPath]) => parentOf(entryPath) === path)
     .map(([entryPath, node]) => entryFor(entryPath, node));
@@ -326,7 +466,9 @@ function listWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntr
 /** The completion menu's source, filtered exactly as `Workspace::complete`
  *  filters it — a fixture that matched more loosely would make the menu look
  *  better here than it is. */
-function completeWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry[] {
+function completeWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceEntry[] {
   const prefix = typeof args?.prefix === "string" ? args.prefix : "";
   const cut = prefix.lastIndexOf("/");
   const directory = cut === -1 ? "" : prefix.slice(0, cut);
@@ -348,16 +490,21 @@ function presentWorkspace(args: Record<string, unknown> | undefined): string[] {
   return paths.filter((path) => Boolean(fixture.nodes[path]));
 }
 
-function readWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
+function readWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceText {
   const [session, fixture] = workspaceFor(args);
   const path = relativePath(args?.path, "path");
   const node = fixture.nodes[path];
   if (!node) throw new Error(`workspace path '${path}' does not exist`);
-  if (node.kind !== "file") throw new Error(`workspace path '${path}' is not a regular file`);
+  if (node.kind !== "file")
+    throw new Error(`workspace path '${path}' is not a regular file`);
   return textView(session, path, node);
 }
 
-function readWorkspaceBinary(args: Record<string, unknown> | undefined): WorkspaceBinary {
+function readWorkspaceBinary(
+  args: Record<string, unknown> | undefined,
+): WorkspaceBinary {
   const [, fixture] = workspaceFor(args);
   const path = relativePath(args?.path, "path");
   const node = fixture.nodes[path];
@@ -368,16 +515,21 @@ function readWorkspaceBinary(args: Record<string, unknown> | undefined): Workspa
   return { path, url: node.binary, bytes: node.binary.length };
 }
 
-function writeWorkspace(args: Record<string, unknown> | undefined): WorkspaceText {
+function writeWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceText {
   const [session, fixture] = workspaceFor(args);
   const path = relativePath(args?.path, "path");
   const text = typeof args?.text === "string" ? args.text : null;
   const expected = typeof args?.revision === "string" ? args.revision : "";
   const node = fixture.nodes[path];
-  if (!node || node.kind !== "file") throw new Error(`workspace path '${path}' is not a regular file`);
+  if (!node || node.kind !== "file")
+    throw new Error(`workspace path '${path}' is not a regular file`);
   if (text === null) throw new Error("text must be a string");
   if (expected !== revision(session, path, node.revision)) {
-    throw new Error(`revision conflict: the file changed; re-read it before writing (current revision ${revision(session, path, node.revision)})`);
+    throw new Error(
+      `revision conflict: the file changed; re-read it before writing (current revision ${revision(session, path, node.revision)})`,
+    );
   }
 
   node.text = text;
@@ -395,33 +547,53 @@ function writeWorkspace(args: Record<string, unknown> | undefined): WorkspaceTex
   return saved;
 }
 
-function createWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry {
+function createWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceEntry {
   const [, fixture] = workspaceFor(args);
-  const parent = args?.parent === null || args?.parent === undefined ? "" : relativePath(args.parent, "parent");
+  const parent =
+    args?.parent === null || args?.parent === undefined
+      ? ""
+      : relativePath(args.parent, "parent");
   const name = relativePath(args?.name, "name");
   const kind = args?.kind;
-  if (name.includes("/")) throw new Error("name must be one workspace path component");
-  if (kind !== "file" && kind !== "directory") throw new Error(`'${String(kind)}' is not a workspace entry kind`);
-  if (parent && fixture.nodes[parent]?.kind !== "directory") throw new Error(`workspace path '${parent}' is not a directory`);
-  if (parent && !fixture.nodes[parent]) throw new Error(`workspace path '${parent}' does not exist`);
+  if (name.includes("/"))
+    throw new Error("name must be one workspace path component");
+  if (kind !== "file" && kind !== "directory")
+    throw new Error(`'${String(kind)}' is not a workspace entry kind`);
+  if (parent && fixture.nodes[parent]?.kind !== "directory")
+    throw new Error(`workspace path '${parent}' is not a directory`);
+  if (parent && !fixture.nodes[parent])
+    throw new Error(`workspace path '${parent}' does not exist`);
   const path = parent ? `${parent}/${name}` : name;
-  if (fixture.nodes[path]) throw new Error(`workspace path '${path}' already exists`);
-  const node: WorkspaceNode = { kind, revision: 1, ...(kind === "file" ? { text: "" } : {}) };
+  if (fixture.nodes[path])
+    throw new Error(`workspace path '${path}' already exists`);
+  const node: WorkspaceNode = {
+    kind,
+    revision: 1,
+    ...(kind === "file" ? { text: "" } : {}),
+  };
   fixture.nodes[path] = node;
   return entryFor(path, node);
 }
 
-function renameWorkspace(args: Record<string, unknown> | undefined): WorkspaceEntry {
+function renameWorkspace(
+  args: Record<string, unknown> | undefined,
+): WorkspaceEntry {
   const [, fixture] = workspaceFor(args);
   const path = relativePath(args?.path, "path");
   const name = relativePath(args?.name, "name");
-  if (name.includes("/")) throw new Error("name must be one workspace path component");
+  if (name.includes("/"))
+    throw new Error("name must be one workspace path component");
   const node = fixture.nodes[path];
   if (!node) throw new Error(`workspace path '${path}' does not exist`);
   const renamed = parentOf(path) ? `${parentOf(path)}/${name}` : name;
-  if (fixture.nodes[renamed]) throw new Error(`workspace path '${renamed}' already exists`);
+  if (fixture.nodes[renamed])
+    throw new Error(`workspace path '${renamed}' already exists`);
 
-  const moved = Object.entries(fixture.nodes).filter(([candidate]) => candidate === path || candidate.startsWith(`${path}/`));
+  const moved = Object.entries(fixture.nodes).filter(
+    ([candidate]) => candidate === path || candidate.startsWith(`${path}/`),
+  );
   for (const [candidate] of moved) delete fixture.nodes[candidate];
   for (const [candidate, value] of moved) {
     fixture.nodes[`${renamed}${candidate.slice(path.length)}`] = value;
@@ -434,7 +606,12 @@ function deleteWorkspace(args: Record<string, unknown> | undefined): void {
   const path = relativePath(args?.path, "path");
   const node = fixture.nodes[path];
   if (!node) throw new Error(`workspace path '${path}' does not exist`);
-  if (node.kind === "directory" && Object.keys(fixture.nodes).some((candidate) => candidate.startsWith(`${path}/`))) {
+  if (
+    node.kind === "directory" &&
+    Object.keys(fixture.nodes).some((candidate) =>
+      candidate.startsWith(`${path}/`),
+    )
+  ) {
     throw new Error(`workspace directory '${path}' is not empty`);
   }
   delete fixture.nodes[path];
@@ -518,9 +695,12 @@ function base64(text: string): string {
   return btoa(binary);
 }
 
-export async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
+export async function invoke<T>(
+  command: string,
+  args?: Record<string, unknown>,
+): Promise<T> {
   switch (command) {
-    case "launchpad":
+    case "project_list":
       return PROJECTS as T;
     case "project_sessions":
       return HISTORY as T;
@@ -533,6 +713,7 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
           cwd: String(args?.path ?? "/home/teamon/code/rust/tcode"),
           name: "tcode",
           home: "/home/teamon",
+          log_id: "0193f1",
         },
         history: [],
         // A fresh folder, so the prompt is the system prompt and the tool
@@ -568,7 +749,9 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       if (!/^[A-Za-z0-9_-]+$/.test(name)) {
         // The real one refuses in `Config::upsert_preset`, and the panel is
         // supposed to keep what was typed and show why.
-        throw new Error(`'${name}' is not a usable preset name — letters, digits, '-' and '_' only`);
+        throw new Error(
+          `'${name}' is not a usable preset name — letters, digits, '-' and '_' only`,
+        );
       }
       if (!PICKER.presets.some((one) => one.key === name)) {
         PICKER.presets.push({ key: name, label: name });
@@ -581,7 +764,9 @@ export async function invoke<T>(command: string, args?: Record<string, unknown>)
       return undefined as T;
     case "shown_file": {
       const path = String(args?.path ?? "");
-      const body = SHOWN[path.slice(path.lastIndexOf(".") + 1)] ?? "no fixture for this file";
+      const body =
+        SHOWN[path.slice(path.lastIndexOf(".") + 1)] ??
+        "no fixture for this file";
       return { body, bytes: body.length, truncated: false } as T;
     }
     case "serve_url":

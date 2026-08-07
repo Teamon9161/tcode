@@ -1,5 +1,5 @@
-//! What the launchpad reads: every folder tcode has ever held a conversation
-//! in, and the conversations inside each one.
+//! What the rail reads: every folder tcode has ever held a conversation in,
+//! and the conversations inside each one.
 //!
 //! There is no registry of projects to consult — `~/.tcode/projects/<id>/` is
 //! named after a *lossy* transform of the path (`store::project_id` folds every
@@ -25,10 +25,10 @@ use tcode_core::store::{LogEvent, SessionStore};
 pub struct ProjectInfo {
     /// The folder itself, as it was recorded when the session was created.
     pub path: String,
-    /// Last path component — what the launchpad shows as the title.
+    /// Last path component — what the rail shows as the project's name.
     pub name: String,
     pub session_count: usize,
-    /// Newest session log's mtime, as unix seconds. Sorts the launchpad.
+    /// Newest session log's mtime, as unix seconds. Sorts the `Recent` band.
     pub last_active: Option<u64>,
     /// False when the recorded folder is gone (moved, deleted, unmounted).
     /// Listed anyway — a project that vanished is information, and silently
@@ -48,7 +48,7 @@ pub struct StoredSession {
 ///
 /// Best-effort throughout: a project directory that cannot be read is skipped
 /// rather than failing the whole list, because one damaged log must not empty
-/// the launchpad.
+/// the rail.
 pub fn list(home: &Path) -> Vec<ProjectInfo> {
     let projects = home.join(".tcode").join("projects");
     let Ok(entries) = fs::read_dir(&projects) else {
@@ -104,7 +104,7 @@ fn describe(dir: &Path) -> Option<ProjectInfo> {
 /// The `cwd` from a log's opening `Meta` record.
 ///
 /// Simplified on the way out: logs written before the app stripped the verbatim
-/// prefix recorded `\\?\C:\…`, and a launchpad row is the one place that string
+/// prefix recorded `\\?\C:\…`, and a project row is the one place that string
 /// would still be read by a person. The folder it names is the same one either
 /// way — `store::project_dir_in` folds the two spellings' state together — so
 /// this is display, not identity.

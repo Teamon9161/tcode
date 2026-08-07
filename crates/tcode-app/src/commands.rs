@@ -69,6 +69,11 @@ pub struct SessionInfo {
     /// round trip. Carried per session rather than fetched separately so a
     /// `SessionInfo` is enough to draw a session on its own.
     pub home: String,
+    /// The session log this conversation is writing to, when it is persisted.
+    /// The rail lists live conversations and resumable logs in one group, and
+    /// this is what stops one conversation appearing as both — a resume offered
+    /// on an already-open log would put two ledgers on one file.
+    pub log_id: Option<String>,
 }
 
 impl SessionInfo {
@@ -77,6 +82,7 @@ impl SessionInfo {
             id: handle.id.clone(),
             cwd: handle.cwd.display().to_string(),
             name: folder_name(&handle.cwd),
+            log_id: handle.log_id.clone(),
             home: tcode_core::home_dir()
                 .map(|home| home.display().to_string())
                 .unwrap_or_default(),
@@ -315,9 +321,10 @@ pub fn sessions(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SessionInfo> {
         .collect()
 }
 
-/// Every folder tcode has held a conversation in, for the launchpad.
+/// Every folder tcode has held a conversation in: the rail's `Recent` band and
+/// the folder menu's list are both this.
 #[derive(Serialize)]
-pub struct Launchpad {
+pub struct ProjectList {
     pub projects: Vec<ProjectInfo>,
     /// The backend's clock, so relative times ("2 hours ago") are computed
     /// against the same clock that produced the timestamps.
@@ -326,7 +333,7 @@ pub struct Launchpad {
     pub home: String,
 }
 
-/// Both launchpad readers scan the session store, so both are `async` with
+/// Both project readers scan the session store, so both are `async` with
 /// their work on a blocking thread. A sync command runs on the main thread
 /// (see [`send_message`] for the other half of that rule), and the main thread
 /// is the one drawing: the disclosure that opened a project used to freeze the
@@ -335,9 +342,9 @@ pub struct Launchpad {
 /// because this is file IO and the runtime it would otherwise sit on is the
 /// one carrying every running turn.
 #[tauri::command]
-pub async fn launchpad() -> Result<Launchpad, String> {
+pub async fn project_list() -> Result<ProjectList, String> {
     let home = tcode_core::home_dir().ok_or("cannot locate the home directory")?;
-    let read = move || Launchpad {
+    let read = move || ProjectList {
         projects: projects::list(&home),
         now: projects::now_unix(),
         home: home.display().to_string(),
@@ -347,9 +354,10 @@ pub async fn launchpad() -> Result<Launchpad, String> {
         .map_err(|error| format!("cannot read the project list: {error}"))
 }
 
-/// The resumable conversations inside one project. Separate from [`launchpad`]
-/// because it replays every log to build previews — affordable for the one
-/// project being opened, not for all of them on every launch.
+/// The resumable conversations inside one project. Separate from
+/// [`project_list`] because it replays every log to build previews —
+/// affordable for the one project a reader opened in the rail, not for all of
+/// them on every launch.
 #[tauri::command]
 pub async fn project_sessions(path: String) -> Result<Vec<StoredSession>, String> {
     tauri::async_runtime::spawn_blocking(move || projects::sessions(Path::new(&path)))
@@ -365,7 +373,7 @@ pub fn open_folder(
     resume: Option<String>,
 ) -> Result<OpenedSession, String> {
     // Canonicalize before anything else: the session id, the project data
-    // directory and the launchpad's grouping all key on the path, and two
+    // directory and the rail's grouping all key on the path, and two
     // spellings of one folder would otherwise become two projects.
     let cwd = crate::paths::canonical_dir(Path::new(&path))
         .map_err(|error| format!("cannot open {path}: {error}"))?;
@@ -1591,7 +1599,7 @@ pub fn picker_state(
 ) -> Result<crate::picker::PickerState, String> {
     let (mode, staged) = match supervisor.get(&session) {
         Some(handle) => handle.mode(),
-        // The launchpad has no session yet and still wants the model chip.
+        // A window with no conversation open still wants the model chip.
         None => (tcode_core::PermissionMode::default(), false),
     };
     let menus = supervisor.menus();

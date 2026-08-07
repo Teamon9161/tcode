@@ -178,6 +178,10 @@ export type SessionInfo = {
   name: string;
   /** Home directory, for rendering `~/…`. */
   home: string;
+  /** The session log this conversation appends to, when it is persisted. The
+   *  rail lists live conversations and resumable logs in one group, and this is
+   *  what stops one conversation appearing as both. */
+  log_id: string | null;
 };
 
 /** Mirrors `commands.rs::WorkspaceTextView`, including the complete-file revision. */
@@ -277,7 +281,7 @@ export type StoredSession = {
   modified: number | null;
 };
 
-export type Launchpad = {
+export type ProjectList = {
   projects: ProjectInfo[];
   /** The backend's clock, so relative times agree with the timestamps. */
   now: number;

@@ -1,55 +1,118 @@
 import type { Block } from "./blocks";
-import type { SessionInfo } from "./types";
+import type { ProjectInfo, SessionInfo, Status } from "./types";
 
 /**
- * The conversation rail, as data.
+ * The rail, as data.
  *
- * The rail was a flat list of conversations named after their folders, which is
- * fine until a folder holds two of them: then it is two identical rows, and the
- * list can account for both without saying which is which. Two facts were
- * missing, and they are different facts — *where* a conversation is, and *what it
- * is for* — so they belong to different elements. The folder becomes a heading
- * over its conversations, and each conversation is named by what it was asked to
- * do.
+ * The rail lists **projects**, and a project's live conversations are the rows
+ * under it. That is one list where there used to be two surfaces: a full-screen
+ * launchpad accounting for every folder tcode had ever worked in, and a rail
+ * accounting for the conversations open right now. The launchpad's "Open"
+ * section *was* the rail drawn a second time as cards, and the price of the
+ * duplication was a whole navigation mode — a screen you left the window to
+ * reach and came back from.
+ *
+ * So the group heading stopped meaning "a folder that happens to hold a live
+ * conversation" and became the project itself. Two bands come out of that, and
+ * they are the product's own question asked twice:
+ *
+ * - **live** — projects with a conversation open. What is running and what is
+ *   waiting for you lives here, at the top, where nothing can push it down.
+ * - **recent** — every other folder tcode has worked in, newest first. Not
+ *   state, just where you have been; capped, because a rail is a column and the
+ *   long tail belongs in the finder.
  *
  * Pure functions here, drawn by `Workspace.tsx`, for the reason `layout.ts` is
- * separate from `Panes.tsx`: grouping and ordering are decisions with right
- * answers, and a test can hold them.
+ * separate from `Panes.tsx`: grouping, ordering and matching are decisions with
+ * right answers, and a test can hold them.
  */
 
 export type RailGroup = {
   /** The folder, which is the group's identity as well as its heading. */
   path: string;
   name: string;
+  /** Open conversations in this folder. Empty for a `recent` group. */
   sessions: SessionInfo[];
+  /** What the project store knows: how many logs, and when it was last worked
+   *  in. Absent for a folder whose first conversation is open but whose logs
+   *  have not been re-scanned yet. */
+  info: ProjectInfo | null;
 };
 
+export type RailBands = {
+  live: RailGroup[];
+  recent: RailGroup[];
+  /** Recent projects the cap left out. The finder is where they are. */
+  overflow: number;
+};
+
+/** How many folders with no live conversation the rail will show. Beyond this
+ *  the column stops being scannable, which is the one thing it is for. */
+export const RECENT_CAP = 8;
+
 /**
- * Conversations under their folders, in the order the reader arranged.
+ * The rail's two bands.
  *
- * `order` holds only the folders that have been moved; everything else keeps the
- * order its first conversation arrived in. That is what makes an arrangement
- * survive opening a new folder: an unlisted project appends rather than
- * scattering the ones already placed.
+ * `order` holds only the folders that have been moved; everything else keeps
+ * the order its first conversation arrived in. That is what makes an
+ * arrangement survive opening a new folder: an unlisted project appends rather
+ * than scattering the ones already placed.
+ *
+ * `hidden` drops a folder from `recent` only. A project with a conversation
+ * open is never hidden — the rail's whole job is to account for those, and a
+ * setting made last month must not be able to swallow one.
  */
-export function railGroups(sessions: SessionInfo[], order: string[]): RailGroup[] {
-  const groups: RailGroup[] = [];
+export function railBands(
+  sessions: SessionInfo[],
+  projects: ProjectInfo[],
+  order: string[],
+  hidden: string[] = [],
+  cap: number = RECENT_CAP,
+): RailBands {
+  const known = new Map(projects.map((project) => [project.path, project]));
+  const live: RailGroup[] = [];
   const at = new Map<string, number>();
   for (const session of sessions) {
     const found = at.get(session.cwd);
     if (found !== undefined) {
-      groups[found].sessions.push(session);
+      live[found].sessions.push(session);
       continue;
     }
-    at.set(session.cwd, groups.length);
-    groups.push({ path: session.cwd, name: session.name, sessions: [session] });
+    at.set(session.cwd, live.length);
+    live.push({
+      path: session.cwd,
+      name: session.name,
+      sessions: [session],
+      info: known.get(session.cwd) ?? null,
+    });
   }
 
   const rank = (path: string) => {
     const placed = order.indexOf(path);
     return placed === -1 ? order.length + (at.get(path) ?? 0) : placed;
   };
-  return groups.sort((a, b) => rank(a.path) - rank(b.path));
+  live.sort((a, b) => rank(a.path) - rank(b.path));
+
+  const away = new Set(hidden);
+  const rest = projects
+    .filter((project) => !at.has(project.path) && !away.has(project.path))
+    .sort(
+      (a, b) =>
+        (b.last_active ?? 0) - (a.last_active ?? 0) ||
+        a.path.localeCompare(b.path),
+    )
+    .map((project) => ({
+      path: project.path,
+      name: project.name,
+      sessions: [],
+      info: project,
+    }));
+
+  return {
+    live,
+    recent: rest.slice(0, cap),
+    overflow: Math.max(0, rest.length - cap),
+  };
 }
 
 /**
@@ -60,7 +123,11 @@ export function railGroups(sessions: SessionInfo[], order: string[]): RailGroup[
  * lands next to. Storing the arrangement as it now reads is the only version of
  * this that cannot drift from what is on screen.
  */
-export function moveProject(groups: RailGroup[], path: string, to: number): string[] {
+export function moveProject(
+  groups: RailGroup[],
+  path: string,
+  to: number,
+): string[] {
   const paths = groups.map((group) => group.path);
   const from = paths.indexOf(path);
   if (from === -1 || to < 0 || to >= paths.length || to === from) return paths;
@@ -89,25 +156,87 @@ export function sessionTitle(blocks: Block[]): string | null {
   return null;
 }
 
-const KEY = "tcode.rail.order";
+/** One thing the finder can take you to. A conversation arrives already named,
+ *  captioned and statused by the rail's own rules, so the finder cannot end up
+ *  describing it differently from the row two inches to its left. */
+export type FoundSession = {
+  kind: "session";
+  session: SessionInfo;
+  title: string;
+  activity: string;
+  status: Status;
+};
 
-export function loadOrder(): string[] {
+export type Found = FoundSession | { kind: "project"; project: ProjectInfo };
+
+/**
+ * The finder's answer: open conversations first, then folders.
+ *
+ * Conversations lead because they are the ones that can be *waiting for you* —
+ * the same reason they hold the top of the rail. Folders follow, and they are
+ * every folder rather than the rail's capped band: reaching the long tail is
+ * exactly what the finder is for.
+ *
+ * Matching is a plain case-insensitive substring over the words a reader can
+ * see (a conversation's title and its folder, a project's name and its path).
+ * Not fuzzy: this list is tens of items long, and a fuzzy matcher's whole value
+ * is ranking thousands. What it buys instead is that a query which matches
+ * nothing means the thing is not there, rather than that you spelled it in a way
+ * the scorer disliked.
+ */
+export function find(
+  query: string,
+  sessions: FoundSession[],
+  projects: ProjectInfo[],
+): Found[] {
+  const needle = query.trim().toLowerCase();
+  const hits = (...fields: string[]) =>
+    !needle || fields.some((field) => field.toLowerCase().includes(needle));
+
+  const found: Found[] = sessions.filter((entry) =>
+    hits(entry.title, entry.session.name, entry.session.cwd),
+  );
+  for (const project of projects) {
+    if (hits(project.name, project.path))
+      found.push({ kind: "project", project });
+  }
+  return found;
+}
+
+/** The identity a found row is keyed and compared by. */
+export function foundKey(entry: Found): string {
+  return entry.kind === "session"
+    ? `s:${entry.session.id}`
+    : `p:${entry.project.path}`;
+}
+
+const KEY = "tcode.rail.order";
+const AWAY = "tcode.rail.hidden";
+
+function loadList(key: string): string[] {
   try {
-    const raw = window.localStorage.getItem(KEY);
+    const raw = window.localStorage.getItem(key);
     if (!raw) return [];
     const stored = JSON.parse(raw) as unknown;
     // Stored data, so it is checked rather than trusted: an entry that is not a
     // path simply does not match any folder and ranks last.
-    return Array.isArray(stored) ? stored.filter((entry): entry is string => typeof entry === "string") : [];
+    return Array.isArray(stored)
+      ? stored.filter((entry): entry is string => typeof entry === "string")
+      : [];
   } catch {
     return [];
   }
 }
 
-export function saveOrder(order: string[]): void {
+function saveList(key: string, value: string[]): void {
   try {
-    window.localStorage.setItem(KEY, JSON.stringify(order));
+    window.localStorage.setItem(key, JSON.stringify(value));
   } catch {
     // An arrangement that has to be redone next launch beats a click that fails.
   }
 }
+
+export const loadOrder = () => loadList(KEY);
+export const saveOrder = (order: string[]) => saveList(KEY, order);
+export const loadHidden = () => loadList(AWAY);
+export const saveHidden = (hidden: string[]) => saveList(AWAY, hidden);

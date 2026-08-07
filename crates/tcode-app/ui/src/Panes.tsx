@@ -1,4 +1,10 @@
-import { useCallback, useMemo, useRef, type CSSProperties, type RefObject } from "react";
+import {
+  useCallback,
+  useMemo,
+  useRef,
+  type CSSProperties,
+  type RefObject,
+} from "react";
 
 import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
 import { SessionContext, type SessionState } from "./session";
@@ -11,7 +17,14 @@ import {
   navValue,
   type Inspect,
 } from "./inspect";
-import { frames, paneSession, type Leaf, type PlacedDivider, type Rect, type Tiling } from "./layout";
+import {
+  frames,
+  paneSession,
+  type Leaf,
+  type PlacedDivider,
+  type Rect,
+  type Tiling,
+} from "./layout";
 import { linkTarget } from "./links";
 import { LinkContext, type Follow } from "./Prose";
 import { basename } from "./show";
@@ -19,8 +32,17 @@ import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
 import { StatusDot } from "./components/Status";
-import { BackIcon, CloseIcon, CollapseIcon, ColumnsIcon, ExpandIcon, FileIcon, FolderIcon, ForwardIcon, GlobeIcon, RowsIcon, TerminalIcon } from "./components/Icons";
-import { MOD } from "./keys";
+import {
+  BackIcon,
+  CloseIcon,
+  CollapseIcon,
+  ColumnsIcon,
+  ExpandIcon,
+  FileIcon,
+  FolderIcon,
+  ForwardIcon,
+  RowsIcon,
+} from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
 import { InspectView } from "./Inspector";
@@ -117,7 +139,12 @@ export type PaneContext = {
   /** Ask what going back to this point would cost; `null` withdraws the ask. */
   onAskRewind: (session: string, target: RewindTarget | null) => void;
   onRewind: (session: string, restoreFiles: boolean) => void;
-  onAnswer: (session: string, decision: Decision, comment: string, setMode?: ApprovalMode) => void;
+  onAnswer: (
+    session: string,
+    decision: Decision,
+    comment: string,
+    setMode?: ApprovalMode,
+  ) => void;
   onDecidePlan: (session: string, choice: PlanDecision) => void;
   onPlanDraft: (session: string, draft: PlanDraft) => void;
   onSavePlan: (session: string) => void;
@@ -135,10 +162,18 @@ export type PaneContext = {
  * That is what lets a conversation keep its scroll position when a panel opens
  * beside it — see `frames` in `layout.ts` for what nesting cost.
  */
-export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContext }) {
+export function Panes({
+  tiling,
+  context,
+}: {
+  tiling: Tiling;
+  context: PaneContext;
+}) {
   const field = useRef<HTMLDivElement>(null);
   const { panes, dividers } = useMemo(() => frames(tiling), [tiling]);
-  const expanded = panes.some(({ leaf }) => leaf.id === context.expanded) ? context.expanded : null;
+  const expanded = panes.some(({ leaf }) => leaf.id === context.expanded)
+    ? context.expanded
+    : null;
   if (!tiling.root) return null;
 
   return (
@@ -152,19 +187,25 @@ export function Panes({ tiling, context }: { tiling: Tiling; context: PaneContex
               className={`pane-slot${visible ? "" : " is-hidden"}`}
               style={box(visible && expanded ? WHOLE : rect)}
             >
-              <Pane leaf={leaf} context={context} expanded={expanded === leaf.id} hidden={!visible} />
+              <Pane
+                leaf={leaf}
+                context={context}
+                expanded={expanded === leaf.id}
+                hidden={!visible}
+              />
             </div>
           );
         })}
-        {!expanded && dividers.map((divider) => (
-          <Divider
-            key={divider.id}
-            divider={divider}
-            field={field}
-            onRatio={context.onRatio}
-            onRotate={context.onRotate}
-          />
-        ))}
+        {!expanded &&
+          dividers.map((divider) => (
+            <Divider
+              key={divider.id}
+              divider={divider}
+              field={field}
+              onRatio={context.onRatio}
+              onRotate={context.onRotate}
+            />
+          ))}
       </div>
     </div>
   );
@@ -408,7 +449,11 @@ function Pane({
         <SessionContext.Provider value={leaf.pane.session}>
           <LinkContext.Provider value={follow}>
             {leaf.pane.kind === "session" ? (
-              <SessionPane leaf={leaf} session={leaf.pane.session} context={context} />
+              <SessionPane
+                leaf={leaf}
+                session={leaf.pane.session}
+                context={context}
+              />
             ) : (
               <InspectPane leaf={leaf} context={context} />
             )}
@@ -419,8 +464,18 @@ function Pane({
   );
 }
 
+/**
+ * Give this pane the whole field, and give it back.
+ *
+ * Absent with one pane on screen, which is most of the time: expanding is
+ * relative to the neighbours it covers, so with no neighbours the control does
+ * nothing you can see and is just a button whose job you have to guess at.
+ * `split` goes false while a pane is expanded — that is what expanding means —
+ * so the second half of the test is what keeps the way back visible.
+ */
 function ExpandPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
   const expanded = context.expanded === leaf.id;
+  if (!context.split && !expanded) return null;
   return (
     <button
       className="icon-btn"
@@ -500,26 +555,14 @@ function SessionPane({
         >
           <FolderIcon size={14} />
         </button>
-        <button
-          className="icon-btn"
-          onClick={context.onOpenBrowser}
-          aria-label="Open or close the browser"
-          title="Open or close the browser"
-        >
-          <GlobeIcon size={14} />
-        </button>
-        {/* Beside the browser rather than in the title bar: both are the
-            window's, but this row is where the window's other surfaces are
-            reached from, and a key nobody has been told about is a feature
-            nobody finds. */}
-        <button
-          className="icon-btn"
-          onClick={context.onToggleTerminal}
-          aria-label="Open or hide the terminals"
-          title={`Terminals (${MOD}+J)`}
-        >
-          <TerminalIcon size={14} />
-        </button>
+        {/* The browser and the terminals used to be two more buttons here, on
+            the argument that this row was where the window's other surfaces
+            were reached from and the title bar had nothing discoverable in it.
+            The title bar's left now carries the rail's toggle and the finder —
+            the window's surfaces, grouped — so the argument reversed and they
+            went there. Neither belonged to a conversation anyway: there is one
+            browser and one terminal dock per window, and a split view drew two
+            buttons for each, both toggling the same single thing. */}
         <ExpandPane leaf={leaf} context={context} />
         <button
           className="icon-btn"
@@ -549,9 +592,9 @@ function SessionPane({
             request={state.approval}
             plan={state.plan}
             draft={draft}
-             onAnswer={(decision, comment, setMode) =>
-               context.onAnswer(session, decision, comment, setMode)
-             }
+            onAnswer={(decision, comment, setMode) =>
+              context.onAnswer(session, decision, comment, setMode)
+            }
             onDecidePlan={(choice) => context.onDecidePlan(session, choice)}
             onPlanDraft={(draft) => context.onPlanDraft(session, draft)}
           />
@@ -574,14 +617,18 @@ function SessionPane({
           <RewindBar
             preview={state.rewindAsk}
             busy={state.rewinding}
-            onConfirm={(restoreFiles) => context.onRewind(session, restoreFiles)}
+            onConfirm={(restoreFiles) =>
+              context.onRewind(session, restoreFiles)
+            }
             onCancel={() => context.onAskRewind(session, null)}
           />
         )}
 
         <QueueStrip
           queued={state.queued}
-          onWithdraw={(index, text) => context.onWithdrawQueued(session, index, text)}
+          onWithdraw={(index, text) =>
+            context.onWithdrawQueued(session, index, text)
+          }
           onSendNow={(turn) => context.onSendQueuedNow(session, turn)}
         />
 
@@ -595,14 +642,15 @@ function SessionPane({
 
         {state.running && <TurnStatus phase={state.activity} />}
 
-        {state.plan && !(state.approval && isPlanReview(state.approval.input)) && (
-          <ProgressStrip
-            plan={state.plan}
-            expanded={state.planOpen}
-            onToggle={() => context.onPlanOpen(session, !state.planOpen)}
-            onOpen={() => context.onOpen(leaf.id, session, { kind: "plan" })}
-          />
-        )}
+        {state.plan &&
+          !(state.approval && isPlanReview(state.approval.input)) && (
+            <ProgressStrip
+              plan={state.plan}
+              expanded={state.planOpen}
+              onToggle={() => context.onPlanOpen(session, !state.planOpen)}
+              onOpen={() => context.onOpen(leaf.id, session, { kind: "plan" })}
+            />
+          )}
 
         <Composer
           value={state.draft}
@@ -662,7 +710,10 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
     (next: Inspect) => onOpenAside(leaf.id, held, next),
     [onOpenAside, leaf.id, held],
   );
-  const mention = useCallback((path: string) => onMention(held, path), [onMention, held]);
+  const mention = useCallback(
+    (path: string) => onMention(held, path),
+    [onMention, held],
+  );
   const changeDraft = useCallback(
     (next: PlanDraft) => onPlanDraft(held, next),
     [onPlanDraft, held],

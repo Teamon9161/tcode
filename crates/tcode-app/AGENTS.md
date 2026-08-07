@@ -18,7 +18,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
-**改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 launchpad / session / approval / question / plan / split / shown / web / terminal / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
+**改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 rail / session / approval / question / plan / split / shown / web / terminal / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
 
 **开关是 `--mode` 而不是环境变量，这条是踩出来的**：原来写的是 `PREVIEW=1 vite`，那是 POSIX shell 给单条命令设环境变量的语法，在 cmd 与 PowerShell 里是**解析错误**——于是"改界面先开预览"这条规矩在 Windows 上整整一段时间根本执行不了，而失败长得像 npm 坏了。新加需要开关的 script 一律用 CLI flag。
 
@@ -271,6 +271,10 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **是 `spawn_blocking` 不是 `spawn`**：这是文件 IO，而 `spawn` 落到的那个 runtime 正是每个 turn 跑在上面的那个，占住一个 worker 几百毫秒等于让正在对话的会话陪着一起等。
 
+    第三条：**侧栏的历史是按需读的，不是随组一起读的**。`Recent` 带展开一个项目会触发一次 `project_sessions`（那是它唯一的内容），但**有活跃会话的组不会**——它的历史藏在 `Earlier · N` 那一行后面，点了才读。少了这条，开着三个文件夹启动 app 就是启动瞬间并发三次全量 replay，而那正是窗口该显得最快的时刻。
+
+23. **同一个对话在侧栏里只许出现一次**（`SessionInfo.log_id`，由 `Session::log_id()` → `SessionHandle.log_id` 一路带上来）。侧栏把"活跃会话"和"能 resume 的 log"画在同一个项目组里，而一个活跃会话**自己就在往某个 log 上写**：不去重的话它会同时是上面那行活跃对话和下面那行 resume 目标，点下面那行就是 `open_folder(path, resume=同一个 id)`——**两个 `Ledger` 挂到同一个 JSONL 上**，这不是显示问题，是写坏会话记录。所以 `openLogs` 命中的那行画成 `open` 且禁用，**不许改成隐藏**：静默漏掉今天的工作看起来就像历史丢了。webview 那侧的 session id 是 `uuid::Uuid::new_v4()`，和 store 的 id 完全是两套空间，别想着拿 id 直接比。
+
     连带一条：**picker 的 preview 不许走 `resume_path`**。`SessionStore::list` 现在用 `store.rs::preview` 逐行浅解析（`LogEvent` 是 internally tagged，反序列化一次要先把整行缓冲成一棵泛型树，等于把每条工具结果、每张贴进来的图解析两遍）。它照样是**重放**而不是扫描——`append`/`truncate_tail`/`compact` 三个操作全都实现，少一个 `/clear` 掉的对话就会复活；而"只认这三个"是安全的，因为 `Ledger` 本来就只有这三种变更（根 CLAUDE.md 的设计约束 2）。
 
 ## 现有结构
@@ -281,7 +285,7 @@ cargo build && cargo test                 # 后端 + 集成测试
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
 - `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`Launchpad.tsx`（第一屏）、`Workspace.tsx`（标题栏 + 可折叠的会话栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`browserYield.ts`（让原生浏览器窗格暂时让位的唯一计数器）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`rail.ts`（侧栏分带/排序/搜索，纯函数）、`Rail.tsx` + `RailProject.tsx`（唯一的导航面：live 带 + `Recent` 带，每个项目下挂活跃会话与按需加载的历史）、`Finder.tsx`（标题栏里的 `Mod+P`，搜活跃会话与全部文件夹）、`FolderPicker.tsx`（“在哪开新会话”的菜单体，folder chip 与侧栏 New 共用一份）、`FieldEmpty.tsx`（没有窗格时的窗格场空态）、`Workspace.tsx`（标题栏 + 可折叠的侧栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`browserYield.ts`（让原生浏览器窗格暂时让位的唯一计数器）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`rail` 场景是没有窗格的窗口——侧栏满着、窗格场空着，也是看合并后侧栏的地方；`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
   - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 用量环 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
   - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。

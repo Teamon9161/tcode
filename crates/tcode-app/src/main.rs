@@ -93,7 +93,7 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::rewind_targets,
             tcode_app::commands::rewind_preview,
             tcode_app::commands::rewind,
-            tcode_app::commands::launchpad,
+            tcode_app::commands::project_list,
             tcode_app::commands::project_sessions,
             tcode_app::commands::open_folder,
             tcode_app::commands::close_session,

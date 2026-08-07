@@ -3,31 +3,12 @@
 
 /* ============================================================ shells */
 
-.launchpad {
-  display: grid;
-  grid-template-rows: auto minmax(0, 1fr);
-  height: 100%;
-}
-
-.launchpad-scroll {
-  overflow-y: auto;
-}
-
-.launchpad-inner {
-  max-width: 860px;
-  margin: 0 auto;
-  padding: var(--s-7) var(--s-5) var(--s-8);
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-7);
-}
-
 /* The window is a sheet of `--chrome` with panes laid on it. The app toolbar
    spans every column; the platform caption above it owns minimize, maximize,
    and close so a native child webview cannot intercept those controls. */
 .workspace {
   display: grid;
-  grid-template-columns: 196px minmax(0, 1fr);
+  grid-template-columns: var(--rail-w) minmax(0, 1fr);
   grid-template-rows: auto minmax(0, 1fr);
   height: 100%;
   overflow: hidden;
@@ -58,6 +39,89 @@
   min-width: 0;
   min-height: 0;
   padding: calc(var(--gutter) / 2);
+}
+
+/* The field with no pane in it. A state of the field rather than a screen of
+   its own — the rail beside it is unchanged, which is the whole reason the
+   launchpad it replaced could go. It stays on the window's chrome and draws no
+   sheet: there is no pane here, and a card in the middle of an empty window is a
+   splash screen. */
+.field-empty {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--s-6);
+  overflow-y: auto;
+}
+
+/* Left, not centred: it starts on the axis every pane starts on. `--measure` is
+   that axis, read rather than repeated as a number. */
+.field-empty-inner {
+  max-width: var(--measure);
+}
+
+.field-empty h1 {
+  margin: 0 0 var(--s-2);
+  color: var(--ink);
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--tracking-tight);
+}
+
+.field-empty p {
+  margin: 0;
+  max-width: 60ch;
+  color: var(--body);
+  font-size: var(--text-sm);
+  text-wrap: pretty;
+}
+.field-empty p b {
+  color: var(--ink);
+  font-weight: var(--weight-medium);
+}
+
+/* The shortcuts, here for the reason DESIGN.md gives: this is the one screen
+   with room and the one moment nobody is mid-task, and a shortcut nothing ever
+   mentions is a shortcut nobody uses. A two-column list rather than a table —
+   there is no header worth drawing over two columns this short. */
+.keymap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-2);
+  margin: var(--s-6) 0 0;
+}
+
+.keymap-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-3);
+}
+
+.keymap dt {
+  display: flex;
+  gap: var(--s-1);
+  flex: none;
+  width: 11rem;
+}
+
+.keymap dd {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+/* The key vocabulary the composer's send glyph and the finder's hint already
+   use: mono, quiet, no plate. A drawn keycap would be the loudest object on an
+   otherwise empty screen. */
+.keymap kbd {
+  padding: 1px var(--s-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--sunken);
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
 }
 
 /* Every pane is positioned against this one box, so no pane is ever nested
@@ -296,10 +360,10 @@ body.is-resizing {
    the composer: never squeezed, and its own list scrolls rather than pushing the
    conversation off the top. The ceiling is a percentage of the *pane*, not of the
    viewport — a `vh` here would ignore that a pane is a fraction of the window. */
-  .pane-body.is-stage > .progress-strip,
-  .pane-body.is-stage > .queue-strip,
-  .pane-body.is-stage > .resume-strip,
-  .pane-body.is-stage > .rewind-bar {
+.pane-body.is-stage > .progress-strip,
+.pane-body.is-stage > .queue-strip,
+.pane-body.is-stage > .resume-strip,
+.pane-body.is-stage > .rewind-bar {
   flex: 0 1 auto;
   min-height: 0;
   max-height: 40%;
@@ -645,16 +709,34 @@ body.is-resizing {
    its labels — knowing which conversations exist matters more than reading
    their names. Nothing shrinks; things are chosen. */
 @media (max-width: 900px) {
+  /* Reassigns the token rather than the grid, so the finder in the title bar
+     narrows with the column it sits over instead of hanging off its edge. */
   .workspace {
-    grid-template-columns: 52px minmax(0, 1fr);
+    --rail-w: 52px;
   }
   .rail-lines,
   .rail-close,
   .rail-project-name,
-  .rail-project-tools,
+  .rail-more,
   .rail-count,
-  .rail-needs {
+  .rail-when,
+  .rail-band,
+  .rail-note,
+  .rail-earlier,
+  .rail-stored,
+  .rail-add,
+  .rail-find-label,
+  .rail-find-key,
+  .rail-start span {
     display: none;
+  }
+  /* `New` keeps its place in the column as a bare glyph: it is the one act the
+     rail offers, not the first thing to drop when the column narrows. */
+  .rail-find {
+    width: auto;
+  }
+  .rail-start {
+    justify-content: center;
   }
   /* The grouping survives as the gap between clusters of dots; there is no room
      for the folder's name, and a truncated one would be worse than none. */
@@ -774,8 +856,10 @@ body.is-resizing {
   font-size: var(--text-sm);
   font-weight: var(--weight-medium);
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease),
-    border-color var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition:
+    background var(--dur-fast) var(--ease),
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 
 .btn-primary {
@@ -856,7 +940,9 @@ body.is-resizing {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition:
+    background var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 .icon-btn:hover {
   background: var(--hover);
@@ -937,212 +1023,68 @@ body.is-resizing {
   color: var(--danger-text);
 }
 
-/* ============================================================ sections */
+/* ============================================================ rail */
 
-.section {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-3);
-}
-
-/* Sentence case, ink, at reading size. An uppercase tracked micro-label above
-   every section is the reflex; it also makes the two sections here look like
-   the same block twice. */
-.section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s-3);
-}
-
-.section-title {
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-tight);
-  color: var(--ink);
-}
-
-/* ============================================================ cards */
-
-.cards {
+/* The rail is the only navigation surface the app has, so it scrolls in one
+   place and keeps `New` out of that scroll: starting a conversation is what you
+   reach for when the list is long, which is exactly when scrolling would have
+   carried the control off the top. */
+.rail {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(212px, 1fr));
-  gap: var(--s-3);
+  grid-template-rows: auto minmax(0, 1fr);
+  min-height: 0;
+  background: var(--chrome);
 }
 
-.card {
+.rail-head {
+  padding: var(--s-2) var(--s-2) var(--s-1);
+}
+
+.rail-scroll {
   display: flex;
   flex-direction: column;
-  align-items: flex-start;
   gap: var(--s-1);
-  padding: var(--s-3) var(--s-4) var(--s-3);
-  min-width: 0;
-  text-align: left;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: var(--r-md);
-  cursor: pointer;
-  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
-    transform var(--dur) var(--ease);
+  min-height: 0;
+  padding: var(--s-1) var(--s-2) var(--s-3);
+  overflow-y: auto;
 }
-.card:hover {
+
+/* Sits in the title bar beside the fold toggle, not in the rail: finding a
+   conversation is the way back to one, so it must survive the rail being put
+   away. Shaped like the field it opens and inset like one (`--sunken` is what
+   "you type into this" looks like everywhere here), but it is a button — the
+   query lives in the popover, and a second field would be a second place to type
+   the same thing. It does not stretch: the bar's remaining width is the window's
+   drag region, and a control that eats it leaves nowhere to grab. */
+.rail-find {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex: none;
+  /* Ends exactly on the rail's right edge: the bar's own left inset, the fold
+     toggle beside it and the gap between are what this subtracts, so the two
+     columns share one seam instead of missing it by two pixels. */
+  width: calc(var(--rail-w) - var(--s-2) - 26px - var(--s-2));
+  min-width: 6rem;
+  padding: var(--s-1) var(--s-2);
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
+}
+.rail-find:hover {
   border-color: var(--line-strong);
-  box-shadow: var(--shadow-rest);
-  transform: translateY(-1px);
-}
-.card:active {
-  transform: translateY(0);
-}
-
-.card-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s-2);
-  width: 100%;
-}
-
-.card-title {
-  min-width: 0;
   color: var(--ink);
-  font-size: var(--text-md);
-  font-weight: var(--weight-semibold);
-  letter-spacing: var(--tracking-tight);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
 }
 
-.card-line,
-.card-path {
-  max-width: 100%;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.card-path {
-  color: var(--faint);
-  font-family: var(--font-mono);
-  font-size: var(--text-2xs);
-}
-/* The live line sits last and gets a rule above it: it is the one part of the
-   card that changes while you watch. */
-.card-line {
-  width: 100%;
-  margin-top: var(--s-2);
-  padding-top: var(--s-2);
-  border-top: 1px solid var(--line);
-  color: var(--body);
-  font-size: var(--text-xs);
-}
-
-/* ============================================================ rows */
-
-.rows {
-  list-style: none;
-  margin: 0;
-  padding: 0;
-  border-top: 1px solid var(--line);
-}
-
-.row-group {
-  border-bottom: 1px solid var(--line);
-}
-
-.row {
-  display: grid;
-  grid-template-columns: auto minmax(90px, auto) minmax(0, 1fr) auto;
-  align-items: center;
-  gap: var(--s-4);
-  width: 100%;
-  padding: var(--s-3);
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  text-align: left;
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease);
-}
-.row:hover {
-  background: var(--hover);
-}
-/* An open row stays marked without the pointer on it: hover is not state. */
-.row-group.is-expanded > .row {
-  background: var(--sunken);
-}
-.row-group.is-expanded > .row .row-chevron {
-  color: var(--muted);
-}
-
-.row-chevron {
-  display: flex;
-  color: var(--faint);
-  margin-right: calc(var(--s-2) * -1);
-}
-.row:hover .row-chevron {
-  color: var(--muted);
-}
-
-.row-name {
-  color: var(--ink);
-  font-size: var(--text-sm);
-  font-weight: var(--weight-medium);
-}
-
-.row-path {
-  min-width: 0;
-  color: var(--muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.row-meta {
-  color: var(--faint);
-  font-size: var(--text-xs);
-  white-space: nowrap;
-}
-
-.row-dot {
-  margin: 0 var(--s-1);
-}
-
-.row-gone {
-  color: var(--danger-text);
-}
-
-.row-history {
-  display: flex;
-  flex-direction: column;
-  padding: 0 var(--s-3) var(--s-3) var(--s-6);
-}
-
-.history-item {
-  display: flex;
-  align-items: center;
-  gap: var(--s-2);
-  padding: var(--s-2) var(--s-3);
-  border: 0;
-  border-radius: var(--r-sm);
-  background: transparent;
-  color: var(--body);
-  font-size: var(--text-xs);
-  text-align: left;
-  cursor: pointer;
-  transition: background var(--dur-fast) var(--ease);
-}
-.history-item:hover:not(:disabled) {
-  background: var(--sunken);
-}
-
-.history-new {
-  color: var(--brand-text);
-  font-weight: var(--weight-medium);
-}
-
-.history-preview {
+.rail-find-label {
   flex: 1;
   min-width: 0;
   white-space: nowrap;
@@ -1150,89 +1092,97 @@ body.is-resizing {
   text-overflow: ellipsis;
 }
 
-.history-time {
+/* The key is the control; the button is the mouse's way to the same place. It
+   is `--faint` because it is a reminder rather than a label — the row reads
+   without it. */
+.rail-find-key {
+  flex: none;
   color: var(--faint);
+  font-family: var(--font-mono);
   font-size: var(--text-2xs);
-  white-space: nowrap;
 }
 
-.history-note {
-  padding: var(--s-2) var(--s-3);
+/* A full-width row rather than a chip beside something: it is the head of the
+   list it adds to, so it takes the list's width.
+
+   Not filled. It was ink-filled first, on the argument that it is the one
+   action here — and a solid black bar across the top of an achromatic column
+   was the loudest object in the window, for a control nobody has to be told
+   about. This rail is scanned for what is *running*; the palette rule is that
+   emphasis goes to state, and a permanent control is never state. So it reads
+   like the rows below it and separates itself by weight and by the tone step
+   under it, not by inverting. */
+.rail-start {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-align: left;
+  cursor: pointer;
+  transition: background var(--dur-fast) var(--ease);
+}
+.rail-start:hover {
+  background: var(--hover);
+}
+/* The plus is the mark that makes this row an action at a glance; it carries
+   the accent so the label does not have to raise its voice to do the same job. */
+.rail-start svg {
+  color: var(--brand);
+}
+
+/* Names the band below it. The band above has no heading, because what its
+   folders have in common — a conversation open in them — is already said by a
+   status dot on every row; naming both would be two labels where one carries
+   information. */
+.rail-band {
+  margin: var(--s-3) 0 var(--s-1);
+  padding: 0 var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+/* Everything the rail says in a sentence rather than a row: a folder it could
+   not read, a rail with nothing in it yet, the count the cap left out. */
+.rail-note {
+  margin: 0;
+  padding: var(--s-2);
   color: var(--faint);
   font-size: var(--text-xs);
-}
-
-/* ============================================================ empty & skeleton */
-
-.empty {
-  display: flex;
-  flex-direction: column;
-  align-items: flex-start;
-  gap: var(--s-3);
-  padding: var(--s-6);
-  background: var(--chrome);
-  border-radius: var(--r-lg);
-}
-.empty h3 {
-  font-size: var(--text-md);
-}
-.empty p {
-  max-width: 52ch;
-  color: var(--body);
-  font-size: var(--text-sm);
   text-wrap: pretty;
 }
-
-.skeleton {
-  height: 10px;
-  border-radius: var(--r-pill);
-  background: var(--sunken);
-  animation: shimmer 1.4s var(--ease) infinite;
+.rail-note b {
+  color: var(--muted);
+  font-weight: var(--weight-medium);
 }
-.row-skeleton {
-  display: grid;
-  grid-template-columns: 90px minmax(0, 1fr) 80px;
-  cursor: default;
-  gap: var(--s-4);
-  align-items: center;
-  padding: var(--s-4) var(--s-3);
-}
-.skeleton-path {
-  width: 60%;
-}
-
-@keyframes shimmer {
-  50% {
-    opacity: 0.45;
-  }
-}
-
-@media (prefers-reduced-motion: reduce) {
-  .skeleton {
-    opacity: 0.7;
-  }
-}
-
-.inline-error {
-  padding: var(--s-3) var(--s-4);
-  border-radius: var(--r-sm);
-  background: var(--danger-wash);
-  color: var(--danger-text);
-  font-size: var(--text-sm);
-}
-
-/* ============================================================ rail */
-
-.rail {
-  display: flex;
-  flex-direction: column;
-  gap: var(--s-1);
-  min-height: 0;
+/* Lifts the cap. A row rather than a link in a sentence, because it is the last
+   item of the list it extends and lines up with the folders above it. */
+.rail-more-row {
+  width: 100%;
   padding: var(--s-2);
-  background: var(--chrome);
-  overflow-y: auto;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition:
+    color var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease);
 }
-
+.rail-more-row:hover {
+  background: var(--hover);
+  color: var(--ink);
+}
 
 .rail-list {
   list-style: none;
@@ -1325,18 +1275,92 @@ body.is-resizing {
   font-size: var(--text-2xs);
 }
 
-/* Reordering, in the vocabulary the plan editor already uses for it: hidden
-   until the row is pointed at or holds focus, because two arrows beside every
-   heading would compete with the headings themselves. */
-.rail-project-tools {
-  display: flex;
+/* When you were last in this folder — the only fact a project with nothing open
+   has, and the one its band is sorted by. It sits where the live band's count
+   sits, so the two bands have one right edge. */
+.rail-when {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+/* Except when what it has to say is that the folder is gone. That is not
+   metadata about how long ago you were there — it is the reason every control
+   on the row is disabled, so it takes the tone the rest of the app uses for a
+   thing that failed rather than the one it uses for a timestamp. */
+.rail-when.is-gone {
+  color: var(--danger-text);
+}
+
+/* A folder that is gone is still listed — dropping it silently looks identical
+   to a bug in the scan — so it is marked rather than removed, and every control
+   that would open it is disabled. */
+.rail-project-name.is-gone {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--line-strong);
+}
+
+/* Everything else this project can do, behind one control. It used to be two
+   arrow buttons appearing on hover; moving a folder is something you do once and
+   rely on for weeks, and it was taking permanent width in the one list that has
+   none to spare. Hidden until pointed at or focused, and held open while its own
+   menu is — a control that vanishes under the menu it opened is a control that
+   looks like it closed something. */
+.rail-add,
+.rail-more {
   flex: none;
   opacity: 0;
   transition: opacity var(--dur-fast) var(--ease);
 }
-.rail-project:hover .rail-project-tools,
-.rail-project:focus-within .rail-project-tools {
+.rail-project:hover .rail-add,
+.rail-project:hover .rail-more,
+.rail-project:focus-within .rail-add,
+.rail-project:focus-within .rail-more,
+.rail-more[aria-expanded="true"] {
   opacity: 1;
+}
+
+/* The project menu. One column of plain rows on the shared popover frame — the
+   same shape the display menu uses, because they are the same kind of thing: a
+   short list of acts, each answered by a click. */
+.pmenu {
+  left: var(--seat-left, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: max-content;
+  min-width: 11rem;
+  padding: var(--s-1);
+}
+.pmenu button {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-4);
+  width: 100%;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+}
+.pmenu button:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--ink);
+}
+/* Restated colours rather than dropped opacity, the rule the buttons follow:
+   a row at 40% shows the surface through it and reads as mud. */
+.pmenu button:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+.pmenu kbd {
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
 }
 
 .rail-new-failure {
@@ -1445,6 +1469,80 @@ body.is-resizing {
   color: var(--danger-text);
 }
 
+/* The three rows inside a group that are not conversations. They share one
+   shape with `.rail-item` — same inset, same radius, same hover — because they
+   sit in the same column and a second row geometry two pixels off is the kind of
+   raggedness one row shape exists to remove. What separates them is tone and
+   size: a conversation is `--body` at `--text-sm`, and none of these is a
+   conversation. */
+.rail-earlier,
+.rail-stored {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: transparent;
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  text-align: left;
+  cursor: pointer;
+  transition: color var(--dur-fast) var(--ease);
+}
+.rail-earlier:hover,
+.rail-stored:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+/* Loading the history costs a replay of every log in the project, so the row
+   says how many before the click rather than after it. */
+.rail-earlier {
+  justify-content: space-between;
+  color: var(--muted);
+}
+.rail-earlier:hover {
+  color: var(--ink);
+}
+.rail-earlier-count {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+}
+
+/* A conversation you can go back to. No status dot, because nothing is
+   happening in it — that empty gutter is the difference between this row and the
+   live one above it, and it is the whole distinction the group has to draw. */
+.rail-stored {
+  justify-content: space-between;
+  color: var(--muted);
+}
+.rail-stored:hover:not(:disabled) {
+  color: var(--ink);
+}
+/* The log this session is already writing to. Disabled rather than hidden: a
+   history that silently omits today's work reads as history that was lost, and
+   resuming it would put a second ledger on one file. */
+.rail-stored:disabled {
+  color: var(--faint);
+  cursor: default;
+}
+.rail-stored-preview {
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.rail-stored-time {
+  flex: none;
+  color: var(--faint);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+
 /* ============================================================ transcript */
 
 /* No `scroll-behavior: smooth`. The only thing that scrolls this programmatically
@@ -1528,7 +1626,9 @@ body.is-resizing {
   font-size: var(--text-2xs);
   cursor: pointer;
   opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 .msg-turn:hover .msg-rewind,
 .msg-rewind:focus-visible {
@@ -2021,7 +2121,9 @@ body.is-resizing {
   text-align: left;
   /* Slow enough that a running group settling to idle reads as the step
      finishing; hover is the same property and is not worth a second rule. */
-  transition: background var(--dur-slow) var(--ease), color var(--dur-fast) var(--ease);
+  transition:
+    background var(--dur-slow) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 .trace-head:hover,
 .trace-head:focus-visible,
@@ -2201,7 +2303,9 @@ body.is-resizing {
   color: var(--faint);
   cursor: pointer;
   opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease),
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    background var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
 }
 .tool:hover .tool-expand,
@@ -3561,6 +3665,125 @@ body.is-resizing {
   text-wrap: pretty;
 }
 
+/* ---- find ------------------------------------------------------------------
+
+   The finder: three bands on the shared frame, the shape the model panel
+   established for a popover that is more than one list of answers — a chrome
+   band holding the field, and the content surface scrolling under it. Wider than
+   the folder menu because its rows carry two facts (what a thing is, and where),
+   and taller because it is the surface the whole tail of the project list lives
+   in. Anchored under the rail's own control rather than centred over the window:
+   a modal here would cover the conversations the window is holding, which is the
+   same argument that keeps the approval dock out of one. */
+.finder {
+  left: var(--seat-left, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: min(26rem, calc(100vw - var(--s-6)));
+  max-height: min(28rem, calc(var(--seat-below, 100vh) - var(--s-4)));
+}
+
+/* Chrome, like the model panel's switch band: the tone step against the list
+   below is the only separator, which is the same boundary the window draws
+   against a pane. */
+.finder-field {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex: none;
+  padding: var(--s-2) var(--s-3);
+  background: var(--chrome);
+  color: var(--muted);
+}
+.finder-field input {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--text-sm);
+}
+.finder-field input:focus {
+  outline: none;
+}
+.finder-field input::placeholder {
+  color: var(--muted);
+}
+
+.finder-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--s-1);
+}
+
+.finder-item {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  width: 100%;
+  min-width: 0;
+  padding: var(--s-2);
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  text-align: left;
+  cursor: pointer;
+}
+/* One mark for "this is the one Enter takes", moved by the arrows *and* by the
+   pointer. Two highlights — a hover tint and a separate keyboard cursor — is a
+   list that appears to have two selections. */
+.finder-item.is-marked {
+  background: var(--hover);
+}
+
+/* Holds the dot's column open on a folder row, so both kinds of result put
+   their names on one left edge. */
+.finder-gutter {
+  flex: none;
+  width: 8px;
+}
+
+.finder-lines {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 1px;
+}
+.finder-name {
+  min-width: 0;
+  color: var(--ink);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.finder-sub {
+  min-width: 0;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A path is machine text wherever it appears (`Path` sets the family); a
+   conversation's caption is ours, and stays in the interface face. */
+.finder-dot {
+  margin: 0 var(--s-1);
+}
+
+/* Says what picking a folder does, because it is the half of this list that
+   could be misread as going back to something. Conversations need no verb —
+   "show the one that is already open" is what a list of open things means. */
+.finder-verb {
+  flex: none;
+  padding: 0 var(--s-1);
+  border-radius: var(--r-xs);
+  background: var(--sunken);
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
 /* ---- what this window shows ------------------------------------------------
 
    The display switches, dropped out of the title bar. Same seat and same frame as
@@ -4668,7 +4891,12 @@ body.is-resizing {
 
 .artifact-loading {
   height: 2px;
-  background: linear-gradient(90deg, transparent, var(--brand-wash), transparent);
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--brand-wash),
+    transparent
+  );
   animation: artifact-pulse 1.2s var(--ease) infinite;
 }
 
@@ -5142,7 +5370,9 @@ body.is-resizing {
   color: var(--faint);
   cursor: pointer;
   opacity: 0;
-  transition: opacity var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+  transition:
+    opacity var(--dur-fast) var(--ease),
+    color var(--dur-fast) var(--ease);
 }
 .queue-item:hover .queue-drop,
 .queue-drop:focus-visible {

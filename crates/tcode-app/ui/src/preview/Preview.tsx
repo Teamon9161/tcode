@@ -7,6 +7,7 @@ import type { Pasted } from "../paste";
 import { BLANK, LimitsContext, type SessionState } from "../session";
 import { NO_METER, type Limits, type Meter } from "../usage";
 import {
+  EMPTY,
   openAside,
   openInspect,
   openWeb,
@@ -20,7 +21,6 @@ import { ToolMetaProvider, type ToolMeta } from "../toolViews";
 import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import type { RewindTarget } from "../rewind";
 import { draftOf, type Plan, type PlanComment } from "../plan";
-import { Launchpad } from "../Launchpad";
 import { Workspace } from "../Workspace";
 
 /**
@@ -37,13 +37,33 @@ import { Workspace } from "../Workspace";
 const HOME = "/home/teamon";
 const ROOT = "/home/teamon/code/rust/tcode";
 
+/** `a`'s log is the first entry in `mock-core`'s history on purpose: it is the
+ *  one state the merged rail had to get right — a conversation that is open
+ *  *and* has a log on disk must appear once, not as a live row plus a resume
+ *  target that would put a second ledger on the same file. */
 const SESSIONS: SessionInfo[] = [
-  { id: "a", cwd: ROOT, name: "tcode", home: HOME },
-  { id: "b", cwd: "/home/teamon/code/py/duck_ext", name: "duck_ext", home: HOME },
-  { id: "c", cwd: "/home/teamon/code/rust/pybond", name: "pybond", home: HOME },
+  { id: "a", cwd: ROOT, name: "tcode", home: HOME, log_id: "0193f0" },
+  {
+    id: "b",
+    cwd: "/home/teamon/code/py/duck_ext",
+    name: "duck_ext",
+    home: HOME,
+    log_id: "0193d2",
+  },
+  {
+    id: "c",
+    cwd: "/home/teamon/code/rust/pybond",
+    name: "pybond",
+    home: HOME,
+    log_id: null,
+  },
 ];
 
-const STATUS: Record<string, Status> = { a: "running", b: "waiting", c: "idle" };
+const STATUS: Record<string, Status> = {
+  a: "running",
+  b: "waiting",
+  c: "idle",
+};
 
 /**
  * The usage strip's world. Deliberately the states worth looking at rather than
@@ -79,7 +99,7 @@ const LIMITS: Limits = {
 };
 
 /**
- * What each conversation is doing, for the launchpad card *and* the rail row.
+ * What each conversation is doing, for the rail row and the finder.
  *
  * One map for both, because it is one fact. The rail needs it for the case the
  * fixture is built around: two of these are the same folder name away from being
@@ -103,19 +123,73 @@ const TOOL_META = new Map<string, ToolMeta>(
     [
       // `display_name` is core's own (`Tool::display_name`), so these are the
       // real answers and not prettier ones: `shell` really does show as "Run".
-      { name: "read", display_name: "Read", route: "transcript", quiet_output: true, hide_success_result: false },
-      { name: "edit", display_name: "Edit", route: "transcript", quiet_output: false, hide_success_result: true },
-      { name: "write", display_name: "Write", route: "transcript", quiet_output: false, hide_success_result: true },
-      { name: "shell", display_name: "Run", route: "transcript", quiet_output: false, hide_success_result: false },
-      { name: "grep", display_name: "Search", route: "transcript", quiet_output: true, hide_success_result: false },
-      { name: "agent", display_name: "Agent", route: "transcript", quiet_output: false, hide_success_result: false },
-      { name: "skill", display_name: "Skill", route: "transcript", quiet_output: false, hide_success_result: false },
+      {
+        name: "read",
+        display_name: "Read",
+        route: "transcript",
+        quiet_output: true,
+        hide_success_result: false,
+      },
+      {
+        name: "edit",
+        display_name: "Edit",
+        route: "transcript",
+        quiet_output: false,
+        hide_success_result: true,
+      },
+      {
+        name: "write",
+        display_name: "Write",
+        route: "transcript",
+        quiet_output: false,
+        hide_success_result: true,
+      },
+      {
+        name: "shell",
+        display_name: "Run",
+        route: "transcript",
+        quiet_output: false,
+        hide_success_result: false,
+      },
+      {
+        name: "grep",
+        display_name: "Search",
+        route: "transcript",
+        quiet_output: true,
+        hide_success_result: false,
+      },
+      {
+        name: "agent",
+        display_name: "Agent",
+        route: "transcript",
+        quiet_output: false,
+        hide_success_result: false,
+      },
+      {
+        name: "skill",
+        display_name: "Skill",
+        route: "transcript",
+        quiet_output: false,
+        hide_success_result: false,
+      },
       // Every field here is what the backend really derives for `ShowTool`, not
       // a plausible-looking set: `quiet_output` follows from its
       // `BatchPolicy::ParallelReadOnly`, and `hide_success_result` is false
       // because `BODY_IS_THE_RESULT` lists only the four editing tools.
-      { name: "show", display_name: "Show", route: "transcript", quiet_output: true, hide_success_result: false },
-      { name: "progress", display_name: "Progress", route: "progress", quiet_output: false, hide_success_result: false },
+      {
+        name: "show",
+        display_name: "Show",
+        route: "transcript",
+        quiet_output: true,
+        hide_success_result: false,
+      },
+      {
+        name: "progress",
+        display_name: "Progress",
+        route: "progress",
+        quiet_output: false,
+        hide_success_result: false,
+      },
       // The retired name a resumed session still holds, aliased onto the live
       // tool exactly as `RETIRED_NAMES` in `commands.rs` does it. In the fixture
       // for the same reason it is in the backend: without it this scene showed a
@@ -208,8 +282,14 @@ const BLOCKS: Block[] = [
     input: {
       phases: [
         { phase: "Phase 1 — locate the inline sleep", status: "completed" },
-        { phase: "Phase 2 — thread an injectable clock", status: "in_progress" },
-        { phase: "Phase 3 — cover the retry path with a test", status: "pending" },
+        {
+          phase: "Phase 2 — thread an injectable clock",
+          status: "in_progress",
+        },
+        {
+          phase: "Phase 3 — cover the retry path with a test",
+          status: "pending",
+        },
       ],
     },
     result: { preview: "progress updated", content: "", isError: false },
@@ -297,11 +377,14 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
     input: {
       file_path: `${ROOT}/crates/tcode-app/tests/bridge.rs`,
       old_string: "    let first_request = collector",
-      new_string: "    let first_request = collector\n        .wait_for(APPROVAL_REQUEST, |payload| payload[\"session\"] == \"s1\")",
+      new_string:
+        '    let first_request = collector\n        .wait_for(APPROVAL_REQUEST, |payload| payload["session"] == "s1")',
     },
     result: {
-      preview: "target_line 696 does not contain an exact old_string occurrence",
-      content: "target_line 696 does not contain an exact old_string occurrence",
+      preview:
+        "target_line 696 does not contain an exact old_string occurrence",
+      content:
+        "target_line 696 does not contain an exact old_string occurrence",
       isError: true,
     },
   },
@@ -318,7 +401,11 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
         name: "read",
         summary: "crates/tcode-core/src/session.rs",
         input: { file_path: `${ROOT}/crates/tcode-core/src/session.rs` },
-        result: { preview: "212 lines", content: "pub struct Session { /* … */ }", isError: false },
+        result: {
+          preview: "212 lines",
+          content: "pub struct Session { /* … */ }",
+          isError: false,
+        },
       },
       {
         kind: "tool",
@@ -326,7 +413,11 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
         name: "read",
         summary: "crates/tcode-core/src/provider.rs",
         input: { file_path: `${ROOT}/crates/tcode-core/src/provider.rs` },
-        result: { preview: "398 lines", content: "pub trait Provider { /* … */ }", isError: false },
+        result: {
+          preview: "398 lines",
+          content: "pub trait Provider { /* … */ }",
+          isError: false,
+        },
       },
       {
         kind: "tool",
@@ -334,7 +425,11 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
         name: "read",
         summary: "crates/tcode-core/src/types.rs",
         input: { file_path: `${ROOT}/crates/tcode-core/src/types.rs` },
-        result: { preview: "94 lines", content: "pub enum ContentBlock { /* … */ }", isError: false },
+        result: {
+          preview: "94 lines",
+          content: "pub enum ContentBlock { /* … */ }",
+          isError: false,
+        },
       },
     ],
   },
@@ -349,10 +444,15 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
     callId: "s1",
     name: "show",
     summary: "out/carry.html",
-    input: { path: "/home/teamon/code/py/duck_ext/out/carry.html", label: "Carry report" },
+    input: {
+      path: "/home/teamon/code/py/duck_ext/out/carry.html",
+      label: "Carry report",
+    },
     result: {
-      preview: "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
-      content: "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
+      preview:
+        "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
+      content:
+        "shown: /home/teamon/code/py/duck_ext/out/carry.html (html, 4.1 KB)",
       isError: false,
     },
   },
@@ -364,7 +464,11 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
     name: "skill",
     summary: "skill",
     input: { name: "impeccable", arguments: "audit the trace column" },
-    result: { preview: "# Skill: impeccable", content: "# Skill: impeccable\n\n…", isError: false },
+    result: {
+      preview: "# Skill: impeccable",
+      content: "# Skill: impeccable\n\n…",
+      isError: false,
+    },
   },
   // A delegating call and its run, paired by `parent_call` the way the wire pairs
   // them. Both are here because the transcript's job is to draw them as one step:
@@ -375,7 +479,10 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
     callId: "a1",
     name: "agent",
     summary: "agent(explore)",
-    input: { agent: "explore", prompt: "Search the workspace for direct calls to sleep." },
+    input: {
+      agent: "explore",
+      prompt: "Search the workspace for direct calls to sleep.",
+    },
   },
   {
     kind: "run",
@@ -389,7 +496,10 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
       parentCall: "a1",
     },
     blocks: [
-      { kind: "assistant", text: "Searching for direct sleeps outside test modules." },
+      {
+        kind: "assistant",
+        text: "Searching for direct sleeps outside test modules.",
+      },
       {
         kind: "tool",
         callId: "r1t1",
@@ -419,7 +529,8 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
       kind: "general",
       model: "claude-sonnet-5",
       summary: "Draft the Sleeper trait and its test double",
-      prompt: "Write a Sleeper trait with a real and an instant implementation.",
+      prompt:
+        "Write a Sleeper trait with a real and an instant implementation.",
       parentCall: "a2",
       // The real wire value (`TaskRunStatus::Done`). It said "ok" here, which no
       // status has ever been — so the transcript's `status === "ok"` test looked
@@ -449,7 +560,9 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
       status: "interrupted",
       toolCalls: 2,
     },
-    blocks: [{ kind: "assistant", text: "Found two so far — the step deadline and…" }],
+    blocks: [
+      { kind: "assistant", text: "Found two so far — the step deadline and…" },
+    ],
   },
   { kind: "note", text: "retrying (1/3): connection reset by peer" },
   // A folded harness note, in the shape core actually emits it: headline first,
@@ -524,8 +637,10 @@ const APPROVAL: ApprovalRequest = {
   allows_project: true,
   input: {
     file_path: "crates/tcode-core/src/agent/mod.rs",
-    old_string: "                tokio::time::sleep(Duration::from_millis(delay)).await;",
-    new_string: "                self.sleeper.sleep(Duration::from_millis(delay)).await;",
+    old_string:
+      "                tokio::time::sleep(Duration::from_millis(delay)).await;",
+    new_string:
+      "                self.sleeper.sleep(Duration::from_millis(delay)).await;",
   },
 };
 
@@ -572,7 +687,8 @@ const QUESTION: ApprovalRequest = {
           },
           {
             label: "Generic parameter",
-            description: "Monomorphized, no dynamic dispatch, but it spreads through the type.",
+            description:
+              "Monomorphized, no dynamic dispatch, but it spreads through the type.",
             preview: "pub struct Agent<S: Sleeper> {\n    sleeper: S,\n}",
           },
         ],
@@ -581,9 +697,18 @@ const QUESTION: ApprovalRequest = {
         question: "What should the tests cover?",
         multiSelect: true,
         options: [
-          { label: "The backoff curve", description: "Delays grow and then cap." },
-          { label: "The cancel path", description: "A cancelled retry stops sleeping." },
-          { label: "The error passthrough", description: "The last error survives the retries." },
+          {
+            label: "The backoff curve",
+            description: "Delays grow and then cap.",
+          },
+          {
+            label: "The cancel path",
+            description: "A cancelled retry stops sleeping.",
+          },
+          {
+            label: "The error passthrough",
+            description: "The last error survives the retries.",
+          },
         ],
       },
     ],
@@ -594,7 +719,10 @@ const QUESTION: ApprovalRequest = {
  *  that scene is the layout, and a second full transcript would only compete
  *  with the first for attention. */
 const OTHER_BLOCKS: Block[] = [
-  { kind: "user", text: "Why is the bond curve loader re-fetching on every call?" },
+  {
+    kind: "user",
+    text: "Why is the bond curve loader re-fetching on every call?",
+  },
   {
     kind: "assistant",
     text: "The cache key includes the request timestamp, so no two calls ever hit. Checking where it is built.",
@@ -639,7 +767,8 @@ const PLAN: Plan = {
         {
           phase: "write the failing test first",
           status: "completed",
-          detail: "One retry, instant clock, asserts the second attempt happened.",
+          detail:
+            "One retry, instant clock, asserts the second attempt happened.",
           phases: [],
         },
         {
@@ -680,7 +809,7 @@ const PLAN_REVIEW: ApprovalRequest = {
 };
 
 const SCENES = [
-  "launchpad",
+  "rail",
   "session",
   "workspace",
   "approval",
@@ -700,7 +829,7 @@ type Scene = (typeof SCENES)[number];
  *  reload — the one thing a scene switcher in component state cannot do. */
 function wanted(): Scene {
   const asked = new URLSearchParams(window.location.search).get("scene");
-  return SCENES.includes(asked as Scene) ? (asked as Scene) : "launchpad";
+  return SCENES.includes(asked as Scene) ? (asked as Scene) : "rail";
 }
 
 /** One conversation, filling the window. */
@@ -711,8 +840,14 @@ const solo = (): Tiling => single({ kind: "session", session: "a" });
  *  two-up never shows whether the recursion reads correctly. */
 function tiled(): Tiling {
   const one = solo();
-  const two = split(one, panes(one)[0].id, "row", { kind: "session", session: "b" });
-  return openInspect(two, panes(two)[0].id, "a", { kind: "diff", callId: "t2" });
+  const two = split(one, panes(one)[0].id, "row", {
+    kind: "session",
+    session: "b",
+  });
+  return openInspect(two, panes(two)[0].id, "a", {
+    kind: "diff",
+    callId: "t2",
+  });
 }
 
 /**
@@ -779,8 +914,12 @@ function terminal(): Tiling {
   return toggleTerminal(solo());
 }
 
-/** The window each scene wants. Every scene but the split views is one conversation. */
+/** The window each scene wants. Every scene but the split views is one
+ *  conversation — and `rail`, which is the window with no pane at all: the
+ *  state that used to be a whole screen (the launchpad) and is now the field's
+ *  empty state beside a rail that carries everything. */
 function layoutFor(scene: Scene): Tiling {
+  if (scene === "rail") return EMPTY;
   if (scene === "split") return tiled();
   if (scene === "shown") return showing();
   if (scene === "web") return web();
@@ -798,7 +937,10 @@ function comments(plan: Plan): PlanComment[] {
       id: "c1",
       path: [1],
       field: "detail",
-      quote: detail.slice(detail.indexOf("Risk:"), detail.indexOf("Risk:") + 96),
+      quote: detail.slice(
+        detail.indexOf("Risk:"),
+        detail.indexOf("Risk:") + 96,
+      ),
       text: "Split the watchdog's clock out — one injected clock for two waiters is the bug this would hide.",
     },
   ];
@@ -823,7 +965,13 @@ export function Preview() {
   // running turn is the only state in which the strip exists at all.
   const [queued, setQueued] = useState<Queued[]>(() =>
     wanted() === "session"
-      ? [{ text: "also add a test for the cap at 30s", attachments: [], turn: 1 }]
+      ? [
+          {
+            text: "also add a test for the cap at 30s",
+            attachments: [],
+            turn: 1,
+          },
+        ]
       : [],
   );
   // The rewind question, opened by the control on any prompt. Its numbers are
@@ -888,7 +1036,9 @@ export function Preview() {
           rewinding: false,
           planFirst: scene === "empty",
           plan,
-          planDraft: plan ? { ...draftOf(plan), comments: comments(plan) } : null,
+          planDraft: plan
+            ? { ...draftOf(plan), comments: comments(plan) }
+            : null,
           planOpen: scene === "session",
           meter: METER,
           activity: ACTIVITY.a,
@@ -904,33 +1054,23 @@ export function Preview() {
   return (
     <ToolMetaProvider meta={TOOL_META}>
       <DisplayContext.Provider value={display}>
-      {/* A conversation with nothing in it yet is also the honest place to show
+        {/* A conversation with nothing in it yet is also the honest place to show
           the other half of the usage panel: a provider that reports no
           subscription windows at all. */}
-      <LimitsContext.Provider value={scene === "empty" ? null : LIMITS}>
-        <div className="preview">
-          <nav className="preview-bar">
-            {SCENES.map((name) => (
-              <button
-                key={name}
-                className={scene === name ? "is-on" : undefined}
-                onClick={() => pick(name)}
-              >
-                {name}
-              </button>
-            ))}
-          </nav>
-          <div className="preview-stage">
-            {scene === "launchpad" && (
-              <Launchpad
-                open={SESSIONS}
-                statusOf={(id) => STATUS[id] ?? "idle"}
-                activityOf={(id) => ACTIVITY[id] ?? ""}
-                onEnter={() => pick("session")}
-                onOpenFolder={async () => pick("session")}
-              />
-            )}
-            {scene !== "launchpad" && (
+        <LimitsContext.Provider value={scene === "empty" ? null : LIMITS}>
+          <div className="preview">
+            <nav className="preview-bar">
+              {SCENES.map((name) => (
+                <button
+                  key={name}
+                  className={scene === name ? "is-on" : undefined}
+                  onClick={() => pick(name)}
+                >
+                  {name}
+                </button>
+              ))}
+            </nav>
+            <div className="preview-stage">
               <Workspace
                 tiling={tiling}
                 display={display}
@@ -940,8 +1080,12 @@ export function Preview() {
                 statusOf={(id) => STATUS[id] ?? "idle"}
                 onTiling={(step) => setTiling(step)}
                 onDraft={(_, value) => setDraft(value)}
-                onAttach={(_, items) => setAttachments((was) => [...was, ...items])}
-                onDetach={(_, id) => setAttachments((was) => was.filter((item) => item.id !== id))}
+                onAttach={(_, items) =>
+                  setAttachments((was) => [...was, ...items])
+                }
+                onDetach={(_, id) =>
+                  setAttachments((was) => was.filter((item) => item.id !== id))
+                }
                 onSend={() => {}}
                 onInterrupt={() => {}}
                 onWithdrawQueued={(_, index) =>
@@ -960,7 +1104,9 @@ export function Preview() {
                           // The count the backend works out from its own list.
                           dropped:
                             REWIND_TARGETS.length -
-                            REWIND_TARGETS.findIndex((entry) => entry.index === target.index),
+                            REWIND_TARGETS.findIndex(
+                              (entry) => entry.index === target.index,
+                            ),
                         }
                       : null,
                   )
@@ -973,13 +1119,11 @@ export function Preview() {
                 onPlanOpen={() => {}}
                 onPlanFirst={() => {}}
                 onCloseSession={() => {}}
-                onHome={() => pick("launchpad")}
                 onOpenFolder={async () => pick("session")}
               />
-            )}
+            </div>
           </div>
-        </div>
-      </LimitsContext.Provider>
+        </LimitsContext.Provider>
       </DisplayContext.Provider>
     </ToolMetaProvider>
   );

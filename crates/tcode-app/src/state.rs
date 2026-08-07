@@ -38,6 +38,11 @@ struct TurnControl {
 pub struct SessionHandle {
     pub id: String,
     pub cwd: PathBuf,
+    /// The session log this conversation appends to. Captured here at open —
+    /// like `progress` and `queue`, and for the same reason: the field lives on
+    /// the `Session`, which is `None` for the whole of a running turn, and the
+    /// rail asks "which stored logs are already open" whenever it draws.
+    pub log_id: Option<String>,
     /// `None` while a turn is running — see the module comment.
     session: Mutex<Option<Session>>,
     /// The session's plan cell, held separately *because* of that `Option`: a
@@ -94,6 +99,7 @@ impl SessionHandle {
         Self {
             id,
             cwd,
+            log_id: session.log_id().map(str::to_owned),
             progress: session.tool_ctx.progress_cell(),
             queue: session.pending.clone(),
             pending_mode: session.pending_mode.clone(),
