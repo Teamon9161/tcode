@@ -277,6 +277,12 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     连带一条：**picker 的 preview 不许走 `resume_path`**。`SessionStore::list` 现在用 `store.rs::preview` 逐行浅解析（`LogEvent` 是 internally tagged，反序列化一次要先把整行缓冲成一棵泛型树，等于把每条工具结果、每张贴进来的图解析两遍）。它照样是**重放**而不是扫描——`append`/`truncate_tail`/`compact` 三个操作全都实现，少一个 `/clear` 掉的对话就会复活；而"只认这三个"是安全的，因为 `Ledger` 本来就只有这三种变更（根 CLAUDE.md 的设计约束 2）。
 
+24. **终端坞永远不是新窗格的落座点**（`layout.ts::seatFor` / `openBeside`）。终端不是普通窗格，是**横在窗口底部的一条带**——所以 `toggleTerminal` 切的是 **root** 而不是邻居，而且它**故意把焦点留在终端里**（开一个还要点进去的终端等于开了一半）。于是所有"在当前窗格旁边打开"的入口（`show` / `showBeside` / `openWeb`）读到那个焦点，就会去切这条坞：`Mod+J` 之后再点浏览器，浏览器落在底部 30% 的一半宽度里，而浏览器是**按窗格 DOM rect 定位的原生子 webview**，被压成一条缝之后整条底部看起来就是**一片白**——所以它是以"白屏"被报上来的，不是以"布局不对"。任何不带显式目标窗格的开窗都必须走 `openBeside`；窗口里只剩坞时新窗格开在**它上面**（`split(..., first: true)`），坞是这个窗口的地板。
+
+    连带一条：**`show` 的"接管当前窗格"只认 `focused`，不许退回 `seatFor`**。接管是对"人正待着的那个窗格"做的；用兜底挑出来的窗格去接管，等于"给我看 duck_ext"把树里排第一的那个对话直接关掉了。这条在改上面那半时踩过一次，`layout.test.ts` 里钉着。
+
+25. **响应式规则一律写在 `app.css` 末尾，写在它要盖掉的组件下面。** media query **不增加特异性**，所以 `@media { .rail-lines { display: none } }` 会被文件后面任何一条同特异性的 `.rail-lines { display: flex }` 打赢。这条是踩出来的：那个 `max-width: 900px` 的块原本挨着文件开头的 shells，于是它下面每个组件都悄悄赢了——侧栏在 52px 的列里照画不误，`needs you`、会话数、`Earlier` 全都溢出到窗格上面去。**它看起来像溢出 bug，其实是层叠顺序 bug**，所以盯着看也看不出来。窄栏另外给自己的盒子加了 `overflow: hidden` 兜底：新加一个元素忘了进列表，代价是少一个标签，而不是一行字横在对话上。
+
 ## 现有结构
 
 - `src/bridge.rs`：出向事件（`SessionEvent`/`TurnFinished`/`ApprovalRequest`）、入向审批（`ApprovalAnswer`/`Pending`）、`WebviewApprover`、`pump_events`。`Emit` trait 在这里。

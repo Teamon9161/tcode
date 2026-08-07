@@ -9,10 +9,16 @@
  *
  * The shortcuts sit here for the reason DESIGN.md gives for putting them on an
  * empty conversation — this is a screen with room and a moment where nobody is
- * mid-task, and a shortcut nothing ever mentions is a shortcut nobody uses. It
- * is not centred in the field: it starts on the field's own left edge, on the
- * axis every pane sits on, because a block floating in the middle of an empty
- * window is a splash screen.
+ * mid-task, and a shortcut nothing ever mentions is a shortcut nobody uses.
+ *
+ * **Centred, unlike every other empty state in the app**, and the exception is
+ * the point. The others sit on their column's left edge because they are the
+ * first thing in a conversation, and a conversation has one axis running down
+ * through the transcript, the dock and the composer. Nothing here shares an
+ * axis with anything: there is no composer under it and no transcript above it.
+ * Left-aligning it anyway — which is what this first shipped as — produced a
+ * small block in the corner of a wide empty window, lined up with nothing. A
+ * rule is worth keeping where the thing it protects exists.
  */
 export function FieldEmpty() {
   return (

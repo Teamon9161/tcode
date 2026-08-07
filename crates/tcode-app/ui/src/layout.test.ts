@@ -43,7 +43,9 @@ const diff = (session: string, callId: string): Pane => ({
  *  never depend on generated ids. */
 function shape(tiling: Tiling): string {
   const draw = (node: Layout): string =>
-    node.kind === "leaf" ? label(node.pane) : `${node.dir}(${draw(node.a)}, ${draw(node.b)})`;
+    node.kind === "leaf"
+      ? label(node.pane)
+      : `${node.dir}(${draw(node.a)}, ${draw(node.b)})`;
   return tiling.root ? draw(tiling.root) : "-";
 }
 
@@ -61,7 +63,9 @@ function history(tiling: Tiling): string[] {
   const leaf = panes(tiling).find((entry) => entry.pane.kind === "inspect");
   if (!leaf || leaf.pane.kind !== "inspect") throw new Error("no inspect pane");
   const { entries, at } = leaf.pane.nav;
-  return entries.map((entry, index) => (index === at ? `[${entry.kind}]` : entry.kind));
+  return entries.map((entry, index) =>
+    index === at ? `[${entry.kind}]` : entry.kind,
+  );
 }
 
 /** Every pane's share of the window's width, by label — the number the person
@@ -69,14 +73,19 @@ function history(tiling: Tiling): string[] {
  *  whatever pane happened to be split. */
 function widths(tiling: Tiling): Record<string, number> {
   const out: Record<string, number> = {};
-  for (const { leaf, rect } of frames(tiling).panes) out[label(leaf.pane)] = rect.width;
+  for (const { leaf, rect } of frames(tiling).panes)
+    out[label(leaf.pane)] = rect.width;
   return out;
 }
 
 /** One split's ratio, for asserting that a drag somewhere else survived. */
 function ratioOf(tiling: Tiling, split: string): number {
   const walk = (node: Layout): number | null =>
-    node.kind === "leaf" ? null : node.id === split ? node.ratio : (walk(node.a) ?? walk(node.b));
+    node.kind === "leaf"
+      ? null
+      : node.id === split
+        ? node.ratio
+        : (walk(node.a) ?? walk(node.b));
   return (tiling.root && walk(tiling.root)) ?? NaN;
 }
 
@@ -129,7 +138,9 @@ describe("split", () => {
 
   it("does nothing for a target that is gone", () => {
     const one = single(talk("tcode"));
-    expect(split(one, "pane-does-not-exist", "row", talk("duck_ext"))).toBe(one);
+    expect(split(one, "pane-does-not-exist", "row", talk("duck_ext"))).toBe(
+      one,
+    );
   });
 });
 
@@ -264,7 +275,9 @@ describe("parentSplit", () => {
 
     const inner = parentSplit(three, id(three, "pybond"));
     expect(inner).not.toBeNull();
-    expect(shape(rotate(three, inner!))).toBe("row(tcode, row(duck_ext, pybond))");
+    expect(shape(rotate(three, inner!))).toBe(
+      "row(tcode, row(duck_ext, pybond))",
+    );
   });
 
   it("has none for the root", () => {
@@ -293,7 +306,10 @@ describe("updatePane", () => {
 describe("openInspect", () => {
   it("splits the conversation the first time something is looked into", () => {
     const one = single(talk("tcode"));
-    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" });
+    const two = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e1",
+    });
 
     expect(shape(two)).toBe("row(tcode, tcode:diff)");
     expect(at(two)).toBe("tcode:diff");
@@ -312,7 +328,10 @@ describe("openInspect", () => {
 
   it("reuses the conversation's pane after that, stacking history", () => {
     const one = single(talk("tcode"));
-    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" });
+    const two = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e1",
+    });
     const three = openInspect(two, id(two, "tcode"), "tcode", {
       kind: "file",
       path: "src/main.rs",
@@ -325,18 +344,31 @@ describe("openInspect", () => {
   it("gives a second conversation its own pane", () => {
     const one = single(talk("tcode"));
     const two = split(one, id(one, "tcode"), "row", talk("duck_ext"));
-    const three = openInspect(two, id(two, "tcode"), "tcode", { kind: "diff", callId: "e1" });
-    const four = openInspect(three, id(three, "duck_ext"), "duck_ext", { kind: "files" });
+    const three = openInspect(two, id(two, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e1",
+    });
+    const four = openInspect(three, id(three, "duck_ext"), "duck_ext", {
+      kind: "files",
+    });
 
-    expect(shape(four)).toBe("row(row(tcode, tcode:diff), row(duck_ext, duck_ext:files))");
+    expect(shape(four)).toBe(
+      "row(row(tcode, tcode:diff), row(duck_ext, duck_ext:files))",
+    );
   });
 });
 
 describe("navigate", () => {
   it("walks one pane's history without touching the layout", () => {
     const one = single(talk("tcode"));
-    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" });
-    const three = openInspect(two, id(two, "tcode"), "tcode", { kind: "output", callId: "e1" });
+    const two = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e1",
+    });
+    const three = openInspect(two, id(two, "tcode"), "tcode", {
+      kind: "output",
+      callId: "e1",
+    });
     const pane = id(three, "tcode:output");
 
     const back = navigate(three, pane, navBack);
@@ -349,7 +381,10 @@ describe("navigate", () => {
 
   it("clamps at both ends", () => {
     const one = single(talk("tcode"));
-    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" });
+    const two = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "diff",
+      callId: "e1",
+    });
     const pane = id(two, "tcode:diff");
 
     expect(history(navigate(two, pane, navBack))).toEqual(["[diff]"]);
@@ -370,8 +405,14 @@ describe("dividers", () => {
 
     const squeezed = setRatio(two, divider, 0.001);
     expect(squeezed.root).toMatchObject({ kind: "split", ratio: 0.1 });
-    expect(setRatio(two, divider, 9).root).toMatchObject({ kind: "split", ratio: 0.9 });
-    expect(setRatio(two, divider, 0.35).root).toMatchObject({ kind: "split", ratio: 0.35 });
+    expect(setRatio(two, divider, 9).root).toMatchObject({
+      kind: "split",
+      ratio: 0.9,
+    });
+    expect(setRatio(two, divider, 0.35).root).toMatchObject({
+      kind: "split",
+      ratio: 0.35,
+    });
   });
 
   it("rotates between side by side and stacked", () => {
@@ -380,7 +421,9 @@ describe("dividers", () => {
     const divider = two.root?.id ?? "";
 
     expect(shape(rotate(two, divider))).toBe("col(tcode, duck_ext)");
-    expect(shape(rotate(rotate(two, divider), divider))).toBe("row(tcode, duck_ext)");
+    expect(shape(rotate(rotate(two, divider), divider))).toBe(
+      "row(tcode, duck_ext)",
+    );
   });
 
   it("ignores ids that are not dividers", () => {
@@ -399,8 +442,15 @@ describe("making room", () => {
 
   it("takes a nested pane's width off the conversation, not off its neighbour", () => {
     const one = single(talk("tcode"));
-    const tree = openInspect(one, id(one, "tcode"), "tcode", { kind: "workspace-tree" });
-    const picked = openInspect(tree, id(tree, "tcode:workspace-tree"), "tcode", file("a.rs"));
+    const tree = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "workspace-tree",
+    });
+    const picked = openInspect(
+      tree,
+      id(tree, "tcode:workspace-tree"),
+      "tcode",
+      file("a.rs"),
+    );
 
     // Without this the file landed in a third of the tree's third — 22% of the
     // window — while the conversation kept two thirds of it untouched.
@@ -412,7 +462,9 @@ describe("making room", () => {
 
   it("leaves a layout that already fits exactly as it was", () => {
     const one = single(talk("tcode"));
-    const tree = openInspect(one, id(one, "tcode"), "tcode", { kind: "workspace-tree" });
+    const tree = openInspect(one, id(one, "tcode"), "tcode", {
+      kind: "workspace-tree",
+    });
 
     expect(tree.root).toMatchObject({ kind: "split", ratio: 0.66 });
   });
@@ -439,7 +491,9 @@ describe("making room", () => {
 
     const wide = widths(tiling);
     expect(Object.keys(wide)).toHaveLength(5);
-    expect(Object.values(wide).reduce((sum, part) => sum + part, 0)).toBeCloseTo(1);
+    expect(
+      Object.values(wide).reduce((sum, part) => sum + part, 0),
+    ).toBeCloseTo(1);
     for (const part of Object.values(wide)) expect(part).toBeGreaterThan(0);
   });
 });
@@ -454,17 +508,37 @@ describe("split direction", () => {
 
   it("stacks rather than shaving another column off a half-width pane", () => {
     const one = single(talk("tcode"));
-    const two = openInspect(one, id(one, "tcode"), "tcode", { kind: "diff", callId: "e1" }, wide);
+    const two = openInspect(
+      one,
+      id(one, "tcode"),
+      "tcode",
+      { kind: "diff", callId: "e1" },
+      wide,
+    );
     expect(shape(two)).toBe("row(tcode, tcode:diff)");
 
-    const three = openAside(two, id(two, "tcode:diff"), "tcode", { kind: "output", callId: "e1" }, wide);
+    const three = openAside(
+      two,
+      id(two, "tcode:diff"),
+      "tcode",
+      { kind: "output", callId: "e1" },
+      wide,
+    );
     expect(shape(three)).toBe("row(tcode, col(tcode:diff, tcode:output))");
   });
 
   it("keeps a list beside what it opens however narrow the pane", () => {
     const two = showBeside(single(talk("tcode")), "duck_ext", wide);
-    const tree = openInspect(two, id(two, "duck_ext"), "duck_ext", { kind: "workspace-tree" }, wide);
-    expect(shape(tree)).toBe("row(tcode, row(duck_ext, duck_ext:workspace-tree))");
+    const tree = openInspect(
+      two,
+      id(two, "duck_ext"),
+      "duck_ext",
+      { kind: "workspace-tree" },
+      wide,
+    );
+    expect(shape(tree)).toBe(
+      "row(tcode, row(duck_ext, duck_ext:workspace-tree))",
+    );
 
     const picked = openInspect(
       tree,
@@ -510,12 +584,18 @@ describe("frames", () => {
     );
     const laid = frames(two);
 
-    expect(laid.panes.map(({ leaf, rect }) => [label(leaf.pane), rect])).toEqual([
+    expect(
+      laid.panes.map(({ leaf, rect }) => [label(leaf.pane), rect]),
+    ).toEqual([
       ["tcode", { left: 0, top: 0, width: 0.5, height: 1 }],
       ["duck_ext", { left: 0.5, top: 0, width: 0.5, height: 1 }],
     ]);
     expect(laid.dividers).toHaveLength(1);
-    expect(laid.dividers[0]).toMatchObject({ dir: "row", ratio: 0.5, within: { left: 0, width: 1 } });
+    expect(laid.dividers[0]).toMatchObject({
+      dir: "row",
+      ratio: 0.5,
+      within: { left: 0, width: 1 },
+    });
   });
 
   it("nests, so an inner split only divides its own half", () => {
@@ -524,7 +604,9 @@ describe("frames", () => {
     const three = split(two, id(two, "duck_ext"), "col", talk("pybond"));
     const laid = frames(three);
 
-    expect(laid.panes.map(({ leaf, rect }) => [label(leaf.pane), rect])).toEqual([
+    expect(
+      laid.panes.map(({ leaf, rect }) => [label(leaf.pane), rect]),
+    ).toEqual([
       ["tcode", { left: 0, top: 0, width: 0.5, height: 1 }],
       ["duck_ext", { left: 0.5, top: 0, width: 0.5, height: 0.5 }],
       ["pybond", { left: 0.5, top: 0.5, width: 0.5, height: 0.5 }],
@@ -555,7 +637,12 @@ describe("sessionsInView", () => {
   it("lists each conversation once, in reading order", () => {
     const one = single(talk("duck_ext"));
     const two = split(one, id(one, "duck_ext"), "row", talk("tcode"));
-    const three = split(two, id(two, "tcode"), "col", diff("duck_ext", "edit-1"));
+    const three = split(
+      two,
+      id(two, "tcode"),
+      "col",
+      diff("duck_ext", "edit-1"),
+    );
 
     expect(sessionsInView(three)).toEqual(["duck_ext", "tcode"]);
   });
@@ -587,7 +674,12 @@ describe("the workspace browser's pane", () => {
   it("hands the second file to the pane the first one made", () => {
     const open = browsing();
     const first = openInspect(open, open.focus, "tcode", file("a.rs"));
-    const second = openInspect(first, browserPane(first, "tcode")!.id, "tcode", file("b.rs"));
+    const second = openInspect(
+      first,
+      browserPane(first, "tcode")!.id,
+      "tcode",
+      file("b.rs"),
+    );
 
     // Still two panes, and the file pane is the one that changed.
     expect(shape(second)).toBe(
@@ -599,11 +691,16 @@ describe("the workspace browser's pane", () => {
   it("keeps a diff from the transcript out of the tree as well", () => {
     const open = browsing();
     const seat = panes(open).find((leaf) => leaf.pane.kind === "session")!;
-    const looked = openInspect(open, seat.id, "tcode", { kind: "diff", callId: "edit-1" });
+    const looked = openInspect(open, seat.id, "tcode", {
+      kind: "diff",
+      callId: "edit-1",
+    });
 
     // Beside the pane it was opened from, which is the transcript — and the
     // tree is still there, which is the whole point.
-    expect(shape(looked)).toBe("row(row(tcode, tcode:diff), tcode:workspace-tree)");
+    expect(shape(looked)).toBe(
+      "row(row(tcode, tcode:diff), tcode:workspace-tree)",
+    );
   });
 
   it("gives openAside a pane even when a file pane already exists", () => {
@@ -611,7 +708,9 @@ describe("the workspace browser's pane", () => {
     const first = openInspect(open, open.focus, "tcode", file("a.rs"));
     const beside = openAside(first, first.focus, "tcode", file("b.rs"));
 
-    expect(panes(beside).filter((leaf) => leaf.pane.kind === "inspect")).toHaveLength(3);
+    expect(
+      panes(beside).filter((leaf) => leaf.pane.kind === "inspect"),
+    ).toHaveLength(3);
     expect(browserPane(beside, "tcode")).not.toBeNull();
   });
 
@@ -620,7 +719,9 @@ describe("the workspace browser's pane", () => {
     const picked = openInspect(open, open.focus, "tcode", file("a.rs"));
     const found = browserPane(picked, "tcode")!;
 
-    expect(found.pane.kind === "inspect" && navValue(found.pane.nav).kind).toBe("workspace-tree");
+    expect(found.pane.kind === "inspect" && navValue(found.pane.nav).kind).toBe(
+      "workspace-tree",
+    );
     expect(browserPane(picked, "duck_ext")).toBeNull();
   });
 });
@@ -711,7 +812,8 @@ describe("the terminals", () => {
   it("takes most of the window for the conversation above it", () => {
     const open = toggleTerminal(single(talk("tcode")));
     const heights: Record<string, number> = {};
-    for (const { leaf, rect } of frames(open).panes) heights[label(leaf.pane)] = rect.height;
+    for (const { leaf, rect } of frames(open).panes)
+      heights[label(leaf.pane)] = rect.height;
 
     expect(heights.tcode).toBeGreaterThan(heights.term);
   });
@@ -728,15 +830,51 @@ describe("the terminals", () => {
   });
 
   it("is not counted as a conversation on screen", () => {
-    expect(sessionsInView(toggleTerminal(single(talk("tcode"))))).toEqual(["tcode"]);
+    expect(sessionsInView(toggleTerminal(single(talk("tcode"))))).toEqual([
+      "tcode",
+    ]);
   });
 
   it("is never overwritten by a conversation arriving", () => {
     const open = toggleTerminal(single(talk("tcode")));
-    const arrived = show({ ...open, focus: terminalPane(open)!.id }, "duck_ext");
+    const arrived = show(
+      { ...open, focus: terminalPane(open)!.id },
+      "duck_ext",
+    );
 
-    expect(shape(arrived)).toBe("col(tcode, row(term, duck_ext))");
+    expect(shape(arrived)).toBe("col(row(tcode, duck_ext), term)");
     expect(terminalPane(arrived)).not.toBeNull();
+  });
+
+  /**
+   * The dock is a band across the bottom of the window, not a pane you put
+   * things beside. `toggleTerminal` splits the root to lay it there and leaves
+   * focus in it on purpose, so every opener that seats itself on the focused
+   * pane used to split the dock instead.
+   *
+   * The browser is where that showed: it is a native child webview positioned
+   * from its pane's rectangle, so landing at half the width of the bottom 30%
+   * composited the page into a sliver and the whole bottom band read as blank.
+   * It was reported as a white screen, which is why these assert the *shape*
+   * rather than merely that the pane exists — "the browser opened" was already
+   * true while the bug was there.
+   */
+  it("never seats a new pane inside the dock", () => {
+    const open = toggleTerminal(single(talk("tcode")));
+
+    expect(shape(openWeb(open))).toBe("col(row(tcode, web), term)");
+    expect(shape(showBeside(open, "duck_ext"))).toBe(
+      "col(row(tcode, duck_ext), term)",
+    );
+  });
+
+  it("stays at the bottom when it is all the window has", () => {
+    const alone = toggleTerminal(EMPTY);
+    expect(shape(alone)).toBe("term");
+    // Above the dock, not below it: the terminals are this window's floor, and
+    // a dock that ends up on top of the thing it serves is the same mistake as
+    // opening inside it.
+    expect(shape(openWeb(alone))).toBe("col(web, term)");
   });
 
   it("closes from its own header like any other pane", () => {

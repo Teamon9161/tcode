@@ -49,31 +49,44 @@
 .field-empty {
   display: flex;
   align-items: center;
+  justify-content: center;
   min-width: 0;
   min-height: 0;
-  padding: var(--s-6);
+  padding: var(--s-7) var(--s-6);
   overflow-y: auto;
 }
 
-/* Left, not centred: it starts on the axis every pane starts on. `--measure` is
-   that axis, read rather than repeated as a number. */
+/* Centred, both ways — and this is the one empty state in the app that is.
+   Every other one sits on its column's left edge, because it is the first thing
+   in a conversation and the conversation has one axis running down through the
+   transcript, the dock and the composer. There is no such axis here: no
+   composer, no transcript, nothing below to line up with. Holding the rule
+   anyway put a small block in the top-left corner of an otherwise empty window,
+   aligned to nothing, which is what "sits on the axis" degrades into when there
+   is no axis. Its own text stays left-aligned — a centred paragraph is harder
+   to read, and the keymap below it is a two-column list. */
 .field-empty-inner {
-  max-width: var(--measure);
+  max-width: 46rem;
 }
 
+/* Larger than a panel heading, because this one has the window to itself and
+   `--text-lg` read as a caption floating in the middle of it. `--text-xl` is
+   the token's documented job (the greeting), and with nothing open this is
+   what greets you. */
 .field-empty h1 {
-  margin: 0 0 var(--s-2);
+  margin: 0 0 var(--s-3);
   color: var(--ink);
-  font-size: var(--text-lg);
+  font-size: var(--text-xl);
   font-weight: var(--weight-semibold);
   letter-spacing: var(--tracking-tight);
+  text-wrap: balance;
 }
 
 .field-empty p {
   margin: 0;
-  max-width: 60ch;
+  max-width: 62ch;
   color: var(--body);
-  font-size: var(--text-sm);
+  font-size: var(--text-base);
   text-wrap: pretty;
 }
 .field-empty p b {
@@ -702,51 +715,6 @@ body.is-resizing {
   padding: var(--s-4);
   color: var(--muted);
   font-size: var(--text-sm);
-}
-
-/* Structural, not fluid: below this width the tree stops being drawn and only
-   the current pane is (see `useNarrow` in `Workspace.tsx`), and the rail loses
-   its labels — knowing which conversations exist matters more than reading
-   their names. Nothing shrinks; things are chosen. */
-@media (max-width: 900px) {
-  /* Reassigns the token rather than the grid, so the finder in the title bar
-     narrows with the column it sits over instead of hanging off its edge. */
-  .workspace {
-    --rail-w: 52px;
-  }
-  .rail-lines,
-  .rail-close,
-  .rail-project-name,
-  .rail-more,
-  .rail-count,
-  .rail-when,
-  .rail-band,
-  .rail-note,
-  .rail-earlier,
-  .rail-stored,
-  .rail-add,
-  .rail-find-label,
-  .rail-find-key,
-  .rail-start span {
-    display: none;
-  }
-  /* `New` keeps its place in the column as a bare glyph: it is the one act the
-     rail offers, not the first thing to drop when the column narrows. */
-  .rail-find {
-    width: auto;
-  }
-  .rail-start {
-    justify-content: center;
-  }
-  /* The grouping survives as the gap between clusters of dots; there is no room
-     for the folder's name, and a truncated one would be worse than none. */
-  .rail-sessions {
-    padding-left: 0;
-  }
-  .rail-item,
-  .rail-project-head {
-    justify-content: center;
-  }
 }
 
 /* ============================================================ top bar */
@@ -6594,4 +6562,74 @@ button.strip-phase-line:hover .strip-phase-name {
    four lines tall that the file scrolls inside. */
 .workspace-file-source {
   flex: 1;
+}
+
+/* ============================================================ narrow window
+
+   Structural, not fluid: below this width the tree stops being drawn and only
+   the current pane is (see `useNarrow` in `Workspace.tsx`), and the rail keeps
+   its status dots and loses everything that needs width to read. Nothing
+   shrinks; things are chosen.
+
+   **This block lives at the end of the file, and that is load-bearing.** A media
+   query adds no specificity, so `@media { .rail-lines { display: none } }` is
+   beaten by any later `.rail-lines { display: flex }` — and while this sat up
+   with the shells, every component below it quietly won. Half the rail went on
+   drawing at 52px and spilled out of its own column: `needs you` across the
+   field, a session count over the panes. It looked like an overflow bug and was
+   a cascade-order one. Anything responsive goes here, under everything it
+   overrides. */
+@media (max-width: 900px) {
+  /* Reassigns the token rather than the grid, so the finder in the title bar
+     narrows with the column it sits over instead of hanging off its edge. */
+  .workspace {
+    --rail-w: 52px;
+  }
+
+  /* Everything that needs width to say anything. The rail keeps exactly what
+     survives at 52px: the status dots, and the one button that adds to it. */
+  .rail-lines,
+  .rail-close,
+  .rail-project-name,
+  .rail-more,
+  .rail-add,
+  .rail-count,
+  .rail-needs,
+  .rail-when,
+  .rail-band,
+  .rail-note,
+  .rail-more-row,
+  .rail-earlier,
+  .rail-stored,
+  .rail-find-label,
+  .rail-find-key,
+  .rail-start span {
+    display: none;
+  }
+
+  /* The belt to that braces: a column this narrow must clip rather than bleed,
+     whatever a later rule decides to keep drawing. The list above is the design;
+     this is the guarantee that forgetting one entry costs a hidden label instead
+     of text lying across the conversation. */
+  .rail,
+  .rail-scroll,
+  .rail-group,
+  .rail-project,
+  .rail-sessions > li {
+    overflow: hidden;
+  }
+
+  .rail-find {
+    width: auto;
+  }
+  /* The grouping survives as the gap between clusters of dots; there is no room
+     for the folder's name, and a truncated one would be worse than none. */
+  .rail-sessions {
+    padding-left: 0;
+  }
+  .rail-item,
+  .rail-start,
+  .rail-project-head {
+    justify-content: center;
+  }
 }

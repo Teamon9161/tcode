@@ -218,10 +218,15 @@ function makeRoom(root: Layout, axis: Dir, opened: string): Layout {
     sa += move - back;
     sb -= move - back;
 
-    const ratio = size > 0 ? Math.min(Math.max(sa / size, MIN_RATIO), 1 - MIN_RATIO) : node.ratio;
+    const ratio =
+      size > 0
+        ? Math.min(Math.max(sa / size, MIN_RATIO), 1 - MIN_RATIO)
+        : node.ratio;
     const a = inA ? fit(node.a, sa) : node.a;
     const b = inA ? node.b : fit(node.b, sb);
-    return a === node.a && b === node.b && ratio === node.ratio ? node : { ...node, ratio, a, b };
+    return a === node.a && b === node.b && ratio === node.ratio
+      ? node
+      : { ...node, ratio, a, b };
   };
   return fit(root, 1);
 }
@@ -314,6 +319,10 @@ export function split(
   dir: Dir,
   pane: Pane,
   ratio = 0.5,
+  /** Put the new pane *before* the target rather than after it. Only the
+   *  terminal dock needs this: it is the one pane whose position in the window
+   *  is fixed (`seatFor`), so a pane opened against it has to land above it. */
+  first = false,
 ): Tiling {
   if (!tiling.root) return single(pane);
   const added = leafOf(pane);
@@ -321,12 +330,50 @@ export function split(
     kind: "split",
     id: nextId(),
     dir,
-    ratio,
-    a: node,
-    b: added,
+    ratio: first ? 1 - ratio : ratio,
+    a: first ? added : node,
+    b: first ? node : added,
   }));
   if (grown === tiling.root) return tiling;
   return { root: makeRoom(grown, dir, added.id), focus: added.id };
+}
+
+/**
+ * Where a pane that nobody placed should go.
+ *
+ * **Never the terminal dock.** The terminals are not an ordinary pane: they are
+ * a band across the bottom of the window, which is why `toggleTerminal` splits
+ * the *root* rather than a neighbour, and it deliberately leaves focus in them
+ * because a terminal you have to click into is half a terminal. Everything that
+ * opens "beside the pane you are in" then read that focus — so `Mod`+`J`
+ * followed by the browser button split the dock, and the browser arrived at
+ * half the width of the bottom 30% with the native webview composited into the
+ * sliver. What that looks like is the bottom of the window going blank, which
+ * is why it was reported as a white screen rather than as a layout mistake.
+ *
+ * `null` means the window holds nothing but the dock, and the caller puts the
+ * new pane above it.
+ */
+function seatFor(tiling: Tiling): Leaf | null {
+  const seat = focused(tiling);
+  if (seat && seat.pane.kind !== "terminal") return seat;
+  return panes(tiling).find((leaf) => leaf.pane.kind !== "terminal") ?? null;
+}
+
+/**
+ * Open `pane` next to whatever the reader is working in, keeping the terminal
+ * dock at the bottom of the window where it belongs.
+ */
+function openBeside(tiling: Tiling, pane: Pane, aspect?: number): Tiling {
+  if (!tiling.root) return single(pane);
+  const seat = seatFor(tiling);
+  // Only the dock is open. Above it, not below: the terminals are the floor of
+  // this window, and a dock that ends up on top of the thing it serves is the
+  // same mistake as opening inside it.
+  if (!seat) {
+    return split(tiling, tiling.root.id, "col", pane, TERMINAL_SHARE, true);
+  }
+  return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), pane);
 }
 
 /**
@@ -354,7 +401,9 @@ export function close(tiling: Tiling, id: string): Tiling {
   const root = without(tiling.root, id);
   if (root === tiling.root) return tiling;
   if (!root) return EMPTY;
-  const focus = findNode(root, tiling.focus) ? tiling.focus : (heir ?? firstLeaf(root).id);
+  const focus = findNode(root, tiling.focus)
+    ? tiling.focus
+    : (heir ?? firstLeaf(root).id);
   return { root, focus };
 }
 
@@ -404,10 +453,20 @@ export function show(tiling: Tiling, session: string, aspect?: number): Tiling {
 
   const pane: Pane = { kind: "session", session };
   if (!tiling.root) return single(pane);
-  const seat = focused(tiling) ?? firstLeaf(tiling.root);
-  if (seat.pane.kind !== "session")
-    return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), pane);
-  return { root: mapNode(tiling.root, seat.id, () => ({ ...seat, pane })), focus: seat.id };
+  // Taking over a seat is only ever done to the pane the reader is *in*. It has
+  // to be `focused` and not `seatFor`: the fallback picks a pane nobody chose,
+  // and reusing that one would answer "show me duck_ext" by closing whatever
+  // conversation happened to be first in the tree. Anything else — the cursor
+  // in a shell, in the browser, in a diff — opens a new pane, which `openBeside`
+  // then keeps out of the terminal dock.
+  const seat = focused(tiling);
+  if (seat && seat.pane.kind === "session") {
+    return {
+      root: mapNode(tiling.root, seat.id, () => ({ ...seat, pane })),
+      focus: seat.id,
+    };
+  }
+  return openBeside(tiling, pane, aspect);
 }
 
 /**
@@ -429,9 +488,7 @@ export function show(tiling: Tiling, session: string, aspect?: number): Tiling {
 export function openWeb(tiling: Tiling, aspect?: number): Tiling {
   const already = panes(tiling).find((leaf) => leaf.pane.kind === "web");
   if (already) return close(tiling, already.id);
-  if (!tiling.root) return single({ kind: "web" });
-  const seat = focused(tiling) ?? firstLeaf(tiling.root);
-  return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), { kind: "web" });
+  return openBeside(tiling, { kind: "web" }, aspect);
 }
 
 /** The browser's pane, if the window has one open. */
@@ -496,7 +553,9 @@ export function terminalPane(tiling: Tiling): Leaf | null {
  * single look.
  */
 export function browsing(pane: Pane): boolean {
-  return pane.kind === "inspect" && navValue(pane.nav).kind === "workspace-tree";
+  return (
+    pane.kind === "inspect" && navValue(pane.nav).kind === "workspace-tree"
+  );
 }
 
 /** The pane browsing `session`'s workspace, if one is open.
@@ -535,7 +594,9 @@ export function openInspect(
 ): Tiling {
   const existing = panes(tiling).find(
     (leaf) =>
-      leaf.pane.kind === "inspect" && leaf.pane.session === session && !browsing(leaf.pane),
+      leaf.pane.kind === "inspect" &&
+      leaf.pane.session === session &&
+      !browsing(leaf.pane),
   );
   if (existing && existing.pane.kind === "inspect") {
     const grown = updatePane(tiling, existing.id, {
@@ -565,17 +626,31 @@ export function openAside(
 ): Tiling {
   const leaf = findLeaf(tiling, from);
   const list = value.kind === "files" || value.kind === "workspace-tree";
-  const share = leaf && browsing(leaf.pane) ? SIDEBAR_SHARE : list ? MAIN_SHARE : undefined;
+  const share =
+    leaf && browsing(leaf.pane) ? SIDEBAR_SHARE : list ? MAIN_SHARE : undefined;
   // A navigation list and what it navigates are a row whatever the shape of the
   // pane: a column of names stacked above a file is a column of names with its
   // width wasted and its length cut off. Everything else is two comparable
   // things, so it takes the automatic direction.
-  const dir = list || (leaf && browsing(leaf.pane)) ? "row" : dirFor(tiling, from, aspect);
-  return split(tiling, from, dir, { kind: "inspect", session, nav: navOf(value) }, share);
+  const dir =
+    list || (leaf && browsing(leaf.pane))
+      ? "row"
+      : dirFor(tiling, from, aspect);
+  return split(
+    tiling,
+    from,
+    dir,
+    { kind: "inspect", session, nav: navOf(value) },
+    share,
+  );
 }
 
 /** Steps one inspect pane's history — back, forward, or on to something new. */
-export function navigate(tiling: Tiling, id: string, step: (nav: Nav) => Nav): Tiling {
+export function navigate(
+  tiling: Tiling,
+  id: string,
+  step: (nav: Nav) => Nav,
+): Tiling {
   const leaf = findLeaf(tiling, id);
   if (!leaf || leaf.pane.kind !== "inspect") return tiling;
   return updatePane(tiling, id, { ...leaf.pane, nav: step(leaf.pane.nav) });
@@ -588,15 +663,17 @@ export function navigate(tiling: Tiling, id: string, step: (nav: Nav) => Nav): T
  *
  * A conversation that already has a pane is focused rather than opened twice.
  */
-export function showBeside(tiling: Tiling, session: string, aspect?: number): Tiling {
+export function showBeside(
+  tiling: Tiling,
+  session: string,
+  aspect?: number,
+): Tiling {
   const already = panes(tiling).find(
     (leaf) => leaf.pane.kind === "session" && leaf.pane.session === session,
   );
   if (already) return { ...tiling, focus: already.id };
 
-  const seat = focused(tiling);
-  if (!tiling.root || !seat) return single({ kind: "session", session });
-  return split(tiling, seat.id, dirFor(tiling, seat.id, aspect), { kind: "session", session });
+  return openBeside(tiling, { kind: "session", session }, aspect);
 }
 
 /** The split holding a node, for rotating it. The root has none. */
@@ -624,7 +701,9 @@ export function setRatio(tiling: Tiling, id: string, ratio: number): Tiling {
 export function rotate(tiling: Tiling, id: string): Tiling {
   if (!tiling.root) return tiling;
   const root = mapNode(tiling.root, id, (node) =>
-    node.kind === "split" ? { ...node, dir: node.dir === "row" ? "col" : "row" } : node,
+    node.kind === "split"
+      ? { ...node, dir: node.dir === "row" ? "col" : "row" }
+      : node,
   );
   return root === tiling.root ? tiling : { ...tiling, root };
 }
@@ -635,7 +714,12 @@ export type Rect = { left: number; top: number; width: number; height: number };
 export type Placed = { leaf: Leaf; rect: Rect };
 /** A divider, plus the box of the split it belongs to — which is what turns a
  *  pointer position anywhere on the field back into that split's own ratio. */
-export type PlacedDivider = { id: string; dir: Dir; ratio: number; within: Rect };
+export type PlacedDivider = {
+  id: string;
+  dir: Dir;
+  ratio: number;
+  within: Rect;
+};
 
 const WHOLE: Rect = { left: 0, top: 0, width: 1, height: 1 };
 
@@ -653,7 +737,10 @@ const WHOLE: Rect = { left: 0, top: 0, width: 1, height: 1 };
  * Flat and keyed by leaf id, a pane survives every split, close, resize and
  * rotate around it untouched.
  */
-export function frames(tiling: Tiling): { panes: Placed[]; dividers: PlacedDivider[] } {
+export function frames(tiling: Tiling): {
+  panes: Placed[];
+  dividers: PlacedDivider[];
+} {
   const panes: Placed[] = [];
   const dividers: PlacedDivider[] = [];
 
@@ -662,15 +749,28 @@ export function frames(tiling: Tiling): { panes: Placed[]; dividers: PlacedDivid
       panes.push({ leaf: node, rect });
       return;
     }
-    dividers.push({ id: node.id, dir: node.dir, ratio: node.ratio, within: rect });
+    dividers.push({
+      id: node.id,
+      dir: node.dir,
+      ratio: node.ratio,
+      within: rect,
+    });
     if (node.dir === "row") {
       const width = rect.width * node.ratio;
       walk(node.a, { ...rect, width });
-      walk(node.b, { ...rect, left: rect.left + width, width: rect.width - width });
+      walk(node.b, {
+        ...rect,
+        left: rect.left + width,
+        width: rect.width - width,
+      });
     } else {
       const height = rect.height * node.ratio;
       walk(node.a, { ...rect, height });
-      walk(node.b, { ...rect, top: rect.top + height, height: rect.height - height });
+      walk(node.b, {
+        ...rect,
+        top: rect.top + height,
+        height: rect.height - height,
+      });
     }
   };
 
@@ -688,7 +788,11 @@ export function frames(tiling: Tiling): { panes: Placed[]; dividers: PlacedDivid
  * matched" from "matched and produced an identical-looking tree". Untouched
  * subtrees keep their identity too, so React reconciliation skips them.
  */
-function mapNode(node: Layout, id: string, fn: (node: Layout) => Layout): Layout {
+function mapNode(
+  node: Layout,
+  id: string,
+  fn: (node: Layout) => Layout,
+): Layout {
   if (node.id === id) return fn(node);
   if (node.kind === "leaf") return node;
   const a = mapNode(node.a, id, fn);

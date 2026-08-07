@@ -123,8 +123,8 @@ DPI; a heading that shrinks inside a narrow rail looks worse, not responsive.
 | `--text-sm` | 13px / 1.55 | Controls, rail items, tool cards |
 | `--text-base` | 14px / 1.65 | Transcript body |
 | `--text-md` | 16px / 1.4 | Card titles, section headings |
-| `--text-lg` | 20px / 1.3 | The empty field's heading |
-| `--text-xl` | 26px / 1.2 | Greeting |
+| `--text-lg` | 20px / 1.3 | Section headings in a panel |
+| `--text-xl` | 26px / 1.2 | The empty field's heading |
 
 Prose caps at 72ch. Monospace blocks may run wider.
 
@@ -347,10 +347,18 @@ One shape per job, used everywhere:
 
   The **empty field** — the window with no pane on it — is one of these rather
   than a screen, which is exactly what the launchpad got wrong. It draws no
-  sheet, starts on the same `--measure` axis every pane starts on, and says *no
-  conversation on screen* rather than *nothing open*: conversations can be
-  running in this window with no pane showing one, and a heading claiming
-  otherwise would be the window contradicting the rail beside it.
+  sheet, and it says *no conversation on screen* rather than *nothing open*:
+  conversations can be running in this window with no pane showing one, and a
+  heading claiming otherwise would be the window contradicting the rail beside
+  it.
+
+  It is also **the one empty state that is centred**, and the exception is worth
+  stating because the left-edge rule above is otherwise absolute. That rule
+  exists to keep an empty conversation on the axis it shares with the composer
+  and the transcript. Here there is no composer and no transcript — nothing to
+  share an axis *with* — so obeying it put a small block in the corner of a wide
+  empty window, aligned to nothing. The heading takes `--text-xl` for the same
+  reason: with the window to itself, `--text-lg` read as a caption adrift in it.
 - **Pane** — a sheet of `--bg` at `--r-sm`, holding a thin header over a body.
   Every pane wears the same frame whatever is inside it, which is what makes a
   diff and a conversation read as two of the same thing rather than a panel
@@ -665,6 +673,26 @@ two screens with room for them and the two moments nobody is mid-task. A shortcu
 nothing ever mentions is a shortcut nobody uses. The empty field lists only the
 keys that move you *between* conversations; the pane verbs belong to a window
 that has panes in it.
+
+## Responsive
+
+Structural, not fluid (PRODUCT.md § Design Principles): below 900px the pane
+tree stops being drawn and only the current pane is, and the rail keeps its
+status dots and drops everything that needs width to read. Nothing shrinks; one
+thing is chosen. The finder stays in the title bar at that width, which is what
+keeps every conversation reachable *by name* once the rail is a column of
+anonymous dots — it is the only way back, so it is the last thing to go.
+
+**Every responsive rule lives at the end of `app.css`, under the components it
+overrides.** A media query adds no specificity, so a `display: none` inside one
+is beaten by any same-specificity `display:` that appears later in the file.
+While this block sat near the top with the shells, every component defined below
+it quietly won: half the rail went on drawing inside a 52px column and spilled
+across the panes — `needs you` lying over the conversation, a session count in
+the field. It reads as an overflow bug and is a cascade-order one, which is why
+it survived being looked at. The narrow rail also sets `overflow: hidden` on its
+own boxes, so forgetting to list a new element costs a visible label rather than
+text across the window.
 
 ## Theme packs
 
