@@ -1,0 +1,35 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>spike: app renderer</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    background: #ffffff;
+    font: 13px system-ui, sans-serif;
+  }
+  /* The overlap probe. Sits exactly over where the browser view is placed and
+     asks for the top of every stacking context this document can offer. If a
+     screen capture finds this colour at the sample point, the DOM paints above
+     a WebContentsView and `seat.ts::yieldToPopover` can be deleted. If it finds
+     the view's colour, that rule survives the migration unchanged. */
+  #probe {
+    position: fixed;
+    left: 250px;
+    top: 100px;
+    width: 500px;
+    height: 400px;
+    background: rgb(220, 30, 30);
+    z-index: 2147483647;
+    isolation: isolate;
+  }
+  #label {
+    position: fixed;
+    left: 12px;
+    top: 12px;
+    color: #333;
+  }
+</style>
+<div id="label">app renderer — the red band is a DOM element asking to be on top</div>
+<div id="probe"></div>

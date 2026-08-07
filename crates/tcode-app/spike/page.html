@@ -1,0 +1,48 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>spike page</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    /* Solid, and nothing like the renderer's red: the screen capture decides
+       who is on top by which of these two colours it finds. */
+    background: rgb(20, 60, 220);
+    color: #fff;
+    font: 13px system-ui, sans-serif;
+  }
+  #hit {
+    position: absolute;
+    left: 40px;
+    top: 40px;
+    padding: 10px 16px;
+    font: inherit;
+  }
+  #size {
+    position: absolute;
+    left: 40px;
+    bottom: 20px;
+  }
+</style>
+<button id="hit">click target</button>
+<div id="size"></div>
+<script>
+  // The page reports its own width, because that is the only number worth
+  // trusting: `place.rs` records a Linux failure where the widget was resized
+  // and the web content inside it never heard about it. An outer frame that
+  // changed while the page stayed at its old width looks correct from the host
+  // and is the actual bug.
+  const report = () => {
+    document.getElementById("size").textContent =
+      `innerWidth=${window.innerWidth} innerHeight=${window.innerHeight}`;
+  };
+  report();
+  addEventListener("resize", report);
+
+  // Proof that a synthesized CDP click reached the page, readable from the host
+  // through `document.title` without any channel between the two.
+  document.getElementById("hit").addEventListener("click", () => {
+    document.title = "clicked";
+  });
+</script>

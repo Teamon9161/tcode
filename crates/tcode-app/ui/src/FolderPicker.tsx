@@ -1,6 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { invoke } from "@ipc";
 
 import type { ProjectInfo, ProjectList } from "./types";
 import { Path } from "./components/Path";
@@ -61,8 +60,11 @@ export function FolderPicker({
     onOpenFolder(path).then(onDone, (error) => setFailure(String(error)));
   };
 
+  // A native dialog belongs to whoever owns the window, so this is a shell
+  // command like `window_*` rather than a plugin import — `null` is a cancelled
+  // dialog, which is an answer and not a failure.
   const pick = async () => {
-    const chosen = await openDialog({ directory: true, multiple: false }).catch(
+    const chosen = await invoke<string | null>("dialog_open_folder").catch(
       (error) => {
         setFailure(`the folder picker could not open: ${String(error)}`);
         return null;

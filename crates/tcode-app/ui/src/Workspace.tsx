@@ -30,7 +30,7 @@ import { inTerminal, MOD } from "./keys";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
 import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
-import { sessionTitle, type FoundSession } from "./rail";
+import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
 import { Panes, type PaneContext } from "./Panes";
 import { DisplayMenu } from "./DisplayMenu";

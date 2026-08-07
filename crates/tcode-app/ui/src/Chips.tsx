@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "@ipc";
 
 import { AGENT_EVENT, type SessionEvent } from "./types";
 import { useSession } from "./session";

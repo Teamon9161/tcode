@@ -142,7 +142,7 @@ impl Serve {
         });
 
         let accepting = Arc::clone(&serve);
-        tauri::async_runtime::spawn(async move {
+        tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = listener.accept().await else {
                     // A failed accept is per-connection (fd limits, a client
@@ -150,7 +150,7 @@ impl Serve {
                     continue;
                 };
                 let serving = Arc::clone(&accepting);
-                tauri::async_runtime::spawn(async move {
+                tokio::spawn(async move {
                     let io = TokioIo::new(stream);
                     let service = service_fn(move |request| respond(Arc::clone(&serving), request));
                     // Errors here are the client hanging up mid-response, which

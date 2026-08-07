@@ -18,8 +18,17 @@ import "./theme/porcelain.css";
 import "@xterm/xterm/css/xterm.css";
 import "./app.css";
 
+import { SHELL } from "@ipc";
 import { App } from "./App";
 import { Boundary } from "./Boundary";
+
+// The title bar is app-drawn (rule 9c), and the two shells make a region
+// draggable by opposite means: Tauri watches for `data-tauri-drag-region` from
+// a script it injects, Electron reads `-webkit-app-region` off the computed
+// style. Set before the first paint and scoped in `app.css`, so neither shell
+// is ever offered the other's mechanism — a title bar that took both would
+// swallow the clicks of the menus that live in it.
+document.documentElement.dataset.shell = SHELL;
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html lost its #root");

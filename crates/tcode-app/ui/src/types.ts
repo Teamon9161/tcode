@@ -7,6 +7,11 @@ export const AGENT_EVENT = "tcode://agent-event";
 export const APPROVAL_REQUEST = "tcode://approval-request";
 export const TURN_STARTED = "tcode://turn-started";
 export const TURN_FINISHED = "tcode://turn-finished";
+/** Mirrors `bridge::WINDOW_STATE`, but emitted by the shell rather than by the
+ *  backend: the window is the one thing on the other side of the pipe. The
+ *  title bar is app-drawn, and the window can be maximized or restored without
+ *  its buttons — a snap gesture, a double-click on the bar, the OS. */
+export const WINDOW_STATE = "tcode://window-state";
 /** Mirrors `browser::BROWSER_NAVIGATED`. Where the browser is, reported by the
  *  webview that owns it — the address bar reads this and never sets it. */
 export const BROWSER_NAVIGATED = "tcode://browser-navigated";
@@ -17,6 +22,10 @@ export const BROWSER_NAVIGATED = "tcode://browser-navigated";
 export const TERMINAL_OUTPUT = "tcode://terminal-output";
 /** Mirrors `terminal::TERMINAL_EXIT`. The program ended; the tab does not. */
 export const TERMINAL_EXIT = "tcode://terminal-exit";
+
+/** The payload of {@link WINDOW_STATE}. One field, and it stays one field: the
+ *  title bar draws a maximize icon or a restore icon and has no other question. */
+export type WindowState = { maximized: boolean };
 
 /** Mirrors `browser::Navigated`. `title` is empty on the navigation itself and
  *  arrives filled in when the document sets one, which is a second event for

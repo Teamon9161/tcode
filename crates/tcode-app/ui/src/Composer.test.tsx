@@ -7,7 +7,7 @@ const mocks = vi.hoisted(() => ({
   onAttach: vi.fn(),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@ipc", () => ({ invoke: mocks.invoke }));
 vi.mock("./Chips", () => ({ Chips: () => null }));
 
 import { Composer } from "./Composer";

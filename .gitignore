@@ -5,6 +5,13 @@
 /crates/tcode-app/target
 # The desktop app's webview bundle: installed and built, never committed.
 /crates/tcode-app/ui/node_modules
+
+# Phase 0 of MIGRATION-ELECTRON.md. The experiment is committed so the Wayland
+# half can be re-run on a Linux machine; its 300MB of Electron and its answers
+# are not. The whole directory goes when the migration lands.
+/crates/tcode-app/spike/node_modules
+/crates/tcode-app/spike/results.json
+/crates/tcode-app/electron/node_modules
 /crates/tcode-app/ui/dist
 examples/
 **/__pycache__/

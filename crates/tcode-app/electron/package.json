@@ -1,0 +1,13 @@
+{
+  "name": "tcode-shell",
+  "private": true,
+  "version": "0.1.22",
+  "description": "The Electron shell for tcode. Owns a window and nothing else; see ../MIGRATION-ELECTRON.md.",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^43.3.0"
+  }
+}

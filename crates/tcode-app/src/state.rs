@@ -625,7 +625,7 @@ impl Supervisor {
         let Some(emit) = self.emit.lock().unwrap().clone() else {
             return;
         };
-        tauri::async_runtime::spawn(watch_monitors(self.agent.clone(), handle, emit));
+        tokio::spawn(watch_monitors(self.agent.clone(), handle, emit));
     }
 
     pub fn skills(&self) -> &[tcode_tools::Skill] {

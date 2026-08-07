@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({ invoke: vi.fn() }));
-vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
+vi.mock("@ipc", () => ({ invoke: mocks.invoke }));
 
 import { FIT_ASPECT, FIT_VIEWPORT, Framed, fit } from "./Framed";
 

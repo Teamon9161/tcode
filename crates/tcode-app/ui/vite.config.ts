@@ -51,16 +51,40 @@ export default defineConfig(({ mode }) => {
     // string — a srcdoc frame inherits this page's CSP and, being an opaque
     // origin, then cannot run any script at all (see
     // `src/sandbox/protocol.ts`).
-    build: { outDir: "dist", emptyOutDir: true },
+    build: {
+      outDir: "dist",
+      emptyOutDir: true,
+      // Fonts stay files, however small.
+      //
+      // Vite inlines any asset under 4 kB as a `data:` URI, and the smaller
+      // subsets of a variable font are under it — which puts them straight into
+      // `@font-face` as `data:font/woff2;…` and straight into the app's CSP,
+      // where `default-src 'self'` blocks them. The failure is silent in the
+      // worst way: no missing file, no failed request, just a fallback face
+      // rendering and a console message nobody reads. It was there before
+      // Electron and would have stayed there.
+      //
+      // The alternative was `font-src 'self' data:`, and it is the wrong one.
+      // `data:` appears in this policy exactly once, for `img-src`, because a
+      // pasted screenshot has nowhere else to live (`paste.ts`); every other
+      // byte the app loads is its own, and a build setting is the cheaper thing
+      // to change than the sentence that says so.
+      assetsInlineLimit: (file) => (file.endsWith(".woff2") || file.endsWith(".woff") ? false : undefined),
+    },
+    // `@ipc` is the whole seam (`src/ipc.ts`), so swapping that one specifier
+    // is what puts the design preview on fixtures. It is a bare specifier
+    // rather than a relative path precisely so it *can* be aliased: relative
+    // imports resolve before an alias ever sees them, and the rule that
+    // fixtures never reach the shipped bundle depends on this being the only
+    // switch.
+    //
+    // **One entry, and that is the finished shape.** There used to be two more
+    // for the window controls and the folder dialog, which reached their shells
+    // directly; they are commands now, answered by whichever shell is hosting
+    // the app, so there is nothing left that a second alias could stand in for.
+    // A new one here means something bypassed the seam.
     resolve: {
-      alias: preview
-        ? {
-            "@tauri-apps/api/core": "/src/preview/mock-core.ts",
-            "@tauri-apps/api/event": "/src/preview/mock-event.ts",
-            "@tauri-apps/api/window": "/src/preview/mock-window.ts",
-            "@tauri-apps/plugin-dialog": "/src/preview/mock-dialog.ts",
-          }
-        : {},
+      alias: { "@ipc": preview ? "/src/preview/mock-ipc.ts" : "/src/ipc.ts" },
     },
   };
 });

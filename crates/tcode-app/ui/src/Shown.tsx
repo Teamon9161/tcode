@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@ipc";
 
 import { RefreshIcon } from "./components/Icons";
 import { FileBody } from "./FileBody";

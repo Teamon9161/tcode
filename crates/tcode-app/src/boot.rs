@@ -33,6 +33,10 @@ pub struct Startup {
 /// because one kind of file cannot be displayed would be trading the whole
 /// tool for a feature. The failure is carried instead of dropped so the pane
 /// that needs it can say what happened rather than staying blank.
+/// `Clone` because `dispatch::Ctx` holds one and the shell also keeps the
+/// original: an `Arc` and a message either way, so there is one server no
+/// matter how many handles name it.
+#[derive(Clone)]
 pub struct ServeHandle(pub Result<Arc<crate::serve::Serve>, String>);
 
 impl ServeHandle {

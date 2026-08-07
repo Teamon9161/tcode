@@ -176,12 +176,13 @@ export function WebPane({
   /**
    * Close a tab, and the pane with it when it was the last one.
    *
-   * A browser with no tabs is not a state anybody asked for, and it is also not
-   * a state this app can be in: the last webview is blanked rather than
-   * destroyed, because it holds the profile every login lives in
-   * (`browser.rs`). So closing the last tab leaves the strip with one blank tab
-   * and takes the pane off screen — which is where a re-open starts, exactly
-   * where a new browser starts.
+   * A browser with no tabs is not a state anybody asked for, so closing the
+   * last tab takes the pane off screen — which is where a re-open starts,
+   * exactly where a new browser starts. What the strip is left holding is the
+   * shell's answer and not this component's assumption: a blank tab under
+   * Tauri, where the last webview owns the profile and is never destroyed, and
+   * nothing at all under Electron, where it does not (`webHost.ts::close`).
+   * Either way the pane goes, which is the only part this decides.
    */
   const closeTab = (id: string) => {
     const last = browser.isLast(id);

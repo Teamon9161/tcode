@@ -705,6 +705,17 @@ export async function invoke<T>(
   args?: Record<string, unknown>,
 ): Promise<T> {
   switch (command) {
+    // The shell's own verbs. The title bar is part of the layout, so the
+    // preview has to draw it; there is no window behind it in a browser tab,
+    // so acting is a no-op and the state is the one a window starts in.
+    case "window_is_maximized":
+      return false as T;
+    case "window_minimize":
+    case "window_toggle_maximize":
+    case "window_close":
+      return undefined as T;
+    case "dialog_open_folder":
+      return "/home/teamon/code/rust/tcode" as T;
     case "project_list":
       return PROJECTS as T;
     case "project_sessions":

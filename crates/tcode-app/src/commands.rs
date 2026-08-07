@@ -1,15 +1,22 @@
-//! Tauri commands: the webview's half of the contract.
+//! The commands: the frontend's half of the contract.
 //!
 //! These are thin on purpose. Each one validates its arguments, then hands off
 //! to [`crate::state`] — so the logic worth testing is reachable without a
 //! window, and everything here is the part that only exists because the
 //! frontend is out of process.
+//!
+//! **Nothing here knows which shell is drawing the window.** They are ordinary
+//! functions taking what they need and returning `Result<_, String>`; the
+//! argument-by-name and serialization that `#[tauri::command]` used to generate
+//! is [`crate::dispatch`], which is also what lets a JSON-RPC line on stdin
+//! reach them. The `browser_*` verbs are not here at all for the same reason:
+//! a browser tab is a native view, so they live with whoever owns the views
+//! (`crate::browser::commands`, and `MIGRATION-ELECTRON.md` on where they go).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Serialize;
-use tauri::{AppHandle, State};
 
 use tcode_core::ContentBlock;
 
@@ -30,7 +37,6 @@ pub struct ClipboardImage {
 
 /// Read an image from the native clipboard when the webview cannot materialize
 /// its promised image MIME type as a DOM file.
-#[tauri::command]
 pub fn clipboard_image() -> Result<Option<ClipboardImage>, String> {
     let mut clipboard = arboard::Clipboard::new()
         .map_err(|error| format!("cannot open the system clipboard: {error}"))?;
@@ -169,8 +175,7 @@ const RETIRED_NAMES: &[(&str, &str)] = &[
     ("task", "agent"),
 ];
 
-#[tauri::command]
-pub fn tool_views(supervisor: State<'_, Arc<Supervisor>>) -> Vec<ToolViewMeta> {
+pub fn tool_views(supervisor: &Arc<Supervisor>) -> Vec<ToolViewMeta> {
     tool_view_metas(&supervisor.agent().tools)
 }
 
@@ -246,8 +251,7 @@ impl PlanView {
 /// The webview asks for this after every `progress` call, when a turn ends, and
 /// when an approval arrives — the three moments a plan can have changed. It is
 /// deliberately not polled: nothing here changes on its own.
-#[tauri::command]
-pub fn plan(supervisor: State<'_, Arc<Supervisor>>, session: String) -> Option<PlanView> {
+pub fn plan(supervisor: &Arc<Supervisor>, session: String) -> Option<PlanView> {
     let handle = supervisor.get(&session)?;
     handle.plan().as_ref().map(PlanView::of)
 }
@@ -258,9 +262,8 @@ pub fn plan(supervisor: State<'_, Arc<Supervisor>>, session: String) -> Option<P
 /// and it is a legal one: the file is the user's. The model finds out the same
 /// way it finds out about an edit made in `$EDITOR` — its next `progress` call
 /// is handed their version.
-#[tauri::command]
 pub fn write_plan(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     phases: serde_json::Value,
 ) -> Result<PlanView, String> {
@@ -282,17 +285,16 @@ pub fn write_plan(
 /// active, and adopting a draft would hand the new session a plan nobody
 /// approved. The state check below is that ordering made explicit rather than
 /// assumed.
-#[tauri::command]
 pub fn execute_plan_elsewhere(
-    app: AppHandle,
-    supervisor: State<'_, Arc<Supervisor>>,
+    emit: &Arc<dyn Emit>,
+    supervisor: &Arc<Supervisor>,
     session: String,
 ) -> Result<OpenedSession, String> {
-    let (handle, instructions) = crate::state::hand_off_plan(&supervisor, &session)?;
+    let (handle, instructions) = crate::state::hand_off_plan(supervisor, &session)?;
     let agent = supervisor.agent();
     let opened = OpenedSession::of(&handle, &agent);
-    let emit: Arc<dyn Emit> = Arc::new(app);
-    tauri::async_runtime::spawn(async move {
+    let emit = emit.clone();
+    tokio::spawn(async move {
         if let Err(error) = run_turn(
             agent,
             handle.clone(),
@@ -311,8 +313,7 @@ pub fn execute_plan_elsewhere(
     Ok(opened)
 }
 
-#[tauri::command]
-pub fn sessions(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SessionInfo> {
+pub fn sessions(supervisor: &Arc<Supervisor>) -> Vec<SessionInfo> {
     supervisor
         .ids()
         .into_iter()
@@ -341,7 +342,6 @@ pub struct ProjectList {
 /// panes — for as long as the read took. `spawn_blocking` and not `spawn`,
 /// because this is file IO and the runtime it would otherwise sit on is the
 /// one carrying every running turn.
-#[tauri::command]
 pub async fn project_list() -> Result<ProjectList, String> {
     let home = tcode_core::home_dir().ok_or("cannot locate the home directory")?;
     let read = move || ProjectList {
@@ -349,7 +349,7 @@ pub async fn project_list() -> Result<ProjectList, String> {
         now: projects::now_unix(),
         home: home.display().to_string(),
     };
-    tauri::async_runtime::spawn_blocking(read)
+    tokio::task::spawn_blocking(read)
         .await
         .map_err(|error| format!("cannot read the project list: {error}"))
 }
@@ -358,17 +358,15 @@ pub async fn project_list() -> Result<ProjectList, String> {
 /// [`project_list`] because it replays every log to build previews —
 /// affordable for the one project a reader opened in the rail, not for all of
 /// them on every launch.
-#[tauri::command]
 pub async fn project_sessions(path: String) -> Result<Vec<StoredSession>, String> {
-    tauri::async_runtime::spawn_blocking(move || projects::sessions(Path::new(&path)))
+    tokio::task::spawn_blocking(move || projects::sessions(Path::new(&path)))
         .await
         .map_err(|error| format!("cannot read this project's conversations: {error}"))
 }
 
 /// Open a folder as a session, optionally resuming one of its logs.
-#[tauri::command]
 pub fn open_folder(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     path: String,
     resume: Option<String>,
 ) -> Result<OpenedSession, String> {
@@ -389,8 +387,7 @@ pub fn open_folder(
 }
 
 /// Close a session, cancelling its turn if one is running.
-#[tauri::command]
-pub fn close_session(supervisor: State<'_, Arc<Supervisor>>, session: String) {
+pub fn close_session(supervisor: &Arc<Supervisor>, session: String) {
     supervisor.close(&session);
 }
 
@@ -471,14 +468,13 @@ const COMPLETION_LIMIT: usize = 12;
 /// somebody is typing, and the main thread is the one drawing the window (see
 /// AGENTS.md rule 22). A directory read that blocks it would stall the caret in
 /// the field that asked for it.
-#[tauri::command]
 pub async fn workspace_complete(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     prefix: String,
 ) -> Result<Vec<WorkspaceEntryView>, String> {
-    let workspace = session_workspace(&supervisor, &session)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let workspace = session_workspace(supervisor, &session)?;
+    tokio::task::spawn_blocking(move || {
         workspace
             .complete(&prefix, COMPLETION_LIMIT)
             .into_iter()
@@ -495,14 +491,13 @@ pub async fn workspace_complete(
 ///
 /// The whole draft is asked about in one call and answered off the main thread,
 /// for the same reason as `workspace_complete`: this runs while somebody types.
-#[tauri::command]
 pub async fn workspace_present(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     paths: Vec<String>,
 ) -> Result<Vec<String>, String> {
-    let workspace = session_workspace(&supervisor, &session)?;
-    tauri::async_runtime::spawn_blocking(move || {
+    let workspace = session_workspace(supervisor, &session)?;
+    tokio::task::spawn_blocking(move || {
         paths
             .into_iter()
             .filter(|path| workspace.exists(path))
@@ -513,39 +508,36 @@ pub async fn workspace_present(
 }
 
 /// List the direct children of the session workspace root or one of its directories.
-#[tauri::command]
 pub fn workspace_list(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: Option<String>,
 ) -> Result<Vec<WorkspaceEntryView>, String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .list(path.as_deref())
         .map(|entries| entries.into_iter().map(WorkspaceEntryView::from).collect())
         .map_err(|error| error.to_string())
 }
 
 /// Read a UTF-8 text file from the session workspace.
-#[tauri::command]
 pub fn workspace_read_text(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
 ) -> Result<WorkspaceTextView, String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .read(&path)
         .map(WorkspaceTextView::from)
         .map_err(|error| error.to_string())
 }
 
 /// Read a file from the session workspace as a `data:` URL.
-#[tauri::command]
 pub fn workspace_read_binary(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
 ) -> Result<WorkspaceBinaryView, String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .read_binary(&path)
         .map(|file| WorkspaceBinaryView {
             url: data_url(Path::new(&file.path), &file.data),
@@ -556,30 +548,28 @@ pub fn workspace_read_binary(
 }
 
 /// Write a UTF-8 text file when its revision still matches.
-#[tauri::command]
 pub fn workspace_write_text(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
     text: String,
     revision: String,
 ) -> Result<WorkspaceTextView, String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .write(&path, &text, &revision)
         .map(WorkspaceTextView::from)
         .map_err(|error| error.to_string())
 }
 
 /// Create an empty file or directory under the session workspace.
-#[tauri::command]
 pub fn workspace_create(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     parent: Option<String>,
     name: String,
     kind: String,
 ) -> Result<WorkspaceEntryView, String> {
-    let workspace = session_workspace(&supervisor, &session)?;
+    let workspace = session_workspace(supervisor, &session)?;
     create_workspace_entry(&workspace, parent.as_deref(), &name, &kind)
 }
 
@@ -606,14 +596,13 @@ fn create_workspace_entry(
 }
 
 /// Rename a file or directory without moving it from its parent directory.
-#[tauri::command]
 pub fn workspace_rename(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
     name: String,
 ) -> Result<WorkspaceEntryView, String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .rename(&path, &name)
         .map(WorkspaceEntryView::from)
         .map_err(|error| error.to_string())
@@ -631,7 +620,6 @@ pub struct OpenerView {
 /// Read once per menu rather than at startup: an editor installed while the app
 /// was running should turn up without a restart, and the probe is a handful of
 /// `stat` calls.
-#[tauri::command]
 pub fn workspace_openers() -> Vec<OpenerView> {
     crate::openers::available()
         .into_iter()
@@ -648,27 +636,25 @@ pub fn workspace_openers() -> Vec<OpenerView> {
 /// in `openers.rs` and an id that is not in it is refused (rule 3). The path is
 /// resolved through the same confinement as every read, so this cannot reach
 /// outside the session's workspace whatever the webview says.
-#[tauri::command]
 pub fn workspace_open_external(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
     opener: String,
 ) -> Result<(), String> {
-    let resolved = session_workspace(&supervisor, &session)?
+    let resolved = session_workspace(supervisor, &session)?
         .host_path(&path)
         .map_err(|error| error.to_string())?;
     crate::openers::open(&opener, &resolved)
 }
 
 /// Delete a file, link, or empty directory from the session workspace.
-#[tauri::command]
 pub fn workspace_delete(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
 ) -> Result<(), String> {
-    session_workspace(&supervisor, &session)?
+    session_workspace(supervisor, &session)?
         .delete(&path)
         .map_err(|error| error.to_string())
 }
@@ -756,8 +742,7 @@ pub struct SlashCommandView {
 /// did not make them unavailable, it made them undiscoverable: a person had to
 /// already know the name to type it. The dispatcher below reads this same
 /// list, so the menu still cannot advertise something it would refuse.
-#[tauri::command]
-pub fn slash_commands(supervisor: State<'_, Arc<Supervisor>>) -> Vec<SlashCommandView> {
+pub fn slash_commands(supervisor: &Arc<Supervisor>) -> Vec<SlashCommandView> {
     tcode_core::commands::CommandRegistry::builtin()
         .entries()
         .filter(|(name, _)| DESKTOP_COMMANDS.contains(&name.trim_start_matches('/')))
@@ -790,17 +775,16 @@ fn slash_parts(line: &str) -> Option<(&str, &str)> {
 /// A line that is no command falls back to the skill table, exactly as
 /// `App::dispatch_skill` does in the terminal: `/name` is shorthand for loading
 /// that skill. The fallback is last, so a skill can never shadow a command.
-#[tauri::command]
 pub fn slash_command(
-    app: AppHandle,
-    supervisor: State<'_, Arc<Supervisor>>,
+    emit: &Arc<dyn Emit>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     line: String,
 ) -> Result<SlashResult, String> {
     match slash_parts(&line) {
         Some((name, _)) if DESKTOP_COMMANDS.contains(&name) => {}
         Some((name, args)) if supervisor.skills().iter().any(|skill| skill.name == name) => {
-            return load_skill(app, &supervisor, &session, name, args)
+            return load_skill(emit, supervisor, &session, name, args)
         }
         Some(_) => {
             return Err(format!(
@@ -839,8 +823,8 @@ pub fn slash_command(
                     .get(&session)
                     .ok_or_else(|| format!("session '{session}' is not open"))?;
                 let agent = supervisor.agent();
-                let emit: Arc<dyn Emit> = Arc::new(app);
-                tauri::async_runtime::spawn(async move {
+                let emit = emit.clone();
+                tokio::spawn(async move {
                     if let Err(error) =
                         run_compact(agent, handle.clone(), emit.clone(), focus).await
                     {
@@ -920,7 +904,7 @@ pub fn skill_prompt(
 /// not a turn is in flight — a prompt queues, where a registry command would
 /// need the `&mut Session` a running turn holds.
 fn load_skill(
-    app: AppHandle,
+    emit: &Arc<dyn Emit>,
     supervisor: &Supervisor,
     session: &str,
     name: &str,
@@ -935,7 +919,7 @@ fn load_skill(
     let prompt = crate::state::folded_prompt(&text)
         .expect("a wrapped skill echo is what `folded_prompt` recognizes");
     let queued = deliver(
-        app,
+        emit,
         supervisor.agent(),
         handle,
         tcode_core::PendingMessage {
@@ -955,7 +939,7 @@ fn load_skill(
 /// Returns the queue as it now stands, so an empty answer means "this is being
 /// sent" and a non-empty one is exactly what to draw above the composer.
 fn deliver(
-    app: AppHandle,
+    emit: &Arc<dyn Emit>,
     agent: Arc<tcode_core::Agent>,
     handle: Arc<crate::state::SessionHandle>,
     message: tcode_core::PendingMessage,
@@ -964,8 +948,8 @@ fn deliver(
         return queue_of(&handle);
     };
     let (input, instructions) = (message.blocks, message.instructions);
-    let emit: Arc<dyn Emit> = Arc::new(app);
-    tauri::async_runtime::spawn(async move {
+    let emit = emit.clone();
+    tokio::spawn(async move {
         if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
         {
             // `Busy` still reaches here: `send_or_queue` closed the ordinary
@@ -994,15 +978,19 @@ fn deliver(
 /// events, and the webview must stay responsive to answer the approvals this
 /// very turn may raise.
 ///
-/// The task goes on `tauri::async_runtime`, not `tokio::spawn`. A sync command
-/// runs on the main thread, where no Tokio runtime is guaranteed to be entered
-/// — `tokio::spawn` there panics, and a panicking command is an `invoke` that
-/// never settles, which the frontend can only render as a turn that started
-/// and produced nothing.
-#[tauri::command]
+/// The task goes on `tokio::spawn`, and that only became safe when every
+/// command started arriving through one async entry point (`dispatch::Registry`
+/// awaited from a single `rpc` command, or from the sidecar's read loop). It
+/// used to be `tauri::async_runtime::spawn`, for a reason worth keeping: a
+/// *sync* `#[tauri::command]` runs on the main thread, where no Tokio runtime is
+/// guaranteed to be entered, and `tokio::spawn` there panics — a panicking
+/// command is an `invoke` that never settles, which the frontend can only render
+/// as a turn that started and produced nothing. There is no longer a path that
+/// reaches this function from outside a runtime; if one is ever added, this is
+/// the failure it produces.
 pub fn send_message(
-    app: AppHandle,
-    supervisor: State<'_, Arc<Supervisor>>,
+    emit: &Arc<dyn Emit>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     text: String,
     images: Option<Vec<ImageInput>>,
@@ -1032,7 +1020,7 @@ pub fn send_message(
     // `Entry::Instruction` immediately before the prompt when it delivers, so
     // "plan this first" means the same thing whether the turn was free or busy.
     Ok(deliver(
-        app,
+        emit,
         agent,
         handle,
         tcode_core::PendingMessage {
@@ -1047,11 +1035,7 @@ pub fn send_message(
 /// What this conversation still owes the model, for the strip above the
 /// composer. Read rather than pushed: the queue is the backend's, and a webview
 /// mirror would be a second answer to "what have I got waiting".
-#[tauri::command]
-pub fn queued(
-    supervisor: State<'_, Arc<Supervisor>>,
-    session: String,
-) -> Result<Vec<QueuedView>, String> {
+pub fn queued(supervisor: &Arc<Supervisor>, session: String) -> Result<Vec<QueuedView>, String> {
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
@@ -1064,9 +1048,8 @@ pub fn queued(
 /// webview and a stale index alone would remove whatever now sits at that
 /// position (AGENTS.md rule 3). A mismatch removes nothing and the answer shows
 /// the caller why.
-#[tauri::command]
 pub fn withdraw_queued(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     index: usize,
     text: String,
@@ -1084,9 +1067,8 @@ pub fn withdraw_queued(
 /// turn would have delivered it. This is the "no, do this instead" button, and
 /// the follow-up turn is started by `run_turn` itself once the cancelled one has
 /// let go of the session.
-#[tauri::command]
 pub fn interrupt_and_send(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     turn: u64,
 ) -> Result<bool, String> {
@@ -1115,9 +1097,8 @@ pub struct RewindTargetView {
 /// other. A prompt this fails to match simply gets no button, and `rewind`
 /// re-checks the index against this same list anyway — the failure mode is a
 /// missing affordance, never a truncation somewhere nobody asked for.
-#[tauri::command]
 pub fn rewind_targets(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
 ) -> Result<Vec<RewindTargetView>, String> {
     let handle = supervisor
@@ -1147,9 +1128,8 @@ pub struct RewindPreview {
     pub dropped: usize,
 }
 
-#[tauri::command]
 pub fn rewind_preview(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     entry_index: usize,
 ) -> Result<RewindPreview, String> {
@@ -1196,9 +1176,8 @@ pub struct Rewound {
     pub restored: Vec<RestoredFile>,
 }
 
-#[tauri::command]
 pub fn rewind(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     entry_index: usize,
     restore_files: bool,
@@ -1335,9 +1314,8 @@ const VIEWER_IMAGE_BUDGET: u64 = 4 * tcode_tools::VIEWER_TEXT_BUDGET;
 /// re-checked against the session's own folder here rather than trusted because
 /// the tool checked it earlier. The two share one definition of the boundary
 /// (`tcode_tools::is_viewable_path`) so they cannot drift into disagreeing.
-#[tauri::command]
 pub fn shown_file(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
     binary: bool,
@@ -1348,115 +1326,6 @@ pub fn shown_file(
     load_shown(Path::new(&path), &handle.cwd, binary)
 }
 
-/// The window's browser, as a small set of verbs over its native child webviews.
-///
-/// These take `AppHandle` where the rest of this file takes `Supervisor`, and
-/// that is the documented exception rather than drift: a child webview is a
-/// window's child and has no headless form (see `browser.rs`). What *can* be
-/// decided without a window — turning what somebody typed into a URL — is
-/// `browser::to_url`, a pure function with its own tests.
-///
-/// Every verb below the first takes an `id`: one tab is one webview, and the
-/// tab a keystroke belongs to is rarely the only one open. The id comes from
-/// the webview and is therefore data (rule 3) — `browser.rs` answers "that
-/// browser tab is not open" rather than falling back to the current one, which
-/// would mean reloading or closing a page nobody pointed at.
-///
-/// `browser_open` is `async` on purpose. Tauri's `Window::add_child` documents
-/// that on Windows it deadlocks when called from a synchronous command or event
-/// handler (the IPC callback runs on the main thread, WebView2 controller
-/// creation needs the browser process, and the browser process is waiting for
-/// that same IPC call to return). An async command runs on the runtime's thread
-/// pool, so `add_child` posts its creation work to the main thread instead of
-/// running it inline, and nothing waits on itself. The other browser verbs
-/// navigate or resize an existing webview and never create one, so they stay
-/// synchronous.
-#[tauri::command]
-pub async fn browser_open(
-    app: tauri::AppHandle,
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    rect: crate::browser::Rect,
-) -> Result<String, String> {
-    browser.open(&app, rect)
-}
-
-/// The pane is back on screen with tabs already open — put the current one
-/// where it belongs and show it again.
-#[tauri::command]
-pub fn browser_show(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    rect: crate::browser::Rect,
-) -> Result<(), String> {
-    browser.show(rect)
-}
-
-/// Bring one tab to the front.
-#[tauri::command]
-pub fn browser_select(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    id: String,
-) -> Result<(), String> {
-    browser.select(&id)
-}
-
-/// Follow the pane. Called for every layout change, including each frame of a
-/// divider drag, so it stays a bare setter.
-#[tauri::command]
-pub fn browser_bounds(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    rect: crate::browser::Rect,
-) -> Result<(), String> {
-    browser.bounds(rect)
-}
-
-/// Give the window back to the HTML for a moment — see `Browser::visible`.
-#[tauri::command]
-pub fn browser_visible(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    visible: bool,
-) -> Result<(), String> {
-    browser.visible(visible)
-}
-
-/// What the user typed in the address bar. It is data (rule 3): `to_url`
-/// refuses what it cannot read rather than guessing a search query out of it.
-#[tauri::command]
-pub fn browser_navigate(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    id: String,
-    url: String,
-) -> Result<(), String> {
-    browser.navigate(&id, &url)
-}
-
-#[tauri::command]
-pub fn browser_step(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    id: String,
-    delta: i32,
-) -> Result<(), String> {
-    browser.step(&id, delta)
-}
-
-#[tauri::command]
-pub fn browser_reload(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    id: String,
-) -> Result<(), String> {
-    browser.reload(&id)
-}
-
-/// Close one tab. Answers `false` when it was the last one and has been blanked
-/// rather than destroyed — see `browser.rs` on why the profile's webview
-/// outlives every tab.
-#[tauri::command]
-pub fn browser_close(
-    browser: State<'_, Arc<crate::browser::Browser>>,
-    id: String,
-) -> Result<bool, String> {
-    browser.close(&id)
-}
-
 /// Start a shell for a new terminal tab.
 ///
 /// The folder is data (rule 3) and takes the same canonicalizing path every
@@ -1465,32 +1334,29 @@ pub fn browser_close(
 /// permission question here — but there is still a "does this folder exist"
 /// question, and answering it here beats a shell that starts in `/` because its
 /// `cwd` was rejected silently.
-#[tauri::command]
 pub fn terminal_open(
-    app: AppHandle,
-    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    emit: &Arc<dyn Emit>,
+    terminals: &Arc<crate::terminal::Terminals>,
     cwd: String,
     cols: u16,
     rows: u16,
 ) -> Result<String, String> {
     let dir = crate::paths::canonical_dir(Path::new(&cwd))
         .map_err(|error| format!("cannot open a terminal in {cwd}: {error}"))?;
-    terminals.open(Arc::new(app), &dir, cols, rows)
+    terminals.open(emit.clone(), &dir, cols, rows)
 }
 
 /// Keystrokes, base64. See `terminal.rs` for why they are not a string.
-#[tauri::command]
 pub fn terminal_write(
-    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    terminals: &Arc<crate::terminal::Terminals>,
     id: String,
     data: String,
 ) -> Result<(), String> {
     terminals.write(&id, &data)
 }
 
-#[tauri::command]
 pub fn terminal_resize(
-    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    terminals: &Arc<crate::terminal::Terminals>,
     id: String,
     cols: u16,
     rows: u16,
@@ -1498,9 +1364,8 @@ pub fn terminal_resize(
     terminals.resize(&id, cols, rows)
 }
 
-#[tauri::command]
 pub fn terminal_close(
-    terminals: State<'_, Arc<crate::terminal::Terminals>>,
+    terminals: &Arc<crate::terminal::Terminals>,
     id: String,
 ) -> Result<(), String> {
     terminals.close(&id)
@@ -1517,10 +1382,9 @@ pub fn terminal_close(
 ///
 /// The path is data (AGENTS.md rule 3) and is re-checked here through the same
 /// boundary as every other read, inside `Serve::url`.
-#[tauri::command]
 pub fn serve_url(
-    supervisor: State<'_, Arc<Supervisor>>,
-    serve: State<'_, crate::boot::ServeHandle>,
+    supervisor: &Arc<Supervisor>,
+    serve: &crate::boot::ServeHandle,
     session: String,
     path: String,
 ) -> Result<String, String> {
@@ -1628,9 +1492,8 @@ fn media_type(path: &Path) -> &'static str {
 /// Everything the composer's chips show. Read together because a preset moves
 /// the model, which moves the effort — three commands would let the strip
 /// render a state that never existed.
-#[tauri::command]
 pub fn picker_state(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
 ) -> Result<crate::picker::PickerState, String> {
     let (mode, staged) = match supervisor.get(&session) {
@@ -1648,9 +1511,8 @@ pub fn picker_state(
     ))
 }
 
-#[tauri::command]
 pub fn choose_model(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     index: usize,
     effort: Option<String>,
 ) -> Result<(), String> {
@@ -1667,20 +1529,15 @@ pub fn choose_model(
     )
 }
 
-#[tauri::command]
-pub fn choose_preset(
-    supervisor: State<'_, Arc<Supervisor>>,
-    key: String,
-) -> Result<String, String> {
+pub fn choose_preset(supervisor: &Arc<Supervisor>, key: String) -> Result<String, String> {
     let menus = supervisor.menus();
     let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
     crate::picker::choose_preset(&mut menus, &key)
 }
 
 /// Pin one sub-agent or helper role to a model, to the main model, or off.
-#[tauri::command]
 pub fn pin_role(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     kind: String,
     pin: crate::picker::PinChoice,
 ) -> Result<String, String> {
@@ -1690,8 +1547,7 @@ pub fn pin_role(
 }
 
 /// Capture the live line-up as `[presets.<name>]`.
-#[tauri::command]
-pub fn save_preset(supervisor: State<'_, Arc<Supervisor>>, name: String) -> Result<(), String> {
+pub fn save_preset(supervisor: &Arc<Supervisor>, name: String) -> Result<(), String> {
     let menus = supervisor.menus();
     let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
     crate::picker::save_preset(&mut menus, &supervisor.agent().model, name.trim())
@@ -1703,9 +1559,8 @@ pub fn save_preset(supervisor: State<'_, Arc<Supervisor>>, name: String) -> Resu
 /// allowed to do without asking, and two folders open side by side routinely
 /// deserve different answers. It is still remembered as the default for new
 /// sessions, which is the part `[tcode_state]` holds.
-#[tauri::command]
 pub fn choose_mode(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     mode: String,
 ) -> Result<(), String> {
@@ -1727,9 +1582,8 @@ pub fn choose_mode(
 }
 
 /// Answer an approval the agent is parked on.
-#[tauri::command]
 pub fn respond_approval(
-    supervisor: State<'_, Arc<Supervisor>>,
+    supervisor: &Arc<Supervisor>,
     session: String,
     answer: ApprovalAnswer,
 ) -> Result<(), String> {
@@ -1745,8 +1599,7 @@ pub fn respond_approval(
 }
 
 /// Stop the running turn. Safe to call when nothing is running.
-#[tauri::command]
-pub fn interrupt(supervisor: State<'_, Arc<Supervisor>>, session: String) -> Result<(), String> {
+pub fn interrupt(supervisor: &Arc<Supervisor>, session: String) -> Result<(), String> {
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;

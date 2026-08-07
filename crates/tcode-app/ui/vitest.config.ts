@@ -6,5 +6,8 @@ import { defineConfig } from "vite";
 // else — no Tauri, no network.
 export default defineConfig({
   plugins: [react()],
+  // Tests double `@ipc` with `vi.mock`, but the specifier still has to resolve
+  // for the module graph to load at all.
+  resolve: { alias: { "@ipc": "/src/ipc.ts" } },
   test: { environment: "jsdom", include: ["src/**/*.test.{ts,tsx}"] },
 });

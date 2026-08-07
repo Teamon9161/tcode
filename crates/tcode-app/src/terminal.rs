@@ -334,11 +334,9 @@ mod tests {
     /// backend emits fine, and the terminal simply stays blank.
     #[test]
     fn the_event_names_match_the_frontends() {
-        let types = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ui/src/types.ts"
-        ))
-        .expect("ui/src/types.ts");
+        let types =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/types.ts"))
+                .expect("ui/src/types.ts");
 
         for name in [TERMINAL_OUTPUT, TERMINAL_EXIT] {
             assert!(
@@ -354,13 +352,15 @@ mod tests {
     /// is invisible from either side on its own.
     #[test]
     fn every_terminal_command_the_frontend_calls_is_registered() {
-        let host = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/ui/src/termHost.ts"
-        ))
-        .expect("ui/src/termHost.ts");
-        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-            .expect("src/main.rs");
+        let host =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/termHost.ts"))
+                .expect("ui/src/termHost.ts");
+        // The registry itself, not the text of the file that builds it. This
+        // used to grep `main.rs` for `commands::terminal_open,` because that
+        // list *was* the registration; now `dispatch::Registry` is, so the test
+        // can ask the real table instead of a source file that happens to
+        // mention the name.
+        let registered = crate::dispatch::Registry::builtin().names();
 
         // Every `invoke("terminal_…")` in the store, whatever it is called.
         let called: Vec<&str> = host
@@ -379,8 +379,8 @@ mod tests {
 
         for command in called {
             assert!(
-                main.contains(&format!("commands::{command},")),
-                "termHost.ts calls `{command}` but main.rs does not register it — the call will \
+                registered.contains(&command),
+                "termHost.ts calls `{command}` but the registry does not have it — the call will \
                  reject and the terminal will look inert"
             );
         }

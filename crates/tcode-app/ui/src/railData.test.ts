@@ -8,7 +8,7 @@ import {
   railBands,
   sessionTitle,
   type FoundSession,
-} from "./rail";
+} from "./railData";
 
 const session = (id: string, cwd: string, name: string): SessionInfo => ({
   id,

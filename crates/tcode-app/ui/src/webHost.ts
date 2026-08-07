@@ -1,5 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { invoke, listen } from "@ipc";
 
 import {
   addTab,
@@ -211,13 +210,16 @@ export function step(delta: number) {
 /**
  * Closes a tab and the page in it.
  *
- * The backend answers whether the webview is gone. It says no for the last one:
- * that webview holds the browser's profile and is never destroyed, so closing
- * the last tab blanks it instead (`browser.rs` explains what re-opening the
- * profile folder costs). The strip says whichever of the two happened rather
- * than deciding for itself — one of them is a tab that disappears, the other a
- * tab back at "New tab", and guessing wrong leaves the strip describing a
- * browser that is not there.
+ * The shell answers whether the view is gone, **and the two shells answer
+ * differently** — which is exactly why this asks instead of deciding. Under
+ * Tauri the last webview holds the browser's profile and is never destroyed, so
+ * closing the last tab blanks it and the answer is `false` (`browser.rs`
+ * explains what re-opening the profile folder costs). Under Electron the
+ * profile belongs to a session partition rather than to a view, so every tab
+ * closes for real and the answer is always `true` (`electron/browser.js`).
+ *
+ * One of those is a tab that disappears and the other a tab back at "New tab";
+ * guessing wrong leaves the strip describing a browser that is not there.
  */
 export function close(id: string) {
   const wasCurrent = state.tabs.current === id;

@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@ipc";
 
 import type { ProjectList } from "./types";
 import { useSeat } from "./seat";
-import { find, foundKey, type Found, type FoundSession } from "./rail";
+import { find, foundKey, type Found, type FoundSession } from "./railData";
 import { Path } from "./components/Path";
 import { StatusDot } from "./components/Status";
 import { SearchIcon } from "./components/Icons";

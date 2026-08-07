@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { invoke } from "@tauri-apps/api/core";
+import { invoke } from "@ipc";
 
 import type { Status, StoredSession } from "./types";
 import type { SessionState } from "./session";
-import type { RailGroup } from "./rail";
-import { sessionTitle } from "./rail";
+import type { RailGroup } from "./railData";
+import { sessionTitle } from "./railData";
 import { statusLabel } from "./activity";
 import { ago } from "./time";
 import { useSeat } from "./seat";

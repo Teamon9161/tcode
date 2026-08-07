@@ -17,6 +17,18 @@ TCODE_BROWSER_DEBUG=1 ./target/debug/tcode-app   # 加上浏览器窗格的几�
 (cd ui && npm run preview:ui)             # 设计预览：浏览器里看全部界面状态
 ```
 
+**现在有两个壳，迁移期内都必须能跑**（`MIGRATION-ELECTRON.md`）。Electron 那个还没有浏览器窗格：
+
+```bash
+cd crates/tcode-app
+cargo build --bin tcode-sidecar           # 后端作为子进程；Electron 壳找 target/{debug,release}/
+(cd ui && npm run build)                  # Electron 只加载 ui/dist，没有 dev server 那条路
+(cd electron && npm install)              # 首次
+(cd electron && TCODE_CWD=/要打开的文件夹 npm start)
+```
+
+`TCODE_CWD` 不设时用 `process.cwd()`，也就是 `electron/` 自己——那是个能用但没意思的文件夹。`TCODE_SIDECAR` 可以指定 sidecar 路径。**sidecar 的 stdout 只发 JSON 帧**，诊断一律 `eprintln!`；一句 `println!` 会插进帧中间（`src/sidecar.rs`）。Electron 主进程把 sidecar 的 stderr、renderer 的 error 级 console 和加载失败都转到自己的终端，因为无边框窗口默认没有 devtools 可开。
+
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 
 **改界面先开 `npm run preview:ui`。** 它用 vite 的 `--mode preview` 把 `@tauri-apps/api/*` 与 dialog 插件别名到 `ui/src/preview/` 下的 fixture，然后加载 `preview.html`，把**真实组件**（不是另画一套 mock）按 rail / session / approval / question / plan / split / shown / web / terminal / empty 这些场景摆出来。没有它，"跑起来的会话正在等审批"这类状态要复现一次得起真 provider 打真 API。别把 mock 引进 `main.tsx` 那条路径——别名只在这个 mode 下生效，发布产物里没有它们。
@@ -33,10 +45,12 @@ TCODE_BROWSER_DEBUG=1 ./target/debug/tcode-app   # 加上浏览器窗格的几�
 2. **一切逻辑写在 `Emit` 上，不写在 `AppHandle` 上**。跑 turn 的路径必须能在没有窗口时被测试驱动（`tests/bridge.rs` 用 collector 顶替 webview）。要 `AppHandle` 才能做的事只允许出现在 `main.rs` 与 `impl Emit for AppHandle` 里。
 3. **webview 传来的一切是数据，不是指令**，`decision` 字符串尤其如此：认不出的决定一律当拒绝（`ApprovalAnswer::into_approval` 的 `_ =>` 分支），有测试钉住。永远不要为了"宽容"给它加 fallback 到放行的分支。
 4. **一个会话同时只跑一个 turn，靠所有权保证**：`SessionHandle` 里的 `Session` 被跑 turn 的一方 `take` 走，结束再放回。不许改成"用一个 bool 标记忙"——那会漂移。
-5. **事件名是契约**：`bridge.rs` 的 `AGENT_EVENT`/`APPROVAL_REQUEST`/`TURN_FINISHED` 常量与 `ui/src/types.ts` 里的同名常量必须同时改。`AgentEvent` 的 JSON 信封形状（adjacently tagged，`{type, data}`）由 `tcode-core` 的 `event_wire_tests` 钉住，改它就要同时改 `ui/src/types.ts`。
+5. **事件名是契约**：`bridge.rs` 的 `AGENT_EVENT`/`APPROVAL_REQUEST`/`TURN_FINISHED`/`WINDOW_STATE` 常量与 `ui/src/types.ts` 里的同名常量必须同时改（`the_event_names_match_the_frontend` 扫这一条）。`WINDOW_STATE` 是里面唯一**由壳发、不由后端发**的：后端没有窗口，也不许长出这个概念——两个壳各自发它（`main.rs` 的 `WindowEvent::Resized`、`electron/main.js` 的 `maximize`/`unmaximize`）。`AgentEvent` 的 JSON 信封形状（adjacently tagged，`{type, data}`）由 `tcode-core` 的 `event_wire_tests` 钉住，改它就要同时改 `ui/src/types.ts`。
 6. **用到新的 Tauri 内建能力，先改 `capabilities/default.json`**。自定义 `#[tauri::command]` 默认放行，但 core 插件的命令（event 的 `listen`/`emit`、window、fs、dialog…）必须显式授权，**未授权时前端那侧只是 promise reject，没有任何报错会自己冒出来**。这条是踩出来的：漏了 `core:default` 时，turn 正常跑完、事件正常 emit，界面却全空，看起来和"卡死"一模一样。
 
-    **`core:default` 不等于"窗口能力都有了"，它只给了只读的那一半**：`is-maximized`、`title`、显示器列表、`internal-toggle-maximize` 在里面，而 `minimize` / `toggle-maximize` / `close` / `start-dragging` 不在。这条也是踩出来的，而且比上一条更难看见：自绘标题栏（规则 9c，`decorations: false`）意味着**没有系统标题栏可以退回去**，于是那三个按钮按下去 reject 成一句 `console.warn`、窗口也拖不动，界面其余部分完全正常。所以标题栏调的每一个"会动手的"窗口命令都必须在这个文件里点名——`browser.rs::the_title_bar_is_granted_the_commands_it_calls` 直接从 `WindowControls.tsx` 里扫这些调用来对，新加一个控件要么带着它的授权，要么在那儿失败。
+    **`core:default` 不等于"窗口能力都有了"，它只给了只读的那一半**：`is-maximized`、`title`、显示器列表、`internal-toggle-maximize` 在里面，而 `minimize` / `toggle-maximize` / `close` / `start-dragging` 不在。这条也是踩出来的，而且比上一条更难看见：自绘标题栏（规则 9c，`decorations: false`）意味着**没有系统标题栏可以退回去**，于是那三个按钮按下去 reject 成一句 `console.warn`、窗口也拖不动，界面其余部分完全正常。**这一条已经被结构解掉，但解法本身要守住**：标题栏不再从 webview 碰窗口，三个按钮和文件夹对话框都是 `invoke` 的普通命令，由拥有窗口的那个壳回答（`main.rs::register_shell` / `electron/main.js`）——Rust 侧对 `Window` 的调用不是 IPC 命令，不经 capability。`browser.rs::the_title_bar_does_not_reach_the_window_from_the_webview` 钉的就是这个"没有"：`WindowControls.tsx` 里再出现 `@tauri-apps` 的 import 或 `.minimize()` 之类就失败。新加一个控件 = 两个壳各加一行，不是加一条授权。
+
+    留在 `capabilities/default.json` 里的 `core:window:allow-minimize` / `allow-toggle-maximize` / `allow-close` / `dialog:allow-open` 现在**没有消费者了**，但没有跟着删——那属于 Phase 5 的边界重新推导，且删之前要真的确认 Rust 侧的 `blocking_pick_folder` 不过 capability（推断如此，未实测）。`core:default`（`listen` 靠它）与 `core:window:allow-start-dragging`（Tauri 注入的 drag 脚本靠它）仍然是必须的。
 7. **前端不许有静默 reject 的 promise**。`listen()` / `invoke()` 一律接 `catch`，把原因显示成致命错误屏。第 6 条那个 bug 之所以难查，就是因为它当时是个 unhandled rejection。
 8. **组件里不许出现字面量颜色/圆角/字号/字体栈，一律 `var(--token)`**。`ui/src/theme/base.css` 是 token 契约（含由 `--bg`/`--ink`/`--brand` 推导的兜底值，本身不含任何字面色），`themes/porcelain.css` 是默认主题包，两者的加载顺序就是覆盖顺序。**换主题 = 换 `main.tsx` 里的一行 import**，包括排版、密度、圆角、阴影，不只是配色。token 的**名字**是契约，主题可以改值不能改名。为什么这么严：写死一个 `#1d201b` 不会报错，只会在换主题那天变成一个找不着的污点。设计依据见 `DESIGN.md`，产品判断见 `PRODUCT.md`。
 9. **路径不许用 `direction: rtl` 做前截断**。bidi 重排会把开头的 `/` 挪到结尾——`/home/me/code` 渲染成 `home/me/code/`。这不是外观问题：审批面板里给人看的是一条错的路径。用 `components/Path.tsx`，它按整段省略，一个字符都不改写。

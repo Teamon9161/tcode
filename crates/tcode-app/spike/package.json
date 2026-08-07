@@ -1,0 +1,14 @@
+{
+  "name": "tcode-electron-spike",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Phase 0 of MIGRATION-ELECTRON.md. Throwaway: answers four questions and gets deleted.",
+  "main": "main.js",
+  "scripts": {
+    "spike": "electron .",
+    "spike:wayland": "electron --ozone-platform-hint=auto ."
+  },
+  "devDependencies": {
+    "electron": "latest"
+  }
+}

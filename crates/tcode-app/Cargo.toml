@@ -19,6 +19,13 @@ path = "src/lib.rs"
 name = "tcode-app"
 path = "src/main.rs"
 
+# The same backend with a pipe instead of a window: what the Electron shell
+# spawns. Named explicitly because auto-discovery would call it `sidecar`, and
+# a binary on someone's PATH should say whose it is.
+[[bin]]
+name = "tcode-sidecar"
+path = "src/bin/sidecar.rs"
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

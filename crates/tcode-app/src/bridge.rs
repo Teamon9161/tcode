@@ -31,6 +31,17 @@ pub const APPROVAL_REQUEST: &str = "tcode://approval-request";
 /// handoff. Without it those run invisibly and the transcript grows on its own.
 pub const TURN_STARTED: &str = "tcode://turn-started";
 pub const TURN_FINISHED: &str = "tcode://turn-finished";
+/// The window was maximized or restored. Emitted by **the shell**, not by
+/// anything below it — `main.rs` under Tauri, `electron/main.js` after that —
+/// because a window is the one thing the backend deliberately knows nothing
+/// about. It is named here anyway so every event the frontend listens on has
+/// one list, and so the check below covers it.
+///
+/// It exists because the state changes without a button here being pressed: a
+/// snap gesture, a double-click on the title bar, the OS restoring the window.
+/// The title bar is app-drawn (rule 9c), so its icon has to follow the window
+/// rather than the last click.
+pub const WINDOW_STATE: &str = "tcode://window-state";
 
 /// Somewhere to send an event. `AppHandle` is the real implementation; tests
 /// substitute a collector so no webview is needed to assert on the stream.
@@ -409,7 +420,13 @@ mod tests {
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/ui/src/types.ts"))
                 .expect("ui/src/types.ts");
 
-        for name in [AGENT_EVENT, APPROVAL_REQUEST, TURN_STARTED, TURN_FINISHED] {
+        for name in [
+            AGENT_EVENT,
+            APPROVAL_REQUEST,
+            TURN_STARTED,
+            TURN_FINISHED,
+            WINDOW_STATE,
+        ] {
             assert!(
                 types.contains(&format!("\"{name}\"")),
                 "ui/src/types.ts does not carry `{name}` — the frontend is listening on a \

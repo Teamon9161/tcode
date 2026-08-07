@@ -55,8 +55,14 @@
 mod place;
 
 pub use place::install;
+// Turning what somebody typed into a URL moved to `crate::address` when the
+// Electron shell needed the same answer without a Tauri webview anywhere near
+// it. Re-exported so this module's own callers and tests read unchanged.
+pub use crate::address::to_url;
 
 use std::sync::{Arc, Mutex};
+
+pub mod commands;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, LogicalPosition, LogicalSize, Manager, Webview, WebviewUrl, Wry};
@@ -477,56 +483,6 @@ fn trace(what: &str, webview: &Webview<Wry>, asked: Rect) {
     );
 }
 
-/// What someone typed in the address bar, as a URL.
-///
-/// The whole of the guesswork, kept pure so it can be tested without a window.
-/// Three rules, in order:
-///
-///  - An explicit scheme is honoured, including `file:` and `about:`.
-///  - A loopback host gets **`http`**, not `https`. This is the case the
-///    feature exists for — a dev server on `localhost:5173` is plain HTTP, and
-///    defaulting it to `https` produces a TLS error page for the single most
-///    common thing anyone will type in here.
-///  - Anything else that looks like a host gets `https`.
-///
-/// A bare word is an error rather than a search: this app has no search
-/// provider, and quietly sending what someone typed to one would be sending it
-/// somewhere they did not name.
-pub fn to_url(input: &str) -> Result<String, String> {
-    let text = input.trim();
-    if text.is_empty() {
-        return Err("type an address".into());
-    }
-    if let Some((scheme, _)) = text.split_once("://") {
-        if scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '-')
-        {
-            return Ok(text.to_string());
-        }
-    }
-    if text.starts_with("about:") || text.starts_with("file:") || text.starts_with("data:") {
-        return Ok(text.to_string());
-    }
-
-    let host = text.split(['/', '?', '#']).next().unwrap_or(text);
-    let name = host.split(':').next().unwrap_or(host);
-    let loopback = name.eq_ignore_ascii_case("localhost")
-        || name == "127.0.0.1"
-        || name == "::1"
-        || name == "[::1]";
-    if loopback {
-        return Ok(format!("http://{text}"));
-    }
-    // A dot or a port is what separates "a host" from "a word someone typed".
-    if name.contains('.') || host.contains(':') {
-        return Ok(format!("https://{text}"));
-    }
-    Err(format!(
-        "'{text}' is not an address. Type a host (example.com), a loopback address (localhost:5173) or a full URL."
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,36 +528,40 @@ mod tests {
         );
     }
 
-    /// An app-owned title bar has to be granted the commands its controls call.
+    /// An app-owned title bar must not reach the window through the webview.
     ///
-    /// `core:default` looks like it covers windows, and it does — the *reading*
-    /// half. `is-maximized`, `title`, the monitor list and
-    /// `internal-toggle-maximize` are in it; `minimize`, `toggle-maximize`,
-    /// `close` and `start-dragging` are not. So the three buttons rejected into
-    /// a `console.warn` and the bar could not be dragged, on a window that has
-    /// no system caption to fall back to — the same failure mode rule 6 is
-    /// about, one layer along: nothing throws, nothing is logged where anyone
-    /// looks, the controls are simply inert.
+    /// This test used to read the other way round: it scanned the component for
+    /// `.minimize()` / `.close()` / `.toggleMaximize()` and required a matching
+    /// grant in `capabilities/default.json`, because `core:default` covers only
+    /// the *reading* half of the window API and the acting half rejects into a
+    /// `console.warn` on a window with no system caption to fall back to.
     ///
-    /// Pinned from the component rather than as a fixed list, so a control
-    /// added later brings its grant with it or fails here.
+    /// The controls now go through `invoke`, answered by whichever shell owns
+    /// the window (`main.rs::register_shell`, `electron/main.js`), and a Rust
+    /// call on a `Window` is not an IPC command — so no grant is involved at
+    /// all. **The check has to invert with it**: as written before it still
+    /// passed, and pinned nothing, which is the one outcome worse than failing.
+    ///
+    /// What it pins now is the invariant that replaced the grants: no window
+    /// call from the frontend. Re-adding one would be inert under Electron
+    /// (there is no `@tauri-apps/api` behind it) and, once Phase 5 removes the
+    /// leftover grants, silently rejected under Tauri.
     #[test]
-    fn the_title_bar_is_granted_the_commands_it_calls() {
-        /// Window methods that *act*, and the permission each one needs. The
-        /// readers `WindowControls` also uses (`isMaximized`, `onResized`) are
-        /// in `core:default` already and are deliberately absent.
-        const ACTS: &[(&str, &str)] = &[
-            (".minimize()", "core:window:allow-minimize"),
-            (".maximize()", "core:window:allow-maximize"),
-            (".unmaximize()", "core:window:allow-unmaximize"),
-            (".unminimize()", "core:window:allow-unminimize"),
-            (".toggleMaximize()", "core:window:allow-toggle-maximize"),
-            (".close()", "core:window:allow-close"),
-            (".hide()", "core:window:allow-hide"),
-            (".show()", "core:window:allow-show"),
-            (".setTitle(", "core:window:allow-set-title"),
-            (".setFullscreen(", "core:window:allow-set-fullscreen"),
-            (".startDragging()", "core:window:allow-start-dragging"),
+    fn the_title_bar_does_not_reach_the_window_from_the_webview() {
+        /// Window methods that *act*. Their presence in the component is the
+        /// failure; each one is a shell command instead.
+        const ACTS: &[&str] = &[
+            ".minimize()",
+            ".maximize()",
+            ".unmaximize()",
+            ".unminimize()",
+            ".toggleMaximize()",
+            ".close()",
+            ".hide()",
+            ".show()",
+            ".setTitle(",
+            ".setFullscreen(",
+            ".startDragging()",
         ];
 
         let component = std::fs::read_to_string(concat!(
@@ -622,14 +582,18 @@ mod tests {
             .filter_map(|entry| entry.as_str())
             .collect();
 
-        for (call, permission) in ACTS {
-            if !component.contains(call) {
-                continue;
-            }
+        assert!(
+            // The import statement, not the bare specifier: prose about what
+            // this file used to do would otherwise fail the check describing it.
+            !component.contains("from \"@tauri-apps"),
+            "the title bar imports a Tauri API again — the window belongs to the shell, \
+             and this file has to work under both of them (see `dispatch::Registry`)"
+        );
+        for call in ACTS {
             assert!(
-                granted.contains(permission),
-                "the title bar calls `{call}` but capabilities/default.json does not grant \
-                 `{permission}` — the control will reject and do nothing"
+                !component.contains(call),
+                "the title bar calls `{call}` directly — that reaches one shell's window API from \
+                 a component both shells render. Add a `window_*` command to each shell instead."
             );
         }
 
@@ -662,8 +626,17 @@ mod tests {
             "/ui/src/browserYield.ts"
         ))
         .expect("ui/src/browserYield.ts");
-        let main = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"))
-            .expect("src/main.rs");
+        // `commands.rs`, not `main.rs`: these verbs are not in
+        // `dispatch::Registry::builtin` — a tab is a native view, so the shell
+        // contributes them through `commands::register`, and that function is
+        // now the list. Still a text scan rather than a real table because
+        // building one needs an `AppHandle`, which is the whole reason they
+        // live apart in the first place.
+        let registrations = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/browser/commands.rs"
+        ))
+        .expect("src/browser/commands.rs");
 
         // Every `"browser_…"` string literal in the two files that talk to this
         // module. Matching the literal rather than the `invoke(` around it: the
@@ -686,9 +659,9 @@ mod tests {
 
         for command in called {
             assert!(
-                main.contains(&format!("commands::{command},")),
-                "the frontend calls `{command}` but main.rs does not register it — the call will \
-                 reject and the browser will look inert"
+                registrations.contains(&format!("\"{command}\"")),
+                "the frontend calls `{command}` but `browser::commands::register` does not add it \
+                 — the call will reject and the browser will look inert"
             );
         }
     }
@@ -787,6 +760,60 @@ mod tests {
         }
     }
 
+    /// The app's policy is one sentence, and two shells now have to say it.
+    ///
+    /// Under Tauri it is a field in `tauri.conf.json`; under Electron it is a
+    /// header the `app://` handler writes. Nothing but this compares them, and
+    /// a policy that drifted would not fail anywhere — it would quietly allow
+    /// something on one shell that the other refuses, which is the worst shape
+    /// a security difference can take.
+    #[test]
+    fn both_shells_serve_the_same_content_security_policy() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let text = std::fs::read_to_string(root.join("tauri.conf.json")).expect("tauri.conf.json");
+        let config: serde_json::Value = serde_json::from_str(&text).expect("valid tauri config");
+        let tauri = config["app"]["security"]["csp"]
+            .as_str()
+            .expect("tauri.conf.json declares a csp");
+
+        // `const CSP = "…" + "…";` — a concatenation of literals, so what is
+        // inside the quotes is the policy.
+        let main =
+            std::fs::read_to_string(root.join("electron/main.js")).expect("electron/main.js");
+        let start = main
+            .find("const CSP =")
+            .expect("electron/main.js declares CSP");
+        let declaration = &main[start..];
+        // `";` and not `;`, because the policy itself is full of semicolons and
+        // a literal cannot contain an unescaped quote.
+        let end = declaration.find("\";").expect("the declaration ends") + 1;
+        let declaration = &declaration[..end];
+        let electron: String = declaration.split('"').skip(1).step_by(2).collect();
+
+        let normalize = |policy: &str| policy.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert_eq!(
+            normalize(tauri),
+            normalize(&electron),
+            "the two shells serve different policies"
+        );
+
+        // Rule 11, stated as the thing that makes it true: there is no
+        // `script-src`, so scripts fall back to `default-src 'self'` — which
+        // carries neither unsafe token. Adding the directive at all is the
+        // change that needs looking at, whatever value it is given.
+        for policy in [tauri, electron.as_str()] {
+            assert!(
+                !policy.contains("script-src"),
+                "the policy grew a `script-src`. Scripts used to fall back to `default-src \
+                 'self'`; whatever this directive says now, it is the one change rule 11 is about"
+            );
+            assert!(
+                !policy.contains("unsafe-eval"),
+                "`unsafe-eval` in the app's policy — see rule 11 and `ui/src/math.tsx`"
+            );
+        }
+    }
+
     #[test]
     fn app_owned_decorations_keep_system_color_out_of_the_caption() {
         let file = concat!(env!("CARGO_MANIFEST_DIR"), "/tauri.conf.json");
@@ -797,47 +824,5 @@ mod tests {
             config["app"]["windows"][0]["decorations"], false,
             "the app-owned title bar must not inherit the operating system's caption color"
         );
-    }
-
-    #[test]
-    fn an_explicit_scheme_is_left_alone() {
-        assert_eq!(
-            to_url("https://github.com/x").unwrap(),
-            "https://github.com/x"
-        );
-        assert_eq!(to_url("http://example.com").unwrap(), "http://example.com");
-        assert_eq!(to_url("about:blank").unwrap(), "about:blank");
-        assert_eq!(to_url("file:///tmp/x.html").unwrap(), "file:///tmp/x.html");
-    }
-
-    /// The case the browser pane was asked for. `https` here would put a TLS
-    /// error page in front of the single most common thing typed into it.
-    #[test]
-    fn a_dev_server_is_plain_http() {
-        assert_eq!(to_url("localhost:5173").unwrap(), "http://localhost:5173");
-        assert_eq!(
-            to_url("127.0.0.1:8080/app").unwrap(),
-            "http://127.0.0.1:8080/app"
-        );
-        assert_eq!(to_url("LOCALHOST:3000").unwrap(), "http://LOCALHOST:3000");
-        // …and a real host still is not.
-        assert_eq!(to_url("github.com").unwrap(), "https://github.com");
-    }
-
-    #[test]
-    fn a_host_gets_https_and_keeps_its_path() {
-        assert_eq!(
-            to_url("docs.rs/tauri/latest?q=1#frag").unwrap(),
-            "https://docs.rs/tauri/latest?q=1#frag"
-        );
-    }
-
-    /// Not a search box. Sending what someone typed to a search provider would
-    /// be sending it somewhere they did not name.
-    #[test]
-    fn a_bare_word_is_refused_rather_than_searched() {
-        let refusal = to_url("how do i center a div").unwrap_err();
-        assert!(refusal.contains("is not an address"), "{refusal}");
-        assert!(to_url("   ").is_err());
     }
 }

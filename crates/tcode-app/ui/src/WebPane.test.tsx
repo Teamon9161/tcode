@@ -18,8 +18,10 @@ const mocks = vi.hoisted(() => ({
   listener: null as null | ((event: { payload: { id: string; url: string; title: string } }) => void),
 }));
 
-vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
-vi.mock("@tauri-apps/api/event", () => ({
+// One module now, so one double: a second `vi.mock` of the same specifier
+// silently replaces the first, which would leave `invoke` undefined here.
+vi.mock("@ipc", () => ({
+  invoke: mocks.invoke,
   listen: (
     _name: string,
     callback: (event: { payload: { id: string; url: string; title: string } }) => void,
