@@ -1348,13 +1348,19 @@ pub fn shown_file(
     load_shown(Path::new(&path), &handle.cwd, binary)
 }
 
-/// The window's browser, as a small set of verbs over one native child webview.
+/// The window's browser, as a small set of verbs over its native child webviews.
 ///
 /// These take `AppHandle` where the rest of this file takes `Supervisor`, and
 /// that is the documented exception rather than drift: a child webview is a
 /// window's child and has no headless form (see `browser.rs`). What *can* be
 /// decided without a window — turning what somebody typed into a URL — is
 /// `browser::to_url`, a pure function with its own tests.
+///
+/// Every verb below the first takes an `id`: one tab is one webview, and the
+/// tab a keystroke belongs to is rarely the only one open. The id comes from
+/// the webview and is therefore data (rule 3) — `browser.rs` answers "that
+/// browser tab is not open" rather than falling back to the current one, which
+/// would mean reloading or closing a page nobody pointed at.
 ///
 /// `browser_open` is `async` on purpose. Tauri's `Window::add_child` documents
 /// that on Windows it deadlocks when called from a synchronous command or event
@@ -1370,8 +1376,27 @@ pub async fn browser_open(
     app: tauri::AppHandle,
     browser: State<'_, Arc<crate::browser::Browser>>,
     rect: crate::browser::Rect,
-) -> Result<(), String> {
+) -> Result<String, String> {
     browser.open(&app, rect)
+}
+
+/// The pane is back on screen with tabs already open — put the current one
+/// where it belongs and show it again.
+#[tauri::command]
+pub fn browser_show(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    rect: crate::browser::Rect,
+) -> Result<(), String> {
+    browser.show(rect)
+}
+
+/// Bring one tab to the front.
+#[tauri::command]
+pub fn browser_select(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    id: String,
+) -> Result<(), String> {
+    browser.select(&id)
 }
 
 /// Follow the pane. Called for every layout change, including each frame of a
@@ -1398,27 +1423,38 @@ pub fn browser_visible(
 #[tauri::command]
 pub fn browser_navigate(
     browser: State<'_, Arc<crate::browser::Browser>>,
+    id: String,
     url: String,
 ) -> Result<(), String> {
-    browser.navigate(&url)
+    browser.navigate(&id, &url)
 }
 
 #[tauri::command]
 pub fn browser_step(
     browser: State<'_, Arc<crate::browser::Browser>>,
+    id: String,
     delta: i32,
 ) -> Result<(), String> {
-    browser.step(delta)
+    browser.step(&id, delta)
 }
 
 #[tauri::command]
-pub fn browser_reload(browser: State<'_, Arc<crate::browser::Browser>>) -> Result<(), String> {
-    browser.reload()
+pub fn browser_reload(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    id: String,
+) -> Result<(), String> {
+    browser.reload(&id)
 }
 
+/// Close one tab. Answers `false` when it was the last one and has been blanked
+/// rather than destroyed — see `browser.rs` on why the profile's webview
+/// outlives every tab.
 #[tauri::command]
-pub fn browser_close(browser: State<'_, Arc<crate::browser::Browser>>) -> Result<(), String> {
-    browser.close()
+pub fn browser_close(
+    browser: State<'_, Arc<crate::browser::Browser>>,
+    id: String,
+) -> Result<bool, String> {
+    browser.close(&id)
 }
 
 /// Start a shell for a new terminal tab.

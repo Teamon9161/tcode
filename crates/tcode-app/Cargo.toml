@@ -65,6 +65,17 @@ thiserror = "2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
+# The browser pane's geometry, on this platform only (`src/browser/gtk.rs`).
+#
+# Tauri builds a child webview here by packing it into the window's vertical
+# `GtkBox`, which stacks it under the app and ignores every rect — there is no
+# positioning to be had through the Tauri API at all on Linux. So the app takes
+# the container over itself: one `GtkOverlay` holding a `GtkFixed`, which is the
+# shape wry *does* honour. Version and features track tauri's own `gtk`
+# dependency exactly, because these are the same widgets it hands us back.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))'.dependencies]
+gtk = { version = "0.18", features = ["v3_24"] }
+
 [dev-dependencies]
 tempfile = "3"
 futures = "0.3"

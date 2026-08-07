@@ -668,6 +668,11 @@ function mockSession(cwd: string): string {
   ].join("");
 }
 
+/** How many browser tabs the fixture believes are open, which is all it takes
+ *  to answer `browser_close` the way the real backend does — the last webview
+ *  is blanked rather than destroyed. */
+let browserTabs = 0;
+
 let mockTerminals = 0;
 
 function openMockTerminal(cwd: string): string {
@@ -779,13 +784,24 @@ export async function invoke<T>(
     // Faking a page inside it with an iframe would be showing something the
     // app never draws, and would quietly answer the one question this pane
     // raises (does the native layer land where the DOM says) with a yes.
+    //
+    // The two that answer something have to answer honestly, because the strip
+    // is drawn from those answers: `browser_open` hands back the tab's id, and
+    // `browser_close` says whether the webview is gone — `false` for the last
+    // one, which the real backend blanks and keeps (`browser.rs`). A fixture
+    // that returned `undefined` here would show a tab strip that never gains a
+    // tab, which is the one part of this pane the preview exists to show.
     case "browser_open":
+      return `preview-tab-${(browserTabs += 1)}` as T;
+    case "browser_close":
+      return ((browserTabs -= 1) > 0) as T;
+    case "browser_show":
+    case "browser_select":
     case "browser_bounds":
     case "browser_visible":
     case "browser_navigate":
     case "browser_step":
     case "browser_reload":
-    case "browser_close":
       return undefined as T;
     // The terminal is the opposite case to the browser above: it *is* drawn on
     // this side, by an emulator painting the app's own palette, so a fixture

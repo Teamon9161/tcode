@@ -12,6 +12,7 @@ cd crates/tcode-app
 (cd ui && npm test)                       # 渲染边界测试（规则 10/11），不碰网络
 cargo build && cargo test                 # 后端 + 集成测试
 ./target/debug/tcode-app                  # 起 app（把 cwd 作为第一个会话）
+TCODE_BROWSER_DEBUG=1 ./target/debug/tcode-app   # 加上浏览器窗格的几何日志（规则 9h）
 
 (cd ui && npm run preview:ui)             # 设计预览：浏览器里看全部界面状态
 ```
@@ -104,9 +105,11 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **方向由 `dirFor` 按被裂窗格的长边挑，不是四处写死 `"row"`**。`Dir` 从第一天就有 `col`，`frames`、分隔条、`rotate` 也一直支持，但四个调用点全写死 row，于是"上下分"只能先裂再转、且只有键盘上一个没人找得到的 `Mod+Alt+R`。`aspect`（场地宽÷高）是这个纯文件唯一算不出来的事实，由 `field.ts` 在点击那一刻量——不许闭包捕获，那些回调为了 memo 只绑一次（规则 21），而窗口会变。**知道语义的调用方压过它**：文件树与 files 索引永远是 row，一列文件名摞在文件上面等于宽度浪费、长度截断。想要另一种方向就转那道缝：唯一"明说方向"的控件是分隔条上 hover 才现身的 `.seam-turn`，画的是**按下去会变成的样子**而不是现在的样子。**它长在缝上而不是窗格 header 上，这是量出来的**：`rotate` 收的本来就是 split 的 id、不是窗格的 id，而 header 上再加第六个图标恰好会在最窄的那个窗格里把关闭键挤出边界——正是这次改动要救的那种窗格（`.pane-head` 在 147px 宽时 scrollWidth 176）。为此 `.divider` 拆成 `.seam`（定位、光标、hover）+ 里面的 `.divider`（role="separator"、拖动、::after 抓取区），因为 `role="separator"` 里塞一个 button 读屏出不来。不许为每个"打开"的动词再各配一个"往下打开"——那是四个动词乘两个方向，而一道缝一个控件对所有窗格都成立。
 
-9h. **浏览器窗格是原生子 webview，而且是窗口级单例**（`src/browser.rs` + `ui/src/WebPane.tsx`，`Pane` 的第三个变体 `{kind:"web"}`）。
+9h. **浏览器窗格是原生子 webview，一个 tab 一个 webview，整体是窗口级单例**（`src/browser.rs` + `ui/src/webHost.ts` + `ui/src/web.ts` + `ui/src/WebPane.tsx`，`Pane` 的第三个变体 `{kind:"web"}`）。
 
-    **capability 恒为空，这条是全仓库最容易静默破掉的一条。** Tauri 的 capability 按 label 匹配，而 `windows: ["main"]` 的语义是**授予该窗口下的每一个 webview**（tauri-utils 原话：regardless of the value of `webviews`）。浏览器是 `main` 的子 webview，所以那一行等于把 `core:default` 发给任意网页，也就是把 `window.__TAURI__`、也就是本机任意命令，发给任意网页。**破掉时什么都不会坏**：app 正常、浏览器正常、只是每个站点都被信任。`capabilities/default.json` 因此写 `webviews: ["main"]`，`browser.rs` 里有一条测试读那个文件钉住它（已验证改回 `windows` 会红）。这也是回读页面只能走 `eval_with_callback` 的原因——它在 runtime 层（WebView2 的 `ExecuteScript`）而不是 Tauri IPC，所以页面不需要任何权限我们也读得到。永远不要为了"让 agent 能操作页面"去加 `dangerousRemoteDomainIpcAccess`。
+    **capability 恒为空，这条是全仓库最容易静默破掉的一条。** Tauri 的 capability 按 label 匹配，而 `windows: ["main"]` 的语义是**授予该窗口下的每一个 webview**（tauri-utils 原话：regardless of the value of `webviews`）。浏览器的每个 tab 都是 `main` 的子 webview，所以那一行等于把 `core:default` 发给任意网页，也就是把 `window.__TAURI__`、也就是本机任意命令，发给任意网页。**破掉时什么都不会坏**：app 正常、浏览器正常、只是每个站点都被信任。`capabilities/default.json` 因此写 `webviews: ["main"]`，`browser.rs` 里有一条测试读那个文件钉住它（已验证改回 `windows` 会红），并且按 `tcode-browser-` 前缀否掉所有 tab 与任何 glob。这也是回读页面只能走 `eval_with_callback` 的原因——它在 runtime 层（WebView2 的 `ExecuteScript`）而不是 Tauri IPC，所以页面不需要任何权限我们也读得到。永远不要为了"让 agent 能操作页面"去加 `dangerousRemoteDomainIpcAccess`。
+
+    **一个 tab 一个 webview，而且最后一个永远不销毁。** tab 装的是**活着的页面**（重载中的 dev server、填了一半的表单），拿一个 webview 在几个地址间来回导航只留得住地址、留不住页面，那正是 tab 的全部意义。代价是所有 tab 共用一个 `data_directory`（cookie 与登录属于浏览器不属于某个 tab），而 `tauri-runtime-wry` 把 `WebContext` 按 data dir 存、最后一个引用它的 webview 析构时就丢掉（Windows/macOS；Linux 那边刻意留着）。丢掉即拆掉握着 profile 目录的 WebView2 环境，紧接着开下一个 tab 就是把同一个目录交给第二个还没关完的浏览器进程——当初逼出"每实例一个 profile 目录"的那次冻结。所以 **`Browser::close` 对最后一个 tab 是导航回 `about:blank` + 隐藏，不是 close**，并用返回值 `bool`（webview 是否真的没了）告诉前端画哪一种：少一个 tab，还是一个回到空白起点的 tab。前端不许自己猜这件事，猜错就是 strip 在描述一个不存在的浏览器。唯一销毁最后一个 webview 的地方是 app 自己退出（`main.rs` 的 `close_all`）。
 
     **它不带 `session`，这是承重的不是省事**：`closeSession` 按 `paneSession(pane)` 过滤，浏览器答 `null` 于是永远不会被会话带走——你正在读的文档不该因为关掉一个对话而消失。连带三条：入口放在每个会话窗格的文件/工作区工具组中，方便在找文件时就近打开，但它仍只会聚焦同一个窗口级浏览器；`sessionsInView` 要跳过它；**`show` 落在它上面必须分裂而不是覆盖**——那是窗口里唯一一个覆盖掉就找不回来的窗格。`layout.test.ts` 有一组测试钉这几条。
 
@@ -114,11 +117,29 @@ cargo build && cargo test                 # 后端 + 集成测试
 
     **rect 由前端连续上报**（`WebPane` 的 `useLayoutEffect` **不带依赖数组**）：原生 webview 不参与布局，它只待在最后被告知的位置，而窗格会**不改变尺寸地移动**（邻居关闭、远处分隔条被拖），那种情况 `ResizeObserver` 一次都不响。两者都要。
 
-    **地址栏是视图不是真相**：webview 自己拥有"现在在哪"，输入只是请求它去某处，显示的 URL 一律来自 `BROWSER_NAVIGATED` 回报——于是重定向、点链接、`history.back()` 三种情况走同一条路径，没有任何地方需要猜一次导航是否真的发生了。**前进后退按钮不能置灰**：有没有可去之处存在页面自己的历史里，跨源读不到；`history.go` 无处可去时什么都不做，那是无害的方向，而猜一份栈出来只会在 SPA 上错得更难查。
+    **在 GTK 上，窗格几何是这个 app 自己实现的，Tauri 一点忙都帮不上**（`src/browser/place.rs`，`cfg(gtk)`）。Tauri 在 Linux 上建子 webview 走的是 `webview_builder.build_gtk(window.default_vbox())`，wry 见到 `GtkBox` 就 `pack_start(webview, expand: true, fill: true, 0)` 并把 `is_in_fixed_parent` 记成 **false**——而那正是它自己的 `set_bounds` 唯一检查的标志。于是**每一个 rect 都被收下然后丢掉**，一个纵向 box 干纵向 box 该干的事：app 自己的 webview 占窗口上半、浏览器占下半，两个都是整宽。实测而非推断：要 (236,110) 处的 1040×315，webview 报回 1280×430（窗口高 860）。wry 只对**一种**容器认 bounds——`GtkFixed`——而 Tauri 从不建一个。所以 `place.rs` 在启动时把窗口改成 `vbox → Overlay{ app, Fixed }`，浏览器的每个 tab 放进那个 Fixed。改完实测：要 1040×745 逻辑像素，量到 2077×1487 物理像素（scale 2）。
+
+    **Fixed 里的 tab 用 `size_allocate` 定尺寸，不是只用 `set_size_request`；而且要再 `idle` 补一次**（两条都有测试钉住）。`set_size_request` 读起来像"就这么大"，实际是**下限**：GtkFixed 发下去的 allocation 是子控件的 preferred size，而一个已经拿到 895px 的 WebKitWebView 会继续 prefer 895px。实测（页面自己打印 `innerWidth`）：只有 request 时，先缩到 518 再撑到 771，页面**一次都没动过**，始终 895。wry 自己就是这么分的——`put` 进 fixed 时 request 一次，之后每一次 `set_bounds` 都是 `size_allocate`。两个都留：request 决定下一轮 allocation cycle（窗口 resize 等）拿到什么，allocate 决定现在。
+
+    补的那一次是因为**在 `show()` 前后做的 allocation 只到 widget，到不了页面**。`Webview::show` 走 wry 的 event loop，而摆放走 `run_on_main_thread`，"先 show 再 place"是两个互不排队的队列；落在工具箱仍视为隐藏的 widget 上的 allocation 会更新它的 `allocated_size`，却永远不到 web process。症状是**外框变了、里面的页面还是旧宽度，多出来的部分是没人画的灰**——而且这是常态不是边角：拖分隔条全程会把浏览器藏起来（`browserYield.ts`），松手才显示。证据：拖完页面停在 678，只把窗口拽宽 1px（等于再 place 一次、这次 webview 全程可见），页面立刻跳到正确的 962。所以 `place` 之后再 `glib::idle_add_local_once` 补一次同样的 allocation——idle 按加入顺序跑，最新的 rect 仍然是最后一句话。
+
+    这条底下有三个小规矩，破掉任何一个都只在 Linux 上出事：**widget 一个都不存**（GTK 对象 `!Send`，而这个模块是从 `Mutex<State>` 后面驱动的），layer 按 widget name 找、每个 tab 按它自己的 name 找，name 就是 webview 的 Tauri label；**所有调用都经 `run_on_main_thread`**（GTK 只有一个合法线程，而 `Browser::open` 跑在 async 池上；从主线程 post 也合法，于是只有一条规则而不是两条路径，队列顺带保证了 adopt 先于 place）；**`install` 必须在启动时跑**，它要搬动 app 自己的 webview，等有人在看的时候再搬至少是一次闪烁。`cfg(gtk)` 由 build.rs 按 target 设，那份 target 名单必须与 Cargo.toml 里 `gtk` 依赖的名单一致，有测试钉住——多了不编译，少了会**静默**退回那个什么都不做的摆放。
+
+    **其余平台上摆放只能是一次 `set_bounds`，绝不是 `set_position` 加 `set_size`**（有测试机械地扫 `place.rs`）。这两种写法看起来等价：Tauri 那两个方法各自先读回 webview 当前 bounds 再写回自己那一个字段，而 `WebView::bounds` **答不出子 webview 在哪**——position 留在 `Default` 也就是 `(0,0)`。于是 `set_size` 把原点当作位置发出去，刚设好的位置被抹掉。同一个洞让 `trace()` 里读回的 position 恒为 `(0,0)`：那是"不知道"，不是"在原点"，能信的只有 size。
+
+    **摆放永远是对一个 webview 做的最后一件事**，在任何 show/hide 之后：被显示是容器要回答的一个事件，它会按自己认为的几何重新 allocate。所以 `visible(true)` 也必须重新摆——popover 让位、被展开的窗格盖住又让出来，这两种情况前端都不会上报 rect，一次不重新摆的 show 就是浏览器回到工具箱最后一次放它的地方。`state.rect` 存在就是为了这个。
+
+    **这个窗格什么都观察不到，所以它自带一个观测口**：`TCODE_BROWSER_DEBUG=1` 打开 `trace()`，打出"要的 rect vs webview 报回的 size"。默认关，因为 `bounds` 在拖分隔条时每帧都跑。它不是调试残留——不在 DOM 里、设计预览合成不了、截图拍到它在错的地方也只说明它在错的地方，这一行是唯一能分开"我们发错了 rect"和"我们发对了、平台拿它干了别的"的东西，而这两个 bug 没有共同修法。
+
+    **地址栏是视图不是真相**：webview 自己拥有"现在在哪"，输入只是请求它去某处，显示的 URL 一律来自 `BROWSER_NAVIGATED` 回报（**带 tab id**——后台 tab 完成一次重定向不许动屏幕上那个 tab 的地址栏）——于是重定向、点链接、`history.back()` 三种情况走同一条路径，没有任何地方需要猜一次导航是否真的发生了。正在打的字是**另一个字段**（`web.ts` 的 `draft`/`sent`），两者只有一条调和规则：**它自己请求的那次导航回来时才丢掉草稿**。少了 `sent` 就是那个老 bug——每个事件（含 WebView2 启动时那次 `about:blank`）都把输入框擦掉，于是 Enter 没东西可发。`draft` 与 `sent` 都按 tab 存，切走再切回来还在。**前进后退按钮不能置灰**：有没有可去之处存在页面自己的历史里，跨源读不到；`history.go` 无处可去时什么都不做，那是无害的方向，而猜一份栈出来只会在 SPA 上错得更难查。
+
+    **tab 列表活在 React 之外**（`webHost.ts` 的 module store，与 `termHost.ts` 同形）：收起窗格会卸载 `WebPane`，而 webview 一个都没走。列表放在 React state 里，这一下就是"页面还在、strip 忘了它们"——两头都输。窗格树里同样只有 `{kind:"web"}`（规则 9d 的纯数据不变）。**从别处点进来的链接开新 tab**，除非当前 tab 是空白的：正在读的页面不该被别处的一次点击顶掉，这跟这个窗格不带 session 是同一条理由。
 
     **`to_url` 里 loopback 走 `http` 不是 `https`**（纯函数，有测试）：这个窗格被要求做出来的头号用途就是看 dev server，而 `localhost:5173` 是明文 HTTP，默认给它 `https` 等于在最常输入的那一行前面立一个 TLS 错误页。**裸词报错而不是搜索**：这个 app 没有搜索提供商，把用户打的字悄悄发给一个他没点名的服务不在选项里。
 
-    **tab 只给 `web` 窗格，别的 inspect 值一个都不给。** `inspect.ts` 那条"单值槽不是 tab 容器"仍然成立，它服务的是**对照**（想同时看两样就分屏）；浏览网页要的是**切换**，同屏摊开五个网页没有意义,而每开一页裂一个窗格会把窗口撑爆。两种窗格要的是不同的东西,所以这是一次有理由的例外,不是先例——发现自己想给 diff 或 run 加 tab 时，回来读这一段。
+    **tab 只给 `web` 与 `terminal` 两个窗格，别的 inspect 值一个都不给。** `inspect.ts` 那条"单值槽不是 tab 容器"仍然成立，它服务的是**对照**（想同时看两样就分屏）；浏览网页与开几个 shell 要的是**切换**，同屏摊开五个网页没有意义，而每开一页裂一个窗格会把窗口撑爆。两种窗格要的是不同的东西，所以这是一次有理由的例外，不是先例——发现自己想给 diff 或 run 加 tab 时，回来读这一段。
+
+    **两条 tab strip 是同一条 strip。** 加/关/选/步进这四个纯函数在 `tabs.ts`（泛型只认 `id`），各自的 tab 类型与领域动词（`renameTab`/`endTab` vs `navigatedTab`/`draftTab`）留在 `terminal.ts` 与 `web.ts`；样式是同一套 `.tab*` class（`.tab-exit` 是终端独有的那一条），差别只有两处真差别：浏览器的 strip 坐在 `--chrome` 上（底下不是这个 app 的表面，是别人的文档），终端的坐在 `--bg` 上。键位也一样是 `Mod+Shift+T` / `Mod+Shift+W`，各自由自己的窗格回答——"哪个 tab"只有窗格答得上来。**不许为第二个 strip 复制一份**：那些注释每一条都记着一个 bug 或一个被否掉的版本，复制出来的两份只在写下来那天一致。
 
 9i. **终端窗格是窗口级单例，但和浏览器不是同一类东西**（`src/terminal.rs` + `ui/src/termHost.ts` + `ui/src/TermPane.tsx`，`Pane` 的第四个变体 `{kind:"terminal"}`）。规则 9h 那些坑这里一个都没有——它是 DOM，不是原生子 webview，所以不用让位给 popover、不用连续上报 rect、也不需要任何 capability。反过来，它有一组自己的。
 

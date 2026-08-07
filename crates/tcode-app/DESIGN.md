@@ -596,8 +596,11 @@ a surface" move `--sunken` makes for code wells — with the padding a printed
 listing has. A first column flush against the pane's edge is the single most
 terminal-emulator thing a layout can do.
 
-**Tabs are segments of one strip, divided by a hairline.** The strip is a pane
-header like any other: `--bg`, the hairline every `.pane-head` draws, 32px.
+**Tabs are segments of one strip, divided by a hairline.** Two panes have tabs
+— the terminals and the browser — and they wear the same strip, written once
+(`.tab*`). It is a pane header like any other: the hairline every `.pane-head`
+draws, 32px, on `--bg` for the terminals and on `--chrome` for the browser,
+whose body is not this app's surface at all but a page from somewhere else.
 Tabs abut — no gaps, no backgrounds, no radii — with a 1px `--line` between
 them, which is the separator this app already uses wherever two regions share a
 tone. The current one is `--ink` at medium weight with a 2px `--brand` bar
@@ -636,7 +639,9 @@ dev server still going.
 Inside a terminal the app gives the keyboard back. `Ctrl+C`, `Ctrl+D`,
 `Ctrl+R`, `Ctrl+W`, `Ctrl+U` are the shell's, and an app that keeps them is an
 app you cannot work in; what stays is `Mod` + `J`, the `Mod` + `Alt` pane moves,
-and `Mod` + `Shift` + `T` / `W` for tabs. The cost is honest and worth naming:
+and `Mod` + `Shift` + `T` / `W` for tabs — the same pair the browser's strip
+takes, because two tab strips that take different keys are two things to learn.
+The cost is honest and worth naming:
 `Ctrl+J` can no longer be sent to a shell as a bare line feed. It buys the one
 key that gets you back out.
 
@@ -655,7 +660,7 @@ in a composer nearly all the time, so a bare key is text.
 | `Mod` + `W` | close this pane — the conversation keeps running |
 | `Mod` + `Alt` + `R` | turn this split from side-by-side to stacked |
 | `Mod` + `J` | show, focus, or hide the terminals |
-| `Mod` + `Shift` + `T` / `W` | new terminal tab / close this one |
+| `Mod` + `Shift` + `T` / `W` | new tab / close this one, in the terminals or the browser |
 | `Esc` | close the pane you are looking into |
 
 Directional focus is decided by the panes' boxes, not by the tree: `row(a,

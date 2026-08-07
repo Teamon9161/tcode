@@ -3,28 +3,26 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
- * The browser pane's address bar, at the boundary where it meets the backend.
+ * The browser pane, at the boundary where it meets the backend.
  *
- * The pane draws only chrome; the page is a native child webview owned by the
- * backend (`src/browser.rs`). What is testable here without a webview is the
- * contract between the two: what the address bar sends when Enter is pressed,
- * and how navigation events update it. The second half is where the pane's
- * bug lived — every `BROWSER_NAVIGATED` event (each navigation, each title
- * change, and the initial slow startup of the WebView2 runtime) used to wipe
- * whatever was being typed, and the form then had nothing to send.
+ * The pane draws only chrome; the pages are native child webviews the backend
+ * owns (`src/browser.rs`), one per tab. What is testable here without a webview
+ * is the contract between the two — which command each control sends, and how
+ * a pane that comes and goes leaves the webviews alone. The tab *data* is
+ * `web.test.ts`; this file is about the calls.
  */
 
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   off: vi.fn(),
-  listener: null as null | ((event: { payload: { url: string; title: string } }) => void),
+  listener: null as null | ((event: { payload: { id: string; url: string; title: string } }) => void),
 }));
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: mocks.invoke }));
 vi.mock("@tauri-apps/api/event", () => ({
   listen: (
     _name: string,
-    callback: (event: { payload: { url: string; title: string } }) => void,
+    callback: (event: { payload: { id: string; url: string; title: string } }) => void,
   ) => {
     mocks.listener = callback;
     return Promise.resolve(mocks.off);
@@ -32,6 +30,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import { WebPane } from "./WebPane";
+import * as browser from "./webHost";
 
 class FakeResizeObserver {
   observe() {}
@@ -43,9 +42,34 @@ vi.stubGlobal("ResizeObserver", FakeResizeObserver);
 // React's `act` warns without this flag, and the warning is noise here.
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+/**
+ * Animation frames, held.
+ *
+ * The pane measures its rectangle a frame after each render, and the first
+ * webview is created from that measurement — so "a frame later" is when the
+ * browser starts existing, and holding the frames is what lets a test see the
+ * gap a link click falls into.
+ */
+const frames: FrameRequestCallback[] = [];
+vi.stubGlobal("requestAnimationFrame", (fn: FrameRequestCallback) => frames.push(fn));
+vi.stubGlobal("cancelAnimationFrame", () => {});
+
+/** Run the pending frames and let the promises they start settle. */
+async function settle() {
+  await act(async () => {
+    for (const frame of frames.splice(0)) frame(0);
+    // `browser_open` resolves in a microtask, and only then is there a tab.
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 let root: Root;
 let container: HTMLDivElement;
 let unmounted: boolean;
+/** What the fake backend believes: one webview per tab, and the last one is
+ *  blanked rather than destroyed (`browser.rs`). */
+let openTabs: string[];
 
 function render(
   onClose: () => void = () => {},
@@ -84,39 +108,90 @@ async function pressEnter() {
   const form = container!.querySelector("form")!;
   await act(async () => {
     form.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true }));
-    // The mocked `invoke` resolves in a microtask; its `.then` sets state, so
-    // it has to land inside this `act` or React warns about an update outside
-    // one.
     await Promise.resolve();
   });
 }
 
 /** A `BROWSER_NAVIGATED` event arriving from the backend. */
-function navigate(url: string) {
+function navigate(url: string, id = openTabs[openTabs.length - 1]) {
   act(() => {
-    mocks.listener?.({ payload: { url, title: "" } });
+    mocks.listener?.({ payload: { id, url, title: "" } });
   });
 }
 
-beforeEach(() => {
-  mocks.invoke.mockReset().mockResolvedValue(undefined);
+function button(label: string): HTMLButtonElement {
+  const found = [...document.querySelectorAll("button")].find(
+    (each) => each.getAttribute("aria-label") === label,
+  );
+  if (!found) throw new Error(`no control labelled "${label}"`);
+  return found;
+}
+
+async function click(label: string) {
+  await act(async () => {
+    button(label).click();
+    // Two: the command's promise, then the follow-up the store chains onto it
+    // (selecting the neighbour of a closed tab).
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+beforeEach(async () => {
+  openTabs = [];
+  mocks.invoke.mockReset().mockImplementation((name: string, args?: Record<string, unknown>) => {
+    if (name === "browser_open") {
+      const id = `tab-${openTabs.length + 1}`;
+      openTabs.push(id);
+      return Promise.resolve(id);
+    }
+    if (name === "browser_close") {
+      // The last webview is never destroyed; it is blanked and kept.
+      if (openTabs.length === 1) return Promise.resolve(false);
+      openTabs = openTabs.filter((id) => id !== args?.id);
+      return Promise.resolve(true);
+    }
+    return Promise.resolve(undefined);
+  });
   mocks.off.mockReset();
   mocks.listener = null;
+  frames.length = 0;
+  browser.reset();
   render();
+  await settle();
 });
 
 afterEach(() => {
-  if (!unmounted) {
-    act(() => root.unmount());
-  }
+  if (!unmounted) act(() => root.unmount());
   container.remove();
+});
+
+describe("the browser pane's first tab", () => {
+  it("opens one when the pane appears, because an empty browser is not a state anybody asked for", () => {
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_open", { rect: expect.anything() });
+    expect(container.querySelectorAll(".tab")).toHaveLength(1);
+  });
+
+  it("shows the tabs it already had rather than opening another", async () => {
+    act(() => root.unmount());
+    mocks.invoke.mockClear();
+    render();
+    await settle();
+
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_show", { rect: expect.anything() });
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_open", expect.anything());
+    expect(container.querySelectorAll(".tab")).toHaveLength(1);
+  });
 });
 
 describe("the browser pane's address bar", () => {
   it("sends what was typed when Enter is pressed", async () => {
     type("github.com");
     await pressEnter();
-    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", { url: "github.com" });
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
+      id: "tab-1",
+      url: "github.com",
+    });
   });
 
   it("keeps the typed address when an unrelated navigation event arrives", async () => {
@@ -125,196 +200,168 @@ describe("the browser pane's address bar", () => {
     // Wiping the field then would make the next Enter send nothing.
     type("github.com");
     navigate("about:blank");
-    expect(container!.querySelector("input")!.value).toBe("github.com");
+    expect(container.querySelector("input")!.value).toBe("github.com");
     await pressEnter();
-    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", { url: "github.com" });
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
+      id: "tab-1",
+      url: "github.com",
+    });
   });
 
   it("shows the canonical URL once its own navigation round-trips", async () => {
     type("github.com");
     await pressEnter();
     navigate("https://github.com");
-    expect(container!.querySelector("input")!.value).toBe("https://github.com");
+    expect(container.querySelector("input")!.value).toBe("https://github.com");
   });
 
-  it("does not wipe a newer address while the old navigation is still in flight", async () => {
+  it("leaves the address bar alone when a background tab navigates", async () => {
     type("github.com");
     await pressEnter();
-    type("docs.rs");
     navigate("https://github.com");
-    expect(container!.querySelector("input")!.value).toBe("docs.rs");
+    await click("New tab");
+
+    navigate("https://redirected.example", "tab-1");
+    expect(container.querySelector("input")!.value).toBe("");
+  });
+});
+
+describe("the browser pane's tabs", () => {
+  it("opens another one beside the first, and gives it the strip", async () => {
+    await click("New tab");
+    const tabs = [...container.querySelectorAll(".tab")];
+    expect(tabs).toHaveLength(2);
+    expect(tabs[1].classList.contains("is-current")).toBe(true);
+    // Each tab is its own webview: two opens, never a re-navigation of one.
+    expect(mocks.invoke.mock.calls.filter(([name]) => name === "browser_open")).toHaveLength(2);
+  });
+
+  it("brings a tab forward when it is clicked, because a hidden webview is not layered", async () => {
+    await click("New tab");
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".tab .tab-name")!.click();
+      await Promise.resolve();
+    });
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_select", { id: "tab-1" });
+  });
+
+  it("keeps each tab's half-typed address to itself", async () => {
+    type("github.com");
+    await click("New tab");
+    expect(container.querySelector("input")!.value).toBe("");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".tab .tab-name")!.click();
+      await Promise.resolve();
+    });
+    expect(container.querySelector("input")!.value).toBe("github.com");
+  });
+
+  it("selects the neighbour when the current tab is closed", async () => {
+    navigate("https://github.com");
+    await click("New tab");
+    mocks.invoke.mockClear();
+    // The second tab is still blank, so it is the one called "New tab" — the
+    // first now carries its page's address.
+    await click("Close New tab");
+    expect(container.querySelectorAll(".tab")).toHaveLength(1);
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_select", { id: "tab-1" });
+  });
+
+  it("blanks the last tab rather than destroying the webview, and puts the pane away", async () => {
+    const onClose = vi.fn();
+    act(() => root.unmount());
+    browser.reset();
+    openTabs = [];
+    render(onClose);
+    await settle();
+    navigate("https://github.com");
+
+    await click("Close github.com");
+
+    // The webview survives — it holds the profile every login lives in — so the
+    // strip keeps one tab, back at its blank start, and the pane goes away.
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(container.querySelectorAll(".tab")).toHaveLength(1);
+    expect(container.querySelector(".tab-label")!.textContent).toBe("New tab");
   });
 });
 
 describe("the browser pane's hide vs close", () => {
-  it("hides the webview instead of destroying it when the pane goes away", () => {
-    // The button that opened the browser takes it off screen without losing
-    // the page: re-opening later must show the page as it was. The webview
-    // lives for the whole app session; only the app's own exit destroys it.
-    act(() => {
-      root.unmount();
-    });
+  it("hides the webviews instead of destroying them when the pane goes away", () => {
+    // The button that opened the browser takes it off screen without losing the
+    // pages: re-opening later must show them as they were.
+    act(() => root.unmount());
     unmounted = true;
     expect(mocks.invoke).toHaveBeenCalledWith("browser_visible", { visible: false });
     expect(mocks.invoke).not.toHaveBeenCalledWith("browser_close", expect.anything());
   });
 
-  it("hides the webview while another pane fills the field", () => {
-    // `visibility: hidden` on the slot does not reach the native webview, so
-    // the pane has to tell the backend separately — including the mount-while-
-    // -hidden case, where `browser_open` would otherwise show it.
-    act(() => {
-      root.unmount();
-    });
+  it("hides the webviews while another pane fills the field", async () => {
+    // `visibility: hidden` on the slot does not reach a native webview, so the
+    // pane has to tell the backend separately.
+    act(() => root.unmount());
     render(() => {}, true);
+    await settle();
     expect(mocks.invoke).toHaveBeenCalledWith("browser_visible", { visible: false });
-  });
-
-  it("closes a blank browser directly without asking", () => {
-    const onClose = vi.fn();
-    act(() => {
-      root.unmount();
-    });
-    render(onClose);
-
-    // Freshly opened, the browser is at its blank start: there is no page a
-    // "hide" would preserve, so the X closes the pane outright — no menu, no
-    // navigation.
-    const closeButton = [...container!.querySelectorAll("button")].find(
-      (button) => button.getAttribute("aria-label") === "Close the browser",
-    )!;
-    act(() => {
-      closeButton.click();
-    });
-
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
-    expect(document.querySelector(".web-close-menu")).toBeNull();
-  });
-
-  it("asks before closing once a page is open", () => {
-    const onClose = vi.fn();
-    act(() => {
-      root.unmount();
-    });
-    render(onClose);
-    navigate("https://github.com");
-
-    const closeButton = [...container!.querySelectorAll("button")].find(
-      (button) => button.getAttribute("aria-label") === "Close the browser",
-    )!;
-    act(() => {
-      closeButton.click();
-    });
-    // The X itself only asks; nothing is navigated or closed by opening the
-    // menu.
-    expect(document.querySelector(".web-close-menu")).not.toBeNull();
-    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
-    expect(onClose).not.toHaveBeenCalled();
-
-    const exit = [...document.querySelectorAll("button")].find(
-      (button) => button.textContent?.includes("Exit browser"),
-    )!;
-    act(() => {
-      exit.click();
-    });
-
-    // Closing the tab sends the page back to the blank start and closes the
-    // pane, but the webview and its profile stay alive — that is what keeps
-    // cookies and logins across an exit, and why a reopen cannot freeze.
-    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", { url: "about:blank" });
-    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_close");
-    expect(onClose).toHaveBeenCalledTimes(1);
-  });
-
-  it("hides the pane without destroying the webview when Hide for now is chosen", () => {
-    const onClose = vi.fn();
-    act(() => {
-      root.unmount();
-    });
-    render(onClose);
-    navigate("https://github.com");
-
-    act(() => {
-      const closeButton = [...container!.querySelectorAll("button")].find(
-        (button) => button.getAttribute("aria-label") === "Close the browser",
-      )!;
-      closeButton.click();
-    });
-    const hide = [...document.querySelectorAll("button")].find(
-      (button) => button.textContent?.includes("Hide for now"),
-    )!;
-    act(() => {
-      hide.click();
-    });
-
-    expect(onClose).toHaveBeenCalledTimes(1);
-    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
-    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_close");
   });
 });
 
 describe("following a link into the browser", () => {
-  /** The pane's rectangle is measured a frame after each render, and the
-   *  webview is created from that measurement — so "a frame later" is when the
-   *  browser starts existing. Holding the frames here is what lets the test see
-   *  the gap a link click falls into. */
-  function heldFrames() {
-    const frames: FrameRequestCallback[] = [];
-    const real = globalThis.requestAnimationFrame;
-    globalThis.requestAnimationFrame = ((fn: FrameRequestCallback) =>
-      frames.push(fn)) as typeof requestAnimationFrame;
-    return {
-      run: async () => {
-        await act(async () => {
-          for (const frame of frames.splice(0)) frame(0);
-          // `browser_open` resolves in a microtask, and only then is there a
-          // webview to navigate.
-          await Promise.resolve();
-        });
-      },
-      restore: () => {
-        globalThis.requestAnimationFrame = real;
-      },
-    };
-  }
-
   it("waits for the webview to exist rather than failing into an error banner", async () => {
-    const frames = heldFrames();
-    try {
-      act(() => root.unmount());
-      render(() => {}, false, { url: "https://example.com/report", at: 1 });
+    act(() => root.unmount());
+    browser.reset();
+    mocks.invoke.mockClear();
+    openTabs = [];
+    render(() => {}, false, { url: "https://example.com/report", at: 1 });
 
-      // The mount that a link *causes*: the webview is still being created, and
-      // navigating now would answer the click with "the browser is not open".
-      expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
+    // The mount that a link *causes*: the webview is still being created, and
+    // navigating now would answer the click with "that browser tab is not open".
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_navigate", expect.anything());
 
-      await frames.run();
-      expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
-        url: "https://example.com/report",
-      });
-    } finally {
-      frames.restore();
-    }
+    await settle();
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
+      id: "tab-1",
+      url: "https://example.com/report",
+    });
   });
 
   it("visits once per request, however often the pane re-renders", async () => {
-    const frames = heldFrames();
-    try {
-      act(() => root.unmount());
-      const request = { url: "https://example.com/report", at: 1 };
-      render(() => {}, false, request);
-      await frames.run();
+    act(() => root.unmount());
+    browser.reset();
+    mocks.invoke.mockClear();
+    openTabs = [];
+    render(() => {}, false, { url: "https://example.com/report", at: 1 });
+    await settle();
 
-      // A title change from the page, a divider moving — any of these re-render
-      // the pane, and none of them are a second click.
-      navigate("https://example.com/report");
-      await frames.run();
+    // A title change from the page, a divider moving — any of these re-render
+    // the pane, and none of them are a second click.
+    navigate("https://example.com/report");
+    await settle();
 
-      const visits = mocks.invoke.mock.calls.filter(([name]) => name === "browser_navigate");
-      expect(visits).toHaveLength(1);
-    } finally {
-      frames.restore();
-    }
+    expect(mocks.invoke.mock.calls.filter(([name]) => name === "browser_navigate")).toHaveLength(1);
+  });
+
+  it("opens a new tab rather than taking over the page being read", async () => {
+    navigate("https://github.com");
+    await act(async () => {
+      root.render(
+        <WebPane
+          onClose={() => {}}
+          expanded={false}
+          onToggleExpanded={() => {}}
+          hidden={false}
+          request={{ url: "https://example.com/report", at: 2 }}
+        />,
+      );
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelectorAll(".tab")).toHaveLength(2);
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_navigate", {
+      id: "tab-2",
+      url: "https://example.com/report",
+    });
   });
 });

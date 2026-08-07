@@ -55,13 +55,15 @@ export type Pane =
    *    cannot take the page you are reading with it.
    *  - Its button belongs on the topbar, which rule 9c reserves for things that
    *    are the window's rather than one conversation's.
-   *  - There is one of it, so when tabs arrive there is exactly one tab strip
-   *    and no question of which browser a tab belongs to.
+   *  - There is one of it, so there is exactly one tab strip and no question
+   *    of which browser a tab belongs to.
    *
-   * It holds no URL either: the page lives in a native child webview that the
-   * backend owns (`src/browser.rs`), which keeps its own history. Putting a URL
-   * here would make this tree the second, always slightly stale, account of
-   * where the browser is.
+   * It holds neither its tabs nor their URLs. Each tab is a native child
+   * webview the backend owns (`src/browser.rs`), keeping its own page and its
+   * own history, and they outlive this pane going away and coming back — so
+   * putting them here would make this tree the second, always slightly stale,
+   * account of what the browser is showing. `webHost.ts` owns the strip, as
+   * `termHost.ts` owns the terminals'.
    */
   | { kind: "web" }
   /**
@@ -475,10 +477,10 @@ export function show(tiling: Tiling, session: string, aspect?: number): Tiling {
  * A toggle, because the button that brings the window-level browser in is the
  * one natural gesture for taking it away — a second click on "Open the browser"
  * doing nothing visible is how this looked broken when it only focused. Hiding
- * is not closing: the native webview stays alive underneath, page and profile
- * intact, so a re-open shows the page as it was. The pane's own close menu
- * sends the page back to `about:blank` ("Exit browser") or just hides it
- * ("Hide for now"); the webview itself is only torn down by the app's exit.
+ * is not closing: the native webviews stay alive underneath, pages and profile
+ * intact, so a re-open shows the tabs as they were. Leaving a page for good is
+ * a tab's own cross; the last webview is only ever blanked, and torn down by
+ * the app's exit.
  *
  * It splits off the focused pane at an even share: a page and a conversation
  * are the same order of thing, unlike a column of file names (`SIDEBAR_SHARE`).

@@ -20,8 +20,9 @@ export const TERMINAL_EXIT = "tcode://terminal-exit";
 
 /** Mirrors `browser::Navigated`. `title` is empty on the navigation itself and
  *  arrives filled in when the document sets one, which is a second event for
- *  the same page rather than a correction. */
-export type Navigated = { url: string; title: string };
+ *  the same page rather than a correction. `id` is the tab's — a background tab
+ *  finishing a redirect must not move the address bar of the one on screen. */
+export type Navigated = { id: string; url: string; title: string };
 
 /**
  * A chunk of a terminal's output.

@@ -78,12 +78,12 @@ export function TermPane({
 
   return (
     <>
-      <header className="pane-head term-tabstrip">
-        <div className="term-tabs" role="tablist" aria-label="Terminals">
+      <header className="pane-head tabstrip">
+        <div className="tabs" role="tablist" aria-label="Terminals">
           {tabs.list.map((tab) => (
             <div
               key={tab.id}
-              className={`term-tab${tab.id === tabs.current ? " is-current" : ""}${
+              className={`tab${tab.id === tabs.current ? " is-current" : ""}${
                 tab.exit === null ? "" : " is-ended"
               }`}
             >
@@ -91,26 +91,26 @@ export function TermPane({
                 type="button"
                 role="tab"
                 aria-selected={tab.id === tabs.current}
-                className="term-tab-name"
+                className="tab-name"
                 title={tab.cwd}
                 onClick={() => terminals.select(tab.id)}
               >
                 {/* The name is its own element so it can be the thing that
                     ellipsises: the button beside it is a flex container, and a
                     bare text node in one cannot be truncated. */}
-                <span className="term-tab-label">{tabLabel(tab)}</span>
+                <span className="tab-label">{tabLabel(tab)}</span>
                 {/* Not a colour: a tab whose program ended says so in words,
                     because "this one is finished" and "this one failed" are
                     different facts and only one of them is worth alarm. */}
                 {tab.exit !== null && (
-                  <span className={`term-tab-exit${tab.exit ? " is-bad" : ""}`}>
+                  <span className={`tab-exit${tab.exit ? " is-bad" : ""}`}>
                     {tab.exit ? `exit ${tab.exit}` : "exited"}
                   </span>
                 )}
               </button>
               <button
                 type="button"
-                className="term-tab-close"
+                className="tab-close"
                 aria-label={`Close ${tabLabel(tab)}`}
                 title="Close this terminal"
                 onClick={() => terminals.close(tab.id)}

@@ -409,13 +409,17 @@ body.is-resizing {
   background: var(--sunken);
 }
 
-/* The browser wears two rows like a real browser: a tab strip (page title,
-   expand, close) above a toolbar (history, address, reload). They were one row
-   once, and reload and close sitting side by side read as the same kind of
-   button — which is how "refresh the page" and "leave the browser" became the
-   same question. Closing lives on the tab, refreshing on the toolbar. */
+/* The browser wears two rows like a real browser: a tab strip above a toolbar
+   (history, address, reload). They were one row once, and reload and close
+   sitting side by side read as the same kind of button — which is how "refresh
+   the page" and "leave the browser" became the same question. Closing lives on
+   the tab, refreshing on the toolbar.
+
+   `--chrome` here, unlike the terminal's strip: the browser's body is not this
+   app's surface at all — it is a page from somewhere else, composited over the
+   pane by the OS — so the strip above it is the window holding a foreign
+   document, which is exactly what chrome is for. */
 .pane-head.web-tabstrip {
-  padding-left: var(--s-3);
   background: var(--chrome);
   /* The toolbar below already borders the top of its own row; keeping the
      base `.pane-head` bottom hairline here would draw the two rows apart with
@@ -424,41 +428,6 @@ body.is-resizing {
 }
 .pane-head.web-toolbar {
   border-top: 1px solid var(--line);
-}
-
-/* The tab's name: the page title when the page has one, its address otherwise.
-   A tab is a *place*, so it is named the way a pane is — by what it holds. */
-.web-tab-title {
-  flex: 1;
-  min-width: 0;
-  overflow: hidden;
-  color: var(--body);
-  font-size: var(--text-xs);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.web-close-box {
-  display: flex;
-}
-
-/* The close menu hangs from the tab strip's X, opening downward like the
-   folder menu. Two items, because leaving the browser is a choice: exit
-   destroys the page, hide keeps it. */
-.web-close-menu {
-  right: var(--seat-right, var(--s-4));
-  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
-  width: min(15rem, calc(100vw - var(--s-6)));
-  max-width: calc(100vw - var(--seat-right, 0px) - var(--s-4));
-  padding: var(--s-1);
-}
-.web-close-head {
-  padding: var(--s-1) var(--s-2) var(--s-2);
-  color: var(--muted);
-  font-size: var(--text-2xs);
-}
-.web-close-note {
-  color: var(--muted);
-  font-size: var(--text-2xs);
 }
 
 /* The address bar takes the room the pane name has elsewhere. It is a field,
@@ -498,22 +467,19 @@ body.is-resizing {
   font-size: var(--text-xs);
 }
 
-/* ---- The terminals ---------------------------------------------------- */
+/* ---- The tab strips --------------------------------------------------- */
 
-/* PRODUCT.md's first rule for this app is that it must not look like a
-   terminal — no phosphor palette, no monospace-everything. This pane is the
-   one place that *is* a terminal, and the way to hold both is that the terminal
-   is a **document on this surface** rather than a window from another era: the
-   app's paper, the app's mono face, the app's ANSI palette rendered light
-   (`base.css`). Everything around it — the strip, the tabs, the labels — stays
-   in the UI face at the app's own density.
+/* Two panes in this window have tabs — the terminals and the browser — and
+   they wear one strip, not two that resemble each other. The rules below are
+   therefore written on `.tab*` and the panes add only what genuinely differs:
+   the browser's strip sits on `--chrome` above a foreign document, the
+   terminal's on `--bg` above its own; the terminal's tabs can say a program
+   ended, and the browser's cannot.
 
-   The strip is a pane header like any other, so it keeps `--bg` and separates
-   from the terminal with the hairline every `.pane-head` already draws. It was
-   `--chrome` once, copied from the browser's strip, and that is backwards here:
-   chrome is the layer panes *lie on*, and using it above a pane's own body made
-   the header read as the window showing through a hole in the pane. */
-.pane-head.term-tabstrip {
+   The alternative was a `web-` copy of a hundred lines whose comments are all
+   about a bug or a rejected version. Two copies of that agree on the day they
+   are written. */
+.pane-head.tabstrip {
   /* No vertical padding: the tabs run the full height of the strip so the
      current one's mark can sit on the hairline at the bottom of it. */
   padding: 0 var(--s-1) 0 0;
@@ -522,7 +488,7 @@ body.is-resizing {
 
 /* Tabs scroll rather than shrink: a name squeezed to three characters is a tab
    you have to click to identify, which is the whole job of the strip. */
-.term-tabs {
+.tabs {
   flex: 1;
   min-width: 0;
   align-self: stretch;
@@ -530,7 +496,7 @@ body.is-resizing {
   overflow-x: auto;
   scrollbar-width: none;
 }
-.term-tabs::-webkit-scrollbar {
+.tabs::-webkit-scrollbar {
   display: none;
 }
 
@@ -558,7 +524,7 @@ body.is-resizing {
  * misread as status — a status dot is a dot in a gutter, and this is a rule
  * under a segment.
  */
-.term-tab {
+.tab {
   position: relative;
   display: flex;
   align-items: center;
@@ -566,16 +532,16 @@ body.is-resizing {
   color: var(--muted);
   transition: color var(--dur-fast) var(--ease);
 }
-.term-tab + .term-tab {
+.tab + .tab {
   border-left: 1px solid var(--line);
 }
-.term-tab:hover {
+.tab:hover {
   color: var(--body);
 }
-.term-tab.is-current {
+.tab.is-current {
   color: var(--ink);
 }
-.term-tab.is-current::after {
+.tab.is-current::after {
   content: "";
   position: absolute;
   inset-inline: 0;
@@ -595,15 +561,15 @@ body.is-resizing {
    the 12px cross measure 24px and eat the air the name had reserved for it.
    The tab then read as "the cross is touching the text" — a spacing bug with a
    spacing-looking cause that is not where the spacing is written. */
-.term-tab-name,
-.term-tab-close {
+.tab-name,
+.tab-close {
   padding: 0;
   border: 0;
   background: none;
   cursor: pointer;
 }
 
-.term-tab-name {
+.tab-name {
   min-width: 0;
   display: flex;
   align-items: baseline;
@@ -621,28 +587,29 @@ body.is-resizing {
   color: inherit;
   font-size: var(--text-xs);
 }
-.term-tab.is-current .term-tab-name {
+.tab.is-current .tab-name {
   font-weight: var(--weight-medium);
 }
 
-.term-tab-label {
+.tab-label {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
 }
 
-/* Said in words, never in colour alone: "it finished" and "it failed" are
-   different facts, and only the second one has earned any alarm. */
-.term-tab-exit {
+/* The terminal's only: a page cannot exit. Said in words, never in colour
+   alone — "it finished" and "it failed" are different facts, and only the
+   second one has earned any alarm. */
+.tab-exit {
   flex: none;
   color: var(--faint);
   font-size: var(--text-2xs);
 }
-.term-tab-exit.is-bad {
+.tab-exit.is-bad {
   color: var(--danger-text);
 }
-.term-tab.is-ended .term-tab-label {
+.tab.is-ended .tab-label {
   color: var(--muted);
 }
 
@@ -656,7 +623,7 @@ body.is-resizing {
    hover, just ink getting darker. A 22px tinted square appearing inside a strip
    that has no other boxes in it is the same mistake as the tab boxes, one
    element smaller. */
-.term-tab-close {
+.tab-close {
   position: absolute;
   right: var(--s-2);
   display: flex;
@@ -666,22 +633,40 @@ body.is-resizing {
     opacity var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
 }
-.term-tab:hover .term-tab-close,
-.term-tab-close:focus-visible {
+.tab:hover .tab-close,
+.tab-close:focus-visible {
   opacity: 1;
 }
-.term-tab-close:hover {
+.tab-close:hover {
   color: var(--ink);
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .term-tab,
-  .term-tab-close {
+  .tab,
+  .tab-close {
     transition: none;
   }
 }
 
-/* The terminal's own surface. The padding is the margin of a printed listing —
+/* ---- The terminals ---------------------------------------------------- */
+
+/* PRODUCT.md's first rule for this app is that it must not look like a
+   terminal — no phosphor palette, no monospace-everything. This pane is the
+   one place that *is* a terminal, and the way to hold both is that the terminal
+   is a **document on this surface** rather than a window from another era: the
+   app's paper, the app's mono face, the app's ANSI palette rendered light
+   (`base.css`). Everything around it — the strip, the tabs, the labels — stays
+   in the UI face at the app's own density.
+
+   Its strip is therefore a pane header like any other, keeping `--bg` and
+   separating from the terminal with the hairline every `.pane-head` draws. It
+   was `--chrome` once, copied from the browser's strip, and that is backwards
+   here: chrome is the layer panes *lie on*, and using it above a pane's own
+   body made the header read as the window showing through a hole in the pane.
+   The browser's strip keeps `--chrome` because what is under it is genuinely
+   not this app's surface.
+
+   The terminal's own surface. The padding is the margin of a printed listing —
    without it the first column sits against the pane's edge, which is the single
    most terminal-emulator thing a layout can do. `FitAddon` measures inside it,
    so the columns the shell is told about are the columns that are drawn. */

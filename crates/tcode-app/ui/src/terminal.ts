@@ -1,21 +1,20 @@
 import { basename } from "./show";
+import { mapTab, noTabs, type TabList } from "./tabs";
 
 /**
  * The terminal's tabs, as data.
  *
- * Pure, for the same reason `layout.ts` is: "what does closing the middle tab
- * select?" and "does a tab that exited still count?" are questions with one
- * right answer each, and answering them inside a component means answering them
- * by clicking. Nothing here knows what a terminal looks like or that a PTY
- * exists — `termHost.ts` owns both.
+ * The strip itself — add, close, select, step — is `tabs.ts`, shared with the
+ * browser's; what is here is what a *terminal* tab is: a shell, a folder, and
+ * an exit code once its program ends. Nothing here knows what a terminal looks
+ * like or that a PTY exists — `termHost.ts` owns both.
  *
  * ## Why tabs live here at all
  *
- * `layout.ts` notes that the window's browser has no session and there is only
- * ever one of it, "so when tabs arrive there is exactly one tab strip and no
- * question of which browser a tab belongs to". The terminal is the same shape
- * and inherits the same conclusion: one pane, one strip, and a tab is a place
- * inside it rather than a second kind of pane.
+ * `layout.ts` notes that the terminals have no session and there is only ever
+ * one pane of them, so there is exactly one tab strip and no question of which
+ * terminal a tab belongs to. A tab is a place *inside* the pane rather than a
+ * second kind of pane, and the tiling tree stays free of it.
  */
 
 /** One shell. `id` is the backend's — the PTY is the tab's identity, so there
@@ -33,46 +32,11 @@ export type Tab = {
   exit: number | null;
 };
 
-export type Tabs = { list: Tab[]; current: string };
+export type Tabs = TabList<Tab>;
 
-export const NO_TABS: Tabs = { list: [], current: "" };
+export const NO_TABS: Tabs = noTabs<Tab>();
 
-/** A new tab always takes focus: you asked for it, so you are typing in it. */
-export function addTab(tabs: Tabs, tab: Tab): Tabs {
-  return { list: [...tabs.list, tab], current: tab.id };
-}
-
-/**
- * Closes one tab, selecting the next one along — the tab that slid into the
- * place the closed one occupied.
- *
- * Falling back to the previous one at the end of the strip is what keeps the
- * selection *near* where you were looking; jumping to the first tab because the
- * last one closed is the behaviour every terminal emulator got wrong once.
- */
-export function closeTab(tabs: Tabs, id: string): Tabs {
-  const at = tabs.list.findIndex((tab) => tab.id === id);
-  if (at < 0) return tabs;
-  const list = tabs.list.filter((tab) => tab.id !== id);
-  if (!list.length) return NO_TABS;
-  if (tabs.current !== id) return { list, current: tabs.current };
-  return { list, current: (list[at] ?? list[list.length - 1]).id };
-}
-
-/** Unknown ids are ignored rather than clearing the selection, for the same
- *  reason `focusPane` ignores them: a stale click must not leave the strip with
- *  nothing current. */
-export function selectTab(tabs: Tabs, id: string): Tabs {
-  return tabs.list.some((tab) => tab.id === id) ? { ...tabs, current: id } : tabs;
-}
-
-/** The next tab along, wrapping. Negative steps go the other way. */
-export function stepTab(tabs: Tabs, delta: number): Tabs {
-  if (tabs.list.length < 2) return tabs;
-  const at = tabs.list.findIndex((tab) => tab.id === tabs.current);
-  const next = (at + delta + tabs.list.length) % tabs.list.length;
-  return { ...tabs, current: tabs.list[next].id };
-}
+export { addTab, closeTab, currentTab, selectTab, stepTab } from "./tabs";
 
 /** What the shell says it is (OSC 2). Blank titles are ignored: a program that
  *  clears the title is not asking for an unnamed tab, and `tabLabel` has a
@@ -80,22 +44,12 @@ export function stepTab(tabs: Tabs, delta: number): Tabs {
 export function renameTab(tabs: Tabs, id: string, title: string): Tabs {
   const clean = title.trim();
   if (!clean) return tabs;
-  return {
-    ...tabs,
-    list: tabs.list.map((tab) => (tab.id === id ? { ...tab, title: clean } : tab)),
-  };
+  return mapTab(tabs, id, (tab) => ({ ...tab, title: clean }));
 }
 
 /** The program ended. The tab stays; only its status changes. */
 export function endTab(tabs: Tabs, id: string, code: number): Tabs {
-  return {
-    ...tabs,
-    list: tabs.list.map((tab) => (tab.id === id ? { ...tab, exit: code } : tab)),
-  };
-}
-
-export function currentTab(tabs: Tabs): Tab | null {
-  return tabs.list.find((tab) => tab.id === tabs.current) ?? null;
+  return mapTab(tabs, id, (tab) => ({ ...tab, exit: code }));
 }
 
 /**

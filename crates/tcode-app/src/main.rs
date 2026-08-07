@@ -49,14 +49,27 @@ fn main() -> anyhow::Result<()> {
             // gets one, and where every open conversation starts watching.
             app.state::<Arc<tcode_app::state::Supervisor>>()
                 .attach_emitter(Arc::new(app.handle().clone()));
-            // The browser is a child webview of the main window. WebView2 hangs
-            // when the parent HWND is destroyed while its controller is still
-            // alive (tauri#13534 is the same teardown for owned windows), so
-            // the child must be closed while the window is still whole, before
-            // the window's own teardown drops it with its parent already gone.
-            // The frontend's pane-close path is the same `browser_close`; this
-            // is the version that runs on the app's own exit, which no frontend
-            // code can intercept (the caption close is non-client area).
+            // The window's widget tree is rearranged now, before anything is on
+            // screen, so the browser's tabs have somewhere positionable to live
+            // (`browser::place`). It moves the app's own webview, which is why
+            // it happens at startup rather than when the first tab opens — and
+            // it is a no-op on every platform that positions child webviews by
+            // itself. A failure here is not fatal: everything except the
+            // browser pane's geometry still works, and a window that refuses to
+            // open would be the worse answer.
+            if let Err(error) = tcode_app::browser::install(app.handle()) {
+                eprintln!("tcode-app: could not prepare the browser layer: {error}");
+            }
+
+            // The browser's tabs are child webviews of the main window.
+            // WebView2 hangs when the parent HWND is destroyed while a
+            // controller is still alive (tauri#13534 is the same teardown for
+            // owned windows), so the children must be closed while the window
+            // is still whole, before the window's own teardown drops them with
+            // their parent already gone. This is also the one place that closes
+            // the *last* webview — `browser_close` deliberately keeps it, and
+            // the app's own exit is not something frontend code can intercept
+            // (the caption close is non-client area).
             let browser = app
                 .state::<Arc<tcode_app::browser::Browser>>()
                 .inner()
@@ -73,7 +86,7 @@ fn main() -> anyhow::Result<()> {
                 .expect("the main window is open")
                 .on_window_event(move |event| {
                     if let tauri::WindowEvent::CloseRequested { .. } = event {
-                        let _ = browser.close();
+                        browser.close_all();
                         terminals.close_all();
                     }
                 });
@@ -115,6 +128,8 @@ fn main() -> anyhow::Result<()> {
             tcode_app::commands::shown_file,
             tcode_app::commands::serve_url,
             tcode_app::commands::browser_open,
+            tcode_app::commands::browser_show,
+            tcode_app::commands::browser_select,
             tcode_app::commands::browser_bounds,
             tcode_app::commands::browser_visible,
             tcode_app::commands::browser_navigate,

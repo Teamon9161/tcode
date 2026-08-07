@@ -4354,6 +4354,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "futures",
+ "gtk",
  "http-body-util",
  "hyper",
  "hyper-util",
