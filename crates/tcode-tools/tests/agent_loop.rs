@@ -5024,6 +5024,59 @@ async fn approving_a_plan_in_this_session_keeps_the_turn_going() {
     assert!(results[2].0.contains("Now starting"), "{results:?}");
 }
 
+/// A phase flip that re-carries the previous call's `state: "active"` is not
+/// a new submission — the approval was granted when that file became active.
+/// Without this guard the model pays the user a second approval for one
+/// document (the resend shape that caused it: copying the approved call's
+/// fields onto the flip).
+#[tokio::test]
+async fn resubmitting_an_active_plan_does_not_ask_again() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "progress",
+            r#"{"title":"Ship it","description":"ship the thing","background":"worth doing","state":"draft","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
+        ),
+        tool_use(
+            "t2",
+            "progress",
+            r#"{"state":"active","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
+        ),
+        // The flip re-carries `state: "active"`; the plan is already active,
+        // so this must not raise a second PlanReview.
+        tool_use(
+            "t3",
+            "progress",
+            r#"{"state":"active","phases":[{"phase":"one","status":"in_progress","detail":"why"}]}"#,
+        ),
+        text_done("executing"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run(&agent, &mut session, &approver, "/plan it").await;
+
+    let asked = approver.asked.lock().unwrap().clone();
+    assert_eq!(
+        asked.len(),
+        1,
+        "the submission asks once; the redundant re-submission must not: {asked:?}"
+    );
+    let results = tool_results(&session);
+    assert_eq!(results.len(), 3, "{results:?}");
+    assert!(
+        !results[2].0.contains("cleared to execute"),
+        "a redundant flip is not a fresh approval: {results:?}"
+    );
+    // The flip itself still landed on disk.
+    let progress = session.progress();
+    let text = std::fs::read_to_string(progress.as_ref().expect("open file").path()).unwrap();
+    assert!(text.contains("## [>] 1. one"), "{text}");
+}
+
 /// Four new files in one batch, the shape a model uses to lay out an example
 /// set. Reported from the field as "four successes, one file on disk"; this
 /// pins the whole path — distinct lanes, distinct writes, every one durable —

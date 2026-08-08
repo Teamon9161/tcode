@@ -156,9 +156,76 @@ pub(crate) fn shell_command(
                 tokio::process::Command::new(which_bash().unwrap_or_else(|| "bash".into()));
             cmd.args(["-c", script]);
             cmd.current_dir(cwd);
+            // Its own process group, so a timeout or cancel can SIGKILL the
+            // whole tree (bash and everything it spawned), not just bash.
+            #[cfg(unix)]
+            {
+                use tokio::process::CommandExt;
+                cmd.process_group(0);
+            }
             cmd
         }
     }
+}
+
+/// Terminate the command's entire process tree and reap it.
+///
+/// `Child::kill` only kills the direct child; a shell command's grandchildren
+/// (cargo, the test exe it spawns) would survive it and keep their file locks.
+/// Unix: the command was spawned in its own process group (see `shell_command`)
+/// and the group gets SIGKILL. Windows: `taskkill /T /F` walks the tree from
+/// the pid. Returns a diagnostic when the tree kill failed and only the direct
+/// child was stopped, so callers can say so instead of leaving the model to
+/// guess why locks are still held.
+pub(crate) async fn kill_process_tree(child: &mut tokio::process::Child) -> Option<String> {
+    // Already exited: there is no tree left to kill, and killing by a reused
+    // pid would hit an innocent process.
+    if child.try_wait().ok().flatten().is_some() {
+        return None;
+    }
+    let pid = child.id()?;
+    #[cfg(unix)]
+    {
+        // The process group id is the leader's pid (`process_group(0)` at
+        // spawn); kill the whole group. ESRCH means the group is already
+        // empty — nothing to do.
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let output = tokio::process::Command::new("taskkill.exe")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .output()
+            .await;
+        match output {
+            Ok(output) if output.status.success() => {}
+            Ok(output) => {
+                let detail = String::from_utf8_lossy(&output.stderr);
+                let _ = child.kill().await;
+                return Some(format!(
+                    "taskkill could not terminate the process tree ({detail}); only the direct child was killed"
+                ));
+            }
+            Err(error) => {
+                let _ = child.kill().await;
+                return Some(format!(
+                    "taskkill could not be started ({error}); only the direct child was killed"
+                ));
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = child.kill().await;
+    }
+    // Reap whatever is left so handles release; no-op for an already-dead
+    // child.
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+    None
 }
 
 /// Names to resolve are handed to the probe through the environment rather
@@ -346,7 +413,7 @@ impl ShellTool {
                     supervisor_shared.set_status(TaskStatus::Exited(code));
                 }
                 _ = supervisor_shared.kill.cancelled() => {
-                    let _ = child.kill().await;
+                    let _ = kill_process_tree(&mut child).await;
                     for r in readers {
                         let _ = r.await;
                     }
@@ -631,17 +698,23 @@ impl Tool for ShellTool {
                 }
             }
             _ = tokio::time::sleep(timeout) => {
-                let _ = child.kill().await;
-                ToolOutput::err(format!(
+                let mut message = format!(
                     "command timed out after {}s and was killed. If it \
                      legitimately needs longer, re-run with timeout_ms up to {}.",
                     timeout.as_secs(),
                     MAX_TIMEOUT_MS
-                ))
+                );
+                if let Some(diag) = kill_process_tree(&mut child).await {
+                    message.push_str(&format!(" {diag}"));
+                }
+                ToolOutput::err(message)
             }
             _ = cancel.cancelled() => {
-                let _ = child.kill().await;
-                ToolOutput::err("command cancelled by user and killed".to_string())
+                let mut message = "command cancelled by user and killed".to_string();
+                if let Some(diag) = kill_process_tree(&mut child).await {
+                    message.push_str(&format!(" {diag}"));
+                }
+                ToolOutput::err(message)
             }
         }
     }
@@ -839,6 +912,97 @@ mod tests {
         let raw = std::fs::read_to_string(path).unwrap();
         assert!(raw.contains("line 0"));
         assert!(raw.contains("line 84"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The timeout branch kills the whole tree: a grandchild the command
+    /// spawned — the shape that left `agent_loop*.exe` holding a linker lock
+    /// after its parent shell was killed — must be gone too, not just the
+    /// direct child. `taskkill /T /F` is what makes that true on Windows.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_tree_on_windows() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let root = std::env::temp_dir().join(format!("tcode-tree-kill-win-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
+        // The command writes its grandchild's pid to the marker, then sleeps;
+        // the tool times out at 2s and must take the grandchild down with it.
+        let command = format!(
+            "$p = Start-Process powershell -ArgumentList '-NoProfile','-Command','Start-Sleep 60' -PassThru; \
+             $p.Id | Set-Content -Path '{}'; Start-Sleep 60",
+            marker.display().to_string().replace('\'', "''")
+        );
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": command, "timeout_ms": 2000 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("timed out"), "{}", output.content);
+        let raw = std::fs::read_to_string(&marker).expect("grandchild pid marker");
+        let pid: u32 = raw.trim().parse().expect("numeric pid");
+        // The grandchild must be gone: Get-Process errors for a dead pid.
+        let check = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": format!("try {{ Get-Process -Id {pid} -ErrorAction Stop | Out-Null; 'alive' }} catch {{ 'gone' }}") }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!check.is_error, "{}", check.content);
+        assert!(check.content.contains("gone"), "{}", check.content);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The Unix side of the same contract: the command runs in its own process
+    /// group, so the timeout's group kill takes a background sleep the command
+    /// spawned down with it. Without `process_group(0)` this test fails — the
+    /// group kill would only reach bash.
+    #[tokio::test]
+    async fn timeout_kills_the_whole_tree_on_unix() {
+        if !cfg!(unix) {
+            return;
+        }
+        if !bash_available() {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let root =
+            std::env::temp_dir().join(format!("tcode-tree-kill-unix-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("marker");
+        let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
+        // bash records a background sleep's pid, then sleeps itself; the group
+        // kill at timeout must take the background sleep down too.
+        let command = format!("sleep 60 & echo $! > '{}'; sleep 60", marker.display());
+        let output = ShellTool::new(ShellKind::Bash)
+            .run(
+                json!({ "command": command, "timeout_ms": 2000 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("timed out"), "{}", output.content);
+        let raw = std::fs::read_to_string(&marker).expect("grandchild pid marker");
+        let pid: u32 = raw.trim().parse().expect("numeric pid");
+        let check = ShellTool::new(ShellKind::Bash)
+            .run(
+                json!({ "command": format!("kill -0 {pid} 2>/dev/null && echo alive || echo gone") }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!check.is_error, "{}", check.content);
+        assert!(check.content.contains("gone"), "{}", check.content);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

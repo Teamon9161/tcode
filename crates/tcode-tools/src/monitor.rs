@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::{AutoSafety, PermissionRequest, TaskStatus, Tool, ToolCtx, ToolOutput};
 
-use crate::shell::{shell_command, spawn_line_reader, ShellKind};
+use crate::shell::{kill_process_tree, shell_command, spawn_line_reader, ShellKind};
 
 const DEFAULT_QUIET_MS: u64 = 1_500;
 const QUIET_RANGE_MS: std::ops::RangeInclusive<u64> = 100..=30_000;
@@ -199,7 +199,7 @@ impl Tool for MonitorTool {
                     supervisor_shared.set_status(TaskStatus::Exited(code));
                 }
                 _ = supervisor_shared.kill.cancelled() => {
-                    let _ = child.kill().await;
+                    let _ = kill_process_tree(&mut child).await;
                     for r in readers {
                         let _ = r.await;
                     }
@@ -207,7 +207,7 @@ impl Tool for MonitorTool {
                 }
                 _ = deadline => {
                     supervisor_shared.mark_timed_out();
-                    let _ = child.kill().await;
+                    let _ = kill_process_tree(&mut child).await;
                     for r in readers {
                         let _ = r.await;
                     }

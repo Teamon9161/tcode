@@ -186,4 +186,3 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-11. Tool friction — shell: 一个测试命令超时被 harness 杀掉后，Windows 的常规 target 中 agent_loop*.exe 持续被 linker 报为已锁定，即使随后未发现 cargo、rustc 或测试进程。为完成验证，我不得不使用会话私有的 CARGO_TARGET_DIR 重编译并在结束后删除。shell 超时时若能终止完整子进程树并等待句柄释放，可避免这一额外编译与目标目录切换。

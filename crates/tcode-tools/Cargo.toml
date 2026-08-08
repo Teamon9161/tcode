@@ -27,5 +27,8 @@ reqwest = { workspace = true }
 futures = { workspace = true }
 os_info = { version = "3", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tempfile = "3"

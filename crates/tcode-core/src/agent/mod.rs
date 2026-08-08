@@ -26,7 +26,7 @@ use crate::config::WatchdogConfig;
 use crate::ledger::Entry;
 use crate::memory::MemoryUpdate;
 use crate::permission::{
-    ApprovalDecision, Approver, BatchApproval, BatchAsk, Decision, PermissionMode,
+    Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk, Decision, PermissionMode,
 };
 use crate::provider::{ProviderError, Request, StreamEvent};
 use crate::tool::{BatchPolicy, DelegateEvent, PermissionRequest, Tool, ToolOutput};
@@ -1196,12 +1196,25 @@ impl Agent {
                     continue;
                 }
                 Decision::Ask | Decision::Auto => {
+                    // A `state: "active"` call for a plan this session already
+                    // holds as active is not a new submission: the approval
+                    // dialog was answered (or never needed) when that file
+                    // became active. Phase flips that re-carry the previous
+                    // call's `state` are the common shape, and re-asking would
+                    // cost a second approval of one document. A genuinely
+                    // revised plan goes back through `draft` first — the
+                    // lifecycle's own arrow — so a submission of a draft still
+                    // asks.
+                    let redundant_review = matches!(request, PermissionRequest::PlanReview { .. })
+                        && crate::progress::is_redundant_submission(&session.tool_ctx, input);
                     // A plan is a durable review artifact, not an approved-only
                     // side effect. Persist the model's submitted version before
                     // it crosses the frontend boundary, and hand the review its
                     // rendered body; the model-issued call in the ledger stays
                     // immutable and free of harness bookkeeping.
-                    let review_input = if matches!(request, PermissionRequest::PlanReview { .. }) {
+                    let review_input = if matches!(request, PermissionRequest::PlanReview { .. })
+                        && !redundant_review
+                    {
                         match crate::progress::review_copy(&session.tool_ctx, input) {
                             Ok(review) => review,
                             Err(error) => {
@@ -1212,17 +1225,23 @@ impl Agent {
                     } else {
                         input.clone()
                     };
-                    let approval = approver
-                        .ask_with_call(
-                            id,
-                            name,
-                            request.summary(),
-                            &request.approval_label(),
-                            request.is_edit(),
-                            request.allows_rule(),
-                            &review_input,
-                        )
-                        .await;
+                    let approval = if redundant_review {
+                        // The user already approved this exact plan; carry that
+                        // decision through without raising the dialog again.
+                        Approval::simple(ApprovalDecision::Yes, None)
+                    } else {
+                        approver
+                            .ask_with_call(
+                                id,
+                                name,
+                                request.summary(),
+                                &request.approval_label(),
+                                request.is_edit(),
+                                request.allows_rule(),
+                                &review_input,
+                            )
+                            .await
+                    };
                     match approval.decision {
                         ApprovalDecision::Yes => {
                             approval_note = approval.comment;

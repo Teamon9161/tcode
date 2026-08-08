@@ -1136,6 +1136,23 @@ pub fn review_copy(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<Value, S
     Ok(review)
 }
 
+/// Whether a `state: "active"` call re-submits the plan this session already
+/// holds as active. The approval dialog was answered (or never needed) when
+/// that file became active, so asking again would be a second approval of one
+/// document — the common shape is a phase flip that re-carries the previous
+/// call's `state: "active"` together with the resent breakdown. A genuinely
+/// revised plan goes back through `draft` first (the lifecycle's own arrow,
+/// `Active -> Draft -> Active`), so a submission of a *draft* still asks.
+pub fn is_redundant_submission(ctx: &crate::tool::ToolCtx, input: &Value) -> bool {
+    is_submission(input)
+        && ctx
+            .progress
+            .lock()
+            .expect("progress lock")
+            .as_ref()
+            .is_some_and(|progress| progress.state() == ProgressState::Active)
+}
+
 /// What a submitted plan is missing, as the error refusing it.
 ///
 /// A draft is the one shape of progress file whose reader is someone other than
@@ -1209,6 +1226,7 @@ pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, S
     if is_view(input) {
         return Ok(progress.full_view());
     }
+    let was_active = progress.state() == ProgressState::Active;
     let submitted = is_submission(input).then(|| progress.body());
     let entered = if is_submission(input) {
         // The approved call: whatever the reviewer left in the pane is the
@@ -1239,8 +1257,10 @@ pub fn apply_call(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<String, S
     // task it was asked to do — draft a plan, submit it — so the model stops
     // exactly where the user expected it to start. (The other approval route,
     // handing the plan to a fresh session, says this in that session's opening
-    // instruction; this is the same sentence for staying put.)
-    if submitted.is_some() {
+    // instruction; this is the same sentence for staying put.) A redundant
+    // re-submission of an already-active plan is not a fresh approval, so it
+    // does not get the nudge either.
+    if submitted.is_some() && !was_active {
         result.push_str(
             "\n\nApproved — you are cleared to execute this plan now. Start with its first phase: mark it in_progress in your next `progress` call and begin the work.",
         );
@@ -1974,6 +1994,55 @@ mod tests {
         assert!(is_submission(&json!({ "state": "active" })));
         assert!(!is_submission(&json!({ "state": "draft" })));
         assert!(!is_submission(&json!({ "phases": [] })));
+    }
+
+    /// A `state: "active"` call for a plan this session already holds as active
+    /// is not a new submission — the approval was answered (or never needed)
+    /// when that file became active, so re-asking would be a second approval of
+    /// one document. The agent loop uses this to skip the dialog; a draft, a
+    /// session with no file open, and a call without `state` all still ask or
+    /// never were submissions.
+    #[test]
+    fn a_resubmission_of_an_active_plan_is_redundant() {
+        // A tracker the model opened without `state` is active from birth;
+        // re-submitting it as active is redundant.
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Track it", "phases": [{ "phase": "one", "status": "in_progress" }] }),
+        )
+        .unwrap();
+        assert!(is_redundant_submission(
+            &ctx,
+            &json!({ "state": "active", "phases": [] })
+        ));
+
+        // A draft has not been approved yet; its submission must still ask.
+        let drafted = test_ctx();
+        apply_call(
+            &drafted,
+            &json!({ "title": "Plan it", "state": "draft", "phases": [] }),
+        )
+        .unwrap();
+        assert!(!is_redundant_submission(
+            &drafted,
+            &json!({ "state": "active", "phases": [] })
+        ));
+
+        // Nothing is open yet: there is no approved file to be redundant about.
+        let fresh = test_ctx();
+        assert!(!is_redundant_submission(
+            &fresh,
+            &json!({ "title": "Other", "state": "active" })
+        ));
+
+        // A call that never names `state: "active"` is not a submission at all.
+        let tracking = test_ctx();
+        apply_call(&tracking, &json!({ "title": "Track it", "phases": [] })).unwrap();
+        assert!(!is_redundant_submission(
+            &tracking,
+            &json!({ "phases": [] })
+        ));
     }
 
     /// A submitted draft is written before the human answers, so declining

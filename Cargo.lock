@@ -2849,6 +2849,7 @@ dependencies = [
  "grep-searcher",
  "htmd",
  "ignore",
+ "libc",
  "os_info",
  "regex",
  "reqwest",
