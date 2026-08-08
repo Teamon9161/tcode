@@ -192,6 +192,5 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4.  Tool friction — shell (PowerShell): 我数次用 Get-ChildItem 'C:\Users\Teamon\.tcode\projects\c--code-rust-tcode' -Force 列目录，返回空（连 scratchpad 都不显示），而同路径的 cmd /c dir 和 Git Bash ls 都正常列出全部内容；Test-Path 对深路径返回 True、对刚写入的文件却静默无输出。为确认进度文件是否落盘，我被迫换 bash 交叉验证并多花了几次调用。最小改进：排查 harness 的 PowerShell 包装对某些路径的目录列举/布尔输出是否被吞掉（可能与输出捕获有关）。
-• Capability gap — 无: 本次没有遇到需要新工具才能干净解决的需求；上面 PowerShell 的问题属于现有工具的缺陷而非缺失能力。
-5. 桌面 terminal.rs 的 a_shell_echoes_what_it_is_told_and_reports_how_it_ended 连续失败（真实 PTY 管道 20s 内等不到 echo，另两个 terminal 测试通过）——纯环境性，该测试不构造 Session、与本次改动零交集。
+4. ~~Tool friction — shell (PowerShell)~~ **已修复，是我们的问题**：`Get-ChildItem | Select-Object Name` 这类以"选属性"结尾的管道返回空。根因不是"某些路径"特殊，而是 wrapper 在脚本后立刻 `exit`：PowerShell 5.1 的格式化器把表状输出（`Select-Object <属性>` 产生的 PSObject）缓冲到管道结束才写，`exit` 直接跳过收尾冲刷，于是整段输出一起丢（实测同一条命令里连后面的字符串/`Test-Path` 布尔输出也一起没）；`cmd /c dir`、`ls`、裸 `Test-Path` 走即时写出路径所以正常。修法（`crates/tcode-tools/src/shell.rs::shell_command`）：脚本包进 `& { … } | Out-String -Stream` 子管道，子管道闭合强制格式化器先写完再跑退出逻辑；`-Stream` 保持 monitor/后台任务逐行流式。附 3 个回归测试：Select-Object 输出保全、流式不缓冲、尾部 `#` 注释不吞闭合。重启 harness 后生效。
+5. ~~桌面 terminal.rs 的 a_shell_echoes… 连续失败~~ **已修复，Windows 特有而非"纯环境性"**：两个真实缺陷。① cmd.exe 启动即发 `ESC[6n` 光标位置查询（DSR）并阻塞等应答——真 webview 里 xterm.js 会答、测试的哑 collector 不会，shell 永远停在启动，输入到不了它；测试替身现在像 xterm.js 一样回 `ESC[1;1R`（`crates/tcode-app/tests/terminal.rs`）。② `exit 7` 后收不到 TERMINAL_EXIT：Windows ConPTY 下客户端退出不关闭输出管道，原 pump 先等管道 EOF 再 `child.wait()` 就永久卡住，死 shell 显示为活着；pump 改为独立 waiter 线程上报退出（`src/terminal.rs`），`open()` 也改为先注册再启 pump 避免 DSR 应答竞态。行终止符按平台区分（Windows Enter=`\r`，Unix=`\n`，Linux 行为不变）。

@@ -125,17 +125,32 @@ pub(crate) fn shell_command(
             let mut cmd = tokio::process::Command::new("powershell.exe");
             // Force UTF-8 so output survives non-English codepages.
             //
-            // PowerShell 5.1 turns a native command's stderr (once merged
-            // with `2>&1`) into an ErrorRecord, which flips `$?` to False;
-            // a script that then ends on a cmdlet — the pipe's `Select-Object
-            // -Last N`, say — exits 1 even though the command exited 0.
-            // `$LASTEXITCODE` keeps the real code, so exit on it first, and
-            // fall back to `$?` when the script never ran a native command.
-            // A newline (not `;`) separates the append so a trailing `#`
-            // comment in the script cannot swallow the exit logic.
+            // The script runs as a sub-pipeline (`& { … }`) piped through
+            // `Out-String -Stream`, and the exit logic runs only after it
+            // closes. PowerShell 5.1's formatter holds table-shaped output —
+            // anything a `Select-Object <property>` pipeline ends in — until
+            // the pipeline ends, and a wrapper that called `exit` right after
+            // the script discarded that unflushed text: `Get-ChildItem |
+            // Select-Object Name` came back empty while `cmd /c dir` on the
+            // same directory (native output, streamed per line) was fine.
+            // Closing the sub-pipeline before the exit logic forces the
+            // formatter to finish, and `-Stream` keeps each line its own
+            // string so `monitor` and background tasks still stream in real
+            // time instead of being buffered until exit.
+            //
+            // PowerShell 5.1 also turns a native command's stderr (once
+            // merged with `2>&1`) into an ErrorRecord, which flips `$?` to
+            // False; a script that then ends on a cmdlet — the pipe's
+            // `Select-Object -Last N`, say — exits 1 even though the command
+            // exited 0. `$LASTEXITCODE` keeps the real code, so exit on it
+            // first, and fall back to `$?` when the script never ran a
+            // native command. The closing `}` sits on its own line so a
+            // trailing `#` comment in the script cannot swallow the block
+            // close, the pipe, or the exit logic.
             let wrapped = format!(
                 "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; \
-                 $OutputEncoding=[System.Text.Encoding]::UTF8; {script}\n\
+                 $OutputEncoding=[System.Text.Encoding]::UTF8; & {{\n{script}\n}} \
+                 | Out-String -Stream\n\
                  $__tcode_q = $?; if ($null -ne $LASTEXITCODE) \
                  {{ exit $LASTEXITCODE }} elseif ($__tcode_q) {{ exit 0 }} \
                  else {{ exit 1 }}"
@@ -868,6 +883,98 @@ mod tests {
             "{}",
             output.content
         );
+    }
+
+    /// The wrapper must not discard output PowerShell's formatter still holds
+    /// when the script ends. `Select-Object <property>` pipelines produce
+    /// table-shaped objects that are only flushed when the pipeline ends, and
+    /// the old wrapper's immediate `exit` dropped them — a `Get-ChildItem |
+    /// Select-Object Name` listing came back as "(no output)" while `cmd /c
+    /// dir` on the same directory was fine. The script now runs as a
+    /// sub-pipeline through `Out-String -Stream`, so the listing must come
+    /// back whole.
+    #[tokio::test]
+    async fn powershell_select_object_output_survives_the_wrapper() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let root = std::env::temp_dir().join(format!("tcode-ps-select-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("visible-file.txt"), "x").unwrap();
+        let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
+        let quoted = root.display().to_string().replace('\'', "''");
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": format!("Get-ChildItem '{quoted}' | Select-Object Name") }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(
+            output.content.contains("visible-file.txt"),
+            "{}",
+            output.content
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The `& { … } | Out-String -Stream` wrapper must not buffer a
+    /// long-running script's output until exit — `monitor` and background
+    /// tasks read lines as they arrive. A line printed before a long sleep
+    /// must be readable from the pipe long before the process exits.
+    #[tokio::test]
+    async fn powershell_wrapper_streams_lines_before_exit() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let root = std::env::temp_dir().join(format!("tcode-ps-stream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let mut cmd = shell_command(
+            ShellKind::PowerShell,
+            "Write-Output 'streamed-first'; Start-Sleep -Seconds 30",
+            &root,
+        );
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        let mut child = cmd.spawn().expect("spawn the wrapped command");
+        let mut stdout = child.stdout.take().expect("piped stdout");
+        use tokio::io::AsyncBufReadExt;
+        let mut lines = tokio::io::BufReader::new(&mut stdout).lines();
+        let first = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+            .await
+            .expect("the first line must arrive well before the 30s sleep ends")
+            .expect("reading the pipe failed")
+            .expect("the pipe hit EOF before the line");
+        assert_eq!(first.trim(), "streamed-first");
+        let _ = kill_process_tree(&mut child).await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A trailing `#` comment in the script must not swallow the block close
+    /// or the exit logic — the closing `}` is on its own line for that reason.
+    #[tokio::test]
+    async fn powershell_trailing_comment_does_not_swallow_the_wrapper() {
+        if !cfg!(windows) {
+            return;
+        }
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::for_test(std::env::temp_dir(), 10_000);
+        let output = ShellTool::new(ShellKind::PowerShell)
+            .run(
+                json!({ "command": "Write-Output 'hi' # trailing comment" }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("hi"), "{}", output.content);
     }
 
     #[test]

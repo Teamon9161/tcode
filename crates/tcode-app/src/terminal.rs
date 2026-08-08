@@ -139,8 +139,10 @@ impl Terminals {
             .map_err(|error| format!("cannot write to the terminal: {error}"))?;
 
         let id = uuid::Uuid::new_v4().to_string();
-        pump(id.clone(), emit, reader, child);
-
+        // Registered before the pump starts: the pump may emit the shell's
+        // very first bytes (cmd.exe's cursor-position query) before `open`
+        // returns, and a terminal that answers that query by writing back must
+        // find itself in the live table already.
         self.live.lock().expect("terminals lock").insert(
             id.clone(),
             Term {
@@ -149,6 +151,7 @@ impl Terminals {
                 killer,
             },
         );
+        pump(id.clone(), emit, reader, child);
         Ok(id)
     }
 
@@ -220,14 +223,23 @@ impl Terminals {
 /// Two threads rather than one, and that is forced: a read on a PTY blocks
 /// until there is something to read, so a single thread cannot both wait for
 /// output and honour a flush deadline. The reader does nothing but hand chunks
-/// over; the pump owns the clock and the byte budget.
+/// over; the pump owns the clock and the byte budget. A third thread owns the
+/// child: on Windows ConPTY a client that exits does not close the
+/// pseudoconsole's output pipe, so the reader never sees EOF, and the pump
+/// must learn of the exit from a waiter rather than from the pipe ending.
 fn pump(
     id: String,
     emit: Arc<dyn Emit>,
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
 ) {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    /// What the pump waits on: output bytes, or the program's exit.
+    enum Msg {
+        Bytes(Vec<u8>),
+        Exited(u32),
+    }
+    let (tx, rx) = mpsc::channel::<Msg>();
+    let exit_tx = tx.clone();
 
     std::thread::spawn(move || {
         let mut buffer = vec![0u8; READ_CHUNK];
@@ -235,20 +247,44 @@ fn pump(
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
                 Ok(read) => {
-                    if tx.send(buffer[..read].to_vec()).is_err() {
+                    if tx.send(Msg::Bytes(buffer[..read].to_vec())).is_err() {
                         break;
                     }
                 }
             }
         }
-        // Dropping `tx` is what tells the pump the program is gone.
+        // Dropping this sender only signals the pipe ending; the waiter below
+        // holds another sender, so the channel stays alive until the exit.
     });
 
     std::thread::spawn(move || {
+        let code = child.wait().map(|status| status.exit_code()).unwrap_or(0);
+        let _ = exit_tx.send(Msg::Exited(code));
+    });
+
+    std::thread::spawn(move || {
+        let mut exit_code: Option<u32> = None;
         // `recv` blocks until there is anything at all, so an idle terminal
         // costs nothing rather than waking up once a window.
         while let Ok(first) = rx.recv() {
-            let mut batch = first;
+            let mut batch = match first {
+                Msg::Bytes(bytes) => bytes,
+                Msg::Exited(code) => {
+                    exit_code = Some(code);
+                    Vec::new()
+                }
+            };
+            if exit_code.is_some() {
+                // The reader may still be a few microseconds behind the exit
+                // message; give it one bounded chance to hand over its final
+                // chunks before the tab reports the exit.
+                for _ in 0..3 {
+                    match rx.recv_timeout(Duration::from_millis(10)) {
+                        Ok(Msg::Bytes(more)) => batch.extend_from_slice(&more),
+                        _ => break,
+                    }
+                }
+            }
             let deadline = Instant::now() + FLUSH_WINDOW;
             while batch.len() < MAX_CHUNK {
                 let left = deadline.saturating_duration_since(Instant::now());
@@ -256,27 +292,33 @@ fn pump(
                     break;
                 }
                 match rx.recv_timeout(left) {
-                    Ok(more) => batch.extend_from_slice(&more),
+                    Ok(Msg::Bytes(more)) => batch.extend_from_slice(&more),
+                    Ok(Msg::Exited(code)) => exit_code = Some(code),
                     Err(RecvTimeoutError::Timeout) => break,
-                    // The program ended mid-batch. Send what it wrote before
-                    // retiring — the last line of a command's output is the one
-                    // that says how it went.
+                    // The pipe ended without an exit message (Unix EOF path);
+                    // the waiter still holds a sender, so keep waiting for it.
                     Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            emit.emit(
-                TERMINAL_OUTPUT,
-                json!({
-                    "id": id,
-                    "data": base64::engine::general_purpose::STANDARD.encode(&batch),
-                }),
-            );
+            if !batch.is_empty() {
+                emit.emit(
+                    TERMINAL_OUTPUT,
+                    json!({
+                        "id": id,
+                        "data": base64::engine::general_purpose::STANDARD.encode(&batch),
+                    }),
+                );
+            }
+            if exit_code.is_some() {
+                break;
+            }
         }
 
-        // `wait` is here rather than anywhere else because this thread is the
-        // one with nothing left to do. It cannot deadlock a `close`: that path
-        // holds a separate killer (see `Term`).
-        let code = child.wait().map(|status| status.exit_code()).unwrap_or(0);
+        // The exit is reported by the waiter, so this is not gated on the pipe
+        // ending — a Windows ConPTY client that exits leaves its output pipe
+        // open. It cannot deadlock a `close`: that path holds a separate
+        // killer (see `Term`).
+        let code = exit_code.unwrap_or(0);
         emit.emit(TERMINAL_EXIT, json!({ "id": id, "code": code }));
     });
 }

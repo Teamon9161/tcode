@@ -15,9 +15,33 @@ use serde_json::Value;
 use tcode_app::bridge::Emit;
 use tcode_app::terminal::{Terminals, TERMINAL_EXIT, TERMINAL_OUTPUT};
 
-#[derive(Default)]
+/// The keystroke that ends a line differs between a Unix PTY in canonical
+/// mode (`\n`) and a Windows console (the Enter key is `\r`).
+#[cfg(windows)]
+const ENTER: &str = "\r";
+#[cfg(not(windows))]
+const ENTER: &str = "\n";
+
+/// The test's stand-in for the webview: records what the backend emitted, and
+/// answers the shell's cursor-position query the way xterm.js does.
+///
+/// cmd.exe sends `ESC [ 6 n` (DSR) as its first act on a fresh console and
+/// blocks until the terminal replies with `ESC [ <row> ; <col> R`. The real
+/// pane answers that through xterm.js; a recorder that never answers leaves
+/// the shell sitting at the query, so no keystroke ever reaches it and the
+/// echo round trip never happens on Windows.
 struct Collector {
     events: Mutex<Vec<(String, Value)>>,
+    terminals: Arc<Terminals>,
+}
+
+impl Collector {
+    fn new(terminals: Arc<Terminals>) -> Self {
+        Self {
+            events: Mutex::new(Vec::new()),
+            terminals,
+        }
+    }
 }
 
 impl Emit for Collector {
@@ -25,7 +49,23 @@ impl Emit for Collector {
         self.events
             .lock()
             .unwrap()
-            .push((event.to_string(), payload));
+            .push((event.to_string(), payload.clone()));
+        if event == TERMINAL_OUTPUT
+            && payload["data"].as_str().is_some_and(|data| {
+                base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .is_ok_and(|bytes| bytes.windows(4).any(|w| w == b"\x1b[6n"))
+            })
+        {
+            let Some(id) = payload["id"].as_str() else {
+                return;
+            };
+            // A freshly opened terminal starts at row 1, column 1.
+            let _ = self.terminals.write(
+                id,
+                &base64::engine::general_purpose::STANDARD.encode("\x1b[1;1R"),
+            );
+        }
     }
 }
 
@@ -87,21 +127,21 @@ fn send(terminals: &Terminals, id: &str, text: &str) {
 #[test]
 fn a_shell_echoes_what_it_is_told_and_reports_how_it_ended() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let collector = Arc::new(Collector::default());
     let terminals = Terminals::new();
+    let collector = Arc::new(Collector::new(terminals.clone()));
 
     let id = terminals
         .open(collector.clone(), dir.path(), 80, 24)
         .expect("open a terminal");
 
-    send(&terminals, &id, "echo tcode-terminal-ok\n");
+    send(&terminals, &id, &format!("echo tcode-terminal-ok{ENTER}"));
     until("the shell to echo", || {
         collector.output(&id).contains("tcode-terminal-ok")
     });
 
     // A specific code, not merely "it ended": the tab shows this, and a status
     // that is always zero is a status nobody can act on.
-    send(&terminals, &id, "exit 7\n");
+    send(&terminals, &id, &format!("exit 7{ENTER}"));
     until("the shell to exit", || collector.exit_code(&id).is_some());
     assert_eq!(collector.exit_code(&id), Some(7));
 }
@@ -125,13 +165,13 @@ fn resizing_a_terminal_that_is_gone_is_an_error_not_a_shrug() {
 #[test]
 fn closing_a_tab_kills_what_was_running_in_it() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let collector = Arc::new(Collector::default());
     let terminals = Terminals::new();
+    let collector = Arc::new(Collector::new(terminals.clone()));
 
     let id = terminals
         .open(collector.clone(), dir.path(), 80, 24)
         .expect("open a terminal");
-    send(&terminals, &id, "sleep 600\n");
+    send(&terminals, &id, &format!("sleep 600{ENTER}"));
     // Wait until the shell is really up before killing it, so what is under
     // test is the kill rather than a race with the spawn.
     until("the shell to start", || !collector.output(&id).is_empty());
