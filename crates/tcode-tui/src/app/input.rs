@@ -469,6 +469,13 @@ impl App {
         if self.overlay.is_some() || self.editor.is_recalling_history() {
             return Vec::new();
         }
+        // A cursor inside an `@` marker completes references even on a slash
+        // line (`/plan rewrite @src/app.rs`): it is the same file picker, only
+        // the rest of the line differs. Checked before the slash branch so a
+        // command's task can name files like any other prompt.
+        if let Some((start, end, query)) = self.active_reference() {
+            return self.reference_completions(start, end, &query);
+        }
         if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {
             let prefix = self.editor.text();
             let mut matches: Vec<CompletionMatch> = UI_COMMANDS
@@ -494,9 +501,17 @@ impl App {
             }));
             return matches;
         }
-        let Some((start, end, query)) = self.active_reference() else {
-            return Vec::new();
-        };
+        Vec::new()
+    }
+
+    /// Candidate files for the active `@` token. Honors the dismissed marker
+    /// that keeps an accepted completion closed until the draft moves.
+    fn reference_completions(
+        &self,
+        start: Position,
+        end: Position,
+        query: &str,
+    ) -> Vec<CompletionMatch> {
         if self.dismissed_reference == Some(start) {
             return Vec::new();
         }
@@ -504,7 +519,7 @@ impl App {
             .reference_index
             .iter()
             .filter_map(|candidate| {
-                reference_score(&candidate.path, &query).map(|score| (score, candidate))
+                reference_score(&candidate.path, query).map(|score| (score, candidate))
             })
             .collect();
         matches.sort_by(|(left_score, left), (right_score, right)| {

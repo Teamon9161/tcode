@@ -2211,14 +2211,25 @@ mod tests {
     #[tokio::test]
     async fn plan_guidance_reaches_the_model_without_entering_the_transcript() {
         let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("notes.md"), "the resume must be one page").unwrap();
         let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut app = harness::app_for_instruction_turn(dir.path(), 90, 40, requests.clone());
 
-        app.run_slash("/plan revise the resume path");
-        tokio::task::yield_now().await;
+        app.run_slash("/plan revise @notes.md");
+        // Reference expansion runs on the blocking pool, so the first request
+        // may land a few scheduler ticks after the turn starts.
+        for _ in 0..20 {
+            if !requests.lock().expect("request log").is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
 
         let frame = app.frame();
-        assert!(frame.contains("▌ /plan revise the resume path"), "{frame}");
+        assert!(
+            frame.contains("revise @notes.md"),
+            "the task is echoed as the user's own prompt: {frame}"
+        );
         assert!(
             !frame.contains("Plan this before doing it."),
             "planning guidance must not enter the transcript: {frame}"
@@ -2244,7 +2255,30 @@ mod tests {
             .join("\n");
         assert!(prompt.contains("<harness-note>"), "{prompt}");
         assert!(prompt.contains("Plan this before doing it."), "{prompt}");
-        assert!(prompt.contains("Task: revise the resume path"), "{prompt}");
+        // The task is the user's own message, so its `@path` reference expands
+        // exactly as it would in a plain prompt — the file content reaches the
+        // model, outside the hidden guidance.
+        assert!(prompt.contains("revise @notes.md"), "{prompt}");
+        assert!(
+            prompt.contains("the resume must be one page"),
+            "the @reference must expand for a plan task: {prompt}"
+        );
+        let guidance = request
+            .messages
+            .iter()
+            .flat_map(|message| &message.content)
+            .find_map(|block| match block {
+                ContentBlock::Text { text } if text.starts_with("<harness-note>") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .expect("guidance instruction block");
+        assert!(
+            !guidance.contains("revise @notes.md")
+                && !guidance.contains("the resume must be one page"),
+            "the task must not be baked into the hidden instruction: {guidance}"
+        );
     }
 
     #[tokio::test]
@@ -3388,6 +3422,42 @@ mod tests {
             "@src/app.rs",
         );
         assert_eq!(editor.text(), "review @src/app.rs ");
+    }
+
+    #[test]
+    fn an_at_marker_in_a_slash_line_completes_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.reference_index = vec![tcode_core::ReferenceCandidate {
+            path: "src/app.rs".into(),
+            kind: tcode_core::ReferenceKind::File,
+            bytes: Some(3),
+        }];
+
+        // A bare slash prefix still offers command completion.
+        app.editor.insert_str("/pl");
+        assert!(
+            app.completion_matches()
+                .iter()
+                .any(|m| matches!(m.kind, CompletionKind::Slash)),
+            "slash completion must keep working"
+        );
+
+        // The cursor inside an `@` marker of a slash line completes files:
+        // `/plan review @src/app.rs` picks the file, not another command.
+        app.editor.clear();
+        app.editor.insert_str("/plan review @src/app.rs");
+        let matches = app.completion_matches();
+        assert!(
+            matches
+                .iter()
+                .any(|m| matches!(m.kind, CompletionKind::Reference { .. })),
+            "an @ token inside a slash line must offer file completion"
+        );
+        assert!(
+            matches.iter().any(|m| m.replacement == "@src/app.rs"),
+            "the typed path stays the completion candidate"
+        );
     }
 
     #[test]

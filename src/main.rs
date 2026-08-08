@@ -772,11 +772,20 @@ async fn main() -> anyhow::Result<()> {
                             "{DIM}interactive resume picker needs the full TUI — use /resume <id>{RESET}"
                         );
                     }
-                    CommandEffect::PlanTurn(instruction) => {
+                    CommandEffect::PlanTurn { instruction, task } => {
+                        // The task is the user's own message: it travels as a
+                        // user block so `@path` references expand like any
+                        // other prompt.
+                        let blocks = if task.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![ContentBlock::Text { text: task }]
+                        };
                         if let Err(e) = run_instruction_turn(
                             &agent,
                             &mut session,
                             instruction,
+                            blocks,
                             true,
                             &line_approver,
                         )
@@ -845,6 +854,7 @@ async fn run_instruction_turn(
     agent: &Agent,
     session: &mut Session,
     instruction: String,
+    blocks: Vec<ContentBlock>,
     expects_plan: bool,
     approver: &dyn tcode_core::Approver,
 ) -> Result<(), AgentError> {
@@ -866,7 +876,7 @@ async fn run_instruction_turn(
             session,
             vec![instruction],
             expects_plan,
-            Vec::new(),
+            blocks,
             &tx,
             approver,
             cancel,

@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::{CommandCtx, CommandEffect, CommandOutcome, SlashCommand};
+use super::{split_line, CommandCtx, CommandEffect, CommandOutcome, SlashCommand};
 use crate::progress::{inventory, Progress, INVENTORY_LIMIT};
 
 pub struct PlanCommand;
@@ -46,13 +46,33 @@ impl SlashCommand for PlanCommand {
             _ => plan_turn(args.trim()),
         }
     }
+
+    /// `/plan task` is a user prompt in disguise: the args become the task the
+    /// frontend submits as the user's own message, so the line is echoed as
+    /// that prompt rather than twice (raw command + task). Subcommands (`list`,
+    /// `resume`, `export`, `last`) answer inline and keep the normal command
+    /// echo.
+    fn as_prompt(&self, line: &str) -> Option<String> {
+        let (_, args) = split_line(line)?;
+        let task = args.trim();
+        match split_verb(task).0 {
+            "" | "list" | "resume" | "export" | "last" => None,
+            _ => Some(task.to_string()),
+        }
+    }
 }
 
 /// The planning turn itself. `/plan`'s guidance is harness-authored model
 /// context, not text the user wrote, so it must not appear in the transcript.
-/// Nothing here touches the permission mode.
+/// The task description is the user's own words: it travels as the effect's
+/// `task` and the frontend submits it as a user prompt, so `@path` references
+/// in it expand exactly as they would in a plain prompt. Nothing here touches
+/// the permission mode.
 fn plan_turn(task: &str) -> CommandOutcome {
-    CommandOutcome::effect(CommandEffect::PlanTurn(planning_instruction(task)))
+    CommandOutcome::effect(CommandEffect::PlanTurn {
+        instruction: planning_instruction(""),
+        task: task.trim().to_string(),
+    })
 }
 
 /// The instruction a planning turn carries, with an optional task description.
@@ -61,6 +81,12 @@ fn plan_turn(task: &str) -> CommandOutcome {
 /// able to start one — the desktop app offers planning as a control on its
 /// composer — and two copies of this text would be two definitions of what
 /// planning means.
+///
+/// The command path (`/plan task`) does not pass the task here: it keeps the
+/// task as the user's own message (see [`CommandEffect::PlanTurn`]) so the
+/// task stays in the transcript and `@path` references expand. The task form
+/// remains for programmatic callers that bake the whole prompt into a single
+/// instruction.
 pub fn planning_instruction(task: &str) -> String {
     match task.trim() {
         "" => PLAN_REQUEST.to_string(),
@@ -199,19 +225,35 @@ mod tests {
 
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::PlanTurn(instruction)] if instruction.contains("state: \"draft\"")
+            [CommandEffect::PlanTurn { instruction, task }]
+                if instruction.contains("state: \"draft\"") && task.is_empty()
         ));
         assert_eq!(session.mode, mode, "planning is not a permission mode");
     }
 
     #[test]
-    fn a_task_description_is_carried_into_the_planning_request() {
+    fn a_task_description_is_carried_as_the_users_own_prompt_text() {
         let outcome = outcome("rewrite the resume path");
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::PlanTurn(instruction)]
-                if instruction.contains("Task: rewrite the resume path")
+            [CommandEffect::PlanTurn { instruction, task }]
+                if !instruction.contains("Task: rewrite the resume path")
+                    && task == "rewrite the resume path"
         ));
+    }
+
+    #[test]
+    fn only_a_task_description_is_a_prompt_not_a_subcommand() {
+        let command = PlanCommand;
+        assert_eq!(command.as_prompt("/plan"), None);
+        assert_eq!(command.as_prompt("/plan list"), None);
+        assert_eq!(command.as_prompt("/plan resume 2"), None);
+        assert_eq!(command.as_prompt("/plan last"), None);
+        assert_eq!(command.as_prompt("/plan export out.md"), None);
+        assert_eq!(
+            command.as_prompt("/plan rewrite @notes.md").as_deref(),
+            Some("rewrite @notes.md")
+        );
     }
 
     #[test]

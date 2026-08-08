@@ -71,12 +71,18 @@ pub enum CommandEffect {
         focus: Option<String>,
     },
     OpenResumePicker,
-    /// Start a planning turn. The payload is the harness-authored planning
-    /// instruction (`plan::planning_instruction`), submitted exactly as-is.
-    /// A planning turn carries the harness guarantee that it does not end
-    /// without a plan file (`Session::planning_expected`), which is why it is
-    /// typed rather than a generic instruction.
-    PlanTurn(String),
+    /// Start a planning turn. `instruction` is the harness-authored planning
+    /// guidance (`plan::planning_instruction`), submitted exactly as-is; the
+    /// user's task description travels as `task` so the frontend submits it as
+    /// the user's own prompt text — `@path` references expand and the task
+    /// stays in the transcript, exactly as it does from the desktop composer's
+    /// plan flag. A planning turn carries the harness guarantee that it does
+    /// not end without a plan file (`Session::planning_expected`), which is
+    /// why it is typed rather than a generic instruction.
+    PlanTurn {
+        instruction: String,
+        task: String,
+    },
     /// The dogfood switch flipped: write it to the selected config's
     /// `[tcode_state]` so it survives a restart. Persisting program state is
     /// the frontend's job here — it
@@ -150,6 +156,15 @@ pub trait SlashCommand: Send + Sync {
         false
     }
     fn run(&self, ctx: &mut CommandCtx<'_>, args: &str) -> CommandOutcome;
+
+    /// A line that is a user prompt in disguise — the args become the user's
+    /// own message, as `/plan rewrite @src/app.rs` does. Returning `Some`
+    /// tells the frontend to echo that prompt instead of the raw command line,
+    /// so the transcript renders the task once, in the user rail, and `@path`
+    /// references expand with the rest of user input.
+    fn as_prompt(&self, _line: &str) -> Option<String> {
+        None
+    }
 }
 
 pub struct CommandRegistry {
@@ -216,7 +231,7 @@ impl CommandRegistry {
     }
 }
 
-fn split_line(line: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_line(line: &str) -> Option<(&str, &str)> {
     let rest = line.trim().strip_prefix('/')?;
     Some(match rest.split_once(char::is_whitespace) {
         Some((name, args)) => (name, args.trim()),

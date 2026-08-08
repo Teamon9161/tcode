@@ -334,7 +334,17 @@ impl App {
         if !is_ui_command(cmd) && self.registry.find(cmd).is_none() && self.dispatch_skill(cmd) {
             return;
         }
-        self.echo_command(cmd);
+        // A command that turns its line into a user prompt (`/plan task`)
+        // echoes that prompt itself (the message carries the task as user
+        // text); echoing the raw line here would print the task twice.
+        if self
+            .registry
+            .find(cmd)
+            .and_then(|command| command.as_prompt(cmd))
+            .is_none()
+        {
+            self.echo_command(cmd);
+        }
         self.dispatch_slash(cmd);
     }
 
@@ -544,11 +554,19 @@ impl App {
                     self.bake_transcript();
                 }
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
-                CommandEffect::PlanTurn(instruction) => {
+                CommandEffect::PlanTurn { instruction, task } => {
+                    // The task is the user's own message: it echoes as a prompt
+                    // and its `@path` references expand like any other input.
+                    // The harness guidance rides along as a hidden instruction.
+                    let blocks = if task.is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![ContentBlock::Text { text: task.clone() }]
+                    };
                     let message = PendingMessage {
-                        text: String::new(),
+                        text: task,
                         attachments: Vec::new(),
-                        blocks: Vec::new(),
+                        blocks,
                         instructions: vec![instruction],
                         expects_plan: true,
                     };
