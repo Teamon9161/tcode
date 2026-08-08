@@ -310,6 +310,7 @@ pub fn execute_plan_elsewhere(
             emit.clone(),
             Vec::new(),
             instructions,
+            false,
         )
         .await
         {
@@ -936,6 +937,7 @@ fn load_skill(
             attachments: Vec::new(),
             blocks: vec![ContentBlock::Text { text }],
             instructions: Vec::new(),
+            expects_plan: false,
         },
     );
     Ok(SlashResult::SkillLoaded { prompt, queued })
@@ -956,10 +958,12 @@ fn deliver(
     let Some(message) = handle.send_or_queue(message) else {
         return queue_of(&handle);
     };
-    let (input, instructions) = (message.blocks, message.instructions);
+    let (input, instructions, expects_plan) =
+        (message.blocks, message.instructions, message.expects_plan);
     let emit = emit.clone();
     tokio::spawn(async move {
-        if let Err(error) = run_turn(agent, handle.clone(), emit.clone(), input, instructions).await
+        if let Err(error) =
+            run_turn(agent, handle.clone(), emit.clone(), input, instructions, expects_plan).await
         {
             // `Busy` still reaches here: `send_or_queue` closed the ordinary
             // race, but two sends can both find the session free before either
@@ -1037,6 +1041,7 @@ pub fn send_message(
             attachments: Vec::new(),
             blocks: input,
             instructions,
+            expects_plan: plan.unwrap_or(false),
         },
     ))
 }

@@ -828,9 +828,22 @@ mod tests {
             registry.route_of("progress", Some(&update)),
             CallRoute::Progress
         );
+        // A flip re-carrying `state` but no document fields is still an update:
+        // the pane must keep tracking it, not bury it under a document card.
+        let recarried = json!({
+            "state": "active",
+            "title": "Rewrite the resume path",
+            "phases": [{ "phase": "one", "status": "completed" }]
+        });
+        assert_eq!(
+            registry.route_of("progress", Some(&recarried)),
+            CallRoute::Progress
+        );
 
         let submission = json!({
             "title": "Rewrite the resume path",
+            "description": "what this plan is for",
+            "background": "## Decision\nworth doing",
             "state": "active",
             "phases": [{ "phase": "one", "status": "pending" }]
         });

@@ -123,8 +123,20 @@ mod tests {
         assert_eq!(ProgressTool.route(&flip), CallRoute::Progress);
         assert_eq!(ProgressTool.route(&Value::Null), CallRoute::Progress);
 
+        // A phase flip that re-carries `state` (the redundant-submission shape)
+        // stays an update: only the phases, no document fields, so it must keep
+        // feeding the plan surface or the live pane freezes at the last draft.
+        let recarried = json!({
+            "state": "active",
+            "title": "Rewrite the resume path",
+            "phases": [{ "phase": "one", "status": "completed" }]
+        });
+        assert_eq!(ProgressTool.route(&recarried), CallRoute::Progress);
+
         let submission = json!({
             "title": "Rewrite the resume path",
+            "description": "what this plan is for",
+            "background": "## Decision\nworth doing",
             "state": "active",
             "phases": [{ "phase": "one", "status": "pending" }]
         });

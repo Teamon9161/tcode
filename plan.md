@@ -122,6 +122,12 @@ loop {
 
 **plan mode 已删除，规划改由 Progress 文件承载**。它曾占着 `PermissionMode` 的一格，但"我还在决定做什么"和"我愿意承担多大风险"是正交的两件事，合并的代价是规划期选不了 auto/unsafe——而探索恰恰是最该放开的阶段。它在 `decide()` 里也从来没有自己的臂（与 default 同一段代码），即**在权限表里本来就没有语义，却霸占着权限表的一格**。现在"先别动手"这个约束来自**文件处于 `draft`** 这一事实：`status_block` 每回合从文件重新导出，不是一次性注入后靠模型自觉记住的指令，批准后自动消失。唯一保留的权限语义是 `PermissionRequest::PlanReview` **在任何模式下都 Ask**（含 unsafe）：用户要求看计划，与他执行时愿担多大风险是两个问题、两个答案，正好在同一个对话框里分别回答。
 
+**`/plan` 回合本身也有结构保障，不再纯靠 prompt 纪律**。`/plan`（桌面 composer 的 plan 开关同）提交的是类型化的一等概念：`CommandEffect::PlanTurn` / `PendingMessage.expects_plan` 把"这是规划回合"从命令效果一路通到 `Session::planning_expected`（内存态，不持久化；resume 后由 ledger 里的 plan 指令兜底）。draft 之前的窗口——连文件都不存在、`status_block` 无从导出的阶段——由两道防线覆盖，都是"排序"而非"风险"语义，不动任何审批准入：
+
+- **回合末护栏**（`run_steps` 的 `planning_turn_end`）：规划回合结束而没有任何 plan 文件时，第一次注入一条 model-only 的 nudge（`prompts/commands/plan-nudge.md`）让模型补救并继续循环；第二次仍无 plan 则上用户可见的 notice（`Entry::Note` + `AgentEvent::Note`："No plan was produced…"）并清标记。max_tokens 放弃与 step-limit 路径只 notice 不 nudge；中断直接清标记，不污染下一次 monitor 唤醒回合。护栏看"文件存在"（draft 也算做出了 plan），不看是否 active——提交与审批是 PlanReview 对话框自己的保障。
+- **文件变更门**（`run_tools` 的 `planning_gate_blocks`）：plan 文件存在前，`touches` 指向**项目内文件**的 write/edit/append 在 `permission_decision` 之前被拒（不弹审批框），返回自愈错误并说明 scratch 例外。**scratch 与 auto memory 永远放行**——规划要 clone 参考仓库、写探针脚本，正是 plan def 摘掉 `readonly` 时承诺的能力；shell/monitor 放行保探索（真正执行由回合末护栏兜底）；`progress`/`ask_user` 永不被拦（创建 plan 不死锁、规划中可问人）。draft 一旦创建门即失效，回到文件状态的软约束。
+- **用户输入是唯一人为释放手段**：`user_turn`/`monitor_turn` 起始清标记，`deliver_pending_input` 按每条消息自身意图设置（普通用户消息即释放）。模型无法伪造用户输入，所以"无 plan 静默结束"在结构上只剩两条出路：模型两次拒绝（伴随 notice 上屏），或用户开口接管。
+
 **`scratch` 没有任何模式例外**：scratch/memory 的本地放行只发生在 auto mode，别的模式一律照常审批。
 
 **子 agent 继承父会话的模式与规则，能力天花板由 def 自己声明**。两个正交旋钮，别混：
@@ -186,3 +192,6 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
+4.  Tool friction — shell (PowerShell): 我数次用 Get-ChildItem 'C:\Users\Teamon\.tcode\projects\c--code-rust-tcode' -Force 列目录，返回空（连 scratchpad 都不显示），而同路径的 cmd /c dir 和 Git Bash ls 都正常列出全部内容；Test-Path 对深路径返回 True、对刚写入的文件却静默无输出。为确认进度文件是否落盘，我被迫换 bash 交叉验证并多花了几次调用。最小改进：排查 harness 的 PowerShell 包装对某些路径的目录列举/布尔输出是否被吞掉（可能与输出捕获有关）。
+• Capability gap — 无: 本次没有遇到需要新工具才能干净解决的需求；上面 PowerShell 的问题属于现有工具的缺陷而非缺失能力。
+5. 桌面 terminal.rs 的 a_shell_echoes_what_it_is_told_and_reports_how_it_ended 连续失败（真实 PTY 管道 20s 内等不到 echo，另两个 terminal 测试通过）——纯环境性，该测试不构造 Session、与本次改动零交集。

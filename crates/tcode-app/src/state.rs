@@ -799,6 +799,7 @@ async fn run_monitor_turn(
             session,
             message.blocks,
             message.instructions,
+            message.expects_plan,
             Some((message.text, message.attachments)),
         )
         .await;
@@ -881,6 +882,7 @@ pub async fn run_compact(
             session,
             message.blocks,
             message.instructions,
+            message.expects_plan,
             Some((message.text, message.attachments)),
         )
         .await;
@@ -916,11 +918,22 @@ pub async fn run_turn(
     emit: Arc<dyn Emit>,
     input: Vec<ContentBlock>,
     instructions: Vec<String>,
+    expects_plan: bool,
 ) -> Result<(), TurnError> {
     let Some(session) = handle.take() else {
         return Err(TurnError::Busy(handle.id.clone()));
     };
-    run_owned_turn(agent, handle, emit, session, input, instructions, None).await
+    run_owned_turn(
+        agent,
+        handle,
+        emit,
+        session,
+        input,
+        instructions,
+        expects_plan,
+        None,
+    )
+    .await
 }
 
 /// Continue a session while it remains exclusively owned by the current turn
@@ -933,6 +946,7 @@ async fn run_owned_turn(
     mut session: Session,
     mut input: Vec<ContentBlock>,
     mut instructions: Vec<String>,
+    mut expects_plan: bool,
     mut queued_echo: Option<(String, Vec<String>)>,
 ) -> Result<(), TurnError> {
     loop {
@@ -977,7 +991,15 @@ async fn run_owned_turn(
             }
             false => {
                 agent
-                    .instruction_turn(&mut session, instructions, input, &tx, &approver, cancel)
+                    .instruction_turn(
+                        &mut session,
+                        instructions,
+                        expects_plan,
+                        input,
+                        &tx,
+                        &approver,
+                        cancel,
+                    )
                     .await
             }
         };
@@ -1022,6 +1044,7 @@ async fn run_owned_turn(
         session = next_session;
         input = message.blocks;
         instructions = message.instructions;
+        expects_plan = message.expects_plan;
         queued_echo = Some((message.text, message.attachments));
     }
 }
@@ -1034,6 +1057,7 @@ fn merge_queued(mut queued: Vec<tcode_core::PendingMessage>) -> Option<tcode_cor
         merged.attachments.extend(next.attachments);
         merged.blocks.extend(next.blocks);
         merged.instructions.extend(next.instructions);
+        merged.expects_plan |= next.expects_plan;
     }
     Some(merged)
 }

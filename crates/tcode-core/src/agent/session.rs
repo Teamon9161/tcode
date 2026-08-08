@@ -28,6 +28,12 @@ pub struct PendingMessage {
     pub blocks: Vec<ContentBlock>,
     /// Model-visible harness guidance to append immediately before this prompt.
     pub instructions: Vec<String>,
+    /// This message is a `/plan` request: the turn it starts (or that it is
+    /// delivered into) must not end without a plan file. The frontend knows
+    /// this at the one place it builds the message — the command effect for
+    /// `/plan`, or the desktop composer's plan flag — so it is typed here
+    /// instead of sniffed from the instruction text.
+    pub expects_plan: bool,
 }
 
 /// A prompt this conversation can be rewound to.
@@ -241,6 +247,17 @@ pub struct Session {
     /// rather than a frontend flag, so the toggle and its persistence work the
     /// same way from the TUI and the REPL.
     suggestions: bool,
+    /// This turn is a planning turn: it started with a `/plan` request, or one
+    /// was delivered into it mid-turn. The harness guarantees such a turn does
+    /// not end without a plan file — either the model produces one, the user
+    /// speaks (releasing the expectation), or the turn-end guard says so
+    /// out loud. In-memory only: a resumed session re-derives its posture from
+    /// the ledger and the progress file, not from this flag.
+    planning_expected: bool,
+    /// The turn-end guard already injected its one self-healing nudge; the
+    /// next no-plan end surfaces a user-visible notice instead of nudging
+    /// again.
+    planning_nudged: bool,
     /// Auto Mode's classifier denial backstop. These counters are session
     /// state rather than ledger entries: they guard runaway retries but must
     /// not alter the model-visible append-only history.
@@ -323,6 +340,8 @@ impl Session {
             turn_usage: Usage::default(),
             dogfood: false,
             suggestions: false,
+            planning_expected: false,
+            planning_nudged: false,
             auto_consecutive_denials: 0,
             auto_total_denials: 0,
             auto_consecutive_unavailable: 0,
@@ -490,6 +509,39 @@ impl Session {
     /// This conversation's current progress file, if it has one.
     pub fn progress(&self) -> std::sync::MutexGuard<'_, Option<crate::progress::Progress>> {
         self.tool_ctx.progress.lock().expect("progress lock")
+    }
+
+    /// Whether the current turn is a planning turn that has not yet produced a
+    /// plan file. The guard (`run_steps`) and the pre-plan mutation gate both
+    /// consult this; the status block re-derives the model-facing hint from it.
+    pub fn planning_expected(&self) -> bool {
+        self.planning_expected
+    }
+
+    /// Whether the turn-end guard already spent its one nudge on this turn.
+    pub fn planning_nudged(&self) -> bool {
+        self.planning_nudged
+    }
+
+    /// Mark the current turn as one that must produce a plan (or be released
+    /// by the user). Every plan request gets its own self-healing nudge, so
+    /// setting also resets the nudge counter; clearing drops both.
+    pub fn set_planning_expectation(&mut self, expected: bool) {
+        self.planning_expected = expected;
+        self.planning_nudged = false;
+    }
+
+    /// The turn-end guard nudged the model once; the next no-plan end reports
+    /// to the user instead.
+    pub fn mark_planning_nudged(&mut self) {
+        self.planning_nudged = true;
+    }
+
+    /// The planning expectation no longer applies: the turn ended (plan made
+    /// or reported), the user spoke, or the turn was interrupted.
+    pub fn clear_planning_expectation(&mut self) {
+        self.planning_expected = false;
+        self.planning_nudged = false;
     }
 
     /// The points this conversation can be rewound to: every prompt the user
@@ -888,17 +940,21 @@ impl Session {
                 format!(" · background running: {running}")
             }
         };
+        // The pre-draft planning window gets the same treatment as a draft:
+        // "you were asked to plan and no plan exists yet" is a fact re-derived
+        // from session state every turn, riding the tail, never the prefix.
+        // Once a file exists the draft hint below takes over.
+        let progress = self.tool_ctx.progress.lock().expect("progress lock");
+        let planning = if self.planning_expected && progress.as_ref().is_none() {
+            " · /plan requested: no plan exists yet — create one via progress (state: \"draft\", then state: \"active\") or tell the user why not"
+        } else {
+            ""
+        };
         // A draft is "do not start yet" as a fact about the file rather than a
         // one-off instruction the model has to remember: it is re-derived every
         // turn, and it stops appearing the moment the user approves the plan.
         // The status block is the turn's tail, never the cached prefix.
-        let draft = match self
-            .tool_ctx
-            .progress
-            .lock()
-            .expect("progress lock")
-            .as_ref()
-        {
+        let draft = match progress.as_ref() {
             Some(progress) if progress.state() == crate::progress::ProgressState::Draft => {
                 format!(
                     " · plan \"{}\" is an unapproved draft: keep refining it, do not start executing",
@@ -909,7 +965,7 @@ impl Session {
         };
         Some(ContentBlock::Text {
             text: format!(
-                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}{draft}</tcode-status>",
+                "<tcode-status>context ~{pct:.0}% of {}k tokens · permission-mode: {}{background}{planning}{draft}</tcode-status>",
                 context_window / 1000,
                 self.mode.label()
             ),
@@ -1009,6 +1065,7 @@ mod tests {
             attachments: vec![],
             blocks: vec![],
             instructions: vec![],
+            expects_plan: false,
         });
 
         pending.defer_to_next_turn();
@@ -1026,6 +1083,7 @@ mod tests {
             attachments: vec![],
             blocks: vec![],
             instructions: vec![],
+            expects_plan: false,
         }
     }
 
@@ -1196,6 +1254,42 @@ mod tests {
         session.pending_mode.set(PermissionMode::Default);
         assert_eq!(session.commit_pending_mode(), None);
         assert_eq!(session.mode, PermissionMode::Default);
+    }
+
+    /// The pre-draft planning window has the same re-derived-tail treatment as
+    /// a draft: while a planning turn has no plan file, the tail says so; the
+    /// moment a file exists, the draft hint takes over and the planning hint
+    /// disappears.
+    #[test]
+    fn a_planning_turn_with_no_plan_file_is_stated_in_every_turn_tail() {
+        crate::home::testing::temp_home();
+        let cwd = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            ToolCtx::for_test(cwd.path().to_path_buf(), 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        session.last_prompt_tokens = 100;
+        let text = |session: &Session| match session.status_block(100_000) {
+            Some(crate::ContentBlock::Text { text }) => text,
+            other => panic!("expected a status block, got {other:?}"),
+        };
+
+        assert!(!text(&session).contains("no plan exists"));
+
+        session.set_planning_expectation(true);
+        let planning = text(&session);
+        assert!(planning.contains("no plan exists"), "{planning}");
+
+        crate::progress::apply_call(
+            &session.tool_ctx,
+            &serde_json::json!({ "title": "Rewrite the resume path", "state": "draft",
+                                 "phases": [{ "phase": "one", "status": "pending" }] }),
+        )
+        .unwrap();
+        let drafting = text(&session);
+        assert!(drafting.contains("unapproved draft"), "{drafting}");
+        assert!(!drafting.contains("no plan exists"), "{drafting}");
     }
 
     /// "Do not start yet" is re-derived from the file every turn instead of

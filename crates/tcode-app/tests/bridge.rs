@@ -279,6 +279,7 @@ fn queued(text: &str) -> tcode_core::PendingMessage {
         attachments: Vec::new(),
         blocks: say(text),
         instructions: Vec::new(),
+        expects_plan: false,
     }
 }
 
@@ -310,7 +311,7 @@ async fn a_turn_streams_its_events_to_the_frontend() {
     let emit = sink(&collector);
     let session = handle("s1", cwd.path().to_path_buf());
 
-    run_turn(agent, session, emit, say("hi"), plain())
+    run_turn(agent, session, emit, say("hi"), plain(), false)
         .await
         .unwrap();
 
@@ -359,7 +360,7 @@ async fn a_mid_turn_mode_switch_gates_the_next_call_and_reports_its_boundary() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("write two notes"), plain()).await }
+        async move { run_turn(agent, session, emit, say("write two notes"), plain(), false).await }
     });
 
     let request = collector
@@ -431,7 +432,7 @@ async fn an_approval_crosses_the_boundary_and_comes_back() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("write a note"), plain()).await }
+        async move { run_turn(agent, session, emit, say("write a note"), plain(), false).await }
     });
 
     let request = collector
@@ -480,7 +481,7 @@ async fn an_unrecognized_decision_denies() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("write a note"), plain()).await }
+        async move { run_turn(agent, session, emit, say("write a note"), plain(), false).await }
     });
 
     let request = collector
@@ -523,8 +524,8 @@ async fn concurrent_sessions_never_cross_streams() {
     supervisor.open(handle_two.clone());
 
     let (a, b) = tokio::join!(
-        run_turn(agent_one, handle_one, emit.clone(), say("one"), plain()),
-        run_turn(agent_two, handle_two, emit, say("two"), plain()),
+        run_turn(agent_one, handle_one, emit.clone(), say("one"), plain(), false),
+        run_turn(agent_two, handle_two, emit, say("two"), plain(), false),
     );
     a.unwrap();
     b.unwrap();
@@ -570,14 +571,14 @@ async fn a_second_turn_on_a_busy_session_is_refused() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent.clone(), session.clone(), emit.clone());
-        async move { run_turn(agent, session, emit, say("first"), plain()).await }
+        async move { run_turn(agent, session, emit, say("first"), plain(), false).await }
     });
     // Park the turn on an approval, so it is provably still running.
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
         .await;
 
-    let second = run_turn(agent, session.clone(), emit, say("second"), plain()).await;
+    let second = run_turn(agent, session.clone(), emit, say("second"), plain(), false).await;
     assert!(
         matches!(second, Err(tcode_app::state::TurnError::Busy(id)) if id == "s1"),
         "a busy session refuses a second turn"
@@ -618,7 +619,7 @@ async fn a_prompt_typed_during_a_turn_is_queued_and_then_sent() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent.clone(), session.clone(), emit.clone());
-        async move { run_turn(agent, session, emit, say("first"), plain()).await }
+        async move { run_turn(agent, session, emit, say("first"), plain(), false).await }
     });
     // Park the turn on an approval, so it is provably still holding the session.
     let request = collector
@@ -699,7 +700,7 @@ async fn interrupt_and_send_delivers_the_queued_message_in_a_successor_turn() {
 
     let running = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("first"), plain()).await }
+        async move { run_turn(agent, session, emit, say("first"), plain(), false).await }
     });
     let first_request = collector
         .wait_for(APPROVAL_REQUEST, |payload| payload["session"] == "s1")
@@ -786,10 +787,11 @@ async fn rewinding_drops_the_tail_and_returns_the_prompt() {
         emit.clone(),
         say("one"),
         plain(),
+        false,
     )
     .await
     .unwrap();
-    run_turn(agent, session.clone(), emit, say("two"), plain())
+    run_turn(agent, session.clone(), emit, say("two"), plain(), false)
         .await
         .unwrap();
 
@@ -837,6 +839,7 @@ async fn a_rewind_to_something_that_is_not_a_prompt_is_refused() {
         sink(&collector),
         say("one"),
         plain(),
+        false,
     )
     .await
     .unwrap();
@@ -1028,6 +1031,51 @@ fn a_compacted_conversation_is_not_charged_for_the_history_it_shed() {
 
 // ---------------------------------------------------------------- plan review
 
+/// A plan-flagged turn that ends without a plan cannot do so silently: the
+/// harness notice reaches the webview as a `Note` event. This is the desktop
+/// side of the turn-end guard, reached through the composer's plan switch
+/// rather than a slash command.
+#[tokio::test]
+async fn a_plan_flagged_turn_that_ends_without_a_plan_says_so() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let agent = agent(
+        MockProvider::new(vec![
+            text_done("here are my thoughts, no plan"),
+            text_done("still no plan"),
+        ]),
+        cwd.path(),
+    );
+    let collector = Arc::new(Collector::default());
+    let emit = sink(&collector);
+    let session = handle("s1", cwd.path().to_path_buf());
+
+    run_turn(
+        agent,
+        session,
+        emit.clone(),
+        Vec::new(),
+        vec![tcode_core::commands::plan::planning_instruction("")],
+        true,
+    )
+    .await
+    .unwrap();
+
+    let notes = collector
+        .payloads(AGENT_EVENT)
+        .into_iter()
+        .filter_map(|payload| {
+            let event = payload["event"].clone();
+            (event["type"] == "Note")
+                .then(|| event["data"].as_str().unwrap_or_default().to_string())
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        notes.iter().any(|text| text.contains("No plan was produced")),
+        "{notes:?}"
+    );
+}
+
 /// A `progress` submission, which is what puts a plan in front of the user.
 fn submit_plan(title: &str, phases: &[(&str, &str)]) -> Vec<StreamEvent> {
     let phases: Vec<Value> = phases
@@ -1140,7 +1188,7 @@ async fn a_plan_edited_in_the_review_is_the_one_that_lands() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+        async move { run_turn(agent, session, emit, say("plan it"), plain(), false).await }
     });
 
     let request = collector
@@ -1216,7 +1264,7 @@ async fn keeping_planning_sends_the_diff_and_leaves_the_draft_alone() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+        async move { run_turn(agent, session, emit, say("plan it"), plain(), false).await }
     });
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
@@ -1272,7 +1320,7 @@ async fn an_unreadable_plan_edit_leaves_the_review_answerable() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+        async move { run_turn(agent, session, emit, say("plan it"), plain(), false).await }
     });
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
@@ -1329,7 +1377,7 @@ async fn the_plan_view_follows_the_file_and_a_hand_edit_writes_it() {
     let collector = Arc::new(Collector::default());
     let emit = sink(&collector);
     let session = handle("s1", cwd.path().to_path_buf());
-    run_turn(agent, session.clone(), emit, say("do it"), plain())
+    run_turn(agent, session.clone(), emit, say("do it"), plain(), false)
         .await
         .unwrap();
 
@@ -1409,7 +1457,7 @@ async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
 
     let turn = tokio::spawn({
         let (agent, session, emit) = (agent, session.clone(), emit);
-        async move { run_turn(agent, session, emit, say("plan it"), plain()).await }
+        async move { run_turn(agent, session, emit, say("plan it"), plain(), false).await }
     });
     let request = collector
         .wait_for(APPROVAL_REQUEST, |p| p["session"] == "s1")
@@ -1523,6 +1571,7 @@ async fn desktop_slash_commands_clear_the_current_ledger_and_open_the_resume_pic
         Arc::new(Sink(Arc::new(Collector::default()))),
         say("hello"),
         plain(),
+        false,
     )
     .await
     .unwrap();
@@ -1565,6 +1614,7 @@ async fn desktop_compaction_streams_its_result_and_finishes_the_turn() {
         emit.clone(),
         say("hello"),
         plain(),
+        false,
     )
     .await
     .unwrap();
@@ -1634,6 +1684,7 @@ async fn a_skill_loads_as_a_prompt_and_shows_as_the_line_that_asked_for_it() {
         Arc::new(Sink(Arc::new(Collector::default()))),
         say(&prompt),
         plain(),
+        false,
     )
     .await
     .unwrap();

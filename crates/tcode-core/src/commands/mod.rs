@@ -71,9 +71,12 @@ pub enum CommandEffect {
         focus: Option<String>,
     },
     OpenResumePicker,
-    /// Start a model turn with harness-authored guidance that is deliberately
-    /// retained in model context but excluded from the human transcript.
-    SubmitInstruction(String),
+    /// Start a planning turn. The payload is the harness-authored planning
+    /// instruction (`plan::planning_instruction`), submitted exactly as-is.
+    /// A planning turn carries the harness guarantee that it does not end
+    /// without a plan file (`Session::planning_expected`), which is why it is
+    /// typed rather than a generic instruction.
+    PlanTurn(String),
     /// The dogfood switch flipped: write it to the selected config's
     /// `[tcode_state]` so it survives a restart. Persisting program state is
     /// the frontend's job here — it

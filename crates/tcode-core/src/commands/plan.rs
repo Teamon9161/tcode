@@ -52,7 +52,7 @@ impl SlashCommand for PlanCommand {
 /// context, not text the user wrote, so it must not appear in the transcript.
 /// Nothing here touches the permission mode.
 fn plan_turn(task: &str) -> CommandOutcome {
-    CommandOutcome::effect(CommandEffect::SubmitInstruction(planning_instruction(task)))
+    CommandOutcome::effect(CommandEffect::PlanTurn(planning_instruction(task)))
 }
 
 /// The instruction a planning turn carries, with an optional task description.
@@ -199,7 +199,7 @@ mod tests {
 
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::SubmitInstruction(instruction)] if instruction.contains("state: \"draft\"")
+            [CommandEffect::PlanTurn(instruction)] if instruction.contains("state: \"draft\"")
         ));
         assert_eq!(session.mode, mode, "planning is not a permission mode");
     }
@@ -209,7 +209,7 @@ mod tests {
         let outcome = outcome("rewrite the resume path");
         assert!(matches!(
             &outcome.effects[..],
-            [CommandEffect::SubmitInstruction(instruction)]
+            [CommandEffect::PlanTurn(instruction)]
                 if instruction.contains("Task: rewrite the resume path")
         ));
     }

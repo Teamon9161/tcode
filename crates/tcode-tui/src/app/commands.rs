@@ -544,12 +544,13 @@ impl App {
                     self.bake_transcript();
                 }
                 CommandEffect::OpenResumePicker => self.open_resume_picker(),
-                CommandEffect::SubmitInstruction(instruction) => {
+                CommandEffect::PlanTurn(instruction) => {
                     let message = PendingMessage {
                         text: String::new(),
                         attachments: Vec::new(),
                         blocks: Vec::new(),
                         instructions: vec![instruction],
+                        expects_plan: true,
                     };
                     // A turn already holds the Session, so the instruction queues at
                     // the loop's next boundary exactly as typed input does.

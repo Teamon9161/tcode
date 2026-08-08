@@ -2158,6 +2158,56 @@ mod tests {
         assert!(app.frame().contains("restore active work"));
     }
 
+    /// The pane tracks the phases the model last sent, whatever surface the
+    /// call renders on. A phase flip that re-carries `state: "active"` (the
+    /// redundant-submission shape) routes to the transcript as a document, and
+    /// must still move the live pane — otherwise the panel freezes at the
+    /// draft and never shows a flip again.
+    #[test]
+    fn a_phase_flip_recarrying_state_still_updates_the_live_progress_pane() {
+        use tcode_core::AgentEvent;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "p1".into(),
+            name: "progress".into(),
+            input: serde_json::json!({
+                "phases": [
+                    {"phase": "one", "status": "in_progress"},
+                    {"phase": "two", "status": "pending"},
+                ]
+            }),
+            summary: String::new(),
+        });
+        let statuses = |app: &App| {
+            app.progress
+                .iter()
+                .map(|phase| phase.status.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(statuses(&app), ["in_progress", "pending"]);
+
+        app.on_agent_event(AgentEvent::ToolStart {
+            call_id: "p2".into(),
+            name: "progress".into(),
+            input: serde_json::json!({
+                "state": "active",
+                "title": "Do the thing",
+                "phases": [
+                    {"phase": "one", "status": "completed"},
+                    {"phase": "two", "status": "in_progress"},
+                ]
+            }),
+            summary: String::new(),
+        });
+        assert_eq!(
+            statuses(&app),
+            ["completed", "in_progress"],
+            "the pane tracks the flip even though it routes as a document"
+        );
+    }
+
     #[tokio::test]
     async fn plan_guidance_reaches_the_model_without_entering_the_transcript() {
         let dir = tempfile::tempdir().unwrap();

@@ -772,10 +772,15 @@ async fn main() -> anyhow::Result<()> {
                             "{DIM}interactive resume picker needs the full TUI — use /resume <id>{RESET}"
                         );
                     }
-                    CommandEffect::SubmitInstruction(instruction) => {
-                        if let Err(e) =
-                            run_instruction_turn(&agent, &mut session, instruction, &line_approver)
-                                .await
+                    CommandEffect::PlanTurn(instruction) => {
+                        if let Err(e) = run_instruction_turn(
+                            &agent,
+                            &mut session,
+                            instruction,
+                            true,
+                            &line_approver,
+                        )
+                        .await
                         {
                             eprintln!("{DIM}error: {e}{RESET}");
                         }
@@ -840,6 +845,7 @@ async fn run_instruction_turn(
     agent: &Agent,
     session: &mut Session,
     instruction: String,
+    expects_plan: bool,
     approver: &dyn tcode_core::Approver,
 ) -> Result<(), AgentError> {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -859,6 +865,7 @@ async fn run_instruction_turn(
         .instruction_turn(
             session,
             vec![instruction],
+            expects_plan,
             Vec::new(),
             &tx,
             approver,

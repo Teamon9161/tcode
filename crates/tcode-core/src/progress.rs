@@ -919,6 +919,14 @@ pub fn is_submission(input: &Value) -> bool {
 /// the text the reviewer actually saw — including a rewrite they made. A
 /// retired `exit_plan` call in a resumed session carries the same field, which
 /// is why this is checked before the submission test rather than after it.
+///
+/// A raw model call is a document only when it carries the whole plan a human
+/// would read — the fields `submission_gaps` requires. A phase flip that
+/// re-carries `state: "active"` (the redundant-submission shape the loop
+/// blesses) carries only `phases`, and rendering that as a document would
+/// both bury the live plan pane's updates under spurious transcript cards and
+/// freeze the pane: surfaces only call `update_progress` for non-document
+/// routes.
 pub fn plan_document(input: &Value) -> Option<String> {
     if let Some(body) = input[REVIEW_BODY_FIELD].as_str() {
         if !body.trim().is_empty() {
@@ -926,6 +934,12 @@ pub fn plan_document(input: &Value) -> Option<String> {
         }
     }
     if !is_submission(input) {
+        return None;
+    }
+    // A submission that could not pass review (missing the document fields)
+    // is not a document either; the only calls that reach a human as a plan
+    // carry the fields review demands.
+    if input["description"].as_str().is_none() || input["background"].as_str().is_none() {
         return None;
     }
     let phases = phases_from_json(&input["phases"]).ok()?;
@@ -2623,14 +2637,33 @@ mod tests {
 
     /// The question every review surface asks before deciding where a call
     /// belongs. A phase flip is not a document; a submission and a review copy
-    /// both are.
+    /// both are. A flip that re-carries `state: "active"` without the document
+    /// fields is an update, not a submission — `submission_gaps` would refuse
+    /// it before a human ever saw it.
     #[test]
     fn a_plan_document_is_a_submission_or_a_saved_review_body() {
         let update = json!({ "phases": [{ "phase": "one", "status": "in_progress" }] });
         assert!(!is_plan_document(&update));
 
+        // The redundant-submission shape the loop blesses: a phase flip that
+        // re-carries the previous call's `state` but only the phases. It must
+        // stay an update so the plan pane keeps tracking it.
+        let recarried_state_flip = json!({
+            "state": "active",
+            "title": "Rewrite the resume path",
+            "phases": [{ "phase": "one", "status": "completed" }]
+        });
+        assert!(
+            !is_plan_document(&recarried_state_flip),
+            "a phase flip is not a document even when it re-carries state"
+        );
+
+        // A real submission carries the document fields review demands.
         let submission = json!({
             "state": "active",
+            "title": "Rewrite the resume path",
+            "description": "what this plan is for",
+            "background": "## Decision\nworth doing",
             "phases": [{ "phase": "one", "status": "pending" }]
         });
         let document = plan_document(&submission).expect("a submission renders its own phases");

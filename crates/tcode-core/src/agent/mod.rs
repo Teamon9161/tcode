@@ -65,6 +65,21 @@ const DOGFOOD_SYSTEM: &str = include_str!("../../prompts/agent/dogfood.md");
 /// Appended to the Auto Mode classifier policy with machine-local folder trust.
 const FOLDER_TRUST_POLICY: &str = include_str!("../../prompts/auto_mode/folder-trust.md");
 
+/// The model-only nudge injected when a planning turn tries to end without a
+/// plan file. Harness-authored instruction text, so it lives in prompts/ and
+/// never appears in the transcript.
+const PLAN_NUDGE: &str = include_str!("../../prompts/commands/plan-nudge.md");
+
+/// The user-visible notice that ends a planning turn which still has no plan
+/// after the nudge. A `Note` entry rather than an instruction: the guarantee
+/// failed, and the user must see that instead of a silent nothing.
+const PLAN_NO_PLAN_NOTICE: &str = "No plan was produced for the /plan request; no plan file exists. Say /plan again to retry, or continue without a plan.";
+
+/// The refusal the pre-plan mutation gate gives the model. Self-healing: it
+/// names the `progress` path and the scratch exception, so the model knows
+/// what to do instead of guessing that all writes are blocked.
+const PLAN_GATE_MESSAGE: &str = "Not executed: this turn was asked to plan first (/plan) and no plan file exists yet. Create the plan with progress (state: \"draft\", then state: \"active\" to submit it), or tell the user why no plan is needed. Exploration and scratch work are allowed — files under the session scratch directory are not blocked. If this change belongs to work already under way before the plan request, explain that and wait for the user's go-ahead.";
+
 /// One-way events for the UI. Approval prompts go the other way through
 /// the `Approver` trait.
 ///
@@ -601,6 +616,9 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
         let model = self.model.snapshot();
+        // A fresh user turn supersedes any pending plan expectation: the user
+        // is steering now, so the turn-end guard must not police their own turn.
+        session.clear_planning_expectation();
         // Auto-compact before the next user entry increases the request.
         self.auto_compact_if_needed(session, &model, events, &cancel)
             .await?;
@@ -655,10 +673,14 @@ impl Agent {
     /// Drive one model turn with harness-authored guidance. The instruction is
     /// model context rather than a human utterance, so it stays out of replay,
     /// export, and the transcript while retaining normal turn behavior.
+    /// `expects_plan` marks the turn as a planning turn: the harness then
+    /// guarantees it does not end without a plan file.
+    #[allow(clippy::too_many_arguments)]
     pub async fn instruction_turn(
         &self,
         session: &mut Session,
         instructions: Vec<String>,
+        expects_plan: bool,
         input: Vec<ContentBlock>,
         events: &mpsc::Sender<AgentEvent>,
         approver: &dyn Approver,
@@ -670,6 +692,7 @@ impl Agent {
         self.note_background(session, events).await?;
         self.commit_mode(session, events).await?;
         self.deliver_deferred_context(session);
+        session.set_planning_expectation(expects_plan);
         for instruction in instructions {
             session.ledger.append(Entry::Instruction(instruction));
         }
@@ -722,6 +745,9 @@ impl Agent {
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
         let model = self.model.snapshot();
+        // A monitor wake is not the planning turn; a stale expectation (e.g.
+        // from a turn that errored out) must not make it nudge about plans.
+        session.clear_planning_expectation();
         self.auto_compact_if_needed(session, &model, events, &cancel)
             .await?;
         if self.note_background(session, events).await? == 0 {
@@ -732,6 +758,70 @@ impl Agent {
         self.run_steps(&model, session, events, approver, &cancel)
             .await?;
         Ok(true)
+    }
+
+    /// The turn-end guarantee for planning turns: a turn that received a
+    /// `/plan` request must not end with no plan file. The first no-plan end
+    /// injects a self-healing nudge (model-only instruction) and continues
+    /// the loop; the second surfaces a user-visible notice and clears the
+    /// expectation. A plan file existing is enough to pass — submission and
+    /// review are the `PlanReview` dialog's own guarantee. Returns whether the
+    /// caller should continue the loop (a nudge was injected).
+    async fn planning_turn_end(
+        &self,
+        session: &mut Session,
+        events: &mpsc::Sender<AgentEvent>,
+        allow_nudge: bool,
+    ) -> Result<bool, AgentError> {
+        if !session.planning_expected() || session.progress().is_some() {
+            session.clear_planning_expectation();
+            return Ok(false);
+        }
+        if allow_nudge && !session.planning_nudged() {
+            session.mark_planning_nudged();
+            session
+                .ledger
+                .append(Entry::Instruction(PLAN_NUDGE.to_string()));
+            return Ok(true);
+        }
+        session.clear_planning_expectation();
+        session
+            .ledger
+            .append(Entry::Note(PLAN_NO_PLAN_NOTICE.to_string()));
+        self.emit(events, AgentEvent::Note(PLAN_NO_PLAN_NOTICE.to_string()))
+            .await?;
+        Ok(false)
+    }
+
+    /// The pre-plan mutation gate: while a planning turn has no plan file, a
+    /// call that would touch a *project* file is refused — the plan must exist
+    /// before the work starts. Scratch and auto-memory targets are exempt:
+    /// planning legitimately clones reference repos and writes probe scripts
+    /// there, exactly the roots Auto Mode's local fast path treats as private
+    /// (`AutoModePolicy::AllowInProjectOrScratchEdit`). `progress` never
+    /// touches a file, so creating the plan itself is never gated.
+    fn planning_gate_blocks(
+        &self,
+        session: &Session,
+        tool: &dyn crate::tool::Tool,
+        input: &Value,
+    ) -> bool {
+        if !session.planning_expected() || session.progress().is_some() {
+            return false;
+        }
+        let Some(raw) = tool.touches(input) else {
+            return false;
+        };
+        let target = crate::memory::canonical_target(&session.tool_ctx.resolve(&raw));
+        let scratch = crate::memory::canonical_target(&session.tool_ctx.scratch_dir);
+        let memory = session
+            .tool_ctx
+            .memory
+            .lock()
+            .expect("memory lock")
+            .auto_dir()
+            .map(crate::memory::canonical_target);
+        !(target.starts_with(&scratch) || memory.is_some_and(|root| target.starts_with(&root)))
     }
 
     /// The model-step loop shared by user turns and monitor wake turns:
@@ -772,6 +862,9 @@ impl Agent {
 
             if cancel.is_cancelled() {
                 self.commit_interrupt(session, &tool_calls, &[], dropped_malformed);
+                // A killed planning turn is not a no-plan end to police; its
+                // expectation must not leak into the next (monitor) turn.
+                session.clear_planning_expectation();
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
@@ -822,6 +915,9 @@ impl Agent {
                 session.ledger.append(Entry::Note(msg.clone()));
                 self.emit(events, AgentEvent::Note(msg)).await?;
                 if give_up {
+                    // No point nudging a model that provably cannot fit the
+                    // cap; the user still has to be told the plan never landed.
+                    self.planning_turn_end(session, events, false).await?;
                     self.emit(events, AgentEvent::TurnEnd).await?;
                     return Ok(());
                 }
@@ -836,6 +932,12 @@ impl Agent {
             }
             truncated_streak = 0;
             if tool_calls.is_empty() || stop != Some(StopReason::ToolUse) {
+                // A planning turn must not end with no plan file: nudge once
+                // (loop continues for a self-healing reply), then report to
+                // the user and clear.
+                if self.planning_turn_end(session, events, true).await? {
+                    continue;
+                }
                 self.emit(events, AgentEvent::TurnEnd).await?;
                 return Ok(());
             }
@@ -851,6 +953,7 @@ impl Agent {
                 }
             };
             if outcome.interrupted {
+                session.clear_planning_expectation();
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
@@ -859,6 +962,7 @@ impl Agent {
             // before it can consume Ctrl+C's queued handoff.
             if cancel.is_cancelled() {
                 self.commit_interrupt(session, &[], &[], false);
+                session.clear_planning_expectation();
                 self.emit(events, AgentEvent::Interrupted).await?;
                 return Ok(());
             }
@@ -902,6 +1006,7 @@ impl Agent {
              (runaway guard). Nothing was lost; continue where you left off \
              when the user asks."
         )));
+        self.planning_turn_end(session, events, false).await?;
         self.emit(events, AgentEvent::StepLimitReached { max: max_steps })
             .await?;
         self.emit(events, AgentEvent::TurnEnd).await?;
@@ -1161,6 +1266,15 @@ impl Agent {
                 ));
                 continue;
             };
+
+            // A planning turn must not start executing before a plan file
+            // exists: project-file mutations are refused outright, with no
+            // approval prompt — the sequencing is not a risk decision to put
+            // to the user per call. Scratch exploration stays free.
+            if self.planning_gate_blocks(session, tool.as_ref(), input) {
+                results.push(tool_result(id, PLAN_GATE_MESSAGE, true));
+                continue;
+            }
 
             // Re-commit any mode staged while an earlier call in this batch was
             // on screen awaiting approval, so the switch reaches the remaining
@@ -2583,6 +2697,11 @@ impl Agent {
             for instruction in message.instructions {
                 session.ledger.append(Entry::Instruction(instruction));
             }
+            // Each delivered message carries its own intent: a queued plan
+            // request marks the turn as planning (its guard then applies at
+            // turn end), and any other user message releases the expectation —
+            // the user spoke, so their latest instruction supersedes `/plan`.
+            session.set_planning_expectation(message.expects_plan);
             let expanded =
                 crate::references::expand_references(session.tool_ctx.cwd.clone(), message.blocks)
                     .await;

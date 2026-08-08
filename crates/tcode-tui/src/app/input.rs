@@ -153,6 +153,7 @@ impl App {
             attachments,
             blocks,
             instructions: Vec::new(),
+            expects_plan: false,
         }
     }
 

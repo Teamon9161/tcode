@@ -374,6 +374,7 @@ async fn a_prompt_queued_mid_turn_lands_after_the_tool_results() {
             },
         ],
         instructions: vec![],
+        expects_plan: false,
     });
     let events = run(&agent, &mut session, &approver, "read lib.rs").await;
 
@@ -4873,6 +4874,356 @@ fn progress_agent(provider: Arc<MockProvider>) -> Agent {
     let mut tools = base.tools.clone();
     tools.push(Arc::new(tcode_tools::ProgressTool));
     Agent { tools, ..base }
+}
+
+/// Drive a harness-instruction turn (the shape `/plan` produces) and collect
+/// its events.
+async fn run_instruction(
+    agent: &Agent,
+    session: &mut Session,
+    approver: &dyn Approver,
+    instruction: String,
+    expects_plan: bool,
+) -> Vec<AgentEvent> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+    let collector = tokio::spawn(async move {
+        let mut v = Vec::new();
+        while let Some(e) = rx.recv().await {
+            v.push(e);
+        }
+        v
+    });
+    agent
+        .instruction_turn(
+            session,
+            vec![instruction],
+            expects_plan,
+            Vec::new(),
+            &tx,
+            approver,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("instruction turn failed");
+    drop(tx);
+    collector.await.unwrap()
+}
+
+/// The guarantee itself: a planning turn that ends with no plan file is nudged
+/// once (model-only instruction), and if the model still declines, the user is
+/// told instead of the turn ending silently.
+#[tokio::test]
+async fn a_planning_turn_that_ends_without_a_plan_is_nudged_then_reported() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        text_done("here are my thoughts, no plan"),
+        text_done("still declining"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run_instruction(
+        &agent,
+        &mut session,
+        &approver,
+        tcode_core::commands::plan::planning_instruction("do the thing"),
+        true,
+    )
+    .await;
+
+    // The plan request, then the nudge: both harness instructions, so both are
+    // model-only and must never surface as events.
+    let instructions: Vec<&str> = session
+        .ledger
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Instruction(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(instructions.len(), 2, "{instructions:?}");
+    assert!(instructions[0].contains("state: \"draft\""));
+    assert!(
+        instructions[1].contains("without a plan file"),
+        "{}",
+        instructions[1]
+    );
+
+    // The notice reached both the ledger (so replay shows it) and the live
+    // event stream (so the user sees it now).
+    assert!(
+        session.ledger.entries().iter().any(
+            |entry| matches!(entry, Entry::Note(text) if text.contains("No plan was produced"))
+        ),
+        "the notice is a durable Note"
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::Note(text) if text.contains("No plan was produced"))
+        ),
+        "the notice reached the frontend"
+    );
+    assert!(!session.planning_expected(), "the expectation is cleared");
+}
+
+/// A draft is a plan: once the file exists, the turn may end normally — no
+/// nudge, no notice.
+#[tokio::test]
+async fn a_planning_turn_that_creates_a_draft_ends_quietly() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use(
+            "t1",
+            "progress",
+            r#"{"title":"Do the thing","state":"draft","phases":[{"phase":"one","status":"pending"}]}"#,
+        ),
+        text_done("drafted, stopping here"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run_instruction(
+        &agent,
+        &mut session,
+        &approver,
+        tcode_core::commands::plan::planning_instruction("do the thing"),
+        true,
+    )
+    .await;
+
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, AgentEvent::Note(text) if text.contains("No plan was produced"))
+        ),
+        "a draft satisfies the guarantee"
+    );
+    assert!(session.progress().is_some());
+    assert!(!session.planning_expected());
+}
+
+/// A `/plan` queued behind a running turn still guards that turn: the request
+/// is delivered at the batch boundary, and the turn may not end silently
+/// without a plan.
+#[tokio::test]
+async fn a_queued_plan_request_delivered_mid_turn_still_guards_the_turn() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"lib.rs"}"#),
+        text_done("read done, and nothing planned"),
+        text_done("still nothing planned"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.pending.push(tcode_core::PendingMessage {
+        text: String::new(),
+        attachments: Vec::new(),
+        blocks: Vec::new(),
+        instructions: vec![tcode_core::commands::plan::planning_instruction("now plan")],
+        expects_plan: true,
+    });
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run(&agent, &mut session, &approver, "read lib.rs").await;
+
+    let instructions: Vec<&str> = session
+        .ledger
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Instruction(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        instructions
+            .iter()
+            .any(|i| i.contains("without a plan file")),
+        "the queued plan request must be nudged: {instructions:?}"
+    );
+    assert!(
+        events.iter().any(
+            |event| matches!(event, AgentEvent::Note(text) if text.contains("No plan was produced"))
+        ),
+        "the second no-plan end reports to the user"
+    );
+    assert!(!session.planning_expected());
+}
+
+/// The user speaking is the escape hatch: a plain message delivered mid-turn
+/// releases the expectation, so the turn may end without a plan, a nudge, or
+/// a notice.
+#[tokio::test]
+async fn a_queued_plain_message_releases_the_planning_guard() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"lib.rs"}"#),
+        text_done("read done, no plan and that is fine"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.pending.push(tcode_core::PendingMessage {
+        text: "forget the plan, just look".into(),
+        attachments: Vec::new(),
+        blocks: vec![ContentBlock::Text {
+            text: "forget the plan, just look".into(),
+        }],
+        instructions: Vec::new(),
+        expects_plan: false,
+    });
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run_instruction(
+        &agent,
+        &mut session,
+        &approver,
+        tcode_core::commands::plan::planning_instruction("do the thing"),
+        true,
+    )
+    .await;
+
+    let instructions: Vec<&str> = session
+        .ledger
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            Entry::Instruction(text) => Some(text.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(instructions.len(), 1, "{instructions:?}");
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, AgentEvent::Note(text) if text.contains("No plan was produced"))
+        ),
+        "a user message releases the guard"
+    );
+    assert!(!session.planning_expected());
+}
+
+/// The gate: a planning turn cannot write a *project* file before a plan file
+/// exists. Scratch writes stay free — planning legitimately clones reference
+/// repos and writes probe scripts there — and once a draft exists the gate
+/// lifts.
+#[tokio::test]
+async fn a_planning_turn_cannot_write_project_files_before_a_plan_exists() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let project_file = dir.path().join("notes.txt");
+    let scratch_file = session.tool_ctx.scratch_dir.join("probe.txt");
+    let write = |path: &std::path::Path, content: &str| {
+        tool_use(
+            "w",
+            "write",
+            &serde_json::json!({ "path": path.to_string_lossy(), "content": content }).to_string(),
+        )
+    };
+    let provider = MockProvider::new(vec![
+        write(&project_file, "should-not-land\n"),
+        write(&scratch_file, "x\n"),
+        tool_use(
+            "t3",
+            "progress",
+            r#"{"title":"Do the thing","state":"draft","phases":[{"phase":"one","status":"pending"}]}"#,
+        ),
+        write(&project_file, "x\n"),
+        text_done("done"),
+    ]);
+    let agent = progress_agent(provider);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    let events = run_instruction(
+        &agent,
+        &mut session,
+        &approver,
+        tcode_core::commands::plan::planning_instruction("do the thing"),
+        true,
+    )
+    .await;
+
+    let results = tool_results(&session);
+    // The first project write is refused by the gate: no approval prompt, an
+    // error result, nothing on disk.
+    assert!(
+        results[0].0.contains("asked to plan first"),
+        "{}",
+        results[0].0
+    );
+    assert!(results[0].1);
+    // The gated write never ran: the file that exists at the end carries the
+    // post-draft content, not the first write's.
+    assert_ne!(
+        std::fs::read_to_string(&project_file).unwrap(),
+        "should-not-land\n"
+    );
+    // The gate refuses before any approval prompt: only the scratch write and
+    // the post-draft write ever asked (the progress draft does not ask).
+    assert_eq!(
+        approver.asked.lock().unwrap().len(),
+        2,
+        "the gated write must never reach an approval prompt"
+    );
+    // Scratch writes are planning exploration, not execution.
+    assert!(!results[1].1, "{}", results[1].1);
+    assert_eq!(std::fs::read_to_string(&scratch_file).unwrap(), "x\n");
+    // A draft file satisfies the gate: the same project write now runs.
+    assert!(session.progress().is_some());
+    assert!(!results[3].1, "{}", results[3].1);
+    assert_eq!(std::fs::read_to_string(&project_file).unwrap(), "x\n");
+    assert!(
+        !events.iter().any(
+            |event| matches!(event, AgentEvent::Note(text) if text.contains("No plan was produced"))
+        ),
+        "the draft means the guarantee held"
+    );
+}
+
+/// Read-only reconnaissance and the `progress` tool itself are never gated:
+/// the model can always investigate and can always create the plan.
+#[tokio::test]
+async fn read_only_tools_and_progress_pass_the_plan_gate() {
+    tcode_core::home::testing::temp_home();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("lib.rs"), "fn main() {}\n").unwrap();
+    let provider = MockProvider::new(vec![
+        tool_use("t1", "read", r#"{"path":"lib.rs"}"#),
+        tool_use(
+            "t2",
+            "progress",
+            r#"{"title":"Do the thing","state":"draft","phases":[{"phase":"one","status":"pending"}]}"#,
+        ),
+        text_done("done"),
+    ]);
+    let agent = progress_agent(provider);
+    let mut session = session(dir.path(), PermissionMode::Default);
+    let approver = ScriptedApprover::new(ApprovalDecision::Yes, None);
+
+    run_instruction(
+        &agent,
+        &mut session,
+        &approver,
+        tcode_core::commands::plan::planning_instruction("do the thing"),
+        true,
+    )
+    .await;
+
+    let results = tool_results(&session);
+    assert!(!results[0].1, "read runs during planning: {}", results[0].0);
+    assert!(
+        !results[1].1,
+        "progress creates the draft during planning: {}",
+        results[1].1
+    );
+    assert!(session.progress().is_some());
 }
 
 /// Design rule (2): the detail of a twelve-phase plan does not live in the

@@ -85,6 +85,7 @@ impl App {
         // index its User entry is about to occupy (rewind jumps to it).
         let entry_index = session.ledger.entries().len();
         let instructions = message.instructions;
+        let expects_plan = message.expects_plan;
         // Echo only actual user text. Command guidance is an Instruction entry
         // and must never occupy the user transcript.
         if !message.text.is_empty() || !message.attachments.is_empty() {
@@ -117,6 +118,7 @@ impl App {
                         .instruction_turn(
                             &mut session,
                             instructions,
+                            expects_plan,
                             blocks,
                             &tx,
                             &*approver,
@@ -370,6 +372,7 @@ impl App {
             attachments: Vec::new(),
             blocks: Vec::new(),
             instructions: vec![instruction],
+            expects_plan: false,
         });
     }
 
@@ -679,9 +682,22 @@ impl App {
         input: serde_json::Value,
     ) {
         self.space_before_response = false;
+        // The live pane tracks the phases the model last sent, whichever
+        // surface the call renders on: a submission and a phase flip that
+        // re-carries `state` both carry the current breakdown. Asked with a
+        // default input, the registry names the progress surface without a
+        // name list (the one place names may be matched is
+        // `RenderRegistry::from_tools`); `update_progress` ignores calls that
+        // carry no phases.
+        if self
+            .renderers
+            .route_of(&name, Some(&serde_json::Value::Null))
+            == CallRoute::Progress
+        {
+            self.update_progress(&input);
+        }
         match self.renderers.route_of(&name, Some(&input)) {
             CallRoute::Progress => {
-                self.update_progress(&input);
                 self.state_label = "updating progress".into();
                 return;
             }
