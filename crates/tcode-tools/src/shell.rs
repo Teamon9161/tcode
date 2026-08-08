@@ -160,7 +160,7 @@ pub(crate) fn shell_command(
             // whole tree (bash and everything it spawned), not just bash.
             #[cfg(unix)]
             {
-                use tokio::process::CommandExt;
+                use std::os::unix::process::CommandExt;
                 cmd.process_group(0);
             }
             cmd
