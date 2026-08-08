@@ -725,7 +725,14 @@ impl App {
         let mut throttle_paint = false;
         while !self.should_exit {
             let running = matches!(self.phase, Phase::Running { .. });
-            if should_repaint(running, throttle_paint, last_redraw.elapsed()) {
+            // A legacy-console paste arrives as a burst of plain key events.
+            // This repaint runs between every two of them, and it takes longer
+            // than the paste window — so an Enter inside the burst would time
+            // out as a bare submit. While the burst flows, the burst-paint arm
+            // below owns the repaint instead; typing still repaints instantly
+            // once the burst goes quiet.
+            let in_paste_burst = self.in_unbracketed_paste_burst();
+            if !in_paste_burst && should_repaint(running, throttle_paint, last_redraw.elapsed()) {
                 self.redraw()?;
                 last_redraw = Instant::now();
             }
@@ -752,6 +759,17 @@ impl App {
                 .deferred_submit
                 .map(|at| tokio::time::Instant::from_std(at + UNBRACKETED_PASTE_WINDOW))
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            // The repaint is suspended during a paste burst, so a lone typed
+            // character still needs a deadline of its own — otherwise it would
+            // sit unpainted until the next event or the 250ms tick.
+            let burst_paint_armed = self.deferred_submit.is_none()
+                && self
+                    .last_plain_text_input
+                    .is_some_and(|at| at.elapsed() <= UNBRACKETED_PASTE_WINDOW);
+            let burst_paint_deadline = self
+                .last_plain_text_input
+                .map(|at| tokio::time::Instant::from_std(at + UNBRACKETED_PASTE_WINDOW))
+                .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
             tokio::select! {
                 ev = term_events.next() => {
                     match ev {
@@ -761,6 +779,11 @@ impl App {
                 }
                 _ = tokio::time::sleep_until(deferred_submit_deadline), if deferred_submit_armed => {
                     self.flush_deferred_submit();
+                }
+                _ = tokio::time::sleep_until(burst_paint_deadline), if burst_paint_armed => {
+                    self.redraw()?;
+                    last_redraw = Instant::now();
+                    self.last_plain_text_input = None;
                 }
                 Some(ev) = recv_opt(&mut self.events_rx) => {
                     self.on_agent_event(ev);
@@ -1673,6 +1696,18 @@ impl App {
         }
     }
 
+    /// Whether the event loop is inside a legacy-console paste burst: a bare
+    /// Enter is still being given its paste window, or a plain-text key just
+    /// arrived. While this holds, the loop suspends its per-event repaint — a
+    /// repaint takes longer than the paste window, so measuring the window
+    /// across one would turn every Enter in the burst into a submit.
+    fn in_unbracketed_paste_burst(&self) -> bool {
+        self.deferred_submit.is_some()
+            || self
+                .last_plain_text_input
+                .is_some_and(|at| at.elapsed() <= UNBRACKETED_PASTE_WINDOW)
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         // A pending approval keeps its mode status visible. Let its one global
         // shortcut through while all other keys still belong to the dialog.
@@ -2094,6 +2129,40 @@ mod tests {
         assert!(app.deferred_submit.is_none());
         assert!(app.editor.is_empty());
         assert!(app.frame().contains("keys and commands"));
+    }
+
+    #[test]
+    fn paste_burst_window_closes_once_plain_input_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        assert!(!app.in_unbracketed_paste_burst());
+
+        // A plain-text key arms the burst; the Enter right after it is a
+        // paste newline, not a deferred submit.
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        assert!(app.in_unbracketed_paste_burst());
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.editor.text(), "a\n");
+        assert!(app.deferred_submit.is_none());
+
+        // Once the window closes, a bare Enter is a submit again — the paste
+        // protection must not swallow deliberate sends.
+        std::thread::sleep(UNBRACKETED_PASTE_WINDOW + Duration::from_millis(20));
+        assert!(!app.in_unbracketed_paste_burst());
+        app.editor.clear();
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+        assert!(app.deferred_submit.is_some());
+        app.flush_deferred_submit();
+        assert!(app.deferred_submit.is_none());
     }
 
     #[test]
