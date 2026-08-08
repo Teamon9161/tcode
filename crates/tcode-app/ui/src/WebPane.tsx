@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
 import {
+  ArrowUp,
   BackIcon,
   CloseIcon,
   CollapseIcon,
@@ -8,8 +9,44 @@ import {
   PlusIcon,
   RefreshIcon,
 } from "./components/Icons";
-import { currentTab, tabLabel } from "./web";
+import { currentTab, tabLabel, type Tab } from "./web";
 import * as browser from "./webHost";
+
+/**
+ * What the tooltip says about a tab an agent opened.
+ *
+ * In words, and the dot's `aria-label` says the same thing — because the strip
+ * already has a rule about this (`.tab-exit` in `app.css`): a fact is never
+ * carried by colour alone. The colour is here to tell two conversations' tabs
+ * apart at a glance, which is a job colour is good at; *what it means* is text.
+ */
+function agentHint(tab: Tab, nameOf: (session: string) => string): string {
+  if (!tab.agent) return "";
+  const who = tab.owner ? nameOf(tab.owner) : null;
+  return who ? `Opened by "${who}", not by you` : "Opened by a conversation, not by you";
+}
+
+/**
+ * A stable colour per conversation, from its id.
+ *
+ * A hash and not a palette, because a palette is a table somebody has to keep
+ * in step with a list of open conversations that changes all day. Lightness and
+ * chroma are fixed so every hue lands at the same weight against either theme,
+ * and only the hue turns — which is the one dimension the eye reads as
+ * "different thing" rather than "more important thing".
+ *
+ * Local to this file on purpose: one consumer, one place. If the rail ever
+ * wants the same colour beside a conversation, that is when it moves somewhere
+ * both can reach — not before (the narrowest-scope rule in the root CLAUDE.md).
+ */
+function tint(owner: string | null): React.CSSProperties | undefined {
+  if (!owner) return undefined;
+  let hash = 0;
+  for (let at = 0; at < owner.length; at += 1) {
+    hash = (hash * 31 + owner.charCodeAt(at)) >>> 0;
+  }
+  return { background: `oklch(0.68 0.15 ${hash % 360})` };
+}
 
 /**
  * The window's browser.
@@ -59,6 +96,8 @@ export function WebPane({
   onToggleExpanded,
   hidden,
   request,
+  nameOf,
+  onHandOver,
 }: {
   onClose: () => void;
   /** This pane is the one filling the field. */
@@ -77,6 +116,26 @@ export function WebPane({
    * is what distinguishes "again" from "still".
    */
   request?: { url: string; at: number } | null;
+  /**
+   * What to call the conversation that owns a tab.
+   *
+   * A lookup and not a session id, which is the distinction the note in
+   * `Panes.tsx` makes: this pane is still the window's rather than any
+   * conversation's, and nothing under it may ask "which session am I in". It
+   * asks "what is that one called", about an id it was given.
+   */
+  nameOf: (session: string) => string;
+  /**
+   * Hand the page on screen to the conversation being worked in.
+   *
+   * The one direction Phase 2 left out. A model's own tabs it already knows the
+   * ids of; a tab *you* opened it has never heard of, and must not be able to
+   * enumerate — a list of every tab would put the user's browsing into model
+   * context, which is a leak wearing a capability's clothes
+   * (`../AGENT-BROWSER.md`). So the way across is the user handing one over,
+   * from the strip, about the page they are looking at.
+   */
+  onHandOver: (tab: string) => void;
 }) {
   const body = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
@@ -225,9 +284,24 @@ export function WebPane({
                 role="tab"
                 aria-selected={each.id === tabs.current}
                 className="tab-name"
-                title={each.url || tabLabel(each)}
+                title={[each.url || tabLabel(each), agentHint(each, nameOf)]
+                  .filter(Boolean)
+                  .join("\n\n")}
                 onClick={() => browser.select(each.id)}
               >
+                {/* A tab nobody in this window asked for. It is marked from the
+                    moment it exists — a page starts loading in it, and a strip
+                    that drew it like any other would be saying somebody opened
+                    it. The colour separates two conversations' tabs; the label
+                    is what says what it means. */}
+                {each.agent && (
+                  <span
+                    className="tab-agent"
+                    style={tint(each.owner)}
+                    role="img"
+                    aria-label={agentHint(each, nameOf)}
+                  />
+                )}
                 {/* The name is its own element so it can be the thing that
                     ellipsises: the button beside it is a flex container, and a
                     bare text node in one cannot be truncated. */}
@@ -327,6 +401,25 @@ export function WebPane({
           title="Reload"
         >
           <RefreshIcon size={14} />
+        </button>
+
+        {/* The handoff. Deliberately an action on the page you are *looking at*
+            rather than a per-tab control: deciding to show somebody a page is
+            something you do while reading it, and a second cross-sized button
+            on every tab would crowd the strip the close control already fills.
+
+            It writes into the composer instead of sending, the same as the file
+            tree's "Mention in the message" — a page handed over with no
+            question attached is of no use to anyone, and "look at this, and…"
+            is a sentence somebody is still writing. */}
+        <button
+          className="icon-btn"
+          onClick={() => tab && onHandOver(tab.id)}
+          disabled={!tab}
+          aria-label="Mention this page in the message"
+          title="Mention this page in the message — the conversation can then read it"
+        >
+          <ArrowUp size={14} />
         </button>
       </header>
 

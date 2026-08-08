@@ -1,22 +1,30 @@
 import { invoke, listen } from "@ipc";
 
 import {
-  addTab,
+  addTabBehind,
   blankTab,
   closeTab,
   currentTab,
   discardDraft,
+  disownedTabs,
   draftTab,
   isBlank,
   navigatedTab,
   newTab,
   NO_TABS,
+  ownedTab,
   selectTab,
   sendingTab,
   stepTab,
   type Tabs,
 } from "./web";
-import { BROWSER_NAVIGATED, type Navigated } from "./types";
+import {
+  BROWSER_NAVIGATED,
+  BROWSER_TAB_OPENED,
+  type AgentEvent,
+  type Navigated,
+  type TabOpened,
+} from "./types";
 
 /**
  * The window's browser: its tabs, and the bridge to the webviews behind them.
@@ -124,6 +132,11 @@ export function mount(rect: NonNullable<typeof bounds>) {
   invoke("browser_show", { rect })
     .then(() => {
       publish({ live: true });
+      // Nothing is current when every tab in the strip was opened by an agent:
+      // those arrive behind, on purpose, and nobody has selected one. Opening
+      // the pane *is* asking to look at a page, so the first one comes forward
+      // — otherwise the pane draws a strip of tabs over an empty rectangle.
+      if (!currentTab(state.tabs)) select(state.tabs.list[0].id);
       settle();
     })
     .catch((error) => failed("cannot show the browser", error));
@@ -182,12 +195,19 @@ export async function open(url?: string) {
   const asked = bounds;
   let id: string;
   try {
-    id = await invoke<string>("browser_open", { rect: asked });
+    // `select: true` because somebody clicked `+`: this tab is the one they
+    // want to be looking at. The shell reads the flag strictly and the other
+    // caller — the backend, opening a tab for a model — passes nothing, which
+    // is how an agent's page never takes the screen (`../AGENT-BROWSER.md`).
+    id = await invoke<string>("browser_open", { rect: asked, select: true });
   } catch (error) {
     failed("cannot open a browser tab", error);
     return;
   }
-  publish({ tabs: addTab(state.tabs, newTab(id)), failure: null, live: true });
+  // Present, then selected. `+` is somebody asking to look at a new page, so
+  // this is the caller that says so — `knownTab` alone never selects, which is
+  // what lets the agent's tabs arrive by the same door without taking over.
+  publish({ tabs: selectTab(knownTab(state.tabs, id, false), id), failure: null, live: true });
   // Identity, not equality: `moved` replaces the object, so this is exactly
   // "did the pane report anything while we were waiting".
   if (bounds !== asked) invoke("browser_bounds", { rect: bounds }).catch(() => {});
@@ -306,9 +326,18 @@ export function visit(url: string) {
 
 // ----------------------------------------------------------------- the bridge
 
-/** Subscribed once for the whole app, not once per pane: hiding and re-opening
- *  the pane would otherwise add a listener each time, and every navigation
- *  would be applied as many times as the pane had been opened. */
+/**
+ * Subscribed once for the whole app, not once per pane: hiding and re-opening
+ * the pane would otherwise add a listener each time, and every navigation would
+ * be applied as many times as the pane had been opened.
+ *
+ * **Called from the window's own startup as well as from the pane** (`watch`),
+ * and that is not belt-and-braces. A model can open a tab in a window whose
+ * browser pane has never been mounted; with the subscription starting at mount,
+ * that tab's announcement went to nobody, and opening the pane afterwards found
+ * an empty strip and opened a *second* tab. The page existed and nothing could
+ * reach it.
+ */
 function listenOnce() {
   if (listening) return;
   listening = true;
@@ -317,4 +346,103 @@ function listenOnce() {
     const { id, url, title } = event.payload;
     publish({ tabs: navigatedTab(state.tabs, id, url, title), failure: null });
   }).catch((error) => failed("cannot follow the browser", error));
+
+  // A tab the strip did not open — the backend opened one for a model. Adding
+  // it is the whole handler: it is not selected, so nothing on screen moves,
+  // and its address arrives the same way every other tab's does.
+  listen<TabOpened>(BROWSER_TAB_OPENED, (event) => {
+    publish({ tabs: knownTab(state.tabs, event.payload.id, event.payload.agent) });
+  }).catch((error) => failed("cannot follow the browser", error));
+}
+
+/** Start following the browser for the window's lifetime. Idempotent, and the
+ *  pane still calls the same thing on mount. */
+export function watch() {
+  listenOnce();
+}
+
+/**
+ * A conversation's `browser` call went past — learn what it says about a tab.
+ *
+ * This is where a tab acquires an owner, and it is the whole of the mechanism.
+ * The backend cannot label the tab itself: a tool is a singleton shared by every
+ * session and `ToolCtx` carries no session id, which is a decision rather than a
+ * gap (`../../AGENT-BROWSER.md` argues it at length — a tab id is a capability,
+ * and the isolation a session-to-tab table would buy is already free). What is
+ * session-tagged is the event stream. So ownership is read off the one thing
+ * that is both session-tagged and tab-naming: the call's own arguments.
+ *
+ * `input.tab`, and never the result text. The arguments are structured data the
+ * model sent; the result is a sentence written for a model to read, and parsing
+ * our own prose back out of it would make an English wording load-bearing.
+ *
+ * The consequence is that `open` itself cannot claim a tab — its input has no
+ * `tab` yet — so a just-opened tab is unattributed until its owner does
+ * anything at all with it. That is a second or two, and it is honest: nobody
+ * has claimed it. `agent` is already true throughout, so the strip is never
+ * pretending the tab is the user's.
+ */
+/**
+ * A conversation was closed. Its tabs are not.
+ *
+ * The pages stay exactly as they are — logged in, half-scrolled, mid-form — and
+ * only stop being attributed. This is the same promise the pane makes
+ * everywhere else (hiding is not closing; `closeSession` filters browser panes
+ * out), applied to the one new thing Phase 2 added: an owner.
+ */
+export function disown(session: string) {
+  const tabs = disownedTabs(state.tabs, session);
+  if (tabs !== state.tabs) publish({ tabs });
+}
+
+/**
+ * The user is handing one of their tabs to a conversation.
+ *
+ * What comes back is text for a composer, not a message and not a note in the
+ * ledger. A tab handed over with no question attached is of no use to anybody
+ * — the point is always "look at *this*, and…" — so it lands in the draft the
+ * same way `@path` does from the file tree, and the user finishes the sentence.
+ *
+ * It is also what makes the trust boundary trivial here: this ends up inside a
+ * **user** message, which is an instruction source, and the user reads it
+ * before pressing enter. The URL is the only thing taken from the page. The
+ * *title* deliberately is not: that is prose a website wrote, and there is no
+ * reason to put it in the user's own turn when the address says as much.
+ */
+export function handOverText(id: string): string | null {
+  const tab = state.tabs.list.find((each) => each.id === id);
+  if (!tab) return null;
+  return tab.url ? `browser tab ${id} (${tab.url})` : `browser tab ${id}`;
+}
+
+export function claim(session: string, event: AgentEvent) {
+  if (event.type !== "ToolStart") return;
+  const call = event.data as { name?: string; input?: { tab?: unknown } };
+  if (call.name !== "browser") return;
+  const tab = call.input?.tab;
+  if (typeof tab !== "string" || !tab) return;
+  const tabs = ownedTab(state.tabs, tab, session);
+  if (tabs !== state.tabs) publish({ tabs });
+}
+
+/**
+ * Make sure the strip has a row for this tab, without disturbing one it
+ * already has and without selecting it.
+ *
+ * Both paths that learn about a tab go through here: the id `browser_open`
+ * answers with, and the event announcing the same tab. They race — two IPC
+ * messages out of one call — and neither ordering is worth depending on, so
+ * the second to arrive has to be a no-op rather than a duplicate row or a row
+ * reset back to blank.
+ *
+ * Selecting is the caller's decision and is spelt separately (`selectTab`),
+ * which is what makes both orderings land in the same place: whichever
+ * arrives second finds the row there and changes nothing.
+ *
+ * `agent` is passed by both callers rather than inferred from which one it is,
+ * for the same reason: the event can arrive before `browser_open` has answered,
+ * and a row created by the wrong door must still describe the tab correctly.
+ */
+function knownTab(tabs: Tabs, id: string, agent: boolean): Tabs {
+  return tabs.list.some((tab) => tab.id === id) ? tabs : addTabBehind(tabs, newTab(id, agent));
 }

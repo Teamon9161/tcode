@@ -15,24 +15,32 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const mocks = vi.hoisted(() => ({
   invoke: vi.fn(),
   off: vi.fn(),
-  listener: null as null | ((event: { payload: { id: string; url: string; title: string } }) => void),
+  /**
+   * Subscribers by event name.
+   *
+   * A single `listener` slot until the agent browser arrived, and that was
+   * fine while the store subscribed to one event. It stopped being fine the
+   * moment it subscribed to two: the slot held whichever registered last, so
+   * every navigation in this file was delivered to the wrong handler — and the
+   * failure looked like the address bar being broken, not like the fixture
+   * being wrong. Keyed by name, a test says which event it is sending.
+   */
+  listeners: new Map<string, (event: { payload: Record<string, unknown> }) => void>(),
 }));
 
 // One module now, so one double: a second `vi.mock` of the same specifier
 // silently replaces the first, which would leave `invoke` undefined here.
 vi.mock("@ipc", () => ({
   invoke: mocks.invoke,
-  listen: (
-    _name: string,
-    callback: (event: { payload: { id: string; url: string; title: string } }) => void,
-  ) => {
-    mocks.listener = callback;
+  listen: (name: string, callback: (event: { payload: Record<string, unknown> }) => void) => {
+    mocks.listeners.set(name, callback);
     return Promise.resolve(mocks.off);
   },
 }));
 
 import { WebPane } from "./WebPane";
 import * as browser from "./webHost";
+import { BROWSER_NAVIGATED, BROWSER_TAB_OPENED } from "./types";
 
 class FakeResizeObserver {
   observe() {}
@@ -72,6 +80,9 @@ let unmounted: boolean;
 /** What the fake backend believes: one webview per tab, and the last one is
  *  blanked rather than destroyed (`browser.rs`). */
 let openTabs: string[];
+/** Tabs the pane asked to hand to a conversation. The pane has no session of
+ *  its own, so all it can do is name the tab and let the window place it. */
+let handedOver: string[];
 
 function render(
   onClose: () => void = () => {},
@@ -90,6 +101,8 @@ function render(
         onToggleExpanded={() => {}}
         hidden={hidden}
         request={request}
+        nameOf={(session) => `conversation ${session}`}
+        onHandOver={(tab) => handedOver.push(tab)}
       />,
     );
   });
@@ -114,11 +127,17 @@ async function pressEnter() {
   });
 }
 
+/** One event arriving from the backend, by name. Throws on an unsubscribed
+ *  name rather than doing nothing: a test that fires into the void passes. */
+function deliver(name: string, payload: Record<string, unknown>) {
+  const listener = mocks.listeners.get(name);
+  if (!listener) throw new Error(`nothing is listening for ${name}`);
+  act(() => listener({ payload }));
+}
+
 /** A `BROWSER_NAVIGATED` event arriving from the backend. */
 function navigate(url: string, id = openTabs[openTabs.length - 1]) {
-  act(() => {
-    mocks.listener?.({ payload: { id, url, title: "" } });
-  });
+  deliver(BROWSER_NAVIGATED, { id, url, title: "" });
 }
 
 function button(label: string): HTMLButtonElement {
@@ -141,6 +160,7 @@ async function click(label: string) {
 
 beforeEach(async () => {
   openTabs = [];
+  handedOver = [];
   mocks.invoke.mockReset().mockImplementation((name: string, args?: Record<string, unknown>) => {
     if (name === "browser_open") {
       const id = `tab-${openTabs.length + 1}`;
@@ -156,7 +176,7 @@ beforeEach(async () => {
     return Promise.resolve(undefined);
   });
   mocks.off.mockReset();
-  mocks.listener = null;
+  mocks.listeners.clear();
   frames.length = 0;
   browser.reset();
   render();
@@ -170,7 +190,14 @@ afterEach(() => {
 
 describe("the browser pane's first tab", () => {
   it("opens one when the pane appears, because an empty browser is not a state anybody asked for", () => {
-    expect(mocks.invoke).toHaveBeenCalledWith("browser_open", { rect: expect.anything() });
+    // `select: true` is part of the call, not decoration. The shell reads it
+    // strictly, and the other caller — the backend, opening a tab for a model
+    // — omits it so that tab never takes the screen. A `+` that stopped
+    // sending it would open tabs nobody could see.
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_open", {
+      rect: expect.anything(),
+      select: true,
+    });
     expect(container.querySelectorAll(".tab")).toHaveLength(1);
   });
 
@@ -183,6 +210,167 @@ describe("the browser pane's first tab", () => {
     expect(mocks.invoke).toHaveBeenCalledWith("browser_show", { rect: expect.anything() });
     expect(mocks.invoke).not.toHaveBeenCalledWith("browser_open", expect.anything());
     expect(container.querySelectorAll(".tab")).toHaveLength(1);
+  });
+});
+
+describe("a tab the strip did not open", () => {
+  /**
+   * The agent browser's half of the strip (`../AGENT-BROWSER.md`).
+   *
+   * A model asks the backend for a tab; the backend asks the shell; the shell
+   * announces it. Before this, `browser_open`'s return value was the only way
+   * a tab could come into existence, so a tab opened anywhere else was a page
+   * on screen that the strip did not know about — which is exactly why a
+   * page's own `window.open` had to be denied and loaded in the same tab.
+   */
+  it("appears in the strip", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    expect(container.querySelectorAll(".tab")).toHaveLength(2);
+  });
+
+  /**
+   * And it says so, from the first frame.
+   *
+   * A page is about to start loading in this tab without anybody in the window
+   * having asked for one. A strip that drew it like every other tab would be
+   * answering "did I open this?" with a shrug — so the mark rides on the birth
+   * event rather than waiting for the ownership that is worked out later.
+   */
+  it("is marked as an agent's before anyone knows whose it is", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    const dot = container.querySelector(".tab-agent");
+    expect(dot).not.toBeNull();
+    expect(dot!.getAttribute("aria-label")).toBe("Opened by a conversation, not by you");
+    // The user's own tab carries nothing extra.
+    expect(container.querySelectorAll(".tab-agent")).toHaveLength(1);
+  });
+
+  /**
+   * Whose it is arrives afterwards, off the session-tagged event stream.
+   *
+   * There is nothing to announce it: the tool is a singleton and `ToolCtx`
+   * carries no session id, on purpose. What identifies the conversation is that
+   * its own `browser` call names the tab — structured arguments the model sent,
+   * not the sentence the tool answered with.
+   */
+  it("takes the name of the conversation whose call names it", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() =>
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: {
+          call_id: "c1",
+          name: "browser",
+          summary: "",
+          input: { action: "snapshot", tab: "agent-tab" },
+        },
+      }),
+    );
+    expect(container.querySelector(".tab-agent")!.getAttribute("aria-label")).toBe(
+      'Opened by "conversation s-7", not by you',
+    );
+  });
+
+  /**
+   * A conversation ending does not close its pages.
+   *
+   * Same sentence the whole pane is built on — hiding is not closing,
+   * `closeSession` leaves the browser pane alone — applied to the one thing
+   * Phase 2 added. The page stays logged in and where it was; it just stops
+   * being attributed to a conversation that no longer exists.
+   */
+  it("keeps the page and loses the owner when the conversation is closed", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() =>
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: {
+          call_id: "c1",
+          name: "browser",
+          summary: "",
+          input: { action: "snapshot", tab: "agent-tab" },
+        },
+      }),
+    );
+    navigate("https://example.com/report", "agent-tab");
+
+    act(() => browser.disown("s-7"));
+
+    expect(container.querySelectorAll(".tab")).toHaveLength(2);
+    // Still an agent's tab — where it came from does not stop being true — and
+    // no longer anybody's.
+    expect(container.querySelector(".tab-agent")!.getAttribute("aria-label")).toBe(
+      "Opened by a conversation, not by you",
+    );
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_close", { id: "agent-tab" });
+  });
+
+  /** A call from a different tool, or one that names no tab, says nothing about
+   *  who owns anything. */
+  it("is not claimed by a call that does not name it", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() => {
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: { call_id: "c1", name: "browser", summary: "", input: { action: "open" } },
+      });
+      browser.claim("s-9", {
+        type: "ToolStart",
+        data: { call_id: "c2", name: "read", summary: "", input: { tab: "agent-tab" } },
+      });
+    });
+    expect(container.querySelector(".tab-agent")!.getAttribute("aria-label")).toBe(
+      "Opened by a conversation, not by you",
+    );
+  });
+
+  /** And it must not take the screen. Whoever is reading the current tab did
+   *  not ask for this one; the whole point of driving the window's own browser
+   *  rather than a headless one is that watching it is optional, not forced. */
+  it("does not become the current tab", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    const current = container.querySelectorAll(".tab.is-current");
+    expect(current).toHaveLength(1);
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_select", { id: "agent-tab" });
+  });
+
+  /** The id also comes back from `browser_open`, so both arrive for a tab the
+   *  strip *did* open. Whichever is second must change nothing — the ordering
+   *  of two IPC messages out of one call is not something to depend on. */
+  it("is not added twice when it is also the strip's own tab", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "tab-1", url: "about:blank", agent: false });
+    expect(container.querySelectorAll(".tab")).toHaveLength(1);
+    expect(container.querySelectorAll(".tab.is-current")).toHaveLength(1);
+    // And it is still the user's: the row was already there, so the second
+    // arrival changes nothing at all.
+    expect(container.querySelectorAll(".tab-agent")).toHaveLength(0);
+  });
+});
+
+describe("handing a page to a conversation", () => {
+  /**
+   * The only way a model learns about a tab it did not open.
+   *
+   * There is deliberately no action that lists tabs: an agent able to enumerate
+   * them would have the user's browsing in its context, which is a leak wearing
+   * a capability's clothes (`../AGENT-BROWSER.md`). The way across is the user
+   * pointing at one page.
+   */
+  it("names the tab on screen and lets the window place it", async () => {
+    navigate("https://github.com/rust-lang/rust/pull/1");
+    await click("Mention this page in the message");
+    expect(handedOver).toEqual(["tab-1"]);
+  });
+
+  /** What lands in the composer is an id and an address. The page's *title* is
+   *  left out on purpose: that is prose a website wrote, and a user's own turn
+   *  is not where it belongs. */
+  it("carries the address and nothing the page wrote", () => {
+    navigate("https://github.com/rust-lang/rust/pull/1");
+    expect(browser.handOverText("tab-1")).toBe(
+      "browser tab tab-1 (https://github.com/rust-lang/rust/pull/1)",
+    );
+    expect(browser.handOverText("no-such-tab")).toBeNull();
   });
 });
 
@@ -354,6 +542,8 @@ describe("following a link into the browser", () => {
           onToggleExpanded={() => {}}
           hidden={false}
           request={{ url: "https://example.com/report", at: 2 }}
+          nameOf={(session) => `conversation ${session}`}
+          onHandOver={(tab) => handedOver.push(tab)}
         />,
       );
       await Promise.resolve();

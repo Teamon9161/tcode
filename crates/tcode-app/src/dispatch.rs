@@ -452,6 +452,17 @@ mod tests {
             "browser_step",
             "browser_reload",
             "browser_close",
+            // Called by the backend rather than by the frontend — the `browser`
+            // tool's way of seeing and working a page (`crate::browser`). Listed
+            // here all the same: what this pins is that the one shell answers
+            // every verb somebody sends it, and the sidecar is now one of the
+            // somebodies.
+            "browser_snapshot",
+            "browser_screenshot",
+            "browser_click",
+            "browser_type",
+            "browser_scroll",
+            "browser_wait",
         ];
 
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -482,11 +493,9 @@ mod tests {
     /// files for their invariants.
     #[test]
     fn the_browser_views_are_isolated_from_the_app() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/electron/browser.js"
-        ))
-        .expect("electron/browser.js");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
 
         // Scan the `webPreferences` block rather than the whole file: the
         // file's own header explains why there is no preload, and would trip a
@@ -527,11 +536,9 @@ mod tests {
     /// reads as a bug in something else entirely.
     #[test]
     fn the_app_renderer_cannot_be_navigated_away_or_open_a_window() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/electron/main.js"
-        ))
-        .expect("electron/main.js");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/main.js"))
+                .expect("electron/main.js");
 
         assert!(
             source.contains("will-navigate") && source.contains("preventDefault"),
@@ -539,10 +546,102 @@ mod tests {
              replace the whole app with a page of someone else's choosing"
         );
         assert!(
-            source.contains("setWindowOpenHandler")
-                && source.contains("action: \"deny\""),
+            source.contains("setWindowOpenHandler") && source.contains("action: \"deny\""),
             "the app renderer lost its `setWindowOpenHandler` deny — \
              `target=\"_blank\"` opens a frameless window carrying this app's preload"
+        );
+    }
+
+    /// A tab opened for a model must not take the screen.
+    ///
+    /// Two callers reach `browser_open` now: the pane, when somebody clicks
+    /// `+`, and the backend, when a model asks for a tab. Only the first has
+    /// any business changing which tab is on screen — the whole reason the
+    /// agent drives the window's own browser rather than a headless one is that
+    /// watching it stays optional (`../AGENT-BROWSER.md`).
+    ///
+    /// What that rests on is one comparison. `args.select` read strictly means
+    /// a caller that omits it gets a background tab; `args.select !== false`,
+    /// or a `?? true`, would flip the default to "steal the screen" and the
+    /// symptom would be a page appearing over whatever someone was reading —
+    /// which reads as a bug in the pane, not in an argument's default.
+    #[test]
+    fn a_tab_opened_for_a_model_does_not_take_the_screen() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
+
+        assert!(
+            source.contains("args.select === true"),
+            "`browser_open` no longer reads `select` strictly — a caller that omits it \
+             would now take the screen, which is what an agent's tab must never do"
+        );
+    }
+
+    /// An approval names a host; the click has to land on that host.
+    ///
+    /// The backend decides what to ask about from the last page it *saw* — a
+    /// navigation it resolved, or a snapshot the page answered with. A page can
+    /// move on its own between that and the click: a redirect, a meta refresh,
+    /// a script. Without the check the user approves "click on github.com" and
+    /// the click lands wherever the tab drifted to, which is the exact failure
+    /// the per-host descriptor exists to prevent — and it fails silently.
+    ///
+    /// It lives in the shell rather than in a preceding round trip because that
+    /// is what makes it airtight: there is no window between reading the URL and
+    /// dispatching the event for the page to move in. The shell is not judging
+    /// anything; it compares a value the backend computed.
+    #[test]
+    fn acting_on_a_tab_checks_the_page_has_not_moved() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
+
+        assert!(
+            source.contains("const onHost ="),
+            "the browser shell lost its host check — a click can now land on a page the user \
+             was never asked about"
+        );
+        for verb in ["browser_click(args)", "browser_type(args)"] {
+            let at = source
+                .find(verb)
+                .unwrap_or_else(|| panic!("browser.js answers `{verb}`"));
+            let body = &source[at..];
+            let body = &body[..body.find("\n    },").expect("the verb body ends")];
+            assert!(
+                body.contains("onHost(args.id, args.host)"),
+                "`{verb}` acts without checking the tab is still on the host the approval named"
+            );
+        }
+    }
+
+    /// A screenshot must not need the tab on screen.
+    ///
+    /// `Page.captureScreenshot` wants a compositor frame, and a hidden
+    /// `WebContentsView` produces none — it answers about every other call and
+    /// hangs in between, measured three runs over (`../AGENT-BROWSER.md`).
+    /// Electron's own `capturePage` came back 9 times out of 9 on the same
+    /// hidden view. Swapping back to the CDP command would reintroduce a
+    /// screenshot that works when someone happens to be looking at the tab,
+    /// which is the worst kind of intermittent.
+    #[test]
+    fn a_screenshot_does_not_need_the_tab_on_screen() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
+
+        let at = source
+            .find("browser_screenshot(args)")
+            .expect("browser.js answers `browser_screenshot`");
+        let body = &source[at..];
+        let body = &body[..body.find("\n    },").expect("the verb body ends")];
+        assert!(
+            body.contains("capturePage()"),
+            "`browser_screenshot` no longer uses Electron's own capture"
+        );
+        assert!(
+            !body.contains("captureScreenshot"),
+            "`browser_screenshot` is back on the CDP command, which hangs on a hidden view"
         );
     }
 
@@ -552,11 +651,9 @@ mod tests {
     /// there anyway (see AGENTS.md rule 9h).
     #[test]
     fn a_browser_tab_cannot_open_a_window() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/electron/browser.js"
-        ))
-        .expect("electron/browser.js");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
 
         assert!(
             source.contains("setWindowOpenHandler")
@@ -573,11 +670,9 @@ mod tests {
     /// the open web. The partition denies them all, once, at boot.
     #[test]
     fn the_browser_partition_denies_permission_requests() {
-        let source = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/electron/browser.js"
-        ))
-        .expect("electron/browser.js");
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/electron/browser.js"))
+                .expect("electron/browser.js");
 
         assert!(
             source.contains("setPermissionRequestHandler"),

@@ -15,6 +15,15 @@ export const WINDOW_STATE = "tcode://window-state";
 /** Mirrors `browser::BROWSER_NAVIGATED`. Where the browser is, reported by the
  *  webview that owns it — the address bar reads this and never sets it. */
 export const BROWSER_NAVIGATED = "tcode://browser-navigated";
+/** Mirrors `electron/browser.js::BROWSER_TAB_OPENED`. A tab exists.
+ *
+ *  The strip used to be the only place a tab could be born — `browser_open`
+ *  returned an id and whoever called it recorded it — and the agent browser
+ *  ends that: the backend opens tabs the strip never asked for. So the list is
+ *  event-sourced, and this is the event. Both paths (this, and the id
+ *  `browser_open` returns) add by id and ignore a duplicate, so neither has to
+ *  arrive first. */
+export const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
 
 /** Mirrors `terminal::TERMINAL_OUTPUT`. Chunks of one terminal's output,
  *  coalesced on the backend — see `terminal.rs` for why a flood must not be one
@@ -32,6 +41,19 @@ export type WindowState = { maximized: boolean };
  *  the same page rather than a correction. `id` is the tab's — a background tab
  *  finishing a redirect must not move the address bar of the one on screen. */
 export type Navigated = { id: string; url: string; title: string };
+
+/**
+ * The payload of {@link BROWSER_TAB_OPENED}. Where the tab starts; everything
+ * after that arrives as a {@link Navigated}.
+ *
+ * `agent` is true when the backend opened this tab for a model rather than the
+ * strip opening it for the user. It rides on the event because this is the only
+ * moment that knows it — *which* conversation owns the tab is learnt afterwards,
+ * from the tool calls that name the tab, but "not yours" has to be true from the
+ * first frame or the strip draws a page loading itself as though somebody had
+ * asked for it.
+ */
+export type TabOpened = { id: string; url: string; agent: boolean };
 
 /**
  * A chunk of a terminal's output.

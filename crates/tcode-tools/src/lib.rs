@@ -39,7 +39,9 @@ pub use skills::{
     SkillSource, SkillTool,
 };
 pub use view_image::ViewImageTool;
-pub use web::{trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool};
+pub use web::{
+    trusted_public_read, trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool,
+};
 
 /// The primary command interpreter on this platform. Windows uses PowerShell;
 /// Unix uses Bash.

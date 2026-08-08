@@ -598,6 +598,27 @@ body.is-resizing {
   text-overflow: ellipsis;
 }
 
+/* The browser's only: a tab a model opened rather than the user.
+ *
+ * Follows the same rule as `.tab-exit` below — the fact is in words (the dot's
+ * own `aria-label`, and the tab's tooltip), and the colour is only here to tell
+ * two conversations' tabs apart. A reader who cannot see the hue has lost
+ * nothing but that separation.
+ *
+ * Aligned to the text rather than the box: `.tab-name` lays its children out on
+ * the baseline so the name can ellipsise, and a bare circle in a baseline row
+ * sits on it like a full stop. `align-self` puts it back on the middle of the
+ * line it belongs to. The neutral fill is for the moment between a tab being
+ * opened and its conversation acting on it, when nobody has claimed it yet. */
+.tab-agent {
+  flex: none;
+  align-self: center;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--muted);
+}
+
 /* The terminal's only: a page cannot exit. Said in words, never in colour
    alone — "it finished" and "it failed" are different facts, and only the
    second one has earned any alarm. */

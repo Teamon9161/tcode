@@ -51,6 +51,7 @@ import {
   type Display,
 } from "./display";
 import { fieldAspect } from "./field";
+import * as browser from "./webHost";
 import { Workspace } from "./Workspace";
 import { Mark, Wordmark } from "./components/Mark";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
@@ -166,6 +167,11 @@ export function App() {
   // is missing the promise rejects, and an unhandled rejection would leave a
   // window that accepts messages and renders nothing back.
   useEffect(() => {
+    // The window follows the browser for its whole life, not only while the
+    // pane is up: a model can open a tab before anybody has opened the pane,
+    // and an announcement nobody was listening for is a page that exists with
+    // no way to reach it (`webHost.ts::listenOnce`).
+    browser.watch();
     const subscriptions = [
       listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
         patch(payload.session, (state) => ({
@@ -175,6 +181,10 @@ export function App() {
           meter: applyUsage(state.meter, payload.event),
           activity: phaseOf(payload.event) ?? state.activity,
         }));
+        // Which conversation is driving which browser tab. It is read here
+        // because this is the only stream carrying both facts at once — the
+        // backend has no session id to put on the tab itself, on purpose.
+        browser.claim(payload.session, payload.event);
         const reported = limitsFrom(payload.event);
         if (reported) setLimits(reported);
         // A `progress` call is the one event that changes a file the panel is
@@ -321,6 +331,11 @@ export function App() {
   const closeSession = useCallback(
     async (id: string) => {
       await invoke("close_session", { session: id }).catch(() => {});
+      // The browser tabs this conversation opened stay open and stop being
+      // attributed to it. Closing a conversation must not take away a page
+      // somebody is reading — the same sentence `closePanesOf` obeys by
+      // leaving the browser pane alone.
+      browser.disown(id);
       const left = sessions.filter((open) => open.id !== id);
       setSessions(left);
       setStates((current) => {

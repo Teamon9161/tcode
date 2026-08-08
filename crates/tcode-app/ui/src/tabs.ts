@@ -33,9 +33,28 @@ export function noTabs<T extends Tabbed>(): TabList<T> {
   return EMPTY as TabList<T>;
 }
 
-/** A new tab always takes focus: you asked for it, so you are looking at it. */
+/** A new tab takes focus: you asked for it, so you are looking at it. */
 export function addTab<T extends Tabbed>(tabs: TabList<T>, tab: T): TabList<T> {
   return { list: [...tabs.list, tab], current: tab.id };
+}
+
+/**
+ * A new tab that does *not* take focus.
+ *
+ * Because the sentence above stopped being true for one caller: an agent opens
+ * browser tabs, and nobody asked for those — the whole point of the agent
+ * browser is that a model can work in the window without taking the screen
+ * from whoever is reading (`../AGENT-BROWSER.md`). The strip still has to list
+ * the tab; it just must not select it.
+ *
+ * Two functions rather than `addTab(tabs, tab, focus)`, because a boolean at a
+ * call site says nothing and the two behaviours have names. A caller that
+ * wants both composes: `selectTab(addTabBehind(…), id)`, which is also what
+ * makes the two ways a tab can be announced converge on the same state
+ * whichever arrives first.
+ */
+export function addTabBehind<T extends Tabbed>(tabs: TabList<T>, tab: T): TabList<T> {
+  return { ...tabs, list: [...tabs.list, tab] };
 }
 
 /**

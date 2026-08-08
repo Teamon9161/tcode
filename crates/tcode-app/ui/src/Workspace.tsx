@@ -29,6 +29,7 @@ import {
 import { inTerminal, MOD } from "./keys";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
+import { handOverText } from "./webHost";
 import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
 import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
@@ -472,6 +473,26 @@ export function Workspace({
       sessions.find((open) => open.id === held)?.cwd ?? sessions[0]?.cwd ?? ""
     );
   }, [tiling, sessions]);
+  // Handing a browser tab to a conversation. Same shape as `mention` and for
+  // the same reasons — it writes a draft, and it appends — but the session has
+  // to be worked out rather than passed in: the browser pane belongs to the
+  // window and not to any conversation, so "which one" is answered by the
+  // focused pane, exactly as `terminalCwd` above answers "which folder".
+  const handOverTab = useCallback(
+    (tab: string) => {
+      const seat = focused(tiling);
+      const held = seat && paneSession(seat.pane);
+      const session = sessions.find((open) => open.id === held)?.id ?? sessions[0]?.id;
+      const reference = handOverText(tab);
+      if (!session || !reference) return;
+      const draft = stateOf(session).draft;
+      onDraft(
+        session,
+        draft.trim() ? `${draft.replace(/\s+$/, "")} ${reference} ` : `${reference} `,
+      );
+    },
+    [tiling, sessions, stateOf, onDraft],
+  );
   // Following a link, as opposed to reaching for the browser. It must not go
   // through `openWeb`: that one is a toggle, so asking it for a page while the
   // browser is already open would put the browser away instead.
@@ -526,6 +547,7 @@ export function Workspace({
       onToggleFiles: toggleFiles,
       onToggleWorkspace: toggleWorkspace,
       onOpenBrowser: openBrowser,
+      onHandOverTab: handOverTab,
       onToggleTerminal: openTerminal,
       terminalCwd,
       onOpenUrl: openUrl,
@@ -568,6 +590,7 @@ export function Workspace({
       toggleFiles,
       toggleWorkspace,
       openBrowser,
+      handOverTab,
       openTerminal,
       terminalCwd,
       openUrl,

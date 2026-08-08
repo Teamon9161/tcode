@@ -666,6 +666,25 @@ pub fn trusted_read_hosts(hosts: impl IntoIterator<Item = String>) -> TrustedRea
     )
 }
 
+/// The shared trusted-public-read judgment.
+///
+/// Anonymous HTTPS on the default port whose host is in the startup-configured
+/// set is a direct-safe public metadata read. `web_fetch` and the desktop
+/// `browser(navigate)` consult this same answer, so the two tools cannot drift
+/// apart on what "trusted" means. Acting tools deliberately never consult it:
+/// pressing buttons on a site as the user is a different question from reading
+/// it (the `browser` `click`/`type` half stays on the ordinary classifier
+/// path).
+pub fn trusted_public_read(url: &Url, trusted_hosts: &TrustedReadHosts) -> bool {
+    url.scheme() == "https"
+        && url.port_or_known_default() == Some(443)
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url
+            .host_str()
+            .is_some_and(|host| trusted_hosts.contains(&host.to_ascii_lowercase()))
+}
+
 pub struct FetchSummarizer {
     model: ModelCell,
     pinned: AgentModels,
@@ -753,14 +772,7 @@ impl Tool for WebFetchTool {
         let Some(url) = input["url"].as_str().and_then(|raw| parse_url(raw).ok()) else {
             return AutoSafety::Classify;
         };
-        if url.scheme() == "https"
-            && url.port_or_known_default() == Some(443)
-            && url.username().is_empty()
-            && url.password().is_none()
-            && url
-                .host_str()
-                .is_some_and(|host| self.trusted_read_hosts.contains(&host.to_ascii_lowercase()))
-        {
+        if trusted_public_read(&url, &self.trusted_read_hosts) {
             AutoSafety::Allow
         } else {
             AutoSafety::Classify

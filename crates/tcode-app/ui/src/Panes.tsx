@@ -31,6 +31,7 @@ import { basename } from "./show";
 import { yieldBrowser } from "./browserYield";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
+import { sessionTitle } from "./railData";
 import { StatusDot } from "./components/Status";
 import {
   BackIcon,
@@ -99,6 +100,11 @@ export type PaneContext = {
   onToggleWorkspace: (pane: string, session: string) => void;
   /** Open the window-owned browser from the local file-navigation tool group. */
   onOpenBrowser: () => void;
+  /** Hand a browser tab to the conversation being worked in — the only way a
+   *  model learns about a tab it did not open (`../AGENT-BROWSER.md`). Like
+   *  `onMention` it writes a draft; unlike it, the pane has no session of its
+   *  own, so which conversation is read off the focused pane. */
+  onHandOverTab: (tab: string) => void;
   /** Show, focus or hide the window's terminals — the three states `Mod+J`
    *  steps through (`toggleTerminal` in `layout.ts`). */
   onToggleTerminal: () => void;
@@ -436,6 +442,16 @@ function Pane({
           onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
           hidden={hidden}
           request={context.webRequest}
+          // A lookup, not an identity. The note above still holds: this pane
+          // belongs to no conversation. It is handed a way to put a name to an
+          // id a tab already carries, which is the same thing the finder does
+          // for a row it did not open either.
+          nameOf={(session) =>
+            sessionTitle(context.stateOf(session).blocks) ??
+            context.sessions.find((open) => open.id === session)?.name ??
+            "a conversation"
+          }
+          onHandOver={context.onHandOverTab}
         />
       ) : leaf.pane.kind === "terminal" ? (
         <TermPane

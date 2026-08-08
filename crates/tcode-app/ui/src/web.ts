@@ -40,17 +40,63 @@ export type Tab = {
   draft: string | null;
   /** The address whose navigation has not round-tripped yet, if any. */
   sent: string | null;
+  /**
+   * Opened by the backend for a model rather than by the strip's `+`.
+   *
+   * Known when the tab is born, and never revised: a page the user takes over
+   * still arrived without them asking, and a strip that quietly dropped the
+   * mark would be answering "did I open this" with "am I using it".
+   */
+  agent: boolean;
+  /**
+   * The conversation driving it, once one has shown itself. `null` for the
+   * user's own tabs, and for an agent's between `open` and its first act.
+   *
+   * Learnt rather than announced, because there is nothing to announce it:
+   * `ToolCtx` carries no session id (deliberately — `../../AGENT-BROWSER.md`),
+   * so the backend cannot put one in the event. What *is* session-tagged is the
+   * event stream, and a `browser` call that names a tab is both. See
+   * `webHost.ts::claim`.
+   */
+  owner: string | null;
 };
 
 export type Tabs = TabList<Tab>;
 
 export const NO_TABS: Tabs = noTabs<Tab>();
 
-export { addTab, closeTab, currentTab, selectTab, stepTab } from "./tabs";
+export { addTab, addTabBehind, closeTab, currentTab, mapTab, selectTab, stepTab } from "./tabs";
 
 /** A tab as the backend hands it over: a webview at its blank start. */
-export function newTab(id: string): Tab {
-  return { id, url: "", title: "", draft: null, sent: null };
+export function newTab(id: string, agent = false): Tab {
+  return { id, url: "", title: "", draft: null, sent: null, agent, owner: null };
+}
+
+/** A conversation showed itself as the one driving this tab.
+ *
+ *  First claim wins. A tab is handed between conversations by the user, not by
+ *  a model mentioning an id it read somewhere, and re-pointing the label on a
+ *  tool call would make "who is driving this" a thing that flickered. */
+export function ownedTab(tabs: Tabs, id: string, session: string): Tabs {
+  return mapTab(tabs, id, (tab) => (tab.owner ? tab : { ...tab, owner: session }));
+}
+
+/**
+ * A conversation ended. Its tabs stay; they just stop belonging to anybody.
+ *
+ * The same sentence the browser pane is built on — closing a conversation must
+ * not take away the page you are reading — and the same one `closeSession`
+ * already says by filtering on `paneSession`. A tab is a window-level thing
+ * that a conversation was *using*, so the end of the conversation ends the
+ * using and nothing else. `agent` is not touched: it is a fact about where the
+ * tab came from, and that does not stop being true.
+ */
+export function disownedTabs(tabs: Tabs, session: string): Tabs {
+  if (!tabs.list.some((tab) => tab.owner === session)) return tabs;
+  return {
+    ...tabs,
+    list: tabs.list.map((tab) => (tab.owner === session ? { ...tab, owner: null } : tab)),
+  };
 }
 
 /** Someone typed. */
@@ -93,7 +139,9 @@ export function navigatedTab(tabs: Tabs, id: string, url: string, title: string)
  *  does: the webview holding the browser's profile is never destroyed
  *  (`browser.rs`), so the page goes and the tab stays. */
 export function blankTab(tabs: Tabs, id: string): Tabs {
-  return mapTab(tabs, id, () => newTab(id));
+  // Everything about the *page* goes; who the tab belongs to stays. Emptying a
+  // tab is not the same event as somebody else opening it.
+  return mapTab(tabs, id, (tab) => ({ ...newTab(id, tab.agent), owner: tab.owner }));
 }
 
 /** True while a tab is at its blank start — nothing loaded, nothing typed that

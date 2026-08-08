@@ -119,7 +119,12 @@ impl SessionFactory {
 }
 
 /// Build the agent and open `cwd` as the first session.
-pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
+///
+/// `shell` is how a tool reaches the window's native views — today only the
+/// `browser` tool needs it (`crate::browser`), and it is a parameter rather
+/// than something assembled here because the pipe exists before the agent
+/// does: `bin/sidecar.rs` owns both ends of it.
+pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyhow::Result<Startup> {
     let config_file = Config::global_file()?;
     anyhow::ensure!(
         Config::exists_at(&config_file),
@@ -138,6 +143,21 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     let active = tcode_providers::build_active(profile, &selection, &config.watchdog)?;
     let model_cell = ModelCell::new(active);
 
+    // Before the agent, because the `browser` tool has to refuse this origin as
+    // a navigation target and therefore needs its port at construction. It
+    // depends on nothing above it — binding a loopback socket is not a
+    // configuration question — so moving it up costs nothing and saves the tool
+    // a mutable cell filled in later.
+    let serve = ServeHandle(
+        crate::serve::Serve::start()
+            .await
+            .map_err(|error| error.to_string()),
+    );
+    let viewer_port = serve.0.as_ref().ok().map(|serve| serve.port());
+
+    let trusted_read_hosts =
+        tcode_tools::trusted_read_hosts(config.auto_mode.trusted_read_hosts.clone());
+
     // `boot` consumes the selection; the model menu needs it to mark which
     // option is current.
     let selection_for_menu = selection.clone();
@@ -147,9 +167,22 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
         selection,
         model_cell: model_cell.clone(),
         agent: None,
-        // The one thing this frontend has that the terminal does not: somewhere
-        // to put a rendered file. See `tcode_tools::ShowTool`.
-        display_tools: vec![Arc::new(tcode_tools::ShowTool)],
+        // The two things this frontend has that the terminal does not:
+        // somewhere to put a rendered file (`tcode_tools::ShowTool`), and a
+        // browser (`crate::browser`, `../AGENT-BROWSER.md`). Both are here
+        // rather than in `builtin_tools` for the same reason — a tool nobody
+        // can honour is worse than a missing one, because the model spends a
+        // call finding out. The browser shares `web_fetch`'s Auto Mode
+        // trusted-read fast path, so it is handed the same normalized host set
+        // (`boot` consumes the config list for the builtin tools; this clone
+        // keeps the two tools on the same list).
+        display_tools: vec![
+            Arc::new(tcode_tools::ShowTool),
+            Arc::new(
+                crate::browser::BrowserTool::new(shell, viewer_port)
+                    .with_trusted_read_hosts(trusted_read_hosts),
+            ),
+        ],
     })
     .await?;
 
@@ -195,11 +228,6 @@ pub async fn start(cwd: PathBuf) -> anyhow::Result<Startup> {
     ));
     supervisor.open(handle.clone());
 
-    let serve = ServeHandle(
-        crate::serve::Serve::start()
-            .await
-            .map_err(|error| error.to_string()),
-    );
     let mut warnings = booted.warnings;
     if let Err(why) = &serve.0 {
         warnings.push(format!("HTML files cannot be displayed: {why}"));

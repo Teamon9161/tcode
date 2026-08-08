@@ -8,6 +8,7 @@
 pub mod address;
 pub mod boot;
 pub mod bridge;
+pub mod browser;
 pub mod commands;
 pub mod dispatch;
 pub mod openers;

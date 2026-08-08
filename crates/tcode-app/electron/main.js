@@ -25,6 +25,22 @@ const { browserVerbs } = require("./browser");
 const ROOT = path.resolve(__dirname, "..");
 const DIST = path.join(ROOT, "ui", "dist");
 
+// The app's identity outside the window itself. Without `app.setName` the
+// process is named after the npm package (`tcode-shell`), which is not the
+// product name; and on Windows the taskbar groups and draws by the
+// Application User Model ID, which otherwise defaults to the executable and
+// leaves a dev run grouped under "Electron". The `.ico` is the Windows form
+// of the mark; the `.png` is the fallback every other platform draws from
+// the window `icon` option.
+app.setName("tcode");
+if (process.platform === "win32") app.setAppUserModelId("com.tcode.app");
+
+const APP_ICON = path.join(
+  ROOT,
+  "icons",
+  process.platform === "win32" ? "icon.ico" : "icon.png",
+);
+
 /** Mirrors `bridge::WINDOW_STATE`, which mirrors `ui/src/types.ts`. */
 const WINDOW_STATE = "tcode://window-state";
 
@@ -93,8 +109,15 @@ function sidecarPath() {
  * replies by id. Requests are answered out of order on purpose — the sidecar
  * runs each command as its own task, so a folder listing that reads a hundred
  * logs does not hold up the pane next to it.
+ *
+ * `answer` is the other direction: the sidecar asking *this* process for
+ * something only it can do — a native view, and eventually that view's debugger
+ * (`../AGENT-BROWSER.md`). It is given a method name and an argument object and
+ * returns the result; throwing is how it says no. Those frames carry `call`
+ * rather than `id` because the two directions number their requests
+ * independently and would otherwise collide.
  */
-function startSidecar(deliver) {
+function startSidecar(deliver, answer) {
   const binary = sidecarPath();
   if (!binary) {
     return {
@@ -129,6 +152,7 @@ function startSidecar(deliver) {
       return;
     }
     if (frame.event !== undefined) return deliver(frame.event, frame.payload);
+    if (frame.call !== undefined) return serveCall(frame);
     const waiting = pending.get(frame.id);
     if (!waiting) return;
     pending.delete(frame.id);
@@ -140,6 +164,26 @@ function startSidecar(deliver) {
   readline.createInterface({ input: child.stderr }).on("line", (line) => {
     console.error(line);
   });
+
+  /**
+   * Answer one `call` frame.
+   *
+   * Always replies, including when `answer` throws or the process is already
+   * gone: the sidecar's own timeout would eventually free the caller, but a
+   * timeout says "the shell is not responding" for what is really "that verb
+   * does not exist" — and rule 3's whole point is that a wrong answer costs
+   * more than a slow one.
+   */
+  async function serveCall(frame) {
+    let reply;
+    try {
+      reply = { call: frame.call, ok: (await answer(frame.method, frame.args)) ?? null };
+    } catch (error) {
+      reply = { call: frame.call, error: String(error?.message ?? error) };
+    }
+    if (gone) return;
+    child.stdin.write(`${JSON.stringify(reply)}\n`);
+  }
 
   const die = (why) => {
     if (gone) return;
@@ -239,6 +283,9 @@ function createWindow() {
     // so this is the name in the taskbar and in alt-tab, and without it the
     // window is called after the npm package.
     title: "tcode",
+    // The mark in the title bar and taskbar. Without it the window draws the
+    // default Electron icon everywhere a window icon is asked for.
+    icon: APP_ICON,
     width: 1280,
     height: 860,
     minWidth: 760,
@@ -307,7 +354,23 @@ app.whenReady().then(() => {
   serveBundle();
 
   const { window, view, emit } = createWindow();
-  const sidecar = startSidecar(emit);
+
+  // Declared before the sidecar starts and filled in just below: the table
+  // needs `sidecar.call` (for `resolveUrl`) and the sidecar needs the table
+  // (to answer its `call` frames). One of the two has to be late-bound, and a
+  // closure reading a `let` is the whole of it — the first frame cannot arrive
+  // before this function returns.
+  let verbs = {};
+  const sidecar = startSidecar(emit, async (method, args) => {
+    const own = verbs[method];
+    // Deliberately the same table the renderer's `invoke` reaches, not a
+    // second one. A shell-owned verb is a thing only this process can do; who
+    // asked does not change what it is. Narrowing it needs a reason, and today
+    // there is none — the renderer is if anything the *less* trusted caller of
+    // the two, since it renders model output.
+    if (!own) throw new Error(`unknown shell verb '${method}'`);
+    return own(args);
+  });
 
   if (sidecar.failed) {
     // Before the window is worth showing: an app whose backend never started
@@ -320,7 +383,7 @@ app.whenReady().then(() => {
 
   // What this process answers for itself: the window it owns, and the native
   // views the browser pane is made of. Everything else is somebody else's.
-  const verbs = {
+  verbs = {
     ...windowVerbs(window),
     ...browserVerbs({
       window,

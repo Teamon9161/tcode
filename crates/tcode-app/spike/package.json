@@ -6,7 +6,8 @@
   "main": "main.js",
   "scripts": {
     "spike": "electron .",
-    "spike:wayland": "electron --ozone-platform-hint=auto ."
+    "spike:wayland": "electron --ozone-platform-hint=auto .",
+    "spike:unthrottled": "electron . --unthrottled"
   },
   "devDependencies": {
     "electron": "latest"

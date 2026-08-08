@@ -108,6 +108,22 @@ cargo test                                # 后端 + 集成测试
 
     **一个 tab 一个 view，而且最后一个也照常销毁。** tab 装的是**活着的页面**（重载中的 dev server、填了一半的表单），拿一个 view 在几个地址间来回导航只留得住地址、留不住页面，那正是 tab 的全部意义。cookie 与登录属于浏览器不属于某个 tab，所以所有 tab 共用一个 partition——Electron 的 session 由 partition 持有、不由最后一个 view 持有，于是 wry 时代"最后一个 tab 永不销毁"的 workaround 没有存在的理由。`browser_close` 的返回值 `bool`（view 是否真的没了）保留，因为前端画哪一种由壳说了算。
 
+    **tab 的出生是事件溯源的，前端不再是唯一的产地**（`BROWSER_TAB_OPENED` + `webHost.ts::knownTab`）。这条随 agent 浏览器一起变的（`AGENT-BROWSER.md`）：后端也会开 tab，而"`browser_open` 的 id 是前端记的"这个前提正是当初逼出 `window.open` 那个 deny+同 tab 折中的原因。现在壳在 tab 出生时发事件，两条路径（返回值与事件）**都按 id 去重、谁先到都行**——这不是防御性编程，是一次调用发出两条 IPC 消息，它们的先后不值得依赖。
+
+    **`select` 严格读、绝不宽容默认**（`args.select === true`）。两个调用方：窗格点 `+` 时传 `select: true`，后端替模型开 tab 时**什么都不传**。宽容默认（`!== false` 或 `?? true`）把默认翻成"抢屏幕"，症状是一个页面盖住你正在读的东西，而那看起来像窗格的 bug、不像一个参数的默认值。前端侧对应的是 `addTabBehind`（不抢焦点）而不是给 `addTab` 加布尔参数。`dispatch.rs::a_tab_opened_for_a_model_does_not_take_the_screen` 钉住壳这一半。
+
+    **浏览器事件的订阅是窗口级的，不是窗格级的**（`App.tsx` 启动时 `browser.watch()`）。从窗格 mount 才订阅曾经成立，agent 浏览器让它不成立了：模型可以在窗格从没打开过的窗口里开 tab，那条 `BROWSER_TAB_OPENED` 发给空气，之后打开窗格看到空 strip 又开了第二个 tab——第一个页面存在但谁也够不着。同一类的另一半在壳里：`rect` 的初值必须是一个**能用的尺寸**而不是 `0×0`，因为 `place()` 会夹到 1px，而 1×1 的 viewport 不是小页面、是停止排版的页面。
+
+    **agent 开的 tab 带两个字段，它们是两个事实**（`ui/src/web.ts` 的 `Tab`）：`agent`（不是你开的）随出生事件到，必须从第一帧就对；`owner`（哪个会话）事后从 `ToolStart` 的 **input** 里学，因为 `ToolCtx` 没有 session id（那是 `AGENT-BROWSER.md` 论证过的决定，不是遗漏）。**读 input 不读结果文本**——结果是写给模型读的散文，回头解析它会让一句措辞变成承重墙。色点只是让两个会话分得开，**含义必须在文字里**（dot 的 `aria-label` 与 tab 的 tooltip），同 `.tab-exit` 那条既有规则。
+
+    **模型能点、能打字，而那一半是按 host 审批的**（`browser(interact <host>)`，click 与 type 共用一条：人在回答的是"能不能以我的身份在这个站点动手"，一个站点一个答案）。host 只由工具**自己观测到的** URL 产生（它解析过的 navigate、页面答回来的 snapshot），**绝不采信模型说的**——否则模型在写自己的权限描述符。备忘会过期，而过期不会造成错误的点击：`browser_click` / `browser_type` 把 host 一起传给壳，壳在派发事件之前拿实时 URL 比一次（`onHost`）。**放在壳里是因为那样检查与动作之间没有窗口给页面跳走**；壳不做判断，只比一个后端算好的值。`dispatch.rs::acting_on_a_tab_checks_the_page_has_not_moved` 钉住。
+
+    **截图用 `webContents.capturePage()`，不用 `Page.captureScreenshot`。** 后者要 compositor 帧，隐藏的 view 不产帧，于是它隔一次答一次、中间挂住（三轮实测，`AGENT-BROWSER.md`）；前者在同一个隐藏 view 上 9/9。换回 CDP 那条就是"有人正好在看这个 tab 时才好使"的间歇性 bug。`dispatch.rs::a_screenshot_does_not_need_the_tab_on_screen` 钉住。
+
+    **模型只能碰它自己开的 tab，除非用户亲手交过去**（工具栏的 "Mention this page in the message" → 写进聚焦会话的 draft）。**绝不许加一个能列举 tab 的 action**：那会把用户正在浏览的 URL 送进模型 context，是隐私泄露披着能力的皮。交接写 draft 不是发消息、只带 URL 不带页面标题（标题是网站写的散文，不该进用户那一轮）。原设计里的 `@tab` 补全**没做也别做**：`@` 已经是文件命名空间，`mentions()`/`segments()`/`useKnownMentions()` 全把正文当路径用。
+
+    **会话关闭时它的 tab 只 disown 不关**（`owner` 置 `null`，`agent` 不动——那是出处，不会变假）。这和下面那条是同一句话的两半。
+
     **它不带 `session`，这是承重的不是省事**：`closeSession` 按 `paneSession(pane)` 过滤，浏览器答 `null` 于是永远不会被会话带走——你正在读的文档不该因为关掉一个对话而消失。连带三条：入口放在每个会话窗格的文件/工作区工具组中，方便在找文件时就近打开，但它仍只会聚焦同一个窗口级浏览器；`sessionsInView` 要跳过它；**`show` 落在它上面必须分裂而不是覆盖**——那是窗口里唯一一个覆盖掉就找不回来的窗格。`layout.test.ts` 有一组测试钉这几条。
 
     **原生 view 合成在 HTML 之上**，不在任何 CSS 能触达的层叠上下文里，所以**每个 popover 打开时浏览器必须让位**（`seat.ts::yieldToPopover`，计数而非布尔——popover 会嵌套，最后一个关掉才恢复）。挂在 `seat.ts` 而不是各调用点，就是规则 17 那条"只有一份实现"现在多了一个更难查的失败：菜单开在页面**后面**，看起来是按钮没反应。

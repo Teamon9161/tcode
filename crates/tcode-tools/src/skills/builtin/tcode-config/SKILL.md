@@ -637,8 +637,11 @@ capped at `1`; total attempts are therefore `retry_count + 1` (at most two).
 specific user intent; `allow` adds exceptions to those soft denials.
 `trusted_read_hosts` contains exact host names for tool-declared anonymous HTTPS
 read targets only. It does not permit shell, bash, arbitrary URLs, credentials,
-or non-default ports. Keep this list small and global because it influences
-Auto Mode safety decisions.
+or non-default ports. In Auto Mode it is the one judgment shared by `web_fetch`
+and the desktop `browser(navigate)`: those hosts skip the safety classifier for
+reading. `browser` acting on a site (`click`/`type`) is never covered by it,
+and loopback / RFC 1918 private-range navigation is always direct-safe. Keep
+this list small and global because it influences Auto Mode safety decisions.
 
 ## Hooks
 

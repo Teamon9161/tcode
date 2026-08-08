@@ -4,11 +4,13 @@ import {
   addTab,
   blankTab,
   closeTab,
+  disownedTabs,
   draftTab,
   isBlank,
   navigatedTab,
   newTab,
   NO_TABS,
+  ownedTab,
   selectTab,
   sendingTab,
   tabLabel,
@@ -98,5 +100,55 @@ describe("a blank tab", () => {
     expect(isBlank(navigatedTab(three(), "a", "https://example.com", "").list[0])).toBe(false);
     // Typing counts: taking the tab over would delete what is in the field.
     expect(isBlank(draftTab(three(), "a", "githu").list[0])).toBe(false);
+  });
+});
+
+describe("a tab an agent opened", () => {
+  const agentTab = (): Tabs => addTab(NO_TABS, newTab("x", true));
+
+  /** Two facts, and they are not the same fact. Whether the user opened it is
+   *  known when the tab is born; which conversation is driving it is worked out
+   *  afterwards, from the calls that name the tab. */
+  it("starts marked as an agent's and unclaimed", () => {
+    const tab = agentTab().list[0];
+    expect(tab.agent).toBe(true);
+    expect(tab.owner).toBeNull();
+    expect(newTab("y").agent).toBe(false);
+  });
+
+  it("takes the first conversation that claims it, and keeps it", () => {
+    const claimed = ownedTab(agentTab(), "x", "s-1");
+    expect(claimed.list[0].owner).toBe("s-1");
+    // A model can mention an id it read anywhere. Handing a tab from one
+    // conversation to another is the user's act, not a tool call's, so a second
+    // claim changes nothing rather than making the label flicker.
+    expect(ownedTab(claimed, "x", "s-2").list[0].owner).toBe("s-1");
+  });
+
+  /** Closing a conversation must not take away a page somebody is reading, so
+   *  the tab stays and only the attribution goes. Other conversations' tabs are
+   *  not touched, which is the whole reason this matches on `owner`. */
+  it("is disowned rather than closed when its conversation ends", () => {
+    const two = ownedTab(
+      ownedTab(addTab(agentTab(), newTab("y", true)), "x", "s-1"),
+      "y",
+      "s-2",
+    );
+    const left = disownedTabs(two, "s-1");
+    expect(left.list.map((tab) => tab.owner)).toEqual([null, "s-2"]);
+    // Where it came from does not stop being true.
+    expect(left.list[0].agent).toBe(true);
+    // And a conversation that owned nothing changes nothing at all — identity,
+    // because `useSyncExternalStore` compares snapshots that way.
+    expect(disownedTabs(left, "s-1")).toBe(left);
+  });
+
+  /** Emptying a tab is not the same event as somebody else opening it: the page
+   *  goes, the tab's provenance does not. */
+  it("keeps its provenance when the page is cleared", () => {
+    const tab = blankTab(ownedTab(agentTab(), "x", "s-1"), "x").list[0];
+    expect(tab.url).toBe("");
+    expect(tab.agent).toBe(true);
+    expect(tab.owner).toBe("s-1");
   });
 });

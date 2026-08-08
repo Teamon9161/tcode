@@ -18,7 +18,7 @@ use anyhow::Context;
 
 use tcode_app::bridge::Emit;
 use tcode_app::dispatch::{Ctx, Registry};
-use tcode_app::sidecar::{self, StdioEmitter};
+use tcode_app::sidecar::{self, ShellClient, StdioEmitter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -27,7 +27,15 @@ async fn main() -> anyhow::Result<()> {
     )
     .context("cannot canonicalize working directory")?;
 
-    let startup = tcode_app::boot::start(cwd).await?;
+    // The pipe comes before the agent now, and the ordering is load-bearing in
+    // both directions: `Ctx` holds the emitter (the write end), and the
+    // `browser` tool the agent is built with holds the shell client (the read
+    // end's other half). Neither can be attached afterwards without a mutable
+    // cell, and one channel created first removes the need for either.
+    let (out, outbound) = sidecar::channel();
+    let shell = Arc::new(ShellClient::new(out.clone()));
+
+    let startup = tcode_app::boot::start(cwd, shell.clone()).await?;
     for warning in &startup.warnings {
         eprintln!("warning: {warning}");
     }
@@ -43,11 +51,6 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // The channel comes first because `Ctx` holds the emitter, and the emitter
-    // is the write end. Under Tauri this is the same ordering constraint spelt
-    // differently: there, `emit` is the one field that cannot exist before the
-    // window does.
-    let (out, outbound) = sidecar::channel();
     let emit: Arc<dyn Emit> = Arc::new(StdioEmitter::new(out.clone()));
     startup.supervisor.attach_emitter(emit.clone());
 
@@ -60,7 +63,7 @@ async fn main() -> anyhow::Result<()> {
 
     // `builtin()` and nothing else: `browser_*` belongs to whoever owns the
     // native views, and on this side of the pipe that is the Electron main
-    // process. Until Phase 4 registers them there, a browser verb comes back as
-    // `unknown command` — which is the accurate answer, and a visible one.
-    sidecar::serve(ctx, Arc::new(Registry::builtin()), out, outbound).await
+    // process. A browser verb invoked from the webview is answered there; one
+    // this process needs goes out as a `call` frame through `shell`.
+    sidecar::serve(ctx, Arc::new(Registry::builtin()), out, outbound, shell).await
 }

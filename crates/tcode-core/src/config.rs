@@ -577,7 +577,10 @@ pub struct AutoModeConfig {
     /// an unavailable safety model cannot hold an interactive approval hostage.
     pub retry_count: u32,
     /// Exact HTTPS hosts a tool has independently declared as anonymous,
-    /// side-effect-free read targets. This is deliberately not a shell rule.
+    /// side-effect-free read targets — `web_fetch` and the desktop
+    /// `browser(navigate)` share this one judgment in Auto Mode. This is
+    /// deliberately not a shell rule, and never covers acting on a site
+    /// (`browser` `click`/`type`).
     #[serde(default = "default_trusted_read_hosts")]
     pub trusted_read_hosts: Vec<String>,
 }
