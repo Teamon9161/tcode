@@ -747,6 +747,9 @@ const PLAN: Plan = {
   path: `${HOME}/.tcode/projects/c--code-rust-tcode/progress/20260730-101200-testable-retry-path.md`,
   file: "20260730-101200-testable-retry-path.md",
   title: "Make the retry path testable",
+  description: "make the retry loop's waiting injectable so it can be tested",
+  background:
+    "## Decision\nWorth doing. The retry loop is the one path no test covers, and the reason is a single `tokio::time::sleep` on wall-clock time.\n\n## What the investigation established\n`agent/mod.rs` is the only place in the crate that waits on wall-clock time; nothing else has to move for a clock to be injectable.\n\n## Ruled out\nShortening the delays under `cfg(test)`: it makes the tests fast without making them deterministic, which is the half that matters.",
   state: "active",
   done: 1,
   total: 4,

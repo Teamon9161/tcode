@@ -34,6 +34,12 @@ export type Plan = {
   path: string;
   file: string;
   title: string;
+  /** One line: what this plan is for. */
+  description: string;
+  /** The plan's prose — everything that belongs to no single phase. Shown but
+   *  not edited here; core carries it through a structural revision untouched
+   *  (`revise_plan_body`), which is what keeps this editor from deleting it. */
+  background: string;
   state: "draft" | "active" | "done";
   done: number;
   total: number;

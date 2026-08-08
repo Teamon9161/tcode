@@ -129,7 +129,15 @@ export function PlanEditor({
         <span className="plan-count">
           {plan.done}/{plan.total} phases
         </span>
+        {plan.description && <p className="plan-description">{plan.description}</p>}
       </header>
+
+      {/* The part of the plan that belongs to no phase — most of what the
+          reviewer is actually deciding about. Read-only here: this editor works
+          in phases, and prose that came back through it would have to be
+          re-parsed out of a structure that has nowhere to put it. Changing it
+          goes through a comment, or through the file itself. */}
+      {plan.background && <div className="plan-background">{plan.background}</div>}
 
       <ol className="plan-phases">
         {draft.phases.map((phase, index) => (

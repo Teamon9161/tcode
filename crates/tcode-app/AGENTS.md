@@ -211,7 +211,11 @@ cargo test                                # 后端 + 集成测试
 
 14. **"到自己的窗格"只有一个控件：`Transcript.tsx` 的 `PopOut`**。以前是把 summary（那条路径）本身做成 hover 出下划线的按钮，两个毛病：链接语义承诺的是"跳到别处"，而这里其实是**同一个东西、更大**；而且只在指针已经压上去时才出现的控件，没人会主动找到。现在每一条有去处的行——工具调用、exploration 行、sub-agent run——末尾都是同一个图标按钮，语义单一。新增可检视的东西时**用它，别再发明第二种点法**。
 
-14b. **计划有两条写盘路径，不许合并成一条**。progress 文件的语法与"省略 detail 即保留"的规则都在 core（`revise_plan_body`），前端只送结构化 phases，永远不写 markdown。两条路径各有各的语义：
+14b. **计划有两条写盘路径，不许合并成一条**。progress 文件的语法与"省略 detail 即保留"的规则都在 core（`revise_plan_body`），前端只送结构化 phases，永远不写 markdown。
+
+    **`background`（不属于任何阶段的正文）只读地过一遍这个编辑器**：`PlanView` 带着它，`PlanEditor` 显示它，但送回去的只有 phases——`revise_plan_body` 从旧 body 里把它原样接回来。这条是**承重**的：这个编辑器按结构编辑，一份只有 phases 的回传若直接重渲染，就会把评审者正在读的那半份计划整个删掉。要改它走评论，或走文件本身。
+
+    两条路径各有各的语义：
 
     - **审批期间**：编辑随 `respond_approval` 的 `phases` 回去，由 `into_approval` 用**后端自己留着的 review input** 拼出 `approved_input`（`Pending` 存 `asked` 就是为了这个：让 webview 回传整个 input，等于批准一件事、执行另一件事）。批准由 core 落盘，前端一个字节都不写；退回则不落盘，只把 diff 与评论送回。**校验失败不消费这次请求**——turn 正停在这个问题上，为了一个空标题把唯一的回答入口吃掉，会话就卡死了。
     - **非审批时段**：`write_plan` 直接落盘，且**故意不动会话内存里的 `disk_hash`**，好让模型下一次 `progress` 调用照常报冲突并拿到用户的版本。这是 core 既有的自愈契约，不是遗漏。

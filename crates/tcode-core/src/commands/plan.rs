@@ -103,6 +103,11 @@ fn list(cwd: &Path) -> CommandOutcome {
             entry.total,
             entry.file_name()
         ));
+        // The line that makes this a listing rather than a set of filenames:
+        // which plan you want is decided here, not by opening each one.
+        if !entry.description.is_empty() {
+            out.push_str(&format!("\n    {}", entry.description));
+        }
     }
     CommandOutcome::info(out)
 }

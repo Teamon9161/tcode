@@ -157,7 +157,7 @@ loop {
 | `grep` / `glob` | 内嵌 grep-searcher/ignore/globset；每行截 512B、`max_filesize` 上限、并行 + 按 (path,line) 排序、deadline 兜底给 partial 标记、剪 VCS/缓存目录、搜 dotfiles + offset 分页 |
 | `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced `Entry::Instruction` 唤醒主 agent——**模型收得到、转录里不出现**（人这边对应的是那次 run 本身），非交互 |
 | `web_fetch` / `web_search` | 见下 Web 节 |
-| `progress` | 一个任务一份耐久的工作分解文件（`~/.tcode/projects/<id>/progress/`，`draft`/`active`/`done`），也是前端进度面板的数据源。**它是该文件唯一的写入者**——模型不得用 `edit` 改它。返回值只回显刚翻成 `[>]` 的那一阶段的 `detail`，所以十二阶段的计划任何时刻只有一个阶段的正文在上下文里。`state: "active"` 就是"提交给用户审批"这一动作本身，因此 `permission()` 是输入的纯函数；用户手改文件后下次更新返回自愈冲突（附他们的原文）。不可代替方案、结论或交接记录。 |
+| `progress` | 一个任务一份耐久的计划文件（`~/.tcode/projects/<id>/progress/`，`draft`/`active`/`done`），也是前端进度面板的数据源。**它是该文件唯一的写入者**——模型不得用 `edit` 改它。**一份计划是包含阶段表的文档**：`description`（一行，inventory 用）+ `background`（不属于任何阶段的正文：决策、勘查确立的事实、数据结构、贯穿约束、被否掉的方案）+ `phases`。返回值只回显刚翻成 `[>]` 的那一阶段的 `detail`，所以十二阶段的计划任何时刻只有一个阶段的正文在上下文里；`background` 只在会话接手文件时随摘要下发一次，超预算退化成小节标题。`state: "active"` 就是"提交给用户审批"这一动作本身，因此 `permission()` 是输入的纯函数；用户手改文件后下次更新返回自愈冲突（附他们的原文）。不可代替方案、结论或交接记录。 |
 | `ask_user` | 必须由用户选择才能继续的阻塞分歧；支持多问题分页。不可用于可由代码、项目上下文或现有用户要求确定的细节。 |
 | `add_note` | 当前 Ledger 的一条高价值交接记录：仅记录用户决策、已验证约束或未完成工作的边界，供后续步骤延续。不是进度跟踪，不写入跨会话自动记忆；compact 后是否保留由摘要决定。 |
 

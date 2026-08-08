@@ -7,6 +7,7 @@ import {
   parsePatch,
   readChanges,
   tally,
+  wrapsLines,
   type Row,
 } from "../diff";
 import { highlight, useGrammar } from "../syntax";
@@ -93,9 +94,10 @@ function DiffView({
   // keeps more of the surrounding file because there it is the thing being read.
   const folded = useMemo(() => fold(rows, dense ? 2 : 4), [rows, dense]);
   const numbered = rows.some((row) => row.before !== null || row.after !== null);
+  const wrap = wrapsLines(language);
 
   return (
-    <div className={`diff${dense ? " is-dense" : ""}`}>
+    <div className={`diff${dense ? " is-dense" : ""}${wrap ? " is-wrap" : ""}`}>
       {(path || !dense) && (
         <div className="diff-head">
           {path && <span className="diff-path">{path}</span>}

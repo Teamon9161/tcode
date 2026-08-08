@@ -30,6 +30,8 @@ const plan = (phases: PlanPhase[]): Plan => ({
   path: "/tmp/p.md",
   file: "p.md",
   title: "Rewrite the resume path",
+  description: "make resume replay aux events in order",
+  background: "## Decision\nWorth doing.",
   state: "active",
   done: phases.filter((entry) => entry.status === "completed").length,
   total: phases.length,

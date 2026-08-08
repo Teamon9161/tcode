@@ -1039,7 +1039,17 @@ fn submit_plan(title: &str, phases: &[(&str, &str)]) -> Vec<StreamEvent> {
     tool_use(
         "call-plan",
         "progress",
-        &serde_json::json!({ "title": title, "state": "active", "phases": phases }).to_string(),
+        // A submission carries the whole plan, not just its checklist: core
+        // refuses one that is missing the description or the prose no phase
+        // holds, before the user is asked anything.
+        &serde_json::json!({
+            "title": title,
+            "description": "what this plan is for",
+            "background": "## Decision\nWorth doing.",
+            "state": "active",
+            "phases": phases,
+        })
+        .to_string(),
     )
 }
 

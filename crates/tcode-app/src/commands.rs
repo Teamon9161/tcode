@@ -220,6 +220,13 @@ pub struct PlanView {
     pub path: String,
     pub file: String,
     pub title: String,
+    /// The plan's one-liner, for the pane's subtitle.
+    pub description: String,
+    /// The plan's prose — the part that belongs to no phase. Sent because this
+    /// pane is a review surface and the reviewer has to be able to read what
+    /// they are approving; the structured editor below it only edits phases, so
+    /// this rides back untouched through `revise_plan_body`.
+    pub background: String,
     /// `draft` · `active` · `done`.
     pub state: &'static str,
     pub done: usize,
@@ -238,6 +245,8 @@ impl PlanView {
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default(),
             title: plan.title.clone(),
+            description: plan.description.clone(),
+            background: plan.background().to_string(),
             state: plan.state().label(),
             done,
             total,

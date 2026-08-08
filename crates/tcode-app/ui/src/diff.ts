@@ -233,3 +233,15 @@ export function languageOf(path: string | null): string {
   const dot = path.lastIndexOf(".");
   return dot === -1 ? "" : path.slice(dot + 1).toLowerCase();
 }
+
+/** Languages whose lines are prose, where a long line folds onto several
+ *  visual rows instead of scrolling sideways. Code is the opposite: a line's
+ *  shape is information, and a wrapped line could read as two added ones.
+ *  Unknown languages get prose treatment too — a plan edit, a ```diff fence,
+ *  a file with no extension — because the tail-hidden failure outweighs the
+ *  shape argument where neither cleanly applies. */
+const PROSE = new Set(["md", "markdown", "mdx", "txt", "text", "rst", "adoc", "asciidoc"]);
+
+export function wrapsLines(language: string): boolean {
+  return language === "" || PROSE.has(language.toLowerCase());
+}

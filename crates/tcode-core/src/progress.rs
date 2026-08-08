@@ -6,6 +6,21 @@
 //! nodded, so both are properties of one object here — `state` says whether the
 //! breakdown has been approved, and the file says it survives the session.
 //!
+//! **A plan is a document that contains a phase list, not a phase list.** The
+//! file therefore has three tiers, each with its own delivery rule:
+//!
+//! - `description` — one line. What this plan is for. It is what the opening
+//!   inventory and `/plan list` show, so relevance can be judged without
+//!   opening anything.
+//! - `background` — the part of the plan that belongs to no single phase: the
+//!   decision and why, the facts investigation established, the shape of the
+//!   data, the constraints that hold throughout, the approaches ruled out.
+//!   Free markdown, deliberately unschematized. Without it this prose has
+//!   nowhere to live but per-phase `detail`, where it is either duplicated
+//!   across phases or dropped — and a model that finds no home for it writes
+//!   its plan somewhere else entirely.
+//! - `phases` — the index into the work, each with its own `detail`.
+//!
 //! Two invariants make this cheap rather than a verbose markdown edit loop, and
 //! both are structural rather than prompt discipline:
 //!
@@ -13,11 +28,14 @@
 //!    markdown, so a phase flip costs one call instead of two round trips of
 //!    full text. [`Progress::reconcile`] is what makes that safe when the user
 //!    edits the file by hand.
-//! 2. **Phase detail is written once and delivered on demand.** A twelve-phase
-//!    plan keeps exactly one phase's prose in context — the one just entered,
+//! 2. **Prose is written once and delivered on demand.** A twelve-phase plan
+//!    keeps exactly one phase's prose in context — the one just entered,
 //!    handed back by [`Progress::set_phases`], or the one already running when
-//!    a session adopts the file ([`Progress::summary`]). The resend that
-//!    carries phase flips need not carry the prose again ([`carry_detail`]),
+//!    a session adopts the file ([`Progress::summary`]). `background` rides
+//!    along at the same adoption points, because cross-cutting text has no
+//!    narrower trigger than "a session is picking this file up". The resend
+//!    that carries phase flips need not carry any of it again
+//!    ([`carry_detail`], and the same omit-to-keep rule for `background`),
 //!    which is what keeps "write the reasoning down" from being a recurring
 //!    charge the model can see and will avoid.
 //!
@@ -44,6 +62,13 @@ const STALE_AFTER: Duration = Duration::from_secs(14 * 24 * 3600);
 
 /// How many unfinished progress files the opening inventory lists.
 pub const INVENTORY_LIMIT: usize = 3;
+
+/// How much `background` a summary carries verbatim. Past this the summary
+/// carries its section headings and where to get the rest, because a summary is
+/// injected at every adoption *and* every compact — a plan whose notes run to
+/// twenty kilobytes would otherwise be re-bought each time. Nothing is lost:
+/// the pointer names the no-argument call that serves the whole file.
+const SUMMARY_BACKGROUND_BUDGET: usize = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -247,8 +272,15 @@ impl Conflict {
 pub struct Progress {
     path: PathBuf,
     pub title: String,
+    /// One line: what this plan is for. The only part of the file the inventory
+    /// shows, which is what makes "you need not open it" a real offer.
+    pub description: String,
     state: ProgressState,
     created: String,
+    /// The plan's own prose — everything that belongs to no single phase.
+    /// Rendered above the phases, and everything above the first phase heading
+    /// parses back into it, so a hand-written preamble survives.
+    background: String,
     phases: Vec<Phase>,
     /// Hash of the bytes last read from or written to `path`. A mismatch means
     /// a human edited the file.
@@ -257,6 +289,10 @@ pub struct Progress {
     /// shown. Deliberately not persisted: it is what *this* model knows, not
     /// what the file holds, so a new session starts knowing nothing.
     seen: HashSet<String>,
+    /// The same fact about `background`. Separate flag rather than a sentinel
+    /// key in `seen`, because a phase title is user-supplied text and any
+    /// sentinel is one a phase could be named.
+    background_seen: bool,
     /// Hash of the body at the last [`Progress::full_view`], so asking again
     /// for a plan that has not moved costs a pointer instead of a copy. Same
     /// contract as `read`'s freshness check, for the same reason.
@@ -275,13 +311,16 @@ impl Progress {
         Ok(Self {
             path,
             title: title.trim().to_string(),
+            description: String::new(),
             state: ProgressState::Draft,
             created: timestamp_rfc3339(SystemTime::now()),
+            background: String::new(),
             phases: Vec::new(),
             // No file yet: any hash that cannot match an existing file's would
             // do, but 0 also means "never written", which `reconcile` needs.
             disk_hash: 0,
             seen: HashSet::new(),
+            background_seen: false,
             viewed: None,
         })
     }
@@ -300,16 +339,20 @@ impl Progress {
             "" => file_title(path),
             title => title.to_string(),
         };
+        let (background, phases) = parse_body(body);
         Ok(Self {
             path: path.to_path_buf(),
             title,
+            description: front.description.trim().to_string(),
             state: ProgressState::parse(&front.state).unwrap_or_default(),
             created: front.created,
-            phases: parse_phases(body),
+            background,
+            phases,
             disk_hash: fnv1a(text.as_bytes()),
             // Parsing a file is not reading it: the text went to disk, not to
             // the model. Whoever hands some of it over marks that much seen.
             seen: HashSet::new(),
+            background_seen: false,
             viewed: None,
         })
     }
@@ -324,6 +367,11 @@ impl Progress {
 
     pub fn phases(&self) -> &[Phase] {
         &self.phases
+    }
+
+    /// The plan's prose: the part that belongs to no single phase.
+    pub fn background(&self) -> &str {
+        &self.background
     }
 
     /// Move to another lifecycle state. Rejects the transitions the lifecycle
@@ -346,15 +394,40 @@ impl Progress {
     }
 
     /// Apply the parts of a `progress` call a review does not decide: the
-    /// breakdown. The title chooses the progress file before this method runs;
-    /// it is never mutable content of an existing tracker. Split out from
-    /// [`Progress::apply`] because a draft submitted for approval is saved
-    /// *before* the human answers — their decision is about `state`, and
-    /// applying it up front would make declining silently promote the plan.
+    /// description, the prose and the breakdown. The title chooses the progress
+    /// file before this method runs; it is never mutable content of an existing
+    /// tracker. Split out from [`Progress::apply`] because a draft submitted for
+    /// approval is saved *before* the human answers — their decision is about
+    /// `state`, and applying it up front would make declining silently promote
+    /// the plan.
+    ///
+    /// `background` follows the same omit-to-keep rule as a phase's `detail`,
+    /// and for the same reason: the breakdown is resent in full on every phase
+    /// flip, so prose that had to ride along would be paid for on every call
+    /// and the model would learn to stop writing it. Everything is validated
+    /// before anything is applied, so one refusal reports every blind rewrite.
     pub fn apply_content(&mut self, input: &Value) -> Result<Option<String>, String> {
-        match input.get("phases") {
-            Some(phases) if !phases.is_null() => self.set_phases(phases_from_json(phases)?),
-            _ => Ok(None),
+        let background = input["background"].as_str().map(str::trim);
+        let phases = match input.get("phases") {
+            Some(phases) if !phases.is_null() => Some(phases_from_json(phases)?),
+            _ => None,
+        };
+        let stored = self.stored_detail();
+        self.refuse_blind_rewrites(phases.as_deref().unwrap_or(&[]), &stored, background)?;
+        if let Some(description) = input["description"]
+            .as_str()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            self.description = description.to_string();
+        }
+        if let Some(background) = background.filter(|text| !text.is_empty()) {
+            self.background = background.to_string();
+            self.background_seen = true;
+        }
+        match phases {
+            Some(phases) => self.set_phases(phases),
+            None => Ok(None),
         }
     }
 
@@ -385,7 +458,7 @@ impl Progress {
     /// which is also what makes the retry legal.
     pub fn set_phases(&mut self, mut phases: Vec<Phase>) -> Result<Option<String>, String> {
         let stored = self.stored_detail();
-        self.refuse_blind_rewrites(&phases, &stored)?;
+        self.refuse_blind_rewrites(&phases, &stored, None)?;
         let was_running = self.running_titles();
         carry_detail(&mut phases, &stored);
         self.phases = phases;
@@ -409,14 +482,22 @@ impl Progress {
         Ok(entered)
     }
 
-    /// Refuse to replace stored detail this conversation has not been shown,
-    /// and hand it over in the error so the next attempt is an informed one.
-    /// Reporting every offending phase at once: one round trip beats N.
+    /// Refuse to replace stored prose this conversation has not been shown, and
+    /// hand it over in the error so the next attempt is an informed one.
+    /// Reporting every offending passage at once — `background` included — is
+    /// why this runs before anything is applied: one round trip beats N.
     fn refuse_blind_rewrites(
         &mut self,
         incoming: &[Phase],
         stored: &HashMap<String, String>,
+        background: Option<&str>,
     ) -> Result<(), String> {
+        let blind_background = background
+            .filter(|text| !text.is_empty())
+            .filter(|text| {
+                !self.background_seen && !self.background.is_empty() && **text != self.background
+            })
+            .map(|_| self.background.clone());
         let blind: Vec<(String, String)> = walk_phases(incoming)
             .into_iter()
             .filter(|phase| !phase.detail.is_empty() && !self.seen.contains(&phase.phase))
@@ -425,12 +506,19 @@ impl Progress {
                 (*held != phase.detail).then(|| (phase.phase.clone(), held.clone()))
             })
             .collect();
-        if blind.is_empty() {
+        if blind.is_empty() && blind_background.is_none() {
             return Ok(());
         }
         let mut error = String::from(
-            "Nothing was applied: these phases already have detail that was written outside this conversation, and you have not been shown it. Here it is. Re-send with `detail` left out to keep it, or with your replacement if you still mean to replace it.\n",
+            "Nothing was applied: this plan already holds text that was written outside this conversation, and you have not been shown it. Here it is. Re-send with those fields left out to keep them, or with your replacement if you still mean to replace them.\n",
         );
+        if let Some(held) = blind_background {
+            error.push_str(&format!(
+                "\n<tcode-progress-background>\n{}\n</tcode-progress-background>\n",
+                held.trim_end()
+            ));
+            self.background_seen = true;
+        }
         for (phase, detail) in blind {
             error.push_str(&format!(
                 "\n<tcode-progress-detail phase=\"{}\">\n{}\n</tcode-progress-detail>\n",
@@ -512,6 +600,7 @@ impl Progress {
             let seen = theirs.flatten().iter().map(|p| p.phase.clone()).collect();
             *self = theirs;
             self.seen = seen;
+            self.background_seen = true;
         }
         Err(Conflict {
             path: self.path.clone(),
@@ -536,31 +625,51 @@ impl Progress {
     }
 
     pub fn render(&self) -> String {
-        let mut out = format!(
-            "---\ntitle: {}\nstate: {}\ncreated: {}\n---\n",
-            yaml_scalar(&self.title),
+        let mut out = format!("---\ntitle: {}\n", yaml_scalar(&self.title));
+        // Written only when there is one, so a file that predates descriptions
+        // still round-trips byte for byte.
+        if !self.description.is_empty() {
+            out.push_str(&format!(
+                "description: {}\n",
+                yaml_scalar(&self.description)
+            ));
+        }
+        out.push_str(&format!(
+            "state: {}\ncreated: {}\n---\n",
             self.state.label(),
             self.created
-        );
+        ));
         out.push_str(&self.body());
         out
     }
 
-    /// The phases as markdown, without the front matter. This is what a review
-    /// pane shows and what `$EDITOR` round-trips: the lifecycle belongs to the
-    /// approval buttons, so it is not put in front of the reviewer's cursor.
+    /// The plan as markdown, without the front matter: the prose, then the
+    /// phases. This is what a review pane shows and what `$EDITOR` round-trips
+    /// — the lifecycle belongs to the approval buttons, so it is not put in
+    /// front of the reviewer's cursor, but everything they are reviewing is.
     pub fn body(&self) -> String {
-        render_phases(&self.phases)
+        render_document(&self.background, &self.phases)
     }
 
     /// Adopt a human-authored body verbatim. The inverse of [`Progress::body`],
-    /// used for the version a reviewer approved after rewriting it.
+    /// used for the version a reviewer approved after rewriting it. Prose they
+    /// added above the first phase comes back as `background` rather than being
+    /// dropped on the next write.
     pub fn set_body(&mut self, markdown: &str) {
-        self.phases = parse_phases(markdown);
+        let (background, phases) = parse_body(markdown);
+        self.background = background;
+        self.phases = phases;
     }
 
-    /// The model-facing summary: title lines and boxes, plus the detail of the
-    /// phase currently `[>]` — and no other phase's.
+    /// The model-facing summary: the plan's prose, title lines and boxes, plus
+    /// the detail of the phase currently `[>]` — and no other phase's.
+    ///
+    /// `background` rides along because every caller of this is a session
+    /// picking the file up, and the prose that belongs to no phase has no
+    /// narrower moment to arrive at than that. Past
+    /// [`SUMMARY_BACKGROUND_BUDGET`] it degrades to its section headings and a
+    /// pointer at the no-argument call, so a very long plan costs a pointer per
+    /// compact rather than its full weight.
     ///
     /// The one-phase-at-a-time budget is the point, not the omission. This is
     /// injected when a session takes the file over (new session, resume,
@@ -585,7 +694,45 @@ impl Progress {
             .collect();
         self.seen = running.into_iter().collect();
         self.viewed = None;
-        self.envelope(&self.summary_body())
+        let (background, whole) = self.background_for_summary();
+        self.background_seen = whole;
+        let mut out = String::new();
+        if !background.is_empty() {
+            out.push_str(&background);
+            out.push_str("\n\n");
+        }
+        out.push_str(&self.summary_body());
+        self.envelope(&out)
+    }
+
+    /// The prose a summary carries, and whether that is all of it. Over budget,
+    /// the section headings are the useful shape — they say what is in the file
+    /// so the model can decide to go and read it; with no headings to list, a
+    /// prefix is the only thing left to offer.
+    fn background_for_summary(&self) -> (String, bool) {
+        if self.background.len() <= SUMMARY_BACKGROUND_BUDGET {
+            return (self.background.clone(), !self.background.is_empty());
+        }
+        let headings: Vec<String> = self
+            .background
+            .lines()
+            .filter(|line| line.starts_with('#'))
+            .map(|line| line.trim_start_matches('#').trim().to_string())
+            .filter(|title| !title.is_empty())
+            .collect();
+        let mut out = String::new();
+        if headings.is_empty() {
+            let head: String = self.background.chars().take(600).collect();
+            out.push_str(head.trim_end());
+            out.push('\n');
+        } else {
+            out.push_str("This plan's notes, by section:\n");
+            for heading in headings {
+                out.push_str(&format!("- {heading}\n"));
+            }
+        }
+        out.push_str("(Shortened. Call `progress` with no arguments to read the plan in full.)");
+        (out, false)
     }
 
     /// The whole file as the model reads it: every phase, every detail. The
@@ -612,22 +759,31 @@ impl Progress {
             .map(|phase| phase.phase.clone())
             .collect();
         self.seen.extend(all);
+        self.background_seen = !self.background.is_empty();
         self.viewed = Some(hash);
         self.envelope(body.trim_start_matches('\n'))
     }
 
     /// One tag for both views, so the model never has to work out which shape
-    /// of progress text it is looking at.
+    /// of progress text it is looking at. `description` rides in the attributes
+    /// rather than the body: the body is the reviewable markdown that
+    /// [`Progress::set_body`] parses back, and a line that is not part of the
+    /// plan's prose has no business in it.
     fn envelope(&self, contents: &str) -> String {
         let name = self
             .path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let description = match self.description.trim() {
+            "" => String::new(),
+            text => format!(" description=\"{}\"", escape_attr(text)),
+        };
         format!(
-            "<tcode-progress file=\"{}\" title=\"{}\" state=\"{}\">\n{}\n</tcode-progress>",
+            "<tcode-progress file=\"{}\" title=\"{}\"{} state=\"{}\">\n{}\n</tcode-progress>",
             name,
             escape_attr(&self.title),
+            description,
             self.state.label(),
             contents.trim_end()
         )
@@ -663,8 +819,28 @@ fn carry_detail(phases: &mut [Phase], stored: &HashMap<String, String>) {
     }
 }
 
-/// A breakdown as the markdown a reader sees. Free-standing so a frontend can
-/// render a plan straight out of a tool call, before any file exists for it.
+/// A whole plan as the markdown a reader sees: the prose, then the breakdown.
+/// Free-standing so a frontend can render a plan straight out of a tool call,
+/// before any file exists for it.
+///
+/// Prose first and phases last is the machine's order and the natural one at
+/// once: [`parse_body`] reads everything above the first boxed heading as the
+/// prose, so a section appended below the checklist would be read as the last
+/// phase's detail. Rendering this way keeps a round trip through `$EDITOR`
+/// meaning what it looks like it means.
+pub fn render_document(background: &str, phases: &[Phase]) -> String {
+    let mut out = String::new();
+    let background = background.trim();
+    if !background.is_empty() {
+        out.push('\n');
+        out.push_str(background);
+        out.push('\n');
+    }
+    out.push_str(&render_phases(phases));
+    out
+}
+
+/// A breakdown as the markdown a reader sees, without the prose above it.
 pub fn render_phases(phases: &[Phase]) -> String {
     let mut out = String::new();
     for (i, phase) in phases.iter().enumerate() {
@@ -753,7 +929,8 @@ pub fn plan_document(input: &Value) -> Option<String> {
         return None;
     }
     let phases = phases_from_json(&input["phases"]).ok()?;
-    Some(render_phases(&phases)).filter(|body| !body.trim().is_empty())
+    let background = input["background"].as_str().unwrap_or("");
+    Some(render_document(background, &phases)).filter(|body| !body.trim().is_empty())
 }
 
 /// Whether this call is a plan for a human to read rather than a phase flip.
@@ -776,8 +953,13 @@ pub fn is_plan_document(input: &Value) -> bool {
 ///
 /// `body` is the plan as it stands (the review copy's own body), because that,
 /// not the ledger, is what the stored detail is being carried from.
+///
+/// The plan's prose is carried the same way and for a stronger reason: a review
+/// surface that edits phases as structure has no way to send it back at all, so
+/// re-rendering from the phases alone would delete it outright.
 pub fn revise_plan_body(body: &str, edited: &[Phase]) -> String {
-    let stored: HashMap<String, String> = walk_phases(&parse_phases(body))
+    let (background, existing) = parse_body(body);
+    let stored: HashMap<String, String> = walk_phases(&existing)
         .into_iter()
         .filter(|phase| !phase.detail.is_empty())
         .map(|phase| (phase.phase.clone(), phase.detail.clone()))
@@ -787,7 +969,7 @@ pub fn revise_plan_body(body: &str, edited: &[Phase]) -> String {
         });
     let mut edited = edited.to_vec();
     carry_detail(&mut edited, &stored);
-    render_phases(&edited)
+    render_document(&background, &edited)
 }
 
 /// One reviewer comment, anchored to the passage it is about.
@@ -897,7 +1079,7 @@ fn quote_lines(source: &str) -> String {
 /// of it is "show me", not "rewrite the file with what it already says".
 fn is_view(input: &Value) -> bool {
     let absent = |field: &str| input.get(field).is_none_or(Value::is_null);
-    absent("phases") && absent("state")
+    absent("phases") && absent("state") && absent("background") && absent("description")
 }
 
 /// The session's selected progress file, opening a new file when this call
@@ -945,7 +1127,7 @@ pub fn review_copy(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<Value, S
         .map_err(|conflict| conflict.message())?;
     progress.apply_content(input)?;
     progress.save()?;
-    if let Some(error) = undetailed(progress.phases()) {
+    if let Some(error) = submission_gaps(progress) {
         return Err(error);
     }
     let mut review = input.clone();
@@ -954,31 +1136,56 @@ pub fn review_copy(ctx: &crate::tool::ToolCtx, input: &Value) -> Result<Value, S
     Ok(review)
 }
 
-/// The submission's phases that carry no prose, as the error refusing them.
+/// What a submitted plan is missing, as the error refusing it.
 ///
 /// A draft is the one shape of progress file whose reader is someone other than
 /// the conversation that wrote it: the person about to approve it, and often a
-/// session handed the file and nothing else. Both are the reason `detail`
-/// exists, so submission is the one moment where its absence is a defect rather
-/// than a budget decision — everywhere else a phase without prose is a model
-/// tracking work it can still see. Enforced here rather than asked for in the
-/// tool description because the description is what the model economizes on:
-/// prose costs output tokens now and pays a reader it will never meet.
+/// session handed the file and nothing else. That reader is the reason all
+/// three of these fields exist, so submission is the one moment where their
+/// absence is a defect rather than a budget decision — everywhere else a bare
+/// phase list is a model tracking work it can still see. Enforced here rather
+/// than asked for in the tool description because the description is what the
+/// model economizes on: prose costs output tokens now and pays a reader it will
+/// never meet.
 ///
-/// Only top-level phases. A sub-phase is read inside its parent's detail, and
-/// demanding prose under each of them buys repetition, not context.
-fn undetailed(phases: &[Phase]) -> Option<String> {
-    let missing: Vec<&str> = phases
+/// Every gap in one message: the model would otherwise pay a round trip per
+/// field to discover a checklist we already hold.
+///
+/// Detail is demanded of top-level phases only. A sub-phase is read inside its
+/// parent's detail, and demanding prose under each of them buys repetition, not
+/// context.
+fn submission_gaps(progress: &Progress) -> Option<String> {
+    let mut gaps: Vec<String> = Vec::new();
+    if progress.description.trim().is_empty() {
+        gaps.push(
+            "`description` is empty. One line saying what this plan is for — it is all the opening inventory and `/plan list` show, so it is what decides whether anyone opens the file at all."
+                .to_string(),
+        );
+    }
+    if progress.background().trim().is_empty() {
+        gaps.push(
+            "`background` is empty. A phase list is an index, not a plan: what you decided and why, the facts your investigation established, the shape of the data, the constraints that hold throughout, and the approaches you ruled out belong to no single phase, and without them the executor re-derives all of it."
+                .to_string(),
+        );
+    }
+    let missing: Vec<&str> = progress
+        .phases()
         .iter()
         .filter(|phase| phase.detail.trim().is_empty())
         .map(|phase| phase.phase.as_str())
         .collect();
-    if missing.is_empty() {
+    if !missing.is_empty() {
+        gaps.push(format!(
+            "these phases have no `detail` — {}. Each needs the files and symbols it touches, what you found in them that decides the approach, why it comes at this point, and what could break.",
+            missing.join(", ")
+        ));
+    }
+    if gaps.is_empty() {
         return None;
     }
     Some(format!(
-        "Not submitted, and the user was not asked: these phases have no `detail` — {}. A plan under review is read by someone who was not in this conversation, and may be executed by a session that has this file and nothing else, so every phase needs its reasoning written down: the files and symbols it touches, what you found in them that decides the approach, what you ruled out and why, why it comes at this point, and what could break. Re-send `phases` with that written out; the phases that already have detail can leave it out to keep it.",
-        missing.join(", ")
+        "Not submitted, and the user was not asked. A plan under review is read by someone who was not in this conversation, and may be executed by a session that has this file and nothing else, so:\n\n- {}\n\nRe-send with that written out. Fields that are already filled in can be left out to keep what they hold.",
+        gaps.join("\n- ")
     ))
 }
 
@@ -1073,6 +1280,7 @@ pub fn current_summary(ctx: &crate::tool::ToolCtx) -> Option<String> {
 #[serde(default)]
 struct FrontMatter {
     title: String,
+    description: String,
     state: String,
     created: String,
 }
@@ -1102,10 +1310,16 @@ fn split_front_matter(text: &str) -> (&str, &str) {
     }
 }
 
-/// Body → phases. Headings carry the box and an optional `1.` / `1.2` number
-/// (rendered by us, ignored on the way back in so a user may renumber freely);
-/// everything between headings is the previous phase's detail.
-fn parse_phases(body: &str) -> Vec<Phase> {
+/// Body → `(background, phases)`. Phase headings carry the box and an optional
+/// `1.` / `1.2` number (rendered by us, ignored on the way back in so a user may
+/// renumber freely); everything between headings is the previous phase's detail.
+///
+/// Everything *above* the first phase heading is the plan's own prose. It used
+/// to be discarded, which meant a preamble a user or a reviewer wrote was
+/// silently deleted by the next phase flip — the one thing `reconcile`'s "their
+/// version wins" is supposed to prevent.
+fn parse_body(body: &str) -> (String, Vec<Phase>) {
+    let mut background = String::new();
     let mut top: Vec<Phase> = Vec::new();
     // Which phase the detail lines currently belong to.
     let mut detail_of: Option<(usize, Option<usize>)> = None;
@@ -1136,12 +1350,10 @@ fn parse_phases(body: &str) -> Vec<Phase> {
                 _ => {}
             }
         }
-        let Some((parent, child)) = detail_of else {
-            continue;
-        };
-        let target = match child {
-            Some(child) => &mut top[parent].phases[child].detail,
-            None => &mut top[parent].detail,
+        let target = match detail_of {
+            Some((parent, Some(child))) => &mut top[parent].phases[child].detail,
+            Some((parent, None)) => &mut top[parent].detail,
+            None => &mut background,
         };
         target.push_str(line);
         target.push('\n');
@@ -1152,7 +1364,7 @@ fn parse_phases(body: &str) -> Vec<Phase> {
             child.detail = child.detail.trim().to_string();
         }
     }
-    top
+    (background.trim().to_string(), top)
 }
 
 /// `## [>] 2. Title` → `(2, InProgress, "Title")`. A heading without a box is
@@ -1192,6 +1404,9 @@ fn is_numbering(head: &str) -> bool {
 pub struct InventoryEntry {
     pub path: PathBuf,
     pub title: String,
+    /// The plan's own one-liner. The whole point of the listing tier: a title
+    /// says which task, this says whether it is the one you are looking for.
+    pub description: String,
     pub state: ProgressState,
     pub done: usize,
     pub total: usize,
@@ -1247,6 +1462,7 @@ fn inventory_at(dir: &Path, now: SystemTime) -> Vec<InventoryEntry> {
             Some(InventoryEntry {
                 path,
                 title: progress.title,
+                description: progress.description,
                 state: progress.state,
                 done,
                 total,
@@ -1274,6 +1490,12 @@ pub fn inventory_note(entries: &[InventoryEntry]) -> Option<String> {
             entry.total,
             entry.file_name()
         ));
+        // The one line that lets this be a listing rather than a set of file
+        // names: whether a plan is worth opening is decided here, not by
+        // reading it.
+        if !entry.description.is_empty() {
+            out.push_str(&format!("  {}\n", entry.description));
+        }
     }
     out.push_str("</tcode-progress-inventory>");
     Some(out)
@@ -1407,11 +1629,14 @@ mod tests {
         let mut progress = Progress {
             path: PathBuf::from("/tmp/x/20260729-101200-demo.md"),
             title: "重写 ledger rewind 路径".into(),
+            description: "让 rewind 跨过 compact 边界仍然成立".into(),
             state: ProgressState::Active,
             created: "2026-07-29T10:12:00Z".into(),
+            background: "## 决策\n值得做：rewind 目前在 Summary 边界上静默截断。".into(),
             phases: Vec::new(),
             disk_hash: 0,
             seen: HashSet::new(),
+            background_seen: false,
             viewed: None,
         };
         let _ = progress.set_phases(vec![
@@ -1441,8 +1666,22 @@ mod tests {
         let text = original.render();
         let parsed = Progress::parse(original.path(), &text).unwrap();
         assert_eq!(parsed.title, original.title);
+        assert_eq!(parsed.description, original.description);
         assert_eq!(parsed.state(), original.state());
+        assert_eq!(parsed.background(), original.background());
         assert_eq!(parsed.phases(), original.phases());
+        assert_eq!(parsed.render(), text);
+    }
+
+    /// A file written before descriptions existed still round-trips byte for
+    /// byte, which is what keeps `reconcile` from reading our own rewrite as a
+    /// user edit.
+    #[test]
+    fn a_file_without_a_description_round_trips_unchanged() {
+        let text = "---\ntitle: \"t\"\nstate: active\ncreated: c\n---\n\n## [ ] 1. one\n";
+        let parsed = Progress::parse(Path::new("/tmp/p.md"), text).unwrap();
+        assert!(parsed.description.is_empty());
+        assert!(parsed.background().is_empty());
         assert_eq!(parsed.render(), text);
     }
 
@@ -1458,12 +1697,18 @@ mod tests {
         assert_eq!(parsed.phases()[1].phase, "Second");
     }
 
+    /// The prose above the checklist is the plan, not litter: it used to be
+    /// discarded on parse, so a preamble a user or a reviewer wrote was deleted
+    /// by the next phase flip — the one thing "their version wins" forbids.
     #[test]
     fn a_heading_without_a_box_is_prose_not_a_phase() {
-        let text = "---\ntitle: t\nstate: draft\ncreated: c\n---\n\n## Background\nnot a phase\n\n## [ ] 1. Real\n";
+        let text = "---\ntitle: \"t\"\ndescription: \"what it is for\"\nstate: draft\ncreated: c\n---\n\n## Background\nnot a phase\n\n## [ ] 1. Real\nwhy\n";
         let parsed = Progress::parse(Path::new("/tmp/p.md"), text).unwrap();
+        assert_eq!(parsed.description, "what it is for");
         assert_eq!(parsed.phases().len(), 1);
         assert_eq!(parsed.phases()[0].phase, "Real");
+        assert_eq!(parsed.background(), "## Background\nnot a phase");
+        assert_eq!(parsed.render(), text, "and it survives being written back");
     }
 
     #[test]
@@ -1517,6 +1762,11 @@ mod tests {
         assert!(summary.contains("[x] 1. 勘查调用面"));
         assert!(summary.contains("← current"));
         assert!(summary.contains("state=\"active\""));
+        assert!(summary.contains("description=\"让 rewind"), "{summary}");
+        assert!(
+            summary.contains("Summary 边界上静默截断"),
+            "the prose that belongs to no phase arrives when a session picks the file up: {summary}"
+        );
         assert!(
             summary.contains("风险：compact"),
             "the running phase's detail is the one a resuming session cannot get any other way: {summary}"
@@ -1734,6 +1984,8 @@ mod tests {
         let ctx = test_ctx();
         let submit = json!({
             "title": "Rewrite the resume path",
+            "description": "make resume replay aux events in order",
+            "background": "## 决策\nWorth doing.",
             "state": "active",
             "phases": [{ "phase": "survey the callers", "status": "in_progress",
                          "detail": "read only" }]
@@ -1759,6 +2011,8 @@ mod tests {
             &json!({ "title": "Rewrite the resume path", "state": "active",
                      "phases": [{ "phase": "survey the callers again", "status": "pending",
                                   "detail": "read only" }] }),
+            // description and background are left out on purpose: the file keeps
+            // what it holds, exactly as `detail` does.
         )
         .unwrap();
         assert_eq!(ctx.progress.lock().unwrap().as_ref().unwrap().path(), first);
@@ -1784,6 +2038,8 @@ mod tests {
         let submit = |migrate: Value| {
             json!({
                 "title": "Rewrite the resume path",
+                "description": "make resume replay aux events in order",
+                "background": "## 决策\nWorth doing: resume replays out of order.",
                 "state": "active",
                 "phases": [
                     { "phase": "survey the callers", "status": "pending", "detail": "read only" },
@@ -1816,6 +2072,106 @@ mod tests {
         .unwrap();
     }
 
+    /// The other two tiers are gated at the same moment and for the same
+    /// reader, and every gap is reported at once rather than one per round trip.
+    #[test]
+    fn a_submission_needs_a_description_and_the_prose_no_phase_holds() {
+        let ctx = test_ctx();
+        let error = review_copy(
+            &ctx,
+            &json!({
+                "title": "Rewrite the resume path",
+                "state": "active",
+                "phases": [{ "phase": "survey the callers", "status": "pending",
+                             "detail": "read only" }]
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("`description` is empty"), "{error}");
+        assert!(error.contains("`background` is empty"), "{error}");
+
+        review_copy(
+            &ctx,
+            &json!({
+                "title": "Rewrite the resume path",
+                "description": "make resume replay aux events in order",
+                "background": "## 决策\nWorth doing: resume replays out of order.",
+                "state": "active",
+                "phases": [{ "phase": "survey the callers", "status": "pending" }]
+            }),
+        )
+        .unwrap();
+        let slot = ctx.progress.lock().unwrap();
+        let plan = slot.as_ref().unwrap();
+        assert_eq!(plan.description, "make resume replay aux events in order");
+        assert!(plan.background().contains("replays out of order"));
+        assert!(
+            plan.body().find("## 决策").unwrap() < plan.body().find("[ ] 1.").unwrap(),
+            "the prose leads the document the reviewer reads: {}",
+            plan.body()
+        );
+    }
+
+    /// The same omit-to-keep bargain `detail` strikes: a phase flip resends the
+    /// breakdown, and prose that had to ride along would be paid for every time.
+    #[test]
+    fn a_resend_without_background_keeps_the_prose_and_cannot_rewrite_it_blind() {
+        let ctx = test_ctx();
+        apply_call(
+            &ctx,
+            &json!({ "title": "Ship it", "background": "why we are doing this at all",
+                     "phases": [{ "phase": "one", "status": "in_progress" }] }),
+        )
+        .unwrap();
+        let path = ctx
+            .progress
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .path()
+            .to_path_buf();
+
+        apply_call(
+            &ctx,
+            &json!({ "phases": [{ "phase": "one", "status": "completed" }] }),
+        )
+        .unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("why we are doing this at all"));
+
+        // A fresh session holding only the file may not overwrite prose it was
+        // never shown — and the refusal hands it over, so the retry is informed.
+        *ctx.progress.lock().unwrap() = Some(Progress::load(&path).unwrap());
+        let rewrite = json!({ "background": "my version" });
+        let error = apply_call(&ctx, &rewrite).unwrap_err();
+        assert!(error.contains("why we are doing this at all"), "{error}");
+        apply_call(&ctx, &rewrite).unwrap();
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("my version"));
+    }
+
+    /// A plan whose notes run long costs a pointer per compact, not their
+    /// weight — and prose the model was only pointed at is prose it has not
+    /// seen, so it still cannot rewrite it blind.
+    #[test]
+    fn an_oversized_background_degrades_to_its_sections() {
+        let mut progress = sample();
+        let section = "x".repeat(SUMMARY_BACKGROUND_BUDGET);
+        progress.background = format!("## 决策\n{section}\n\n## 数据结构\nmore");
+        let summary = progress.summary();
+        assert!(summary.contains("- 决策"), "{summary}");
+        assert!(summary.contains("- 数据结构"), "{summary}");
+        assert!(
+            !summary.contains(&section),
+            "the weight stays out of context"
+        );
+        assert!(summary.contains("no arguments"), "{summary}");
+        assert!(!progress.background_seen);
+    }
+
     /// A session can retain a declined draft, but the next task's title must
     /// select a new tracker rather than mutating the abandoned file in place.
     #[test]
@@ -1825,6 +2181,8 @@ mod tests {
             &ctx,
             &json!({
                 "title": "Functional test plan",
+                "description": "check the suite still passes end to end",
+                "background": "## 决策\nWorth doing.",
                 "state": "active",
                 "phases": [{ "phase": "run tests", "status": "pending", "detail": "cargo test" }]
             }),
@@ -1840,6 +2198,8 @@ mod tests {
             &ctx,
             &json!({
                 "title": "Fix plan review flow",
+                "description": "stop a declined draft from being overwritten",
+                "background": "## 决策\nWorth doing.",
                 "state": "active",
                 "phases": [{ "phase": "write regression", "status": "pending",
                              "detail": "cover the declined path" }]
@@ -2139,7 +2499,9 @@ mod tests {
     #[test]
     fn an_approved_rewrite_comes_back_to_the_model() {
         let ctx = test_ctx();
-        let draft = json!({ "title": "Ship it", "state": "active", "phases": [
+        let draft = json!({ "title": "Ship it", "state": "active",
+            "description": "ship the thing", "background": "## 决策\nWorth doing.",
+            "phases": [
             { "phase": "mine", "status": "pending", "detail": "my reasoning" }
         ] });
         review_copy(&ctx, &draft).unwrap();
@@ -2223,7 +2585,8 @@ mod tests {
     /// behind phases the reviewer never opened.
     #[test]
     fn a_reviewed_edit_keeps_detail_the_reviewer_left_alone() {
-        let body = "\n## [ ] 1. one\nwhy one\n\n## [ ] 2. two\nwhy two\n";
+        let body =
+            "\n## Decision\nworth doing\n\n## [ ] 1. one\nwhy one\n\n## [ ] 2. two\nwhy two\n";
         let revised = revise_plan_body(
             body,
             &[
@@ -2239,6 +2602,10 @@ mod tests {
         assert!(
             revised.contains("why two"),
             "untouched prose survives: {revised}"
+        );
+        assert!(
+            revised.contains("## Decision\nworth doing"),
+            "a structural editor cannot send the plan's prose back, so re-rendering must not drop it: {revised}"
         );
         assert!(revised.contains("rewritten by the reviewer"), "{revised}");
         assert!(

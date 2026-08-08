@@ -4989,8 +4989,10 @@ async fn approving_a_plan_in_this_session_keeps_the_turn_going() {
         tool_use(
             "t1",
             "progress",
-            r#"{"title":"Ship it","state":"draft","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
+            r#"{"title":"Ship it","description":"ship the thing","background":"worth doing: nothing else reads this file","state":"draft","phases":[{"phase":"one","status":"pending","detail":"why"}]}"#,
         ),
+        // The submission leaves description and background out: the file keeps
+        // what it holds, exactly as it does for a phase's detail.
         tool_use(
             "t2",
             "progress",

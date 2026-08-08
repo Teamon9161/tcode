@@ -5074,6 +5074,15 @@ body.is-resizing {
   color: var(--syn-plain);
 }
 
+/* Long prose lines fold instead of scrolling sideways: the tail of a changed
+   line is exactly what a review exists to read, and a clipped line is a change
+   approved without its tail. Code keeps `pre` above — a code line's shape is
+   information, and a wrapped line could read as two added ones. */
+.diff.is-wrap .diff-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 .diff-gap {
   padding: 2px var(--s-3) 2px 4.6em;
   background: var(--sunken);
@@ -5792,8 +5801,32 @@ button.strip-phase-line:hover .strip-phase-name {
 
 .plan-head {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
   gap: var(--s-2);
+}
+/* Its own line under the title row: the count is pinned right by `margin-left:
+   auto`, so anything sharing that line competes with it. */
+.plan-description {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+
+/* The plan's prose. Set as a block of source markdown rather than rendered:
+   this is the text the model wrote and the reviewer may quote back at it, and a
+   rendered copy would be a second grammar to keep in step with core's. */
+.plan-background {
+  margin: var(--s-3) 0;
+  padding-left: var(--s-3);
+  border-left: 2px solid var(--line);
+  color: var(--muted);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 .plan-title {
   font-size: var(--text-md);
