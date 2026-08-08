@@ -18,6 +18,7 @@ use input::*;
 use rewind::*;
 use views::*;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -93,6 +94,12 @@ const DOUBLE_ESC: Duration = Duration::from_millis(1200);
 /// events. A human cannot reasonably type two keys in this interval, while a
 /// terminal injects a pasted line without a gap.
 const UNBRACKETED_PASTE_WINDOW: Duration = Duration::from_millis(10);
+
+/// Minimum gap between on-demand `@` re-scans. The popup requests one on every
+/// completion pass while a token is being edited, so this is what keeps a long
+/// typing session from scanning once per keystroke; the scan itself runs on a
+/// blocking thread either way.
+const REFERENCE_SCAN_COOLDOWN: Duration = Duration::from_millis(2000);
 
 /// Opens a note the human slipped to the model mid-turn (approval comment,
 /// `/note`), distinguishing it from a full user turn under the same rail.
@@ -313,6 +320,13 @@ pub struct App {
     reference_index: Vec<ReferenceCandidate>,
     reference_tx: mpsc::Sender<(PathBuf, Vec<ReferenceCandidate>)>,
     reference_rx: mpsc::Receiver<(PathBuf, Vec<ReferenceCandidate>)>,
+    /// On-demand `@` re-scan: the popup requests one while a token is being
+    /// completed, the event loop starts it, and the guards keep requests cheap.
+    /// Only the loop consumes the pending flag, so a keystroke-frequency
+    /// trigger can never spawn a scan from the draw/key path.
+    reference_refresh_pending: Cell<bool>,
+    reference_scanning: Cell<bool>,
+    last_reference_scan: Cell<Option<Instant>>,
     /// Prompts submitted while a turn was running. The agent loop takes them at
     /// its next safe boundary; until then they show, dimmed, above the input.
     pending: tcode_core::PendingInput,
@@ -612,6 +626,9 @@ impl App {
             reference_index: Vec::new(),
             reference_tx,
             reference_rx,
+            reference_refresh_pending: Cell::new(false),
+            reference_scanning: Cell::new(false),
+            last_reference_scan: Cell::new(None),
             suggestion: None,
             suggest_cancel: None,
             suggest_gen: 0,
@@ -770,6 +787,10 @@ impl App {
                 .last_plain_text_input
                 .map(|at| tokio::time::Instant::from_std(at + UNBRACKETED_PASTE_WINDOW))
                 .unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(3600));
+            // Start the re-scan the `@` popup asked for, if any: the request
+            // is set during draw/key handling, so this spawns at most once per
+            // event-loop iteration and never from the draw path itself.
+            self.flush_pending_reference_refresh();
             tokio::select! {
                 ev = term_events.next() => {
                     match ev {
@@ -802,10 +823,7 @@ impl App {
                     }
                 }
                 Some((cwd, index)) = self.reference_rx.recv() => {
-                    if cwd == self.cwd {
-                        self.reference_index = index;
-                        self.popup_index = 0;
-                    }
+                    self.apply_reference_scan(cwd, index);
                 }
                 Some(ask) = self.ask_rx.recv() => {
                     self.open_review(ask);
@@ -3526,6 +3544,83 @@ mod tests {
         assert!(
             matches.iter().any(|m| m.replacement == "@src/app.rs"),
             "the typed path stays the completion candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_completion_discovers_files_created_after_startup() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        // The file appears after startup, from outside tcode's own tools —
+        // the exact case the on-demand re-scan exists for.
+        std::fs::write(dir.path().join("notes.md"), "hi").unwrap();
+
+        app.editor.insert_str("@notes");
+        // A completion pass over the stale (empty) index requests a re-scan;
+        // the event loop's flush starts it, and the result lands on the channel.
+        assert!(
+            app.completion_matches().is_empty(),
+            "the stale snapshot knows nothing yet"
+        );
+        app.flush_pending_reference_refresh();
+        let (cwd, index) = app.reference_rx.recv().await.expect("scan result");
+        app.apply_reference_scan(cwd, index);
+
+        assert!(
+            app.completion_matches()
+                .iter()
+                .any(|m| m.replacement == "@notes.md"),
+            "a file created after startup must complete once the re-scan lands"
+        );
+    }
+
+    #[tokio::test]
+    async fn at_completion_does_not_pile_up_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.editor.insert_str("@a");
+        app.completion_matches();
+        assert!(
+            app.reference_refresh_pending.get(),
+            "the first @ pass requests a scan"
+        );
+        app.flush_pending_reference_refresh();
+        assert!(
+            app.reference_scanning.get(),
+            "the flush must start the scan and mark it in flight"
+        );
+        assert!(
+            !app.reference_refresh_pending.get(),
+            "the request was consumed by the flush"
+        );
+        // While a scan runs, typing more of the token must not request another.
+        app.completion_matches();
+        assert!(
+            !app.reference_refresh_pending.get(),
+            "no request while a scan is in flight"
+        );
+
+        // A landing result clears the in-flight flag, but the cooldown still
+        // holds, so the next pass does not immediately scan again.
+        let (cwd, index) = app.reference_rx.recv().await.expect("scan result");
+        app.apply_reference_scan(cwd, index);
+        assert!(!app.reference_scanning.get());
+        app.completion_matches();
+        assert!(
+            !app.reference_refresh_pending.get(),
+            "the cooldown must hold right after a scan"
+        );
+    }
+
+    #[test]
+    fn slash_completion_does_not_request_reference_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.editor.insert_str("/pl");
+        app.completion_matches();
+        assert!(
+            !app.reference_refresh_pending.get(),
+            "only an @ token asks for a re-scan"
         );
     }
 

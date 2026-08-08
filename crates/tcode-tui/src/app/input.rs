@@ -6,7 +6,8 @@
 //! decisions that need the session — which paths exist, what a paste becomes.
 //!
 //! Touches: editor, attachments, next_attachment_id, clipboard,
-//! reference_index, input_hitbox, input_mouse_active, input_dragged,
+//! reference_index, reference_refresh_pending, reference_scanning,
+//! last_reference_scan, input_hitbox, input_mouse_active, input_dragged,
 //! drag_scroll, popup_index, dismissed_reference, overlay.
 
 use super::*;
@@ -366,6 +367,8 @@ impl App {
     /// Results carry their cwd, so a slow scan that finishes after `/cd` is
     /// harmlessly discarded.
     pub(super) fn refresh_reference_index(&self) {
+        self.reference_scanning.set(true);
+        self.last_reference_scan.set(Some(Instant::now()));
         let cwd = self.cwd.clone();
         let tx = self.reference_tx.clone();
         tokio::spawn(async move {
@@ -375,6 +378,43 @@ impl App {
                 .unwrap_or_default();
             let _ = tx.send((cwd, index)).await;
         });
+    }
+
+    /// Ask the event loop to re-scan the project, at most once per
+    /// `REFERENCE_SCAN_COOLDOWN` and never while a scan is already running.
+    /// Called on every completion pass while the user edits an `@` token, so
+    /// it is a rate guard, not a responsiveness one: the scan itself stays on
+    /// a blocking thread and its result lands asynchronously on `reference_rx`.
+    pub(super) fn request_reference_refresh(&self) {
+        let now = Instant::now();
+        let cooled = self
+            .last_reference_scan
+            .get()
+            .is_none_or(|at| now.saturating_duration_since(at) >= REFERENCE_SCAN_COOLDOWN);
+        if !self.reference_scanning.get() && cooled {
+            self.reference_refresh_pending.set(true);
+        }
+    }
+
+    /// Start the scan the `@` popup requested, if any. Runs each event-loop
+    /// iteration so the gap between request and spawn is at most one wake-up;
+    /// the draw/key path never spawns directly.
+    pub(super) fn flush_pending_reference_refresh(&mut self) {
+        if self.reference_refresh_pending.get() {
+            self.reference_refresh_pending.set(false);
+            self.refresh_reference_index();
+        }
+    }
+
+    /// Land a finished scan. Always clears the in-flight flag — a scan whose
+    /// cwd is stale still ended — and only replaces the live index when the
+    /// cwd still matches, so a slow scan finishing after `/cd` is discarded.
+    pub(super) fn apply_reference_scan(&mut self, cwd: PathBuf, index: Vec<ReferenceCandidate>) {
+        self.reference_scanning.set(false);
+        if cwd == self.cwd {
+            self.reference_index = index;
+            self.popup_index = 0;
+        }
     }
 
     pub(super) fn paste_from_clipboard(&mut self) {
@@ -474,6 +514,13 @@ impl App {
         // the rest of the line differs. Checked before the slash branch so a
         // command's task can name files like any other prompt.
         if let Some((start, end, query)) = self.active_reference() {
+            // The popup reads a snapshot, so a file created outside tcode
+            // (editor, file manager, git) stays invisible until a re-scan.
+            // Ask for one on the passes through the token; the event loop
+            // starts it in the background and lands it into the open popup.
+            if self.dismissed_reference != Some(start) {
+                self.request_reference_refresh();
+            }
             return self.reference_completions(start, end, &query);
         }
         if self.editor.line_count() == 1 && self.editor.text().starts_with('/') {
