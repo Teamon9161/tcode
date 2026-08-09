@@ -1,0 +1,247 @@
+name: Desktop Release
+
+on:
+  push:
+    tags: ["app-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate desktop release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Verify tag and manifests
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#app-v}"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]] || {
+            echo "app tag must be app-v<semver>, got $GITHUB_REF_NAME" >&2
+            exit 1
+          }
+          node - "$version" <<'NODE'
+          const fs = require("node:fs");
+          const expected = process.argv[2];
+          const cargo = fs.readFileSync("crates/tcode-app/Cargo.toml", "utf8");
+          const cargoVersion = /^version\s*=\s*"([^"]+)"/m.exec(cargo)?.[1];
+          const manifests = [
+            ["crates/tcode-app/Cargo.toml", cargoVersion],
+            ["crates/tcode-app/package.json", JSON.parse(fs.readFileSync("crates/tcode-app/package.json", "utf8")).version],
+            ["crates/tcode-app/ui/package.json", JSON.parse(fs.readFileSync("crates/tcode-app/ui/package.json", "utf8")).version],
+          ];
+          for (const [file, version] of manifests) {
+            if (version !== expected) {
+              throw new Error(`${file} has ${version ?? "no"} version, expected ${expected}`);
+            }
+          }
+          NODE
+          echo "value=$version" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Package Windows x64
+    needs: validate
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build bundled sidecar
+        shell: bash
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/tcode-app/Cargo.toml
+          --target x86_64-pc-windows-msvc
+
+      - name: Install and build desktop assets
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm --prefix ui ci
+          npm --prefix ui run build
+          npm run stage:sidecar -- target/x86_64-pc-windows-msvc/release/tcode-sidecar.exe
+          npm run dist:win
+
+      - name: Verify Windows package contents
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="release/dist/win-unpacked/resources"
+          test -f "$app/app.asar"
+          test -f "$app/app-update.yml"
+          test -f "$app/sidecar/tcode-sidecar.exe"
+          test -f release/dist/latest.yml
+          test -f release/dist/tcode-${{ needs.validate.outputs.version }}-setup-x64.exe
+
+      - name: Upload Windows release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-windows
+          path: |
+            crates/tcode-app/release/dist/tcode-*-setup-x64.exe
+            crates/tcode-app/release/dist/tcode-*-setup-x64.exe.blockmap
+            crates/tcode-app/release/dist/latest.yml
+          if-no-files-found: error
+
+  linux:
+    name: Package Linux x64
+    needs: validate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Build bundled sidecar
+        run: >-
+          cargo build --release --locked
+          --manifest-path crates/tcode-app/Cargo.toml
+          --target x86_64-unknown-linux-gnu
+
+      - name: Install and build desktop assets
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm --prefix ui ci
+          npm --prefix ui run build
+          npm run stage:sidecar -- target/x86_64-unknown-linux-gnu/release/tcode-sidecar
+          npm run dist:linux
+
+      - name: Verify Linux package contents
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release/dist/latest-linux.yml
+          find release/dist -maxdepth 1 -type f -name '*.AppImage' -print -quit | grep -q .
+
+      - name: Upload Linux release assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-linux
+          path: |
+            crates/tcode-app/release/dist/*.AppImage
+            crates/tcode-app/release/dist/*.AppImage.blockmap
+            crates/tcode-app/release/dist/latest-linux.yml
+          if-no-files-found: error
+
+  macos:
+    name: Package macOS universal
+    needs: validate
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+
+      - name: Build universal bundled sidecar
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+          mkdir -p release/universal
+          lipo -create \
+            target/aarch64-apple-darwin/release/tcode-sidecar \
+            target/x86_64-apple-darwin/release/tcode-sidecar \
+            -output release/universal/tcode-sidecar
+          archs="$(lipo -archs release/universal/tcode-sidecar)"
+          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
+
+      - name: Install and build desktop assets
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ci
+          npm --prefix ui ci
+          npm --prefix ui run build
+          npm run stage:sidecar -- release/universal/tcode-sidecar
+          npm run dist:mac
+
+      - name: Verify manual macOS package contents
+        working-directory: crates/tcode-app
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f release/dist/tcode-${{ needs.validate.outputs.version }}-mac-universal.dmg
+          test -f release/dist/tcode-${{ needs.validate.outputs.version }}-mac-universal.zip
+          test ! -e release/dist/latest-mac.yml
+          app="release/dist/mac-universal/tcode.app/Contents/Resources"
+          test -f "$app/app.asar"
+          test -f "$app/sidecar/tcode-sidecar"
+          test ! -e "$app/app-update.yml"
+          archs="$(lipo -archs "$app/sidecar/tcode-sidecar")"
+          [[ "$archs" == *arm64* && "$archs" == *x86_64* ]]
+
+      - name: Upload macOS manual-install assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-macos
+          path: |
+            crates/tcode-app/release/dist/tcode-*-mac-universal.dmg
+            crates/tcode-app/release/dist/tcode-*-mac-universal.zip
+          if-no-files-found: error
+
+  publish:
+    name: Publish external desktop release
+    needs: [validate, windows, linux, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download desktop release assets
+        uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create external release
+        env:
+          GH_TOKEN: ${{ secrets.TCODE_DESKTOP_RELEASE_TOKEN }}
+          VERSION: ${{ needs.validate.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$GH_TOKEN" || {
+            echo "TCODE_DESKTOP_RELEASE_TOKEN is required to publish to Teamon9161/tcode-desktop-releases" >&2
+            exit 1
+          }
+          test -f "dist/tcode-${VERSION}-setup-x64.exe"
+          test -f "dist/latest.yml"
+          find dist -maxdepth 1 -type f -name '*.AppImage' -print -quit | grep -q .
+          test -f "dist/latest-linux.yml"
+          test -f "dist/tcode-${VERSION}-mac-universal.dmg"
+          test -f "dist/tcode-${VERSION}-mac-universal.zip"
+          if gh release view "v$VERSION" --repo Teamon9161/tcode-desktop-releases >/dev/null 2>&1; then
+            echo "desktop release v$VERSION already exists; publish a corrected higher version instead" >&2
+            exit 1
+          fi
+          gh release create "v$VERSION" dist/* \
+            --repo Teamon9161/tcode-desktop-releases \
+            --title "tcode $VERSION" \
+            --generate-notes

@@ -12,6 +12,8 @@
 /crates/tcode-app/spike/node_modules
 /crates/tcode-app/spike/results.json
 /crates/tcode-app/electron/node_modules
+/crates/tcode-app/node_modules
+/crates/tcode-app/release
 /crates/tcode-app/ui/dist
 examples/
 **/__pycache__/

@@ -39,6 +39,16 @@ The command selects the current platform's release binary, verifies `checksums.t
 
 The sidecar is released independently at `voice-v<version>` only when its code or model support changes. Ordinary `v<version>` tcode releases reuse the installed sidecar.
 
+## Desktop app
+
+The Electron desktop app is distributed separately from the terminal CLI at [Teamon9161/tcode-desktop-releases](https://github.com/Teamon9161/tcode-desktop-releases/releases/latest). Its version and `app-v<version>` source tag are independent of the root CLI's `v<version>` releases.
+
+- **Windows x64:** download the per-user NSIS installer. On later launches, the app checks for a newer desktop release and asks before downloading it and again before restarting to install it.
+- **Linux x64:** download and run the AppImage. When it is launched as an AppImage, it follows the same consented update flow.
+- **macOS universal:** download the DMG or ZIP and install manually. macOS does not use the app updater in this first release.
+
+These initial desktop builds are intentionally **unsigned** for a small group of trusted users. Windows may show an unknown-publisher or SmartScreen warning, and macOS Gatekeeper may require a user to manually allow opening the downloaded app. Do not treat the GitHub Release checksum metadata as a replacement for platform code-signing identity.
+
 ## Build from source
 ```sh
 cargo build --release
@@ -72,3 +82,15 @@ GitHub Actions validates pushes and pull requests. A release is only published w
 - `tcode-x86_64-windows.exe` and `tcode-aarch64-windows.exe`
 
 For example, after changing the manifest version to `0.2.0`, publishing is triggered externally with `git tag v0.2.0` followed by `git push origin v0.2.0`.
+
+### Desktop release checklist
+
+Desktop releases are deliberately separate so they never become the root CLI's `latest` feed.
+
+1. Bump the same desktop version in `crates/tcode-app/Cargo.toml`, `crates/tcode-app/package.json`, and `crates/tcode-app/ui/package.json`; regenerate the affected lockfiles.
+2. Ensure the source repository secret `TCODE_DESKTOP_RELEASE_TOKEN` is a fine-grained PAT limited to `contents:write` on `Teamon9161/tcode-desktop-releases`. Never put it in an app package or local config.
+3. Push `app-v<version>`. The Desktop Release workflow builds the Windows x64 NSIS installer, Linux x64 AppImage, and unsigned macOS universal DMG/ZIP, then creates `v<version>` in the external release repository.
+4. Confirm the external release contains `latest.yml`, `latest-linux.yml`, both Windows/Linux package assets and blockmaps, plus the macOS DMG/ZIP. There must be no `latest-mac.yml` in this unsigned manual-install phase.
+5. Do not overwrite a desktop release. Publish a higher corrected desktop version instead. Before relying on the updater for a release, test an installed Windows and Linux version N upgrading to N+1; validate macOS manual installation separately.
+
+When distribution expands, add Windows signing and Apple Developer ID signing/notarization before enabling macOS auto-update. This does not require changing the tag or external-repository topology.

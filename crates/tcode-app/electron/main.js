@@ -13,7 +13,6 @@
 
 const { spawn } = require("node:child_process");
 const path = require("node:path");
-const fs = require("node:fs");
 const readline = require("node:readline");
 const { pathToFileURL } = require("node:url");
 
@@ -21,6 +20,8 @@ const { app, BaseWindow, WebContentsView, dialog, ipcMain, net, protocol } =
   require("electron");
 
 const { browserVerbs } = require("./browser");
+const { resolveSidecarPath, sidecarMissingMessage } = require("./paths");
+const { startAutomaticUpdates } = require("./updater");
 
 const ROOT = path.resolve(__dirname, "..");
 const DIST = path.join(ROOT, "ui", "dist");
@@ -90,16 +91,19 @@ protocol.registerSchemesAsPrivileged([
 
 /** Resolved once, so a missing build is one clear message and not fifty. */
 function sidecarPath() {
-  const named = process.env.TCODE_SIDECAR;
-  if (named) return named;
-  const exe = process.platform === "win32" ? "tcode-sidecar.exe" : "tcode-sidecar";
-  // Debug first: this is a development shell, and a stale release build sitting
-  // next to a fresh debug one is the confusing case worth ruling out.
-  for (const profile of ["debug", "release"]) {
-    const candidate = path.join(ROOT, "target", profile, exe);
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  return null;
+  return resolveSidecarPath({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    root: ROOT,
+  });
+}
+
+function missingSidecarMessage() {
+  return sidecarMissingMessage({
+    isPackaged: app.isPackaged,
+    resourcesPath: process.resourcesPath,
+    root: ROOT,
+  });
 }
 
 /**
@@ -121,10 +125,7 @@ function startSidecar(deliver, answer) {
   const binary = sidecarPath();
   if (!binary) {
     return {
-      failed:
-        "tcode-sidecar was not found. Build it first:\n\n" +
-        "    cargo build --bin tcode-sidecar\n\n" +
-        `(looked under ${path.join(ROOT, "target")}; set TCODE_SIDECAR to override)`,
+      failed: missingSidecarMessage(),
     };
   }
 
@@ -413,10 +414,18 @@ app.whenReady().then(() => {
   });
 
   view.webContents.loadURL("app://tcode/index.html");
-  window.once("ready-to-show", () => window.show());
+
+  let shown = false;
+  const showAndCheckForUpdates = () => {
+    if (shown) return;
+    shown = true;
+    window.show();
+    startAutomaticUpdates({ isPackaged: app.isPackaged, window, dialog });
+  };
+  window.once("ready-to-show", showAndCheckForUpdates);
   // `BaseWindow` has no `ready-to-show` of its own — that belongs to the
   // contents — so the first paint of the view is the signal.
-  view.webContents.once("did-finish-load", () => window.show());
+  view.webContents.once("did-finish-load", showAndCheckForUpdates);
 
   app.on("before-quit", () => sidecar.stop());
 });

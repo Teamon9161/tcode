@@ -12,11 +12,16 @@ cargo build --bin tcode-sidecar           # 后端作为子进程；Electron 壳
 (cd ui && npm install && npm run build)   # 首次 / 改过前端；Electron 只加载 ui/dist
 (cd ui && npm test)                       # 渲染边界测试（规则 10/11），不碰网络
 cargo test                                # 后端 + 集成测试
-(cd electron && npm install)              # 首次
-(cd electron && TCODE_CWD=/要打开的文件夹 npm start)   # 起 app
+npm ci                                    # Electron 壳、打包器与 updater（在 crate 根目录）
+npm run test:shell                        # 壳的纯 Node 路径/updater/staging 测试
+npm start                                 # 从 crate 根目录启动 Electron 开发壳
 ```
 
-`TCODE_CWD` 不设时用 `process.cwd()`，也就是 `electron/` 自己——那是个能用但没意思的文件夹。`TCODE_SIDECAR` 可以指定 sidecar 路径。**sidecar 的 stdout 只发 JSON 帧**，诊断一律 `eprintln!`；一句 `println!` 会插进帧中间（`src/sidecar.rs`）。Electron 主进程把 sidecar 的 stderr、renderer 的 error 级 console 和加载失败都转到自己的终端，因为无边框窗口默认没有 devtools 可开。
+`TCODE_CWD` 不设时用 `process.cwd()`，也就是 `crates/tcode-app/`；那是个能用但没意思的文件夹。`TCODE_SIDECAR` 可以指定 sidecar 路径。**sidecar 的 stdout 只发 JSON 帧**，诊断一律 `eprintln!`；一句 `println!` 会插进帧中间（`src/sidecar.rs`）。Electron 主进程把 sidecar 的 stderr、renderer 的 error 级 console 和加载失败都转到自己的终端，因为无边框窗口默认没有 devtools 可开。
+
+发布包的 sidecar 绝不从 `target/` 或 `TCODE_SIDECAR` 取：它只从 `process.resourcesPath/sidecar/tcode-sidecar[.exe]` 启动，且必须由 `npm run stage:sidecar -- <已构建的二进制>` 复制进 `release/sidecar/` 后才可打包。打包前还必须已有 `ui/dist`；例如本机 Windows 验证可依次运行 `cargo build --bin tcode-sidecar`、`npm --prefix ui run build`、`npm run stage:sidecar -- target/debug/tcode-sidecar.exe`、`npm run dist:win`。`release/` 是生成的 staging/output，永不提交，也不应被清理脚本删除开发者现有构建产物。
+
+发布包只在 Windows/Linux 启动后检查更新，发现新版先问是否下载、下载完成再问是否重启安装。macOS 首版只提供手动下载的 DMG/ZIP，打包配置必须保持 `mac.publish: null`，不能让 Git remote 或 Actions token 推导出错误的 updater feed。Windows/Linux 首版是未签名包；不要添加 `forceCodeSigning`，也不要把任何发布 token 放进应用。
 
 `npm run build` 与 `preview:ui` 都会先跑 `build:sandbox`（三个 IIFE 进 `public/`，被 gitignore）。**只改了 `src/sandbox/` 下的文件时，dev server 不会热更它们**——那是静态产物，得重跑 `npm run build:sandbox` 再刷新。
 

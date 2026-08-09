@@ -1,0 +1,110 @@
+{
+  "name": "tcode",
+  "private": true,
+  "version": "0.1.22",
+  "description": "The Electron desktop application for tcode.",
+  "author": "Teamon9161",
+  "main": "electron/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test:shell": "node --test electron/*.test.js",
+    "stage:sidecar": "node scripts/stage-sidecar.js",
+    "dist": "electron-builder",
+    "dist:win": "electron-builder --win --publish=never",
+    "dist:linux": "electron-builder --linux --publish=never",
+    "dist:mac": "electron-builder --mac --universal --publish=never"
+  },
+  "dependencies": {
+    "electron-updater": "^6.8.9"
+  },
+  "devDependencies": {
+    "electron": "^43.3.0",
+    "electron-builder": "^26.15.3"
+  },
+  "build": {
+    "appId": "com.tcode.app",
+    "productName": "tcode",
+    "asar": true,
+    "directories": {
+      "output": "release/dist"
+    },
+    "files": [
+      "electron/**/*",
+      "ui/dist/**/*",
+      "icons/**/*",
+      "!electron/**/*.test.js"
+    ],
+    "extraResources": [
+      {
+        "from": "release/sidecar",
+        "to": "sidecar",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "icons/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "tcode-${version}-setup-${arch}.${ext}",
+      "publish": [
+        {
+          "provider": "github",
+          "owner": "Teamon9161",
+          "repo": "tcode-desktop-releases"
+        }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
+    },
+    "linux": {
+      "icon": "icons/512x512.png",
+      "target": [
+        {
+          "target": "AppImage",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "tcode-${version}-${arch}.${ext}",
+      "publish": [
+        {
+          "provider": "github",
+          "owner": "Teamon9161",
+          "repo": "tcode-desktop-releases"
+        }
+      ]
+    },
+    "mac": {
+      "icon": "icons/512x512.png",
+      "publish": null,
+      "x64ArchFiles": "**/sidecar/tcode-sidecar",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "universal"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "universal"
+          ]
+        }
+      ],
+      "artifactName": "tcode-${version}-mac-universal.${ext}"
+    }
+  }
+}

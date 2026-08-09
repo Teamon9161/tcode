@@ -32,3 +32,34 @@ jobs:
 
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked
+
+  desktop:
+    name: Desktop checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/tcode-app
+
+      - name: Run desktop Rust tests
+        run: cargo test --manifest-path crates/tcode-app/Cargo.toml --locked
+
+      - name: Install and test Electron shell
+        working-directory: crates/tcode-app
+        run: |
+          npm ci
+          npm run test:shell
+
+      - name: Install, test, and build desktop UI
+        working-directory: crates/tcode-app/ui
+        run: |
+          npm ci
+          npm test
+          npm run build
