@@ -244,4 +244,5 @@ jobs:
           gh release create "v$VERSION" dist/* \
             --repo Teamon9161/tcode-desktop-releases \
             --title "tcode $VERSION" \
+            --target main \
             --generate-notes
