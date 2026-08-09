@@ -371,16 +371,30 @@ fn staging_path(executable: &Path) -> Result<PathBuf> {
     Ok(executable.with_file_name(format!("{file_name}.new")))
 }
 
+/// The helper that retries replacing `executable` with `staged` until the
+/// running tcode exits and releases the file, then deletes itself.
+///
+/// The self-delete must be `(goto) 2>nul & del "%~f0"`, never a bare
+/// `del "%~f0"`: cmd re-opens the batch file by name to keep reading after
+/// each line, so deleting it mid-run makes the next read fail with "The batch
+/// file cannot be found" — printed after every Windows update even though the
+/// move succeeded. The `(goto)` (a syntax error) ends batch parsing first,
+/// and `&` runs the deletion regardless, so the file is still cleaned up.
+#[cfg(windows)]
+fn windows_replacer_script(staged: &Path, executable: &Path) -> String {
+    format!(
+        "@echo off\r\n:retry\r\nmove /Y \"{}\" \"{}\" >nul 2>nul\r\nif errorlevel 1 (\r\n  timeout /t 1 /nobreak >nul\r\n  goto retry\r\n)\r\n(goto) 2>nul & del \"%~f0\"\r\n",
+        staged.display(),
+        executable.display()
+    )
+}
+
 #[cfg(windows)]
 fn spawn_windows_replacer(staged: &Path, executable: &Path) -> Result<()> {
     use std::process::Command;
 
     let script = std::env::temp_dir().join(format!("tcode-update-{}.cmd", std::process::id()));
-    let script_body = format!(
-        "@echo off\r\n:retry\r\nmove /Y \"{}\" \"{}\" >nul 2>nul\r\nif errorlevel 1 (\r\n  timeout /t 1 /nobreak >nul\r\n  goto retry\r\n)\r\ndel \"%~f0\"\r\n",
-        staged.display(),
-        executable.display()
-    );
+    let script_body = windows_replacer_script(staged, executable);
     std::fs::write(&script, script_body)
         .with_context(|| format!("cannot create {}", script.display()))?;
     Command::new("cmd")
@@ -441,6 +455,24 @@ mod tests {
         assert_eq!(
             staging_path(Path::new("/opt/bin/tcode")).unwrap(),
             PathBuf::from("/opt/bin/tcode.new")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacer_script_ends_without_reopening_a_deleted_self() {
+        let script = windows_replacer_script(
+            Path::new(r"C:\Program Files\tcode\tcode.exe.new"),
+            Path::new(r"C:\Program Files\tcode\tcode.exe"),
+        );
+        // A bare `del "%~f0"` deletes the running batch file; cmd then re-opens
+        // it by name to continue reading and prints "The batch file cannot be
+        // found" on every Windows update. The `(goto)` aborts batch parsing
+        // before the delete so nothing reads the file afterwards.
+        assert!(script.contains(r#"(goto) 2>nul & del "%~f0""#));
+        assert!(
+            !script.contains("del \"%~f0\"\r\n(goto)"),
+            "self-delete must keep the (goto) guard"
         );
     }
 }
