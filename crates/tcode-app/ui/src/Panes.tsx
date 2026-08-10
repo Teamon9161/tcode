@@ -810,6 +810,14 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
           className="pane-name"
           title={value.kind === "workspace-file" ? value.path : undefined}
         >
+          {activeFileControls?.dirty && (
+            <span
+              className="workspace-file-dirty"
+              role="img"
+              aria-label="Unsaved changes"
+              title={`Unsaved changes — ${MOD}+S saves`}
+            />
+          )}
           {inspectTitle(value)}
         </span>
         {activeFileControls?.onMode && activeFileControls.mode && (
@@ -833,7 +841,6 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
             }
           >
             <PencilIcon size={12} />
-            {activeFileControls.mode}
           </button>
         )}
         {activeFileControls && (
@@ -846,21 +853,6 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
             title="Read this file again"
           >
             <RefreshIcon size={14} />
-          </button>
-        )}
-        {activeFileControls?.onSave && (
-          <button
-            type="button"
-            className="btn btn-primary workspace-file-save"
-            onClick={activeFileControls.onSave}
-            disabled={activeFileControls.saveDisabled || activeFileControls.saving}
-            title={`Save (${MOD}+S)`}
-          >
-            {activeFileControls.saving
-              ? "saving…"
-              : activeFileControls.dirty
-                ? "save"
-                : "saved"}
           </button>
         )}
         <ExpandPane leaf={leaf} context={context} />

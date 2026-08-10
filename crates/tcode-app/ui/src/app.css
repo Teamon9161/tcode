@@ -6490,18 +6490,27 @@ button.strip-phase-line:hover .strip-phase-name {
   height: 100%;
 }
 
-.workspace-file-mode,
-.workspace-file-save {
+.workspace-file-mode {
   flex: none;
   font-size: var(--text-xs);
 }
 
-.workspace-file-save {
-  padding: var(--s-1) var(--s-3);
+/* The unsaved-changes mark: a filled dot ahead of the file name, the same
+   "parked on you" amber as the needs-you status (DESIGN.md § palette), and the
+   same shape — 3.2:1 on --bg is what amber was chosen to clear as a dot. */
+.workspace-file-dirty {
+  display: inline-block;
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-inline-end: var(--s-2);
+  border-radius: 50%;
+  background: var(--amber);
+  vertical-align: 1px;
 }
 
 .workspace-file-warning,
-.workspace-file-conflict,
+.workspace-file-disk,
 .workspace-file-error {
   flex: none;
   margin: 0;
@@ -6510,9 +6519,33 @@ button.strip-phase-line:hover .strip-phase-name {
 }
 
 .workspace-file-warning,
-.workspace-file-conflict {
+.workspace-file-disk {
   background: var(--amber-wash);
   color: var(--amber-text);
+}
+
+/* The disk-change banner is an answer, not a notice: it carries the reload and
+   overwrite buttons beside the sentence that explains them. */
+.workspace-file-disk {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex-wrap: wrap;
+}
+
+.workspace-file-disk p {
+  margin: 0;
+}
+
+.workspace-file-disk-actions {
+  display: inline-flex;
+  gap: var(--s-2);
+  margin-inline-start: auto;
+}
+
+.workspace-file-disk .btn {
+  padding: var(--s-1) var(--s-2);
+  font-size: var(--text-xs);
 }
 
 .workspace-file-error {

@@ -6,7 +6,7 @@
   "author": "Teamon9161",
   "main": "electron/main.js",
   "scripts": {
-    "start": "electron .",
+    "start": "node scripts/prestart.js && electron .",
     "test:shell": "node --test electron/*.test.js",
     "stage:sidecar": "node scripts/stage-sidecar.js",
     "dist": "electron-builder",

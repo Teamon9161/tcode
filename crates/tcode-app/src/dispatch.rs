@@ -246,13 +246,18 @@ impl Registry {
         );
         result!(
             t,
+            "workspace_stat",
+            c::workspace_stat[supervisor](session, path)
+        );
+        result!(
+            t,
             "workspace_read_binary",
             c::workspace_read_binary[supervisor](session, path)
         );
         result!(
             t,
             "workspace_write_text",
-            c::workspace_write_text[supervisor](session, path, text, revision)
+            c::workspace_write_text[supervisor](session, path, text, revision, force)
         );
         result!(
             t,

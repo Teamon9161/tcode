@@ -30,6 +30,7 @@ const textView = (path: string, text: string): WorkspaceTextView => ({
   path,
   text,
   revision: `revision:${path}`,
+  fingerprint: `fingerprint:${path}`,
   bytes: text.length,
   truncated: false,
 });
@@ -119,7 +120,7 @@ afterEach(() => {
 });
 
 describe("workspace file pane header", () => {
-  it("names the file once and places reload/save before the pane controls", async () => {
+  it("names the file once and keeps the header to icon controls", async () => {
     mocks.invoke.mockResolvedValue(textView("src/main.rs", "fn main() {}"));
     await draw({ kind: "workspace-file", path: "src/main.rs" });
 
@@ -128,7 +129,10 @@ describe("workspace file pane header", () => {
     expect(name.title).toBe("src/main.rs");
     expect(container.querySelector(".workspace-file-bar")).toBeNull();
     expect(container.querySelector('[aria-label="Read this file again"]')).not.toBeNull();
-    expect(container.querySelector(".workspace-file-save")).not.toBeNull();
+    // No save button: an unsaved draft is signalled by the dot ahead of the
+    // name, and saved with Mod+S.
+    expect(container.querySelector(".workspace-file-save")).toBeNull();
+    expect(container.querySelector(".workspace-file-dirty")).toBeNull();
   });
 
   it("toggles Markdown in the pane header without resetting its draft", async () => {
@@ -142,6 +146,41 @@ describe("workspace file pane header", () => {
     expect(container.textContent).toContain("body");
     act(() => container.querySelector<HTMLButtonElement>('[aria-label="Edit Markdown"]')!.click());
     expect(editor()?.state.doc.toString()).toBe("# title\nbody");
+  });
+
+  it("makes the Markdown mode switch an icon without a word label", async () => {
+    mocks.invoke.mockResolvedValue(textView("docs/guide.md", "# title"));
+    await draw({ kind: "workspace-file", path: "docs/guide.md" });
+
+    const chip = container.querySelector<HTMLButtonElement>(".workspace-file-mode")!;
+    expect(chip.textContent).toBe("");
+    expect(chip.getAttribute("aria-label")).toBe("Edit Markdown");
+  });
+
+  it("shows an unsaved dot ahead of the name and clears it on save", async () => {
+    mocks.invoke.mockImplementation((command: string, args: { path: string; text?: string }) =>
+      command === "workspace_read_text"
+        ? Promise.resolve(textView(args.path, "saved"))
+        : Promise.resolve(textView(args.path, args.text ?? "")),
+    );
+    await draw({ kind: "workspace-file", path: "dot.txt" });
+    expect(container.querySelector(".workspace-file-dirty")).toBeNull();
+
+    act(() => editor()!.dispatch({ changes: { from: 5, insert: " draft" } }));
+    expect(container.querySelector(".workspace-file-dirty")).not.toBeNull();
+
+    const event = new KeyboardEvent("keydown", {
+      key: "s",
+      ctrlKey: true,
+      bubbles: true,
+      cancelable: true,
+    });
+    await act(async () => {
+      window.dispatchEvent(event);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(container.querySelector(".workspace-file-dirty")).toBeNull();
   });
 
   it("keeps images render-only while retaining reload", async () => {
@@ -161,13 +200,12 @@ describe("workspace file pane header", () => {
   it("hides a stale registration immediately when navigation selects another path", async () => {
     mocks.invoke.mockResolvedValueOnce(textView("a.txt", "a"));
     await draw({ kind: "workspace-file", path: "a.txt" });
-    expect(container.querySelector(".workspace-file-save")).not.toBeNull();
+    expect(container.querySelector('[aria-label="Read this file again"]')).not.toBeNull();
 
     mocks.invoke.mockReturnValueOnce(new Promise(() => {}));
     await draw({ kind: "workspace-file", path: "b.txt" });
 
     expect(container.querySelector<HTMLElement>(".pane-name")?.title).toBe("b.txt");
-    expect(container.querySelector<HTMLButtonElement>(".workspace-file-save")?.disabled).toBe(true);
     expect(
       container.querySelector<HTMLButtonElement>('[aria-label="Read this file again"]')?.disabled,
     ).toBe(true);

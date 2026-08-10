@@ -3,8 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTextView } from "./types";
 import {
+  canForceSaveWorkspaceText,
   canSaveWorkspaceText,
-  conflictedWorkspaceFileSession,
+  diskChangedWorkspaceFileSession,
   newWorkspaceFileSession,
   reloadNeedsConfirmation,
   reloadedWorkspaceFileSession,
@@ -18,6 +19,7 @@ const file = (text: string, revision = "revision", truncated = false): Workspace
   path: "notes.md",
   text,
   revision,
+  fingerprint: `fingerprint-${revision}`,
   bytes: text.length,
   truncated,
 });
@@ -55,6 +57,7 @@ describe("workspace file sessions", () => {
     expect(saved.text).toBe("edited after submit");
     expect(workspaceFileDirty(saved)).toBe(true);
     expect(saved.file.revision).toBe("revision-2");
+    expect(saved.file.fingerprint).toBe("fingerprint-revision-2");
     expect(saved.editorState).toBe(editorState);
     expect(saved.editorScroll).toEqual({ top: 120, left: 8 });
     expect(saved.mode).toBe("edit");
@@ -67,7 +70,7 @@ describe("workspace file sessions", () => {
       mode: "edit" as const,
       editorState: EditorState.create({ doc: "draft" }),
       editorScroll: { top: 80, left: 0 },
-      conflicted: true,
+      diskChanged: true,
     };
     const reloaded = reloadedWorkspaceFileSession(current, file("remote", "revision-2"));
 
@@ -76,16 +79,16 @@ describe("workspace file sessions", () => {
     expect(reloaded.generation).toBe(current.generation + 1);
     expect(reloaded.editorScroll.top).toBe(80);
     expect(reloaded.mode).toBe("edit");
-    expect(reloaded.conflicted).toBe(false);
+    expect(reloaded.diskChanged).toBe(false);
   });
 
-  it("marks a conflict without replacing the draft", () => {
+  it("marks a disk change without replacing the draft", () => {
     const current = { ...newWorkspaceFileSession(file("saved"), false), text: "draft" };
-    const conflicted = conflictedWorkspaceFileSession(current);
+    const changed = diskChangedWorkspaceFileSession(current);
 
-    expect(conflicted.text).toBe("draft");
-    expect(conflicted.file.text).toBe("saved");
-    expect(conflicted.conflicted).toBe(true);
+    expect(changed.text).toBe("draft");
+    expect(changed.file.text).toBe("saved");
+    expect(changed.diskChanged).toBe(true);
   });
 });
 
@@ -95,10 +98,16 @@ describe("workspace editor save and reload policy", () => {
     expect(reloadNeedsConfirmation(false)).toBe(false);
   });
 
-  it("never saves an unchanged, truncated, or conflicted response", () => {
-    expect(canSaveWorkspaceText({ dirty: true, truncated: false, conflicted: false })).toBe(true);
-    expect(canSaveWorkspaceText({ dirty: false, truncated: false, conflicted: false })).toBe(false);
-    expect(canSaveWorkspaceText({ dirty: true, truncated: true, conflicted: false })).toBe(false);
-    expect(canSaveWorkspaceText({ dirty: true, truncated: false, conflicted: true })).toBe(false);
+  it("never saves an unchanged, truncated, or disk-changed response", () => {
+    expect(canSaveWorkspaceText({ dirty: true, truncated: false, diskChanged: false })).toBe(true);
+    expect(canSaveWorkspaceText({ dirty: false, truncated: false, diskChanged: false })).toBe(false);
+    expect(canSaveWorkspaceText({ dirty: true, truncated: true, diskChanged: false })).toBe(false);
+    expect(canSaveWorkspaceText({ dirty: true, truncated: false, diskChanged: true })).toBe(false);
+  });
+
+  it("lets the overwrite answer skip only the disk-change guard", () => {
+    expect(canForceSaveWorkspaceText({ dirty: true, truncated: false })).toBe(true);
+    expect(canForceSaveWorkspaceText({ dirty: true, truncated: true })).toBe(false);
+    expect(canForceSaveWorkspaceText({ dirty: false, truncated: false })).toBe(false);
   });
 });

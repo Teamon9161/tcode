@@ -23,7 +23,7 @@ import type { RewindTarget } from "../rewind";
 import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Workspace } from "../Workspace";
 import {
-  conflictedWorkspaceFileSession,
+  diskChangedWorkspaceFileSession,
   newWorkspaceFileSession,
   rememberWorkspaceFileSession,
 } from "../workspaceDrafts";
@@ -924,9 +924,10 @@ function workspaceImage(): Tiling {
   });
 }
 
-/** Two safety states side by side. The conflict is seeded through the same
- * durable transition production uses after a rejected write; the truncated
- * file still arrives through the real preview IPC fixture. */
+/** Two safety states side by side. The disk-change state is seeded through the
+ * same durable transition production uses after a rejected write or a poll
+ * sighting; the truncated file still arrives through the real preview IPC
+ * fixture. */
 function workspaceEdge(): Tiling {
   const path = "fixtures/conflict.ts";
   const disk = "export const revision = 'disk';\n";
@@ -935,6 +936,7 @@ function workspaceEdge(): Tiling {
       path,
       text: disk,
       revision: `fixture:a:${path}:1`,
+      fingerprint: `fixture:fp:a:${path}:1`,
       bytes: new TextEncoder().encode(disk).length,
       truncated: false,
     },
@@ -943,7 +945,7 @@ function workspaceEdge(): Tiling {
   rememberWorkspaceFileSession(
     "a",
     path,
-    conflictedWorkspaceFileSession({
+    diskChangedWorkspaceFileSession({
       ...base,
       text: `${disk}export const localDraft = true;\n`,
     }),

@@ -221,8 +221,19 @@ export type WorkspaceTextView = {
   path: string;
   text: string;
   revision: string;
+  /** Metadata identity (length + mtime) of the file at this read/write. The
+   *  editor compares `workspace_stat` against it to notice the disk moved. */
+  fingerprint: string;
   bytes: number;
   truncated: boolean;
+};
+
+/** Mirrors `commands.rs::WorkspaceStatView`: the metadata answer the editor
+ *  polls, in the same `fingerprint` vocabulary as `WorkspaceTextView`. */
+export type WorkspaceStatView = {
+  path: string;
+  fingerprint: string;
+  bytes: number;
 };
 
 /** Mirrors `commands.rs::WorkspaceBinaryView`: a file the viewer draws rather

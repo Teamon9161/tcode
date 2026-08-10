@@ -54,10 +54,24 @@ pub struct TextFile {
     pub text: String,
     /// Revision of the whole file, including bytes beyond a returned prefix.
     pub revision: String,
+    /// Cheap identity of the file as it was at this read/write: length plus
+    /// last-modified time. Not content-based, so a poll can recompute it from
+    /// metadata alone; the editor compares it to notice the disk moved.
+    pub fingerprint: String,
     /// Size of the whole file in bytes.
     pub bytes: u64,
     /// Whether `text` is a prefix rather than the entire file.
     pub truncated: bool,
+}
+
+/// The metadata answer for change detection: everything the editor needs to
+/// tell whether a file moved since it last read it, without paying for the
+/// file's bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceStat {
+    pub path: String,
+    pub fingerprint: String,
+    pub bytes: u64,
 }
 
 /// A regular file returned as bytes rather than as text.
@@ -282,8 +296,11 @@ impl Workspace {
     /// from the response but still contributes to its revision.
     pub fn read(&self, path: &str) -> Result<TextFile, WorkspaceError> {
         let full = self.resolve_existing_file(path)?;
-        let bytes = fs::read(&full).map_err(|source| WorkspaceError::Io { path: full, source })?;
-        self.text_response(path, bytes)
+        let bytes = fs::read(&full).map_err(|source| WorkspaceError::Io {
+            path: full.clone(),
+            source,
+        })?;
+        self.text_response(&full, path, bytes)
     }
 
     /// Read a regular file as bytes, for the views that draw a file rather than
@@ -316,6 +333,26 @@ impl Workspace {
         })
     }
 
+    /// Whether the file named by a wire path has changed since it was last
+    /// read or written.
+    ///
+    /// The fingerprint is metadata, not content — that is the whole point of
+    /// the separate answer: the editor polls it every couple of seconds, and a
+    /// content hash would make each poll a full read of files it may not even
+    /// display.
+    pub fn stat(&self, path: &str) -> Result<WorkspaceStat, WorkspaceError> {
+        let full = self.resolve_existing_file(path)?;
+        let metadata = fs::metadata(&full).map_err(|source| WorkspaceError::Io {
+            path: full.clone(),
+            source,
+        })?;
+        Ok(WorkspaceStat {
+            path: path.to_owned(),
+            fingerprint: fingerprint_of(&metadata),
+            bytes: metadata.len(),
+        })
+    }
+
     /// Replace a regular text file only if `revision` still identifies its
     /// current complete contents.
     pub fn write(
@@ -324,6 +361,31 @@ impl Workspace {
         text: &str,
         revision: &str,
     ) -> Result<TextFile, WorkspaceError> {
+        let (full, current) = self.prepare_write(path, text)?;
+        let current_revision = revision_of(&current);
+        if revision != current_revision {
+            return Err(WorkspaceError::RevisionConflict {
+                current: current_revision,
+            });
+        }
+        self.write_bytes(&full, path, text)
+    }
+
+    /// Replace a regular text file regardless of what is on disk now.
+    ///
+    /// This is the explicit "overwrite" answer to a file that changed outside
+    /// the editor: the reader has seen the revision check's warning and chose
+    /// to lose the other side's changes anyway. Every other validation —
+    /// containment, NUL, UTF-8 — still runs.
+    pub fn write_force(&self, path: &str, text: &str) -> Result<TextFile, WorkspaceError> {
+        let (full, _current) = self.prepare_write(path, text)?;
+        self.write_bytes(&full, path, text)
+    }
+
+    /// The shared start of both write paths: the text must be writable, and
+    /// the current bytes are needed either to compare revisions or to know the
+    /// write is even valid before anything is truncated.
+    fn prepare_write(&self, path: &str, text: &str) -> Result<(PathBuf, Vec<u8>), WorkspaceError> {
         if text.as_bytes().contains(&0) {
             return Err(WorkspaceError::BinaryFile(path.to_owned()));
         }
@@ -333,20 +395,20 @@ impl Workspace {
             source,
         })?;
         self.validate_text(path, &current)?;
-        let current_revision = revision_of(&current);
-        if revision != current_revision {
-            return Err(WorkspaceError::RevisionConflict {
-                current: current_revision,
-            });
-        }
+        Ok((full, current))
+    }
 
+    fn write_bytes(&self, full: &Path, path: &str, text: &str) -> Result<TextFile, WorkspaceError> {
         OpenOptions::new()
             .write(true)
             .truncate(true)
-            .open(&full)
+            .open(full)
             .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
-            .map_err(|source| WorkspaceError::Io { path: full, source })?;
-        self.text_response(path, text.as_bytes().to_vec())
+            .map_err(|source| WorkspaceError::Io {
+                path: full.to_path_buf(),
+                source,
+            })?;
+        self.text_response(full, path, text.as_bytes().to_vec())
     }
 
     /// Create a UTF-8 text file under `parent` (`None` is the root).
@@ -368,9 +430,12 @@ impl Workspace {
             .create_new(true)
             .open(&full)
             .and_then(|mut file| std::io::Write::write_all(&mut file, text.as_bytes()))
-            .map_err(|source| WorkspaceError::Io { path: full, source })?;
+            .map_err(|source| WorkspaceError::Io {
+                path: full.clone(),
+                source,
+            })?;
         let path = join_wire(&parent_wire, name);
-        self.text_response(&path, text.as_bytes().to_vec())
+        self.text_response(&full, &path, text.as_bytes().to_vec())
     }
 
     /// Create a directory under `parent` (`None` is the root).
@@ -555,16 +620,26 @@ impl Workspace {
         std::str::from_utf8(bytes).map_err(|_| WorkspaceError::InvalidUtf8(path.to_owned()))
     }
 
-    fn text_response(&self, path: &str, bytes: Vec<u8>) -> Result<TextFile, WorkspaceError> {
+    fn text_response(
+        &self,
+        full: &Path,
+        path: &str,
+        bytes: Vec<u8>,
+    ) -> Result<TextFile, WorkspaceError> {
         let text = self.validate_text(path, &bytes)?;
         let mut end = text.len().min(TEXT_READ_LIMIT);
         while end > 0 && !text.is_char_boundary(end) {
             end -= 1;
         }
+        let metadata = fs::metadata(full).map_err(|source| WorkspaceError::Io {
+            path: full.to_path_buf(),
+            source,
+        })?;
         Ok(TextFile {
             path: path.to_owned(),
             text: text[..end].to_owned(),
             revision: revision_of(&bytes),
+            fingerprint: fingerprint_of(&metadata),
             bytes: bytes.len() as u64,
             truncated: bytes.len() > TEXT_READ_LIMIT,
         })
@@ -711,6 +786,19 @@ fn revision_of(bytes: &[u8]) -> String {
     format!("{hash:016x}-{}", bytes.len())
 }
 
+/// A cheap identity of a file's current contents for change detection: length
+/// plus last-modified time. Unlike [`revision_of`], it needs only metadata, so
+/// a poll can compare it without reading the file.
+fn fingerprint_of(metadata: &Metadata) -> String {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos().to_string())
+        .unwrap_or_else(|| "?".to_owned());
+    format!("{}-{}", metadata.len(), modified)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -852,6 +940,59 @@ mod tests {
         assert_eq!(renamed.path, "src/lib.rs");
         workspace.delete("src/lib.rs").unwrap();
         workspace.delete("src").unwrap();
+    }
+
+    #[test]
+    fn stat_fingerprint_changes_when_the_file_does_and_not_otherwise() {
+        let (root, workspace) = workspace();
+        workspace.create_file(None, "watch.txt", "one").unwrap();
+
+        let first = workspace.stat("watch.txt").unwrap();
+        assert_eq!(first.path, "watch.txt");
+        assert_eq!(first.bytes, 3);
+        assert_eq!(
+            workspace.stat("watch.txt").unwrap().fingerprint,
+            first.fingerprint
+        );
+
+        fs::write(root.path().join("watch.txt"), "two words").unwrap();
+        let second = workspace.stat("watch.txt").unwrap();
+        // Different length too, so the assertion holds even on filesystems
+        // whose mtime granularity is coarser than the gap between the writes.
+        assert_ne!(second.fingerprint, first.fingerprint);
+
+        assert!(matches!(
+            workspace.stat("missing.txt"),
+            Err(WorkspaceError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn write_force_overwrites_a_revision_the_plain_write_refuses() {
+        let (root, workspace) = workspace();
+        workspace.create_file(None, "shared.txt", "disk").unwrap();
+        let stale = workspace.read("shared.txt").unwrap();
+
+        // The disk moves behind the reader's back, exactly like an agent edit.
+        fs::write(root.path().join("shared.txt"), "agent change").unwrap();
+        assert!(matches!(
+            workspace.write("shared.txt", "my change", &stale.revision),
+            Err(WorkspaceError::RevisionConflict { .. })
+        ));
+
+        let overwritten = workspace.write_force("shared.txt", "my change").unwrap();
+        assert_eq!(overwritten.text, "my change");
+        assert_eq!(
+            fs::read_to_string(root.path().join("shared.txt")).unwrap(),
+            "my change"
+        );
+
+        // The force path still refuses what the plain path refuses.
+        fs::write(root.path().join("bin.dat"), b"text\0data").unwrap();
+        assert!(matches!(
+            workspace.write_force("bin.dat", "nope"),
+            Err(WorkspaceError::BinaryFile(_))
+        ));
     }
 
     #[test]

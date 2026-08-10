@@ -35,6 +35,7 @@ const textView = (path: string, text: string, truncated = false): WorkspaceTextV
   path,
   text,
   revision: `revision:${path}`,
+  fingerprint: `fingerprint:${path}`,
   bytes: text.length,
   truncated,
 });
@@ -58,6 +59,15 @@ function editor(): EditorView | null {
   return dom ? EditorView.findFromDOM(dom) : null;
 }
 
+/** One stat poll tick: advance the 2s interval and flush its promise. */
+async function poll() {
+  await act(async () => {
+    vi.advanceTimersByTime(2000);
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
 beforeEach(() => {
   serial += 1;
   session = `workspace-file-test-${serial}`;
@@ -71,6 +81,7 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+  vi.useRealTimers();
 });
 
 describe("WorkspaceFile routes live workspace content", () => {
@@ -139,7 +150,7 @@ describe("WorkspaceFile routes live workspace content", () => {
     expect(container.querySelector("iframe")).toBeNull();
   });
 
-  it("preserves the draft and disables overwrite after a revision conflict", async () => {
+  it("lands a rejected save in the disk-change banner instead of a dead end", async () => {
     mocks.invoke.mockImplementation((command: string) =>
       command === "workspace_read_text"
         ? Promise.resolve(textView("conflict.txt", "saved"))
@@ -155,8 +166,11 @@ describe("WorkspaceFile routes live workspace content", () => {
     });
 
     expect(editor()?.state.doc.toString()).toBe("saved draft");
-    expect(container.textContent).toContain("changed outside this editor");
+    expect(container.textContent).toContain("changed on disk");
     expect(controls?.saveDisabled).toBe(true);
+    // The banner is the way out: overwrite is offered beside the draft.
+    expect(container.querySelector(".workspace-file-disk")).not.toBeNull();
+    expect(container.textContent).toContain("Overwrite the file");
   });
 
   it("renders a truncated prefix read-only and never enables save", async () => {
@@ -185,8 +199,99 @@ describe("WorkspaceFile routes live workspace content", () => {
     mocks.invoke.mockClear();
     await draw("notes.txt");
 
-    expect(mocks.invoke).not.toHaveBeenCalled();
+    // The draft comes back from the module-lifetime session, not from disk —
+    // the one call a remount is allowed is the stat that re-checks the disk
+    // baseline the session was read against.
+    expect(mocks.invoke).not.toHaveBeenCalledWith("workspace_read_text", expect.anything());
+    expect(mocks.invoke).toHaveBeenCalledWith("workspace_stat", { session, path: "notes.txt" });
     expect(editor()?.state.doc.toString()).toBe("saved draft");
     expect(editor()?.state.selection.main.head).toBe(2);
+  });
+});
+
+describe("WorkspaceFile notices the disk moved", () => {
+  it("asks a clean editor to reload when the file changed on disk", async () => {
+    vi.useFakeTimers();
+    // A file the agent rewrote: the read's fingerprint and the stat's no longer
+    // match, the way a real rewrite moves both mtime and length.
+    mocks.invoke.mockImplementation((command: string, args: { path?: string }) => {
+      const path = typeof args?.path === "string" ? args.path : "watch.txt";
+      return command === "workspace_stat"
+        ? Promise.resolve({ path, fingerprint: "fingerprint-moved", bytes: 5 })
+        : Promise.resolve(textView(path, "one"));
+    });
+    await draw("watch.txt");
+    expect(container.querySelector(".workspace-file-disk")).toBeNull();
+
+    await poll();
+
+    expect(container.querySelector(".workspace-file-disk")).not.toBeNull();
+    expect(container.textContent).toContain("changed on disk");
+    // Clean editor: no overwrite answer, because there is nothing to overwrite
+    // with — reload is the whole answer.
+    expect(container.textContent).toContain("Reload");
+    expect(container.textContent).not.toContain("Overwrite");
+  });
+
+  it("offers overwrite when both sides changed, and it clears the banner", async () => {
+    vi.useFakeTimers();
+    mocks.invoke.mockImplementation(
+      (command: string, args: { path?: string; text?: string }) => {
+        const path = typeof args?.path === "string" ? args.path : "both.txt";
+        if (command === "workspace_stat") {
+          return Promise.resolve({ path, fingerprint: "fingerprint-moved", bytes: 12 });
+        }
+        return Promise.resolve(textView(path, typeof args?.text === "string" ? args.text : "saved"));
+      },
+    );
+    await draw("both.txt");
+    act(() => editor()!.dispatch({ changes: { from: 5, insert: " draft" } }));
+
+    await poll();
+    expect(container.querySelector(".workspace-file-disk")).not.toBeNull();
+    expect(container.textContent).toContain("Overwrite the file");
+
+    mocks.invoke.mockClear();
+    await act(async () => {
+      container
+        .querySelector<HTMLButtonElement>(".workspace-file-disk .btn-primary")!
+        .click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(mocks.invoke).toHaveBeenCalledWith(
+      "workspace_write_text",
+      expect.objectContaining({ path: "both.txt", force: true }),
+    );
+    expect(container.querySelector(".workspace-file-disk")).toBeNull();
+    expect(editor()?.state.doc.toString()).toBe("saved draft");
+  });
+
+  it("reloads from the disk answer and drops the banner", async () => {
+    vi.useFakeTimers();
+    const changed = { path: "notes.txt", fingerprint: "fingerprint-moved", bytes: 9 };
+    mocks.invoke.mockImplementation((command: string, args: { path?: string }) => {
+      const path = typeof args?.path === "string" ? args.path : "notes.txt";
+      if (command === "workspace_stat") return Promise.resolve(changed);
+      if (command === "workspace_read_text") {
+        return Promise.resolve(textView(path, "agent rewrite"));
+      }
+      return Promise.resolve(textView(path, ""));
+    });
+    await draw("notes.txt");
+    act(() => editor()!.dispatch({ changes: { from: 5, insert: " draft" } }));
+
+    await poll();
+    expect(container.textContent).toContain("Reload and discard my changes");
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".workspace-file-disk .btn")!.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(container.querySelector(".workspace-file-disk")).toBeNull();
+    expect(editor()?.state.doc.toString()).toBe("agent rewrite");
   });
 });

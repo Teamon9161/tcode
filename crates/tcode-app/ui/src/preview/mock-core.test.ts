@@ -3,7 +3,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { invoke, resetPreviewFixtures } from "./mock-core";
 
 type Entry = { name: string; path: string; kind: "file" | "directory" | "link" };
-type TextView = { path: string; text: string; revision: string; bytes: number; truncated: boolean };
+type TextView = {
+  path: string;
+  text: string;
+  revision: string;
+  fingerprint: string;
+  bytes: number;
+  truncated: boolean;
+};
 type BinaryView = { path: string; url: string; bytes: number };
 
 const call = <T>(command: string, args: Record<string, unknown>) => invoke<T>(command, args);
@@ -85,6 +92,7 @@ describe("preview workspace fixture", () => {
   it("returns deterministic revisions and exposes the post-save remote conflict", async () => {
     const loaded = await call<TextView>("workspace_read_text", { session: "a", path: "README.md" });
     expect(loaded.revision).toBe("fixture:a:README.md:1");
+    expect(loaded.fingerprint).toBe("fixture:fp:a:README.md:1");
 
     const saved = await call<TextView>("workspace_write_text", {
       session: "a",
@@ -100,5 +108,17 @@ describe("preview workspace fixture", () => {
       text: `${saved.text}\nsecond local edit`,
       revision: saved.revision,
     })).rejects.toThrow("revision conflict");
+
+    // The overwrite answer skips the revision guard, exactly as the backend's
+    // `write_force` does — the fixture has to stay the acceptance surface.
+    const forced = await call<TextView>("workspace_write_text", {
+      session: "a",
+      path: "README.md",
+      text: "overwritten",
+      revision: "stale",
+      force: true,
+    });
+    expect(forced.text).toBe("overwritten");
+    expect(forced.fingerprint).toBe("fixture:fp:a:README.md:4");
   });
 });

@@ -5,10 +5,11 @@ import { FileBody } from "./FileBody";
 import { Prose } from "./Prose";
 import { useSession } from "./session";
 import { basename, workspaceRouteOf } from "./show";
-import type { WorkspaceBinaryView, WorkspaceTextView } from "./types";
+import type { WorkspaceBinaryView, WorkspaceStatView, WorkspaceTextView } from "./types";
 import {
+  canForceSaveWorkspaceText,
   canSaveWorkspaceText,
-  conflictedWorkspaceFileSession,
+  diskChangedWorkspaceFileSession,
   newWorkspaceFileSession,
   reloadNeedsConfirmation,
   reloadedWorkspaceFileSession,
@@ -28,6 +29,11 @@ import {
   type WorkspaceEditorSnapshot,
 } from "./WorkspaceEditor";
 
+/** How often the open file is checked against disk. The check is metadata-only
+ *  (`workspace_stat`), so a poll is the same order of cost as a stat — and it
+ *  is how the editor notices an agent rewriting the file out from under it. */
+const POLL_MS = 2000;
+
 /** One file from the live workspace tree. Unlike a `show` artifact, every UTF-8
  * non-Markdown file opens as source; Markdown alone has preview/edit modes, and
  * image extensions remain render-only. `workspaceRouteOf` owns that distinction
@@ -43,6 +49,15 @@ export function WorkspaceFile({ path }: { path: string }) {
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const preview = useRef<HTMLDivElement>(null);
+  // The poll reads the current baseline from a ref rather than from `document`
+  // in a closure, so the 2s interval never has to be re-created on every
+  // keystroke; `saving` is read the same way so a poll cannot flag the disk
+  // for the write that is in flight (the save refreshes the baseline itself).
+  const documentRef = useRef<WorkspaceFileSession | null>(null);
+  const savingRef = useRef(false);
+  useEffect(() => {
+    documentRef.current = document;
+  });
 
   const remember = useCallback(
     (next: WorkspaceFileSession) => {
@@ -97,20 +112,55 @@ export function WorkspaceFile({ path }: { path: string }) {
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
 
+  // The disk-change check. Runs while the file is shown; the immediate call
+  // covers a session that was cached by an earlier navigation, the interval the
+  // agent editing the file while it is on screen.
+  useEffect(() => {
+    if (route.load !== "text") return;
+    const check = () => {
+      const baseline = documentRef.current?.file.fingerprint;
+      if (!baseline || savingRef.current) return;
+      invoke<WorkspaceStatView>("workspace_stat", { session, path })
+        .then((stat) => {
+          if (stat.fingerprint === baseline) return;
+          // The baseline guard drops a response that raced a save or reload:
+          // the file has since been re-read, so this sighting is stale.
+          setDocument((current) =>
+            current && !current.diskChanged && current.file.fingerprint === baseline
+              ? diskChangedWorkspaceFileSession(current)
+              : current,
+          );
+        })
+        .catch(() => {
+          // A transient read error is not worth a banner; the next poll retries.
+        });
+    };
+    check();
+    const id = setInterval(check, POLL_MS);
+    return () => clearInterval(id);
+  }, [path, route.load, session]);
+
   useLayoutEffect(() => {
     if (!document || document.mode !== "preview" || !preview.current) return;
     preview.current.scrollTop = document.previewScroll;
   }, [document?.generation, document?.mode]);
 
-  const reload = useCallback(() => {
-    if (
-      reloadNeedsConfirmation(dirty) &&
-      !window.confirm("Discard your unsaved changes and reload this file?")
-    ) {
-      return;
-    }
-    void read(true);
-  }, [dirty, read]);
+  // `confirmed` is the banner's reload button: the banner itself is the choice
+  // to discard, so it must not ask again. The header's refresh icon still asks
+  // whenever reloading would throw away edits.
+  const reload = useCallback(
+    (confirmed: boolean) => {
+      if (
+        !confirmed &&
+        reloadNeedsConfirmation(dirty) &&
+        !window.confirm("Discard your unsaved changes and reload this file?")
+      ) {
+        return;
+      }
+      void read(true);
+    },
+    [dirty, read],
+  );
 
   const changeMode = useCallback((mode: WorkspaceMode) => {
     if (!document || document.mode === mode) return;
@@ -139,63 +189,76 @@ export function WorkspaceFile({ path }: { path: string }) {
     [path, session],
   );
 
-  const save = useCallback(() => {
-    if (!document) return;
-    const submitted = document.text;
-    if (
-      !canSaveWorkspaceText({
-        dirty,
-        truncated: !document.complete,
-        conflicted: document.conflicted,
-      })
-    ) {
-      if (!document.complete) {
-        setFailure(
-          "This response is only the file prefix. It cannot be saved; reload cannot recover the full content, so use another editor for this file.",
-        );
+  // `force` is the banner's overwrite answer: write over whatever is on disk
+  // now, skipping the revision guard the reader was just told about. A
+  // revision conflict on a plain save lands in the same banner instead of a
+  // dead end — the file changed, and the choice is reload or overwrite.
+  const submit = useCallback(
+    (force: boolean) => {
+      if (!document) return;
+      const submitted = document.text;
+      const allowed = force
+        ? canForceSaveWorkspaceText({ dirty, truncated: !document.complete })
+        : canSaveWorkspaceText({
+            dirty,
+            truncated: !document.complete,
+            diskChanged: document.diskChanged,
+          });
+      if (!allowed) {
+        if (!document.complete) {
+          setFailure(
+            "This response is only the file prefix. It cannot be saved; reload cannot recover the full content, so use another editor for this file.",
+          );
+        }
+        return;
       }
-      return;
-    }
 
-    setSaving(true);
-    setFailure(null);
-    invoke<WorkspaceTextView>("workspace_write_text", {
-      session,
-      path,
-      text: submitted,
-      revision: document.file.revision,
-    })
-      .then((saved) => {
-        setDocument((current) => {
-          if (!current) return current;
-          const next = savedWorkspaceFileSession(current, saved, submitted);
-          rememberWorkspaceFileSession(session, path, next);
-          return next;
-        });
+      setSaving(true);
+      savingRef.current = true;
+      setFailure(null);
+      invoke<WorkspaceTextView>("workspace_write_text", {
+        session,
+        path,
+        text: submitted,
+        revision: document.file.revision,
+        force,
       })
-      .catch((error) => {
-        const message = String(error);
-        if (message.toLocaleLowerCase().includes("revision conflict")) {
+        .then((saved) => {
           setDocument((current) => {
             if (!current) return current;
-            const next = conflictedWorkspaceFileSession(current);
+            const next = savedWorkspaceFileSession(current, saved, submitted);
             rememberWorkspaceFileSession(session, path, next);
             return next;
           });
-          setFailure(null);
-        } else {
-          setFailure(`could not save this file: ${message}`);
-        }
-      })
-      .finally(() => setSaving(false));
-  }, [dirty, document, path, session]);
+        })
+        .catch((error) => {
+          const message = String(error);
+          if (!force && message.toLocaleLowerCase().includes("revision conflict")) {
+            setDocument((current) => {
+              if (!current) return current;
+              const next = diskChangedWorkspaceFileSession(current);
+              rememberWorkspaceFileSession(session, path, next);
+              return next;
+            });
+            setFailure(null);
+          } else {
+            setFailure(`could not save this file: ${message}`);
+          }
+        })
+        .finally(() => {
+          setSaving(false);
+          savingRef.current = false;
+        });
+    },
+    [dirty, document, path, session],
+  );
 
   const saveEnabled =
     document !== null &&
     canSaveWorkspaceText({
       dirty,
       truncated: !document.complete,
-      conflicted: document.conflicted,
+      diskChanged: document.diskChanged,
     });
   const editing = route.as === "editor" || document?.mode === "edit";
 
@@ -205,8 +268,8 @@ export function WorkspaceFile({ path }: { path: string }) {
       path,
       mode: route.as === "markdown" ? (document?.mode ?? "preview") : null,
       onMode: route.as === "markdown" ? changeMode : null,
-      onReload: reload,
-      onSave: route.load === "text" ? save : null,
+      onReload: () => reload(false),
+      onSave: route.load === "text" ? () => submit(false) : null,
       dirty,
       loading,
       saving,
@@ -221,10 +284,10 @@ export function WorkspaceFile({ path }: { path: string }) {
       reload,
       route.as,
       route.load,
-      save,
       saveEnabled,
       saving,
       session,
+      submit,
     ],
   );
   useWorkspaceFileControls(controls);
@@ -239,11 +302,33 @@ export function WorkspaceFile({ path }: { path: string }) {
         </p>
       )}
 
-      {document?.conflicted && (
-        <p className="workspace-file-conflict">
-          The file changed outside this editor. Reload to discard this draft and read the current
-          file; this editor will not overwrite it.
-        </p>
+      {document?.diskChanged && (
+        <div className="workspace-file-disk">
+          <p>
+            This file changed on disk.
+            {dirty
+              ? " Your edits are still here — reload to discard them, or overwrite the file."
+              : ""}
+          </p>
+          <div className="workspace-file-disk-actions">
+            <button type="button" className="btn" onClick={() => reload(true)}>
+              {dirty ? "Reload and discard my changes" : "Reload"}
+            </button>
+            {dirty && (
+              <button
+                type="button"
+                className="btn btn-primary"
+                onClick={() => submit(true)}
+                disabled={
+                  !canForceSaveWorkspaceText({ dirty, truncated: !document.complete }) ||
+                  saving
+                }
+              >
+                Overwrite the file
+              </button>
+            )}
+          </div>
+        </div>
       )}
 
       {failure && <p className="workspace-file-error">{failure}</p>}

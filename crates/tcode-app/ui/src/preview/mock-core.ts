@@ -274,8 +274,14 @@ type WorkspaceText = {
   path: string;
   text: string;
   revision: string;
+  fingerprint: string;
   bytes: number;
   truncated: boolean;
+};
+type WorkspaceStat = {
+  path: string;
+  fingerprint: string;
+  bytes: number;
 };
 type WorkspaceBinary = { path: string; url: string; bytes: number };
 
@@ -499,8 +505,26 @@ function textView(
     path,
     text,
     revision: revision(session, path, node.revision),
+    // Metadata identity in the real wire; the fixture ties it to the same
+    // revision number so a simulated collaborator write moves both.
+    fingerprint: `fixture:fp:${session}:${path}:${node.revision}`,
     bytes: node.totalBytes ?? new TextEncoder().encode(text).length,
     truncated: node.truncated ?? false,
+  };
+}
+
+/** The metadata answer the editor polls; revision-derived, like `textView`. */
+function statWorkspace(args: Record<string, unknown> | undefined): WorkspaceStat {
+  const [session, fixture] = workspaceFor(args);
+  const path = relativePath(args?.path, "path");
+  const node = fixture.nodes[path];
+  if (!node) throw new Error(`workspace path '${path}' does not exist`);
+  if (node.kind !== "file")
+    throw new Error(`workspace path '${path}' is not a regular file`);
+  return {
+    path,
+    fingerprint: `fixture:fp:${session}:${path}:${node.revision}`,
+    bytes: node.totalBytes ?? new TextEncoder().encode(node.text ?? "").length,
   };
 }
 
@@ -580,11 +604,12 @@ function writeWorkspace(
   const path = relativePath(args?.path, "path");
   const text = typeof args?.text === "string" ? args.text : null;
   const expected = typeof args?.revision === "string" ? args.revision : "";
+  const force = args?.force === true;
   const node = fixture.nodes[path];
   if (!node || node.kind !== "file")
     throw new Error(`workspace path '${path}' is not a regular file`);
   if (text === null) throw new Error("text must be a string");
-  if (expected !== revision(session, path, node.revision)) {
+  if (!force && expected !== revision(session, path, node.revision)) {
     throw new Error(
       `revision conflict: the file changed; re-read it before writing (current revision ${revision(session, path, node.revision)})`,
     );
@@ -903,6 +928,8 @@ export async function invoke<T>(
       ] as T;
     case "workspace_read_text":
       return readWorkspace(args) as T;
+    case "workspace_stat":
+      return statWorkspace(args) as T;
     case "workspace_read_binary":
       return readWorkspaceBinary(args) as T;
     case "workspace_write_text":

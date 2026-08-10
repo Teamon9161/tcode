@@ -18,7 +18,10 @@ export type WorkspaceFileSession = {
   editorState: EditorState | null;
   editorScroll: WorkspaceEditorPosition;
   previewScroll: number;
-  conflicted: boolean;
+  /** The disk no longer matches `file` — whether the editor noticed it by
+   *  polling, or a save's revision check reported it. The banner and its
+   *  reload/overwrite answers are the way out. */
+  diskChanged: boolean;
   /** Changes only when a confirmed reload must create a fresh EditorView and
    * sever the old undo chain. Saves intentionally leave it alone. */
   generation: number;
@@ -54,7 +57,7 @@ export function newWorkspaceFileSession(
     editorState: null,
     editorScroll: ZERO,
     previewScroll: 0,
-    conflicted: false,
+    diskChanged: false,
     generation: 0,
   };
 }
@@ -72,7 +75,7 @@ export function reloadedWorkspaceFileSession(
     text: file.text,
     complete: !file.truncated,
     editorState: null,
-    conflicted: false,
+    diskChanged: false,
     generation: current.generation + 1,
   };
 }
@@ -89,14 +92,16 @@ export function savedWorkspaceFileSession(
     ...current,
     file: { ...saved, text: submitted },
     complete: true,
-    conflicted: false,
+    diskChanged: false,
   };
 }
 
-export function conflictedWorkspaceFileSession(
+/** The polling check or a rejected write just told us the disk moved. The
+ * draft stays intact; the banner offers reload (discard) and overwrite. */
+export function diskChangedWorkspaceFileSession(
   current: WorkspaceFileSession,
 ): WorkspaceFileSession {
-  return { ...current, conflicted: true };
+  return { ...current, diskChanged: true };
 }
 
 export function workspaceFileDirty(value: WorkspaceFileSession): boolean {
@@ -112,13 +117,26 @@ export function reloadNeedsConfirmation(dirty: boolean): boolean {
 export function canSaveWorkspaceText({
   dirty,
   truncated,
-  conflicted,
+  diskChanged,
 }: {
   dirty: boolean;
   truncated: boolean;
-  conflicted: boolean;
+  diskChanged: boolean;
 }): boolean {
-  return dirty && !truncated && !conflicted;
+  return dirty && !truncated && !diskChanged;
+}
+
+/** The overwrite answer to a file that changed outside the editor: the reader
+ * explicitly chose to lose the other side's changes, so the disk-change guard
+ * is skipped — but a truncated prefix still must never become a write. */
+export function canForceSaveWorkspaceText({
+  dirty,
+  truncated,
+}: {
+  dirty: boolean;
+  truncated: boolean;
+}): boolean {
+  return dirty && !truncated;
 }
 
 function keyOf(session: string, path: string): string {

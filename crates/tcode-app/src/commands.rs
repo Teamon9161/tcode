@@ -23,7 +23,7 @@ use tcode_core::ContentBlock;
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
 use crate::projects::{self, ProjectInfo, StoredSession};
 use crate::state::{run_compact, run_turn, Supervisor};
-use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry};
+use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry, WorkspaceStat};
 
 /// A normalized image read from the system clipboard for the webview.
 ///
@@ -431,6 +431,7 @@ pub struct WorkspaceTextView {
     pub path: String,
     pub text: String,
     pub revision: String,
+    pub fingerprint: String,
     pub bytes: u64,
     pub truncated: bool,
 }
@@ -441,8 +442,28 @@ impl From<TextFile> for WorkspaceTextView {
             path: file.path,
             text: file.text,
             revision: file.revision,
+            fingerprint: file.fingerprint,
             bytes: file.bytes,
             truncated: file.truncated,
+        }
+    }
+}
+
+/// The metadata answer the editor polls to notice the disk moved: same
+/// `fingerprint` vocabulary as [`WorkspaceTextView`], without the bytes.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct WorkspaceStatView {
+    pub path: String,
+    pub fingerprint: String,
+    pub bytes: u64,
+}
+
+impl From<WorkspaceStat> for WorkspaceStatView {
+    fn from(stat: WorkspaceStat) -> Self {
+        Self {
+            path: stat.path,
+            fingerprint: stat.fingerprint,
+            bytes: stat.bytes,
         }
     }
 }
@@ -557,18 +578,40 @@ pub fn workspace_read_binary(
         .map_err(|error| error.to_string())
 }
 
-/// Write a UTF-8 text file when its revision still matches.
+/// The metadata answer the editor polls to notice the disk moved.
+pub fn workspace_stat(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+) -> Result<WorkspaceStatView, String> {
+    session_workspace(supervisor, &session)?
+        .stat(&path)
+        .map(WorkspaceStatView::from)
+        .map_err(|error| error.to_string())
+}
+
+/// Write a UTF-8 text file when its revision still matches — or, when `force`
+/// is set, regardless of what changed on disk. `force` is the "overwrite"
+/// answer the editor offers after telling the reader the file moved.
 pub fn workspace_write_text(
     supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
     text: String,
     revision: String,
+    force: bool,
 ) -> Result<WorkspaceTextView, String> {
-    session_workspace(supervisor, &session)?
-        .write(&path, &text, &revision)
-        .map(WorkspaceTextView::from)
-        .map_err(|error| error.to_string())
+    let workspace = session_workspace(supervisor, &session)?;
+    if force {
+        workspace
+            .write_force(&path, &text)
+            .map(WorkspaceTextView::from)
+    } else {
+        workspace
+            .write(&path, &text, &revision)
+            .map(WorkspaceTextView::from)
+    }
+    .map_err(|error| error.to_string())
 }
 
 /// Create an empty file or directory under the session workspace.
