@@ -207,3 +207,7 @@ loop {
 19. 浏览器窗格隐藏了,但是有打开页面,这时候拖动别的窗格宽度,浏览器页面会有一部分显示出来.
 20. Tool friction — browser.screenshot：报告的可访问性快照已确认多个 Vega canvas 图表正常渲染，但截图工具返回“nothing to draw / probably blank”。这使它无法用于画布图表的最终视觉核验。若截图能等待 canvas 完成绘制，或在失败时说明是后台标签限制，将能避免误报空白页面。
 21. browser visual inspection：预览页面的 accessibility snapshot 能读取完整界面和 “Settings” 按钮，但 browser.screenshot 对同一非空页面返回“nothing to draw”，点击后的 portal popover 也未出现在 snapshot 中。我的替代方式是以真实预览启动、构建和 detector 验证；最小改进是让浏览器工具对已 snapshot 成功的页面稳定返回像素截图，并能列出 portal/dialog 内容，便于完成桌面 UI 的视觉验收。
+22. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
+23. 文件显示器，一行长度超过窗口的时候要自动换行吧，而且最后最好视觉上留一行方便用户打空格。
+24. Capability gap — Browser 工作树运行时：functions.browser 始终连接当前旧 tcode 进程，编辑后的 browser.js 无法在不重启会话的情况下加载，因此它继续复现旧的 AX/screenshot 故障，不能验证刚构建的实现。此次只能改用真实 Electron fixture 和临时 Electron 截图脚本。最小改进是允许启动一个基于当前工作树的隔离 Browser runtime，或提供明确的 runtime build id 与 reload 操作。
+  Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存

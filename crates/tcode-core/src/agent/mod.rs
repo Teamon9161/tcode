@@ -138,6 +138,10 @@ pub enum AgentEvent {
         /// should keep showing only `preview`.
         content: String,
         is_error: bool,
+        /// Optional renderer-only association data from the tool. This field is
+        /// emitted to frontends but is never copied into the ledger result.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ui_metadata: Option<crate::tool::ToolUiMetadata>,
     },
     /// Reference context expanded from explicit `@path` markers immediately
     /// before a user entry is appended. The transcript keeps the concise marker;
@@ -1511,6 +1515,7 @@ impl Agent {
                     preview: preview(&output.content),
                     content: output.content.clone(),
                     is_error: output.is_error,
+                    ui_metadata: output.ui_metadata.clone(),
                 },
             )
             .await?;
@@ -1655,6 +1660,7 @@ impl Agent {
                     preview: preview(&output.content),
                     content: output.content.clone(),
                     is_error: output.is_error,
+                    ui_metadata: output.ui_metadata.clone(),
                 },
             )
             .await?;
@@ -2243,6 +2249,7 @@ impl Agent {
                     preview: preview(&output.content),
                     content: output.content.clone(),
                     is_error: output.is_error,
+                    ui_metadata: output.ui_metadata.clone(),
                 },
             )
             .await?;
@@ -2533,6 +2540,7 @@ impl Agent {
                     preview: preview(&output.content),
                     content: output.content.clone(),
                     is_error: output.is_error,
+                    ui_metadata: output.ui_metadata.clone(),
                 },
             )
             .await?;
@@ -2793,6 +2801,7 @@ impl Agent {
     ) -> ToolOutput {
         let is_error = output.is_error;
         let images = output.images;
+        let ui_metadata = output.ui_metadata;
         let tool_impl = self.tool(tool);
         let shortened = (!is_error)
             .then(|| tool_impl?.compact_success_output(input, &output.content))
@@ -2828,6 +2837,7 @@ impl Agent {
                 content,
                 is_error,
                 images,
+                ui_metadata,
             };
         }
         let mut blobs = session.tool_ctx.blobs.lock().expect("blobs lock");
@@ -2836,6 +2846,7 @@ impl Agent {
             content: blobs.gate(tool, content, is_error),
             is_error,
             images,
+            ui_metadata,
         }
     }
 
@@ -2872,6 +2883,7 @@ impl Agent {
             ),
             is_error: output.is_error,
             images: output.images,
+            ui_metadata: output.ui_metadata,
         }
     }
 
@@ -3205,6 +3217,34 @@ mod event_wire_tests {
         assert_eq!(nested["type"], "ToolStart");
         assert_eq!(nested["data"]["input"]["path"], "src/main.rs");
         assert_eq!(nested["data"]["input"]["replace_all"], false);
+    }
+
+    #[test]
+    fn tool_ui_metadata_is_structured_and_optional() {
+        let tagged = AgentEvent::ToolEnd {
+            call_id: "call-1".into(),
+            name: "browser".into(),
+            preview: "opened".into(),
+            content: "opened".into(),
+            is_error: false,
+            ui_metadata: Some(crate::tool::ToolUiMetadata::BrowserTab { id: "tab-7".into() }),
+        };
+        let wire = serde_json::to_value(tagged).unwrap();
+        assert_eq!(
+            wire["data"]["ui_metadata"],
+            serde_json::json!({ "kind": "browser_tab", "id": "tab-7" })
+        );
+
+        let untagged = AgentEvent::ToolEnd {
+            call_id: "call-2".into(),
+            name: "read".into(),
+            preview: "read".into(),
+            content: "read".into(),
+            is_error: false,
+            ui_metadata: None,
+        };
+        let wire = serde_json::to_value(untagged).unwrap();
+        assert!(wire["data"].get("ui_metadata").is_none());
     }
 
     /// `ToolBatchStart` is the one variant carrying tuples. They cross as JSON

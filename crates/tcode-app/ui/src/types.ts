@@ -24,6 +24,9 @@ export const BROWSER_NAVIGATED = "tcode://browser-navigated";
  *  `browser_open` returns) add by id and ignore a duplicate, so neither has to
  *  arrive first. */
 export const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
+/** Mirrors `electron/browser.js::BROWSER_THUMBNAIL`. Renderer-only, transient,
+ *  and revisioned so an older capture can never replace a newer page. */
+export const BROWSER_THUMBNAIL = "tcode://browser-thumbnail";
 
 /** Mirrors `terminal::TERMINAL_OUTPUT`. Chunks of one terminal's output,
  *  coalesced on the backend — see `terminal.rs` for why a flood must not be one
@@ -54,6 +57,15 @@ export type Navigated = { id: string; url: string; title: string };
  * asked for it.
  */
 export type TabOpened = { id: string; url: string; agent: boolean };
+
+export type BrowserThumbnail = {
+  id: string;
+  url: string;
+  data: string;
+  width: number;
+  height: number;
+  revision: number;
+};
 
 /**
  * A chunk of a terminal's output.
@@ -91,6 +103,7 @@ export type AgentEvent =
         preview: string;
         content: string;
         is_error: boolean;
+        ui_metadata?: { kind: "browser_tab"; id: string };
       };
     }
   | {

@@ -1822,7 +1822,9 @@ mod tests {
         let state: ModelState = toml::from_str("terminal_shell = \"\"").unwrap();
         assert_eq!(state.terminal_shell.as_deref(), Some(""));
         assert!(!state.is_empty());
-        assert!(toml::to_string(&state).unwrap().contains("terminal_shell = \"\""));
+        assert!(toml::to_string(&state)
+            .unwrap()
+            .contains("terminal_shell = \"\""));
     }
 
     #[test]

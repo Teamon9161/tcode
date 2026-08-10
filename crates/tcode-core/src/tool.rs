@@ -33,6 +33,17 @@ pub struct Compacted {
     pub by: String,
 }
 
+/// Structured display metadata carried beside a tool result.
+///
+/// This is deliberately absent from `ContentBlock::ToolResult`: frontends may
+/// use it to associate transient UI state with a call, but neither the provider
+/// ledger nor the model should ever receive it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolUiMetadata {
+    BrowserTab { id: String },
+}
+
 #[derive(Debug, Clone)]
 pub struct ToolOutput {
     pub content: String,
@@ -41,6 +52,9 @@ pub struct ToolOutput {
     /// its result, e.g. `read` on a screenshot. Providers that can't carry an
     /// image in a tool result degrade to the text alone.
     pub images: Vec<crate::types::ContentBlock>,
+    /// Renderer-only association data. It travels on `AgentEvent::ToolEnd` and
+    /// nowhere in the model-facing result.
+    pub ui_metadata: Option<ToolUiMetadata>,
 }
 
 impl ToolOutput {
@@ -49,6 +63,7 @@ impl ToolOutput {
             content: content.into(),
             is_error: false,
             images: Vec::new(),
+            ui_metadata: None,
         }
     }
     /// Tool errors are written FOR the model: always include what it
@@ -58,11 +73,17 @@ impl ToolOutput {
             content: content.into(),
             is_error: true,
             images: Vec::new(),
+            ui_metadata: None,
         }
     }
     /// Attach image blocks to a successful output.
     pub fn with_images(mut self, images: Vec<crate::types::ContentBlock>) -> Self {
         self.images = images;
+        self
+    }
+    /// Attach renderer-only metadata to a successful output.
+    pub fn with_ui_metadata(mut self, metadata: ToolUiMetadata) -> Self {
+        self.ui_metadata = Some(metadata);
         self
     }
 }

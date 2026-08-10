@@ -29,7 +29,9 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
-use tcode_core::{AutoSafety, ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{
+    AutoSafety, ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput, ToolUiMetadata,
+};
 
 use crate::sidecar::Shell;
 
@@ -597,6 +599,10 @@ const ACTIONS: &str =
     "open, navigate, snapshot, screenshot, click, type, scroll, wait, back, forward, reload, close";
 
 impl BrowserTool {
+    fn output(tab: &str, content: impl Into<String>) -> ToolOutput {
+        ToolOutput::ok(content).with_ui_metadata(ToolUiMetadata::BrowserTab { id: tab.into() })
+    }
+
     async fn dispatch(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, String> {
         match action_of(input) {
             Some("open") => {
@@ -606,10 +612,13 @@ impl BrowserTool {
                 // the strip draws this tab as one it did not open.
                 let id = self.call("browser_open", json!({ "agent": true })).await?;
                 let id = id.as_str().unwrap_or_default();
-                Ok(ToolOutput::ok(format!(
+                Ok(Self::output(
+                    id,
+                    format!(
                     "opened browser tab {id} (blank, in the background — the user's screen did \
                      not change). Use it as `tab` for the other actions."
-                )))
+                ),
+                ))
             }
             Some("navigate") => {
                 let tab = tab_of(input)?;
@@ -620,10 +629,13 @@ impl BrowserTool {
                 self.call("browser_navigate", json!({ "id": tab, "url": url }))
                     .await?;
                 self.saw(tab, &url);
-                Ok(ToolOutput::ok(format!(
+                Ok(Self::output(
+                    tab,
+                    format!(
                     "tab {tab} was sent to {url}. Take a snapshot to see where it ended up — a \
                      redirect or a client-side route can land somewhere else."
-                )))
+                ),
+                ))
             }
             Some("snapshot") => {
                 let tab = tab_of(input)?;
@@ -635,11 +647,14 @@ impl BrowserTool {
                 let (body, omitted) = render(&nodes);
 
                 if body.is_empty() {
-                    return Ok(ToolOutput::ok(format!(
+                    return Ok(Self::output(
+                        tab,
+                        format!(
                         "tab {tab} is at {url} and its accessibility tree is empty — the page is \
                          probably still loading, or it is a blank tab. `action=\"wait\"` on this \
                          tab, then snapshot again."
-                    )));
+                    ),
+                    ));
                 }
                 let mut header = format!("tab {tab} — {url}");
                 if !title.is_empty() {
@@ -648,7 +663,10 @@ impl BrowserTool {
                 if omitted > 0 {
                     header.push_str(&format!("  [{omitted} further elements not shown]"));
                 }
-                Ok(ToolOutput::ok(format!("{header}\n\n{}", fence(url, &body))))
+                Ok(Self::output(
+                    tab,
+                    format!("{header}\n\n{}", fence(url, &body)),
+                ))
             }
             Some("screenshot") => {
                 let tab = tab_of(input)?;
@@ -679,10 +697,12 @@ impl BrowserTool {
                     shot["width"].as_i64().unwrap_or(0),
                     shot["height"].as_i64().unwrap_or(0),
                 );
-                Ok(ToolOutput::ok(note).with_images(vec![ContentBlock::Image {
-                    media_type: "image/png".into(),
-                    data: data.into(),
-                }]))
+                Ok(
+                    Self::output(tab, note).with_images(vec![ContentBlock::Image {
+                        media_type: "image/png".into(),
+                        data: data.into(),
+                    }]),
+                )
             }
             Some(action @ ("click" | "type")) => {
                 let tab = tab_of(input)?;
@@ -694,10 +714,13 @@ impl BrowserTool {
                         json!({ "id": tab, "ref": element, "host": host }),
                     )
                     .await?;
-                    return Ok(ToolOutput::ok(format!(
+                    return Ok(Self::output(
+                        tab,
+                        format!(
                         "clicked ref_{element} on {host}. The page may have changed — snapshot \
                          tab {tab} to see what it says now."
-                    )));
+                    ),
+                    ));
                 }
                 let text = input["text"]
                     .as_str()
@@ -708,7 +731,9 @@ impl BrowserTool {
                     json!({ "id": tab, "ref": element, "host": host, "text": text, "submit": submit }),
                 )
                 .await?;
-                Ok(ToolOutput::ok(format!(
+                Ok(Self::output(
+                    tab,
+                    format!(
                     "ref_{element} on {host} now reads \"{text}\"{}. Snapshot tab {tab} to see \
                      the result.",
                     if submit {
@@ -716,7 +741,8 @@ impl BrowserTool {
                     } else {
                         ""
                     }
-                )))
+                ),
+                ))
             }
             Some("scroll") => {
                 let tab = tab_of(input)?;
@@ -731,9 +757,12 @@ impl BrowserTool {
                     args["ref"] = json!(ref_of(input)?);
                 }
                 self.call("browser_scroll", args).await?;
-                Ok(ToolOutput::ok(format!(
-                    "scrolled {direction}. Snapshot tab {tab} to read what came into view."
-                )))
+                Ok(Self::output(
+                    tab,
+                    format!(
+                        "scrolled {direction}. Snapshot tab {tab} to read what came into view."
+                    ),
+                ))
             }
             Some("wait") => {
                 let tab = tab_of(input)?;
@@ -745,18 +774,21 @@ impl BrowserTool {
                 let settled = self.call("browser_wait", args).await?["settled"]
                     .as_bool()
                     .unwrap_or(false);
-                Ok(ToolOutput::ok(match (settled, phrase) {
-                    (true, Some(text)) => format!("\"{text}\" is on the page in tab {tab}."),
-                    (true, None) => format!("tab {tab} has stopped loading."),
-                    (false, Some(text)) => format!(
+                Ok(Self::output(
+                    tab,
+                    match (settled, phrase) {
+                        (true, Some(text)) => format!("\"{text}\" is on the page in tab {tab}."),
+                        (true, None) => format!("tab {tab} has stopped loading."),
+                        (false, Some(text)) => format!(
                         "waited, and \"{text}\" never appeared in tab {tab}. Snapshot it — the \
                          page may say something you did not expect."
                     ),
-                    (false, None) => format!(
+                        (false, None) => format!(
                         "tab {tab} was still loading when the wait ran out. Snapshot it anyway; \
                          a page that streams may already have what you need."
                     ),
-                }))
+                    },
+                ))
             }
             Some(action @ ("back" | "forward")) => {
                 let tab = tab_of(input)?;
@@ -768,22 +800,24 @@ impl BrowserTool {
                 // direction: the next action that needs a host asks for a
                 // snapshot instead of acting on a stale one.
                 self.forget(tab);
-                Ok(ToolOutput::ok(format!(
-                    "went {action} in tab {tab}. Snapshot it to see where that landed."
-                )))
+                Ok(Self::output(
+                    tab,
+                    format!("went {action} in tab {tab}. Snapshot it to see where that landed."),
+                ))
             }
             Some("reload") => {
                 let tab = tab_of(input)?;
                 self.call("browser_reload", json!({ "id": tab })).await?;
-                Ok(ToolOutput::ok(format!(
-                    "reloaded tab {tab}. Snapshot it once it has settled."
-                )))
+                Ok(Self::output(
+                    tab,
+                    format!("reloaded tab {tab}. Snapshot it once it has settled."),
+                ))
             }
             Some("close") => {
                 let tab = tab_of(input)?;
                 self.call("browser_close", json!({ "id": tab })).await?;
                 self.forget(tab);
-                Ok(ToolOutput::ok(format!("closed browser tab {tab}")))
+                Ok(Self::output(tab, format!("closed browser tab {tab}")))
             }
             Some(other) => Err(format!(
                 "'{other}' is not a browser action. Use one of: {ACTIONS}."

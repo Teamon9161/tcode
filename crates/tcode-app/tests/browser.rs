@@ -94,7 +94,10 @@ async fn opening_a_tab_does_not_ask_for_the_screen() {
     let out = run(&tool, json!({ "action": "open" })).await;
 
     assert!(!out.is_error, "{}", out.content);
-    assert!(out.content.contains("tab-7"), "{}", out.content);
+    assert_eq!(
+        out.ui_metadata,
+        Some(tcode_core::ToolUiMetadata::BrowserTab { id: "tab-7".into() })
+    );
     let (method, args) = shell.calls().remove(0);
     assert_eq!(method, "browser_open");
     assert_eq!(

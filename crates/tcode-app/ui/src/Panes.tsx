@@ -119,6 +119,10 @@ export type PaneContext = {
    *  `onMention` it writes a draft; unlike it, the pane has no session of its
    *  own, so which conversation is read off the focused pane. */
   onHandOverTab: (tab: string) => void;
+  /** Reveal exactly the native Browser tab associated with a transcript group.
+   *  Unknown or closed capabilities do nothing; they never fall back to the
+   *  tab that happens to be current. */
+  onRevealBrowserTab: (tab: string) => void;
   /** Show, focus or hide the window's terminals — the three states `Mod+J`
    *  steps through (`toggleTerminal` in `layout.ts`). */
   onToggleTerminal: () => void;
@@ -760,6 +764,7 @@ function SessionPane({
           rewindTargets={state.rewindTargets}
           onOpen={openHere}
           onRewind={askRewind}
+          onRevealBrowserTab={context.onRevealBrowserTab}
         />
 
         {/* Docked, not modal: every other pane stays readable while this one

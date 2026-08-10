@@ -26,7 +26,9 @@ import {
 import {
   BROWSER_NAVIGATED,
   BROWSER_TAB_OPENED,
+  BROWSER_THUMBNAIL,
   type AgentEvent,
+  type BrowserThumbnail,
   type Navigated,
   type TabOpened,
 } from "./types";
@@ -72,14 +74,28 @@ type Snapshot = {
    *  A link followed elsewhere waits for this rather than racing the pane's
    *  first `browser_open`. */
   live: boolean;
+  /** Latest renderer-only page previews, keyed by exact tab capability. */
+  thumbnails: ReadonlyMap<string, BrowserThumbnail>;
 };
 
 const watchers = new Set<() => void>();
 
-let state: Snapshot = { tabs: NO_TABS, failure: null, live: false };
+let state: Snapshot = {
+  tabs: NO_TABS,
+  failure: null,
+  live: false,
+  thumbnails: new Map(),
+};
 /** The pane's rectangle, as last measured. */
 let bounds: { x: number; y: number; width: number; height: number } | null = null;
 let listening = false;
+/** Browser calls awaiting `ToolEnd`, including their session so a late event
+ *  cannot re-assign a tab after that conversation has closed. */
+const pendingBrowserCalls = new Map<
+  string,
+  { session: string; tab?: string; action: string }
+>();
+const closedSessions = new Set<string>();
 
 // ------------------------------------------------------------------ the store
 
@@ -96,6 +112,16 @@ export function snapshot(): Snapshot {
   return state;
 }
 
+/** Referentially stable until this exact tab receives a newer preview. */
+export function thumbnail(id: string): BrowserThumbnail | undefined {
+  return state.thumbnails.get(id);
+}
+
+/** Referentially stable until this exact tab navigates or is closed. */
+export function tab(id: string) {
+  return state.tabs.list.find((candidate) => candidate.id === id);
+}
+
 function publish(next: Partial<Snapshot>) {
   state = { ...state, ...next };
   for (const watcher of watchers) watcher();
@@ -108,7 +134,9 @@ function failed(what: string, error: unknown) {
 /** Tests only. The app has one browser for its lifetime, so nothing else has
  *  any business emptying this. */
 export function reset() {
-  state = { tabs: NO_TABS, failure: null, live: false };
+  state = { tabs: NO_TABS, failure: null, live: false, thumbnails: new Map() };
+  pendingBrowserCalls.clear();
+  closedSessions.clear();
   bounds = null;
   listening = false;
   resetBrowserVisibility();
@@ -217,6 +245,7 @@ export async function open(url?: string) {
 }
 
 export function select(id: string) {
+  if (!state.tabs.list.some((tab) => tab.id === id)) return;
   publish({ tabs: selectTab(state.tabs, id) });
   invoke("browser_select", { id })
     .then(settle)
@@ -243,15 +272,23 @@ export function step(delta: number) {
  * guessing wrong leaves the strip describing a browser that is not there.
  */
 export function close(id: string) {
-  const wasCurrent = state.tabs.current === id;
   invoke<boolean>("browser_close", { id })
     .then((gone) => {
-      publish({ tabs: gone ? closeTab(state.tabs, id) : blankTab(state.tabs, id), failure: null });
-      // Closing the current tab hands the front to its neighbour, and a native
-      // webview only comes forward when it is told to.
-      if (gone && wasCurrent && state.tabs.current) select(state.tabs.current);
+      if (gone) dropClosedTab(id);
+      else publish({ tabs: blankTab(state.tabs, id), failure: null });
     })
     .catch((error) => failed("cannot close that tab", error));
+}
+
+function dropClosedTab(id: string) {
+  const wasCurrent = state.tabs.current === id;
+  const tabs = closeTab(state.tabs, id);
+  const thumbnails = new Map(state.thumbnails);
+  thumbnails.delete(id);
+  publish({ tabs, thumbnails, failure: null });
+  // The shell deliberately leaves nothing current after closing its selected
+  // native view. The store chooses the neighbour and must tell the shell too.
+  if (wasCurrent && tabs.current) select(tabs.current);
 }
 
 /** Whether closing this tab would leave the browser with nothing to show —
@@ -354,6 +391,16 @@ function listenOnce() {
   listen<TabOpened>(BROWSER_TAB_OPENED, (event) => {
     publish({ tabs: knownTab(state.tabs, event.payload.id, event.payload.agent) });
   }).catch((error) => failed("cannot follow the browser", error));
+
+  listen<BrowserThumbnail>(BROWSER_THUMBNAIL, (event) => {
+    const preview = event.payload;
+    if (!state.tabs.list.some((tab) => tab.id === preview.id)) return;
+    const prior = state.thumbnails.get(preview.id);
+    if (prior && prior.revision >= preview.revision) return;
+    const thumbnails = new Map(state.thumbnails);
+    thumbnails.set(preview.id, preview);
+    publish({ thumbnails });
+  }).catch((error) => failed("cannot follow browser previews", error));
 }
 
 /** Start following the browser for the window's lifetime. Idempotent, and the
@@ -373,15 +420,10 @@ export function watch() {
  * session-tagged is the event stream. So ownership is read off the one thing
  * that is both session-tagged and tab-naming: the call's own arguments.
  *
- * `input.tab`, and never the result text. The arguments are structured data the
- * model sent; the result is a sentence written for a model to read, and parsing
- * our own prose back out of it would make an English wording load-bearing.
- *
- * The consequence is that `open` itself cannot claim a tab — its input has no
- * `tab` yet — so a just-opened tab is unattributed until its owner does
- * anything at all with it. That is a second or two, and it is honest: nobody
- * has claimed it. `agent` is already true throughout, so the strip is never
- * pretending the tab is the user's.
+ * Calls with an input tab are claimed immediately. `open` has no such input,
+ * so its successful structured `ToolEnd.ui_metadata` supplies the id without
+ * parsing model-facing prose. The same start/end pair lets a successful model
+ * `close` remove exactly that tab from the strip; failures leave it untouched.
  */
 /**
  * A conversation was closed. Its tabs are not.
@@ -392,6 +434,7 @@ export function watch() {
  * out), applied to the one new thing Phase 2 added: an owner.
  */
 export function disown(session: string) {
+  closedSessions.add(session);
   const tabs = disownedTabs(state.tabs, session);
   if (tabs !== state.tabs) publish({ tabs });
 }
@@ -417,12 +460,54 @@ export function handOverText(id: string): string | null {
 }
 
 export function claim(session: string, event: AgentEvent) {
-  if (event.type !== "ToolStart") return;
-  const call = event.data as { name?: string; input?: { tab?: unknown } };
-  if (call.name !== "browser") return;
-  const tab = call.input?.tab;
-  if (typeof tab !== "string" || !tab) return;
-  const tabs = ownedTab(state.tabs, tab, session);
+  if (event.type === "ToolStart") {
+    const call = event.data as {
+      call_id?: string;
+      name?: string;
+      input?: { tab?: unknown; action?: unknown };
+    };
+    if (call.name !== "browser" || closedSessions.has(session)) return;
+    const tab = call.input?.tab;
+    if (call.call_id) {
+      pendingBrowserCalls.set(call.call_id, {
+        session,
+        tab: typeof tab === "string" && tab ? tab : undefined,
+        action: typeof call.input?.action === "string" ? call.input.action : "",
+      });
+    }
+    if (typeof tab !== "string" || !tab) return;
+    const tabs = ownedTab(state.tabs, tab, session);
+    if (tabs !== state.tabs) publish({ tabs });
+    return;
+  }
+
+  if (event.type !== "ToolEnd") return;
+  const result = event.data as {
+    call_id?: string;
+    name?: string;
+    is_error?: boolean;
+    ui_metadata?: { kind?: string; id?: unknown };
+  };
+  if (result.name !== "browser") return;
+  const pending = result.call_id ? pendingBrowserCalls.get(result.call_id) : undefined;
+  if (result.call_id) pendingBrowserCalls.delete(result.call_id);
+  if (result.is_error) return;
+
+  const tagged = result.ui_metadata;
+  const tab = tagged?.kind === "browser_tab" && typeof tagged.id === "string"
+    ? tagged.id
+    : pending?.tab;
+  if (!tab) return;
+  if (pending?.action === "close") {
+    dropClosedTab(tab);
+    return;
+  }
+  const known = knownTab(state.tabs, tab, true);
+  if (closedSessions.has(session) || (pending && pending.session !== session)) {
+    if (known !== state.tabs) publish({ tabs: known });
+    return;
+  }
+  const tabs = ownedTab(known, tab, session);
   if (tabs !== state.tabs) publish({ tabs });
 }
 

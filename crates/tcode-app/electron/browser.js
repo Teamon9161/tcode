@@ -55,6 +55,9 @@ const BROWSER_NAVIGATED = "tcode://browser-navigated";
  * is event-sourced and the strip learns about a tab whoever made it.
  */
 const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
+/** A transient low-resolution page preview for the app renderer. Never sent to
+ *  the sidecar, ledger or model. Mirrors `ui/src/types.ts`. */
+const BROWSER_THUMBNAIL = "tcode://browser-thumbnail";
 
 /**
  * How long any one CDP command may take.
@@ -67,14 +70,29 @@ const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
  * error can name the command.
  */
 const CDP_TIMEOUT = 15_000;
+/** A background tab only needs a few frames, not a second call-sized timeout. */
+const RENDER_TIMEOUT = 3_000;
+
+const FORCE_LAYOUT = `document.documentElement &&
+  document.documentElement.getBoundingClientRect(); undefined`;
 
 function withTimeout(promise, ms, what) {
-  return Promise.race([
-    promise,
-    new Promise((_resolve, reject) =>
-      setTimeout(() => reject(new Error(`${what} did not answer within ${ms}ms`)), ms),
-    ),
-  ]);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} did not answer within ${ms}ms`)),
+      ms,
+    );
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 /** Where a tab starts. Deliberately not a search engine or a vendor page: the
@@ -103,10 +121,12 @@ const PARTITION = "persist:tcode-browser";
  * tests, and is deliberately not reimplemented here.
  */
 function browserVerbs(
-  { window, emit, resolveUrl },
+  { window, appView, emit, resolveUrl },
   {
     WebContentsView = NativeWebContentsView,
     session = nativeSession,
+    renderTimeout = RENDER_TIMEOUT,
+    thumbnailDelay = 120,
   } = {},
 ) {
   // A page in a tab can ask for the camera, the microphone, geolocation or
@@ -281,12 +301,162 @@ function browserVerbs(
     for (const tab of tabs) tab.view.setVisible(shown && tab.id === current);
   };
 
-  /** Apply visibility first and geometry last. Showing a native child can make
-   *  Electron allocate it at remembered bounds, so every path that may reveal
-   *  the current tab ends with its newest rectangle. */
+  /** Apply visibility first and geometry last. A current browser tab belongs
+   *  above the app renderer; background render recovery temporarily puts a tab
+   *  below it, so selecting that tab must also restore its native z-order. */
   const syncCurrent = () => {
     restack();
-    if (shown && current) place(find(current));
+    if (shown && current) {
+      const view = find(current);
+      window.contentView.addChildView(view);
+      place(view);
+    }
+  };
+
+  /**
+   * Give a background tab a compositor frame without showing it over the app.
+   *
+   * A WebContentsView hidden from birth has a live DOM and accessibility target,
+   * but Electron 43 gives it no capture surface. `capturePage` options and
+   * background throttling do not create that first frame. A visible child does,
+   * so the target is placed at real bounds and made visible below the app
+   * renderer. A selected browser sibling is briefly detached first because
+   * Electron/Viz rejects capture while that sibling remains in the native tree;
+   * detaching does not destroy or navigate it. The app still hides every target
+   * pixel and the selection itself never changes.
+   * Afterwards the tab returns to its ordinary hidden state, and neither
+   * `current` nor `shown` changes.
+   *
+   * Calls are serialized because two simultaneous warm-ups would otherwise
+   * reorder and hide each other's views. The queue survives a failed call.
+   */
+  let renderQueue = Promise.resolve();
+  const rendered = (id, work, { before = true, after = false } = {}) => {
+    const run = async () => {
+      const view = find(id);
+      const contents = view.webContents;
+      const background = !shown || current !== id;
+      const state = () => {
+        const bounds = typeof view.getBounds === "function" ? view.getBounds() : rect;
+        return `url=${contents.getURL() || "no page"}, bounds=${bounds.width}x${bounds.height}` +
+          `@${bounds.x},${bounds.y}, current=${current || "none"}, paneVisible=${shown}`;
+      };
+      const paint = async (when) => {
+        try {
+          await withTimeout(
+            contents.executeJavaScript(FORCE_LAYOUT),
+            renderTimeout,
+            `browser ${when} layout`,
+          );
+          const until = Date.now() + renderTimeout;
+          let last;
+          do {
+            try {
+              const remaining = Math.max(1, until - Date.now());
+              const probe = await withTimeout(
+                contents.capturePage(),
+                remaining,
+                `browser ${when} frame`,
+              );
+              if (!probe.isEmpty()) return;
+              last = new Error(`browser ${when} frame was empty`);
+            } catch (error) {
+              last = error;
+            }
+            if (Date.now() < until) {
+              await new Promise((resolve) => setTimeout(resolve, 50));
+            }
+          } while (Date.now() < until);
+          throw last;
+        } catch (error) {
+          throw new Error(`could not render that browser tab (${state()}): ${error.message}`);
+        }
+      };
+
+      place(view);
+      if (!background) return work(view);
+
+      if (!appView) throw new Error("the app renderer is unavailable for background capture");
+      const cover = shown && current ? find(current) : null;
+      if (cover) window.contentView.removeChildView(cover);
+      window.contentView.addChildView(view, 0);
+      window.contentView.addChildView(appView);
+      view.setVisible(true);
+
+      try {
+        if (before) await paint("initial");
+        const answer = await work(view);
+        if (after) await paint("result");
+        return answer;
+      } finally {
+        if (background) syncCurrent();
+      }
+    };
+
+    const call = renderQueue.then(run, run);
+    renderQueue = call.then(() => undefined, () => undefined);
+    return call;
+  };
+
+  /**
+   * Ask for a fresh transient page preview without making the Browser action
+   * wait for it. Requests coalesce per tab; a revision that finishes after a
+   * newer request is discarded rather than repainting the transcript with an
+   * older page. Failures are intentionally silent here: the action already has
+   * its own authoritative result, while a thumbnail is optional renderer state.
+   */
+  const thumbnailState = new Map();
+  const requestThumbnail = (id) => {
+    let state = thumbnailState.get(id);
+    if (!state) {
+      state = { requested: 0, timer: null, running: false };
+      thumbnailState.set(id, state);
+    }
+    state.requested += 1;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = setTimeout(() => {
+      state.timer = null;
+      void publishThumbnail(id, state);
+    }, thumbnailDelay);
+  };
+
+  const publishThumbnail = async (id, state) => {
+    if (state.running) return;
+    state.running = true;
+    try {
+      for (;;) {
+        if (thumbnailState.get(id) !== state) break;
+        const revision = state.requested;
+        let preview;
+        try {
+          preview = await rendered(id, async (view) => {
+            let image = await withTimeout(
+              view.webContents.capturePage(),
+              renderTimeout,
+              "browser thumbnail",
+            );
+            if (image.isEmpty()) throw new Error("browser thumbnail was empty");
+            if (image.getSize().width > 720) image = image.resize({ width: 720 });
+            return {
+              id,
+              url: view.webContents.getURL(),
+              data: image.toPNG().toString("base64"),
+              width: image.getSize().width,
+              height: image.getSize().height,
+              revision,
+            };
+          });
+        } catch {
+          if (state.requested === revision) break;
+          continue;
+        }
+        if (thumbnailState.get(id) !== state || state.requested !== revision) continue;
+        emit(BROWSER_THUMBNAIL, preview);
+        break;
+      }
+    } finally {
+      state.running = false;
+    }
   };
 
   function create(id) {
@@ -302,12 +472,14 @@ function browserVerbs(
     });
 
     const contents = view.webContents;
-    const report = (title) =>
+    const report = (title) => {
       emit(BROWSER_NAVIGATED, {
         id,
         url: contents.getURL(),
         title: title ?? "",
       });
+      requestThumbnail(id);
+    };
 
     // Three events for two facts. A navigation and the title it later resolves
     // to are separate events for the same page rather than a correction — the
@@ -331,6 +503,10 @@ function browserVerbs(
     });
 
     view.setVisible(false);
+    // Bounds must exist before the first navigation. A hidden-from-birth view
+    // loaded at zero size can finish with a live DOM but no layout/capture
+    // surface, and no later capture option repairs that lifecycle.
+    place(view);
     window.contentView.addChildView(view);
     contents.loadURL(HOME).catch(() => {});
     return view;
@@ -389,6 +565,7 @@ function browserVerbs(
       find(args.id);
       current = args.id;
       syncCurrent();
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -419,12 +596,19 @@ function browserVerbs(
     },
 
     async browser_navigate(args) {
-      const view = find(args.id);
       // The backend decides what the string means. `localhost:5173` is http and
       // `github.com` is https, and those rules have tests attached to them in
-      // exactly one place (`crate::address`).
+      // exactly one place (`crate::address`). Keep the target compositing under
+      // the app until its new document has painted; loading a background view
+      // while it stays hidden is the lifecycle that produced healthy-but-blank
+      // loopback pages.
       const url = await resolveUrl(args.url);
-      await view.webContents.loadURL(url);
+      await rendered(
+        args.id,
+        (view) => view.webContents.loadURL(url),
+        { before: false, after: true },
+      );
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -439,11 +623,13 @@ function browserVerbs(
      *  direction. */
     browser_step(args) {
       find(args.id).webContents.navigationHistory.goToOffset(args.delta);
+      requestThumbnail(args.id);
       return null;
     },
 
     browser_reload(args) {
       find(args.id).webContents.reload();
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -467,14 +653,26 @@ function browserVerbs(
      * time somebody clicks a link.
      */
     async browser_snapshot(args) {
-      const contents = find(args.id).webContents;
-      await cdp(args.id, "Accessibility.enable");
-      const tree = await cdp(args.id, "Accessibility.getFullAXTree");
-      return {
-        url: contents.getURL(),
-        title: contents.getTitle(),
-        nodes: tree.nodes ?? [],
-      };
+      return rendered(args.id, async (view) => {
+        const contents = view.webContents;
+        await cdp(args.id, "Accessibility.enable");
+        const tree = await cdp(args.id, "Accessibility.getFullAXTree");
+        const nodes = tree.nodes ?? [];
+        const url = contents.getURL();
+        if (nodes.length === 0 && url !== HOME) {
+          const bounds = typeof view.getBounds === "function" ? view.getBounds() : rect;
+          throw new Error(
+            `the accessibility tree stayed empty after render recovery for ${url}; ` +
+              `bounds=${bounds.width}x${bounds.height}@${bounds.x},${bounds.y}, ` +
+              `current=${current || "none"}, paneVisible=${shown}`,
+          );
+        }
+        return {
+          url,
+          title: contents.getTitle(),
+          nodes,
+        };
+      });
     },
 
     /**
@@ -488,14 +686,18 @@ function browserVerbs(
      */
     async browser_click(args) {
       onHost(args.id, args.host);
-      const at = await onNode(args.id, args.ref, CENTER, [true]);
-      if (!at.width || !at.height) {
-        throw new Error(`ref_${args.ref} has no size on screen — it is hidden or collapsed`);
-      }
-      const where = { x: at.x, y: at.y, button: "left", clickCount: 1 };
-      await cdp(args.id, "Input.dispatchMouseEvent", { type: "mouseMoved", ...where });
-      await cdp(args.id, "Input.dispatchMouseEvent", { type: "mousePressed", ...where });
-      await cdp(args.id, "Input.dispatchMouseEvent", { type: "mouseReleased", ...where });
+      await rendered(args.id, async () => {
+        const at = await onNode(args.id, args.ref, CENTER, [true]);
+        if (!at.width || !at.height) {
+          throw new Error(`ref_${args.ref} has no size on screen — it is hidden or collapsed`);
+        }
+        const where = { x: at.x, y: at.y, button: "left", clickCount: 1 };
+        await cdp(args.id, "Input.dispatchMouseEvent", { type: "mouseMoved", ...where });
+        await cdp(args.id, "Input.dispatchMouseEvent", { type: "mousePressed", ...where });
+        await cdp(args.id, "Input.dispatchMouseEvent", { type: "mouseReleased", ...where });
+        return null;
+      }, { after: true });
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -515,25 +717,29 @@ function browserVerbs(
      */
     async browser_type(args) {
       onHost(args.id, args.host);
-      await onNode(
-        args.id,
-        args.ref,
-        `function () {
-          this.focus();
-          if (typeof this.select === "function") this.select();
-        }`,
-      );
-      await cdp(args.id, "Input.insertText", { text: args.text });
-      if (args.submit === true) {
-        const key = {
-          key: "Enter",
-          code: "Enter",
-          windowsVirtualKeyCode: 13,
-          nativeVirtualKeyCode: 13,
-        };
-        await cdp(args.id, "Input.dispatchKeyEvent", { type: "keyDown", text: "\r", ...key });
-        await cdp(args.id, "Input.dispatchKeyEvent", { type: "keyUp", ...key });
-      }
+      await rendered(args.id, async () => {
+        await onNode(
+          args.id,
+          args.ref,
+          `function () {
+            this.focus();
+            if (typeof this.select === "function") this.select();
+          }`,
+        );
+        await cdp(args.id, "Input.insertText", { text: args.text });
+        if (args.submit === true) {
+          const key = {
+            key: "Enter",
+            code: "Enter",
+            windowsVirtualKeyCode: 13,
+            nativeVirtualKeyCode: 13,
+          };
+          await cdp(args.id, "Input.dispatchKeyEvent", { type: "keyDown", text: "\r", ...key });
+          await cdp(args.id, "Input.dispatchKeyEvent", { type: "keyUp", ...key });
+        }
+        return null;
+      }, { after: true });
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -549,14 +755,18 @@ function browserVerbs(
         left: { deltaX: -step, deltaY: 0 },
       }[args.direction];
       if (!by) throw new Error(`'${args.direction}' is not a direction`);
-      let at = { x: 8, y: 8 };
-      if (args.ref) at = await onNode(args.id, args.ref, CENTER, [false]);
-      await cdp(args.id, "Input.dispatchMouseEvent", {
-        type: "mouseWheel",
-        x: at.x,
-        y: at.y,
-        ...by,
-      });
+      await rendered(args.id, async () => {
+        let at = { x: 8, y: 8 };
+        if (args.ref) at = await onNode(args.id, args.ref, CENTER, [false]);
+        await cdp(args.id, "Input.dispatchMouseEvent", {
+          type: "mouseWheel",
+          x: at.x,
+          y: at.y,
+          ...by,
+        });
+        return null;
+      }, { after: true });
+      requestThumbnail(args.id);
       return null;
     },
 
@@ -576,65 +786,67 @@ function browserVerbs(
      * run it.
      */
     async browser_wait(args) {
-      const contents = find(args.id).webContents;
-      const limit = Math.min(Math.max(args.timeoutMs || 10000, 500), 30000);
-      const until = Date.now() + limit;
-      let quiet = 0;
-      for (;;) {
-        if (args.text) {
-          const seen = await cdp(args.id, "Runtime.evaluate", {
-            expression: `!!document.body && document.body.innerText.includes(${JSON.stringify(
-              args.text,
-            )})`,
-            returnByValue: true,
-          });
-          if (seen.result && seen.result.value === true) return { settled: true };
-        } else {
-          quiet = contents.isLoading() ? 0 : quiet + 1;
-          if (quiet >= 2) return { settled: true };
+      return rendered(args.id, async (view) => {
+        const contents = view.webContents;
+        const limit = Math.min(Math.max(args.timeoutMs || 10000, 500), 30000);
+        const until = Date.now() + limit;
+        let quiet = 0;
+        for (;;) {
+          if (args.text) {
+            const seen = await cdp(args.id, "Runtime.evaluate", {
+              expression: `!!document.body && document.body.innerText.includes(${JSON.stringify(
+                args.text,
+              )})`,
+              returnByValue: true,
+            });
+            if (seen.result && seen.result.value === true) return { settled: true };
+          } else {
+            quiet = contents.isLoading() ? 0 : quiet + 1;
+            if (quiet >= 2) return { settled: true };
+          }
+          if (Date.now() >= until) return { settled: false };
+          await new Promise((resolve) => setTimeout(resolve, 250));
         }
-        if (Date.now() >= until) return { settled: false };
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      }
+      });
     },
 
     /**
      * A picture of the tab, whether or not anyone can see it.
      *
-     * **`capturePage` and not `Page.captureScreenshot`**, and that choice is the
-     * whole reason this works on a hidden tab. The CDP command wants a
-     * compositor frame and a hidden `WebContentsView` is not producing any, so
-     * it answers roughly every other call and hangs in between — measured three
-     * times over, three shots each (`../AGENT-BROWSER.md`). Electron's own
-     * capture takes a different path and came back 9 times out of 9 on a view
-     * that was `setVisible(false)`, at the right size, with the right bytes.
-     *
-     * So the design that was written for this — briefly make the tab visible
-     * underneath the current one, shoot, hide it again — is not needed and is
-     * not here. Nothing on screen changes because nothing on screen is touched.
+     * `capturePage`, not CDP `Page.captureScreenshot`: the latter still hangs
+     * intermittently when a tab is hidden. Electron's capture is reliable once
+     * the current document has produced a compositor frame. A view that was
+     * hidden before its first load is the missing case the original 9/9 probe
+     * did not measure, so `rendered` creates that frame under the app renderer
+     * before this call.
      *
      * Narrowed if the pane is wide, because the cost of an image is its
      * dimensions and a 2560-pixel screenshot buys a model nothing a 1400-pixel
      * one does not.
      */
     async browser_screenshot(args) {
-      const contents = find(args.id).webContents;
-      let image = await withTimeout(contents.capturePage(), CDP_TIMEOUT, "capturePage");
-      if (image.isEmpty()) {
-        throw new Error(
-          "that tab had nothing to draw — it is probably still loading, or blank",
-        );
-      }
-      const size = image.getSize();
-      if (size.width > 1400) {
-        image = image.resize({ width: 1400 });
-      }
-      return {
-        url: contents.getURL(),
-        data: image.toPNG().toString("base64"),
-        width: image.getSize().width,
-        height: image.getSize().height,
-      };
+      return rendered(args.id, async (view) => {
+        const contents = view.webContents;
+        let image = await withTimeout(contents.capturePage(), CDP_TIMEOUT, "capturePage");
+        if (image.isEmpty()) {
+          const bounds = typeof view.getBounds === "function" ? view.getBounds() : rect;
+          throw new Error(
+            `capturePage returned an empty image after render recovery for ` +
+              `${contents.getURL() || "no page"}; bounds=${bounds.width}x${bounds.height}` +
+              `@${bounds.x},${bounds.y}, current=${current || "none"}, paneVisible=${shown}`,
+          );
+        }
+        const size = image.getSize();
+        if (size.width > 1400) {
+          image = image.resize({ width: 1400 });
+        }
+        return {
+          url: contents.getURL(),
+          data: image.toPNG().toString("base64"),
+          width: image.getSize().width,
+          height: image.getSize().height,
+        };
+      });
     },
 
     /** Close one tab, and answer whether the view is gone.
@@ -645,6 +857,9 @@ function browserVerbs(
     browser_close(args) {
       const at = tabs.findIndex((tab) => tab.id === args.id);
       if (at < 0) throw new Error("that browser tab is not open");
+      const pendingThumbnail = thumbnailState.get(args.id);
+      if (pendingThumbnail?.timer) clearTimeout(pendingThumbnail.timer);
+      thumbnailState.delete(args.id);
       const [tab] = tabs.splice(at, 1);
       window.contentView.removeChildView(tab.view);
       // Detached before the contents go, because `close()` on a webContents
@@ -670,4 +885,10 @@ function browserVerbs(
   };
 }
 
-module.exports = { browserVerbs, PARTITION, BROWSER_NAVIGATED, BROWSER_TAB_OPENED };
+module.exports = {
+  browserVerbs,
+  PARTITION,
+  BROWSER_NAVIGATED,
+  BROWSER_TAB_OPENED,
+  BROWSER_THUMBNAIL,
+};

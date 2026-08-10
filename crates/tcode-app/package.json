@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node scripts/prestart.js && electron .",
     "test:shell": "node --test electron/*.test.js",
+    "test:browser": "electron scripts/browser-electron-fixture.js",
     "stage:sidecar": "node scripts/stage-sidecar.js",
     "dist": "electron-builder",
     "dist:win": "electron-builder --win --publish=never",

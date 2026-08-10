@@ -31,6 +31,7 @@ import { inTerminal, MOD } from "./keys";
 import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
 import { handOverText } from "./webHost";
+import { revealBrowserTab } from "./browserReveal";
 import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
 import { cwdForTerminal } from "./terminal";
 import { sessionTitle, type FoundSession } from "./railData";
@@ -522,6 +523,12 @@ export function Workspace({
     },
     [onTiling],
   );
+  const revealBrowser = useCallback(
+    (tab: string) => {
+      revealBrowserTab(tab, onTiling, () => setExpanded(null));
+    },
+    [onTiling],
+  );
   // The one control that *asks* for a direction, as opposed to `dirFor`
   // guessing one when a pane opens. It acts on the seam rather than on either
   // pane, which is why the handle rides on the divider and this takes a divider
@@ -562,6 +569,7 @@ export function Workspace({
       onToggleWorkspace: toggleWorkspace,
       onOpenBrowser: openBrowser,
       onHandOverTab: handOverTab,
+      onRevealBrowserTab: revealBrowser,
       onToggleTerminal: openTerminal,
       terminalCwd,
       onOpenUrl: openUrl,
@@ -604,6 +612,7 @@ export function Workspace({
       toggleWorkspace,
       openBrowser,
       handOverTab,
+      revealBrowser,
       openTerminal,
       terminalCwd,
       openUrl,

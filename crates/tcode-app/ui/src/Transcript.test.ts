@@ -18,6 +18,24 @@ const tool = (name: string, callId: string, input: unknown = {}): Extract<Block,
   input,
 });
 
+const browser = (
+  callId: string,
+  tab: string,
+  options: { error?: boolean; finished?: boolean } = {},
+): Extract<Block, { kind: "tool" }> => {
+  const block = tool("browser", callId, { action: "snapshot", tab });
+  if (options.finished === false) return block;
+  return {
+    ...block,
+    result: {
+      preview: options.error ? "failed" : "page",
+      content: options.error ? "failed" : "page",
+      isError: options.error ?? false,
+      uiMetadata: { kind: "browser_tab", id: tab },
+    },
+  };
+};
+
 describe("groupTranscriptBlocks", () => {
   it("collapses contiguous reads and searches into one exploration step", () => {
     const items = groupTranscriptBlocks([tool("read", "r1"), tool("grep", "g1"), tool("glob", "g2")]);
@@ -60,6 +78,68 @@ describe("groupTranscriptBlocks", () => {
 
     const separated = groupTranscriptBlocks([tool("shell", "s3"), tool("read", "r1"), tool("bash", "b2")]);
     expect(separated.map((item) => item.kind)).toEqual(["block", "exploration", "block"]);
+  });
+
+  it("groups only successful Browser calls for the same structured tab", () => {
+    const grouped = groupTranscriptBlocks([
+      browser("b1", "tab-a"),
+      browser("b2", "tab-a"),
+    ]);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]).toMatchObject({
+      kind: "browser",
+      tab: "tab-a",
+      blocks: [{ callId: "b1" }, { callId: "b2" }],
+    });
+
+    const splitTabs = groupTranscriptBlocks([
+      browser("b3", "tab-a"),
+      browser("b4", "tab-b"),
+    ]);
+    expect(splitTabs).toMatchObject([
+      { kind: "browser", tab: "tab-a" },
+      { kind: "browser", tab: "tab-b" },
+    ]);
+  });
+
+  it("keeps unresolved, failed and untagged Browser calls as direct boundaries", () => {
+    const untagged = {
+      ...browser("b3", "tab-a"),
+      result: { preview: "page", content: "page", isError: false },
+    };
+    const items = groupTranscriptBlocks([
+      browser("b1", "tab-a"),
+      browser("running", "tab-a", { finished: false }),
+      browser("b2", "tab-a"),
+      browser("failed", "tab-a", { error: true }),
+      untagged,
+    ]);
+
+    expect(items.map((item) => item.kind)).toEqual([
+      "browser",
+      "block",
+      "browser",
+      "block",
+      "block",
+    ]);
+  });
+
+  it("does not group Browser calls across prose or another tool", () => {
+    const items = groupTranscriptBlocks([
+      browser("b1", "tab-a"),
+      { kind: "assistant", text: "The dialog is open." },
+      browser("b2", "tab-a"),
+      tool("read", "r1"),
+      browser("b3", "tab-a"),
+    ]);
+
+    expect(items.map((item) => item.kind)).toEqual([
+      "browser",
+      "block",
+      "browser",
+      "exploration",
+      "browser",
+    ]);
   });
 
   // Reasoning used to be swept into the surrounding exploration group, from when

@@ -27,6 +27,38 @@ const ended = (callId: string, content: string): AgentEvent => ({
 
 const build = (events: AgentEvent[]): Block[] => events.reduce(applyEvent, [] as Block[]);
 
+describe("tool UI metadata", () => {
+  it("preserves structured Browser tab metadata outside result prose", () => {
+    const blocks = build([
+      {
+        type: "ToolStart",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          summary: "open",
+          input: { action: "open" },
+        },
+      },
+      {
+        type: "ToolEnd",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          preview: "opened browser tab prose-is-not-an-id",
+          content: "opened browser tab prose-is-not-an-id",
+          is_error: false,
+          ui_metadata: { kind: "browser_tab", id: "tab-structured" },
+        },
+      },
+    ]);
+
+    expect(blocks[0]).toMatchObject({
+      kind: "tool",
+      result: { uiMetadata: { kind: "browser_tab", id: "tab-structured" } },
+    });
+  });
+});
+
 describe("queued input", () => {
   it("records a delivered prompt as a normal user message", () => {
     const blocks = build([

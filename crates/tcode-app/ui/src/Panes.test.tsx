@@ -65,6 +65,7 @@ function paneContext(focus = "inspect-pane"): PaneContext {
     onToggleWorkspace: none,
     onOpenBrowser: none,
     onHandOverTab: none,
+    onRevealBrowserTab: none,
     onToggleTerminal: none,
     terminalCwd: "/project",
     onOpenUrl: none,

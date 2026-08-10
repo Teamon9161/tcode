@@ -82,7 +82,7 @@ function titleCase(name: string): string {
   return name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-export type TranscriptGroup = "exploration" | "changes" | "commands";
+export type TranscriptGroup = "exploration" | "changes" | "commands" | "browser";
 
 export type ToolView = {
   /** Change preview under the header, shown at the call site. */
@@ -216,7 +216,23 @@ function skillArguments(input: unknown): string | null {
   return typeof args === "string" && args.trim() ? args.trim() : null;
 }
 
+const browser: ToolView = {
+  summary: (input) => {
+    if (typeof input !== "object" || input === null) return null;
+    const call = input as Record<string, unknown>;
+    const action = typeof call.action === "string" ? call.action : "browser";
+    if (action === "navigate" && typeof call.url === "string") return call.url;
+    if ((action === "click" || action === "type") && typeof call.ref === "string") {
+      return `${action} ${call.ref}`;
+    }
+    return action;
+  },
+  preferInputSummary: true,
+  transcriptGroup: "browser",
+};
+
 const VIEWS: Record<string, ToolView> = {
+  browser,
   show: showing,
   edit: editing,
   write: editing,

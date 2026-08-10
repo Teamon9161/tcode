@@ -2190,6 +2190,56 @@ body.is-resizing {
   opacity: 1;
 }
 
+/* A Browser trace owns one live page preview below its ordinary disclosure.
+   It is a footer of the existing row, not another card and not another link:
+   the image is inert, while the one `PopOut` control reveals the exact native
+   tab. */
+.browser-preview {
+  min-width: 0;
+  margin: var(--s-2) 0 0 var(--s-4);
+}
+.browser-preview-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  min-width: 0;
+  margin-bottom: var(--s-1);
+}
+.browser-preview-url {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.browser-preview:hover .pop-out,
+.browser-preview:focus-within .pop-out {
+  opacity: 1;
+}
+.browser-preview-image,
+.browser-preview-empty {
+  display: block;
+  width: 100%;
+  max-height: 14rem;
+  border-radius: var(--r-sm);
+  background: var(--sunken);
+}
+.browser-preview-image {
+  height: auto;
+  object-fit: cover;
+  object-position: top;
+}
+.browser-preview-empty {
+  min-height: 8rem;
+  display: grid;
+  place-items: center;
+  color: var(--faint);
+  font-size: var(--text-xs);
+}
+
 /* Indented under its own head, aligned to the chevron's text rather than to the
    pane edge, so depth is legible without a single line being drawn. */
 .trace-body {

@@ -14,6 +14,7 @@ cargo build --bin tcode-sidecar           # 后端作为子进程；Electron 壳
 cargo test                                # 后端 + 集成测试
 npm ci                                    # Electron 壳、打包器与 updater（在 crate 根目录）
 npm run test:shell                        # 壳的纯 Node 路径/updater/staging 测试
+npm run test:browser                      # 真实 Electron + loopback compositor/canvas/portal 回归
 npm start                                 # 从 crate 根目录启动 Electron 开发壳；启动前自动构建过期产物
 ```
 
@@ -125,7 +126,7 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     **模型能点、能打字，而那一半是按 host 审批的**（`browser(interact <host>)`，click 与 type 共用一条：人在回答的是"能不能以我的身份在这个站点动手"，一个站点一个答案）。host 只由工具**自己观测到的** URL 产生（它解析过的 navigate、页面答回来的 snapshot），**绝不采信模型说的**——否则模型在写自己的权限描述符。备忘会过期，而过期不会造成错误的点击：`browser_click` / `browser_type` 把 host 一起传给壳，壳在派发事件之前拿实时 URL 比一次（`onHost`）。**放在壳里是因为那样检查与动作之间没有窗口给页面跳走**；壳不做判断，只比一个后端算好的值。`dispatch.rs::acting_on_a_tab_checks_the_page_has_not_moved` 钉住。
 
-    **截图用 `webContents.capturePage()`，不用 `Page.captureScreenshot`。** 后者要 compositor 帧，隐藏的 view 不产帧，于是它隔一次答一次、中间挂住（三轮实测，`AGENT-BROWSER.md`）；前者在同一个隐藏 view 上 9/9。换回 CDP 那条就是"有人正好在看这个 tab 时才好使"的间歇性 bug。`dispatch.rs::a_screenshot_does_not_need_the_tab_on_screen` 钉住。
+    **截图仍用 `webContents.capturePage()`，不用 `Page.captureScreenshot`，但后台 tab 必须先获得当前文档的 compositor surface。** 后者在隐藏 view 上交替成功/挂住，原先前者的“隐藏时 9/9”测量漏了关键生命周期：那是**先可见渲染过、再隐藏**的 view；agent tab 从出生起隐藏时，DOM/AX 树可以正常而 `capturePage()` 永远是 0×0。`browser.js::rendered` 把后台目标放到有效 bounds，暂时将当前 browser sibling 脱离 native tree，再让目标在 app renderer 下方可见并用一次有界 capture 驱动帧，最后按 `current`/`shown` 原样恢复；目标像素始终被 app 覆盖，agent 也没有改变当前 tab。navigate、snapshot、click/type/scroll/wait 与 screenshot 共用这一条，portal/canvas 的结果才能在隐藏前真正提交。`npm run test:browser` 用真实 Electron + loopback canvas/portal 页钉住这个生命周期，纯 Node 测试另钉住层级恢复与错误诊断。
 
     **模型只能碰它自己开的 tab，除非用户亲手交过去**（工具栏的 "Mention this page in the message" → 写进聚焦会话的 draft）。**绝不许加一个能列举 tab 的 action**：那会把用户正在浏览的 URL 送进模型 context，是隐私泄露披着能力的皮。交接写 draft 不是发消息、只带 URL 不带页面标题（标题是网站写的散文，不该进用户那一轮）。原设计里的 `@tab` 补全**没做也别做**：`@` 已经是文件命名空间，`mentions()`/`segments()`/`useKnownMentions()` 全把正文当路径用。
 

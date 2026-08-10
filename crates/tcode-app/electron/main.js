@@ -272,6 +272,16 @@ function serveBundle() {
   });
 }
 
+// The classic no-flash startup is `show: false` plus `window.show()` once the
+// page has painted. That pattern stalls here: with a hidden window the view's
+// first compositor frame never completes in software-rendering environments
+// (no GPU / VM / RDP), so neither `ready-to-show` nor `did-finish-load`
+// fires and the window never appears at all. On platforms with `setOpacity`
+// the window is instead created visible but transparent and faded in on load —
+// the same no-flash effect, while the compositor runs from the first frame.
+// Linux has no `setOpacity`, so it keeps the hidden-until-ready pattern.
+const FADE_IN = process.platform === "win32" || process.platform === "darwin";
+
 function createWindow() {
   // `BaseWindow` with an explicit child view rather than `BrowserWindow`: the
   // browser pane puts sibling `WebContentsView`s in this same container, and
@@ -295,8 +305,11 @@ function createWindow() {
     // The title bar is the app's own (rule 9c). `main.tsx` puts the matching
     // drag surface on it; without `frame: false` there would be two.
     frame: false,
-    show: false,
+    show: !FADE_IN,
   });
+  // See `FADE_IN`: the window must be compositor-visible from the start, and
+  // transparent until the first page paint hides the white background.
+  if (FADE_IN) window.setOpacity(0);
 
   const view = new WebContentsView({
     webPreferences: {
@@ -388,6 +401,7 @@ app.whenReady().then(() => {
     ...windowVerbs(window),
     ...browserVerbs({
       window,
+      appView: view,
       emit,
       // The browser asks the backend what a typed address means rather than
       // deciding here — one implementation of that guesswork, with its tests
@@ -419,6 +433,7 @@ app.whenReady().then(() => {
   const showAndCheckForUpdates = () => {
     if (shown) return;
     shown = true;
+    if (FADE_IN) window.setOpacity(1);
     window.show();
     startAutomaticUpdates({ isPackaged: app.isPackaged, window, dialog });
   };
@@ -426,6 +441,9 @@ app.whenReady().then(() => {
   // `BaseWindow` has no `ready-to-show` of its own — that belongs to the
   // contents — so the first paint of the view is the signal.
   view.webContents.once("did-finish-load", showAndCheckForUpdates);
+  // A load that neither finishes nor fails must not leave a transparent (or
+  // hidden, on Linux) window forever; the page is local, so 10s is generous.
+  setTimeout(showAndCheckForUpdates, 10000);
 
   app.on("before-quit", () => sidecar.stop());
 });

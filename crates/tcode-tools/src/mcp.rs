@@ -369,6 +369,7 @@ impl Tool for McpTool {
                     content,
                     is_error,
                     images,
+                    ui_metadata: None,
                 },
                 Err(e) => ToolOutput::err(e),
             },

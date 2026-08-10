@@ -85,7 +85,17 @@
 | `setVisible(false)` + `webContents.capturePage()` | **9/9 好**，500×375、4744 字节，尺寸和内容都对 |
 | `setVisible(true)` + `capturePage()`（对照） | 9/9 好 |
 
-`capturePage` 不走 debugger，隐藏与否它都答。**所以 `screenshot` 不需要 restack、不需要窗格开着、不需要任何东西盖住它，屏幕上什么都不会变。** `browser.js::browser_screenshot` 用的就是它，`dispatch.rs::a_screenshot_does_not_need_the_tab_on_screen` 钉住这个选择（换回 CDP 那条就是"有人正好在看这个 tab 时才好使"的间歇性 bug）。
+`capturePage` 不走 debugger，隐藏与否它都答。**这条结论后来被 agent tab 的真实生命周期推翻，9/9 只对“先可见渲染过、再隐藏”的 probe 成立。** 旧测量和它当时推导出的方案留在上面，下面是补齐生命周期后的结论。
+
+**第三次修正（2026-08-10）：从出生起隐藏的 view 没有 capture surface。** 在健康的 loopback Vite 页上，同一个 tab 的 AX snapshot 有数百个节点，而 `capturePage()` 回 0×0/0 bytes；点击的 CDP event 会派发，但 portal/dialog 也可能在隐藏前没有提交。最小 Electron probe 把两个生命周期分开后得到：
+
+| 生命周期 | `capturePage()` |
+|---|---|
+| `setVisible(false)` 后直接 load，从未可见 | **0×0，空**；`stayHidden` / `stayAwake` 不改变 |
+| 可见并产过当前文档的 frame，再隐藏 | **稳定非空** |
+| 可见但完整放在 app renderer 下方 | **稳定非空，屏幕仍只显示 app** |
+
+所以生产实现回到了第一次修正里那个“在 cover 下短暂 compositing”的方向，但仍保留 `capturePage()` 而不回到会挂住的 CDP screenshot。`browser.js::rendered` 给目标有效 bounds，把当前 browser sibling 短暂脱离 native tree，让目标在 app renderer 下方可见，以有界 `capturePage()` 驱动 frame，再按 `current`/`shown` 恢复；调用串行，失败带 URL、bounds、current 与 pane visibility。navigate 对旧 `about:blank` 不等待 frame，只在新文档 load 后 warm；前台本来可见的 tab 不走这条恢复。snapshot、click/type/scroll/wait 与 screenshot 共用 helper，因此修的不只是图片，也包括 canvas 和 portal/dialog 的视觉提交。真实回归入口是 `npm run test:browser`。
 
 三条附带结论仍然成立、仍然有用：
 
@@ -206,9 +216,9 @@ type Tab = { …; agent: boolean; owner: string | null };
 
 这条已经测过并成立（见上面 Phase 0 第 1 条）：隐藏的 view 上 `Runtime.evaluate` 与 `Input.dispatchMouseEvent` 都照常工作。
 
-**`screenshot` 也不例外，而且不需要任何额外动作**：`capturePage()` 在隐藏 view 上就答（见 Phase 0 第 1b 条），所以屏幕上是哪个 tab 从头到尾没变，连一帧都没闪。
+**`screenshot` 不改变 `current`，但后台 tab 需要一次被 app 完整覆盖的 render recovery**（见 Phase 0 第 1b 条的第三次修正）。`rendered` 短暂调整 native child tree，目标像素从未露出，完成后当前 tab 与 pane visibility 原样恢复；click/type 等视觉交互也走同一条，保证 portal/canvas 在隐藏前提交。
 
-顺带一句：**a11y 树那条路根本不需要像素**。这是把 snapshot 而不是 screenshot 定为主要观测面的第二个理由，也是第一版可以完全不碰屏幕的原因。
+顺带一句：**a11y 树的读取不依赖像素内容，但隐藏出生的当前文档仍先走同一条 bounded recovery。** 这样“AX 有内容、capture 为空”不再被当成一个可接受的页面状态。snapshot 仍是主要观测面。
 
 ## 传输：反向 RPC
 
@@ -264,7 +274,7 @@ pub trait Shell: Send + Sync {
 | `type` | `tab, ref, text, submit?` | 3 | **替换**字段原有内容(用元素自己的 `select()`),`Input.insertText` 一次写完;`submit` 是真 Enter |
 | `scroll` | `tab, ref?, direction, amount?` | 3 | 带 `ref` 就在那个元素里滚 |
 | `wait` | `tab, text?` | 3 | 有 `text` 等这句话出现,没有就等页面不再加载(`isLoading()` 连续两次为假)。**没有 `for` 枚举**:一个可选参数就分得开,少一个概念 |
-| `screenshot` | `tab` | 3 | `capturePage()`,tab 隐藏着照拍(见 Phase 0 第 1b 条);模型没有 vision 时直接报错并指向 `snapshot`,不静默降级 |
+| `screenshot` | `tab` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current；模型没有 vision 时直接报错并指向 `snapshot`,不静默降级 |
 
 **`ref` 三种写法都收**(`ref_44` / `"44"` / `44`)。零猜测原则最小的一次应用:替代方案是模型花一个 turn 试出这工具要哪一种。
 

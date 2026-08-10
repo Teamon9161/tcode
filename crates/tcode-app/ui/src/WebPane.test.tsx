@@ -39,8 +39,10 @@ vi.mock("@ipc", () => ({
 }));
 
 import { WebPane } from "./WebPane";
+import { revealBrowserTab } from "./browserReveal";
+import { single, webPane, type Tiling } from "./layout";
 import * as browser from "./webHost";
-import { BROWSER_NAVIGATED, BROWSER_TAB_OPENED } from "./types";
+import { BROWSER_NAVIGATED, BROWSER_TAB_OPENED, BROWSER_THUMBNAIL } from "./types";
 
 /** Production mounts geometry from the lightweight pane slot. These focused
  * chrome tests provide the same first measurement without rendering the whole
@@ -359,6 +361,207 @@ describe("a tab the strip did not open", () => {
     // And it is still the user's: the row was already there, so the second
     // arrival changes nothing at all.
     expect(container.querySelectorAll(".tab-agent")).toHaveLength(0);
+  });
+});
+
+describe("transient Browser transcript state", () => {
+  it("keeps the newest thumbnail revision for an exact tab", () => {
+    const newer = {
+      id: "tab-1",
+      url: "https://example.com/new",
+      data: "newer",
+      width: 720,
+      height: 480,
+      revision: 2,
+    };
+    deliver(BROWSER_THUMBNAIL, newer);
+    deliver(BROWSER_THUMBNAIL, {
+      ...newer,
+      url: "https://example.com/old",
+      data: "older",
+      revision: 1,
+    });
+
+    expect(browser.thumbnail("tab-1")).toEqual(newer);
+  });
+
+  it("claims an opened tab from structured ToolEnd metadata, not result prose", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() => {
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: { call_id: "b1", name: "browser", summary: "open", input: { action: "open" } },
+      });
+      browser.claim("s-7", {
+        type: "ToolEnd",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          preview: "opened something unrelated",
+          content: "opened something unrelated",
+          is_error: false,
+          ui_metadata: { kind: "browser_tab", id: "agent-tab" },
+        },
+      });
+    });
+
+    expect(browser.tab("agent-tab")?.owner).toBe("s-7");
+  });
+
+  it("removes exactly a successfully closed model tab and its thumbnail", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    deliver(BROWSER_THUMBNAIL, {
+      id: "agent-tab",
+      url: "https://example.com",
+      data: "preview",
+      width: 720,
+      height: 480,
+      revision: 1,
+    });
+    act(() => {
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          summary: "close",
+          input: { action: "close", tab: "agent-tab" },
+        },
+      });
+      browser.claim("s-7", {
+        type: "ToolEnd",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          preview: "closed",
+          content: "closed",
+          is_error: false,
+          ui_metadata: { kind: "browser_tab", id: "agent-tab" },
+        },
+      });
+    });
+
+    expect(browser.tab("agent-tab")).toBeUndefined();
+    expect(browser.thumbnail("agent-tab")).toBeUndefined();
+    deliver(BROWSER_THUMBNAIL, {
+      id: "agent-tab",
+      url: "https://example.com/stale",
+      data: "late-preview",
+      width: 720,
+      height: 480,
+      revision: 2,
+    });
+    expect(browser.thumbnail("agent-tab")).toBeUndefined();
+    expect(browser.snapshot().tabs.current).toBe("tab-1");
+  });
+
+  it("leaves a model tab in place when close fails", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() => {
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          summary: "close",
+          input: { action: "close", tab: "agent-tab" },
+        },
+      });
+      browser.claim("s-7", {
+        type: "ToolEnd",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          preview: "not open",
+          content: "not open",
+          is_error: true,
+        },
+      });
+    });
+
+    expect(browser.tab("agent-tab")).toBeDefined();
+  });
+
+  it("does not reassign ownership from ToolEnd after the session closes", () => {
+    deliver(BROWSER_TAB_OPENED, { id: "agent-tab", url: "about:blank", agent: true });
+    act(() => {
+      browser.claim("s-7", {
+        type: "ToolStart",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          summary: "snapshot",
+          input: { action: "snapshot", tab: "agent-tab" },
+        },
+      });
+      browser.disown("s-7");
+      browser.claim("s-7", {
+        type: "ToolEnd",
+        data: {
+          call_id: "b1",
+          name: "browser",
+          preview: "page",
+          content: "page",
+          is_error: false,
+          ui_metadata: { kind: "browser_tab", id: "agent-tab" },
+        },
+      });
+    });
+
+    expect(browser.tab("agent-tab")?.owner).toBeNull();
+  });
+
+  it("reveals a known exact tab by collapsing and focusing a Browser pane", () => {
+    let tiling: Tiling = single({ kind: "session", session: "s-1" });
+    const collapse = vi.fn();
+    mocks.invoke.mockClear();
+
+    let revealed = false;
+    act(() => {
+      revealed = revealBrowserTab(
+        "tab-1",
+        (step) => { tiling = step(tiling); },
+        collapse,
+        16 / 9,
+      );
+    });
+
+    expect(revealed).toBe(true);
+    expect(collapse).toHaveBeenCalledTimes(1);
+    expect(webPane(tiling)).not.toBeNull();
+    expect(tiling.focus).toBe(webPane(tiling)?.id);
+    expect(mocks.invoke).toHaveBeenCalledWith("browser_select", { id: "tab-1" });
+  });
+
+  it("leaves expansion, layout and selection alone for an unknown reveal id", () => {
+    const original = single({ kind: "session", session: "s-1" });
+    let tiling = original;
+    const collapse = vi.fn();
+    mocks.invoke.mockClear();
+
+    let revealed = true;
+    act(() => {
+      revealed = revealBrowserTab(
+        "closed-tab",
+        (step) => { tiling = step(tiling); },
+        collapse,
+        16 / 9,
+      );
+    });
+
+    expect(revealed).toBe(false);
+    expect(collapse).not.toHaveBeenCalled();
+    expect(tiling).toBe(original);
+    expect(browser.snapshot().tabs.current).toBe("tab-1");
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_select", expect.anything());
+  });
+
+  it("does not select the current tab when asked to reveal an unknown id", () => {
+    mocks.invoke.mockClear();
+    act(() => browser.select("closed-tab"));
+
+    expect(browser.snapshot().tabs.current).toBe("tab-1");
+    expect(mocks.invoke).not.toHaveBeenCalledWith("browser_select", expect.anything());
   });
 });
 

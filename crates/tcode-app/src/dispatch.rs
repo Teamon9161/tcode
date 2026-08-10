@@ -629,15 +629,13 @@ mod tests {
         }
     }
 
-    /// A screenshot must not need the tab on screen.
+    /// A screenshot must not need the tab to be current or exposed over the app.
     ///
-    /// `Page.captureScreenshot` wants a compositor frame, and a hidden
-    /// `WebContentsView` produces none — it answers about every other call and
-    /// hangs in between, measured three runs over (`../AGENT-BROWSER.md`).
-    /// Electron's own `capturePage` came back 9 times out of 9 on the same
-    /// hidden view. Swapping back to the CDP command would reintroduce a
-    /// screenshot that works when someone happens to be looking at the tab,
-    /// which is the worst kind of intermittent.
+    /// `Page.captureScreenshot` hangs intermittently on a hidden view. Electron's
+    /// `capturePage` is the reliable path, but the original 9/9 measurement only
+    /// covered a view that had rendered before it was hidden. A tab hidden from
+    /// birth needs the shared `rendered` recovery to create its current document's
+    /// compositor surface under the app renderer (`../AGENT-BROWSER.md`).
     #[test]
     fn a_screenshot_does_not_need_the_tab_on_screen() {
         let source =
@@ -649,6 +647,11 @@ mod tests {
             .expect("browser.js answers `browser_screenshot`");
         let body = &source[at..];
         let body = &body[..body.find("\n    },").expect("the verb body ends")];
+        assert!(
+            body.contains("rendered(args.id"),
+            "`browser_screenshot` bypasses background render recovery — a tab hidden from birth \
+             can have a live AX tree and still return an empty image"
+        );
         assert!(
             body.contains("capturePage()"),
             "`browser_screenshot` no longer uses Electron's own capture"

@@ -1,4 +1,4 @@
-import { memo, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { memo, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 
 import { runPairs, runSteps, type Block, type RunMeta } from "./blocks";
 import type { Inspect } from "./inspect";
@@ -21,6 +21,7 @@ import { ChevronDown, ChevronRight, PanelIcon, RewindIcon } from "./components/I
 import { ImageViewer } from "./ImageViewer";
 import { StatusDot } from "./components/Status";
 import type { Status } from "./types";
+import * as webHost from "./webHost";
 
 /**
  * The conversation.
@@ -50,6 +51,7 @@ export const Transcript = memo(function Transcript({
   rewindTargets,
   onOpen,
   onRewind,
+  onRevealBrowserTab,
 }: {
   blocks: Block[];
   running: boolean;
@@ -58,6 +60,7 @@ export const Transcript = memo(function Transcript({
   rewindTargets?: RewindTarget[];
   onOpen: (value: Inspect) => void;
   onRewind?: (target: RewindTarget) => void;
+  onRevealBrowserTab: (tab: string) => void;
 }) {
   const scroller = useRef<HTMLDivElement>(null);
   const pinned = useRef(true);
@@ -100,7 +103,11 @@ export const Transcript = memo(function Transcript({
     >
       <div className="transcript-inner">
         <RewindContext.Provider value={rewinding}>
-          <BlockList blocks={blocks} onOpen={onOpen} />
+          <BlockList
+            blocks={blocks}
+            onOpen={onOpen}
+            onRevealBrowserTab={onRevealBrowserTab}
+          />
         </RewindContext.Provider>
       </div>
     </div>
@@ -119,11 +126,13 @@ export function BlockList({
   blocks,
   onOpen,
   groupExploration = true,
+  onRevealBrowserTab = () => {},
 }: {
   blocks: Block[];
   onOpen: (value: Inspect) => void;
   /** Batches are already a deliberate grouping boundary. */
   groupExploration?: boolean;
+  onRevealBrowserTab?: (tab: string) => void;
 }) {
   const { thinking } = useDisplay();
   const pairs = useMemo(() => runPairs(blocks), [blocks]);
@@ -158,15 +167,29 @@ export function BlockList({
           <ChangesGroup key={keyOf(item)} blocks={item.blocks} onOpen={onOpen} />
         ) : item.kind === "commands" ? (
           <CommandsGroup key={keyOf(item)} blocks={item.blocks} onOpen={onOpen} />
+        ) : item.kind === "browser" ? (
+          <BrowserGroup
+            key={keyOf(item)}
+            tab={item.tab}
+            blocks={item.blocks}
+            onOpen={onOpen}
+            onReveal={onRevealBrowserTab}
+          />
         ) : item.block.kind === "run" ? (
           <RunCall
             key={keyOf(item)}
             block={item.block}
             report={pairs.report.get(item.block.run)}
             onOpen={onOpen}
+            onRevealBrowserTab={onRevealBrowserTab}
           />
         ) : (
-          <BlockView key={keyOf(item)} block={item.block} onOpen={onOpen} />
+          <BlockView
+            key={keyOf(item)}
+            block={item.block}
+            onOpen={onOpen}
+            onRevealBrowserTab={onRevealBrowserTab}
+          />
         ),
       )}
     </>
@@ -198,7 +221,8 @@ export type TranscriptItem =
   | { kind: "block"; block: Block; at: number }
   | { kind: "exploration"; blocks: ToolBlock[]; at: number }
   | { kind: "changes"; blocks: ToolBlock[]; at: number }
-  | { kind: "commands"; blocks: ToolBlock[]; at: number };
+  | { kind: "commands"; blocks: ToolBlock[]; at: number }
+  | { kind: "browser"; tab: string; blocks: ToolBlock[]; at: number };
 
 /** Consecutive low-risk inspection calls are one trace step, not a stack of
  * cards.
@@ -219,9 +243,12 @@ export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
   let exploration: ToolBlock[] = [];
   let changes: ToolBlock[] = [];
   let commands: ToolBlock[] = [];
+  let browser: ToolBlock[] = [];
+  let browserTab = "";
   let explorationAt = 0;
   let changesAt = 0;
   let commandsAt = 0;
+  let browserAt = 0;
   const flushExploration = () => {
     if (exploration.length > 0) {
       grouped.push({ kind: "exploration", blocks: exploration, at: explorationAt });
@@ -240,35 +267,69 @@ export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
     }
     commands = [];
   };
+  const flushBrowser = () => {
+    if (browser.length > 0) {
+      grouped.push({ kind: "browser", tab: browserTab, blocks: browser, at: browserAt });
+    }
+    browser = [];
+    browserTab = "";
+  };
 
   blocks.forEach((block, at) => {
     const group = block.kind === "tool" ? transcriptGroupFor(block.name) : undefined;
     if (block.kind === "tool" && group === "exploration") {
       flushChanges();
       flushCommands();
+      flushBrowser();
       if (exploration.length === 0) explorationAt = at;
       exploration.push(block);
     } else if (block.kind === "tool" && group === "changes") {
       flushExploration();
       flushCommands();
+      flushBrowser();
       if (changes.length === 0) changesAt = at;
       changes.push(block);
     } else if (block.kind === "tool" && group === "commands") {
       flushExploration();
       flushChanges();
+      flushBrowser();
       if (commands.length === 0) commandsAt = at;
       commands.push(block);
+    } else if (block.kind === "tool" && group === "browser") {
+      flushExploration();
+      flushChanges();
+      flushCommands();
+      const tab = browserTabOf(block);
+      if (!tab) {
+        flushBrowser();
+        grouped.push({ kind: "block", block, at });
+      } else {
+        if (browser.length > 0 && browserTab !== tab) flushBrowser();
+        if (browser.length === 0) {
+          browserAt = at;
+          browserTab = tab;
+        }
+        browser.push(block);
+      }
     } else {
       flushExploration();
       flushChanges();
       flushCommands();
+      flushBrowser();
       grouped.push({ kind: "block", block, at });
     }
   });
   flushExploration();
   flushChanges();
   flushCommands();
+  flushBrowser();
   return grouped;
+}
+
+function browserTabOf(block: ToolBlock): string | null {
+  if (!block.result || block.result.isError) return null;
+  const metadata = block.result.uiMetadata;
+  return metadata?.kind === "browser_tab" && metadata.id ? metadata.id : null;
 }
 
 /**
@@ -285,9 +346,11 @@ export function groupTranscriptBlocks(blocks: Block[]): TranscriptItem[] {
 const BlockView = memo(function BlockView({
   block,
   onOpen,
+  onRevealBrowserTab,
 }: {
   block: Block;
   onOpen: (value: Inspect) => void;
+  onRevealBrowserTab: (tab: string) => void;
 }) {
   switch (block.kind) {
     case "user":
@@ -309,11 +372,23 @@ const BlockView = memo(function BlockView({
     case "tool":
       return <ToolCall block={block} onOpen={onOpen} />;
     case "batch":
-      return <BatchCall block={block} onOpen={onOpen} />;
+      return (
+        <BatchCall
+          block={block}
+          onOpen={onOpen}
+          onRevealBrowserTab={onRevealBrowserTab}
+        />
+      );
     // Reached only for a run whose parent call is not in the same list — the
     // paired case is drawn by `BlockList`, which is where the pairing is known.
     case "run":
-      return <RunCall block={block} onOpen={onOpen} />;
+      return (
+        <RunCall
+          block={block}
+          onOpen={onOpen}
+          onRevealBrowserTab={onRevealBrowserTab}
+        />
+      );
   }
 });
 
@@ -526,6 +601,7 @@ function TraceGroup({
   running = false,
   failed = false,
   count,
+  footer,
   children,
 }: {
   label: string;
@@ -533,6 +609,7 @@ function TraceGroup({
   running?: boolean;
   failed?: boolean;
   count?: number;
+  footer?: React.ReactNode;
   children: React.ReactNode;
 }) {
   const [open, setOpen] = useState(defaultOpen);
@@ -558,6 +635,7 @@ function TraceGroup({
         </span>
       </button>
       {open && <div className="trace-body">{children}</div>}
+      {footer}
     </section>
   );
 }
@@ -635,6 +713,70 @@ function CommandsGroup({
   );
 }
 
+function BrowserGroup({
+  tab,
+  blocks,
+  onOpen,
+  onReveal,
+}: {
+  tab: string;
+  blocks: ToolBlock[];
+  onOpen: (value: Inspect) => void;
+  onReveal: (tab: string) => void;
+}) {
+  return (
+    <TraceGroup
+      label="Browse page"
+      count={blocks.length}
+      failed={blocks.some((block) => block.result?.isError)}
+      footer={<BrowserPreview tab={tab} onReveal={onReveal} />}
+    >
+      {blocks.map((block) => (
+        <ToolCall key={block.callId} block={block} onOpen={onOpen} />
+      ))}
+    </TraceGroup>
+  );
+}
+
+function BrowserPreview({ tab, onReveal }: { tab: string; onReveal: (tab: string) => void }) {
+  const preview = useSyncExternalStore(
+    webHost.subscribe,
+    () => webHost.thumbnail(tab),
+    () => undefined,
+  );
+  const known = useSyncExternalStore(
+    webHost.subscribe,
+    () => webHost.tab(tab),
+    () => undefined,
+  );
+  const url = preview?.url || known?.url || "about:blank";
+
+  return (
+    <div className="browser-preview">
+      <div className="browser-preview-bar">
+        <span className="browser-preview-url" title={url}>{url}</span>
+        {known && (
+          <PopOut
+            onOpen={() => onReveal(tab)}
+            title="Show this browser tab"
+          />
+        )}
+      </div>
+      {preview ? (
+        <img
+          className="browser-preview-image"
+          src={`data:image/png;base64,${preview.data}`}
+          width={preview.width}
+          height={preview.height}
+          alt="Current browser page preview"
+        />
+      ) : (
+        <div className="browser-preview-empty">Waiting for page preview</div>
+      )}
+    </div>
+  );
+}
+
 function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: Inspect) => void }) {
   const toolName = useToolName();
   const failed = block.result?.isError ?? false;
@@ -662,9 +804,15 @@ function ExplorationItem({ block, onOpen }: { block: ToolBlock; onOpen: (value: 
  * that only appears when the pointer is already on it is a control nobody finds
  * on purpose. A magnifier at the end of the row says what it does and stays put.
  */
-function PopOut({ onOpen }: { onOpen: () => void }) {
+function PopOut({
+  onOpen,
+  title = "Open in its own pane",
+}: {
+  onOpen: () => void;
+  title?: string;
+}) {
   return (
-    <button className="pop-out" onClick={onOpen} title="Open in its own pane" aria-label="Open in its own pane">
+    <button className="pop-out" onClick={onOpen} title={title} aria-label={title}>
       <PanelIcon size={12} />
     </button>
   );
@@ -797,9 +945,11 @@ function ToolCall({
 function BatchCall({
   block,
   onOpen,
+  onRevealBrowserTab,
 }: {
   block: Extract<Block, { kind: "batch" }>;
   onOpen: (value: Inspect) => void;
+  onRevealBrowserTab: (tab: string) => void;
 }) {
   const { editDetails } = useDisplay();
   const done = block.blocks.every((child) => child.kind !== "tool" || child.result !== undefined);
@@ -814,7 +964,12 @@ function BatchCall({
       defaultOpen={editDetails && hasChanges}
       running={!done}
     >
-      <BlockList blocks={block.blocks} onOpen={onOpen} groupExploration={false} />
+      <BlockList
+        blocks={block.blocks}
+        onOpen={onOpen}
+        groupExploration={false}
+        onRevealBrowserTab={onRevealBrowserTab}
+      />
     </TraceGroup>
   );
 }
@@ -831,12 +986,14 @@ const RunCall = memo(function RunCall({
   block,
   report,
   onOpen,
+  onRevealBrowserTab,
 }: {
   block: Extract<Block, { kind: "run" }>;
   /** The delegating call, whose result is the report this run came back with.
    *  Absent for a log recorded before runs carried their parent call. */
   report?: ToolBlock;
   onOpen: (value: Inspect) => void;
+  onRevealBrowserTab: (tab: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const status = block.meta.status;
@@ -881,7 +1038,11 @@ const RunCall = memo(function RunCall({
           {/* The run's last message and its report are the same text (see
               `runSteps`), so the steps stop short of it and the report below
               is the single copy. */}
-          <BlockList blocks={steps} onOpen={onOpen} />
+          <BlockList
+            blocks={steps}
+            onOpen={onOpen}
+            onRevealBrowserTab={onRevealBrowserTab}
+          />
           {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
           {report?.result?.content && (
             <Prose className="run-report" text={report.result.content} />

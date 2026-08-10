@@ -62,6 +62,6 @@ pub use template::PromptVariables;
 pub use tool::{
     BatchPolicy, CallRoute, CohortChannelMessage, CohortMember, CohortMemberRun,
     CohortMemberStatus, CohortUpdate, Compacted, DelegateEvent, DelegatedApprovalRequest,
-    PermissionRequest, Tool, ToolCtx, ToolOutput,
+    PermissionRequest, Tool, ToolCtx, ToolOutput, ToolUiMetadata,
 };
 pub use types::{ContentBlock, Message, RateLimit, RateLimits, Role, StopReason, ToolDef, Usage};

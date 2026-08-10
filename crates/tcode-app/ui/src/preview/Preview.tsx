@@ -1,6 +1,13 @@
 import { useEffect, useState } from "react";
 
-import type { ApprovalRequest, Queued, SessionInfo, Status } from "../types";
+import {
+  BROWSER_TAB_OPENED,
+  BROWSER_THUMBNAIL,
+  type ApprovalRequest,
+  type Queued,
+  type SessionInfo,
+  type Status,
+} from "../types";
 import type { Block } from "../blocks";
 import type { TouchedFile } from "../files";
 import type { Pasted } from "../paste";
@@ -22,6 +29,8 @@ import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import type { RewindTarget } from "../rewind";
 import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Workspace } from "../Workspace";
+import * as browser from "../webHost";
+import { deliver } from "./mock-event";
 import {
   diskChangedWorkspaceFileSession,
   newWorkspaceFileSession,
@@ -41,6 +50,8 @@ import {
 
 const HOME = "/home/teamon";
 const ROOT = "/home/teamon/code/rust/tcode";
+const PREVIEW_BROWSER_TAB = "preview-browser-tab";
+const CLOSED_BROWSER_TAB = "closed-browser-tab";
 
 /** `a`'s log is the first entry in `mock-core`'s history on purpose: it is the
  *  one state the merged rail had to get right — a conversation that is open
@@ -437,6 +448,56 @@ See [the retry notes](https://example.com/retry) for the original reasoning, and
         },
       },
     ],
+  },
+  // Consecutive Browser calls are one ordinary trace group with a live footer.
+  // The tab id comes from structured renderer metadata, never from the prose in
+  // these result fields; the preview image itself is delivered separately by
+  // the transient shell-event fixture below.
+  {
+    kind: "tool",
+    callId: "browser-1",
+    name: "browser",
+    summary: "navigate",
+    input: {
+      action: "navigate",
+      tab: PREVIEW_BROWSER_TAB,
+      url: "https://visualization.example.com/portfolio/risk/scenarios?desk=government-bonds",
+    },
+    result: {
+      preview: "navigated",
+      content: "navigated",
+      isError: false,
+      uiMetadata: { kind: "browser_tab", id: PREVIEW_BROWSER_TAB },
+    },
+  },
+  {
+    kind: "tool",
+    callId: "browser-2",
+    name: "browser",
+    summary: "click ref_12",
+    input: { action: "click", tab: PREVIEW_BROWSER_TAB, ref: "12" },
+    result: {
+      preview: "clicked",
+      content: "clicked",
+      isError: false,
+      uiMetadata: { kind: "browser_tab", id: PREVIEW_BROWSER_TAB },
+    },
+  },
+  { kind: "assistant", text: "The portal is open and visually verified." },
+  // A successful historic call whose native tab has since closed. It retains
+  // its trace but receives neither a thumbnail nor a reveal control.
+  {
+    kind: "tool",
+    callId: "browser-closed",
+    name: "browser",
+    summary: "snapshot",
+    input: { action: "snapshot", tab: CLOSED_BROWSER_TAB },
+    result: {
+      preview: "page snapshot",
+      content: "page snapshot",
+      isError: false,
+      uiMetadata: { kind: "browser_tab", id: CLOSED_BROWSER_TAB },
+    },
   },
   // A shown report, at its call site — the shape `show` actually produces most
   // of the time, since an artifact draws where the conversation is and the
@@ -1072,6 +1133,59 @@ export function Preview() {
     setTiling(layoutFor(name));
     window.history.replaceState(null, "", `?scene=${name}`);
   };
+
+  // Browser previews are shell events, not transcript data. The fixture follows
+  // that same boundary: the trace above carries only the tab capability while a
+  // one-shot event supplies the current pixels and makes the exact-tab PopOut
+  // live. The second historic tab is intentionally never announced.
+  useEffect(() => {
+    browser.watch();
+    deliver(BROWSER_TAB_OPENED, {
+      id: PREVIEW_BROWSER_TAB,
+      url: "about:blank",
+      agent: true,
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 720;
+    canvas.height = 440;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    context.fillStyle = "#f8fafc";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#0f172a";
+    context.font = "600 28px sans-serif";
+    context.fillText("Government bond risk", 36, 52);
+    context.fillStyle = "#64748b";
+    context.font = "16px sans-serif";
+    context.fillText("Scenario P&L by tenor", 36, 82);
+    context.fillStyle = "#dbeafe";
+    context.fillRect(36, 112, 648, 264);
+    context.fillStyle = "#2563eb";
+    [126, 184, 142, 224, 176, 246, 198].forEach((height, index) => {
+      context.fillRect(72 + index * 82, 344 - height, 44, height);
+    });
+    context.fillStyle = "#ffffff";
+    context.fillRect(344, 156, 300, 158);
+    context.strokeStyle = "#94a3b8";
+    context.strokeRect(344, 156, 300, 158);
+    context.fillStyle = "#0f172a";
+    context.font = "600 20px sans-serif";
+    context.fillText("Scenario details", 368, 194);
+    context.font = "16px sans-serif";
+    context.fillText("Portal content is visible", 368, 232);
+    context.fillStyle = "#15803d";
+    context.fillRect(368, 260, 118, 30);
+
+    deliver(BROWSER_THUMBNAIL, {
+      id: PREVIEW_BROWSER_TAB,
+      url: "https://visualization.example.com/portfolio/risk/scenarios?desk=government-bonds",
+      data: canvas.toDataURL("image/png").split(",", 2)[1],
+      width: canvas.width,
+      height: canvas.height,
+      revision: 1,
+    });
+  }, []);
 
   // The model panel is a click away from any conversation, and clicking is the
   // one thing a look-through cannot do for you. This scene opens it, so the

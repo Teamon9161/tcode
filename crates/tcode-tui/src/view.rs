@@ -202,6 +202,7 @@ impl SessionView {
                 preview,
                 content,
                 is_error,
+                ..
             } => {
                 // Peek before consuming: a `progress` submission belongs in the
                 // transcript while a phase flip does not, and only the call's
@@ -1264,6 +1265,7 @@ mod tests {
                 preview: "read Cargo.toml".into(),
                 content: "[tool output]".into(),
                 is_error: false,
+                ui_metadata: None,
             },
             &mut live_ctx,
         );

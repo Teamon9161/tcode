@@ -26,7 +26,14 @@ import type { AgentEvent } from "./types";
  * import to the other and fail the build on Windows.)
  */
 
-export type ToolResult = { preview: string; content: string; isError: boolean };
+export type ToolUiMetadata = { kind: "browser_tab"; id: string };
+
+export type ToolResult = {
+  preview: string;
+  content: string;
+  isError: boolean;
+  uiMetadata?: ToolUiMetadata;
+};
 
 export type RunMeta = {
   kind: string;
@@ -168,10 +175,16 @@ export function applyEvent(blocks: Block[], event: AgentEvent): Block[] {
         preview: string;
         content: string;
         is_error: boolean;
+        ui_metadata?: ToolUiMetadata;
       };
       return updateCall(blocks, data.call_id, (call) => ({
         ...call,
-        result: { preview: data.preview, content: data.content, isError: data.is_error },
+        result: {
+          preview: data.preview,
+          content: data.content,
+          isError: data.is_error,
+          uiMetadata: data.ui_metadata,
+        },
       }));
     }
 

@@ -747,6 +747,7 @@ async fn failed_tool_result_is_visible_and_durable() {
                 preview,
                 content,
                 is_error: true,
+                ..
             } if call_id == "missing-read" && name == "read" => {
                 Some((preview.as_str(), content.as_str()))
             }

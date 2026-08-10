@@ -472,6 +472,7 @@ impl App {
                 preview,
                 content,
                 is_error,
+                ..
             } => self.on_tool_end(call_id, name, preview, content, is_error),
             AgentEvent::ReferencesExpanded {
                 labels,
