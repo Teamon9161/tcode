@@ -1,6 +1,8 @@
 import {
+  memo,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -9,7 +11,7 @@ import {
 } from "react";
 
 import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
-import { SessionContext, type SessionState } from "./session";
+import { BLANK, SessionContext, type SessionState } from "./session";
 import {
   canBack,
   canForward,
@@ -31,6 +33,7 @@ import { linkTarget } from "./links";
 import { LinkContext, type Follow } from "./Prose";
 import { basename } from "./show";
 import { yieldBrowser } from "./browserYield";
+import * as browserHost from "./webHost";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
 import { sessionTitle } from "./railData";
@@ -87,8 +90,6 @@ import {
  *  because it goes down every level of the recursion untouched. */
 export type PaneContext = {
   sessions: SessionInfo[];
-  stateOf: (session: string) => SessionState;
-  statusOf: (session: string) => Status;
   focus: string;
   /** True once the window holds more than one pane; below that, "which pane is
    *  current" is not a question anybody is asking. */
@@ -184,9 +185,13 @@ export type PaneContext = {
 export function Panes({
   tiling,
   context,
+  stateOf,
+  statusOf,
 }: {
   tiling: Tiling;
   context: PaneContext;
+  stateOf: (session: string) => SessionState;
+  statusOf: (session: string) => Status;
 }) {
   const field = useRef<HTMLDivElement>(null);
   const { panes, dividers } = useMemo(() => frames(tiling), [tiling]);
@@ -201,18 +206,16 @@ export function Panes({
         {panes.map(({ leaf, rect }) => {
           const visible = !expanded || leaf.id === expanded;
           return (
-            <div
+            <PaneSlot
               key={leaf.id}
-              className={`pane-slot${visible ? "" : " is-hidden"}`}
-              style={box(visible && expanded ? WHOLE : rect)}
-            >
-              <Pane
-                leaf={leaf}
-                context={context}
-                expanded={expanded === leaf.id}
-                hidden={!visible}
-              />
-            </div>
+              leaf={leaf}
+              rect={visible && expanded ? WHOLE : rect}
+              context={context}
+              stateOf={stateOf}
+              statusOf={statusOf}
+              expanded={expanded === leaf.id}
+              hidden={!visible}
+            />
           );
         })}
         {!expanded &&
@@ -241,6 +244,117 @@ function box(rect: Rect): CSSProperties {
     width: `${rect.width * 100}%`,
     height: `${rect.height * 100}%`,
   };
+}
+
+/**
+ * The cheap geometry layer around a memoized pane.
+ *
+ * Slot rectangles change on every divider frame and on structural moves such
+ * as swapping two equally sized panes. The pane subtree should not redraw for
+ * either, but a native browser page still has to follow both resize and pure
+ * translation. Keeping the body ref and measurement here lets those two facts
+ * coexist: this wrapper re-renders with the slot, while the pane beneath it can
+ * keep its transcript, composer and browser chrome untouched.
+ */
+function PaneSlot({
+  leaf,
+  rect,
+  context,
+  stateOf,
+  statusOf,
+  expanded,
+  hidden,
+}: {
+  leaf: Leaf;
+  rect: Rect;
+  context: PaneContext;
+  stateOf: (session: string) => SessionState;
+  statusOf: (session: string) => Status;
+  expanded: boolean;
+  hidden: boolean;
+}) {
+  const webBody = useRef<HTMLDivElement>(null);
+  const placed = useRef("");
+  const booked = useRef(0);
+  const web = leaf.pane.kind === "web";
+  const session = paneSession(leaf.pane);
+  const state = session ? stateOf(session) : undefined;
+  const status = session ? statusOf(session) : undefined;
+  const nameOf = useCallback(
+    (owner: string) =>
+      sessionTitle(stateOf(owner).blocks) ??
+      context.sessions.find((open) => open.id === owner)?.name ??
+      "a conversation",
+    [context.sessions, stateOf],
+  );
+  const webNameOf = web ? nameOf : undefined;
+
+  const placeWeb = useCallback((first: boolean) => {
+    const measured = webBody.current?.getBoundingClientRect();
+    if (!measured) return;
+    const bounds = {
+      x: measured.left,
+      y: measured.top,
+      width: measured.width,
+      height: measured.height,
+    };
+    const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
+    if (!first && key === placed.current) return;
+    placed.current = key;
+    if (first) browserHost.mount(bounds);
+    else browserHost.moved(bounds);
+  }, []);
+
+  const scheduleWeb = useCallback(
+    (first: boolean) => {
+      if (booked.current) return;
+      booked.current = requestAnimationFrame(() => {
+        booked.current = 0;
+        placeWeb(first);
+      });
+    },
+    [placeWeb],
+  );
+
+  // Deliberately no dependency array: the slot can move without resizing, and
+  // ResizeObserver does not report that case. The actual DOM read waits until
+  // the next frame, after the browser has already laid out the changed slot.
+  useLayoutEffect(() => {
+    if (web) scheduleWeb(placed.current === "");
+    else placed.current = "";
+  });
+
+  useLayoutEffect(() => {
+    if (!web || !webBody.current) return;
+    const watch = new ResizeObserver(() => scheduleWeb(false));
+    watch.observe(webBody.current);
+    return () => watch.disconnect();
+  }, [scheduleWeb, web]);
+
+  useEffect(
+    () => () => {
+      if (booked.current) cancelAnimationFrame(booked.current);
+    },
+    [],
+  );
+
+  return (
+    <div
+      className={`pane-slot${hidden ? " is-hidden" : ""}`}
+      style={box(rect)}
+    >
+      <Pane
+        leaf={leaf}
+        context={context}
+        state={state}
+        status={status}
+        webBody={webBody}
+        webNameOf={webNameOf}
+        expanded={expanded}
+        hidden={hidden}
+      />
+    </div>
+  );
 }
 
 /**
@@ -404,15 +518,29 @@ function Divider({
 
 /** The frame every pane wears. Focus follows the pointer down rather than a
  *  click, so dragging a divider or selecting text in a pane also makes it the
- *  current one — the same moment a window manager would have taken focus. */
-function Pane({
+ *  current one — the same moment a window manager would have taken focus.
+ *
+ * Memoized at the frame boundary because a ratio change only changes each
+ * slot's rectangle. `setRatio` preserves leaf identity and `Workspace` keeps
+ * the context stable, so re-rendering the pane subtree on every drag frame was
+ * pure work: headers, composers and native-view measurement effects all ran
+ * even though their inputs had not changed. */
+const Pane = memo(function Pane({
   leaf,
   context,
+  state,
+  status,
+  webBody,
+  webNameOf,
   expanded,
   hidden,
 }: {
   leaf: Leaf;
   context: PaneContext;
+  state?: SessionState;
+  status?: Status;
+  webBody: RefObject<HTMLDivElement | null>;
+  webNameOf?: (session: string) => string;
   /** This pane is the one filling the field. */
   expanded: boolean;
   /** Another pane fills the field and this slot is `visibility: hidden`. The
@@ -464,6 +592,7 @@ function Pane({
           worse answer than none. */}
       {leaf.pane.kind === "web" ? (
         <WebPane
+          bodyRef={webBody}
           onClose={() => context.onClosePane(leaf.id)}
           expanded={expanded}
           onToggleExpanded={() => context.onToggleExpanded(leaf.id)}
@@ -473,11 +602,7 @@ function Pane({
           // belongs to no conversation. It is handed a way to put a name to an
           // id a tab already carries, which is the same thing the finder does
           // for a row it did not open either.
-          nameOf={(session) =>
-            sessionTitle(context.stateOf(session).blocks) ??
-            context.sessions.find((open) => open.id === session)?.name ??
-            "a conversation"
-          }
+          nameOf={webNameOf!}
           onHandOver={context.onHandOverTab}
         />
       ) : leaf.pane.kind === "terminal" ? (
@@ -495,17 +620,23 @@ function Pane({
               <SessionPane
                 leaf={leaf}
                 session={leaf.pane.session}
+                state={state ?? BLANK}
+                status={status ?? "idle"}
                 context={context}
               />
             ) : (
-              <InspectPane leaf={leaf} context={context} />
+              <InspectPane
+                leaf={leaf}
+                state={state ?? BLANK}
+                context={context}
+              />
             )}
           </LinkContext.Provider>
         </SessionContext.Provider>
       )}
     </section>
   );
-}
+});
 
 /**
  * Give this pane the whole field, and give it back.
@@ -535,14 +666,17 @@ function ExpandPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
 function SessionPane({
   leaf,
   session,
+  state,
+  status,
   context,
 }: {
   leaf: Leaf;
   session: string;
+  state: SessionState;
+  status: Status;
   context: PaneContext;
 }) {
   const info = context.sessions.find((open) => open.id === session);
-  const state = context.stateOf(session);
   // A draft is built once per plan, not per render: `draftOf` mints the row ids
   // the editor keys on, so rebuilding it while someone is typing would remount
   // every field and take the caret with it.
@@ -570,7 +704,7 @@ function SessionPane({
   return (
     <>
       <header className="pane-head">
-        <StatusDot status={context.statusOf(session)} />
+        <StatusDot status={status} />
         {/* The name and the path were the same fact twice — a conversation is
             named after its folder — so they are one control now. It was already
             the answer to "which folder"; making it the control for it too is
@@ -731,14 +865,21 @@ function TurnStatus({ phase }: { phase: string }) {
   );
 }
 
-function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
+function InspectPane({
+  leaf,
+  state,
+  context,
+}: {
+  leaf: Leaf;
+  state: SessionState;
+  context: PaneContext;
+}) {
   const pane = leaf.pane.kind === "inspect" ? leaf.pane : null;
   const [fileControls, setFileControls] = useState<WorkspaceFileControls | null>(null);
   const registerFileControls = useCallback((next: WorkspaceFileControls) => {
     setFileControls(next);
     return () => setFileControls((current) => (current === next ? null : current));
   }, []);
-  const state = context.stateOf(pane?.session ?? "");
   // Same reason as the session pane: one draft per plan, not one per render.
   const draft = useMemo(
     () => state.planDraft ?? (state.plan ? draftOf(state.plan) : null),

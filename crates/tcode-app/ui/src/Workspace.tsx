@@ -146,6 +146,11 @@ export function Workspace({
   const leaves = panes(tiling);
   const here = focused(tiling);
   const onScreen = useMemo(() => new Set(sessionsInView(tiling)), [tiling]);
+  /** Event handlers need the newest draft without making every callback depend
+   *  on the render-time selector. Rendering still uses `stateOf` directly; this
+   *  ref is only read after a click, when reading current state is the point. */
+  const latestStateOf = useRef(stateOf);
+  latestStateOf.current = stateOf;
 
   useEffect(() => {
     if (expanded && !findLeaf(tiling, expanded)) setExpanded(null);
@@ -241,13 +246,13 @@ export function Workspace({
   const mention = useCallback(
     (session: string, path: string) => {
       const quoted = /\s/.test(path) ? `@"${path}"` : `@${path}`;
-      const draft = stateOf(session).draft;
+      const draft = latestStateOf.current(session).draft;
       onDraft(
         session,
         draft.trim() ? `${draft.replace(/\s+$/, "")} ${quoted} ` : `${quoted} `,
       );
     },
-    [stateOf, onDraft],
+    [onDraft],
   );
 
   // Esc closes the pane you are looking into, before it reaches the composer's
@@ -491,13 +496,13 @@ export function Workspace({
       const session = sessions.find((open) => open.id === held)?.id ?? sessions[0]?.id;
       const reference = handOverText(tab);
       if (!session || !reference) return;
-      const draft = stateOf(session).draft;
+      const draft = latestStateOf.current(session).draft;
       onDraft(
         session,
         draft.trim() ? `${draft.replace(/\s+$/, "")} ${reference} ` : `${reference} `,
       );
     },
-    [tiling, sessions, stateOf, onDraft],
+    [tiling, sessions, onDraft],
   );
   // Following a link, as opposed to reaching for the browser. It must not go
   // through `openWeb`: that one is a toggle, so asking it for a page while the
@@ -542,8 +547,6 @@ export function Workspace({
   const context: PaneContext = useMemo(
     () => ({
       sessions,
-      stateOf,
-      statusOf,
       focus: tiling.focus,
       split,
       onFocus: focusOn,
@@ -586,8 +589,6 @@ export function Workspace({
     }),
     [
       sessions,
-      stateOf,
-      statusOf,
       tiling.focus,
       split,
       focusOn,
@@ -721,7 +722,16 @@ export function Workspace({
       {/* The field, or what stands in for it. An empty tiling used to swap the
           whole window for the launchpad; now it is a state of the field, which
           is what it always was — the rail beside it is unchanged either way. */}
-      {shown.root ? <Panes tiling={shown} context={context} /> : <FieldEmpty />}
+      {shown.root ? (
+        <Panes
+          tiling={shown}
+          context={context}
+          stateOf={stateOf}
+          statusOf={statusOf}
+        />
+      ) : (
+        <FieldEmpty />
+      )}
     </div>
   );
 }

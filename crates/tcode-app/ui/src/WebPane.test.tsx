@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, useLayoutEffect, useRef, type ComponentProps } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -42,6 +42,21 @@ import { WebPane } from "./WebPane";
 import * as browser from "./webHost";
 import { BROWSER_NAVIGATED, BROWSER_TAB_OPENED } from "./types";
 
+/** Production mounts geometry from the lightweight pane slot. These focused
+ * chrome tests provide the same first measurement without rendering the whole
+ * tiling field; slot movement itself is covered in Panes.performance.test.tsx. */
+function RenderedWebPane(props: Omit<ComponentProps<typeof WebPane>, "bodyRef">) {
+  const body = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    requestAnimationFrame(() => {
+      const box = body.current?.getBoundingClientRect();
+      if (!box) return;
+      browser.mount({ x: box.left, y: box.top, width: box.width, height: box.height });
+    });
+  }, []);
+  return <WebPane {...props} bodyRef={body} />;
+}
+
 class FakeResizeObserver {
   observe() {}
   unobserve() {}
@@ -55,10 +70,10 @@ vi.stubGlobal("ResizeObserver", FakeResizeObserver);
 /**
  * Animation frames, held.
  *
- * The pane measures its rectangle a frame after each render, and the first
- * webview is created from that measurement — so "a frame later" is when the
- * browser starts existing, and holding the frames is what lets a test see the
- * gap a link click falls into.
+ * The production slot measures the browser body's rectangle one frame after
+ * render, and the focused fixture above mirrors that first measurement — so "a
+ * frame later" is when the browser starts existing, and holding the frames is
+ * what lets a test see the gap a link click falls into.
  */
 const frames: FrameRequestCallback[] = [];
 vi.stubGlobal("requestAnimationFrame", (fn: FrameRequestCallback) => frames.push(fn));
@@ -95,7 +110,7 @@ function render(
   root = createRoot(container);
   act(() => {
     root.render(
-      <WebPane
+      <RenderedWebPane
         onClose={onClose}
         expanded={false}
         onToggleExpanded={() => {}}
@@ -536,7 +551,7 @@ describe("following a link into the browser", () => {
     navigate("https://github.com");
     await act(async () => {
       root.render(
-        <WebPane
+        <RenderedWebPane
           onClose={() => {}}
           expanded={false}
           onToggleExpanded={() => {}}

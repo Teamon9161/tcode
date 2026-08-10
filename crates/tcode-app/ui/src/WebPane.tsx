@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useSyncExternalStore } from "react";
+import { useEffect, useRef, useSyncExternalStore, type RefObject } from "react";
 import {
   ArrowUp,
   BackIcon,
@@ -62,11 +62,11 @@ function tint(owner: string | null): React.CSSProperties | undefined {
  * Three consequences shape this file:
  *
  *  - **The rectangle has to be reported, continuously.** A native webview does
- *    not participate in layout; it sits where it was last told. So every render
- *    measures the body and, when it moved, tells the store. `useLayoutEffect`
- *    with no dependency array is deliberate: a pane can move without changing
- *    size (a sibling closed, a divider moved on the far side), and a
- *    `ResizeObserver` alone never fires for that.
+ *    not participate in layout; it sits where it was last told. The lightweight
+ *    slot wrapper in `Panes.tsx` measures this component's body after every slot
+ *    render and on resize. It lives outside the memoized pane subtree so a pane
+ *    can move without changing size while the expensive chrome and neighbours
+ *    still skip their renders.
  *  - **The address bar is a view, not the source of truth.** The webview owns
  *    where it is; typing here only asks it to go somewhere. The URL displayed
  *    comes back over `BROWSER_NAVIGATED`, so a redirect, a link click and a
@@ -91,6 +91,7 @@ function tint(owner: string | null): React.CSSProperties | undefined {
  * page already keeps.
  */
 export function WebPane({
+  bodyRef,
   onClose,
   expanded,
   onToggleExpanded,
@@ -99,6 +100,9 @@ export function WebPane({
   nameOf,
   onHandOver,
 }: {
+  /** The slot owns native-view geometry so its cheap wrapper can update while
+   *  this pane's memoized subtree stays untouched. */
+  bodyRef: RefObject<HTMLDivElement | null>;
   onClose: () => void;
   /** This pane is the one filling the field. */
   expanded: boolean;
@@ -137,74 +141,11 @@ export function WebPane({
    */
   onHandOver: (tab: string) => void;
 }) {
-  const body = useRef<HTMLDivElement>(null);
   const field = useRef<HTMLInputElement>(null);
-  const placed = useRef<string>("");
   const { tabs, failure, live } = useSyncExternalStore(browser.subscribe, browser.snapshot);
   const tab = currentTab(tabs);
   /** The serial of the last request acted on, so a re-render is not a re-visit. */
   const visited = useRef(0);
-
-  /** The frame a pending measurement is booked for, so the render that follows
-   *  a keystroke does not book a second one. */
-  const booked = useRef(0);
-
-  /** Measure, and only cross the bridge when it actually moved. This runs on
-   *  every render and on every resize, so it is the one place that has to stay
-   *  cheap. */
-  const place = useCallback((first: boolean) => {
-    const box = body.current?.getBoundingClientRect();
-    if (!box) return;
-    const rect = { x: box.left, y: box.top, width: box.width, height: box.height };
-    const key = `${rect.x},${rect.y},${rect.width},${rect.height}`;
-    if (!first && key === placed.current) return;
-    placed.current = key;
-    if (first) browser.mount(rect);
-    else browser.moved(rect);
-  }, []);
-
-  /**
-   * Book the measurement for the next frame, at most once.
-   *
-   * Measuring is `getBoundingClientRect`, and calling it in a layout effect —
-   * straight after a commit, while the layout it would read is dirty — forces
-   * the platform to lay the whole document out synchronously before it can
-   * answer. With this pane open that bill was paid after *every* render in the
-   * window, including the one behind each keystroke in a composer three panes
-   * away, on a document holding a conversation hundreds of blocks long.
-   *
-   * A frame later the layout is already computed and the same call is a read.
-   * Nothing is lost by the wait: the webview is composited by the OS, so it was
-   * never going to move in the same frame as the HTML underneath it anyway.
-   */
-  const schedule = useCallback(
-    (first: boolean) => {
-      if (booked.current) return;
-      booked.current = requestAnimationFrame(() => {
-        booked.current = 0;
-        place(first);
-      });
-    },
-    [place],
-  );
-
-  useLayoutEffect(() => {
-    schedule(placed.current === "");
-  });
-
-  useLayoutEffect(() => {
-    if (!body.current) return;
-    const watch = new ResizeObserver(() => schedule(false));
-    watch.observe(body.current);
-    return () => watch.disconnect();
-  }, [schedule]);
-
-  useEffect(
-    () => () => {
-      if (booked.current) cancelAnimationFrame(booked.current);
-    },
-    [],
-  );
 
   // The pane is going away — hidden by the same button that opened it, or
   // because another pane fills the field. Either way the webviews must stop
@@ -429,7 +370,7 @@ export function WebPane({
           rendered into it. Anything drawn here would be underneath a webview
           and therefore invisible — which is also why the failure line above
           sits outside it. */}
-      <div ref={body} className="pane-body is-web" />
+      <div ref={bodyRef} className="pane-body is-web" />
     </>
   );
 }

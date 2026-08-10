@@ -1,6 +1,11 @@
 import { invoke, listen } from "@ipc";
 
 import {
+  resetBrowserVisibility,
+  setBrowserShown,
+  syncBrowserVisibility,
+} from "./browserYield";
+import {
   addTabBehind,
   blankTab,
   closeTab,
@@ -51,12 +56,11 @@ import {
  *
  * ## What "hidden" means here
  *
- * Two different things hide the browser and they must not fight. `wanted` is
- * the pane's own state — off screen because another pane is expanded, or
- * because the pane unmounted. The popover yield (`browserYield.ts`) is a
- * separate, momentary borrow of the window and talks to the backend directly.
- * This module only ever re-asserts `wanted`, and only right after creating or
- * selecting a webview, which is the one moment the backend cannot know it.
+ * Two different things hide the browser and they must not fight. The pane's own
+ * requested state — off screen because another pane is expanded, or because
+ * the pane unmounted — and temporary yields for popovers or divider drags are
+ * composed by `browserYield.ts`. Creating or selecting a view re-asserts that
+ * same composed state rather than bypassing it.
  */
 
 type Snapshot = {
@@ -75,8 +79,6 @@ const watchers = new Set<() => void>();
 let state: Snapshot = { tabs: NO_TABS, failure: null, live: false };
 /** The pane's rectangle, as last measured. */
 let bounds: { x: number; y: number; width: number; height: number } | null = null;
-/** Whether the pane wants the browser on screen. */
-let wanted = true;
 let listening = false;
 
 // ------------------------------------------------------------------ the store
@@ -108,8 +110,8 @@ function failed(what: string, error: unknown) {
 export function reset() {
   state = { tabs: NO_TABS, failure: null, live: false };
   bounds = null;
-  wanted = true;
   listening = false;
+  resetBrowserVisibility();
 }
 
 // ------------------------------------------------------------------- the pane
@@ -159,21 +161,20 @@ export function moved(rect: NonNullable<typeof bounds>) {
  */
 export function unmount() {
   publish({ live: false });
-  invoke("browser_visible", { visible: false }).catch(() => {});
+  setBrowserShown(false);
 }
 
 /** The pane is on screen but covered by an expanded pane. `visibility: hidden`
  *  does not reach a native webview, so it has to be told. */
 export function shown(visible: boolean) {
-  wanted = visible;
-  invoke("browser_visible", { visible }).catch(() => {});
+  setBrowserShown(visible);
 }
 
 /** Re-assert what the pane wants, right after a call that shows a webview by
  *  creating or selecting it. The backend cannot know a pane mounted while
  *  another one is expanded. */
 function settle() {
-  if (!wanted) invoke("browser_visible", { visible: false }).catch(() => {});
+  syncBrowserVisibility();
 }
 
 // ------------------------------------------------------------------- the tabs

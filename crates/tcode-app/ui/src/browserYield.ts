@@ -1,32 +1,50 @@
 import { invoke } from "@ipc";
 
 /**
- * Making the browser stand down for a moment.
+ * The browser's effective visibility.
  *
- * The browser's page is a native child webview the OS composites *above* the
- * whole document, outside any stacking context CSS can reach. Two things in
- * this window therefore need it off the screen while they happen, and neither
- * of them owns it:
+ * A native page has two independent reasons to be off screen:
  *
- *  - **A popover** would otherwise open behind the page (`seat.ts`, rule 17),
- *    which looks exactly like a button that does nothing.
- *  - **A divider drag** would otherwise ask the platform to move and resize a
- *    whole browser process on every pointer sample. `browser.rs` has said this
- *    is what should happen since the file was written; nothing did it.
+ *  - the browser pane itself is hidden (`wanted`), and
+ *  - the app temporarily needs the renderer above it (`held`), for a popover
+ *    or a divider drag.
  *
- * Counted rather than a boolean, because these nest — a popover open over a
- * drag, a submenu over a menu — and it is the *last* one finishing that should
- * bring the page back. A boolean would let one closing submenu reveal the page
- * underneath the menu still in front of it.
- *
- * Calling this with no browser open is free: `Browser::visible` returns without
- * a webview, so no caller has to know whether the pane exists.
+ * They must be composed here rather than sent as competing booleans. In
+ * particular, releasing a divider used to send `visible: true` even when an
+ * expanded pane had already hidden the browser, which exposed a strip of the
+ * page at its last native bounds.
  */
+let wanted = false;
 let held = 0;
 
+function apply() {
+  invoke("browser_visible", { visible: wanted && held === 0 }).catch(() => {});
+}
+
+/** State what the pane wants. Temporary yields still take precedence. */
+export function setBrowserShown(visible: boolean) {
+  wanted = visible;
+  apply();
+}
+
+/**
+ * Re-assert the composed state after creating or selecting a native view.
+ * Those shell operations can change which view is current, but they do not
+ * know whether a popover or drag currently owns the renderer.
+ */
+export function syncBrowserVisibility() {
+  apply();
+}
+
+/**
+ * Make the browser stand down for a moment.
+ *
+ * Counted rather than a boolean because these can nest. Only the final release
+ * restores the pane's requested state; it never assumes that state is visible.
+ */
 export function yieldBrowser(): () => void {
   held += 1;
-  if (held === 1) invoke("browser_visible", { visible: false }).catch(() => {});
+  if (held === 1) apply();
   let released = false;
   return () => {
     // Guarded because a React cleanup can run twice under StrictMode, and a
@@ -34,6 +52,12 @@ export function yieldBrowser(): () => void {
     if (released) return;
     released = true;
     held -= 1;
-    if (held === 0) invoke("browser_visible", { visible: true }).catch(() => {});
+    if (held === 0) apply();
   };
+}
+
+/** Tests only. The app owns one browser coordinator for its whole lifetime. */
+export function resetBrowserVisibility() {
+  wanted = false;
+  held = 0;
 }

@@ -36,7 +36,10 @@
 // one is pinned in `main.js`'s own tests-by-inspection: nothing below may pass
 // `preload`, `nodeIntegration` or `contextIsolation: false`.
 
-const { WebContentsView, session } = require("electron");
+const {
+  WebContentsView: NativeWebContentsView,
+  session: nativeSession,
+} = require("electron");
 
 /** Mirrors `browser::BROWSER_NAVIGATED`, which mirrors `ui/src/types.ts`. */
 const BROWSER_NAVIGATED = "tcode://browser-navigated";
@@ -99,7 +102,13 @@ const PARTITION = "persist:tcode-browser";
  * a typed string means — that judgement is `crate::address::to_url`, has five
  * tests, and is deliberately not reimplemented here.
  */
-function browserVerbs({ window, emit, resolveUrl }) {
+function browserVerbs(
+  { window, emit, resolveUrl },
+  {
+    WebContentsView = NativeWebContentsView,
+    session = nativeSession,
+  } = {},
+) {
   // A page in a tab can ask for the camera, the microphone, geolocation or
   // notifications. Chromium's answer would be a prompt, and there is nobody
   // here to answer a prompt about a page that came from the open web — so the
@@ -272,6 +281,14 @@ function browserVerbs({ window, emit, resolveUrl }) {
     for (const tab of tabs) tab.view.setVisible(shown && tab.id === current);
   };
 
+  /** Apply visibility first and geometry last. Showing a native child can make
+   *  Electron allocate it at remembered bounds, so every path that may reveal
+   *  the current tab ends with its newest rectangle. */
+  const syncCurrent = () => {
+    restack();
+    if (shown && current) place(find(current));
+  };
+
   function create(id) {
     const view = new WebContentsView({
       webPreferences: {
@@ -344,8 +361,8 @@ function browserVerbs({ window, emit, resolveUrl }) {
       const view = create(id);
       tabs.push({ id, view });
       if (args.select === true) current = id;
-      place(view);
-      restack();
+      if (shown && current === id) syncCurrent();
+      else place(view);
       // Announced, not returned-only: the caller gets the id back, but the
       // strip has to hear about a tab it did not open. Both paths add by id and
       // ignore a duplicate, so the order these arrive in does not matter.
@@ -364,25 +381,25 @@ function browserVerbs({ window, emit, resolveUrl }) {
     browser_show(args) {
       rect = args.rect;
       shown = true;
-      for (const tab of tabs) place(tab.view);
-      restack();
+      syncCurrent();
       return null;
     },
 
     browser_select(args) {
       find(args.id);
       current = args.id;
-      place(find(args.id));
-      restack();
+      syncCurrent();
       return null;
     },
 
-    /** Follow the pane. Runs for every frame of a divider drag, so it stays a
-     *  bare setter. Only the current tab is placed; the others are placed when
-     *  they are selected. */
+    /** Follow the pane. During a divider drag the page is hidden, so only
+     *  remember the newest rectangle; moving a hidden WebContentsView would
+     *  still make Chromium re-layout the whole page in another process. The
+     *  final rectangle is applied once when `browser_visible(true)` restores
+     *  the pane. */
     browser_bounds(args) {
       rect = args.rect;
-      if (current) place(find(current));
+      if (shown && current) place(find(current));
       return null;
     },
 
@@ -390,10 +407,14 @@ function browserVerbs({ window, emit, resolveUrl }) {
      *
      *  `setVisible(false)` rather than removing the view: the spike checked
      *  that both reveal the DOM and that neither destroys the page, and this is
-     *  the one that does not have to remember where the view went. */
+     *  the one that does not have to remember where the view went.
+     *
+     *  Showing is ordered visibility first, placement last. Electron may
+     *  allocate a native child at its remembered bounds when it becomes
+     *  visible, so the pane's latest rectangle has to be the final operation. */
     browser_visible(args) {
       shown = args.visible;
-      restack();
+      syncCurrent();
       return null;
     },
 
@@ -643,7 +664,7 @@ function browserVerbs({ window, emit, resolveUrl }) {
         // then nothing is current, so nothing is shown.
         current = "";
       }
-      restack();
+      syncCurrent();
       return true;
     },
   };

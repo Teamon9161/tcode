@@ -50,8 +50,6 @@ function paneContext(focus = "inspect-pane"): PaneContext {
   const none = () => {};
   return {
     sessions: [{ id: "s", cwd: "/project", name: "project", home: "/home/me", log_id: null }],
-    stateOf: () => BLANK,
-    statusOf: () => "idle",
     focus,
     split: true,
     onFocus: none,
@@ -96,7 +94,14 @@ function paneContext(focus = "inspect-pane"): PaneContext {
 
 async function draw(value: Inspect, nextContext = context) {
   await act(async () => {
-    root.render(<Panes tiling={tiling(value)} context={nextContext} />);
+    root.render(
+      <Panes
+        tiling={tiling(value)}
+        context={nextContext}
+        stateOf={() => BLANK}
+        statusOf={() => "idle"}
+      />,
+    );
     await Promise.resolve();
     await Promise.resolve();
   });
