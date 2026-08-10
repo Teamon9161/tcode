@@ -27,7 +27,7 @@
 
 ## 已测事实与待测
 
-`spike/results.json`（Electron 43.3.0 / Chrome 150.0.7871.212 / win32）里已经有一半答案了——Phase 0 那次 spike 顺手测了 CDP：
+`spike/results.json` 里已经有一半答案了——Phase 0 那次 spike（win32，Electron 43.3.0 / Chrome 150.0.7871.212）顺手测了 CDP，2026-08-10 在 Linux（KDE 双屏，Wayland 与 X11 各跑一遍）复测结论一致，细节见下面"Linux 已跑"一节：
 
 | 探针 | 结果 |
 |---|---|
@@ -112,11 +112,22 @@
 
 （原本还有一条"运行时新建 partition 的代价"，随"默认用用户的 profile"这个决定一起作废：第一版只有一个 partition，和今天一模一样。）
 
-**Linux/Wayland 仍未验证，而且短期内验证不了**：开发机是 Windows。整个 Electron 迁移里唯一没跑的就是它（`AGENTS.md` 开头那句"Linux/Wayland 一项仍待跑"），而它恰好是当初决定迁移的那个坑所在。所以：
+**Linux 已跑（2026-08-10，KDE Plasma，双屏）：结论与 win32 一致。** 两个 ozone 路径各跑一遍：`npm run spike:wayland` 与 `npx electron --ozone-platform=x11 .`。Wayland 那条会弹一次 xdg-desktop-portal 的"分享哪个屏幕"对话框（KDE 双屏尤其明显）——那是安全边界，没有编程指定的口子；X11 那条走 X 抓屏、不经过 portal，不想点对话框就加 `--ozone-platform=x11`。真 app 的截图走 `capturePage()`，两条路径都不弹。
 
-- 上面三条的答案**只对 win32 成立**，`results.json` 里带着 platform 字段，别当成跨平台结论。
-- 第一次在 Linux 上跑这个 app 时，先跑 spike 再用功能。
-- 但**不要为一个没测过的平台预留抽象**：真出问题时改的是壳里那几行，而现在猜出来的接缝八成划在错的地方。
+复测结果（`results.json` 的 `probes.agentBrowser`）：
+
+- **setBounds 到达页面**（`pageFollowedTheHost: true`）——当初 Tauri 在 Linux 上不成立的那个坑，Electron 成立。
+- **隐藏 view 上 CDP 照常工作**（attached / evaluate / 点击都到页面）；`Page.captureScreenshot` 仍交替超时（Wayland 那次 `timeout/9113/timeout/9113`），`capturePage()` 隐藏时 3/3 好——`browser_screenshot` 走 capturePage 的决策跨平台成立。
+- **DevTools 打开不 detach debugger**（1.5s 与 4.5s 两条采样都 attached）——"别做三态机"跨平台成立。
+- **partition cookie 共享 / 隔离 / 持久**：第二次跑 `sessionPersistedAcrossRuns: true`，persist cookie 从上一轮活了下来。
+- **a11y 树**：GitHub PR 页 2058 节点，过滤后 588 useful / ~20KB——snapshot 是过滤器不是序列化器。
+- **后台 tab 照常报导航**（10ms 内）。
+
+**唯一没测成的是 zOrder 的像素采样**：spike 假设单屏且窗口可自定位（硬编码 `WINDOW = {x:60, y:60}`），KDE 双屏 + Wayland 不允许应用定位窗口，两次运行的采样点都落在捕获画面外（Wayland 恒为 `neither`，X11 报 `outside the capture`）。这个问题只能由改过的探针回答——窗口显示后读 `win.getBounds()`、遍历 `screen.getAllDisplays()` 找包含窗口的那块屏——留着给真正需要它的那天，别为它猜答案。
+
+- 这些答案现在对 win32 与 linux 都成立；`results.json` 带着 platform 字段，仍是"跑过的那台机器"的记录。
+- 第一次在 Linux 上开这个 app 时，spike 已先行跑过（2026-08-10），可以直接用功能。
+- 仍然不要为没测过的平台预留抽象：真出问题时改的是壳里那几行，而现在猜出来的接缝八成划在错的地方。
 
 ## 数据结构
 
@@ -323,7 +334,7 @@ ChatGPT 那份把"agent 直接用你的 work session"当卖点，方向是对的
 
 **第一版 = Phase 0 + 1 + 2。** 三步都做完才有东西可用，做完就停下来看。
 
-**Phase 0 — 补测。✅ 已完成**（win32）。`spike/main.js::agentBrowserProbes`，结果在 `results.json` 的 `probes.agentBrowser`，结论在上面"Phase 0 补测的结果"。Linux 留给第一次在 Linux 上开这个 app 的那天。
+**Phase 0 — 补测。✅ 已完成**（win32 初测，2026-08-10 Linux/KDE 复测一致）。`spike/main.js::agentBrowserProbes`，结果在 `results.json` 的 `probes.agentBrowser`，结论在上面"Phase 0 补测的结果"。zOrder 像素探针在 Linux 双屏下未测成（采样点落在捕获外），见上。
 
 **Phase 1 — 通道。✅ 已完成。** `sidecar.rs` 的 `Shell` trait + `ShellClient`（`{"call": n, …}` 帧、按 `call` id 路由回复、`CALL_TIMEOUT` 30s、shell 退出时清空 pending），`electron/main.js` 的 `serveCall`（同一张 `verbs` 表，多一个调用方）。六条单测在 `sidecar::tests`。
 

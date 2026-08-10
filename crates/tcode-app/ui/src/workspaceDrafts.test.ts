@@ -1,38 +1,91 @@
+import { EditorSelection, EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
 import type { WorkspaceTextView } from "./types";
 import {
   canSaveWorkspaceText,
-  discardWorkspaceDraft,
+  conflictedWorkspaceFileSession,
+  newWorkspaceFileSession,
   reloadNeedsConfirmation,
-  rememberWorkspaceDraft,
-  workspaceDraft,
+  reloadedWorkspaceFileSession,
+  rememberWorkspaceFileSession,
+  savedWorkspaceFileSession,
+  workspaceFileDirty,
+  workspaceFileSession,
 } from "./workspaceDrafts";
 
-const file = (text: string): WorkspaceTextView => ({
+const file = (text: string, revision = "revision", truncated = false): WorkspaceTextView => ({
   path: "notes.md",
   text,
-  revision: "revision",
+  revision,
   bytes: text.length,
-  truncated: false,
+  truncated,
 });
 
-describe("workspace drafts", () => {
-  it("keeps an unsaved draft scoped to its session and path", () => {
-    rememberWorkspaceDraft("one", "notes.md", { file: file("saved"), text: "edited", complete: true });
+describe("workspace file sessions", () => {
+  it("keeps clean and dirty state scoped to its session and path", () => {
+    const value = newWorkspaceFileSession(file("saved"), true);
+    rememberWorkspaceFileSession("one", "notes.md", { ...value, text: "edited" });
 
-    expect(workspaceDraft("one", "notes.md")?.text).toBe("edited");
-    expect(workspaceDraft("two", "notes.md")).toBeNull();
-    expect(workspaceDraft("one", "other.md")).toBeNull();
-
-    discardWorkspaceDraft("one", "notes.md");
+    expect(workspaceFileSession("one", "notes.md")?.text).toBe("edited");
+    expect(workspaceFileSession("two", "notes.md")).toBeNull();
+    expect(workspaceFileSession("one", "other.md")).toBeNull();
   });
 
-  it("clears a draft when reload discards it", () => {
-    rememberWorkspaceDraft("one", "notes.md", { file: file("saved"), text: "edited", complete: true });
-    discardWorkspaceDraft("one", "notes.md");
+  it("opens Markdown in preview and ordinary UTF-8 text in edit mode", () => {
+    expect(newWorkspaceFileSession(file("# title"), true).mode).toBe("preview");
+    expect(newWorkspaceFileSession(file("fn main() {}"), false).mode).toBe("edit");
+  });
 
-    expect(workspaceDraft("one", "notes.md")).toBeNull();
+  it("advances the save baseline without losing editor state, mode or viewport", () => {
+    const editorState = EditorState.create({
+      doc: "edited",
+      selection: EditorSelection.cursor(4),
+    });
+    const current = {
+      ...newWorkspaceFileSession(file("saved"), true),
+      text: "edited after submit",
+      mode: "edit" as const,
+      editorState,
+      editorScroll: { top: 120, left: 8 },
+    };
+    const saved = savedWorkspaceFileSession(current, file("echo", "revision-2"), "edited");
+
+    expect(saved.file.text).toBe("edited");
+    expect(saved.text).toBe("edited after submit");
+    expect(workspaceFileDirty(saved)).toBe(true);
+    expect(saved.file.revision).toBe("revision-2");
+    expect(saved.editorState).toBe(editorState);
+    expect(saved.editorScroll).toEqual({ top: 120, left: 8 });
+    expect(saved.mode).toBe("edit");
+  });
+
+  it("reloads from disk with a fresh editor generation and no old state", () => {
+    const current = {
+      ...newWorkspaceFileSession(file("saved"), true),
+      text: "draft",
+      mode: "edit" as const,
+      editorState: EditorState.create({ doc: "draft" }),
+      editorScroll: { top: 80, left: 0 },
+      conflicted: true,
+    };
+    const reloaded = reloadedWorkspaceFileSession(current, file("remote", "revision-2"));
+
+    expect(reloaded.text).toBe("remote");
+    expect(reloaded.editorState).toBeNull();
+    expect(reloaded.generation).toBe(current.generation + 1);
+    expect(reloaded.editorScroll.top).toBe(80);
+    expect(reloaded.mode).toBe("edit");
+    expect(reloaded.conflicted).toBe(false);
+  });
+
+  it("marks a conflict without replacing the draft", () => {
+    const current = { ...newWorkspaceFileSession(file("saved"), false), text: "draft" };
+    const conflicted = conflictedWorkspaceFileSession(current);
+
+    expect(conflicted.text).toBe("draft");
+    expect(conflicted.file.text).toBe("saved");
+    expect(conflicted.conflicted).toBe(true);
   });
 });
 

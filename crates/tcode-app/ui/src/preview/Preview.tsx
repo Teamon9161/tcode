@@ -22,6 +22,11 @@ import { DisplayContext, DISPLAY_DEFAULT, type Display } from "../display";
 import type { RewindTarget } from "../rewind";
 import { draftOf, type Plan, type PlanComment } from "../plan";
 import { Workspace } from "../Workspace";
+import {
+  conflictedWorkspaceFileSession,
+  newWorkspaceFileSession,
+  rememberWorkspaceFileSession,
+} from "../workspaceDrafts";
 
 /**
  * The design preview: every screen and state, side by side, in a browser.
@@ -815,6 +820,10 @@ const SCENES = [
   "rail",
   "session",
   "workspace",
+  "workspace-md",
+  "workspace-image",
+  "workspace-edge",
+  "workspace-expanded",
   "approval",
   "command",
   "question",
@@ -882,12 +891,83 @@ function showing(): Tiling {
   });
 }
 
-/** A real session beside its live workspace tree. From here, opening README.md
- * reaches Markdown preview, while the nested TypeScript fixture reaches the
- * highlighted source view; the inspect pane keeps both in its normal history. */
+/** The normal tree-to-file shape: a conversation, the stable navigation tree,
+ * and a deliberately long TypeScript document. The source pane is narrow here,
+ * which makes this the density and horizontal-scroll acceptance scene. */
 function workspace(): Tiling {
   const one = solo();
-  return openInspect(one, panes(one)[0].id, "a", { kind: "workspace-tree" });
+  const tree = openInspect(one, panes(one)[0].id, "a", {
+    kind: "workspace-tree",
+  });
+  return openInspect(tree, tree.focus, "a", {
+    kind: "workspace-file",
+    path: "crates/tcode-app/src/Workspace.tsx",
+  });
+}
+
+/** A readable-width Markdown document. The header switch is live, so this one
+ * scene exercises preview/edit without walking through the tree first. */
+function workspaceMarkdown(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", {
+    kind: "workspace-file",
+    path: "docs/fixture-notes.md",
+  });
+}
+
+/** The binary route: reload remains in the header, while mode and save do not. */
+function workspaceImage(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", {
+    kind: "workspace-file",
+    path: "icons/mark.png",
+  });
+}
+
+/** Two safety states side by side. The conflict is seeded through the same
+ * durable transition production uses after a rejected write; the truncated
+ * file still arrives through the real preview IPC fixture. */
+function workspaceEdge(): Tiling {
+  const path = "fixtures/conflict.ts";
+  const disk = "export const revision = 'disk';\n";
+  const base = newWorkspaceFileSession(
+    {
+      path,
+      text: disk,
+      revision: `fixture:a:${path}:1`,
+      bytes: new TextEncoder().encode(disk).length,
+      truncated: false,
+    },
+    false,
+  );
+  rememberWorkspaceFileSession(
+    "a",
+    path,
+    conflictedWorkspaceFileSession({
+      ...base,
+      text: `${disk}export const localDraft = true;\n`,
+    }),
+  );
+
+  const one = solo();
+  const truncated = openInspect(one, panes(one)[0].id, "a", {
+    kind: "workspace-file",
+    path: "fixtures/truncated.log",
+  });
+  return openAside(truncated, truncated.focus, "a", {
+    kind: "workspace-file",
+    path,
+  });
+}
+
+/** Workspace HTML is source, never the framed artifact viewer. Preview opens
+ * this pane expanded so the full-height editor and dense header can be judged. */
+function workspaceExpanded(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", {
+    kind: "workspace-file",
+    path: "docs/report.html",
+  });
 }
 
 /**
@@ -928,6 +1008,10 @@ function layoutFor(scene: Scene): Tiling {
   if (scene === "web") return web();
   if (scene === "terminal") return terminal();
   if (scene === "workspace") return workspace();
+  if (scene === "workspace-md") return workspaceMarkdown();
+  if (scene === "workspace-image") return workspaceImage();
+  if (scene === "workspace-edge") return workspaceEdge();
+  if (scene === "workspace-expanded") return workspaceExpanded();
   return solo();
 }
 
@@ -1001,6 +1085,29 @@ export function Preview() {
       if (!alive) return;
       const chip = document.querySelector<HTMLButtonElement>(".chip.is-model");
       if (chip) chip.click();
+      else if (tries++ < 20) requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+    return () => {
+      alive = false;
+    };
+  }, [scene]);
+
+  // The expanded source scene is an interaction state rather than a second
+  // layout implementation. Drive the real header control once it has mounted.
+  useEffect(() => {
+    if (scene !== "workspace-expanded") return;
+    let alive = true;
+    let tries = 0;
+    const tick = () => {
+      if (!alive) return;
+      const body = document.querySelector<HTMLElement>(
+        ".pane-body.is-workspace-file",
+      );
+      const expand = body
+        ?.closest(".pane")
+        ?.querySelector<HTMLButtonElement>('[aria-label="Expand this pane"]');
+      if (expand) expand.click();
       else if (tries++ < 20) requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);

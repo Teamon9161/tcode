@@ -6,6 +6,7 @@
 }
 .preview-bar {
   display: flex;
+  flex-wrap: wrap;
   gap: var(--s-1);
   padding: var(--s-2) var(--s-3);
   background: var(--sunken);

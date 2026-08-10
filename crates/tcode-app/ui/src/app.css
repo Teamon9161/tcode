@@ -6471,57 +6471,39 @@ button.strip-phase-line:hover .strip-phase-name {
   color: var(--muted);
 }
 
-.workspace-file {
+/* Workspace documents own their viewport. The generic inspect pane scroll is
+   correct for diffs and reports, but it breaks CodeMirror virtualization and
+   makes Markdown lose an independent reading position. */
+.pane-body.is-inspect.is-workspace-file {
   display: flex;
   flex-direction: column;
-  min-height: 100%;
-  gap: var(--s-3);
-}
-
-/* A file pane is one flat pane: the header names and acts on the file, the
-   file itself is the content, and the single divider is the only boundary it
-   needs. Nothing frames the file while it is being read — a grey well around a
-   rendered document says "field to type in", which in the resting state is a
-   promise about the wrong thing. The well belongs to the textarea, and appears
-   with it. */
-.workspace-file-bar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--s-3);
-  padding-bottom: var(--s-3);
-  border-bottom: 1px solid var(--line);
-}
-
-/* One line. `overflow-wrap: anywhere` is right where the path is a view's own
-   heading with the width to itself; on this row it shares the width with the
-   controls, so a deep path wrapped to five lines and pushed them down the
-   pane. It is a `Path` now, which elides by whole segments and keeps the tail
-   — the file's own name is the part worth reading, and the full path is in the
-   tooltip (rule 9). */
-.workspace-file-bar .inspect-path {
-  min-width: 0;
-  margin-bottom: 0;
   overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
+  padding: 0;
 }
 
-.workspace-file-actions {
+.workspace-file {
   display: flex;
-  align-items: center;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.workspace-file-mode,
+.workspace-file-save {
   flex: none;
-  gap: var(--s-2);
+  font-size: var(--text-xs);
 }
 
 .workspace-file-save {
   padding: var(--s-1) var(--s-3);
-  font-size: var(--text-xs);
 }
 
 .workspace-file-warning,
 .workspace-file-conflict,
 .workspace-file-error {
+  flex: none;
   margin: 0;
   padding: var(--s-2) var(--s-3);
   font-size: var(--text-xs);
@@ -6538,86 +6520,289 @@ button.strip-phase-line:hover .strip-phase-name {
   color: var(--danger-text);
 }
 
-/* The same file, in the same face, in the same place. A source file's read view
-   is a code block with no card and no chip (see below), so its editor matches
-   it: no well, no border, no smaller type. Switching modes must not look like
-   the file was swapped for a worse copy of itself — the chip in the header is
-   what says which mode this is, and the caret is what proves it. */
-.workspace-file-source {
-  display: block;
-  width: 100%;
-  min-height: calc(var(--s-8) * 4);
-  padding: 0;
-  border: 0;
-  background: none;
-  color: var(--ink);
-  font-family: var(--font-mono);
-  font-size: var(--text-sm);
-  line-height: var(--lh-normal);
-  resize: none;
-}
-
-/* Nothing on focus: the field fills the pane, so a ring around it is a ring
-   around the window. Whether it has the caret is answered by the caret. */
-.workspace-file-source:focus {
-  outline: none;
-}
-
-/* Read-only happens for one reason — the response was only the file's prefix —
-   and the banner above says so in a sentence. Greying the text as well makes
-   the file itself look like the problem. */
-.workspace-file-source:read-only {
-  cursor: default;
-}
-
-/* The read view. It grows into the pane so an image or a diagram gets the room
-   it was opened for, and it owns no chrome of its own: whatever `FileBody`
-   drew — a document, a picture, a code block — is already a finished surface. */
-.workspace-file-body {
-  min-width: 0;
+/* Markdown is a document rather than an editor viewport, so it carries the
+   normal reading inset and owns the scroll position cached for preview mode. */
+.workspace-file-preview {
   flex: 1;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--s-4);
+  overflow: auto;
 }
 
-/* A picture is sized by the pane, never enlarged past its own pixels: an icon
-   blown up to fill a column is a blurrier answer to "which icon is this". */
+.workspace-file-preview .doc {
+  margin-inline: auto;
+}
+
+/* Images remain the only render-only workspace route. Centre the available
+   canvas without enlarging a small source past its natural dimensions. */
+.workspace-file-body {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  min-height: 0;
+  padding: var(--s-4);
+  overflow: auto;
+}
+
 .workspace-file-body .shown-image {
   max-width: 100%;
   max-height: 100%;
   object-fit: contain;
 }
 
-/* A source file is the pane, not a snippet sitting in one. The shared code
-   block is right everywhere else — inside a conversation it has to say where a
-   quotation starts and stops — but here the tinted card is the same grey well
-   this view was rebuilt to get rid of, drawn around the entire contents of the
-   window. The language chip goes with it: the header above already spells out
-   the extension, and printing `tsx` under `…/Workspace.tsx` is one fact taking
-   two lines. The copy button stays; it is the only thing in that bar that was
-   ever an action. */
-.workspace-file-body .code-block {
-  background: none;
+/* CodeMirror is locally uncontrolled after mount; this host and its scroller
+   are the one continuous editable surface, not a field placed inside a pane. */
+.workspace-editor,
+.workspace-editor > .cm-editor,
+.workspace-editor .cm-scroller {
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
 }
 
-.workspace-file-body .code-lang {
-  display: none;
-}
-
-/* With the chip gone the bar holds one hover-only button, so it keeps just
-   enough height to be that button's seat and none of a caption's padding. */
-.workspace-file-body .code-bar {
-  padding: 0;
-  min-height: 20px;
-}
-
-.workspace-file-body .code-body {
-  padding: 0;
-  font-size: var(--text-sm);
-}
-
-/* The textarea is the pane's whole body once editing starts, rather than a box
-   four lines tall that the file scrolls inside. */
-.workspace-file-source {
+.workspace-editor {
   flex: 1;
+  overflow: hidden;
+}
+
+.workspace-editor .cm-editor {
+  background: var(--bg);
+  color: var(--syn-plain);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--lh-normal);
+}
+
+.workspace-editor .cm-editor.cm-focused {
+  outline: none;
+}
+
+.workspace-editor .cm-scroller {
+  overflow: auto;
+  font-family: inherit;
+}
+
+.workspace-editor .cm-content {
+  min-height: 100%;
+  padding-block: var(--s-2);
+  caret-color: var(--focus-ring);
+}
+
+.workspace-editor .cm-line {
+  padding-inline: var(--s-3);
+}
+
+.workspace-editor .cm-gutters {
+  border-right: 1px solid var(--line);
+  background: var(--bg);
+  color: var(--faint);
+}
+
+.workspace-editor .cm-gutterElement {
+  padding-inline: var(--s-2);
+}
+
+.workspace-editor .cm-activeLine,
+.workspace-editor .cm-activeLineGutter {
+  background: var(--hover);
+}
+
+.workspace-editor .cm-activeLineGutter {
+  color: var(--muted);
+}
+
+.workspace-editor .cm-selectionBackground,
+.workspace-editor .cm-content ::selection,
+.workspace-editor .cm-selectionMatch {
+  background: var(--selected) !important;
+}
+
+.workspace-editor .cm-selectionMatch {
+  outline: 1px solid var(--line-strong);
+}
+
+.workspace-editor .cm-cursor,
+.workspace-editor .cm-dropCursor {
+  border-color: var(--focus-ring);
+}
+
+.workspace-editor .cm-matchingBracket {
+  background: var(--selected);
+  outline: 1px solid var(--line-strong);
+}
+
+.workspace-editor .cm-nonmatchingBracket,
+.workspace-editor .cm-specialChar {
+  background: var(--danger-wash);
+  color: var(--danger-text);
+}
+
+/* Search is part of the document rather than a floating dialog. Its controls
+   use the same compact field/button vocabulary as the rest of the app. */
+.workspace-editor .cm-panels {
+  background: var(--chrome);
+  color: var(--body);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+}
+
+.workspace-editor .cm-panels-top {
+  border-bottom: 1px solid var(--line);
+}
+
+.workspace-editor .cm-panels-bottom {
+  border-top: 1px solid var(--line);
+}
+
+.workspace-editor .cm-search {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-2) var(--s-3);
+}
+
+.workspace-editor .cm-textfield,
+.workspace-editor .cm-button {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  background: var(--bg);
+  color: var(--ink);
+  font: inherit;
+}
+
+.workspace-editor .cm-textfield {
+  padding-inline: var(--s-2);
+}
+
+.workspace-editor .cm-textfield:focus-visible,
+.workspace-editor .cm-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+.workspace-editor .cm-button {
+  padding-inline: var(--s-2);
+  background-image: none;
+  cursor: pointer;
+}
+
+.workspace-editor .cm-button:hover {
+  background: var(--hover);
+}
+
+.workspace-editor .cm-button:active {
+  background: var(--pressed);
+}
+
+.workspace-editor .cm-search label {
+  color: var(--muted);
+}
+
+.workspace-editor .cm-panel.cm-search [name="close"] {
+  color: var(--muted);
+}
+
+.workspace-editor .cm-tooltip {
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  color: var(--body);
+  box-shadow: var(--shadow-lift);
+  font-family: var(--font-ui);
+  font-size: var(--text-xs);
+  overflow: hidden;
+}
+
+.workspace-editor .cm-tooltip-autocomplete > ul > li[aria-selected] {
+  background: var(--selected);
+  color: var(--ink);
+}
+
+/* `classHighlighter` supplies structure only. These are the editor's expanded
+   Lezer classes mapped back onto the same seven syntax roles Shiki uses for
+   read-only code; no CodeMirror palette enters the theme. */
+.workspace-editor .tok-comment {
+  color: var(--syn-comment);
+  font-style: italic;
+}
+
+.workspace-editor .tok-string,
+.workspace-editor .tok-string2,
+.workspace-editor .tok-bool,
+.workspace-editor .tok-null {
+  color: var(--syn-string);
+}
+
+.workspace-editor .tok-number {
+  color: var(--syn-number);
+}
+
+.workspace-editor .tok-keyword,
+.workspace-editor .tok-modifier,
+.workspace-editor .tok-operatorKeyword,
+.workspace-editor .tok-controlKeyword,
+.workspace-editor .tok-definitionKeyword,
+.workspace-editor .tok-moduleKeyword {
+  color: var(--syn-keyword);
+  font-weight: var(--weight-medium);
+}
+
+.workspace-editor .tok-typeName,
+.workspace-editor .tok-className,
+.workspace-editor .tok-namespace,
+.workspace-editor .tok-macroName,
+.workspace-editor .tok-heading {
+  color: var(--syn-type);
+  font-weight: var(--weight-medium);
+}
+
+.workspace-editor .tok-variableName,
+.workspace-editor .tok-propertyName,
+.workspace-editor .tok-labelName,
+.workspace-editor .tok-name,
+.workspace-editor .tok-definition,
+.workspace-editor .tok-local {
+  color: var(--syn-plain);
+}
+
+.workspace-editor .tok-operator,
+.workspace-editor .tok-punctuation,
+.workspace-editor .tok-bracket,
+.workspace-editor .tok-separator {
+  color: var(--syn-punct);
+}
+
+.workspace-editor .tok-tagName,
+.workspace-editor .tok-attributeName,
+.workspace-editor .tok-link {
+  color: var(--syn-keyword);
+}
+
+.workspace-editor .tok-meta,
+.workspace-editor .tok-processingInstruction,
+.workspace-editor .tok-annotationName {
+  color: var(--muted);
+}
+
+.workspace-editor .tok-emphasis {
+  font-style: italic;
+}
+
+.workspace-editor .tok-strong {
+  font-weight: var(--weight-semibold);
+}
+
+.workspace-editor .tok-inserted {
+  color: var(--diff-add-ink);
+}
+
+.workspace-editor .tok-deleted,
+.workspace-editor .tok-invalid {
+  color: var(--danger-text);
 }
 
 /* ============================================================ narrow window

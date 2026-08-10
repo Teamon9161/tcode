@@ -17,6 +17,7 @@ import {
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
 import type { Meter } from "./usage";
+import { isTyping } from "./typing";
 
 /**
  * The input. One control that changes intent with the turn: send while idle,
@@ -50,19 +51,6 @@ const MAX_HEIGHT = 220;
  * would mention a file.
  */
 const PUBLISH_IDLE = 200;
-
-/** Whether taking the caret away from this node would interrupt somebody. A
- *  focus change ends an open IME composition, so "is a field being typed into"
- *  is the question, not "is it a form control". */
-function isTyping(node: Element | null): boolean {
-  if (!node) return false;
-  const name = node.tagName;
-  return (
-    name === "TEXTAREA" ||
-    name === "INPUT" ||
-    (node as HTMLElement).isContentEditable === true
-  );
-}
 
 export function Composer({
   value,

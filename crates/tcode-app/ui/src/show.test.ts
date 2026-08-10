@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { extensionOf, isBinary, isServed, parseRows, shownAs } from "./show";
+import {
+  extensionOf,
+  isBinary,
+  isServed,
+  parseRows,
+  shownAs,
+  workspaceRouteOf,
+} from "./show";
 
 describe("what a shown file is drawn as", () => {
   it("routes by extension, and anything unknown is still readable as text", () => {
@@ -53,6 +60,20 @@ describe("what a shown file is drawn as", () => {
     expect(isServed("plot.png")).toBe(false);
     expect(isServed("notes.md")).toBe(false);
     expect(isBinary("out/report.html")).toBe(false);
+  });
+
+  it("keeps artifact loading and live workspace editing as separate routes", () => {
+    // A shown report is a served document, while the same workspace path is
+    // UTF-8 source. Neither answer can leak into the other caller.
+    expect(isServed("out/report.html")).toBe(true);
+    expect(shownAs("out/report.html", "<p>hi</p>")).toEqual({ as: "framed" });
+    expect(workspaceRouteOf("out/report.html")).toEqual({ load: "text", as: "editor" });
+
+    expect(workspaceRouteOf("README.md")).toEqual({ load: "text", as: "markdown" });
+    expect(workspaceRouteOf("plot.png")).toEqual({ load: "bytes", as: "image" });
+    for (const path of ["plot.svg", "flow.mmd", "data.csv", "data.tsv", "chart.json", "main.rs"]) {
+      expect(workspaceRouteOf(path)).toEqual({ load: "text", as: "editor" });
+    }
   });
 
   it("does not mistake a dotfile for an extension", () => {

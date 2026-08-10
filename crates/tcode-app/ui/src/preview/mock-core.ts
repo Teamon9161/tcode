@@ -262,6 +262,8 @@ type WorkspaceNode = {
   text?: string;
   binary?: string;
   revision: number;
+  truncated?: boolean;
+  totalBytes?: number;
 };
 type WorkspaceFixture = {
   nodes: Record<string, WorkspaceNode>;
@@ -320,6 +322,13 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
           "",
           'const focused = new Set(["workspace-tree", "workspace-file"]);',
           "export const hasWorkspaceView = (view: string) => focused.has(view);",
+          "",
+          ...Array.from({ length: 48 }, (_, index) => [
+            `export function fixtureLine${index + 1}(value: number): number {`,
+            `  return value + ${index + 1};`,
+            "}",
+            "",
+          ]).flat(),
         ].join("\n"),
       },
       "crates/tcode-app/src/theme": { kind: "directory", revision: 1 },
@@ -348,7 +357,56 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
       "docs/fixture-notes.md": {
         kind: "file",
         revision: 1,
-        text: "# Fixture notes\n\nWorkspace paths are relative to the session root.\n",
+        text: [
+          "# Fixture notes",
+          "",
+          "Workspace paths are relative to the session root.",
+          "",
+          "## Editing contract",
+          "",
+          "Markdown opens as this restricted document and can switch to source without losing either scroll position.",
+          "",
+          "## Enough prose to scroll",
+          "",
+          ...Array.from(
+            { length: 18 },
+            (_, index) =>
+              `Paragraph ${index + 1}. The preview keeps a reading position independently from the editor selection and undo history.`,
+          ),
+        ].join("\n\n"),
+      },
+      "docs/report.html": {
+        kind: "file",
+        revision: 1,
+        text: [
+          "<!doctype html>",
+          '<html lang="en">',
+          "  <head>",
+          '    <meta charset="utf-8">',
+          "    <title>Workspace HTML stays source</title>",
+          "  </head>",
+          "  <body>",
+          "    <h1>This must not execute in a workspace pane</h1>",
+          "    <script>document.body.dataset.executed = 'never';</script>",
+          "  </body>",
+          "</html>",
+        ].join("\n"),
+      },
+      fixtures: { kind: "directory", revision: 1 },
+      "fixtures/truncated.log": {
+        kind: "file",
+        revision: 1,
+        text: Array.from(
+          { length: 36 },
+          (_, index) => `${String(index + 1).padStart(4, "0")} preview log prefix`,
+        ).join("\n"),
+        truncated: true,
+        totalBytes: 4_800_000,
+      },
+      "fixtures/conflict.ts": {
+        kind: "file",
+        revision: 1,
+        text: "export const revision = 'disk';\n",
       },
       "empty-fixture": { kind: "directory", revision: 1 },
       "outside-workspace": { kind: "link", revision: 1 },
@@ -441,8 +499,8 @@ function textView(
     path,
     text,
     revision: revision(session, path, node.revision),
-    bytes: new TextEncoder().encode(text).length,
-    truncated: false,
+    bytes: node.totalBytes ?? new TextEncoder().encode(text).length,
+    truncated: node.truncated ?? false,
   };
 }
 

@@ -39,6 +39,7 @@ import type { Display } from "./display";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import { Rail } from "./Rail";
 import { FieldEmpty } from "./FieldEmpty";
+import { isTyping } from "./typing";
 
 /**
  * The window: the rail on the left, a tiled field of panes beside it, and a
@@ -265,12 +266,7 @@ export function Workspace({
       // editor. Escape must never be the key that throws away what you were
       // writing — that is the same rule the composer's own Escape follows.
       if (document.querySelector(".seated")) return;
-      if (
-        event.target instanceof HTMLInputElement ||
-        event.target instanceof HTMLTextAreaElement
-      ) {
-        return;
-      }
+      if (isTyping(event.target)) return;
       if (expanded) {
         event.stopPropagation();
         setExpanded(null);

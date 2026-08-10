@@ -57,6 +57,10 @@ export type Load =
 type View = {
   ext: string[];
   load?: Load;
+  /** The live workspace has a different route from an artifact viewer: images
+   * stay render-only, Markdown has preview/edit modes, and every other UTF-8
+   * file opens as source in the editor. */
+  workspace?: "image" | "markdown";
   /**
    * A constant, except where the extension genuinely does not settle it. `.json`
    * is a container, not a kind of thing: an echarts option and a config file
@@ -75,9 +79,10 @@ const VIEWS: View[] = [
   {
     ext: ["png", "jpg", "jpeg", "gif", "webp", "avif", "bmp", "ico"],
     load: "bytes",
+    workspace: "image",
     as: { as: "image" },
   },
-  { ext: ["md", "markdown"], as: { as: "doc" } },
+  { ext: ["md", "markdown"], workspace: "markdown", as: { as: "doc" } },
   {
     ext: ["json"],
     as: (body) => (isChartOption(body) ? { as: "sandbox", sandbox: "echarts" } : { as: "text" }),
@@ -99,6 +104,26 @@ export function extensionOf(path: string): string {
  *  is what the loader needs before it has anything to look at. */
 export function loadOf(path: string): Load {
   return LOOKUP.get(extensionOf(path))?.load ?? "text";
+}
+
+/** The live workspace route is deliberately distinct from `loadOf`: an HTML
+ * artifact is served as an isolated document, while that same path selected
+ * from the workspace tree is editable UTF-8 source. Image and Markdown facts
+ * still come from the shared registry rather than a component-local suffix
+ * list. */
+export type WorkspaceRoute =
+  | { load: "bytes"; as: "image" }
+  | { load: "text"; as: "markdown" | "editor" };
+
+export function workspaceRouteOf(path: string): WorkspaceRoute {
+  switch (LOOKUP.get(extensionOf(path))?.workspace) {
+    case "image":
+      return { load: "bytes", as: "image" };
+    case "markdown":
+      return { load: "text", as: "markdown" };
+    default:
+      return { load: "text", as: "editor" };
+  }
 }
 
 /** Whether this file has to arrive as a `data:` URL. */

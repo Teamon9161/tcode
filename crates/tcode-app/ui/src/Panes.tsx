@@ -1,7 +1,9 @@
 import {
   useCallback,
+  useEffect,
   useMemo,
   useRef,
+  useState,
   type CSSProperties,
   type RefObject,
 } from "react";
@@ -42,6 +44,8 @@ import {
   FileIcon,
   FolderIcon,
   ForwardIcon,
+  PencilIcon,
+  RefreshIcon,
   RowsIcon,
 } from "./components/Icons";
 import { Transcript } from "./Transcript";
@@ -57,6 +61,12 @@ import { RewindBar } from "./RewindBar";
 import type { RewindTarget } from "./rewind";
 import type { PlanDecision } from "./PlanEditor";
 import { draftOf, isPlanReview, type PlanDraft } from "./plan";
+import { MOD } from "./keys";
+import {
+  matchesWorkspaceFileControls,
+  WorkspaceFileControlsContext,
+  type WorkspaceFileControls,
+} from "./workspaceFileControls";
 
 /**
  * The tiling field: the pane tree, drawn.
@@ -706,6 +716,11 @@ function TurnStatus({ phase }: { phase: string }) {
 
 function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
   const pane = leaf.pane.kind === "inspect" ? leaf.pane : null;
+  const [fileControls, setFileControls] = useState<WorkspaceFileControls | null>(null);
+  const registerFileControls = useCallback((next: WorkspaceFileControls) => {
+    setFileControls(next);
+    return () => setFileControls((current) => (current === next ? null : current));
+  }, []);
   const state = context.stateOf(pane?.session ?? "");
   // Same reason as the session pane: one draft per plan, not one per render.
   const draft = useMemo(
@@ -739,7 +754,36 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
   if (!pane) return null;
   const { session, nav } = pane;
   const value = navValue(nav);
+  const activeFileControls =
+    value.kind === "workspace-file" &&
+    matchesWorkspaceFileControls(fileControls, session, value.path)
+      ? fileControls
+      : null;
   const info = context.sessions.find((open) => open.id === session);
+
+  useEffect(() => {
+    if (!activeFileControls || leaf.id !== context.focus) return;
+    const saveFile = (event: KeyboardEvent) => {
+      if (
+        !(event.ctrlKey || event.metaKey) ||
+        event.altKey ||
+        event.shiftKey ||
+        event.key.toLocaleLowerCase() !== "s"
+      ) {
+        return;
+      }
+      event.preventDefault();
+      if (
+        activeFileControls.onSave &&
+        !activeFileControls.saveDisabled &&
+        !activeFileControls.saving
+      ) {
+        activeFileControls.onSave();
+      }
+    };
+    window.addEventListener("keydown", saveFile);
+    return () => window.removeEventListener("keydown", saveFile);
+  }, [activeFileControls, context.focus, leaf.id]);
 
   return (
     <>
@@ -762,7 +806,63 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
             <ForwardIcon size={14} />
           </button>
         </div>
-        <span className="pane-name">{inspectTitle(value)}</span>
+        <span
+          className="pane-name"
+          title={value.kind === "workspace-file" ? value.path : undefined}
+        >
+          {inspectTitle(value)}
+        </span>
+        {activeFileControls?.onMode && activeFileControls.mode && (
+          <button
+            type="button"
+            className={`chip is-toggle workspace-file-mode${
+              activeFileControls.mode === "edit" ? " is-on" : ""
+            }`}
+            onClick={() =>
+              activeFileControls.onMode?.(
+                activeFileControls.mode === "edit" ? "preview" : "edit",
+              )
+            }
+            disabled={activeFileControls.loading || activeFileControls.saving}
+            aria-pressed={activeFileControls.mode === "edit"}
+            aria-label={
+              activeFileControls.mode === "edit" ? "Preview Markdown" : "Edit Markdown"
+            }
+            title={
+              activeFileControls.mode === "edit" ? "Preview Markdown" : "Edit Markdown"
+            }
+          >
+            <PencilIcon size={12} />
+            {activeFileControls.mode}
+          </button>
+        )}
+        {activeFileControls && (
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={activeFileControls.onReload}
+            disabled={activeFileControls.loading || activeFileControls.saving}
+            aria-label="Read this file again"
+            title="Read this file again"
+          >
+            <RefreshIcon size={14} />
+          </button>
+        )}
+        {activeFileControls?.onSave && (
+          <button
+            type="button"
+            className="btn btn-primary workspace-file-save"
+            onClick={activeFileControls.onSave}
+            disabled={activeFileControls.saveDisabled || activeFileControls.saving}
+            title={`Save (${MOD}+S)`}
+          >
+            {activeFileControls.saving
+              ? "saving…"
+              : activeFileControls.dirty
+                ? "save"
+                : "saved"}
+          </button>
+        )}
         <ExpandPane leaf={leaf} context={context} />
         <button
           className="icon-btn"
@@ -773,20 +873,26 @@ function InspectPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
         </button>
       </header>
 
-      <div className="pane-body is-inspect">
-        <InspectView
-          value={value}
-          blocks={state.blocks}
-          files={state.files}
-          cwd={info?.cwd ?? ""}
-          plan={state.plan}
-          planDraft={draft}
-          onOpen={openHere}
-          onOpenAside={openAside}
-          onMention={mention}
-          onPlanDraft={changeDraft}
-          onSavePlan={save}
-        />
+      <div
+        className={`pane-body is-inspect${
+          value.kind === "workspace-file" ? " is-workspace-file" : ""
+        }`}
+      >
+        <WorkspaceFileControlsContext.Provider value={registerFileControls}>
+          <InspectView
+            value={value}
+            blocks={state.blocks}
+            files={state.files}
+            cwd={info?.cwd ?? ""}
+            plan={state.plan}
+            planDraft={draft}
+            onOpen={openHere}
+            onOpenAside={openAside}
+            onMention={mention}
+            onPlanDraft={changeDraft}
+            onSavePlan={save}
+          />
+        </WorkspaceFileControlsContext.Provider>
       </div>
     </>
   );

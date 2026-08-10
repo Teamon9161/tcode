@@ -364,9 +364,14 @@ One shape per job, used everywhere:
   diff and a conversation read as two of the same thing rather than a panel
   bolted to the side of the app. The header carries the pane's identity on the
   left and its actions on the right; it never carries window-level controls.
-  Focus is a 1px `--brand` ring in the gutter, drawn only when more than one
-  pane exists — with one pane, "which is current" is not a question anyone is
-  asking, and answering it anyway spends the state colour on nothing.
+  A live workspace file follows that rule literally: its basename appears once
+  as the identity (the full path is its tooltip), while Markdown mode, reload
+  and save sit beside expand and close. File state and file operations remain in
+  the file view and register into this header; the pane frame does not learn how
+  to read or write a workspace. Focus is a 1px `--brand` ring in the gutter,
+  drawn only when more than one pane exists — with one pane, "which is current"
+  is not a question anyone is asking, and answering it anyway spends the state
+  colour on nothing.
 
   **"It never carries window-level controls" was aspirational for a while.** The
   header held six icons, two of which — the browser and the terminals — are the
@@ -550,14 +555,24 @@ One shape per job, used everywhere:
   it is set in the mono face, for the same reason a path in the transcript is.
   Grouping is a heading (the profile) rather than a repeated line under every
   row.
-- **Editable document** — the plan review's field vocabulary, and the one place
-  in the app where text is edited in place. A title or a paragraph is a
-  transparent `<textarea>` that grows with its content: `--sunken` on hover, a
-  `--focus-ring` border and `--bg` on focus, and no border at rest, so the plan
-  reads as a plan rather than as a form. Row controls (reorder, remove, add)
-  appear on hover or focus-within — four icons beside every row would compete
-  with the text they act on. Never `contenteditable`: model text goes in these
-  fields, and a textarea has no path from that to markup (see rule 10).
+- **Editable documents** — two jobs, with two deliberately different field
+  vocabularies. Plan review is structured editing: a title or paragraph is a
+  transparent `<textarea>` that grows with its content, takes `--sunken` on
+  hover and a `--focus-ring` border with `--bg` on focus, and has no border at
+  rest, so the plan reads as a plan rather than a form. Row controls (reorder,
+  remove, add) appear on hover or focus-within — four icons beside every row
+  would compete with the text they act on. Never `contenteditable`: model text
+  goes in these fields, and a textarea has no path from that to markup (see rule
+  10).
+
+  A live workspace source file is instead a full CodeMirror document. All UTF-8
+  non-Markdown files open directly in that editor; Markdown alone defaults to
+  the restricted rendered document and switches between preview and edit in the
+  pane header. The editor is the pane's remaining height and owns its scroll,
+  selection, history, find and indentation state rather than presenting another
+  inset field. Images stay render-only. Both CodeMirror and the read-only code
+  renderer emit semantic `tok-*` classes whose colours come only from the
+  theme's `--syn-*` contract.
 - **Anchored comment** — a quoted passage and a note, drawn under the field it is
   about, with the quote standing in for a highlight. The highlight is deliberately
   not drawn: it would have to be an overlay mirroring a textarea, and an anchor

@@ -1,6 +1,6 @@
 # tcode-app — 硬规则
 
-Electron 桌面前端：Rust 后端（本 crate，作为 sidecar 子进程）+ Electron 壳（`electron/`）+ webview 前端（`ui/`，Vite + React + TS）。后端是持有一个 `Arc<Agent>` 与多个隔离 `Session` 的 supervisor，事件经 JSON 帧推给 webview。**2026 年从 Tauri 迁到 Electron**（迁移记录在 `AGENTS.md` 规则 9h 与 git 历史里）；`spike/` 留着 Phase 0 的实测证据，Linux/Wayland 一项仍待跑。
+Electron 桌面前端：Rust 后端（本 crate，作为 sidecar 子进程）+ Electron 壳（`electron/`）+ webview 前端（`ui/`，Vite + React + TS）。后端是持有一个 `Arc<Agent>` 与多个隔离 `Session` 的 supervisor，事件经 JSON 帧推给 webview。**2026 年从 Tauri 迁到 Electron**（迁移记录在 `AGENTS.md` 规则 9h 与 git 历史里）；`spike/` 留着 Phase 0 的实测证据（win32 初测 + 2026-08-10 Linux/KDE 复测，结论一致；zOrder 像素探针在 Linux 双屏下仍待跑）。
 
 ## 构建与运行
 
@@ -347,15 +347,15 @@ npm start                                 # 从 crate 根目录启动 Electron �
   - **`show` 的三个文件**：`show.ts`（扩展名→怎么画的注册表 + CSV 解析，纯函数、有测试）、`Shown.tsx`（唯一读磁盘的检视视图，见硬规则 13）、后端的 `commands.rs::shown_file`（哑字节服务：**要 text 还是 `data:` URL 由前端那张表说了算**，后端不再判一次，否则就是两张要同步的表）。
   - **`show.ts` 的 `Load` 有三个值不是两个**：`text` / `bytes` / `served`。第三个的意思是**根本不读**——frame 自己去 origin 取，所以 `Shown.tsx` 对它跳过 `shown_file`。这不是省一次 IO：走读的那条路会在 `VIEWER_TEXT_BUDGET` 上把一份 10MB 的自包含报告截断，然后把残片交给一个跑不了它脚本的渲染器。**新加一种"前端不该读"的文件时改这个字段，不要在 `Shown.tsx` 里加 `if`。**
   - **`Framed.tsx` 的 reload 是 React `key`，不是 URL 上的 cache-buster**。跨源没法叫文档自己刷新，所以把手只能是元素本身：换 key → 卸载重建 → 重新请求 → `no-store` 让它是一次真读。写成 `?v=N` 对真 server 也work，但对任何不吃 query 的 URL 就碎了——设计预览里那个 `blob:` 正是这种，这条就是这么发现的。渲染本体在 `FileBody.tsx`（表格只把有限行放进 DOM，`ROW_STEP` 不是分页而是上限——20 万行 DOM 就是一个冻住的窗口）。
-  - **文件树点开的文件是那张表的第三个入口，不是第四种画法**（`WorkspaceFile.tsx`）。它和 `Shown.tsx` 共用 `FileBody`，所以一个 `.svg` 是模型 show 出来的还是有人从树里点开的，画出来一模一样。它曾经是 `WorkspaceEditor`：所有文件一律开在灰 textarea 里，旁边挂一个 `source / preview` 开关——而"preview"这个区分只有 Markdown 有，`.rs` 点它没有意义，`.png` 后端根本读不出来（`Workspace::read` 只认 UTF-8）。
+  - **文件树点开的文件复用同一张扩展名事实表，但不复用 artifact 的展示路由**（`show.ts` / `WorkspaceFile.tsx`）。`show` artifact 的 `.html` / `.svg` / mermaid / CSV / TSV 继续走各自的 frame、sandbox 或表格；workspace route 只回答读取通道与文件会话形态：图片走 bytes 并 render-only，Markdown 走 text 且默认受限 `Prose` preview，其余 UTF-8 文件（包括 HTML、SVG、mermaid、CSV、TSV、JSON）走 text 并直接打开 CodeMirror 源码。扩展名事实仍只有 registry 一份，组件里不许再长一张表。
 
-    **两态是"看"和"改"，不是"源码"和"预览"。** 渲染是静止态（打开一个文件的窗格就是被要求把它显示出来），改是一次点击（改是一个决定）。**读的时候不许有输入框的外观**——沉底的灰井是"这里可以打字"的承诺，静止态给这个承诺就是承诺错了东西；井属于 textarea，跟它一起出现。哪些文件连这个开关都没有也由同一张表说了算：`isBinary` 认下的以 `data:` URL 到达，那是一张图片，图片没有源码可以放进 textarea。
+    **workspace file 是跨导航存活的文件会话，不是一次 render**。按 `[session,path]` 缓存 baseline/revision、draft、CodeMirror selection/history/scroll、Markdown preview scroll、mode、conflict 与 reload generation；save 只推进 baseline，不重建 editor，确认 reload 才切 generation 并斩断旧 undo chain。文件名只在 inspect pane header 出现一次；`WorkspaceFile` 通过 pane-scoped registration 把 Markdown mode / reload / save 与当前 identity 交给 header，header 和 `Mod+S` 必须同时核对 session/path，不能让 back/forward 或快速换文件留下 stale action。truncated prefix、revision conflict 和 binary render-only 继续是不可覆盖的不变量。
 
     **二进制走 `Workspace::read_binary`，不许改道去 `shown_file`。** 两者的"在不在工作区里"是两套定义（前者按 root 解析且每一段都不许是 link，后者按 `is_viewable_path`），图片能读了却换一条边界进来，就是给同一句话两个意思。`.ico` 之类新扩展名要同时进 `show.ts` 的表和 `commands.rs::media_type`。
   - **粘贴/拖入的图片**走 `paste.ts`（长边 1568 以上重采样，模型本来也只看这个分辨率）→ `send_message` 的 `images` → `commands.rs::compose`。模型不支持 vision 时图片**存进 scratch 并告诉模型路径**，不静默丢——用户贴了个东西，丢掉它等于让人对着一张谁也没有的图提问。
-  - **语法高亮：语法来自 Shiki，配色一律不来自它**（`syntax.ts`）。这里曾经是一个手写扫描器，理由是任何库都自带调色板、是字面值、主题包改不动它，等于在"chroma 只表示状态"的界面里塞第二套配色——那条理由至今成立，变的是划线的位置。现在交给 Shiki 的**主题根本不是调色板**：`mark()` 把八种 kind 各涂一个哨兵色（`#000001`…），`kindOf()` 再把它读回来，跨过这趟旅程的只有一个下标。到 DOM 的仍然是 `tok-*` class，值仍然在 `base.css` 的 `--syn-*` 契约里。
+  - **语法高亮有两条 parser 路径，但只有一套配色契约**。read-only transcript / diff / approval / artifact code 继续由 Shiki 的 `syntax.ts` 解析；live workspace editor 由 `@codemirror/language-data` 按完整文件名 lazy load parser，并用 `@lezer/highlight` 的 `classHighlighter` 产出稳定 `tok-*` class。两条路径都只把结构带到 DOM，颜色一律映射到 `base.css` 的 `--syn-*`，不允许 Shiki theme、CodeMirror default highlight style 或第三套字面调色板进入组件。
 
-    三条别改坏：**只调 `codeToTokens`，永远不调 `codeToHtml`**——前者返回数据，后者返回 markup，规则 10 在这里是靠类型成立的，不是靠 review。**scope→kind 的表是我们自己的**，不是 Shiki 的 `css-variables` 主题（它把对象属性和数字归一堆、把标签名和关键字归一堆，跟这个 app 画它们的方式不一样）。**语法是异步按语言懒加载的**，所以 `highlight()` 在拿到之前返回 `null`，调用方拿 `useGrammar` 订阅、这期间画纯文本——一段没上色的代码是完整可读的，为它画个 loading 比等它更差。
+    Shiki 三条别改坏：**只调 `codeToTokens`，永远不调 `codeToHtml`**——前者返回数据，后者返回 markup，规则 10 在这里是靠类型成立的，不是靠 review。**scope→kind 的表是我们自己的**，不是 Shiki 的 `css-variables` 主题（它把对象属性和数字归一堆、把标签名和关键字归一堆，跟这个 app 画它们的方式不一样）。**语法是异步按语言懒加载的**，所以 `highlight()` 在拿到之前返回 `null`，调用方拿 `useGrammar` 订阅、这期间画纯文本——一段没上色的代码是完整可读的，为它画个 loading 比等它更差。CodeMirror 同理在 parser 到达前保持 plain text，并用 `Compartment.reconfigure` 注入，不得重建文档或破坏 IME/undo。
 - `src/serve.rs`：`.html` 报告的本机 origin（见 11b）。绑 `127.0.0.1:0`，每个 root 一个不可猜的 token 前缀，边界**复用 `tcode_tools::viewable_within`**——那是 `is_viewable_path` 的同一条规则换个返回值（落在哪个 root 下 + 相对路径），**不许在这里写第三套"在不在工作区里"**。相对路径不能用 `strip_prefix` 自己算：containment 是逐 component 且 Windows 上大小写不敏感的，`c:\proj` 与 `C:\Proj\x.html` 正是它接受而 strip 返回 `None` 的那一对。
   - **文件服务本体是 `tower_http::ServeDir`，不是手写的**。Range（视频拖动、PDF viewer）、条件请求、HEAD、目录 index、按扩展名的 MIME 全在它那儿，而这些正好是一份生成报告会逐个踩到的东西。**MIME 错一个就是一次"就这个报告显示不出来"**：`.js` 不是 `text/javascript` 时 module script 直接被拒，`.wasm` 不是 `application/wasm` 时 `instantiateStreaming` 失败——`a_report_and_everything_it_pulls_in` 按值钉住了这几个。
   - 三个自己加的响应头，各有理由：`no-store`（否则 `Shown.tsx` 那个 reload 按钮是个不做事的按钮）、`text/*` 补 `charset=utf-8`（`mime_guess` 只给裸 `text/html`，中文报告靠浏览器猜编码就是乱码）、`POLICY`（见 11b，堵外传）。

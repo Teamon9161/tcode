@@ -28,6 +28,19 @@ describe("preview workspace fixture", () => {
     expect(aReadme.text).toContain("Markdown editor preview");
     expect(bReadme.text).toContain("duck_ext");
     expect(aReadme.path).toBe("README.md");
+
+    const longSource = await call<TextView>("workspace_read_text", {
+      session: "a",
+      path: "crates/tcode-app/src/Workspace.tsx",
+    });
+    expect(longSource.text.split("\n").length).toBeGreaterThan(150);
+
+    const truncated = await call<TextView>("workspace_read_text", {
+      session: "a",
+      path: "fixtures/truncated.log",
+    });
+    expect(truncated.truncated).toBe(true);
+    expect(truncated.bytes).toBe(4_800_000);
   });
 
   /* The second door, and the fixture that proves the scene can show a picture
