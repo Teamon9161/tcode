@@ -1854,8 +1854,9 @@ body.is-resizing {
 }
 
 .code-block {
+  border: 1px solid var(--line);
   border-radius: var(--r-sm);
-  background: var(--sunken);
+  background: var(--bg);
   overflow: hidden;
 }
 
@@ -3222,7 +3223,8 @@ body.is-resizing {
    steps. */
 .mrow {
   display: grid;
-  grid-template-columns: 12px 1fr auto auto;
+  /* The fifth column carries the vision warning; it is 0-wide when absent. */
+  grid-template-columns: 12px 1fr auto auto auto;
   align-items: center;
   gap: 2px var(--s-2);
   width: 100%;
@@ -3267,6 +3269,14 @@ body.is-resizing {
 }
 .mrow-more {
   color: var(--faint);
+}
+/* A role whose whole job the running line-up cannot do — today, vision
+   resolving to a text-only model. An amber note, quieter than the row itself:
+   it says the capability is missing, not that anything is wrong. */
+.mrow-warn {
+  color: var(--amber-text);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
 }
 /* The second line belongs under the name, not beside it: it explains the row,
    and a row's explanation reads as prose on the name's own axis. */
