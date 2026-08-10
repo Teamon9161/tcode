@@ -36,7 +36,7 @@ import { cwdForTerminal } from "./terminal";
 import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
 import { Panes, type PaneContext } from "./Panes";
-import { DisplayMenu } from "./DisplayMenu";
+import { SettingsPanel } from "./DisplayMenu";
 import type { Display } from "./display";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import { Rail } from "./Rail";
@@ -701,7 +701,7 @@ export function Workspace({
             not. With the window split, "show reasoning" cannot mean one thing in
             the left pane and another in the right. */}
         <WindowDragRegion />
-        <DisplayMenu display={display} onChange={onDisplay} />
+        <SettingsPanel display={display} onChange={onDisplay} />
         <WindowControls />
       </header>
 

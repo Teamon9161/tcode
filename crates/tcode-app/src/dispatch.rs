@@ -297,6 +297,12 @@ impl Registry {
         // The terminal. The PTY stays on this side of the pipe — see
         // `AGENTS.md` rule 9i for why it is worth keeping behind the same
         // audited boundary.
+        result!(t, "desktop_settings", c::desktop_settings[supervisor]());
+        result!(
+            t,
+            "set_terminal_shell",
+            c::set_terminal_shell[supervisor, terminals](shell)
+        );
         result!(t, "terminal_open", c::terminal_open[emit, terminals](cwd, cols, rows));
         result!(t, "terminal_write", c::terminal_write[terminals](id, data));
         result!(

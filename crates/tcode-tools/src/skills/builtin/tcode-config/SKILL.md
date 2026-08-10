@@ -20,8 +20,8 @@ Use these locations deliberately:
 - `[tcode_state]` in the selected user config is runtime state written by
   `/model`, `/agents`, `/suggest`, permission-mode and voice controls,
   `/dogfood`, and folder-trust choices. It stores the active
-  profile/model/effort/preset, ad-hoc agent pins, UI toggles, and the
-  machine-local `folder_trust` map keyed by canonical folder path. tcode changes
+  profile/model/effort/preset, ad-hoc agent pins, UI toggles (including the
+  desktop terminal shell selection), and the machine-local `folder_trust` map keyed by canonical folder path. tcode changes
   only this table through a comment-preserving `toml_edit` read-modify-write;
   do not use it for normal handwritten defaults or project policy. The single
   exception is `/model save`, which adds or replaces one `[presets.<name>]`
@@ -519,14 +519,33 @@ re-enable filtering you turned off.
 `ui.suggest_next` controls the post-turn next-prompt guess and costs one small
 auxiliary request per turn; its default is `false`, and `[tcode_state].suggestions`
 from `/suggest` takes precedence when present. `ui.show_reasoning` only displays
-provider reasoning summaries; it does not change provider behaviour. `ui.shell`
-names the shell the desktop app's terminal pane starts in each tab, e.g.
-`shell = "/bin/zsh"`. Absent means detect: `$SHELL`, then the user's login
-shell from the passwd database, then `/bin/sh`. It is the one place the
-terminal shell is set; the agent's `bash` tool is deliberately unaffected —
-its permission rules, descriptions and resolution probes are Bash's. Like the
-other `[ui]` fields, all three are read only from the selected user
-configuration.
+provider reasoning summaries; it does not change provider behaviour.
+
+`ui.shell` is the **handwritten default** for the desktop terminal pane's command,
+for example `shell = "/bin/zsh"`. The selected desktop Settings surface can save
+`[tcode_state].terminal_shell`, a string in the **selected user configuration**;
+when it is present it wins over `ui.shell`. A non-empty value is the executable or
+command used for terminals opened after saving. An explicit empty string (`""`),
+written by **Use automatic shell**, is meaningful: it overrides `ui.shell` and
+detects the platform default instead. When no runtime value is present, `ui.shell`
+falls back to automatic detection: `$SHELL`, then the user's login shell from the
+passwd database, then `/bin/sh`.
+
+```toml
+[ui]
+# Handwritten fallback for the desktop terminal pane.
+shell = "/bin/zsh"
+
+[tcode_state]
+# Optional Settings override. Set to "" to select automatic detection.
+terminal_shell = ""
+```
+
+This setting affects only terminal tabs opened by the desktop app after it is
+saved. The agent's `bash` tool is deliberately unaffected: its permission rules,
+descriptions and resolution probes remain Bash's. Like the other `[ui]` fields,
+`ui.shell` is read only from the selected user configuration; the runtime override
+is written there through the comment-preserving `[tcode_state]` update path.
 
 ## Voice input
 

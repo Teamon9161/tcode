@@ -27,6 +27,7 @@ function draw(
   doc = "one",
   state?: EditorState | null,
   initialOffset?: number | null,
+  initialFallbackScroll?: number,
 ) {
   act(() => {
     root.render(
@@ -35,6 +36,7 @@ function draw(
         initialDoc={doc}
         initialState={state}
         initialOffset={initialOffset}
+        initialFallbackScroll={initialFallbackScroll}
         onSnapshot={(next) => {
           snapshot = next;
         }}
@@ -158,6 +160,12 @@ describe("WorkspaceEditor", () => {
 
     expect(destroy).toHaveBeenCalledTimes(1);
     destroy.mockRestore();
+  });
+
+  it("uses preview scroll as a fallback when source hit-testing cannot locate text", () => {
+    const editor = draw("one two three", null, null, 96);
+
+    expect(editor.scrollDOM.scrollTop).toBe(96);
   });
 
   it("accepts a preview hand-off position and keeps the document intact", () => {

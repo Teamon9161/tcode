@@ -87,10 +87,10 @@ struct Term {
 #[derive(Default)]
 pub struct Terminals {
     live: Mutex<HashMap<String, Term>>,
-    /// The shell a new tab runs, when the user configured one (`[ui] shell`).
-    /// `None` means detect: `$SHELL`, then the passwd login shell, then
-    /// `/bin/sh`.
-    configured: Option<String>,
+    /// The shell a new tab runs, set from the selected global configuration.
+    /// It is mutable because Settings applies to the next tab without restarting
+    /// the whole app; existing PTYs retain the program they already started.
+    configured: Mutex<Option<String>>,
 }
 
 impl Terminals {
@@ -98,15 +98,21 @@ impl Terminals {
         Self::with_shell(None)
     }
 
-    /// A shell named in the user's config, applied to every tab this window
-    /// opens. The single place the shell is set — the terminal pane is the
-    /// only surface that needs it, and `config.ui.shell` is where the setting
-    /// lives (see `tcode-core::config::UiConfig`).
+    /// A shell resolved from the selected user's runtime Settings override or
+    /// hand-written configuration, applied to every tab this window opens. The
+    /// terminal pane is the only surface that needs it.
     pub fn with_shell(configured: Option<String>) -> Arc<Self> {
         Arc::new(Self {
             live: Mutex::new(HashMap::new()),
-            configured: configured.filter(|shell| !shell.trim().is_empty()),
+            configured: Mutex::new(configured.filter(|shell| !shell.trim().is_empty())),
         })
+    }
+
+    /// Apply a Settings change to terminals opened from now on. Running tabs own
+    /// their child process, so changing a preference must not restart or alter them.
+    pub fn set_shell(&self, configured: Option<String>) {
+        *self.configured.lock().expect("terminal shell lock") =
+            configured.filter(|shell| !shell.trim().is_empty());
     }
 
     /// Starts a shell in `cwd` and returns the id its tab will use.
@@ -124,7 +130,8 @@ impl Terminals {
             .openpty(size(cols, rows))
             .map_err(|error| format!("cannot open a terminal: {error}"))?;
 
-        let mut command = CommandBuilder::new(pick_shell(self.configured.clone()));
+        let configured = self.configured.lock().expect("terminal shell lock").clone();
+        let mut command = CommandBuilder::new(pick_shell(configured));
         command.cwd(cwd);
         // What a program asks the terminal for. xterm.js is a 256-colour,
         // truecolor-capable terminal, and a shell that is not told inherits
@@ -372,8 +379,8 @@ fn pick_shell(configured: Option<String>) -> String {
 /// the user database, then `/bin/sh`. The passwd fallback matters because a
 /// desktop launch often has no `SHELL` at all — a file manager does not start
 /// the app from a shell — and `/bin/sh` on Debian is dash, which is not the
-/// shell anybody configured. `[ui] shell` in the config overrides all three
-/// (see `Terminals::with_shell`).
+/// shell anybody configured. The Settings override or `[ui] shell` wins over
+/// all three (see `Terminals::with_shell`).
 fn shell() -> String {
     #[cfg(windows)]
     {
@@ -424,7 +431,9 @@ fn login_shell() -> Option<String> {
         if bytes.is_empty() {
             return None;
         }
-        return std::ffi::OsString::from_vec(bytes.to_vec()).into_string().ok();
+        return std::ffi::OsString::from_vec(bytes.to_vec())
+            .into_string()
+            .ok();
     }
 }
 
@@ -509,7 +518,9 @@ mod tests {
         #[cfg(not(windows))]
         {
             let login = login_shell();
-            assert!(login.as_deref().is_some_and(|shell| !shell.trim().is_empty()));
+            assert!(login
+                .as_deref()
+                .is_some_and(|shell| !shell.trim().is_empty()));
         }
     }
 

@@ -376,6 +376,7 @@ export function WorkspaceFile({ path }: { path: string }) {
           initialState={document.editorState}
           initialScroll={document.editorScroll}
           initialOffset={pendingPreviewOffset.current}
+          initialFallbackScroll={document.previewScroll}
           readOnly={!document.complete}
           onSnapshot={updateEditor}
         />

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { imageFiles, isImagePaste } from "./paste";
+import { imageFiles, isImagePaste, uniquePasted, type Pasted } from "./paste";
 
 describe("imageFiles", () => {
   it("reads an image exposed only through clipboard items", () => {
@@ -78,5 +78,30 @@ describe("imageFiles", () => {
     } as unknown as DataTransfer;
 
     expect(isImagePaste(transfer)).toBe(false);
+  });
+});
+
+
+describe("uniquePasted", () => {
+  const image = (data: string, id: string): Pasted => ({
+    id,
+    mediaType: "image/png",
+    data,
+    url: `data:image/png;base64,${data}`,
+    name: "clipboard.png",
+  });
+
+  it("keeps one decoded image when a single paste exposes it twice", () => {
+    const once = image("same-bytes", "paste-1");
+    const duplicate = image("same-bytes", "paste-2");
+
+    expect(uniquePasted([once, duplicate])).toEqual([once]);
+  });
+
+  it("preserves genuinely different images", () => {
+    const first = image("first", "paste-1");
+    const second = image("second", "paste-2");
+
+    expect(uniquePasted([first, second])).toEqual([first, second]);
   });
 });

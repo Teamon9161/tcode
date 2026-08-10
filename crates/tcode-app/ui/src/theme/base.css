@@ -60,6 +60,7 @@
   --syn-number: var(--ink);
   --syn-keyword: var(--brand-text);
   --syn-type: var(--ink);
+  --syn-call: var(--syn-type);
 
   /* ---- Diff ----------------------------------------------------------- */
   /* Additions and removals are the one place a review surface must be

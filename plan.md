@@ -206,3 +206,4 @@ loop {
 18. 连续的Browser操作应该全部收到一起,然后下面渲染一下浏览器的对应页面缩略图,类似show, 会更新的那种, 然后再加一个按钮,可以用户点击就打开对应的浏览器页面.
 19. 浏览器窗格隐藏了,但是有打开页面,这时候拖动别的窗格宽度,浏览器页面会有一部分显示出来.
 20. Tool friction — browser.screenshot：报告的可访问性快照已确认多个 Vega canvas 图表正常渲染，但截图工具返回“nothing to draw / probably blank”。这使它无法用于画布图表的最终视觉核验。若截图能等待 canvas 完成绘制，或在失败时说明是后台标签限制，将能避免误报空白页面。
+21. browser visual inspection：预览页面的 accessibility snapshot 能读取完整界面和 “Settings” 按钮，但 browser.screenshot 对同一非空页面返回“nothing to draw”，点击后的 portal popover 也未出现在 snapshot 中。我的替代方式是以真实预览启动、构建和 detector 验证；最小改进是让浏览器工具对已 snapshot 成功的页面稳定返回像素截图，并能列出 portal/dialog 内容，便于完成桌面 UI 的视觉验收。

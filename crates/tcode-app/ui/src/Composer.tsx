@@ -4,9 +4,10 @@ import { segments } from "./completion";
 import { useCompletions, useKnownMentions } from "./useCompletions";
 import { useSession } from "./session";
 
-import { imagesFrom, isImagePaste, type Pasted } from "./paste";
+import { imagesFrom, isImagePaste, uniquePasted, type Pasted } from "./paste";
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
+import { ImageViewer } from "./ImageViewer";
 import type { Meter } from "./usage";
 import { isTyping } from "./typing";
 
@@ -86,6 +87,7 @@ export function Composer({
   const mirror = useRef<HTMLDivElement>(null);
   const [dropping, setDropping] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
+  const [viewing, setViewing] = useState<number | null>(null);
   /** Where the caret is, or `null` while the field does not have it. It is the
    *  other half of "what is being typed": the same text with the caret in two
    *  places is two different tokens. */
@@ -233,6 +235,7 @@ export function Composer({
   const take = (transfer: DataTransfer | null) => {
     setFailure(null);
     imagesFrom(transfer)
+      .then(uniquePasted)
       .then((images) => images.length > 0 && onAttach(images))
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };
@@ -301,9 +304,17 @@ export function Composer({
     >
       {attachments.length > 0 && (
         <ul className="attachments">
-          {attachments.map((item) => (
+          {attachments.map((item, index) => (
             <li key={item.id} className="attachment">
-              <img className="attachment-thumb" src={item.url} alt={item.name} />
+              <button
+                type="button"
+                className="attachment-preview"
+                onClick={() => setViewing(index)}
+                aria-label={`View ${item.name}`}
+                title={`View ${item.name}`}
+              >
+                <img className="attachment-thumb" src={item.url} alt="" />
+              </button>
               <span className="attachment-name">{item.name}</span>
               <button
                 type="button"
@@ -323,6 +334,13 @@ export function Composer({
           {failure}
         </p>
       )}
+
+      <ImageViewer
+        images={attachments.map((item) => ({ url: item.url, label: item.name }))}
+        index={viewing}
+        onIndex={setViewing}
+        onClose={() => setViewing(null)}
+      />
 
       <div className="composer-row" ref={row}>
         {/* The draft again, behind the field, drawn only to tint the paths in

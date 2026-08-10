@@ -756,6 +756,10 @@ function mockSession(cwd: string): string {
  *  is blanked rather than destroyed. */
 let browserTabs = 0;
 
+/** The terminal preference keeps state in the preview just as it does through
+ * `[tcode_state]` in the real selected user config. */
+let terminalShell = "";
+
 let mockTerminals = 0;
 
 function openMockTerminal(cwd: string): string {
@@ -897,6 +901,11 @@ export async function invoke<T>(
     case "browser_step":
     case "browser_reload":
       return undefined as T;
+    case "desktop_settings":
+      return { terminal_shell: terminalShell } as T;
+    case "set_terminal_shell":
+      terminalShell = String(args?.shell ?? "").trim();
+      return { terminal_shell: terminalShell } as T;
     // The terminal is the opposite case to the browser above: it *is* drawn on
     // this side, by an emulator painting the app's own palette, so a fixture
     // can show the real thing. What it plays back is a session with colour in

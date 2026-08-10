@@ -23,9 +23,9 @@ pub struct Startup {
     pub session: Arc<SessionHandle>,
     pub warnings: Vec<String>,
     pub serve: ServeHandle,
-    /// The shell the terminal pane should start, from `[ui] shell`. `None` =
-    /// detect (`$SHELL`, passwd, `/bin/sh`). Carried out of `start` because
-    /// the config object is consumed by `tcode_frontend::boot`.
+    /// The desktop terminal shell resolved from the runtime Settings override or
+    /// `[ui] shell`. `None` = detect (`$SHELL`, passwd, `/bin/sh`). Carried out
+    /// of `start` because the config object is consumed by `tcode_frontend::boot`.
     pub terminal_shell: Option<String>,
 }
 
@@ -242,6 +242,6 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
         session: handle,
         warnings,
         serve,
-        terminal_shell: config.ui.shell.clone(),
+        terminal_shell: state.terminal_shell.clone().or(config.ui.shell.clone()),
     })
 }

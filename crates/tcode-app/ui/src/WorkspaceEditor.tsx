@@ -24,6 +24,7 @@ export function WorkspaceEditor({
   initialState,
   initialScroll = ZERO_SCROLL,
   initialOffset,
+  initialFallbackScroll = 0,
   readOnly = false,
   onSnapshot,
   languageLoader = loadEditorLanguage,
@@ -38,6 +39,10 @@ export function WorkspaceEditor({
    *  the reader's position handed over from the markdown preview. Ignored once
    *  `initialScroll` carries a real position. */
   initialOffset?: number | null;
+  /** A preview's exact source offset normally opens the editor at the same
+   * line. If browser caret hit-testing is unavailable, preserve its scroll
+   * position approximately rather than starting from the top. */
+  initialFallbackScroll?: number;
   readOnly?: boolean;
   onSnapshot: (snapshot: WorkspaceEditorSnapshot) => void;
   /** Kept injectable so the async parser boundary can be tested without
@@ -102,6 +107,8 @@ export function WorkspaceEditor({
           // A zero-height first frame is not a reason to drop the editor.
         }
       });
+    } else if (initialFallbackScroll !== 0) {
+      view.scrollDOM.scrollTop = initialFallbackScroll;
     }
     const rememberScroll = () => publish(view);
     view.scrollDOM.addEventListener("scroll", rememberScroll, { passive: true });

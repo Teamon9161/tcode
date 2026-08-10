@@ -111,3 +111,16 @@ describe("workspace editor save and reload policy", () => {
     expect(canForceSaveWorkspaceText({ dirty: false, truncated: false })).toBe(false);
   });
 });
+
+
+  it("does not mark a Windows line-ending document dirty after CodeMirror normalizes it", () => {
+    const current = newWorkspaceFileSession(file("one\r\ntwo"), false);
+
+    expect(workspaceFileDirty({ ...current, text: "one\ntwo" })).toBe(false);
+  });
+
+  it("still marks substantive text changes dirty after normalizing line endings", () => {
+    const current = newWorkspaceFileSession(file("one\r\ntwo"), false);
+
+    expect(workspaceFileDirty({ ...current, text: "one\nchanged" })).toBe(true);
+  });

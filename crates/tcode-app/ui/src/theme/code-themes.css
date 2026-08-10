@@ -1,0 +1,37 @@
+/* Optional syntax palettes. These override only semantic code tokens, so the
+ * app's status language and porcelain surfaces remain stable. The values follow
+ * the public GitHub Light, One Light, and Solarized Light families rather than
+ * importing a library palette that CodeMirror could not share. */
+
+:root[data-code-theme="github-light"] {
+  --syn-comment: oklch(0.56 0.016 255);
+  --syn-punct: oklch(0.39 0.025 255);
+  --syn-plain: oklch(0.3 0.025 255);
+  --syn-string: oklch(0.4 0.105 255);
+  --syn-number: oklch(0.46 0.14 300);
+  --syn-keyword: oklch(0.48 0.18 27);
+  --syn-type: oklch(0.43 0.13 255);
+  --syn-call: oklch(0.46 0.15 300);
+}
+
+:root[data-code-theme="one-light"] {
+  --syn-comment: oklch(0.64 0.018 280);
+  --syn-punct: oklch(0.36 0.025 280);
+  --syn-plain: oklch(0.3 0.025 280);
+  --syn-string: oklch(0.48 0.12 145);
+  --syn-number: oklch(0.51 0.115 83);
+  --syn-keyword: oklch(0.46 0.15 325);
+  --syn-type: oklch(0.52 0.115 83);
+  --syn-call: oklch(0.52 0.135 255);
+}
+
+:root[data-code-theme="solarized-light"] {
+  --syn-comment: oklch(0.59 0.027 220);
+  --syn-punct: oklch(0.46 0.035 220);
+  --syn-plain: oklch(0.39 0.035 220);
+  --syn-string: oklch(0.5 0.13 145);
+  --syn-number: oklch(0.55 0.125 80);
+  --syn-keyword: oklch(0.5 0.17 345);
+  --syn-type: oklch(0.55 0.115 205);
+  --syn-call: oklch(0.53 0.115 245);
+}

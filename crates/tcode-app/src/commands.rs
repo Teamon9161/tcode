@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use serde::Serialize;
 
-use tcode_core::ContentBlock;
+use tcode_core::{config::Config, ContentBlock};
 
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
 use crate::projects::{self, ProjectInfo, StoredSession};
@@ -979,8 +979,15 @@ fn deliver(
         (message.blocks, message.instructions, message.expects_plan);
     let emit = emit.clone();
     tokio::spawn(async move {
-        if let Err(error) =
-            run_turn(agent, handle.clone(), emit.clone(), input, instructions, expects_plan).await
+        if let Err(error) = run_turn(
+            agent,
+            handle.clone(),
+            emit.clone(),
+            input,
+            instructions,
+            expects_plan,
+        )
+        .await
         {
             // `Busy` still reaches here: `send_or_queue` closed the ordinary
             // race, but two sends can both find the session free before either
@@ -1355,6 +1362,56 @@ pub fn shown_file(
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     load_shown(Path::new(&path), &handle.cwd, binary)
+}
+
+/// The persisted desktop preferences which have a runtime effect.
+///
+/// Code palettes are browser-local display state; the shell has to cross the
+/// sidecar because it chooses the program new terminal tabs execute.
+#[derive(Serialize)]
+pub struct DesktopSettings {
+    pub terminal_shell: String,
+}
+
+fn selected_config_file(supervisor: &Arc<Supervisor>) -> Result<PathBuf, String> {
+    let menus = supervisor.menus();
+    let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    Ok(menus.config_file.clone())
+}
+
+/// Read the terminal shell after its runtime preference has overridden the
+/// hand-written default. An empty response deliberately means automatic
+/// detection, not a missing setting.
+pub fn desktop_settings(supervisor: &Arc<Supervisor>) -> Result<DesktopSettings, String> {
+    let config_file = selected_config_file(supervisor)?;
+    let config = Config::load_global_at(&config_file).map_err(|error| error.to_string())?;
+    Ok(DesktopSettings {
+        terminal_shell: config
+            .tcode_state
+            .terminal_shell
+            .or(config.ui.shell)
+            .unwrap_or_default(),
+    })
+}
+
+/// Persist the shell selected in Settings and use it for tabs opened from now
+/// on. The empty string is meaningful: it asks the terminal to detect a shell
+/// rather than returning to the hand-written `[ui] shell` default.
+pub fn set_terminal_shell(
+    supervisor: &Arc<Supervisor>,
+    terminals: &Arc<crate::terminal::Terminals>,
+    shell: String,
+) -> Result<DesktopSettings, String> {
+    let shell = shell.trim().to_string();
+    let config_file = selected_config_file(supervisor)?;
+    Config::update_tcode_state_checked(&config_file, |state| {
+        state.terminal_shell = Some(shell.clone());
+    })
+    .map_err(|error| error.to_string())?;
+    terminals.set_shell(Some(shell.clone()));
+    Ok(DesktopSettings {
+        terminal_shell: shell,
+    })
 }
 
 /// Start a shell for a new terminal tab.

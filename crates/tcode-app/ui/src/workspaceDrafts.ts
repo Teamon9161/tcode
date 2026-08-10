@@ -105,7 +105,7 @@ export function diskChangedWorkspaceFileSession(
 }
 
 export function workspaceFileDirty(value: WorkspaceFileSession): boolean {
-  return value.text !== value.file.text;
+  return value.text.replace(/\r\n?/g, "\n") !== value.file.text.replace(/\r\n?/g, "\n");
 }
 
 /** A reload replaces unsaved text, so only a dirty editor needs an explicit choice. */

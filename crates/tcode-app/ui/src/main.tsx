@@ -12,6 +12,7 @@ import "@fontsource/ibm-plex-mono/500.css";
 // Swapping the theme import here swaps the entire look.
 import "./theme/base.css";
 import "./theme/porcelain.css";
+import "./theme/code-themes.css";
 // The emulator's structural CSS — cell geometry and the viewport, not colour;
 // its palette comes from `--term-*` through `termHost.ts`. Ahead of `app.css`
 // so this app's rules for that pane win (`.pane-body.is-term`).
@@ -19,6 +20,7 @@ import "@xterm/xterm/css/xterm.css";
 import "./app.css";
 
 import { SHELL } from "@ipc";
+import { loadCodeTheme, setCodeTheme } from "./codeTheme";
 import { App } from "./App";
 import { Boundary } from "./Boundary";
 
@@ -28,6 +30,7 @@ import { Boundary } from "./Boundary";
 // first paint; the design preview answers "preview" instead, so a preview never
 // inherits a drag region it has no window for.
 document.documentElement.dataset.shell = SHELL;
+setCodeTheme(loadCodeTheme());
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html lost its #root");

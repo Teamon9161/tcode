@@ -38,7 +38,19 @@ let counter = 0;
  * are the textarea's own business and must keep landing in it.
  */
 export async function imagesFrom(transfer: DataTransfer | null): Promise<Pasted[]> {
-  return Promise.all(imageFiles(transfer).map(read));
+  return uniquePasted(await Promise.all(imageFiles(transfer).map(read)));
+}
+
+/** Keep one decoded image once per incoming batch as well as across batches.
+ * Chromium may hand the same clipboard item out as distinct `File`s whose
+ * metadata does not agree, but their bytes do. */
+export function uniquePasted(items: Pasted[], seen = new Set<string>()): Pasted[] {
+  return items.filter((item) => {
+    const key = `${item.mediaType}\u0000${item.data}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 /**

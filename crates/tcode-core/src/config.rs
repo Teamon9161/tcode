@@ -912,6 +912,10 @@ pub struct ModelState {
     /// project configuration: checking out a repository cannot make it trusted.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub folder_trust: BTreeMap<String, FolderTrust>,
+    /// The desktop terminal shell chosen in Settings. `Some("")` deliberately
+    /// means "detect automatically" and overrides a handwritten `[ui] shell`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_shell: Option<String>,
 }
 
 impl ModelState {
@@ -940,6 +944,7 @@ impl ModelState {
             && self.voice_words.is_none()
             && self.mode.is_none()
             && self.folder_trust.is_empty()
+            && self.terminal_shell.is_none()
     }
 }
 
@@ -1810,6 +1815,14 @@ mod tests {
         assert_eq!(UiConfig::default().shell, None);
         let configured: UiConfig = toml::from_str("shell = \"/bin/zsh\"").unwrap();
         assert_eq!(configured.shell.as_deref(), Some("/bin/zsh"));
+    }
+
+    #[test]
+    fn desktop_terminal_shell_override_round_trips_including_automatic() {
+        let state: ModelState = toml::from_str("terminal_shell = \"\"").unwrap();
+        assert_eq!(state.terminal_shell.as_deref(), Some(""));
+        assert!(!state.is_empty());
+        assert!(toml::to_string(&state).unwrap().contains("terminal_shell = \"\""));
     }
 
     #[test]

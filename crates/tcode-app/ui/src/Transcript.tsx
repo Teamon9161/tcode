@@ -18,6 +18,7 @@ import {
   transcriptGroupFor,
 } from "./toolViews";
 import { ChevronDown, ChevronRight, PanelIcon, RewindIcon } from "./components/Icons";
+import { ImageViewer } from "./ImageViewer";
 import { StatusDot } from "./components/Status";
 import type { Status } from "./types";
 
@@ -316,29 +317,32 @@ const BlockView = memo(function BlockView({
   }
 });
 
-/**
- * Images that rode with a prompt, at a size that says which one it was.
- *
- * The full size is a pane, not a lightbox and not this element grown: a
- * thumbnail answers "which image was that" and nothing else, and enlarging
- * things is what panes are for in this app — an image beside the conversation
- * that mentions it beats one covering it. The control is `PopOut` rather than
- * the thumbnail itself, because "somewhere to go" has exactly one control in
- * this transcript (AGENTS.md rule 14) and an image is a poor place to open a
- * second: a picture that is silently also a button teaches nothing about the
- * rows above it that work the same way.
- */
+/** Images that rode with a prompt, at a size that says which one it was. */
 function Images({ urls, onOpen }: { urls: string[]; onOpen: (value: Inspect) => void }) {
+  const [viewing, setViewing] = useState<number | null>(null);
   if (urls.length === 0) return null;
   const name = (at: number) => (urls.length > 1 ? `image ${at + 1}` : "image");
   return (
     <div className="msg-images">
       {urls.map((url, at) => (
         <figure key={at} className="msg-image">
-          <img src={url} alt={name(at)} />
+          <button
+            type="button"
+            onClick={() => setViewing(at)}
+            aria-label={`View ${name(at)}`}
+            title={`View ${name(at)}`}
+          >
+            <img src={url} alt={name(at)} />
+          </button>
           <PopOut onOpen={() => onOpen({ kind: "image", url, label: name(at) })} />
         </figure>
       ))}
+      <ImageViewer
+        images={urls.map((url, at) => ({ url, label: name(at) }))}
+        index={viewing}
+        onIndex={setViewing}
+        onClose={() => setViewing(null)}
+      />
     </div>
   );
 }
