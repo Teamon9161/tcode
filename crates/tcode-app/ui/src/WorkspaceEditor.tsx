@@ -6,7 +6,7 @@ import { loadEditorLanguage } from "./editorLanguage";
 import {
   restoreWorkspaceEditorState,
   workspaceEditorExtensions,
-} from "./workspaceEditor";
+} from "./workspaceEditorSetup";
 
 export type WorkspaceEditorPosition = {
   top: number;

@@ -1808,8 +1808,7 @@ mod tests {
     #[test]
     fn the_terminal_shell_is_optional_and_unset_by_default() {
         assert_eq!(UiConfig::default().shell, None);
-        let configured: UiConfig =
-            toml::from_str("shell = \"/bin/zsh\"").unwrap();
+        let configured: UiConfig = toml::from_str("shell = \"/bin/zsh\"").unwrap();
         assert_eq!(configured.shell.as_deref(), Some("/bin/zsh"));
     }
 
