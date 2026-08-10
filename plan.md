@@ -192,10 +192,10 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行,还有就是prompt框上方的plan下拉后看不到background, 要有个展开的地方可以看到background, 并且最好做好渲染,我看plan审批那边的background都没有经过md渲染.
+12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行
 20. Tool friction — browser.screenshot：报告的可访问性快照已确认多个 Vega canvas 图表正常渲染，但截图工具返回“nothing to draw / probably blank”。这使它无法用于画布图表的最终视觉核验。若截图能等待 canvas 完成绘制，或在失败时说明是后台标签限制，将能避免误报空白页面。
 22. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
-23. 文件显示器，一行长度超过窗口的时候要自动换行吧，而且最后最好视觉上留一行方便用户打空格。
 24. Capability gap — Browser 工作树运行时：functions.browser 始终连接当前旧 tcode 进程，编辑后的 browser.js 无法在不重启会话的情况下加载，因此它继续复现旧的 AX/screenshot 故障，不能验证刚构建的实现。此次只能改用真实 Electron fixture 和临时 Electron 截图脚本。最小改进是允许启动一个基于当前工作树的隔离 Browser runtime，或提供明确的 runtime build id 与 reload 操作。
   Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
 25. Tool friction — browser.navigate：为实际检查 Vite UI 预览，我导航到已成功启动的 http://localhost:5174，但工具返回了 tcode 内嵌浏览器的 render recovery 超时，且报告 paneVisible=false，导致无法取得页面快照或截图。我只能以测试和生产构建完成验证。最小改进是让 harness 的浏览器检查能直接加载本机开发服务器，或在页面不可见时不依赖该应用内浏览器的 compositor 恢复路径。
+26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。

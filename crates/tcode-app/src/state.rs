@@ -1,7 +1,7 @@
 //! The supervisor: one `Arc<Agent>`, many isolated sessions.
 //!
-//! Phase 1 opens exactly one session, but the shape is the multi-session one
-//! from the start — a map keyed by session id, each entry owning its own
+//! Sessions are opened on demand — the app starts with none, and a session
+//! begins when the user opens a folder — and each entry owns its own
 //! `Session`, cancel token and pending approvals. Sessions share the agent
 //! (it is stateless) and nothing else.
 //!
@@ -578,10 +578,9 @@ pub struct Supervisor {
     /// A `HashMap` alone would hand the UI a different order each time.
     order: Mutex<Vec<String>>,
     /// Where a harness-started turn sends its events. Late-bound because the
-    /// supervisor is built during boot, before there is a window to emit into,
-    /// and the first session is already open by then. `attach_emitter` is the
-    /// one place that closes that gap — see it for what happens to the sessions
-    /// opened first.
+    /// supervisor is built during boot, before there is a window to emit into.
+    /// `attach_emitter` is the one place that closes that gap — see it for what
+    /// happens to the sessions opened first.
     emit: Mutex<Option<Arc<dyn Emit>>>,
 }
 
@@ -608,9 +607,8 @@ impl Supervisor {
     }
 
     /// Give the supervisor somewhere to emit, and start the monitor watch on
-    /// every conversation — the ones already open included, since the folder the
-    /// app launched on becomes a session during boot, well before a window
-    /// exists. Called once, from the Tauri `setup` hook.
+    /// every conversation already open — sessions opened after this point are
+    /// watched from `open`.
     pub fn attach_emitter(&self, emit: Arc<dyn Emit>) {
         *self.emit.lock().unwrap() = Some(emit);
         let open: Vec<Arc<SessionHandle>> =

@@ -15,12 +15,11 @@ use tcode_core::config::Config;
 use tcode_core::{ModelCell, Session};
 use tcode_tools::ShellFilters;
 
-use crate::state::{SessionHandle, Supervisor};
+use crate::state::Supervisor;
 
-/// The agent, one open session, and anything that degraded on the way up.
+/// The agent, and anything that degraded on the way up.
 pub struct Startup {
     pub supervisor: Arc<Supervisor>,
-    pub session: Arc<SessionHandle>,
     pub warnings: Vec<String>,
     pub serve: ServeHandle,
     /// The desktop terminal shell resolved from the runtime Settings override or
@@ -122,7 +121,8 @@ impl SessionFactory {
     }
 }
 
-/// Build the agent and open `cwd` as the first session.
+/// Build the agent. No conversation is opened here: the app starts on the empty
+/// field, and a session begins when the user opens a folder.
 ///
 /// `shell` is how a tool reaches the window's native views — today only the
 /// `browser` tool needs it (`crate::browser`), and it is a parameter rather
@@ -219,18 +219,7 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
     }));
 
     let factory = SessionFactory::new(config_file, model_cell, booted.shell_filters.clone());
-    let session = factory.open(&cwd, None)?;
-
     let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus, booted.skills));
-    // The session id is the app's handle for this conversation, independent of
-    // the JSONL log id: a resumed log and a fresh one are both just "a session"
-    // to the frontend.
-    let handle = Arc::new(SessionHandle::new(
-        uuid::Uuid::new_v4().to_string(),
-        cwd,
-        session,
-    ));
-    supervisor.open(handle.clone());
 
     let mut warnings = booted.warnings;
     if let Err(why) = &serve.0 {
@@ -239,7 +228,6 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
 
     Ok(Startup {
         supervisor,
-        session: handle,
         warnings,
         serve,
         terminal_shell: state.terminal_shell.clone().or(config.ui.shell.clone()),

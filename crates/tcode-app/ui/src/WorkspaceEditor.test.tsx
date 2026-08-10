@@ -9,6 +9,7 @@ import {
   WorkspaceEditor,
   type WorkspaceEditorSnapshot,
 } from "./WorkspaceEditor";
+import { workspaceEditorExtensions } from "./workspaceEditorSetup";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -79,6 +80,11 @@ afterEach(() => {
 });
 
 describe("WorkspaceEditor", () => {
+  it("wraps long lines instead of scrolling them sideways", () => {
+    const extensions = workspaceEditorExtensions(false);
+    expect(extensions).toContain(EditorView.lineWrapping);
+  });
+
   it("creates an accessible editor from the external initial document and reports user changes", () => {
     const editor = draw("hello");
 

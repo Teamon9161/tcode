@@ -42,6 +42,10 @@ export function workspaceEditorExtensions(readOnly: boolean): Extension[] {
     lineNumbers(),
     highlightActiveLineGutter(),
     highlightSpecialChars(),
+    // A file is read in this pane, not fought with: a long line (minified
+    // JSON, a data row, an unwrapped URL) wraps rather than pushing the text
+    // sideways out of the window.
+    EditorView.lineWrapping,
     history(),
     drawSelection(),
     dropCursor(),

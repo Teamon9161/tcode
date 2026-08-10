@@ -7000,6 +7000,11 @@ button.strip-phase-line:hover .strip-phase-name {
 .workspace-editor .cm-content {
   min-height: 100%;
   padding-block: var(--s-2);
+  /* A file that ends without a trailing newline renders no final blank line,
+     so the last line sits flush against the bottom edge and there is nowhere
+     comfortable to click and keep typing. The extra line-height of bottom
+     padding is that place — a click below the document maps to its end. */
+  padding-bottom: calc(var(--s-2) + var(--text-sm) * var(--lh-normal));
   caret-color: var(--focus-ring);
 }
 

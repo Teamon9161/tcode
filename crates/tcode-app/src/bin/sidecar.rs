@@ -1,13 +1,14 @@
 //! The backend as a child process, for the Electron shell.
 //!
 //! Deliberately the same shape as `main.rs`, minus a window: boot the agent,
-//! open the working directory as the first session, build the one [`Ctx`], and
-//! hand a registry to whatever is going to drive it. The difference is entirely
-//! in the last line — a pipe instead of a webview.
+//! build the one [`Ctx`], and hand a registry to whatever is going to drive
+//! it. The difference is entirely in the last line — a pipe instead of a
+//! webview. No conversation is opened at boot: the window starts on the empty
+//! field, and a session begins when the user opens a folder.
 //!
-//! **The working directory is the folder to open**, exactly as under Tauri.
-//! Which folder that is remains the shell's decision; it spawns this process
-//! with the cwd it wants.
+//! **The working directory is the process's cwd**, which is what the shell
+//! chose to spawn it with. Which folder that is remains the shell's decision;
+//! it spawns this process with the cwd it wants.
 //!
 //! Nothing here prints to stdout. See `sidecar.rs` for why that is a hard rule
 //! rather than a habit.
@@ -35,15 +36,12 @@ async fn main() -> anyhow::Result<()> {
     let (out, outbound) = sidecar::channel();
     let shell = Arc::new(ShellClient::new(out.clone()));
 
+    eprintln!("tcode-sidecar: booting on {}", cwd.display());
     let startup = tcode_app::boot::start(cwd, shell.clone()).await?;
     for warning in &startup.warnings {
         eprintln!("warning: {warning}");
     }
-    eprintln!(
-        "tcode-sidecar: session {} open on {}",
-        startup.session.id,
-        startup.session.cwd.display()
-    );
+    eprintln!("tcode-sidecar: ready — no conversation open (start one from the rail)");
     if let Ok(serve) = startup.serve.get() {
         eprintln!(
             "tcode-sidecar: viewer origin on http://127.0.0.1:{}",
