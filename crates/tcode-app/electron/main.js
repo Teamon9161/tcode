@@ -273,16 +273,16 @@ function serveBundle() {
 }
 
 // The classic no-flash startup is `show: false` plus `window.show()` once the
-// page has painted. That pattern stalls here: with a hidden window the view's
-// first compositor frame never completes in software-rendering environments
-// (no GPU / VM / RDP), so neither `ready-to-show` nor `did-finish-load`
-// fires and the window never appears at all. On platforms with `setOpacity`
-// the window is instead created visible but transparent and faded in on load —
-// the same no-flash effect, while the compositor runs from the first frame.
-// Linux has no `setOpacity`, so it keeps the hidden-until-ready pattern.
-const FADE_IN = process.platform === "win32" || process.platform === "darwin";
-
-function createWindow() {
+// page has painted. That pattern depends on the compositor being able to
+// produce the view's first frame while the window is hidden; on machines
+// Chromium renders in software (no GPU — VM, RDP, some drivers) that frame
+// never comes, so neither `ready-to-show` nor `did-finish-load` fires and the
+// window never appears at all. Any sub-1 window opacity has the same effect
+// (`setOpacity` turns the window layered, which stalls the view's load the
+// same way). Where the compositor is hardware the hidden-until-ready pattern
+// is kept; where it is not, the window is shown from the start and the brief
+// white pre-paint (the theme is white) stands in for a flash.
+function createWindow({ visibleStart }) {
   // `BaseWindow` with an explicit child view rather than `BrowserWindow`: the
   // browser pane puts sibling `WebContentsView`s in this same container, and
   // having the app itself be one of them means there is one kind of thing in
@@ -305,11 +305,11 @@ function createWindow() {
     // The title bar is the app's own (rule 9c). `main.tsx` puts the matching
     // drag surface on it; without `frame: false` there would be two.
     frame: false,
-    show: !FADE_IN,
+    // `visibleStart`: see the note above `createWindow`. On software-rendered
+    // machines a hidden window stalls the load, so there the window is visible
+    // from the first frame instead of hidden until the page paints.
+    show: visibleStart,
   });
-  // See `FADE_IN`: the window must be compositor-visible from the start, and
-  // transparent until the first page paint hides the white background.
-  if (FADE_IN) window.setOpacity(0);
 
   const view = new WebContentsView({
     webPreferences: {
@@ -365,9 +365,16 @@ function createWindow() {
 // ------------------------------------------------------------------- assembly
 
 app.whenReady().then(() => {
+  // GPU feature status is only available once the browser process is up. The
+  // hidden-until-ready startup pattern is only used when the compositor is
+  // genuinely hardware-accelerated; any software rendering (VM, RDP, disabled
+  // GPU) stalls a hidden window's load, so there the window is visible from
+  // the first frame instead (see `createWindow`).
+  const visibleStart = app.getGPUFeatureStatus().gpu_compositing !== "enabled";
+
   serveBundle();
 
-  const { window, view, emit } = createWindow();
+  const { window, view, emit } = createWindow({ visibleStart });
 
   // Declared before the sidecar starts and filled in just below: the table
   // needs `sidecar.call` (for `resolveUrl`) and the sidecar needs the table
@@ -433,7 +440,6 @@ app.whenReady().then(() => {
   const showAndCheckForUpdates = () => {
     if (shown) return;
     shown = true;
-    if (FADE_IN) window.setOpacity(1);
     window.show();
     startAutomaticUpdates({ isPackaged: app.isPackaged, window, dialog });
   };
