@@ -2866,21 +2866,29 @@ body.is-resizing {
   margin-top: 0;
 }
 
-/* A scale, rather than two sizes and a weight. `rich` maps h1–h6 onto h3–h6, so
-   these four names carry six levels — the last two share a size and separate by
-   weight alone, which is what a sixth level is worth. */
-.doc .prose-h3 {
+/* The DOM rank is demoted by `rich`, but these classes retain Markdown's source
+   depth. A document needs a real scale: a reader should find its sections by
+   shape before reading them, and a heading must never lose to inline bold. */
+.doc .prose-h1 {
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+}
+.doc .prose-h2 {
   font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+.doc .prose-h3 {
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
 }
 .doc .prose-h4 {
-  font-size: var(--text-md);
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
 }
 .doc .prose-h5,
 .doc .prose-h6 {
   font-size: var(--text-base);
-}
-.doc .prose-h5 {
-  font-weight: var(--weight-semibold);
+  font-weight: var(--weight-medium);
 }
 
 /* Prose in a document is read, not scanned past. A transcript keeps tables and
@@ -5038,13 +5046,23 @@ body.is-resizing {
   margin: var(--s-2) 0 0;
   color: var(--ink);
 }
-.prose-h3 {
+/* A conversation's headings are smaller than a document's, but follow the
+   same source order. `rich` preserves that order in the class even while it
+   lowers the DOM tag, so # is never visually weaker than **bold**. */
+.prose-h1,
+.prose-h2 {
   font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+.prose-h3 {
+  font-size: var(--text-base);
+  font-weight: var(--weight-semibold);
 }
 .prose-h4,
 .prose-h5,
 .prose-h6 {
   font-size: var(--text-base);
+  font-weight: var(--weight-medium);
 }
 
 .prose-list {
@@ -7148,10 +7166,17 @@ button.strip-phase-line:hover .strip-phase-name {
 .workspace-editor .tok-typeName,
 .workspace-editor .tok-className,
 .workspace-editor .tok-namespace,
-.workspace-editor .tok-macroName,
-.workspace-editor .tok-heading {
+.workspace-editor .tok-macroName {
   color: var(--syn-type);
   font-weight: var(--weight-medium);
+}
+
+/* Markdown structure must read as structure in source too. It uses the same
+   graphite hierarchy as the preview; links remain olive because they name an
+   action once rendered, not because green is a generic syntax colour. */
+.workspace-editor .tok-heading {
+  color: var(--syn-plain);
+  font-weight: var(--weight-semibold);
 }
 
 .workspace-editor .tok-function,

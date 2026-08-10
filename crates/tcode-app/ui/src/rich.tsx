@@ -151,8 +151,9 @@ function block(token: Token, key: string): ReactNode {
 
     case "heading": {
       const item = token as Tokens.Heading;
-      // Transcript headings are structure inside someone else's page, so they
-      // stay in the body's own scale rather than competing with the app's.
+      // Transcript headings are structure inside someone else's page, so their
+      // DOM ranks are demoted. The source depth stays on `prose-h{depth}` for
+      // the document and transcript styles to give it the right visual rank.
       const Tag = (["h3", "h4", "h5", "h6", "h6", "h6"] as const)[
         Math.min(Math.max(item.depth, 1), 6) - 1
       ];

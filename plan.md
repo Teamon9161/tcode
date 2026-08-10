@@ -192,22 +192,10 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4. Windows PowerShell 的 `Get-ChildItem | Select-Object Name` 等表格管道输出仍会为空；之前声称修复后实际行为未变，需要从真实 shell 调用路径复现并修复。
-7. md渲染的时候比如~~我看显示是删除线,但是不是整条删除,感觉就删除了半行.切换edit模式的时候不应该重置窗口的位置吧,每次都回开头.
-8. workspace 文件窗口在 Linux 支持移动到回收站（move to trash）；之前改过但实际行为仍未生效，需要复现并修复。
-9. terminal 窗格和新 terminal tab 应以当前聚焦 session 的文件夹启动，不应始终落到第一个 session 的目录。
-10. 窗口支持互换位置吗,这点hyprland是怎么做的呢。需要交换既有窗格位置/内容，而不只是横竖旋转 split。
 12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行,还有就是prompt框上方的plan下拉后看不到background, 要有个展开的地方可以看到background, 并且最好做好渲染,我看plan审批那边的background都没有经过md渲染.
-13. browser: the attached browser returned a blank page and empty accessibility tree for the healthy loopback preview, although curl and local Firefox rendered the same URL correctly. The workaround required headless Firefox screenshots and WebDriver BiDi. Letting the browser controller reach the same loopback namespace—or returning a concrete navigation/network error instead of an empty tree—would remove that detour.
-14. ctrl+v粘贴图片会粘贴两次
-15. workspace的editor点击编辑,不要回到文件开头位置
-16. app的prompt框上面的plan窗口好像没有及时更新状态.
-17. `@path` 引用必须明确是用户消息投递时的磁盘快照；同一路径在后续消息再次引用时必须重新读取最新内容，并用回归测试保证不复用旧快照，避免历史 Ledger 内容与当前文件混淆。
-18. 连续的Browser操作应该全部收到一起,然后下面渲染一下浏览器的对应页面缩略图,类似show, 会更新的那种, 然后再加一个按钮,可以用户点击就打开对应的浏览器页面.
-19. 浏览器窗格隐藏了,但是有打开页面,这时候拖动别的窗格宽度,浏览器页面会有一部分显示出来.
 20. Tool friction — browser.screenshot：报告的可访问性快照已确认多个 Vega canvas 图表正常渲染，但截图工具返回“nothing to draw / probably blank”。这使它无法用于画布图表的最终视觉核验。若截图能等待 canvas 完成绘制，或在失败时说明是后台标签限制，将能避免误报空白页面。
-21. browser visual inspection：预览页面的 accessibility snapshot 能读取完整界面和 “Settings” 按钮，但 browser.screenshot 对同一非空页面返回“nothing to draw”，点击后的 portal popover 也未出现在 snapshot 中。我的替代方式是以真实预览启动、构建和 detector 验证；最小改进是让浏览器工具对已 snapshot 成功的页面稳定返回像素截图，并能列出 portal/dialog 内容，便于完成桌面 UI 的视觉验收。
 22. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
 23. 文件显示器，一行长度超过窗口的时候要自动换行吧，而且最后最好视觉上留一行方便用户打空格。
 24. Capability gap — Browser 工作树运行时：functions.browser 始终连接当前旧 tcode 进程，编辑后的 browser.js 无法在不重启会话的情况下加载，因此它继续复现旧的 AX/screenshot 故障，不能验证刚构建的实现。此次只能改用真实 Electron fixture 和临时 Electron 截图脚本。最小改进是允许启动一个基于当前工作树的隔离 Browser runtime，或提供明确的 runtime build id 与 reload 操作。
   Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
+25. Tool friction — browser.navigate：为实际检查 Vite UI 预览，我导航到已成功启动的 http://localhost:5174，但工具返回了 tcode 内嵌浏览器的 render recovery 超时，且报告 paneVisible=false，导致无法取得页面快照或截图。我只能以测试和生产构建完成验证。最小改进是让 harness 的浏览器检查能直接加载本机开发服务器，或在页面不可见时不依赖该应用内浏览器的 compositor 恢复路径。

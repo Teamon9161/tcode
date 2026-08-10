@@ -71,9 +71,14 @@ describe("rich() never produces markup from model output", () => {
 
 describe("rich() still renders the document", () => {
   it("builds tables, lists and headings", () => {
-    const html = render("## Title\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |");
+    const html = render("# One\n\n## Two\n\n### Three\n\n- one\n- two\n\n| a | b |\n|---|---|\n| 1 | 2 |");
     expect(html).toContain("<table");
     expect(html).toContain("<li>");
+    // The DOM rank is deliberately demoted inside the app, but the source
+    // level survives as a class so document CSS can retain a real hierarchy.
+    expect(html).toContain('class="prose-h prose-h1"');
+    expect(html).toContain('class="prose-h prose-h2"');
+    expect(html).toContain('class="prose-h prose-h3"');
     expect(html).toMatch(/<h[1-6]/);
   });
 
