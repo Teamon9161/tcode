@@ -371,12 +371,13 @@ impl AgentTool {
     /// applied. Validation uses this same inventory, so MCP selectors can only
     /// advertise tools a delegated agent will actually receive.
     fn base_tools(&self, cwd: &Path, model: ModelCell) -> Vec<Arc<dyn Tool>> {
-        let mut tools = crate::builtin_tools_with_skills_and_web_fetch(
+        let mut tools = crate::builtin_tools_with_vision(
             crate::discover_skills(cwd),
             crate::WebFetchTool::new(self.trusted_read_hosts.clone()).with_summarizer(
                 crate::FetchSummarizer::new(model.clone(), self.pinned.clone()),
             ),
             self.shell_filters.clone(),
+            Some(self.pinned.clone()),
         );
         tools.extend(self.extension_tools.iter().cloned());
         tools.push(Arc::new(crate::ViewImageTool::new(

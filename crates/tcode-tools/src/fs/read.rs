@@ -6,7 +6,9 @@ use tokio_util::sync::CancellationToken;
 
 use tcode_core::freshness::{content_hash, ReadStatus};
 use tcode_core::images::detect_image_mime;
-use tcode_core::{AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{
+    AgentModels, AgentRole, AutoSafety, BatchPolicy, PermissionRequest, Tool, ToolCtx, ToolOutput,
+};
 
 use crate::redact::redact_lines;
 
@@ -15,7 +17,24 @@ use super::{
     MAX_READ_FILE_BYTES, MAX_READ_OUTPUT_BYTES, MIN_READ_WINDOW,
 };
 
-pub struct ReadTool;
+pub struct ReadTool {
+    /// The live `/agents` pins, when this toolset also carries `view_image`.
+    /// The image hint consults the vision role's running resolution so it never
+    /// sends the model on a delegation the vision model cannot answer.
+    vision: Option<AgentModels>,
+}
+
+impl ReadTool {
+    pub fn with_vision(vision: Option<AgentModels>) -> Self {
+        Self { vision }
+    }
+}
+
+impl Default for ReadTool {
+    fn default() -> Self {
+        Self::with_vision(None)
+    }
+}
 
 #[async_trait]
 impl Tool for ReadTool {
@@ -135,11 +154,36 @@ impl Tool for ReadTool {
                 .as_ref()
                 .is_some_and(|model| !model.snapshot().provider.supports_vision())
             {
-                return ToolOutput::err(format!(
-                    "{} is an image, but the current model cannot view images. Delegate it: view_image(paths=[\"{}\"], prompt=\"<specific question>\")",
-                    rel(&path, &ctx.cwd).display(),
-                    path_str,
-                ));
+                // The delegation hint is only worth giving when the vision
+                // role's running resolution can actually answer it — the same
+                // resolution `view_image` uses. Otherwise no model in this
+                // session can read the image, and pointing at view_image would
+                // send the model on a delegation guaranteed to fail. A toolset
+                // without pins cannot judge the vision role, so it keeps the
+                // historic suggestion rather than claiming images are
+                // unwatchable.
+                let can_delegate = match (&self.vision, ctx.model.as_ref()) {
+                    (None, _) => true,
+                    (Some(pins), Some(cell)) => pins.can_view_images(cell),
+                    (Some(_), None) => false,
+                };
+                let rel = rel(&path, &ctx.cwd).display().to_string();
+                return ToolOutput::err(if can_delegate {
+                    format!("{rel} is an image, but the current model cannot view images. Delegate it: view_image(paths=[\"{path_str}\"], prompt=\"<specific question>\")")
+                } else {
+                    let vision =
+                        self.vision
+                            .as_ref()
+                            .zip(ctx.model.as_ref())
+                            .and_then(|(pins, cell)| {
+                                pins.resolve(AgentRole::Vision, cell)
+                                    .map(|model| model.describe())
+                            });
+                    match vision {
+                        Some(desc) => format!("{rel} is an image, and no model in this session can view it — vision resolves to {desc}, which is text-only. Pin a vision-capable model with /agents → vision to read images."),
+                        None => format!("{rel} is an image, and no model in this session can view it. Pin a vision-capable model with /agents → vision to read images."),
+                    }
+                });
             }
             let hash = content_hash(&bytes);
             let force = input["force"].as_bool().unwrap_or(false);

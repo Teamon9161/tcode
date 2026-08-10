@@ -195,6 +195,10 @@ const PICKER: PickerState = {
   modes: MODES,
   mode: "accept-edits",
   mode_staged: false,
+  // The preview's main model (Opus 5) is vision-capable, so the line-up can
+  // view images and the vision row stays quiet. Flip to false to look at the
+  // warning state in the panel.
+  can_view_images: true,
 };
 
 /** What `show` panes read. Keyed by extension so one fixture covers the whole

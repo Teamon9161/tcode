@@ -87,9 +87,10 @@ impl Tool for ViewImageTool {
 
         let model = self.model_for_vision();
         if !model.provider.supports_vision() {
-            return ToolOutput::err(
-                "the configured vision model cannot view images. Choose a vision-capable model with /agents → vision or configure [agents.vision].",
-            );
+            return ToolOutput::err(format!(
+                "the configured vision model cannot view images ({}). Choose a vision-capable model with /agents → vision or configure [agents.vision].",
+                model.describe(),
+            ));
         }
 
         let mut content = Vec::with_capacity(paths.len() * 2 + 1);

@@ -1541,7 +1541,13 @@ fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
         "the new model is live"
     );
 
-    let state = tcode_app::picker::state_of(&menus, &cell, PermissionMode::Default, false);
+    let state = tcode_app::picker::state_of(
+        &menus,
+        &cell,
+        &tcode_core::AgentModels::default(),
+        PermissionMode::Default,
+        false,
+    );
     assert_eq!(
         state.effort.as_deref(),
         Some("high"),

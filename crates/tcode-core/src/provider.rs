@@ -203,6 +203,19 @@ impl AgentModels {
         }
     }
 
+    /// Whether the session can view images at all: the live main model accepts
+    /// image blocks, or the vision role's current resolution does — resolved
+    /// exactly as `view_image` resolves it (a pin wins, inherit/absent follows
+    /// the live main model). `false` means `view_image` cannot help: both the
+    /// current model and the vision model are text-only, so reading an image
+    /// is not possible in this session.
+    pub fn can_view_images(&self, primary: &ModelCell) -> bool {
+        primary.snapshot().provider.supports_vision()
+            || self
+                .resolve(AgentRole::Vision, primary)
+                .is_some_and(|model| model.provider.supports_vision())
+    }
+
     /// The raw assignment, for callers that must distinguish "inherit" from
     /// "absent" (off-by-default roles).
     pub fn pin_state(&self, kind: &str) -> Option<AgentPin> {
@@ -278,4 +291,66 @@ pub trait Provider: Send + Sync {
         req: Request,
         cancel: CancellationToken,
     ) -> Result<EventStream, ProviderError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::stream;
+
+    /// A provider whose vision support is whatever the test says, so the
+    /// capability question can be answered without a real model.
+    struct TestProvider {
+        vision: bool,
+    }
+
+    #[async_trait]
+    impl Provider for TestProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+        fn model(&self) -> &str {
+            "test-model"
+        }
+        fn cache_strategy(&self) -> CacheStrategy {
+            CacheStrategy::ImplicitPrefix
+        }
+        fn supports_vision(&self) -> bool {
+            self.vision
+        }
+        async fn stream(
+            &self,
+            _request: Request,
+            _cancel: CancellationToken,
+        ) -> Result<EventStream, ProviderError> {
+            Ok(Box::pin(stream::empty()))
+        }
+    }
+
+    fn cell(vision: bool) -> ModelCell {
+        ModelCell::new(ActiveModel {
+            provider: std::sync::Arc::new(TestProvider { vision }),
+            max_tokens: None,
+            context_window: 16_000,
+            effort: None,
+        })
+    }
+
+    #[test]
+    fn can_view_images_reads_the_running_resolution_not_a_default() {
+        let pins = AgentModels::default();
+        // No pin: vision inherits the main model, so a text-only main model
+        // cannot view images at all.
+        assert!(!pins.can_view_images(&cell(false)));
+        assert!(pins.can_view_images(&cell(true)));
+        // A pinned vision model answers for the role even when the main model
+        // is text-only — the same resolution `view_image` uses.
+        pins.pin("vision", cell(true).snapshot());
+        assert!(pins.can_view_images(&cell(false)));
+        pins.pin("vision", cell(false).snapshot());
+        assert!(!pins.can_view_images(&cell(false)));
+        // The main model's own capability still counts: images are readable
+        // through `read` even if the vision role is pinned text-only.
+        assert!(pins.can_view_images(&cell(true)));
+    }
 }

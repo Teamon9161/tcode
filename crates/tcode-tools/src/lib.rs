@@ -62,7 +62,7 @@ pub const fn primary_shell_tool_name() -> &'static str {
 use std::path::Path;
 use std::sync::Arc;
 
-use tcode_core::Tool;
+use tcode_core::{AgentModels, Tool};
 
 /// Built-in toolset. On Windows PowerShell is the primary shell and a
 /// `bash` tool appears when Git Bash is on PATH; on Unix there is bash.
@@ -132,8 +132,23 @@ pub fn builtin_tools_with_skills_and_web_fetch(
     web_fetch: WebFetchTool,
     filters: Arc<ShellFilters>,
 ) -> Vec<Arc<dyn Tool>> {
+    builtin_tools_with_vision(skills, web_fetch, filters, None)
+}
+
+/// Same toolset, with `read` carrying the live `/agents` pins so its image
+/// hint can tell whether delegating to `view_image` would help (zero-guess:
+/// never send the model on a delegation the vision model cannot answer). The
+/// main agent (`tcode_frontend::build_agent`) and every sub-agent assemble
+/// their toolset through this; toolsets with no pins at all — ACP, the plain
+/// binary, tests — keep the plain hint.
+pub fn builtin_tools_with_vision(
+    skills: Vec<Skill>,
+    web_fetch: WebFetchTool,
+    filters: Arc<ShellFilters>,
+    vision: Option<AgentModels>,
+) -> Vec<Arc<dyn Tool>> {
     let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(fs::ReadTool),
+        Arc::new(fs::ReadTool::with_vision(vision)),
         Arc::new(fs::WriteTool),
         Arc::new(fs::AppendTool),
         Arc::new(fs::EditTool),

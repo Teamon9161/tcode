@@ -30,6 +30,10 @@ pub struct OverlayCtx<'a> {
     /// The running provider's reasoning effort. No menu holds it: it belongs
     /// to the live `ModelCell`, not to the list of what could be picked.
     pub effort: Option<String>,
+    /// Whether the running line-up can view images. Computed by `App` from the
+    /// live cell and pins, because the menus are not rebuilt on a `/model`
+    /// switch; the model hub's vision row warns when false.
+    pub can_view_images: bool,
     pub width: u16,
     pub height: u16,
 }
@@ -41,6 +45,7 @@ impl OverlayCtx<'_> {
             agents: self.agents,
             presets: self.presets,
             effort: self.effort.as_deref(),
+            can_view_images: self.can_view_images,
         }
     }
 }
@@ -454,6 +459,7 @@ mod tests {
             agents,
             presets,
             effort: None,
+            can_view_images: true,
             width: 80,
             height: 24,
         }

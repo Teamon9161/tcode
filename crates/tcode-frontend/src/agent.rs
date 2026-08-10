@@ -69,11 +69,12 @@ pub fn build_agent(build: AgentBuild<'_>) -> Arc<Agent> {
         display_tools,
     } = build;
 
-    let mut tools = tcode_tools::builtin_tools_with_skills_and_web_fetch(
+    let mut tools = tcode_tools::builtin_tools_with_vision(
         skills,
         WebFetchTool::new(trusted_read_hosts.clone())
             .with_summarizer(FetchSummarizer::new(model_cell.clone(), pinned.clone())),
         shell_filters.clone(),
+        Some(pinned.clone()),
     );
     tools.push(Arc::new(ViewImageTool::new(
         model_cell.clone(),

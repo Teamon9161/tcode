@@ -360,6 +360,10 @@ pub struct HubCtx<'a> {
     pub agents: &'a AgentMenu,
     pub presets: &'a PresetMenu,
     pub effort: Option<&'a str>,
+    /// Whether the session's running line-up can view images at all. Read from
+    /// the live cell and pins each time the hub renders, because a `/model`
+    /// switch does not rebuild the menus. The vision row warns when false.
+    pub can_view_images: bool,
 }
 
 /// Where a drilled-into `Picker` sends its result.
@@ -447,6 +451,7 @@ impl Hub {
             agents,
             presets,
             effort,
+            can_view_images: _,
         } = ctx;
         let rows = entries(agents, presets);
         let Some(entry) = rows.get(index).filter(|entry| entry.selectable()) else {
@@ -599,6 +604,7 @@ impl Hub {
             agents,
             presets,
             effort,
+            can_view_images,
         } = ctx;
         if let Some((_, picker)) = &self.open {
             return picker.render(menu);
@@ -620,6 +626,10 @@ impl Hub {
             .max()
             .unwrap_or(0)
             .max(12);
+        // The vision row is the one helper whose whole job a text-only model
+        // cannot do; a warning there is the quiet place this session says
+        // images are unwatchable. The role key is the core contract.
+        let vision = agents.roles.iter().position(|role| role.key == "vision");
         for (index, entry) in rows.iter().enumerate().skip(start).take(WINDOW) {
             let is_sel = index == self.selected;
             let marker = if is_sel { "▸ " } else { "  " };
@@ -673,10 +683,14 @@ impl Hub {
                 Entry::Agent(role) => {
                     let label = agents.roles[*role].label.as_str();
                     let desc = agents.describe(*role, menu);
-                    Line::styled(
+                    let mut spans = vec![Span::styled(
                         format!("    {marker}{label:<width$}{desc}", width = label_col),
                         style,
-                    )
+                    )];
+                    if vision == Some(*role) && !can_view_images {
+                        spans.push(Span::styled("  ⚠ cannot view images", theme::warn()));
+                    }
+                    Line::from(spans)
                 }
             });
         }
@@ -756,6 +770,7 @@ mod tests {
             agents,
             presets,
             effort: None,
+            can_view_images: true,
         }
     }
 
@@ -1079,5 +1094,66 @@ mod tests {
             columns.all(|column| column == first),
             "every description lines up in one column"
         );
+    }
+
+    /// The vision row is where the hub says images are unwatchable: when the
+    /// running line-up resolves vision to a text-only model, the row carries a
+    /// small warning; a capable line-up stays quiet.
+    #[test]
+    fn vision_row_warns_when_no_model_can_view_images() {
+        let m = menu();
+        let a = AgentMenu {
+            roles: vec![
+                AgentRole {
+                    key: "explore".into(),
+                    label: "explore".into(),
+                    allows_off: false,
+                    section: RoleSection::Task,
+                },
+                AgentRole {
+                    key: "vision".into(),
+                    label: "vision".into(),
+                    allows_off: false,
+                    section: RoleSection::Helper,
+                },
+            ],
+            pins: vec![AgentModelChoice::Inherit, AgentModelChoice::Inherit],
+            pin: Box::new(|_, _| Err("not pinned in tests".into())),
+        };
+        let p = presets(&[], None);
+        let hub = Hub::new(&a, &p, true);
+
+        let warn = HubCtx {
+            menu: &m,
+            agents: &a,
+            presets: &p,
+            effort: None,
+            can_view_images: false,
+        };
+        let warned = hub
+            .render(&warn)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            warned.contains("vision") && warned.contains("cannot view images"),
+            "vision row must warn when no model can view images:\n{warned}"
+        );
+
+        let quiet = HubCtx {
+            menu: &m,
+            agents: &a,
+            presets: &p,
+            effort: None,
+            can_view_images: true,
+        };
+        let quiet_text = hub
+            .render(&quiet)
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!quiet_text.contains("cannot view images"));
     }
 }

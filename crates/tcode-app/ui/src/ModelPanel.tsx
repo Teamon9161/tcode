@@ -438,6 +438,9 @@ function Roles({
               <span className={`mrow-meta${role.pin.kind === "model" ? " is-id" : ""}`}>
                 {pinLabel(role.pin, state.models)}
               </span>
+              {role.key === "vision" && !state.can_view_images && (
+                <span className="mrow-warn">cannot view images</span>
+              )}
               <ChevronRight size={13} className="mrow-more" />
             </button>
           ))}

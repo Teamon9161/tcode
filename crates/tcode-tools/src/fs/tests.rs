@@ -5,7 +5,7 @@ use super::*;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tcode_core::images::detect_image_mime;
-use tcode_core::{PermissionRequest, Tool, ToolCtx, ToolOutput};
+use tcode_core::{AgentModels, PermissionRequest, Tool, ToolCtx, ToolOutput};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(windows)]
@@ -36,9 +36,43 @@ impl tcode_core::Provider for TextOnlyProvider {
     }
 }
 
+struct VisionCapableProvider;
+
+#[async_trait::async_trait]
+impl tcode_core::Provider for VisionCapableProvider {
+    fn name(&self) -> &str {
+        "test"
+    }
+    fn model(&self) -> &str {
+        "vision-capable"
+    }
+    fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+        tcode_core::CacheStrategy::ImplicitPrefix
+    }
+    fn supports_vision(&self) -> bool {
+        true
+    }
+    async fn stream(
+        &self,
+        _request: tcode_core::Request,
+        _cancel: CancellationToken,
+    ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+        unreachable!("read routing test never streams")
+    }
+}
+
 fn text_only_model() -> tcode_core::ModelCell {
     tcode_core::ModelCell::new(tcode_core::ActiveModel {
         provider: Arc::new(TextOnlyProvider),
+        max_tokens: Some(1024),
+        context_window: 16_000,
+        effort: None,
+    })
+}
+
+fn vision_capable_model() -> tcode_core::ModelCell {
+    tcode_core::ModelCell::new(tcode_core::ActiveModel {
+        provider: Arc::new(VisionCapableProvider),
         max_tokens: Some(1024),
         context_window: 16_000,
         effort: None,
@@ -539,7 +573,7 @@ async fn edit_does_not_mark_unshown_lines_as_read() {
         .await;
     assert!(!edited.is_error, "{}", edited.content);
 
-    let unseen = ReadTool
+    let unseen = ReadTool::default()
         .run(
             json!({ "path": "many.txt", "offset": 200, "limit": 120 }),
             &ctx,
@@ -554,7 +588,7 @@ async fn edit_does_not_mark_unshown_lines_as_read() {
         unseen.content
     );
 
-    let repeated = ReadTool
+    let repeated = ReadTool::default()
         .run(
             json!({ "path": "many.txt", "offset": 200, "limit": 120 }),
             &ctx,
@@ -576,7 +610,7 @@ async fn capped_read_does_not_mark_unemitted_tail_as_seen() {
     std::fs::write(&file, body).unwrap();
     let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
-    let first = ReadTool
+    let first = ReadTool::default()
         .run(
             json!({ "path": "long.txt" }),
             &ctx,
@@ -590,7 +624,7 @@ async fn capped_read_does_not_mark_unemitted_tail_as_seen() {
         first.content
     );
 
-    let tail = ReadTool
+    let tail = ReadTool::default()
         .run(
             json!({ "path": "long.txt", "offset": 500, "limit": 120 }),
             &ctx,
@@ -605,7 +639,7 @@ async fn capped_read_does_not_mark_unemitted_tail_as_seen() {
         tail.content
     );
 
-    let repeated_tail = ReadTool
+    let repeated_tail = ReadTool::default()
         .run(
             json!({ "path": "long.txt", "offset": 500, "limit": 120 }),
             &ctx,
@@ -645,7 +679,7 @@ async fn ordinary_long_lines_are_returned_whole() {
     std::fs::write(dir.join("notes.md"), format!("a\nb\n{wide}\nd\ne\nf\n")).unwrap();
     let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .run(
             json!({ "path": "notes.md" }),
             &ctx,
@@ -666,7 +700,7 @@ async fn oversized_lines_are_clipped_with_a_self_healing_note() {
     std::fs::write(dir.join("bundle.js"), format!("ok\n{huge}\nend\n")).unwrap();
     let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .run(
             json!({ "path": "bundle.js" }),
             &ctx,
@@ -702,7 +736,7 @@ async fn read_redacts_credentials_and_write_refuses_the_placeholder() {
     std::fs::write(dir.join("config.toml"), &original).unwrap();
     let ctx = ToolCtx::for_test(dir.clone(), 10_000);
 
-    let out = ReadTool
+    let out = ReadTool::default()
         .run(
             json!({ "path": "config.toml" }),
             &ctx,
@@ -797,7 +831,7 @@ async fn text_only_models_are_routed_to_view_image_without_freshness() {
     let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
 
     for _ in 0..2 {
-        let result = ReadTool
+        let result = ReadTool::default()
             .run(
                 json!({ "path": "shot.png" }),
                 &ctx,
@@ -807,6 +841,64 @@ async fn text_only_models_are_routed_to_view_image_without_freshness() {
         assert!(result.is_error);
         assert!(result.content.contains("view_image"));
     }
+}
+
+/// When the vision role also resolves to a text-only model (vision inherits
+/// the main model, which is text-only), read must not suggest the doomed
+/// view_image delegation — no model in the session can view images.
+#[tokio::test]
+async fn image_hint_does_not_suggest_view_image_when_vision_is_text_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(
+        &image,
+        tcode_core::images::normalize_rgba(1, 1, vec![0; 4])
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    // vision = inherit → the text-only main model, so delegating cannot help.
+    let pins = AgentModels::default();
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
+    let result = ReadTool::with_vision(Some(pins))
+        .run(
+            json!({ "path": "shot.png" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(result
+        .content
+        .contains("no model in this session can view it"));
+    assert!(!result.content.contains("view_image("));
+}
+
+/// A pinned vision-capable model keeps the delegation hint even when the main
+/// model is text-only: view_image can still answer.
+#[tokio::test]
+async fn image_hint_suggests_view_image_when_vision_is_capable() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("shot.png");
+    std::fs::write(
+        &image,
+        tcode_core::images::normalize_rgba(1, 1, vec![0; 4])
+            .unwrap()
+            .bytes,
+    )
+    .unwrap();
+    let pins = AgentModels::default();
+    pins.pin("vision", vision_capable_model().snapshot());
+    let ctx = ToolCtx::for_test(dir.path().to_path_buf(), 10_000).with_model(text_only_model());
+    let result = ReadTool::with_vision(Some(pins))
+        .run(
+            json!({ "path": "shot.png" }),
+            &ctx,
+            &CancellationToken::new(),
+        )
+        .await;
+    assert!(result.is_error);
+    assert!(result.content.contains("view_image("));
 }
 
 #[tokio::test]
@@ -821,7 +913,7 @@ async fn read_inlines_a_png_as_an_image_block() {
     std::fs::write(&png, &bytes).unwrap();
 
     let ctx = ToolCtx::for_test(dir.clone(), 10_000);
-    let out = ReadTool
+    let out = ReadTool::default()
         .run(
             json!({ "path": png.to_str().unwrap() }),
             &ctx,
@@ -838,7 +930,7 @@ async fn read_inlines_a_png_as_an_image_block() {
     ));
 
     // A second read of the unchanged image dedupes: no image re-sent.
-    let again = ReadTool
+    let again = ReadTool::default()
         .run(
             json!({ "path": png.to_str().unwrap() }),
             &ctx,
@@ -869,7 +961,9 @@ async fn run_append(ctx: &ToolCtx, path: &str, content: &str) -> ToolOutput {
 }
 
 async fn run_read(ctx: &ToolCtx, input: Value) -> ToolOutput {
-    ReadTool.run(input, ctx, &CancellationToken::new()).await
+    ReadTool::default()
+        .run(input, ctx, &CancellationToken::new())
+        .await
 }
 
 /// `read` emits file content verbatim: no line-number gutter, so the bytes it

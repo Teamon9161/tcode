@@ -881,6 +881,10 @@ impl App {
             agents: &self.agents,
             presets: &self.presets,
             effort: self.agent.model.snapshot().effort,
+            // Live, not from the menus: a `/model` switch swaps the cell
+            // without rebuilding them, and the vision row must reflect the
+            // line-up actually running.
+            can_view_images: self.agent.models.can_view_images(&self.agent.model),
             width: area_width(&self.terminal),
             height: area_height(&self.terminal),
         }

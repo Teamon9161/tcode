@@ -1591,9 +1591,11 @@ pub fn picker_state(
     };
     let menus = supervisor.menus();
     let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    let agent = supervisor.agent();
     Ok(crate::picker::state_of(
         &menus,
-        &supervisor.agent().model,
+        &agent.model,
+        &agent.models,
         mode,
         staged,
     ))

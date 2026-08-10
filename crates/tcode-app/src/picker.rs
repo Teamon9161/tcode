@@ -19,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use serde::{Deserialize, Serialize};
 
 use tcode_core::config::Config;
-use tcode_core::{ModelCell, PermissionMode};
+use tcode_core::{AgentModels, ModelCell, PermissionMode};
 use tcode_frontend::{AgentMenu, AgentModelChoice, ModelMenu, PresetDraft, PresetMenu};
 
 /// The live menus, rebuilt whenever a choice replaces them.
@@ -165,6 +165,11 @@ pub struct PickerState {
     pub mode: &'static str,
     /// True while the chosen mode is waiting for a running turn to end.
     pub mode_staged: bool,
+    /// Whether the running line-up can view images at all (the live main
+    /// model, or the vision role's current resolution). The panel's vision row
+    /// warns when false. Read live, not from the menus, because a `choose_model`
+    /// does not rebuild them.
+    pub can_view_images: bool,
 }
 
 pub const MODES: &[ModeChoice] = &[
@@ -199,6 +204,7 @@ pub fn mode_from_key(key: &str) -> Option<PermissionMode> {
 pub fn state_of(
     menus: &Pickers,
     model: &ModelCell,
+    pinned: &AgentModels,
     mode: PermissionMode,
     mode_staged: bool,
 ) -> PickerState {
@@ -249,6 +255,7 @@ pub fn state_of(
         modes: MODES.iter().map(clone_mode).collect(),
         mode: mode.label(),
         mode_staged,
+        can_view_images: pinned.can_view_images(model),
     }
 }
 

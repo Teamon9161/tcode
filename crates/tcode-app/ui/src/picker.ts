@@ -45,6 +45,9 @@ export type PickerState = {
   modes: { key: string; detail: string }[];
   mode: string;
   mode_staged: boolean;
+  /** Whether the running line-up can view images at all. The vision row warns
+   *  when false. Read live by the backend, not from the menus. */
+  can_view_images: boolean;
 };
 
 /** One profile's models, carrying each one's index in the flat menu. */
