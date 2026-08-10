@@ -480,6 +480,7 @@ shell_output_filters = true
 [ui]
 suggest_next = false # default; true makes one small auxiliary request per turn
 show_reasoning = false
+# shell = "/bin/zsh"  # optional; the desktop terminal pane's shell (detected when unset)
 
 [voice]
 enabled = false
@@ -518,8 +519,14 @@ re-enable filtering you turned off.
 `ui.suggest_next` controls the post-turn next-prompt guess and costs one small
 auxiliary request per turn; its default is `false`, and `[tcode_state].suggestions`
 from `/suggest` takes precedence when present. `ui.show_reasoning` only displays
-provider reasoning summaries; it does not change provider behaviour. Like the
-other `[ui]` fields, both are read only from the selected user configuration.
+provider reasoning summaries; it does not change provider behaviour. `ui.shell`
+names the shell the desktop app's terminal pane starts in each tab, e.g.
+`shell = "/bin/zsh"`. Absent means detect: `$SHELL`, then the user's login
+shell from the passwd database, then `/bin/sh`. It is the one place the
+terminal shell is set; the agent's `bash` tool is deliberately unaffected —
+its permission rules, descriptions and resolution probes are Bash's. Like the
+other `[ui]` fields, all three are read only from the selected user
+configuration.
 
 ## Voice input
 

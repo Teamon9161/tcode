@@ -837,10 +837,22 @@ export function App() {
   );
   const attach = useCallback(
     (id: string, items: SessionState["attachments"]) =>
-      patch(id, (was) => ({
-        ...was,
-        attachments: [...was.attachments, ...items],
-      })),
+      patch(id, (was) => {
+        // One Ctrl+V can reach here twice — the same paste exposed twice by the
+        // engine, or a paste event plus the native clipboard fallback. A second
+        // chip for the same bytes is the "pasted twice" bug, so an image that
+        // is already in the draft is not added again. (The native fallback
+        // encodes differently, so it is caught by the dimension guard in the
+        // composer instead.)
+        const existing = new Set(
+          was.attachments.map((entry) => `${entry.mediaType}\u0000${entry.data}`),
+        );
+        const fresh = items.filter(
+          (entry) => !existing.has(`${entry.mediaType}\u0000${entry.data}`),
+        );
+        if (fresh.length === 0) return was;
+        return { ...was, attachments: [...was.attachments, ...fresh] };
+      }),
     [patch],
   );
   const detach = useCallback(

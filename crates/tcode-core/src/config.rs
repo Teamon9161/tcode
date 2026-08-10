@@ -420,6 +420,13 @@ pub struct UiConfig {
     /// Show provider reasoning summaries in the transcript. Reasoning remains
     /// in the persisted ledger for provider replay regardless of this setting.
     pub show_reasoning: bool,
+    /// The shell the desktop app's terminal pane starts in each tab, e.g.
+    /// `"shell = \"/bin/zsh\""`. Absent means detect: `$SHELL`, then the
+    /// passwd login shell, then `/bin/sh`. This is the one place the terminal
+    /// shell is set; the agent's `bash` tool is deliberately unaffected — its
+    /// permission rules and descriptions are Bash's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
 }
 
 /// `[instructions]`: human-maintained instruction discovery.
@@ -1796,6 +1803,14 @@ mod tests {
         assert!(!UiConfig::default().show_reasoning);
         let configured: UiConfig = toml::from_str("show_reasoning = true").unwrap();
         assert!(configured.show_reasoning);
+    }
+
+    #[test]
+    fn the_terminal_shell_is_optional_and_unset_by_default() {
+        assert_eq!(UiConfig::default().shell, None);
+        let configured: UiConfig =
+            toml::from_str("shell = \"/bin/zsh\"").unwrap();
+        assert_eq!(configured.shell.as_deref(), Some("/bin/zsh"));
     }
 
     #[test]

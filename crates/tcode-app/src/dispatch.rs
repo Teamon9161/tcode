@@ -274,6 +274,11 @@ impl Registry {
             "workspace_delete",
             c::workspace_delete[supervisor](session, path)
         );
+        result!(
+            t,
+            "workspace_trash",
+            c::workspace_trash[supervisor](session, path)
+        );
         value!(t, "workspace_openers", c::workspace_openers[]());
         result!(
             t,

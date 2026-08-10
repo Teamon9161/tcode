@@ -33,6 +33,11 @@ use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry, Workspace
 pub struct ClipboardImage {
     pub media_type: String,
     pub data: String,
+    /// The size the provider will receive. The frontend uses it to recognise
+    /// the same paste that also arrived through the DOM path (which encodes
+    /// differently, so bytes would not match) — see `paste.ts`.
+    pub width: u32,
+    pub height: u32,
 }
 
 /// Read an image from the native clipboard when the webview cannot materialize
@@ -61,6 +66,8 @@ fn clipboard_image_from_rgba(
     Ok(ClipboardImage {
         media_type: image.media_type.to_string(),
         data: base64::engine::general_purpose::STANDARD.encode(image.bytes),
+        width: image.width,
+        height: image.height,
     })
 }
 
@@ -709,6 +716,19 @@ pub fn workspace_delete(
 ) -> Result<(), String> {
     session_workspace(supervisor, &session)?
         .delete(&path)
+        .map_err(|error| error.to_string())
+}
+
+/// Move a file, directory or link from the session workspace to the platform
+/// trash. Recoverable, so the frontend does not ask before calling it — the
+/// same reason a file manager's "Move to trash" does not confirm.
+pub fn workspace_trash(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+) -> Result<(), String> {
+    session_workspace(supervisor, &session)?
+        .trash(&path)
         .map_err(|error| error.to_string())
 }
 
@@ -1725,6 +1745,10 @@ mod tests {
             tcode_core::images::detect_image_mime(&bytes),
             Some(image.media_type.as_str())
         );
+        // The frontend matches native pastes against DOM pastes by shape (the
+        // two encode differently, so bytes would not compare) — dimensions
+        // must survive normalization.
+        assert_eq!((image.width, image.height), (1, 1));
     }
 
     #[test]

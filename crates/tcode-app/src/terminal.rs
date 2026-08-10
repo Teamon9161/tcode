@@ -87,11 +87,26 @@ struct Term {
 #[derive(Default)]
 pub struct Terminals {
     live: Mutex<HashMap<String, Term>>,
+    /// The shell a new tab runs, when the user configured one (`[ui] shell`).
+    /// `None` means detect: `$SHELL`, then the passwd login shell, then
+    /// `/bin/sh`.
+    configured: Option<String>,
 }
 
 impl Terminals {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+        Self::with_shell(None)
+    }
+
+    /// A shell named in the user's config, applied to every tab this window
+    /// opens. The single place the shell is set — the terminal pane is the
+    /// only surface that needs it, and `config.ui.shell` is where the setting
+    /// lives (see `tcode-core::config::UiConfig`).
+    pub fn with_shell(configured: Option<String>) -> Arc<Self> {
+        Arc::new(Self {
+            live: Mutex::new(HashMap::new()),
+            configured: configured.filter(|shell| !shell.trim().is_empty()),
+        })
     }
 
     /// Starts a shell in `cwd` and returns the id its tab will use.
@@ -109,7 +124,7 @@ impl Terminals {
             .openpty(size(cols, rows))
             .map_err(|error| format!("cannot open a terminal: {error}"))?;
 
-        let mut command = CommandBuilder::new(shell());
+        let mut command = CommandBuilder::new(pick_shell(self.configured.clone()));
         command.cwd(cwd);
         // What a program asks the terminal for. xterm.js is a 256-colour,
         // truecolor-capable terminal, and a shell that is not told inherits
@@ -335,6 +350,15 @@ fn size(cols: u16, rows: u16) -> PtySize {
     }
 }
 
+/// The configured shell wins over every detection; an empty string is not a
+/// configuration. Kept as a pure function so the priority is testable without
+/// touching the process environment.
+fn pick_shell(configured: Option<String>) -> String {
+    configured
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(shell)
+}
+
 /// The program a new tab runs.
 ///
 /// The user's own shell, because a terminal that is not the shell you
@@ -343,6 +367,13 @@ fn size(cols: u16, rows: u16) -> PtySize {
 /// actually tests to decide it is interactive, and passing the flags as well
 /// starts a *login* shell that re-reads profiles the desktop session already
 /// applied.
+///
+/// Priority: `$SHELL` (the session's own choice), then the login shell from
+/// the user database, then `/bin/sh`. The passwd fallback matters because a
+/// desktop launch often has no `SHELL` at all — a file manager does not start
+/// the app from a shell — and `/bin/sh` on Debian is dash, which is not the
+/// shell anybody configured. `[ui] shell` in the config overrides all three
+/// (see `Terminals::with_shell`).
 fn shell() -> String {
     #[cfg(windows)]
     {
@@ -353,7 +384,47 @@ fn shell() -> String {
         std::env::var("SHELL")
             .ok()
             .filter(|shell| !shell.trim().is_empty())
+            .or_else(login_shell)
             .unwrap_or_else(|| "/bin/sh".into())
+    }
+}
+
+/// The shell the current user is configured with in the user database.
+///
+/// Asked of the kernel (`getpwuid_r`) rather than guessed from `$USER`: the
+/// uid is a fact, the env var is a claim. This is the "what did they actually
+/// choose as their login shell" answer, which `$SHELL` may be missing entirely
+/// when the app was launched from a desktop session.
+#[cfg(not(windows))]
+fn login_shell() -> Option<String> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let uid = unsafe { libc::getuid() };
+    let mut passwd: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+    let mut buffer = vec![0u8; 4096];
+    loop {
+        let rc = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut passwd,
+                buffer.as_mut_ptr().cast::<libc::c_char>(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if rc == libc::ERANGE && buffer.len() < (1 << 20) {
+            buffer.resize(buffer.len() * 2, 0);
+            continue;
+        }
+        if rc != 0 || result.is_null() || passwd.pw_shell.is_null() {
+            return None;
+        }
+        let bytes = unsafe { std::ffi::CStr::from_ptr(passwd.pw_shell) }.to_bytes();
+        if bytes.is_empty() {
+            return None;
+        }
+        return std::ffi::OsString::from_vec(bytes.to_vec()).into_string().ok();
     }
 }
 
@@ -433,5 +504,21 @@ mod tests {
         // Whatever this machine is, the fallback is a shell that exists.
         let picked = shell();
         assert!(!picked.trim().is_empty());
+        // The passwd database answers for the current user on Unix — that is
+        // the whole point of the fallback when a desktop launch has no $SHELL.
+        #[cfg(not(windows))]
+        {
+            let login = login_shell();
+            assert!(login.as_deref().is_some_and(|shell| !shell.trim().is_empty()));
+        }
+    }
+
+    #[test]
+    fn a_configured_shell_wins_and_an_empty_one_is_not_a_configuration() {
+        assert_eq!(pick_shell(Some("/bin/zsh".into())), "/bin/zsh");
+        // An empty string in the config means "no preference", so detection
+        // still runs — the shell() call inside just has to return something.
+        assert!(!pick_shell(Some(String::new())).trim().is_empty());
+        assert!(!pick_shell(None).trim().is_empty());
     }
 }

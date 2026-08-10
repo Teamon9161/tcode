@@ -197,6 +197,20 @@ export function WorkspaceFiles({
       .catch((error) => setFailure(`could not delete ${entry.name}: ${String(error)}`));
   };
 
+  // Recoverable, so it needs no question — the same reason a file manager's
+  // "Move to trash" does not confirm. The permanent Delete below still asks.
+  const trash = (entry: WorkspaceTreeNode) => {
+    setFailure(null);
+    void invoke<void>("workspace_trash", { session, path: entry.path })
+      .then(() => {
+        setTree((current) => deleteWorkspaceEntry(current, entry.path));
+        setRenaming((current) => (current === entry.path ? null : current));
+      })
+      .catch((error) =>
+        setFailure(`could not move ${entry.name} to the trash: ${String(error)}`),
+      );
+  };
+
   // Failures are shown rather than swallowed (rule 7). A clipboard that refused
   // is worth a line: the next thing that happens is a paste of whatever was
   // there before, into something that matters.
@@ -405,6 +419,7 @@ export function WorkspaceFiles({
             );
           }}
           onRename={() => menu.entry && setRenaming(menu.entry.path)}
+          onTrash={() => menu.entry && trash(menu.entry)}
           onDelete={() => menu.entry && remove(menu.entry)}
         />
       )}
@@ -525,6 +540,7 @@ function WorkspaceMenu({
   onMention,
   onCopy,
   onRename,
+  onTrash,
   onDelete,
 }: {
   menu: Menu;
@@ -535,6 +551,7 @@ function WorkspaceMenu({
   onMention: () => void;
   onCopy: (what: "path" | "relative" | "name") => void;
   onRename: () => void;
+  onTrash: () => void;
   onDelete: () => void;
 }) {
   const session = useSession();
@@ -638,6 +655,7 @@ function WorkspaceMenu({
               <Item onClick={act(onRename)} keys="F2">
                 Rename
               </Item>
+              <Item onClick={act(onTrash)}>Move to trash</Item>
               <Item danger onClick={() => setAsking(true)} keys="Del">
                 Delete
               </Item>

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import type { ApprovalMode, Decision, SessionInfo, Status } from "./types";
 import type { SessionState } from "./session";
@@ -457,17 +457,25 @@ export function Workspace({
   // window is, which is what makes it read as an IDE's rather than as another
   // pane that landed wherever there was room (`toggleTerminal`).
   const openTerminal = useCallback(() => onTiling(toggleTerminal), [onTiling]);
-  // The folder a new tab starts in. Read off the focused pane for the reason
-  // rule 9c gives: with the window split, "the current folder" is a guess, and
-  // the pane you are in is what makes it answerable. Falling back to the first
-  // conversation covers the case where focus is on the browser or the terminal
-  // itself — some folder beats none, and it is the one the rail leads with.
+  // The folder a new tab starts in. The focused conversation's folder — for the
+  // reason rule 9c gives, with the window split "the current folder" is a guess
+  // and the pane you are in is what makes it answerable — *remembered* rather
+  // than read live. Reading the live focus would work only until the terminal
+  // is open: `toggleTerminal` deliberately moves focus into the terminal pane
+  // (AGENTS.md rule 24), which has no session, and the fallback then silently
+  // picks the first conversation — the "the terminal always opens in the first
+  // session" report. The ref keeps the last pane that had a folder, so a new
+  // tab lands in the session you were working in, and switching focus to
+  // another session before pressing + moves the next tab there. Falling back to
+  // the first conversation covers the app's first moment, when nothing has been
+  // focused yet.
+  const lastSessionCwd = useRef<string | null>(null);
   const terminalCwd = useMemo(() => {
     const seat = focused(tiling);
     const held = seat && paneSession(seat.pane);
-    return (
-      sessions.find((open) => open.id === held)?.cwd ?? sessions[0]?.cwd ?? ""
-    );
+    const cwd = sessions.find((open) => open.id === held)?.cwd;
+    if (cwd) lastSessionCwd.current = cwd;
+    return lastSessionCwd.current ?? sessions[0]?.cwd ?? "";
   }, [tiling, sessions]);
   // Handing a browser tab to a conversation. Same shape as `mention` and for
   // the same reasons — it writes a draft, and it appends — but the session has

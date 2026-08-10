@@ -514,6 +514,37 @@ impl Workspace {
         Ok(())
     }
 
+    /// Move a regular file, directory (empty or not) or link to the platform
+    /// trash instead of removing it. Recoverable, so unlike [`Self::delete`]
+    /// this is the action a file manager would call "Move to trash".
+    ///
+    /// It resolves through the same checks as every other operation — no
+    /// component may be a link, and the entry must canonicalize inside the
+    /// root — and the entry itself is moved whole: a link is trashed as a
+    /// link, a directory is trashed with its contents.
+    pub fn trash(&self, path: &str) -> Result<(), WorkspaceError> {
+        let components = parse_wire_path(path)?;
+        let name = components.last().expect("non-empty wire path");
+        let parent = self.resolve_components_dir(&components[..components.len() - 1], path)?;
+        let full = parent.join(name);
+        let metadata = fs::symlink_metadata(&full).map_err(|source| match source.kind() {
+            std::io::ErrorKind::NotFound => WorkspaceError::NotFound(path.to_owned()),
+            _ => WorkspaceError::Io {
+                path: full.clone(),
+                source,
+            },
+        })?;
+        if !is_link(&metadata) {
+            // A link's target may live anywhere; only a real entry has to be
+            // inside the root.
+            self.assert_canonical_inside(&full)?;
+        }
+        trash::delete(&full).map_err(|source| WorkspaceError::Io {
+            path: full.clone(),
+            source: std::io::Error::other(source.to_string()),
+        })
+    }
+
     fn resolve_parent(&self, parent: Option<&str>) -> Result<(PathBuf, String), WorkspaceError> {
         match parent {
             Some(path) => Ok((self.resolve_existing_dir(path)?, path.to_owned())),
@@ -1003,6 +1034,66 @@ mod tests {
             .create_file(Some("nonempty"), "file", "x")
             .unwrap();
         assert!(workspace.delete("nonempty").is_err());
+    }
+
+    /// The freedesktop trash layout is what the Linux implementation writes:
+    /// the entry lands under `files/` and its `.trashinfo` beside it. Only
+    /// asserted on Linux — Windows and macOS have their own trash, and this
+    /// test is here for the platform the report named.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trash_moves_a_file_and_a_nonempty_directory_to_the_platform_trash() {
+        // Point the trash at a scratch location so the test never touches the
+        // machine's real trash. `trash` reads `XDG_DATA_HOME` per call; no
+        // other test in this binary reads it, and this one restores it.
+        let trash_home = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", trash_home.path());
+        let restore = || match previous {
+            Some(value) => std::env::set_var("XDG_DATA_HOME", value),
+            None => std::env::remove_var("XDG_DATA_HOME"),
+        };
+
+        let (root, workspace) = workspace();
+        workspace.create_file(None, "draft.md", "hello").unwrap();
+        workspace.create_dir(None, "project").unwrap();
+        workspace
+            .create_file(Some("project"), "notes.txt", "keep me")
+            .unwrap();
+
+        workspace.trash("draft.md").unwrap();
+        workspace.trash("project").unwrap();
+
+        restore();
+        assert!(!root.path().join("draft.md").exists());
+        assert!(!root.path().join("project").exists());
+        let files = trash_home.path().join("Trash/files");
+        assert_eq!(
+            std::fs::read_to_string(files.join("draft.md")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(files.join("project/notes.txt")).unwrap(),
+            "keep me"
+        );
+        assert!(trash_home.path().join("Trash/info/draft.md.trashinfo").exists());
+    }
+
+    #[test]
+    fn trash_keeps_the_same_boundary_as_delete() {
+        let (_root, workspace) = workspace();
+        assert!(matches!(
+            workspace.trash("../secret"),
+            Err(WorkspaceError::InvalidPath(_))
+        ));
+        assert!(matches!(
+            workspace.trash("missing.txt"),
+            Err(WorkspaceError::NotFound(_))
+        ));
+        assert!(matches!(
+            workspace.trash(""),
+            Err(WorkspaceError::InvalidPath(_))
+        ));
     }
 
     #[test]

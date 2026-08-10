@@ -194,9 +194,8 @@ loop {
 3. acp支持
 4. ~~Tool friction — shell (PowerShell)~~ **已修复，是我们的问题**：`Get-ChildItem | Select-Object Name` 这类以"选属性"结尾的管道返回空。根因不是"某些路径"特殊，而是 wrapper 在脚本后立刻 `exit`：PowerShell 5.1 的格式化器把表状输出（`Select-Object <属性>` 产生的 PSObject）缓冲到管道结束才写，`exit` 直接跳过收尾冲刷，于是整段输出一起丢（实测同一条命令里连后面的字符串/`Test-Path` 布尔输出也一起没）；`cmd /c dir`、`ls`、裸 `Test-Path` 走即时写出路径所以正常。修法（`crates/tcode-tools/src/shell.rs::shell_command`）：脚本包进 `& { … } | Out-String -Stream` 子管道，子管道闭合强制格式化器先写完再跑退出逻辑；`-Stream` 保持 monitor/后台任务逐行流式。附 3 个回归测试：Select-Object 输出保全、流式不缓冲、尾部 `#` 注释不吞闭合。重启 harness 后生效。
 5. ~~桌面 terminal.rs 的 a_shell_echoes… 连续失败~~ **已修复，Windows 特有而非"纯环境性"**：两个真实缺陷。① cmd.exe 启动即发 `ESC[6n` 光标位置查询（DSR）并阻塞等应答——真 webview 里 xterm.js 会答、测试的哑 collector 不会，shell 永远停在启动，输入到不了它；测试替身现在像 xterm.js 一样回 `ESC[1;1R`（`crates/tcode-app/tests/terminal.rs`）。② `exit 7` 后收不到 TERMINAL_EXIT：Windows ConPTY 下客户端退出不关闭输出管道，原 pump 先等管道 EOF 再 `child.wait()` 就永久卡住，死 shell 显示为活着；pump 改为独立 waiter 线程上报退出（`src/terminal.rs`），`open()` 也改为先注册再启 pump 避免 DSR 应答竞态。行终止符按平台区分（Windows Enter=`\r`，Unix=`\n`，Linux 行为不变）。
-6. plan.md的edit按钮最好和窗口的放大和关闭同级吧,做个icon, 还有md现在的源码切换放在那里了, save还有文件名这些单独一行没必要,你看下怎么弄更好, 聚焦在这个窗口的时候支持快捷键保存.
 7. md渲染的时候比如~~我看显示是删除线,但是不是整条删除,感觉就删除了半行.切换edit模式的时候不应该重置窗口的位置吧,每次都回开头.
-8. 文件窗口linux支持移动到回收站, move to trash.
+8. workspace文件窗口linux支持移动到回收站, move to trash.
 9. terminal窗格快捷键打开的位置是不是应该和聚焦的session的文件夹有关,现在好像默认打开的都是第一个session的?然后比如要加tab也得根据当前激活的session来?因为terminal应该是共用的?
 10. 窗口支持互换位置吗,这点hyprland是怎么做的呢.
 11. shell是不是默认用linux的默认shell?并且支持在一个设置的地方设置.

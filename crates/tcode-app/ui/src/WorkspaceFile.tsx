@@ -24,6 +24,7 @@ import {
   useWorkspaceFileControls,
   type WorkspaceFileControls,
 } from "./workspaceFileControls";
+import { offsetAtPoint } from "./previewOffset";
 import {
   WorkspaceEditor,
   type WorkspaceEditorSnapshot,
@@ -49,6 +50,9 @@ export function WorkspaceFile({ path }: { path: string }) {
   const [saving, setSaving] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const preview = useRef<HTMLDivElement>(null);
+  // Where the preview was when the reader left it, for the editor's first
+  // entry. See `changeMode`; read once by the `WorkspaceEditor` mount.
+  const pendingPreviewOffset = useRef<number | null>(null);
   // The poll reads the current baseline from a ref rather than from `document`
   // in a closure, so the 2s interval never has to be re-created on every
   // keystroke; `saving` is read the same way so a poll cannot flag the disk
@@ -164,6 +168,23 @@ export function WorkspaceFile({ path }: { path: string }) {
 
   const changeMode = useCallback((mode: WorkspaceMode) => {
     if (!document || document.mode === mode) return;
+    // Leaving the preview for the editor: remember where the reader was, so
+    // the editor can open there instead of at the top. Only the first entry
+    // uses it (`editorState` is null until an editor has ever been opened);
+    // after that the editor's own saved scroll is exact. If the point lands on
+    // nothing text-like, `offsetAtPoint` says null and the editor starts at
+    // the top — which is where somebody who never scrolled was anyway.
+    if (document.mode === "preview" && mode === "edit" && document.editorState === null) {
+      const previewNode = preview.current;
+      if (previewNode) {
+        const rect = previewNode.getBoundingClientRect();
+        pendingPreviewOffset.current = offsetAtPoint(
+          previewNode,
+          rect.left + Math.min(rect.width / 2, 80),
+          rect.top + 10,
+        );
+      }
+    }
     remember({
       ...document,
       mode,
@@ -346,6 +367,7 @@ export function WorkspaceFile({ path }: { path: string }) {
           initialDoc={document.text}
           initialState={document.editorState}
           initialScroll={document.editorScroll}
+          initialOffset={pendingPreviewOffset.current}
           readOnly={!document.complete}
           onSnapshot={updateEditor}
         />

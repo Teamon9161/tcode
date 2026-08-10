@@ -64,6 +64,15 @@ anyhow = "1"
 thiserror = "2"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
+# `login_shell()` in `src/terminal.rs`: reading the user's shell from the
+# passwd database needs `getpwuid_r`; guessing at the user from `$USER` would
+# trust an env var for a fact the kernel knows.
+libc = "0.2"
+# Move a workspace file to the platform trash instead of removing it for good
+# (`src/workspace.rs::Workspace::trash`). Freedesktop's spec on Linux, the
+# Recycle Bin on Windows, Trash on macOS — the one cross-platform answer to
+# "recoverable delete".
+trash = "5"
 
 [dev-dependencies]
 tempfile = "3"

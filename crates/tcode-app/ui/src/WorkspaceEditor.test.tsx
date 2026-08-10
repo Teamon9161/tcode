@@ -23,13 +23,18 @@ const loaded = vi.fn(
     }),
 );
 
-function draw(doc = "one", state?: EditorState | null) {
+function draw(
+  doc = "one",
+  state?: EditorState | null,
+  initialOffset?: number | null,
+) {
   act(() => {
     root.render(
       <WorkspaceEditor
         path="src/main.rs"
         initialDoc={doc}
         initialState={state}
+        initialOffset={initialOffset}
         onSnapshot={(next) => {
           snapshot = next;
         }}
@@ -153,5 +158,15 @@ describe("WorkspaceEditor", () => {
 
     expect(destroy).toHaveBeenCalledTimes(1);
     destroy.mockRestore();
+  });
+
+  it("accepts a preview hand-off position and keeps the document intact", () => {
+    const editor = draw("one two three", null, 5);
+    expect(editor.state.doc.toString()).toBe("one two three");
+    // The hand-off scroll is deferred and best-effort; in a zero-height test
+    // DOM it lands wherever measurement says, but it must never throw or
+    // corrupt the editor.
+    act(() => editor.dispatch({ changes: { from: 3, insert: "-" } }));
+    expect(editor.state.doc.toString()).toBe("one- two three");
   });
 });

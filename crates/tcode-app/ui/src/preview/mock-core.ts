@@ -941,6 +941,9 @@ export async function invoke<T>(
     case "workspace_delete":
       deleteWorkspace(args);
       return undefined as T;
+    case "workspace_trash":
+      deleteWorkspace(args);
+      return undefined as T;
     // Two openers rather than all three: the backend only ever reports what is
     // installed, and a fixture where everything is present would never show the
     // shape a real machine has (rule: a fixture writes what the wire really

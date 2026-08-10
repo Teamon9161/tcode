@@ -10,9 +10,11 @@ import {
   imageFromNativeClipboard,
   imagesFrom,
   isImagePaste,
+  matchesRecentPaste,
   needsNativeImageRead,
   type NativeClipboardImage,
   type Pasted,
+  type RecentPasteShape,
 } from "./paste";
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
@@ -51,6 +53,14 @@ const MAX_HEIGHT = 220;
  * would mention a file.
  */
 const PUBLISH_IDLE = 200;
+
+/**
+ * How long a DOM-path paste stays comparable for the native clipboard
+ * fallback. Long enough that the two events of one Ctrl+V land inside it;
+ * short enough that two deliberate pastes of same-sized images a moment apart
+ * are not mistaken for each other.
+ */
+const RECENT_PASTE_MS = 1500;
 
 export function Composer({
   value,
@@ -99,6 +109,12 @@ export function Composer({
    *  other half of "what is being typed": the same text with the caret in two
    *  places is two different tokens. */
   const [caret, setCaret] = useState<number | null>(null);
+  // What the DOM paste path just attached, for the native fallback to compare
+  // against. One Ctrl+V can reach this handler twice on some platforms — the
+  // first event carries a DOM File, the second is empty and falls through to
+  // `clipboard_image`. The two reads encode differently (JPEG vs PNG), so the
+  // only way the fallback can tell it is the same paste is by shape.
+  const recentPastes = useRef<RecentPasteShape[]>([]);
 
   // What is in the field, and what the window was last told is in it. They
   // differ only between a keystroke and the publish that follows it.
@@ -256,12 +272,22 @@ export function Composer({
       .catch(() => [])
       .then(async (images) => {
         if (images.length > 0) {
+          const now = Date.now();
+          recentPastes.current = [
+            ...recentPastes.current.filter((entry) => now - entry.at < RECENT_PASTE_MS),
+            ...images.map((image) => ({ width: image.width, height: image.height, at: now })),
+          ];
           onAttach(images);
           return;
         }
         const image = await invoke<NativeClipboardImage | null>("clipboard_image");
         if (!image) throw new Error("the system clipboard did not provide an image");
-        onAttach([imageFromNativeClipboard(image)]);
+        // The DOM path and the native read of the same paste both normalize to
+        // the same long edge, so a matching shape within the window means this
+        // is the second delivery of a paste that already attached a chip.
+        if (!matchesRecentPaste(recentPastes.current, image.width, image.height, Date.now(), RECENT_PASTE_MS)) {
+          onAttach([imageFromNativeClipboard(image)]);
+        }
       })
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };

@@ -311,7 +311,12 @@ describe("the composer input", () => {
   });
 
   it("uses the native clipboard when WebKit promises an image without a File", async () => {
-    mocks.invoke.mockResolvedValue({ media_type: "image/png", data: "aGVsbG8=" });
+    mocks.invoke.mockResolvedValue({
+      media_type: "image/png",
+      data: "aGVsbG8=",
+      width: 800,
+      height: 600,
+    });
     const transfer = {
       types: ["image/png"],
       files: { length: 0, item: () => null },
@@ -326,9 +331,48 @@ describe("the composer input", () => {
       expect.objectContaining({
         mediaType: "image/png",
         data: "aGVsbG8=",
+        width: 800,
+        height: 600,
         url: "data:image/png;base64,aGVsbG8=",
       }),
     ]);
+  });
+
+  it("does not attach the native clipboard again for a paste the DOM path already took", async () => {
+    // One Ctrl+V can reach the handler twice: first with a DOM File, then with
+    // the empty WebKitGTK shape. The DOM path attaches a chip; the empty second
+    // delivery would read the same image from the native clipboard (as PNG,
+    // different bytes than the DOM path's JPEG) and attach a second one. The
+    // shape guard lives in `matchesRecentPaste` (paste.test.ts); here the whole
+    // flow is pinned end to end: a native image whose shape was just attached
+    // by the DOM path is dropped.
+    //
+    // jsdom cannot decode an image, so the DOM path reports a zero-size chip
+    // (`imagesFrom` resolves rather than rejects). The native clipboard answers
+    // with that same zero shape, which the guard treats as a duplicate.
+    const file = new File(["image"], "clipboard.png", { type: "image/png" });
+    mocks.invoke.mockResolvedValue({
+      media_type: "image/png",
+      data: "bmF0aXZl",
+      width: 0,
+      height: 0,
+    });
+    const first = {
+      types: ["Files"],
+      files: { 0: file, length: 1, item: () => file },
+      items: [],
+    } as unknown as DataTransfer;
+
+    await paste(first);
+    mocks.invoke.mockClear();
+    const second = {
+      types: ["image/png"],
+      files: { length: 0, item: () => null },
+      items: [{ kind: "file", type: "image/png", getAsFile: () => null }],
+    } as unknown as DataTransfer;
+    await paste(second);
+
+    expect(mocks.onAttach).toHaveBeenCalledTimes(1);
   });
 
   it("leaves ordinary text paste entirely to the textarea", async () => {

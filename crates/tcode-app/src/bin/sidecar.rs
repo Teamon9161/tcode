@@ -57,7 +57,7 @@ async fn main() -> anyhow::Result<()> {
     let ctx = Arc::new(Ctx {
         supervisor: startup.supervisor,
         serve: startup.serve,
-        terminals: tcode_app::terminal::Terminals::new(),
+        terminals: tcode_app::terminal::Terminals::with_shell(startup.terminal_shell),
         emit,
     });
 
