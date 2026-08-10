@@ -318,8 +318,6 @@ impl Registry {
         result!(t, "pin_role", c::pin_role[supervisor](kind, pin));
         result!(t, "save_preset", c::save_preset[supervisor](name));
 
-        // The two commands with no dependencies at all.
-        result!(t, "clipboard_image", c::clipboard_image[]());
         // What somebody typed in the address bar, as a URL. A backend command
         // and not a `browser_*` verb on purpose: it needs no view, and the
         // alternative was a second copy of five tests' worth of guesswork

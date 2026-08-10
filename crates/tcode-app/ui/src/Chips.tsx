@@ -36,38 +36,10 @@ import type { Meter } from "./usage";
 
 export function Chips({ meter }: { meter: Meter }) {
   const session = useSession();
-  const [state, setState] = useState<PickerState | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-
-  const refresh = useCallback(
-    () =>
-      invoke<PickerState>("picker_state", { session })
-        .then(setState)
-        .catch((error) => setFailure(String(error))),
-    [session],
-  );
-
-  useEffect(() => {
-    refresh();
-  }, [refresh]);
-
-  useEffect(() => {
-    let unlisten: (() => void) | undefined;
-    listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
-      if (payload.session === session && payload.event.type === "ModeChanged") refresh();
-    })
-      .then((stop) => {
-        unlisten = stop;
-      })
-      .catch((error) => setFailure(`cannot watch permission mode: ${String(error)}`));
-    return () => unlisten?.();
-  }, [refresh, session]);
+  const { state, failure, refresh, act } = usePicker(session);
 
   if (failure) return <p className="chips-note">{failure}</p>;
   if (!state) return <div className="chips" />;
-
-  const act = (run: Promise<unknown>) =>
-    run.then(refresh).catch((error) => setFailure(String(error)));
 
   return (
     <div className="chips">
@@ -103,6 +75,51 @@ export function Chips({ meter }: { meter: Meter }) {
       <ModelPanel state={state} refresh={refresh} />
     </div>
   );
+}
+
+/** The model is process-scoped, but some decisions — such as executing an
+ * approved plan elsewhere — need to make that scope explicit before they run.
+ * This is the same picker as the composer’s chip, not a second model switcher. */
+export function ModelPicker() {
+  const session = useSession();
+  const { state, failure, refresh } = usePicker(session);
+  if (failure) return <p className="chips-note">{failure}</p>;
+  if (!state) return null;
+  return <ModelPanel state={state} refresh={refresh} />;
+}
+
+function usePicker(session: string) {
+  const [state, setState] = useState<PickerState | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  const refresh = useCallback(
+    () =>
+      invoke<PickerState>("picker_state", { session })
+        .then(setState)
+        .catch((error) => setFailure(String(error))),
+    [session],
+  );
+
+  useEffect(() => {
+    refresh();
+  }, [refresh]);
+
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
+      if (payload.session === session && payload.event.type === "ModeChanged") refresh();
+    })
+      .then((stop) => {
+        unlisten = stop;
+      })
+      .catch((error) => setFailure(`cannot watch permission mode: ${String(error)}`));
+    return () => unlisten?.();
+  }, [refresh, session]);
+
+  const act = (run: Promise<unknown>) =>
+    run.then(refresh).catch((error) => setFailure(String(error)));
+
+  return { state, failure, refresh, act };
 }
 
 /**

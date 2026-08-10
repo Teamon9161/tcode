@@ -1,3 +1,4 @@
+import { focused, paneSession, type Tiling } from "./layout";
 import { basename } from "./show";
 import { mapTab, noTabs, type TabList } from "./tabs";
 
@@ -61,4 +62,22 @@ export function endTab(tabs: Tabs, id: string, code: number): Tabs {
  */
 export function tabLabel(tab: Tab): string {
   return tab.title || basename(tab.cwd) || "shell";
+}
+
+/** Chooses the folder for the next terminal tab without treating the terminal
+ * itself as a session. Once focus enters that session-less pane, the most
+ * recently focused session remains the only unambiguous source of a folder. */
+export function cwdForTerminal(
+  tiling: Tiling,
+  sessions: readonly { id: string; cwd: string }[],
+  remembered: string | null,
+): string {
+  const current = focused(tiling);
+  const session = current && paneSession(current.pane);
+  return (
+    sessions.find((open) => open.id === session)?.cwd ??
+    remembered ??
+    sessions[0]?.cwd ??
+    ""
+  );
 }

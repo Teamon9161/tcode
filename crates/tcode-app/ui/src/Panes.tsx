@@ -47,6 +47,7 @@ import {
   PencilIcon,
   RefreshIcon,
   RowsIcon,
+  SwapIcon,
 } from "./components/Icons";
 import { Transcript } from "./Transcript";
 import { Composer } from "./Composer";
@@ -96,6 +97,8 @@ export type PaneContext = {
   onClosePane: (pane: string) => void;
   /** Turn a seam: the two panes it separates swap between beside and stacked. */
   onRotate: (divider: string) => void;
+  /** Exchange the two subtrees the seam separates, preserving their pane ids. */
+  onSwap: (divider: string) => void;
   onRatio: (divider: string, ratio: number) => void;
   onOpen: (pane: string, session: string, value: Inspect) => void;
   /** Show it *as well*, in a pane of its own — the deliberate "keep this one and
@@ -220,6 +223,7 @@ export function Panes({
               field={field}
               onRatio={context.onRatio}
               onRotate={context.onRotate}
+              onSwap={context.onSwap}
             />
           ))}
       </div>
@@ -272,11 +276,13 @@ function Divider({
   field,
   onRatio,
   onRotate,
+  onSwap,
 }: {
   divider: PlacedDivider;
   field: RefObject<HTMLDivElement | null>;
   onRatio: (divider: string, ratio: number) => void;
   onRotate: (divider: string) => void;
+  onSwap: (divider: string) => void;
 }) {
   const { id, dir, ratio, within } = divider;
   const row = dir === "row";
@@ -350,6 +356,7 @@ function Divider({
       };
 
   const turn = row ? "Stack these panes" : "Put these panes side by side";
+  const exchange = "Swap these panes";
 
   return (
     <div className={`seam is-${dir}`} style={place}>
@@ -380,6 +387,16 @@ function Divider({
         title={turn}
       >
         {row ? <RowsIcon size={13} /> : <ColumnsIcon size={13} />}
+      </button>
+      <button
+        type="button"
+        className="seam-swap"
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={() => onSwap(id)}
+        aria-label={exchange}
+        title={exchange}
+      >
+        <SwapIcon size={13} />
       </button>
     </div>
   );

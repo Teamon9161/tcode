@@ -710,6 +710,20 @@ export function rotate(tiling: Tiling, id: string): Tiling {
   return root === tiling.root ? tiling : { ...tiling, root };
 }
 
+/** Exchanges the two sides of one divider without replacing either subtree.
+ *
+ * The ratio belongs to the screen positions, not their contents, so it stays
+ * put: a narrow right pane moved left occupies the formerly left rectangle.
+ * Keeping the subtrees and their leaf ids intact is what lets the flat renderer
+ * preserve transcript scroll, editor state and live terminal hosts. */
+export function swap(tiling: Tiling, id: string): Tiling {
+  if (!tiling.root) return tiling;
+  const root = mapNode(tiling.root, id, (node) =>
+    node.kind === "split" ? { ...node, a: node.b, b: node.a } : node,
+  );
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
 /** A box as fractions of the field, 0–1. */
 export type Rect = { left: number; top: number; width: number; height: number };
 

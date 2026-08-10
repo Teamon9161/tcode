@@ -138,6 +138,17 @@ export const RowsIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/** Two panes changing places. The opposed arrows make it distinct from the
+ * turn controls above, which change the direction of the split instead. */
+export const SwapIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M5 8h13" />
+    <path d="m15 5 3 3-3 3" />
+    <path d="M19 16H6" />
+    <path d="m9 13-3 3 3 3" />
+  </Glyph>
+);
+
 export const ExpandIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M9 5H5v4" />

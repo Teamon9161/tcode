@@ -25,52 +25,6 @@ use crate::projects::{self, ProjectInfo, StoredSession};
 use crate::state::{run_compact, run_turn, Supervisor};
 use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry, WorkspaceStat};
 
-/// A normalized image read from the system clipboard for the webview.
-///
-/// The caller only reaches this after a user paste, when WebKitGTK advertised
-/// image data but did not provide a DOM `File` to decode itself.
-#[derive(Serialize)]
-pub struct ClipboardImage {
-    pub media_type: String,
-    pub data: String,
-    /// The size the provider will receive. The frontend uses it to recognise
-    /// the same paste that also arrived through the DOM path (which encodes
-    /// differently, so bytes would not match) — see `paste.ts`.
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Read an image from the native clipboard when the webview cannot materialize
-/// its promised image MIME type as a DOM file.
-pub fn clipboard_image() -> Result<Option<ClipboardImage>, String> {
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|error| format!("cannot open the system clipboard: {error}"))?;
-    let image = match clipboard.get_image() {
-        Ok(image) => image,
-        Err(arboard::Error::ContentNotAvailable) => return Ok(None),
-        Err(error) => return Err(format!("cannot read the system clipboard image: {error}")),
-    };
-    clipboard_image_from_rgba(image.width, image.height, image.bytes.into_owned()).map(Some)
-}
-
-fn clipboard_image_from_rgba(
-    width: usize,
-    height: usize,
-    rgba: Vec<u8>,
-) -> Result<ClipboardImage, String> {
-    use base64::Engine as _;
-
-    let width = u32::try_from(width).map_err(|_| "clipboard image is too wide")?;
-    let height = u32::try_from(height).map_err(|_| "clipboard image is too tall")?;
-    let image = tcode_core::images::normalize_rgba(width, height, rgba)?;
-    Ok(ClipboardImage {
-        media_type: image.media_type.to_string(),
-        data: base64::engine::general_purpose::STANDARD.encode(image.bytes),
-        width: image.width,
-        height: image.height,
-    })
-}
-
 /// What the frontend needs to render a session before any turn has run.
 #[derive(Serialize)]
 pub struct SessionInfo {
@@ -1731,30 +1685,6 @@ mod tests {
             panic!("expected a note");
         };
         assert!(text.contains("could not be saved"), "{text}");
-    }
-
-    #[test]
-    fn native_clipboard_pixels_become_a_provider_image() {
-        use base64::Engine as _;
-
-        let image = clipboard_image_from_rgba(1, 1, vec![1, 2, 3, 255]).unwrap();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&image.data)
-            .unwrap();
-        assert_eq!(
-            tcode_core::images::detect_image_mime(&bytes),
-            Some(image.media_type.as_str())
-        );
-        // The frontend matches native pastes against DOM pastes by shape (the
-        // two encode differently, so bytes would not compare) — dimensions
-        // must survive normalization.
-        assert_eq!((image.width, image.height), (1, 1));
-    }
-
-    #[test]
-    fn malformed_native_clipboard_pixels_are_refused() {
-        let result = clipboard_image_from_rgba(1, 1, vec![1, 2, 3]);
-        assert!(matches!(result, Err(error) if error.contains("RGBA buffer")));
     }
 
     #[test]

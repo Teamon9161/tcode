@@ -38,10 +38,6 @@ portable-pty = "0.9"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 base64 = "0.22"
-# The clipboard image fallback for a user-initiated paste. The desktop app can
-# run natively under Wayland, so the default X11-only backend cannot see the
-# clipboard that WebKitGTK just pasted from.
-arboard = { version = "3", features = ["wayland-data-control"] }
 
 # The loopback origin for shown artifacts (`serve.rs`). `ServeDir` rather than
 # hand-rolled file serving: byte ranges, conditional requests, HEAD, directory

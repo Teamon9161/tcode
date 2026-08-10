@@ -20,6 +20,7 @@ import {
   parentSplit,
   rotate,
   showBeside,
+  swap,
   sessionsInView,
   setRatio,
   show,
@@ -426,10 +427,25 @@ describe("dividers", () => {
     );
   });
 
+  it("exchanges the two sides while preserving their leaf ids and ratio", () => {
+    const one = single(talk("tcode"));
+    const two = split(one, id(one, "tcode"), "row", talk("duck_ext"), 0.3);
+    const divider = two.root?.id ?? "";
+    const tcode = id(two, "tcode");
+    const duck = id(two, "duck_ext");
+
+    const exchanged = swap(two, divider);
+    expect(shape(exchanged)).toBe("row(duck_ext, tcode)");
+    expect(id(exchanged, "tcode")).toBe(tcode);
+    expect(id(exchanged, "duck_ext")).toBe(duck);
+    expect(exchanged.root).toMatchObject({ kind: "split", ratio: 0.3 });
+  });
+
   it("ignores ids that are not dividers", () => {
     const one = single(talk("tcode"));
     expect(setRatio(one, id(one, "tcode"), 0.3)).toBe(one);
     expect(rotate(one, id(one, "tcode"))).toBe(one);
+    expect(swap(one, id(one, "tcode"))).toBe(one);
   });
 });
 

@@ -1,8 +1,10 @@
 import { describe, expect, it } from "vitest";
 
+import { showBeside, single, toggleTerminal } from "./layout";
 import {
   addTab,
   closeTab,
+  cwdForTerminal,
   endTab,
   NO_TABS,
   renameTab,
@@ -72,6 +74,26 @@ describe("the terminal's tabs", () => {
 
   it("names an untitled tab after its folder, never after its id", () => {
     expect(tabLabel(tab("0193f0-uuid-ish"))).toBe("tcode");
+  });
+
+  it("keeps the focused session's folder for a tab opened from the terminal", () => {
+    const sessions = [
+      { id: "first", cwd: "/work/first" },
+      { id: "second", cwd: "/work/second" },
+    ];
+    const sessionsPane = showBeside(single({ kind: "session", session: "first" }), "second");
+    const remembered = cwdForTerminal(sessionsPane, sessions, null);
+    const terminal = toggleTerminal(sessionsPane);
+
+    expect(remembered).toBe("/work/second");
+    expect(cwdForTerminal(terminal, sessions, remembered)).toBe("/work/second");
+  });
+
+  it("uses the first session only before any session has received focus", () => {
+    const sessions = [{ id: "first", cwd: "/work/first" }];
+    expect(cwdForTerminal(single({ kind: "terminal" }), sessions, null)).toBe(
+      "/work/first",
+    );
   });
 
   it("keeps a tab whose program ended, and remembers how", () => {

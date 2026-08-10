@@ -57,6 +57,7 @@ function paneContext(focus = "inspect-pane"): PaneContext {
     onFocus: none,
     onClosePane: none,
     onRotate: none,
+    onSwap: none,
     onRatio: none,
     onOpen: none,
     onOpenAside: none,

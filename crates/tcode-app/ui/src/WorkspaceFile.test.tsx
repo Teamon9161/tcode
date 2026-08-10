@@ -120,6 +120,40 @@ describe("WorkspaceFile routes live workspace content", () => {
     expect(editor()?.state.selection.main.head).toBe(3);
   });
 
+  it("samples Markdown text below preview padding before entering the editor", async () => {
+    mocks.invoke.mockResolvedValue(textView("README.md", "# title\n\nbody"));
+    await draw("README.md");
+
+    const preview = container.querySelector<HTMLElement>(".workspace-file-preview")!;
+    preview.style.paddingTop = "24px";
+    Object.defineProperty(preview, "clientHeight", { configurable: true, value: 200 });
+    vi.spyOn(preview, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 100,
+      top: 100,
+      left: 0,
+      right: 300,
+      bottom: 300,
+      width: 300,
+      height: 200,
+      toJSON: () => ({}),
+    });
+    const text = preview.querySelector(".prose-h1")!.firstChild!;
+    const caret = vi.fn((_: number, y: number) =>
+      y >= 124 ? { startContainer: text, startOffset: 2 } : null,
+    );
+    const previous = Object.getOwnPropertyDescriptor(document, "caretRangeFromPoint");
+    Object.defineProperty(document, "caretRangeFromPoint", { configurable: true, value: caret });
+
+    try {
+      act(() => controls?.onMode?.("edit"));
+      expect(caret).toHaveBeenCalledWith(80, 125);
+    } finally {
+      if (previous) Object.defineProperty(document, "caretRangeFromPoint", previous);
+      else Reflect.deleteProperty(document, "caretRangeFromPoint");
+    }
+  });
+
   it("reads images as bytes and never offers an editor or save action", async () => {
     const binary: WorkspaceBinaryView = {
       path: "icons/mark.png",

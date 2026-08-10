@@ -178,10 +178,18 @@ export function WorkspaceFile({ path }: { path: string }) {
       const previewNode = preview.current;
       if (previewNode) {
         const rect = previewNode.getBoundingClientRect();
+        const paddingTop = Number.parseFloat(getComputedStyle(previewNode).paddingTop) || 0;
+        // The preview has inset content. Sampling a fixed 10px below its border
+        // lands in that padding, where there is no text node to hand to the
+        // editor, so a reader who had scrolled opened at the top instead.
+        const y = rect.top + Math.min(
+          Math.max(paddingTop + 1, 1),
+          Math.max(previewNode.clientHeight - 1, 1),
+        );
         pendingPreviewOffset.current = offsetAtPoint(
           previewNode,
           rect.left + Math.min(rect.width / 2, 80),
-          rect.top + 10,
+          y,
         );
       }
     }

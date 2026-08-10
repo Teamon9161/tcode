@@ -47,6 +47,7 @@ export function ProgressStrip({
   /** Which phases the reader has opened or closed by hand, keyed by path.
    *  Absent means "whatever this phase's status implies". */
   const [shown, setShown] = useState<Record<string, boolean>>({});
+  const [backgroundOpen, setBackgroundOpen] = useState(false);
 
   return (
     <section className={`dock progress-strip${expanded ? " is-open" : ""}`} aria-label="Plan progress">
@@ -95,6 +96,21 @@ export function ProgressStrip({
             <PanelIcon size={12} />
           </button>
         </div>
+
+        {expanded && plan.background && (
+          <div className="strip-background">
+            <button
+              type="button"
+              className="strip-background-toggle"
+              onClick={() => setBackgroundOpen((was) => !was)}
+              aria-expanded={backgroundOpen}
+            >
+              {backgroundOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+              Background
+            </button>
+            {backgroundOpen && <Prose className="strip-detail" text={plan.background} />}
+          </div>
+        )}
 
         {expanded && (
           <ol className="strip-phases">

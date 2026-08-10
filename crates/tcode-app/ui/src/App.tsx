@@ -32,6 +32,7 @@ import {
   type Tiling,
 } from "./layout";
 import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
+import { PlanRefreshes } from "./planRefresh";
 import type { PlanDecision } from "./PlanEditor";
 import { BLANK, LimitsContext, type SessionState } from "./session";
 import { replayLedger } from "./replay";
@@ -106,6 +107,7 @@ export function App() {
    */
   const held = useRef(states);
   held.current = states;
+  const planRefreshes = useRef(new PlanRefreshes());
 
   /**
    * Re-read one conversation's plan.
@@ -118,14 +120,16 @@ export function App() {
    */
   const readPlan = useCallback(
     (id: string) => {
+      const request = planRefreshes.current.begin(id);
       invoke<Plan | null>("plan", { session: id })
-        .then((plan) =>
+        .then((plan) => {
+          if (!planRefreshes.current.isCurrent(id, request)) return;
           patch(id, (state) => ({
             ...state,
             plan,
             planDraft: rebase(state.planDraft, plan),
-          })),
-        )
+          }));
+        })
         .catch((error) => console.warn("plan unavailable:", error));
     },
     [patch],

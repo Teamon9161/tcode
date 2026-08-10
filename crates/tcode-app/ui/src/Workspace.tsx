@@ -20,6 +20,7 @@ import {
   rotate,
   sessionsInView,
   setRatio,
+  swap,
   show,
   showBeside,
   toggleTerminal,
@@ -31,6 +32,7 @@ import { nearestPane, type Box, type Dir4 } from "./focus";
 import { fieldAspect } from "./field";
 import { handOverText } from "./webHost";
 import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
+import { cwdForTerminal } from "./terminal";
 import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
 import { Panes, type PaneContext } from "./Panes";
@@ -294,6 +296,7 @@ export function Workspace({
    *   Mod+Alt+←↑↓→     move focus to the pane that way
    *   Mod+W            close this pane (the conversation keeps running)
    *   Mod+Alt+R        turn this split from side-by-side to stacked
+   *   Mod+Alt+S        exchange the two sides of this split
    *   Mod+J            show, focus, or hide the terminals
    *
    * Digits are read from `event.code`, not `event.key`: with Shift down the
@@ -388,6 +391,15 @@ export function Workspace({
         return;
       }
 
+      if (event.altKey && (event.key === "s" || event.key === "S")) {
+        event.preventDefault();
+        onTiling((current) => {
+          const divider = parentSplit(current, current.focus);
+          return divider ? swap(current, divider) : current;
+        });
+        return;
+      }
+
       if (
         !event.altKey &&
         !event.shiftKey &&
@@ -459,24 +471,14 @@ export function Workspace({
   const openTerminal = useCallback(() => onTiling(toggleTerminal), [onTiling]);
   // The folder a new tab starts in. The focused conversation's folder — for the
   // reason rule 9c gives, with the window split "the current folder" is a guess
-  // and the pane you are in is what makes it answerable — *remembered* rather
-  // than read live. Reading the live focus would work only until the terminal
-  // is open: `toggleTerminal` deliberately moves focus into the terminal pane
-  // (AGENTS.md rule 24), which has no session, and the fallback then silently
-  // picks the first conversation — the "the terminal always opens in the first
-  // session" report. The ref keeps the last pane that had a folder, so a new
-  // tab lands in the session you were working in, and switching focus to
-  // another session before pressing + moves the next tab there. Falling back to
-  // the first conversation covers the app's first moment, when nothing has been
-  // focused yet.
+  // and the pane you are in is what makes it answerable — is remembered rather
+  // than inferred once focus is in the session-less terminal.
   const lastSessionCwd = useRef<string | null>(null);
-  const terminalCwd = useMemo(() => {
-    const seat = focused(tiling);
-    const held = seat && paneSession(seat.pane);
-    const cwd = sessions.find((open) => open.id === held)?.cwd;
-    if (cwd) lastSessionCwd.current = cwd;
-    return lastSessionCwd.current ?? sessions[0]?.cwd ?? "";
-  }, [tiling, sessions]);
+  const terminalCwd = cwdForTerminal(tiling, sessions, lastSessionCwd.current);
+  const terminalSource = focused(tiling);
+  if (terminalSource && paneSession(terminalSource.pane)) {
+    lastSessionCwd.current = terminalCwd;
+  }
   // Handing a browser tab to a conversation. Same shape as `mention` and for
   // the same reasons — it writes a draft, and it appends — but the session has
   // to be worked out rather than passed in: the browser pane belongs to the
@@ -524,6 +526,10 @@ export function Workspace({
     (seam: string) => onTiling((current) => rotate(current, seam)),
     [onTiling],
   );
+  const swapSeam = useCallback(
+    (seam: string) => onTiling((current) => swap(current, seam)),
+    [onTiling],
+  );
   const toggleExpanded = useCallback(
     (pane: string) => {
       onTiling((current) => focusPane(current, pane));
@@ -543,6 +549,7 @@ export function Workspace({
       onFocus: focusOn,
       onClosePane: closePane,
       onRotate: turnSeam,
+      onSwap: swapSeam,
       onRatio: ratio,
       onOpen: open,
       onOpenAside: openBeside,
@@ -586,6 +593,7 @@ export function Workspace({
       focusOn,
       closePane,
       turnSeam,
+      swapSeam,
       ratio,
       open,
       openBeside,

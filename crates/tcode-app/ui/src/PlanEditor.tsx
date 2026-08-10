@@ -24,6 +24,8 @@ import { SelectionBubble } from "./components/SelectionBubble";
 import { GrowingText } from "./components/GrowingText";
 import { TextDiff } from "./components/Diff";
 import { ChevronDown, ChevronRight, CloseIcon, PlusIcon } from "./components/Icons";
+import { ModelPicker } from "./Chips";
+import { Prose } from "./Prose";
 
 /**
  * The plan, as a document you can work on.
@@ -137,7 +139,7 @@ export function PlanEditor({
           in phases, and prose that came back through it would have to be
           re-parsed out of a structure that has nowhere to put it. Changing it
           goes through a comment, or through the file itself. */}
-      {plan.background && <div className="plan-background">{plan.background}</div>}
+      {plan.background && <Prose className="plan-background" text={plan.background} />}
 
       <ol className="plan-phases">
         {draft.phases.map((phase, index) => (
@@ -215,6 +217,11 @@ export function PlanEditor({
             placeholder="Anything else to say about this plan"
             onChange={(event) => setNote(event.target.value)}
           />
+          <div className="plan-execution-model">
+            <span className="plan-execution-label">Execution model</span>
+            <ModelPicker />
+            <span className="plan-execution-note">Applies to every session in this app.</span>
+          </div>
           <div className="plan-buttons">
             <button
               type="button"

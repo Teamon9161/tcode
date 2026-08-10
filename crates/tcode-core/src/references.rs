@@ -250,7 +250,7 @@ fn file_reference(path: &Path, relative: &str) -> String {
         {
             Some(content) if approx_tokens(&content) <= MAX_FILE_REFERENCE_TOKENS => {
                 return format!(
-                    "Project reference file `{relative}` ({bytes} bytes, complete contents):\n```\n{content}\n```"
+                    "Project reference file `{relative}` ({bytes} bytes, complete contents; snapshot taken when this user message was delivered):\n```\n{content}\n```"
                 );
             }
             Some(_) => {
@@ -497,6 +497,37 @@ mod tests {
             .iter()
             .any(|text| text.contains("complete contents") && text.contains("answer")));
         assert!(extras.iter().any(|text| text.contains("bounded tree")));
+    }
+
+    #[tokio::test]
+    async fn reexpanding_a_reference_reads_the_current_file_contents() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plan.md");
+        fs::write(&path, "old plan body").unwrap();
+
+        let first = expand_references(
+            dir.path().to_path_buf(),
+            vec![ContentBlock::Text {
+                text: "review @plan.md".into(),
+            }],
+        )
+        .await;
+        fs::write(&path, "current plan body").unwrap();
+        let second = expand_references(
+            dir.path().to_path_buf(),
+            vec![ContentBlock::Text {
+                text: "review @plan.md".into(),
+            }],
+        )
+        .await;
+
+        let text = |expanded: &ExpandedReferences| match &expanded.blocks[1] {
+            ContentBlock::Text { text } => text.clone(),
+            _ => panic!("reference should be text"),
+        };
+        assert!(text(&first).contains("old plan body"));
+        assert!(text(&second).contains("current plan body"));
+        assert!(!text(&second).contains("old plan body"));
     }
 
     #[tokio::test]

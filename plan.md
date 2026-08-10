@@ -192,13 +192,16 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-4. ~~Tool friction — shell (PowerShell)~~ **已修复，是我们的问题**：`Get-ChildItem | Select-Object Name` 这类以"选属性"结尾的管道返回空。根因不是"某些路径"特殊，而是 wrapper 在脚本后立刻 `exit`：PowerShell 5.1 的格式化器把表状输出（`Select-Object <属性>` 产生的 PSObject）缓冲到管道结束才写，`exit` 直接跳过收尾冲刷，于是整段输出一起丢（实测同一条命令里连后面的字符串/`Test-Path` 布尔输出也一起没）；`cmd /c dir`、`ls`、裸 `Test-Path` 走即时写出路径所以正常。修法（`crates/tcode-tools/src/shell.rs::shell_command`）：脚本包进 `& { … } | Out-String -Stream` 子管道，子管道闭合强制格式化器先写完再跑退出逻辑；`-Stream` 保持 monitor/后台任务逐行流式。附 3 个回归测试：Select-Object 输出保全、流式不缓冲、尾部 `#` 注释不吞闭合。重启 harness 后生效。
-5. ~~桌面 terminal.rs 的 a_shell_echoes… 连续失败~~ **已修复，Windows 特有而非"纯环境性"**：两个真实缺陷。① cmd.exe 启动即发 `ESC[6n` 光标位置查询（DSR）并阻塞等应答——真 webview 里 xterm.js 会答、测试的哑 collector 不会，shell 永远停在启动，输入到不了它；测试替身现在像 xterm.js 一样回 `ESC[1;1R`（`crates/tcode-app/tests/terminal.rs`）。② `exit 7` 后收不到 TERMINAL_EXIT：Windows ConPTY 下客户端退出不关闭输出管道，原 pump 先等管道 EOF 再 `child.wait()` 就永久卡住，死 shell 显示为活着；pump 改为独立 waiter 线程上报退出（`src/terminal.rs`），`open()` 也改为先注册再启 pump 避免 DSR 应答竞态。行终止符按平台区分（Windows Enter=`\r`，Unix=`\n`，Linux 行为不变）。
+4. Windows PowerShell 的 `Get-ChildItem | Select-Object Name` 等表格管道输出仍会为空；之前声称修复后实际行为未变，需要从真实 shell 调用路径复现并修复。
 7. md渲染的时候比如~~我看显示是删除线,但是不是整条删除,感觉就删除了半行.切换edit模式的时候不应该重置窗口的位置吧,每次都回开头.
-8. workspace文件窗口linux支持移动到回收站, move to trash.
-9. terminal窗格快捷键打开的位置是不是应该和聚焦的session的文件夹有关,现在好像默认打开的都是第一个session的?然后比如要加tab也得根据当前激活的session来?因为terminal应该是共用的?
-10. 窗口支持互换位置吗,这点hyprland是怎么做的呢.
-11. shell是不是默认用linux的默认shell?并且支持在一个设置的地方设置.
+8. workspace 文件窗口在 Linux 支持移动到回收站（move to trash）；之前改过但实际行为仍未生效，需要复现并修复。
+9. terminal 窗格和新 terminal tab 应以当前聚焦 session 的文件夹启动，不应始终落到第一个 session 的目录。
+10. 窗口支持互换位置吗,这点hyprland是怎么做的呢。需要交换既有窗格位置/内容，而不只是横竖旋转 split。
 12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行,还有就是prompt框上方的plan下拉后看不到background, 要有个展开的地方可以看到background, 并且最好做好渲染,我看plan审批那边的background都没有经过md渲染.
 13. browser: the attached browser returned a blank page and empty accessibility tree for the healthy loopback preview, although curl and local Firefox rendered the same URL correctly. The workaround required headless Firefox screenshots and WebDriver BiDi. Letting the browser controller reach the same loopback namespace—or returning a concrete navigation/network error instead of an empty tree—would remove that detour.
 14. ctrl+v粘贴图片会粘贴两次
+15. workspace的editor点击编辑,不要回到文件开头位置
+16. app的prompt框上面的plan窗口好像没有及时更新状态.
+17. `@path` 引用必须明确是用户消息投递时的磁盘快照；同一路径在后续消息再次引用时必须重新读取最新内容，并用回归测试保证不复用旧快照，避免历史 Ledger 内容与当前文件混淆。
+18. 连续的Browser操作应该全部收到一起,然后下面渲染一下浏览器的对应页面缩略图,类似show, 会更新的那种, 然后再加一个按钮,可以用户点击就打开对应的浏览器页面.
+19. 浏览器窗格隐藏了,但是有打开页面,这时候拖动别的窗格宽度,浏览器页面会有一部分显示出来.

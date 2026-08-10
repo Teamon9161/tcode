@@ -1,21 +1,10 @@
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import { invoke } from "@ipc";
-
 import { Completions } from "./Completions";
 import { segments } from "./completion";
 import { useCompletions, useKnownMentions } from "./useCompletions";
 import { useSession } from "./session";
 
-import {
-  imageFromNativeClipboard,
-  imagesFrom,
-  isImagePaste,
-  matchesRecentPaste,
-  needsNativeImageRead,
-  type NativeClipboardImage,
-  type Pasted,
-  type RecentPasteShape,
-} from "./paste";
+import { imagesFrom, isImagePaste, type Pasted } from "./paste";
 import { Chips } from "./Chips";
 import { CloseIcon, ReturnIcon, StopIcon } from "./components/Icons";
 import type { Meter } from "./usage";
@@ -53,14 +42,6 @@ const MAX_HEIGHT = 220;
  * would mention a file.
  */
 const PUBLISH_IDLE = 200;
-
-/**
- * How long a DOM-path paste stays comparable for the native clipboard
- * fallback. Long enough that the two events of one Ctrl+V land inside it;
- * short enough that two deliberate pastes of same-sized images a moment apart
- * are not mistaken for each other.
- */
-const RECENT_PASTE_MS = 1500;
 
 export function Composer({
   value,
@@ -109,13 +90,6 @@ export function Composer({
    *  other half of "what is being typed": the same text with the caret in two
    *  places is two different tokens. */
   const [caret, setCaret] = useState<number | null>(null);
-  // What the DOM paste path just attached, for the native fallback to compare
-  // against. One Ctrl+V can reach this handler twice on some platforms — the
-  // first event carries a DOM File, the second is empty and falls through to
-  // `clipboard_image`. The two reads encode differently (JPEG vs PNG), so the
-  // only way the fallback can tell it is the same paste is by shape.
-  const recentPastes = useRef<RecentPasteShape[]>([]);
-
   // What is in the field, and what the window was last told is in it. They
   // differ only between a keystroke and the publish that follows it.
   const [text, setText] = useState(value);
@@ -260,35 +234,6 @@ export function Composer({
     setFailure(null);
     imagesFrom(transfer)
       .then((images) => images.length > 0 && onAttach(images))
-      .catch((error) => setFailure(`could not read that image: ${String(error)}`));
-  };
-
-  const takeClipboardImage = (transfer: DataTransfer | null) => {
-    setFailure(null);
-    // Prefer the browser's File when it has one. WebKitGTK sometimes advertises
-    // an image MIME but provides no File, in which case the native clipboard is
-    // the only source that can still fulfill this user-initiated paste.
-    imagesFrom(transfer)
-      .catch(() => [])
-      .then(async (images) => {
-        if (images.length > 0) {
-          const now = Date.now();
-          recentPastes.current = [
-            ...recentPastes.current.filter((entry) => now - entry.at < RECENT_PASTE_MS),
-            ...images.map((image) => ({ width: image.width, height: image.height, at: now })),
-          ];
-          onAttach(images);
-          return;
-        }
-        const image = await invoke<NativeClipboardImage | null>("clipboard_image");
-        if (!image) throw new Error("the system clipboard did not provide an image");
-        // The DOM path and the native read of the same paste both normalize to
-        // the same long edge, so a matching shape within the window means this
-        // is the second delivery of a paste that already attached a chip.
-        if (!matchesRecentPaste(recentPastes.current, image.width, image.height, Date.now(), RECENT_PASTE_MS)) {
-          onAttach([imageFromNativeClipboard(image)]);
-        }
-      })
       .catch((error) => setFailure(`could not read that image: ${String(error)}`));
   };
 
@@ -458,11 +403,11 @@ export function Composer({
             setCaret(null);
           }}
           onPaste={(event) => {
-            // Text stays native. The final branch catches the empty WebKitGTK
-            // clipboard event shape, which can still be a system image paste.
-            if (!needsNativeImageRead(event.clipboardData)) return;
+            // Text stays native; DOM `File`s are the Electron image-paste
+            // contract verified by the desktop clipboard probe.
+            if (!isImagePaste(event.clipboardData)) return;
             event.preventDefault();
-            takeClipboardImage(event.clipboardData);
+            take(event.clipboardData);
           }}
           onKeyDown={(event) => {
             // An IME uses Enter to accept the current candidate. That key must

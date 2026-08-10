@@ -233,11 +233,10 @@ body.is-resizing {
    same reason the grab area reaches into both panes. Hidden until the pointer
    is here: a permanent chip on every seam is furniture on a window whose whole
    subject is what the panes contain. */
-.seam-turn {
+.seam-turn,
+.seam-swap {
   position: absolute;
-  top: 50%;
   left: 50%;
-  transform: translate(-50%, -50%);
   display: grid;
   place-items: center;
   width: 22px;
@@ -253,11 +252,24 @@ body.is-resizing {
     opacity var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
 }
+.seam-turn {
+  top: 50%;
+  transform: translate(-50%, -50%);
+}
+/* The exchange belongs beside the direction control but cannot overlap it: a
+   seam's controls are a compact two-action group, not a guessing game. */
+.seam-swap {
+  top: calc(50% + 26px);
+  transform: translate(-50%, -50%);
+}
 .seam:hover .seam-turn,
-.seam-turn:focus-visible {
+.seam:hover .seam-swap,
+.seam-turn:focus-visible,
+.seam-swap:focus-visible {
   opacity: 1;
 }
-.seam-turn:hover {
+.seam-turn:hover,
+.seam-swap:hover {
   color: var(--ink);
 }
 
@@ -5705,6 +5717,29 @@ body.is-resizing {
    the plan's progress look like a stray green decoration, so it has no separate
    meter. */
 
+.strip-background {
+  padding-top: var(--s-2);
+}
+.strip-background-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.strip-background-toggle:hover,
+.strip-background-toggle:focus-visible {
+  color: var(--ink);
+}
+.strip-background .strip-detail {
+  padding-top: var(--s-2);
+}
+
 .strip-phases {
   list-style: none;
   display: flex;
@@ -5815,18 +5850,20 @@ button.strip-phase-line:hover .strip-phase-name {
   text-wrap: pretty;
 }
 
-/* The plan's prose. Set as a block of source markdown rather than rendered:
-   this is the text the model wrote and the reviewer may quote back at it, and a
-   rendered copy would be a second grammar to keep in step with core's. */
+/* The plan background is a document, not a quoted source block: the reviewer
+   is reading its headings, lists and links exactly as they will be understood. */
 .plan-background {
+  max-width: 72ch;
   margin: var(--s-3) 0;
-  padding-left: var(--s-3);
-  border-left: 2px solid var(--line);
-  color: var(--muted);
+  color: var(--body);
   font-size: var(--text-xs);
-  line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.plan-background > :first-child {
+  margin-top: 0;
+}
+.plan-background > :last-child {
+  margin-bottom: 0;
 }
 .plan-title {
   font-size: var(--text-md);
@@ -6101,6 +6138,24 @@ button.strip-phase-line:hover .strip-phase-name {
   display: flex;
   flex-direction: column;
   gap: var(--s-2);
+}
+.plan-execution-model {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.plan-execution-label {
+  color: var(--body);
+  font-weight: 500;
+}
+.plan-execution-model .chip-box {
+  flex: none;
+}
+.plan-execution-note {
+  text-wrap: pretty;
 }
 .plan-buttons {
   display: flex;
