@@ -1,7 +1,7 @@
 {
   "name": "tcode",
   "private": true,
-  "version": "0.1.23",
+  "version": "0.1.24",
   "description": "The Electron desktop application for tcode.",
   "author": "Teamon9161",
   "main": "electron/main.js",

@@ -64,6 +64,7 @@ impl Shell for FakeShell {
 
 struct MockModel {
     vision: bool,
+    tool_result_images: bool,
     answer: &'static str,
     requests: Mutex<Vec<Request>>,
 }
@@ -88,6 +89,10 @@ impl Provider for MockModel {
 
     fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    fn supports_tool_result_images(&self) -> bool {
+        self.tool_result_images
     }
 
     async fn stream(
@@ -237,6 +242,87 @@ async fn a_snapshot_is_filtered_and_fenced() {
     // The wrapper and the page root carry nothing their children do not.
     assert!(!out.content.contains("generic"), "{}", out.content);
     assert!(!out.content.contains("RootWebArea"), "{}", out.content);
+}
+
+/// Dense pages are bounded before the central blob gate has to spill thousands
+/// of irrelevant AX rows. The default is part of the contract: callers get a
+/// useful page slice plus an exact omitted count without knowing this option.
+#[tokio::test]
+async fn a_snapshot_bounds_dense_pages_by_default() {
+    let mut dense = page();
+    dense["nodes"] = Value::Array(
+        (0..501)
+            .map(|index| {
+                json!({
+                    "nodeId": index.to_string(),
+                    "role": { "value": "heading" },
+                    "name": { "value": format!("Event {index}") },
+                    "backendDOMNodeId": index,
+                    "ignored": false
+                })
+            })
+            .collect(),
+    );
+    let tool = BrowserTool::new(FakeShell::answering(vec![Ok(dense)]), None);
+
+    let out = run(&tool, json!({ "action": "snapshot", "tab": "t" })).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert_eq!(out.content.matches(" heading \"").count(), 500);
+    assert!(out.content.contains("1 further element"), "{}", out.content);
+    assert!(out.content.contains("max_elements"), "{}", out.content);
+}
+
+/// Callers can tighten that default further, and the omitted count tells the
+/// model exactly how to opt into a larger view when the cut content matters.
+#[tokio::test]
+async fn a_snapshot_can_bound_the_number_of_elements() {
+    let shell = FakeShell::answering(vec![Ok(page())]);
+    let tool = BrowserTool::new(shell, None);
+
+    let out = run(
+        &tool,
+        json!({ "action": "snapshot", "tab": "t", "max_elements": 1 }),
+    )
+    .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("ref_3 heading"), "{}", out.content);
+    assert!(!out.content.contains("ref_44 link"), "{}", out.content);
+    assert!(out.content.contains("1 further element"), "{}", out.content);
+    assert!(out.content.contains("max_elements"), "{}", out.content);
+}
+
+#[tokio::test]
+async fn an_invalid_snapshot_limit_is_rejected_before_capture() {
+    let shell = FakeShell::answering(vec![]);
+    let tool = BrowserTool::new(shell.clone(), None);
+
+    let out = run(
+        &tool,
+        json!({ "action": "snapshot", "tab": "t", "max_elements": 0 }),
+    )
+    .await;
+
+    assert!(out.is_error);
+    assert!(out.content.contains("between 1"), "{}", out.content);
+    assert!(shell.calls().is_empty());
+}
+
+#[tokio::test]
+async fn snapshot_limits_above_the_hard_cap_are_rejected_before_capture() {
+    let shell = FakeShell::answering(vec![]);
+    let tool = BrowserTool::new(shell.clone(), None);
+
+    let out = run(
+        &tool,
+        json!({ "action": "snapshot", "tab": "t", "max_elements": 5_001 }),
+    )
+    .await;
+
+    assert!(out.is_error);
+    assert!(out.content.contains("5000"), "{}", out.content);
+    assert!(shell.calls().is_empty());
 }
 
 /// The document title is page-owned bytes just like AX text. It must never
@@ -602,28 +688,142 @@ async fn going_back_forgets_where_the_tab_was() {
     ));
 }
 
-/// A screenshot passed directly to an image-capable parent remains an image
-/// block in that conversation. `ToolCtx::for_test` has no model, which stands
-/// for "no evidence that it is text-only" in this focused transport test.
+/// A provider that supports multimodal tool results returns the normalized image
+/// block directly to the current model without making an isolated vision call.
 #[tokio::test]
 async fn a_screenshot_reaches_an_image_capable_parent() {
     let shell = FakeShell::answering(vec![Ok(json!({
-        "url": "https://example.com", "data": "iVBORw0KGgo=", "width": 800, "height": 600
+        "url": "https://example.com", "data": png(), "width": 800, "height": 600
     }))]);
+    let primary = Arc::new(MockModel {
+        vision: true,
+        tool_result_images: true,
+        answer: "unused",
+        requests: Mutex::new(Vec::new()),
+    });
     let tool = BrowserTool::new(shell.clone(), None);
+    let ctx = ctx().with_model(model(primary.clone()));
 
-    // `ToolCtx::for_test` carries no model, which stands for "no reason to
-    // think it cannot" — a test asking for a screenshot means to get one.
-    let out = run(&tool, json!({ "action": "screenshot", "tab": "t" })).await;
+    let out = run_with_ctx(&tool, json!({ "action": "screenshot", "tab": "t" }), &ctx).await;
 
     assert!(!out.is_error, "{}", out.content);
     assert_eq!(out.images.len(), 1, "the picture never reached the model");
+    assert!(primary.requests.lock().unwrap().is_empty());
     assert!(out.content.contains("800"), "{}", out.content);
     assert!(
         out.content.contains("snapshot"),
         "a screenshot should point at where the refs are: {}",
         out.content
     );
+}
+
+#[tokio::test]
+async fn a_direct_screenshot_rejects_invalid_image_bytes() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "url": "https://example.com", "data": "iVBORw0KGgo=", "width": 800, "height": 600
+    }))]);
+    let tool = BrowserTool::new(shell, None);
+
+    let out = run(&tool, json!({ "action": "screenshot", "tab": "t" })).await;
+
+    assert!(out.is_error);
+    assert!(out.content.contains("not usable"), "{}", out.content);
+    assert!(out.images.is_empty());
+}
+
+/// Responsive checks set a temporary browser viewport instead of forcing a
+/// second Electron window. Both dimensions cross the shell boundary together.
+#[tokio::test]
+async fn a_screenshot_can_request_a_temporary_viewport() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "url": "https://example.com", "data": png(), "width": 800, "height": 600
+    }))]);
+    let tool = BrowserTool::new(shell.clone(), None);
+
+    let out = run(
+        &tool,
+        json!({
+            "action": "screenshot",
+            "tab": "t",
+            "width": 800,
+            "height": 600
+        }),
+    )
+    .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    let (method, args) = shell.calls().remove(0);
+    assert_eq!(method, "browser_screenshot");
+    assert_eq!(args["viewport"], json!({ "width": 800, "height": 600 }));
+}
+
+#[tokio::test]
+async fn a_screenshot_rejects_an_incomplete_viewport_before_capture() {
+    let shell = FakeShell::answering(vec![]);
+    let tool = BrowserTool::new(shell.clone(), None);
+
+    let out = run(
+        &tool,
+        json!({ "action": "screenshot", "tab": "t", "width": 800 }),
+    )
+    .await;
+
+    assert!(out.is_error);
+    assert!(out.content.contains("both"), "{}", out.content);
+    assert!(shell.calls().is_empty());
+}
+
+#[tokio::test]
+async fn invalid_screenshot_viewports_are_rejected_before_capture() {
+    for input in [
+        json!({ "action": "screenshot", "tab": "t", "width": 319, "height": 600 }),
+        json!({ "action": "screenshot", "tab": "t", "width": 2_561, "height": 600 }),
+        json!({ "action": "screenshot", "tab": "t", "width": "800", "height": 600 }),
+    ] {
+        let shell = FakeShell::answering(vec![]);
+        let tool = BrowserTool::new(shell.clone(), None);
+        let out = run(&tool, input).await;
+
+        assert!(out.is_error);
+        assert!(shell.calls().is_empty());
+    }
+}
+
+/// A vision-capable model can still sit behind a text-only tool-result role
+/// (notably OpenAI Chat Completions). In that case the same model is used
+/// through the isolated vision request instead of silently returning an image
+/// block its API will omit.
+#[tokio::test]
+async fn a_screenshot_delegates_when_tool_results_cannot_carry_images() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "url": "https://example.com/dashboard",
+        "data": png(),
+        "width": 800,
+        "height": 600
+    }))]);
+    let primary = Arc::new(MockModel {
+        vision: true,
+        tool_result_images: false,
+        answer: "The mobile navigation is collapsed.",
+        requests: Mutex::new(Vec::new()),
+    });
+    let tool = BrowserTool::new(shell, None).with_vision(AgentModels::default());
+    let ctx = ctx().with_model(model(primary.clone()));
+
+    let out = run_with_ctx(
+        &tool,
+        json!({ "action": "screenshot", "tab": "t", "prompt": "Is this mobile?" }),
+        &ctx,
+    )
+    .await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.images.is_empty(),
+        "pixels entered a text-only tool result"
+    );
+    assert!(out.content.contains("mobile navigation"), "{}", out.content);
+    assert_eq!(primary.requests.lock().unwrap().len(), 1);
 }
 
 /// A text-only parent does not receive an image block it cannot consume. The
@@ -639,11 +839,13 @@ async fn a_screenshot_delegates_to_the_configured_vision_role() {
     }))]);
     let primary = Arc::new(MockModel {
         vision: false,
+        tool_result_images: false,
         answer: "unused",
         requests: Mutex::new(Vec::new()),
     });
     let vision = Arc::new(MockModel {
         vision: true,
+        tool_result_images: true,
         answer: "The chart is clipped on the right.",
         requests: Mutex::new(Vec::new()),
     });
@@ -704,6 +906,7 @@ async fn a_screenshot_without_any_vision_model_fails_before_capture() {
     }))]);
     let primary = Arc::new(MockModel {
         vision: false,
+        tool_result_images: false,
         answer: "unused",
         requests: Mutex::new(Vec::new()),
     });

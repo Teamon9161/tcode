@@ -64,6 +64,8 @@ pub trait Provider: Send + Sync {
     async fn stream(&self, req: Request, cancel: CancellationToken)
         -> Result<BoxStream<'static, StreamEvent>>;
     fn cache_strategy(&self) -> CacheStrategy;  // ExplicitBreakpoints | ImplicitPrefix
+    fn supports_vision(&self) -> bool;          // user message 可接受图片
+    fn supports_tool_result_images(&self) -> bool; // tool result 可内联图片；与上一项正交
 }
 
 #[async_trait]
@@ -162,7 +164,7 @@ loop {
 | `monitor` | 后台监视（对齐 claude-code 的 Monitor）：跑平台主 shell 脚本，stdout 每行即一个事件（512B 截断），安全边界作为 `Entry::Note` 注入、空闲时前端按 quiet 合流窗口唤醒 `monitor_turn`（每次空闲唤醒 = 一次完整前缀 cache read，合流即省钱）；事件是 Note 不是 User，Auto Mode 授权判定天然不把事件当用户授权（claude-code 靠 prompt 纪律，这里靠类型）；洪水自动停（120 事件/60s，附"收紧过滤器"自愈提示）；与 shell 共用注册表、日志管道、`kill_task` 与权限规则域（`run(...)`）；默认 5min 超时，`persistent` 免超时；resume 时未终结的任务/监视注入一条"未恢复"Note（零猜测） |
 | `grep` / `glob` | 内嵌 grep-searcher/ignore/globset；每行截 512B、`max_filesize` 上限、并行 + 按 (path,line) 排序、deadline 兜底给 partial 标记、剪 VCS/缓存目录、搜 dotfiles + offset 分页 |
 | `task` | sub-agent：注册表选类型（`general` + 只读 `explore`），独立 ledger，受限工具集；`background: true`（仅主 agent）不阻塞派发，完成时 report 作为 fenced `Entry::Instruction` 唤醒主 agent——**模型收得到、转录里不出现**（人这边对应的是那次 run 本身），非交互 |
-| `web_fetch` / `web_search` | 见下 Web 节 |
+| `web_fetch` / `web_search` | HTTP 抓取、可选 fetch 模型摘要与搜索实现见 `crates/tcode-tools/src/web.rs` |
 | `progress` | 一个任务一份耐久的计划文件（`~/.tcode/projects/<id>/progress/`，`draft`/`active`/`done`），也是前端进度面板的数据源。**它是该文件唯一的写入者**——模型不得用 `edit` 改它。**一份计划是包含阶段表的文档**：`description`（一行，inventory 用）+ `background`（不属于任何阶段的正文：决策、勘查确立的事实、数据结构、贯穿约束、被否掉的方案）+ `phases`。返回值只回显刚翻成 `[>]` 的那一阶段的 `detail`，所以十二阶段的计划任何时刻只有一个阶段的正文在上下文里；`background` 只在会话接手文件时随摘要下发一次，超预算退化成小节标题。`state: "active"` 就是"提交给用户审批"这一动作本身，因此 `permission()` 是输入的纯函数；用户手改文件后下次更新返回自愈冲突（附他们的原文）。不可代替方案、结论或交接记录。 |
 | `ask_user` | 必须由用户选择才能继续的阻塞分歧；支持多问题分页。不可用于可由代码、项目上下文或现有用户要求确定的细节。 |
 | `add_note` | 当前 Ledger 的一条高价值交接记录：仅记录用户决策、已验证约束或未完成工作的边界，供后续步骤延续。不是进度跟踪，不写入跨会话自动记忆；compact 后是否保留由摘要决定。 |
@@ -197,9 +199,5 @@ loop {
 24. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
 26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
 28. app prompt框上方的plan栏，展开后，再展开background，没法滚动，在长background的时候展开后看不全，也没法看phase了。
-30. Tool friction — browser.snapshot：为验证一个搜索筛选结果，快照把页面中 180 行事件明细和所有图表可访问文本都返回，产生了 3,500 余行输出。若支持按元素 ref 截取快照或提供最大文本量参数，可避免长表页面的无关上下文开销。
-31. Tool friction — browser.screenshot：真实截图成功后，API 返回了“image(s) omitted: this API cannot carry images returned from a tool”，导致当前会话无法把像素交给 view_image 做二次检查。最小改进是将返回图片保留为可检查的 artifact/path，或允许工具返回的 image block 直接作为 view_image 输入；否则截图成功也只能验证尺寸和调用状态，不能检查实际像素。
 32. app Append不显示diff
-33. Tool friction — browser.screenshot: 使用具体视觉检查 prompt 截图后，只返回了“image omitted: this API cannot carry images”，没有返回描述中预期的视觉模型结论。为完成检查，不得不通过临时 Electron 脚本保存截图，再调用 view_image。在图片不能进入主上下文时直接返回视觉子模型的文字结论即可消除这组额外调用。
-
-Capability gap — browser viewport sizing: 本次必须验证 900px 以下的 responsive rail，但 browser 工具没有调整 viewport 的动作。最终通过临时 BrowserWindow 设置 800px 宽度并截图。增加受限的 resize 动作，或给 screenshot 增加 viewport 宽高参数，就能直接完成响应式页面验证。
+33. Tool friction — agent(explore)：我要求复审“当前 working-tree diff”，但只读 agent 没有 git/diff 能力，也未在工具描述中说明这一限制，因此改为扫描完整文件树，使用了 44 次工具调用和约 225 万输入 token，并且阶段性报告与最终报告的关注点不一致。最小改进是让只读 agent 可读取 git diff，或在派发时自动附带当前 patch；至少应在 agent 能力描述中明确其无法查看 working-tree diff。

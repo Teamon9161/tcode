@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use tcode_core::{
-    AgentModels, AgentRole, AutoSafety, ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput,
+    AgentModels, AgentRole, AutoSafety, PermissionRequest, Tool, ToolCtx, ToolOutput,
     ToolUiMetadata,
 };
 
@@ -77,13 +77,19 @@ const STRUCTURAL: &[&str] = &[
     "RootWebArea",
 ];
 
-/// Ceiling on one snapshot's text.
-///
-/// A backstop, not the budget: oversized tool output already spills to a file
-/// the model can read or grep (`Tool::gates_output`), and that mechanism is
-/// better than anything invented here because the model already knows it. This
-/// only stops a pathological page from being turned into a string first.
+/// Hard ceiling on one snapshot's text. The ordinary limit is by element count;
+/// this second bound protects against a page putting an enormous accessible name
+/// on one element.
 const SNAPSHOT_MAX_BYTES: usize = 200 * 1024;
+/// An ordinary snapshot stays small enough to inspect directly. Callers that
+/// genuinely need a dense page can raise this explicitly, up to the hard cap.
+const SNAPSHOT_DEFAULT_ELEMENTS: usize = 500;
+const SNAPSHOT_MAX_ELEMENTS: usize = 5_000;
+
+const SCREENSHOT_MIN_WIDTH: i64 = 320;
+const SCREENSHOT_MAX_WIDTH: i64 = 2_560;
+const SCREENSHOT_MIN_HEIGHT: i64 = 240;
+const SCREENSHOT_MAX_HEIGHT: i64 = 1_440;
 
 /// The fence every snapshot is wrapped in. Same tag and same escaping as
 /// `web_fetch` — see [`fence`].
@@ -292,6 +298,47 @@ fn ref_of(input: &Value) -> Result<i64, String> {
         .map_err(|_| format!("'{raw}' is not a ref — a snapshot writes them as ref_<number>"))
 }
 
+fn snapshot_max_elements(input: &Value) -> Result<usize, String> {
+    let Some(value) = input["max_elements"].as_u64() else {
+        return if input["max_elements"].is_null() {
+            Ok(SNAPSHOT_DEFAULT_ELEMENTS)
+        } else {
+            Err("snapshot `max_elements` must be a positive integer".into())
+        };
+    };
+    let value = usize::try_from(value).unwrap_or(usize::MAX);
+    if !(1..=SNAPSHOT_MAX_ELEMENTS).contains(&value) {
+        return Err(format!(
+            "snapshot `max_elements` must be between 1 and {SNAPSHOT_MAX_ELEMENTS}"
+        ));
+    }
+    Ok(value)
+}
+
+fn screenshot_viewport(input: &Value) -> Result<Option<Value>, String> {
+    let width = input["width"].as_i64();
+    let height = input["height"].as_i64();
+    if width.is_none() && height.is_none() {
+        return if input["width"].is_null() && input["height"].is_null() {
+            Ok(None)
+        } else {
+            Err("screenshot `width` and `height` must be integers".into())
+        };
+    }
+    let (Some(width), Some(height)) = (width, height) else {
+        return Err("screenshot viewport needs both `width` and `height`".into());
+    };
+    if !(SCREENSHOT_MIN_WIDTH..=SCREENSHOT_MAX_WIDTH).contains(&width)
+        || !(SCREENSHOT_MIN_HEIGHT..=SCREENSHOT_MAX_HEIGHT).contains(&height)
+    {
+        return Err(format!(
+            "screenshot viewport must be {SCREENSHOT_MIN_WIDTH}–{SCREENSHOT_MAX_WIDTH}px wide and \
+             {SCREENSHOT_MIN_HEIGHT}–{SCREENSHOT_MAX_HEIGHT}px high"
+        ));
+    }
+    Ok(Some(json!({ "width": width, "height": height })))
+}
+
 /// Validate and canonicalize the bounded CSS property query.
 fn style_properties(input: &Value) -> Result<Vec<String>, String> {
     let properties = input["properties"]
@@ -455,7 +502,14 @@ fn useful(node: &Node) -> bool {
 /// the thing that actually contains it, rather than four times under nothing.
 /// The walk is bounded because a malformed tree is a page's to produce, not
 /// something to hang on.
-fn render(nodes: &[Node]) -> (String, usize, HashSet<i64>) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotLimit {
+    Complete,
+    Elements,
+    Bytes,
+}
+
+fn render(nodes: &[Node], max_elements: usize) -> (String, usize, HashSet<i64>, SnapshotLimit) {
     use std::collections::HashMap;
 
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
@@ -480,9 +534,15 @@ fn render(nodes: &[Node]) -> (String, usize, HashSet<i64>) {
     let mut refs = HashSet::new();
     let mut written = 0usize;
     let mut omitted = 0usize;
+    let mut limit = SnapshotLimit::Complete;
     for node in nodes.iter().filter(|node| useful(node)) {
-        if out.len() >= SNAPSHOT_MAX_BYTES {
+        if limit == SnapshotLimit::Bytes {
             omitted += 1;
+            continue;
+        }
+        if written >= max_elements {
+            omitted += 1;
+            limit = SnapshotLimit::Elements;
             continue;
         }
         let indent = "  ".repeat(depth_of(node).min(12));
@@ -490,21 +550,23 @@ fn render(nodes: &[Node]) -> (String, usize, HashSet<i64>) {
             .backend_id
             .map(|id| format!("ref_{id} "))
             .unwrap_or_default();
-        if node.name.is_empty() {
-            out.push_str(&format!("{indent}{reference}{}\n", node.role));
+        let line = if node.name.is_empty() {
+            format!("{indent}{reference}{}\n", node.role)
         } else {
-            out.push_str(&format!(
-                "{indent}{reference}{} \"{}\"\n",
-                node.role, node.name
-            ));
+            format!("{indent}{reference}{} \"{}\"\n", node.role, node.name)
+        };
+        if out.len().saturating_add(line.len()) > SNAPSHOT_MAX_BYTES {
+            omitted += 1;
+            limit = SnapshotLimit::Bytes;
+            continue;
         }
+        out.push_str(&line);
         if let Some(id) = node.backend_id {
             refs.insert(id);
         }
         written += 1;
     }
-    let _ = written;
-    (out, omitted, refs)
+    (out, omitted, refs, limit)
 }
 
 /// Wrap page text so the model can see where it starts and stops.
@@ -540,12 +602,17 @@ impl Tool for BrowserTool {
          \n\
          Seeing: `open` (no arguments; answers a tab id, opened in the \
          background without taking the screen), `navigate` (`tab`, `url`), \
-         `snapshot` (`tab`; the page's accessibility tree — this is how you see \
-         a page, and each reported element carries a `ref_<n>`), \
+         `snapshot` (`tab`, optional `max_elements`; the page's accessibility \
+         tree — this is how you see a page, and each reported element carries \
+         a `ref_<n>`), \
          `computed_style` (`tab`, `ref`, `properties`; read a bounded set of CSS \
          values for one snapshot element), `screenshot` (`tab`, optional \
-         `prompt`; pixels for layout questions `snapshot` cannot answer; a \
-         specific prompt helps when a separate vision model inspects it).\n\
+         `prompt`, and optional paired `width` and `height`; pixels for layout \
+         questions `snapshot` cannot answer; a specific prompt helps when a \
+         separate vision model inspects it; a viewport temporarily tests \
+         responsive pixels without resizing the app window, screenshots wider \
+         than 1400 pixels are downscaled before return, and later snapshots and \
+         refs still use the pane's actual size).\n\
          \n\
          Acting: `click` (`tab`, `ref`), `type` (`tab`, `ref`, `text`, and \
          `submit: true` to press Enter after — this replaces what the field \
@@ -575,6 +642,24 @@ impl Tool for BrowserTool {
                 "tab": {
                     "type": "string",
                     "description": "The tab id from `open`. Required by every action except `open`."
+                },
+                "max_elements": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": SNAPSHOT_MAX_ELEMENTS,
+                    "description": "For `snapshot`: maximum accessibility elements to return. Defaults to 500; raise it only when the omitted count says the needed content was cut."
+                },
+                "width": {
+                    "type": "integer",
+                    "minimum": SCREENSHOT_MIN_WIDTH,
+                    "maximum": SCREENSHOT_MAX_WIDTH,
+                    "description": "For `screenshot`: temporary viewport width in CSS pixels. Requires `height`."
+                },
+                "height": {
+                    "type": "integer",
+                    "minimum": SCREENSHOT_MIN_HEIGHT,
+                    "maximum": SCREENSHOT_MAX_HEIGHT,
+                    "description": "For `screenshot`: temporary viewport height in CSS pixels. Requires `width`."
                 },
                 "url": {
                     "type": "string",
@@ -794,12 +879,13 @@ impl BrowserTool {
             }
             Some("snapshot") => {
                 let tab = tab_of(input)?;
+                let max_elements = snapshot_max_elements(input)?;
                 let page = self.call("browser_snapshot", json!({ "id": tab })).await?;
                 let url = page["url"].as_str().unwrap_or("about:blank");
                 let title = page["title"].as_str().unwrap_or_default();
                 self.saw(tab, url);
                 let nodes = read_nodes(&page["nodes"]);
-                let (body, omitted, refs) = render(&nodes);
+                let (body, omitted, refs, limit) = render(&nodes, max_elements);
                 self.remember_refs(tab, url, refs);
 
                 if body.is_empty() {
@@ -818,7 +904,25 @@ impl BrowserTool {
                 }
                 let mut header = format!("tab {tab} — {url}");
                 if omitted > 0 {
-                    header.push_str(&format!("  [{omitted} further elements not shown]"));
+                    let next = match limit {
+                        SnapshotLimit::Elements if max_elements < SNAPSHOT_MAX_ELEMENTS => {
+                            format!(
+                                "repeat with a larger `max_elements` (up to \
+                                 {SNAPSHOT_MAX_ELEMENTS}) if they matter"
+                            )
+                        }
+                        SnapshotLimit::Elements => "the `max_elements` ceiling was reached; \
+                            narrow the page by interacting or scrolling before taking another \
+                            snapshot"
+                            .into(),
+                        SnapshotLimit::Bytes => "the 200 KiB text ceiling was reached; narrow \
+                            the page by interacting or scrolling before taking another snapshot"
+                            .into(),
+                        SnapshotLimit::Complete => {
+                            unreachable!("omitted elements require a limit")
+                        }
+                    };
+                    header.push_str(&format!("  [{omitted} further elements not shown; {next}]"));
                 }
                 Ok(Self::output(
                     tab,
@@ -858,11 +962,14 @@ impl BrowserTool {
             }
             Some("screenshot") => {
                 let tab = tab_of(input)?;
-                // A direct image block only works when the parent model can see
-                // it. Otherwise resolve the same live vision role `view_image`
-                // uses and return that isolated request's text — the pixels do
-                // not enter the parent ledger.
-                let direct = sees_images(ctx);
+                let viewport = screenshot_viewport(input)?;
+                // A direct image block works only when the model can see it
+                // *and* the provider can encode images in a tool result. Some
+                // vision APIs accept pixels only in user messages. Otherwise
+                // resolve the same live vision role `view_image` uses and
+                // return that isolated request's text — the pixels do not enter
+                // the parent ledger.
+                let direct = accepts_tool_result_images(ctx);
                 let delegated = if direct {
                     None
                 } else {
@@ -874,16 +981,19 @@ impl BrowserTool {
                 };
                 if !direct && delegated.is_none() {
                     return Err(
-                        "neither the main model nor the configured vision model can read images. \
-                         Use action=\"snapshot\" for page text, structure and refs, or choose a \
+                        "this provider cannot carry images in tool results, and the configured \
+                         vision model cannot inspect the screenshot separately. Use \
+                         action=\"snapshot\" for page text, structure and refs, or choose a \
                          vision-capable model with /agents → vision."
                             .into(),
                     );
                 }
 
-                let shot = self
-                    .call("browser_screenshot", json!({ "id": tab }))
-                    .await?;
+                let mut args = json!({ "id": tab });
+                if let Some(viewport) = viewport {
+                    args["viewport"] = viewport;
+                }
+                let shot = self.call("browser_screenshot", args).await?;
                 let url = shot["url"].as_str().unwrap_or("about:blank");
                 self.saw(tab, url);
                 let data = shot["data"].as_str().unwrap_or_default();
@@ -897,15 +1007,6 @@ impl BrowserTool {
                     shot["height"].as_i64().unwrap_or(0),
                 );
 
-                let Some(model) = delegated else {
-                    return Ok(
-                        Self::output(tab, note).with_images(vec![ContentBlock::Image {
-                            media_type: "image/png".into(),
-                            data: data.into(),
-                        }]),
-                    );
-                };
-
                 let bytes = base64::engine::general_purpose::STANDARD
                     .decode(data)
                     .map_err(|error| format!("the shell returned an invalid PNG: {error}"))?;
@@ -915,6 +1016,11 @@ impl BrowserTool {
                 .await
                 .map_err(|error| format!("screenshot normalization failed: {error}"))?
                 .map_err(|error| format!("the browser screenshot is not usable: {error}"))?;
+
+                let Some(model) = delegated else {
+                    return Ok(Self::output(tab, note).with_images(vec![image.into_block()]));
+                };
+
                 let question = input["prompt"]
                     .as_str()
                     .filter(|prompt| !prompt.trim().is_empty());
@@ -1090,14 +1196,16 @@ impl BrowserTool {
     }
 }
 
-/// Whether the model this call is running on can read an image at all.
+/// Whether the current provider can carry image blocks in a tool result.
 ///
-/// `None` is a context with no model, which is a test — and a test asking for a
-/// screenshot means to get one.
-fn sees_images(ctx: &ToolCtx) -> bool {
-    ctx.model
-        .as_ref()
-        .is_none_or(|cell| cell.snapshot().provider.supports_vision())
+/// Accepting an image in a user message is not enough: OpenAI-compatible tool
+/// result roles are text-only even for vision-capable models. `None` is a
+/// focused test context asking to receive the raw screenshot.
+fn accepts_tool_result_images(ctx: &ToolCtx) -> bool {
+    ctx.model.as_ref().is_none_or(|cell| {
+        let model = cell.snapshot();
+        model.provider.supports_vision() && model.provider.supports_tool_result_images()
+    })
 }
 
 #[cfg(test)]
@@ -1178,7 +1286,7 @@ mod tests {
     #[test]
     fn interactive_elements_carry_the_browsers_own_node_id_as_their_ref() {
         let nodes = read_nodes(&tree(vec![ax(node("1", None, "button", "Sign in", 42))]));
-        let (out, _, _) = render(&nodes);
+        let (out, _, _, _) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
         assert_eq!(out.trim(), "ref_42 button \"Sign in\"");
     }
 
@@ -1194,7 +1302,7 @@ mod tests {
             "Files changed",
             7,
         ))]));
-        let (out, _, _) = render(&nodes);
+        let (out, _, _, _) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
         assert_eq!(out.trim(), "ref_7 heading \"Files changed\"");
     }
 
@@ -1210,7 +1318,7 @@ mod tests {
             ax(ignored),
             ax(node("3", Some("1"), "link", "Home", 3)),
         ]));
-        let (out, _, _) = render(&nodes);
+        let (out, _, _, _) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
         assert_eq!(out.trim(), "ref_3 link \"Home\"");
     }
 
@@ -1224,7 +1332,7 @@ mod tests {
             ax(node("3", Some("2"), "generic", "", 3)),
             ax(node("4", Some("3"), "link", "Home", 4)),
         ]));
-        let (out, _, _) = render(&nodes);
+        let (out, _, _, _) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
         assert_eq!(out, "ref_1 navigation \"Main\"\n  ref_4 link \"Home\"\n");
     }
 
@@ -1236,8 +1344,25 @@ mod tests {
             ax(node("1", Some("2"), "link", "a", 1)),
             ax(node("2", Some("1"), "link", "b", 2)),
         ]));
-        let (out, _, _) = render(&nodes);
+        let (out, _, _, _) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
         assert!(out.contains("ref_1 link \"a\""), "{out}");
+    }
+
+    #[test]
+    fn one_enormous_accessible_name_cannot_cross_the_snapshot_byte_ceiling() {
+        let nodes = read_nodes(&tree(vec![ax(node(
+            "1",
+            None,
+            "heading",
+            &"x".repeat(SNAPSHOT_MAX_BYTES),
+            1,
+        ))]));
+        let (out, omitted, refs, limit) = render(&nodes, SNAPSHOT_MAX_ELEMENTS);
+
+        assert!(out.len() <= SNAPSHOT_MAX_BYTES);
+        assert_eq!(omitted, 1);
+        assert!(refs.is_empty(), "a ref for an omitted node was admitted");
+        assert!(limit == SnapshotLimit::Bytes);
     }
 
     // ---------------------------------------------------------------- fence

@@ -291,6 +291,14 @@ pub trait Provider: Send + Sync {
     fn supports_vision(&self) -> bool {
         true
     }
+    /// Whether this provider's wire format can carry image blocks inside a
+    /// tool result. This is narrower than [`Provider::supports_vision`]: some
+    /// APIs accept images in user messages but restrict tool outputs to text.
+    /// Defaulting to false keeps an unknown transport from silently dropping
+    /// pixels; providers with a typed tool-result image representation opt in.
+    fn supports_tool_result_images(&self) -> bool {
+        false
+    }
     /// Open a streaming request. Establishing the connection retries
     /// internally; mid-stream failures surface as an `Err` item and the
     /// caller decides whether to re-send the turn.
@@ -360,5 +368,9 @@ mod tests {
         // The main model's own capability still counts: images are readable
         // through `read` even if the vision role is pinned text-only.
         assert!(pins.can_view_images(&cell(true)));
+        assert!(
+            !cell(true).snapshot().provider.supports_tool_result_images(),
+            "unknown provider transports must opt in before tool-result images are sent"
+        );
     }
 }

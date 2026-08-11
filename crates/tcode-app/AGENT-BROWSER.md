@@ -1,6 +1,6 @@
-# Agent 驱动浏览器（CDP）— 未实现，本文是执行计划
+# Agent 驱动浏览器（CDP）— 已实现，本文是设计记录
 
-写给**没参与过这次对话的人**。第一节是"这是不是个真问题"，不同意就别往下做。
+写给**没参与过这次对话的人**。第一节解释它解决的真实问题，后续记录已落地的决策、测量与实现边界。
 
 前置：浏览器窗格本身已经实现（`AGENTS.md` 规则 9h：`electron/browser.js` + `ui/src/webHost.ts` + `WebPane.tsx`，一个 tab 一个 `WebContentsView`，窗口级单例，不带 session）。本文只加一件事：**让模型也能操作那些 tab**。
 
@@ -267,7 +267,7 @@ pub trait Shell: Send + Sync {
 |---|---|---|---|
 | `open` | — | 2 | 开 tab,返回 id,停在 `about:blank`。**没有 `profile` 参数**:第一版只有一个 partition |
 | `navigate` | `tab, url` | 2 | url 经 `crate::address::to_url`,与地址栏同一份判定 |
-| `snapshot` | `tab` | 2 | 过滤后的 a11y 树 + `ref`。**默认的"看"**;实现主体是过滤规则(见 Phase 0 第 2 条)。每个保留下来的具名元素都带自己的 backend-node ref，除了交互还供 `computed_style` 精确定位；Rust 只准后者使用最近一次 snapshot 实际输出、且绑定该 snapshot URL 的 ref。**没有 `cursor` 参数**——输出过大时走 `Tool::gates_output` 那条既有的溢出到文件的路,模型已经知道怎么 read/grep 它,再发明一套分页只是第二种要学的机制 |
+| `snapshot` | `tab, max_elements?` | 2 | 过滤后的 a11y 树 + `ref`。**默认的"看"**；实现主体是过滤规则（见 Phase 0 第 2 条）。每个保留下来的具名元素都带自己的 backend-node ref，除了交互还供 `computed_style` 精确定位；Rust 只准后者使用最近一次 snapshot 实际输出、且绑定该 snapshot URL 的 ref。默认最多返回 500 个 useful element，明确需要密集页面时可把 `max_elements` 提到 5000；截断会报告 omitted 数并指明这个参数。**没有 `cursor` 参数**——输出仍过大时走 `Tool::gates_output` 既有的溢出文件机制，不再发明第二套分页。 |
 | `close` | `tab` | 2 | |
 | `back` / `forward` / `reload` | `tab` | 3 | 只读。之后**清掉 host 备忘与 snapshot ref 准入集**——页面去哪了这工具没看见,下一次 `click` 会要求先 snapshot，下一次 `computed_style` 也只能查新快照 |
 | `click` | `tab, ref` | 3 | 真鼠标事件(`Input.dispatchMouseEvent`),不是 `element.click()`——后者跳过 hover/focus/遮挡层,页面看着能用其实没动 |
@@ -275,7 +275,7 @@ pub trait Shell: Send + Sync {
 | `scroll` | `tab, ref?, direction, amount?` | 3 | 带 `ref` 就在那个元素里滚 |
 | `wait` | `tab, text?` | 3 | 有 `text` 等这句话出现,没有就等页面不再加载(`isLoading()` 连续两次为假)。**没有 `for` 枚举**:一个可选参数就分得开,少一个概念 |
 | `computed_style` | `tab, ref, properties` | 3 | 只读一个**最近 snapshot 实际输出且 URL 仍相同**的元素的 1–12 个白名单 CSS computed values；Rust 与壳双重校验，固定函数 + value arguments，**没有 selector / JS eval** |
-| `screenshot` | `tab, prompt?` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current；主模型能看图就回 image block，纯文本主模型委派 live vision role 后只回围栏内文字，两边都不能看才在 capture 前拒绝并指向 `snapshot` |
+| `screenshot` | `tab, prompt?, width?, height?` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current。`width`/`height` 必须成对且受限，临时 viewport 也在 app cover 下完成并恢复真实窗格尺寸。只有 provider 同时支持 vision 与 tool-result image block 才直回图片；当前 Anthropic 与 Codex Responses 走这条，OpenAI Chat Completions 的文本 `tool` role 改走 live vision role 的隔离请求并回围栏内文字。没有可用 vision route 才在 capture 前拒绝并指向 `snapshot`。 |
 
 **`ref` 三种写法都收**(`ref_44` / `"44"` / `44`)。零猜测原则最小的一次应用:替代方案是模型花一个 turn 试出这工具要哪一种。
 
@@ -376,7 +376,7 @@ ChatGPT 那份把"agent 直接用你的 work session"当卖点，方向是对的
 - 坐标用页面里的 `getBoundingClientRect()`，不用 `DOM.getBoxModel`。两个都能答，但只有前者是**规范定义**的（相对 viewport，正是 `Input.dispatchMouseEvent` 要的）；后者的坐标系是 Chromium 的一个约定，这边验证不了，而搞错的症状是点偏几百像素——看起来像页面坏了，不像坐标系错了。
 - `wait` 的 needle 经 `JSON.stringify` 插值进表达式：模型从敌意页面上抄一句话来等，不能让那句话在页面里被执行。
 
-**验证到哪一步**：Rust 侧 15 条集成测试（fake shell 驱动整个工具，无窗口）+ 单测；壳侧靠 `dispatch.rs` 读文本钉住两条**结构**不变量（host 复核在动作之前、截图不走 CDP）。**click/type/scroll/wait 的真实往返仍未被自动化测试覆盖，坐标与 `Input.insertText` 的行为是按 Chromium 的既有做法写的、没在真页面上跑过。** 第一次真跑通要在 app 里让模型点一次。
+**验证到哪一步**：Rust 侧 browser 集成测试（fake shell 驱动整个工具，无窗口）+ 单测；`electron/browser.test.js` 钉住 viewport 成功/失败恢复、实时 host 复核等壳边界，`npm run test:browser` 再用真实 Electron + loopback 页面驱动后台 snapshot / computed style / click / screenshot / thumbnail，并验证 native z-order 恢复。**type/scroll/wait 的真实往返仍未被自动化测试覆盖**；它们的 CDP 行为目前只按 Chromium 的既有做法实现并以边界测试约束。
 
 **Phase 4 — 交接。✅ 已完成。**
 

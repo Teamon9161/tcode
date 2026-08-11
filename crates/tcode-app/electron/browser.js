@@ -228,6 +228,25 @@ function browserVerbs(
     "transform",
   ]);
   const MAX_STYLE_PROPERTIES = 12;
+  const SCREENSHOT_VIEWPORT = Object.freeze({
+    minWidth: 320,
+    maxWidth: 2560,
+    minHeight: 240,
+    maxHeight: 1440,
+  });
+  const screenshotViewport = (input) => {
+    if (input == null) return null;
+    const { width, height } = input;
+    if (!Number.isInteger(width) || !Number.isInteger(height) ||
+        width < SCREENSHOT_VIEWPORT.minWidth || width > SCREENSHOT_VIEWPORT.maxWidth ||
+        height < SCREENSHOT_VIEWPORT.minHeight || height > SCREENSHOT_VIEWPORT.maxHeight) {
+      throw new Error(
+        `screenshot viewport must be ${SCREENSHOT_VIEWPORT.minWidth}-${SCREENSHOT_VIEWPORT.maxWidth}px ` +
+          `wide and ${SCREENSHOT_VIEWPORT.minHeight}-${SCREENSHOT_VIEWPORT.maxHeight}px high`,
+      );
+    }
+    return { width, height };
+  };
   const COMPUTED_STYLE = `function (properties) {
     const view = this.ownerDocument && this.ownerDocument.defaultView;
     if (!view) throw new Error("this element has no document");
@@ -346,12 +365,12 @@ function browserVerbs(
   // window's content area at (0,0) — so they are already the DIP the view
   // wants. Rounded because `setBounds` takes integers, and floored at one
   // pixel because a zero-sized view is a page that stops laying out.
-  const place = (view) =>
+  const place = (view, viewport = null) =>
     view.setBounds({
       x: Math.round(rect.x),
       y: Math.round(rect.y),
-      width: Math.max(1, Math.round(rect.width)),
-      height: Math.max(1, Math.round(rect.height)),
+      width: Math.max(1, Math.round(viewport?.width ?? rect.width)),
+      height: Math.max(1, Math.round(viewport?.height ?? rect.height)),
     });
 
   /** Only the current tab is on screen, and only when the pane wants one to be.
@@ -402,11 +421,12 @@ function browserVerbs(
    * reorder and hide each other's views. The queue survives a failed call.
    */
   let renderQueue = Promise.resolve();
-  const rendered = (id, work, { before = true, after = false } = {}) => {
+  const rendered = (id, work, { before = true, after = false, viewport = null } = {}) => {
     const run = async () => {
       const view = find(id);
       const contents = view.webContents;
       const background = !shown || current !== id;
+      const covered = background || viewport !== null;
       const state = () => {
         const bounds = typeof view.getBounds === "function" ? view.getBounds() : rect;
         return `url=${contents.getURL() || "no page"}, bounds=${bounds.width}x${bounds.height}` +
@@ -444,8 +464,8 @@ function browserVerbs(
         }
       };
 
-      place(view);
-      if (!background) return work(view);
+      place(view, viewport);
+      if (!covered) return work(view);
 
       if (!appView) throw new Error("the app renderer is unavailable for background capture");
       const cover = shown && current ? find(current) : null;
@@ -460,7 +480,8 @@ function browserVerbs(
         if (after) await paint("result");
         return answer;
       } finally {
-        if (background) syncCurrent();
+        if (viewport !== null) place(view);
+        syncCurrent();
       }
     };
 
@@ -907,11 +928,13 @@ function browserVerbs(
      * did not measure, so `rendered` creates that frame under the app renderer
      * before this call.
      *
-     * Narrowed if the pane is wide, because the cost of an image is its
-     * dimensions and a 2560-pixel screenshot buys a model nothing a 1400-pixel
-     * one does not.
+     * Captures wider than 1400 pixels are narrowed before encoding because the
+     * image cost grows with its dimensions without buying the model useful
+     * detail at that width. A requested viewport controls the pixels rendered
+     * before that output cap is applied.
      */
     async browser_screenshot(args) {
+      const viewport = screenshotViewport(args.viewport);
       return rendered(args.id, async (view) => {
         const contents = view.webContents;
         let image = await withTimeout(contents.capturePage(), CDP_TIMEOUT, "capturePage");
@@ -933,7 +956,7 @@ function browserVerbs(
           width: image.getSize().width,
           height: image.getSize().height,
         };
-      });
+      }, { viewport });
     },
 
     /** Close one tab, and answer whether the view is gone.

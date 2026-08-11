@@ -263,6 +263,10 @@ impl Provider for AnthropicProvider {
         self.vision
     }
 
+    fn supports_tool_result_images(&self) -> bool {
+        true
+    }
+
     async fn stream(
         &self,
         req: Request,
@@ -445,6 +449,11 @@ mod tests {
             Some("https://api.deepseek.com/anthropic".into()),
             watchdog(),
         )
+    }
+
+    #[test]
+    fn anthropic_tool_results_can_carry_images() {
+        assert!(native().supports_tool_result_images());
     }
 
     #[test]

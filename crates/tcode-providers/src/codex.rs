@@ -271,20 +271,28 @@ fn push_items(msg: &Message, out: &mut Vec<Value>, vision: bool) {
                     ..
                 } = block
                 {
-                    // function_call_output takes a text string; images can't
-                    // ride along, so note their omission honestly.
                     let output = if images.is_empty() {
-                        content.clone()
+                        Value::String(content.clone())
+                    } else if vision {
+                        // Responses function outputs accept structured content;
+                        // Codex's own view_image tool uses this input_image form.
+                        let mut items = Vec::with_capacity(images.len() + 1);
+                        if !content.is_empty() {
+                            items.push(json!({ "type": "input_text", "text": content }));
+                        }
+                        items.extend(images.iter().filter_map(|image| match image {
+                            ContentBlock::Image { media_type, data } => Some(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{media_type};base64,{data}"),
+                            })),
+                            _ => None,
+                        }));
+                        Value::Array(items)
                     } else {
-                        format!(
-                            "{content}\n[{} image(s) omitted: {}]",
-                            images.len(),
-                            if vision {
-                                "this API cannot carry images returned from a tool"
-                            } else {
-                                "this model cannot view images; use the view_image tool to delegate"
-                            }
-                        )
+                        Value::String(format!(
+                            "{content}\n[{} image(s) omitted: this model cannot view images; use the view_image tool to delegate]",
+                            images.len()
+                        ))
                     };
                     out.push(json!({
                         "type": "function_call_output",
@@ -406,6 +414,10 @@ impl Provider for CodexProvider {
 
     fn supports_vision(&self) -> bool {
         self.vision
+    }
+
+    fn supports_tool_result_images(&self) -> bool {
+        true
     }
 
     async fn stream(
@@ -587,6 +599,43 @@ mod tests {
     fn body_with_effort(effort: Option<&str>) -> Value {
         let provider = CodexProvider::new("gpt-5.6-luna".into(), WatchdogConfig::default());
         provider.build_body(&request(effort, None))
+    }
+
+    #[test]
+    fn codex_tool_results_can_carry_images() {
+        let provider = CodexProvider::new("gpt-5.6-luna".into(), WatchdogConfig::default());
+        assert!(provider.supports_tool_result_images());
+    }
+
+    #[test]
+    fn image_tool_results_use_responses_content_items() {
+        let message = Message {
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call-1".into(),
+                content: "browser screenshot".into(),
+                is_error: false,
+                images: vec![ContentBlock::Image {
+                    media_type: "image/png".into(),
+                    data: "aGVsbG8=".into(),
+                }],
+            }],
+        };
+        let mut items = Vec::new();
+
+        push_items(&message, &mut items, true);
+
+        assert_eq!(
+            items,
+            vec![json!({
+                "type": "function_call_output",
+                "call_id": "call-1",
+                "output": [
+                    { "type": "input_text", "text": "browser screenshot" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,aGVsbG8=" }
+                ]
+            })]
+        );
     }
 
     /// The backend 400s on both `max_output_tokens` and `"effort":"off"`, which

@@ -30,6 +30,10 @@ const PAGE = `<!doctype html>
     context.fillText("rendered canvas", 58, 98);
   };
   requestAnimationFrame(() => draw("#2563eb"));
+  window.narrowViewportSeen = matchMedia("(max-width: 700px)").matches;
+  addEventListener("resize", () => {
+    window.narrowViewportSeen ||= matchMedia("(max-width: 700px)").matches;
+  });
   document.querySelector("#open").addEventListener("click", () => {
     draw("#15803d");
     const portal = document.createElement("div");
@@ -134,6 +138,18 @@ app.whenReady().then(async () => {
       "background-color": "rgb(12, 34, 56)",
       "border-style": "solid",
     });
+
+    const responsive = await verbs.browser_screenshot({
+      id: backgroundId,
+      viewport: { width: 640, height: 480 },
+    });
+    assert.ok(responsive.data.length > 1000, "the responsive screenshot needs real pixels");
+    assert.equal(
+      await backgroundView.webContents.executeJavaScript("window.narrowViewportSeen"),
+      true,
+      "the page must lay out at the requested temporary viewport",
+    );
+    assert.deepEqual(backgroundView.getBounds(), rect, "the responsive probe must restore bounds");
 
     const before = await verbs.browser_screenshot({ id: backgroundId });
     assert.ok(before.data.length > 1000, "the canvas page needs a real screenshot");

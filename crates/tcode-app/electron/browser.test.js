@@ -128,6 +128,83 @@ test("a visible browser still follows an ordinary bounds update", () => {
   assert.deepEqual(view.bounds, [{ x: 80, y: 30, width: 720, height: 540 }]);
 });
 
+test("a screenshot uses a temporary viewport under the app and restores the pane", async () => {
+  const { verbs, first, view, appView, children } = harness();
+  const pane = { x: 40, y: 70, width: 900, height: 640 };
+  verbs.browser_show({ rect: pane });
+  let capturedAt;
+  view.webContents.capturePage = async () => {
+    capturedAt = view.lastBounds;
+    return fakeImage(800, 600);
+  };
+
+  const answer = await verbs.browser_screenshot({
+    id: first,
+    viewport: { width: 800, height: 600 },
+  });
+
+  assert.deepEqual(capturedAt, { x: 40, y: 70, width: 800, height: 600 });
+  assert.deepEqual(view.lastBounds, pane, "the responsive probe became the visible pane size");
+  assert.equal(children.at(-1), view, "the app cover was not removed after capture");
+  assert.equal(children.includes(appView), true);
+  assert.deepEqual({ width: answer.width, height: answer.height }, { width: 800, height: 600 });
+});
+
+test("a failed responsive screenshot restores the visible pane", async () => {
+  const { verbs, first, view, children } = harness();
+  const pane = { x: 40, y: 70, width: 900, height: 640 };
+  verbs.browser_show({ rect: pane });
+  let captures = 0;
+  view.webContents.capturePage = async () => {
+    captures += 1;
+    if (captures === 1) return fakeImage(800, 600);
+    throw new Error("capture unavailable");
+  };
+
+  await assert.rejects(
+    verbs.browser_screenshot({
+      id: first,
+      viewport: { width: 800, height: 600 },
+    }),
+    /capture unavailable/,
+  );
+
+  assert.deepEqual(view.lastBounds, pane);
+  assert.equal(children.at(-1), view);
+});
+
+test("a background screenshot viewport restores that tab's pane bounds", async () => {
+  const { verbs } = harness();
+  const pane = { x: 30, y: 50, width: 900, height: 640 };
+  verbs.browser_show({ rect: pane });
+  const backgroundId = verbs.browser_open({ select: false });
+  const background = FakeWebContentsView.instances[1];
+
+  await verbs.browser_screenshot({
+    id: backgroundId,
+    viewport: { width: 640, height: 480 },
+  });
+
+  assert.deepEqual(background.lastBounds, pane);
+  assert.deepEqual(background.operations.at(-2), ["bounds", pane]);
+  assert.deepEqual(background.operations.at(-1), ["visible", false]);
+});
+
+test("an invalid screenshot viewport is rejected before capture", async () => {
+  const { verbs, first, view } = harness();
+  let captures = 0;
+  view.webContents.capturePage = async () => {
+    captures += 1;
+    return fakeImage();
+  };
+
+  await assert.rejects(
+    verbs.browser_screenshot({ id: first, viewport: { width: 200, height: 600 } }),
+    /screenshot viewport/,
+  );
+  assert.equal(captures, 0);
+});
+
 test("showing an existing browser places the current tab after visibility", () => {
   const { verbs, view } = harness();
   const rect = { x: 40, y: 70, width: 900, height: 640 };

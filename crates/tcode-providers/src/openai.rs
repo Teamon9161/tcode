@@ -285,6 +285,10 @@ impl Provider for OpenAiProvider {
         self.vision
     }
 
+    fn supports_tool_result_images(&self) -> bool {
+        false
+    }
+
     async fn stream(
         &self,
         req: Request,
@@ -424,6 +428,11 @@ mod tests {
             Some(base_url.into()),
             watchdog(),
         )
+    }
+
+    #[test]
+    fn openai_tool_results_cannot_carry_images() {
+        assert!(!provider("https://api.openai.com/v1").supports_tool_result_images());
     }
 
     /// The field is optional here, and omitting it is the point: it leaves the
