@@ -357,6 +357,9 @@ pub struct DelegatedApprovalRequest {
 
 /// Shared context handed to every tool invocation.
 pub struct ToolCtx {
+    /// `/kong` mode: propagated to sub-agents so they share the parent's
+    /// 般若心要 framing.
+    pub kong: bool,
     pub cwd: PathBuf,
     /// Session-private temporary workspace. This is the only scratch path
     /// exposed to the model, and the boundary Auto Mode may fast-allow.
@@ -498,6 +501,7 @@ impl ToolCtx {
             delegate: Mutex::new(None),
             delegated_approvals: Mutex::new(None),
             delegated_permissions: Mutex::new(None),
+            kong: false,
             cwd,
             scratch_dir,
         }

@@ -583,6 +583,10 @@ impl App {
                 CommandEffect::PersistDogfood(on) => {
                     self.state_store.update(move |state| state.dogfood = on)
                 }
+                CommandEffect::PersistKong(on) => {
+                    self.kong = on;
+                    self.state_store.update(move |state| state.kong = on)
+                }
                 CommandEffect::PersistSuggestions(on) => {
                     self.state_store
                         .update(move |state| state.suggestions = Some(on));
@@ -605,6 +609,7 @@ impl App {
             self.committed_mode = session.mode;
             self.pending_mode.clear();
             self.dogfood = session.dogfood();
+            self.kong = session.kong();
         }
         if self.cwd != old_cwd {
             self.reference_index.clear();

@@ -912,6 +912,9 @@ impl App {
         if self.dogfood {
             spans.push(Span::styled(" · dogfood".to_string(), theme::warn()));
         }
+        if self.kong {
+            spans.push(Span::styled(" · kong".to_string(), theme::warn()));
+        }
         // Same reason as dogfood: an armed mode must be visible while it is
         // armed, not only in the line that armed it.
         if let Some(marker) = self.voice.status_marker() {

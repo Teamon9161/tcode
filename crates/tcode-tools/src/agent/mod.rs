@@ -981,13 +981,18 @@ impl AgentTool {
             ProviderSafetyClassifier::new(model.clone(), self.pinned.clone())
                 .with_config(self.auto_classifier_config),
         );
+        let system = if ctx.kong && matches!(kind.as_str(), "general" | "plan") {
+            format!("{}\n\n{}", tcode_core::KONG_SYSTEM, def.system)
+        } else {
+            def.system.clone()
+        };
         let agent = Agent {
             model: model.clone(),
             // A sub-agent has no input box, so it never suggests; it still
             // carries the pins so its own classifier resolves the same way.
             models: self.pinned.clone(),
             tools: self.sub_tools_with(def, &ctx.cwd, model.clone(), extra),
-            system: def.system.clone(),
+            system,
             watchdog: self.watchdog.clone(),
             hooks: Default::default(),
             safety_classifier: Some(safety_classifier),

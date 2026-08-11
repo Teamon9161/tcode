@@ -392,6 +392,7 @@ impl App {
         self.committed_mode = session.mode;
         self.mode_label = session.mode.label().to_string();
         self.dogfood = session.dogfood();
+        self.kong = session.kong();
         self.session = Some(session);
         self.reset_conversation_ui();
 

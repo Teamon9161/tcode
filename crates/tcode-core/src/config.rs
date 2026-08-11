@@ -879,6 +879,9 @@ pub struct ModelState {
     /// `/dogfood`, so it survives a restart instead of being re-toggled.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dogfood: bool,
+    /// `/kong`, so it survives a restart instead of being re-toggled.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub kong: bool,
     /// `/suggest`. Absent = follow `[ui] suggest_next` from config.toml;
     /// the runtime toggle is what the user last chose, so it wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]

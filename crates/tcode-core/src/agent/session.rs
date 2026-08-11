@@ -243,6 +243,8 @@ pub struct Session {
     pub turn_usage: Usage,
     /// `/dogfood`: also report harness tool defects while working.
     dogfood: bool,
+    /// `/kong`: prepend 般若心要 to the system prompt.
+    kong: bool,
     /// `/suggest`: guess the next prompt when the turn ends. Session state
     /// rather than a frontend flag, so the toggle and its persistence work the
     /// same way from the TUI and the REPL.
@@ -339,6 +341,7 @@ impl Session {
             auto_compact_declined: false,
             turn_usage: Usage::default(),
             dogfood: false,
+            kong: false,
             suggestions: false,
             planning_expected: false,
             planning_nudged: false,
@@ -430,6 +433,15 @@ impl Session {
     /// would pay for it forever and bloat the history it lands in.
     pub fn set_dogfood(&mut self, on: bool) {
         self.dogfood = on;
+    }
+
+    pub fn kong(&self) -> bool {
+        self.kong
+    }
+
+    pub fn set_kong(&mut self, on: bool) {
+        self.kong = on;
+        self.tool_ctx.kong = on;
     }
 
     pub fn suggestions(&self) -> bool {

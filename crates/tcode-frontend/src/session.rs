@@ -77,6 +77,7 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
         rules,
     );
     session.set_dogfood(state.dogfood);
+    session.set_kong(state.kong);
     session.register_cwd_scope(shell_filters);
     if let Some(trust) = state.folder_trust_for(&cwd) {
         session.set_folder_trust(trust);

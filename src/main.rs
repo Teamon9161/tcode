@@ -716,6 +716,9 @@ async fn main() -> anyhow::Result<()> {
                     CommandEffect::PersistDogfood(on) => {
                         Config::update_tcode_state(&config_file, |state| state.dogfood = on)
                     }
+                    CommandEffect::PersistKong(on) => {
+                        Config::update_tcode_state(&config_file, |state| state.kong = on)
+                    }
                     // The plain REPL has no input box to ghost into, so the
                     // toggle only has to be remembered, not acted on.
                     CommandEffect::PersistSuggestions(on) => {

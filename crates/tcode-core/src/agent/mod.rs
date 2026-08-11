@@ -62,6 +62,9 @@ const MAX_TRUNCATED_STEPS: usize = 2;
 /// Appended to the system prompt while `/dogfood` is on.
 const DOGFOOD_SYSTEM: &str = include_str!("../../prompts/agent/dogfood.md");
 
+/// Prepended to the system prompt while `/kong` is on.
+pub const KONG_SYSTEM: &str = include_str!("../../prompts/agent/kong.md");
+
 /// Appended to the Auto Mode classifier policy with machine-local folder trust.
 const FOLDER_TRUST_POLICY: &str = include_str!("../../prompts/auto_mode/folder-trust.md");
 
@@ -384,13 +387,16 @@ impl Agent {
                         .iter()
                         .map(|block| match block {
                             ContentBlock::Text { text } => approx_tokens(text) as u64,
-                            ContentBlock::Thinking {
-                                thinking,
-                                signature,
-                            } => {
-                                (approx_tokens(thinking)
-                                    + signature.as_deref().map(approx_tokens).unwrap_or_default())
-                                    as u64
+                            ContentBlock::Thinking { thinking, .. } => {
+                                // Only the readable summary counts here.
+                                // Codex-style signatures carry the full
+                                // encrypted reasoning JSON whose char count
+                                // has no relationship to the server's actual
+                                // token cost; counting it triggers premature
+                                // auto-compact. The usage-based path
+                                // (total_input + output_tokens) is the
+                                // authoritative within-turn context tracker.
+                                approx_tokens(thinking) as u64
                             }
                             // Provider-specific image accounting is unavailable
                             // until usage arrives; reserve a conservative budget.
@@ -607,7 +613,15 @@ impl Agent {
     }
 
     pub(super) fn system_prompt(&self, session: &Session) -> String {
-        let mut prompt = session.prompt_variables().expand(&self.system);
+        let mut prompt = if session.kong() {
+            let mut p = String::with_capacity(KONG_SYSTEM.len() + 2 + self.system.len());
+            p.push_str(KONG_SYSTEM);
+            p.push_str("\n\n");
+            p.push_str(&session.prompt_variables().expand(&self.system));
+            p
+        } else {
+            session.prompt_variables().expand(&self.system)
+        };
         if !session.opening_context().is_empty() {
             prompt.push_str("\n\n");
             prompt.push_str(session.opening_context());
@@ -938,7 +952,9 @@ impl Agent {
                 // Same boundary work as after a tool batch: the truncated reply
                 // is in the ledger and counts against the window, and anything
                 // the user typed meanwhile is delivered before the retry.
-                session.last_prompt_tokens = self.estimate_context_tokens(session);
+                session.last_prompt_tokens = session
+                    .last_prompt_tokens
+                    .max(self.estimate_context_tokens(session));
                 self.auto_compact_if_needed(session, model, events, cancel)
                     .await?;
                 self.deliver_pending_input(session, events).await?;
@@ -999,7 +1015,12 @@ impl Agent {
             // A tool batch can add most of the context in one turn. Re-estimate
             // the next complete request here rather than waiting for the user
             // to submit another prompt after the window has already overflowed.
-            session.last_prompt_tokens = self.estimate_context_tokens(session);
+            // `max` keeps the authoritative usage-based value from the last
+            // stream step (which includes reasoning replay cost) while still
+            // growing when tool results push the estimate higher.
+            session.last_prompt_tokens = session
+                .last_prompt_tokens
+                .max(self.estimate_context_tokens(session));
             self.auto_compact_if_needed(session, model, events, cancel)
                 .await?;
             // *After* the compaction, and that order is the point: a prompt

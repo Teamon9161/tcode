@@ -12,6 +12,7 @@ mod compact;
 mod cost;
 mod dogfood;
 mod exit;
+mod kong;
 mod export;
 mod memory;
 mod mode;
@@ -89,6 +90,7 @@ pub enum CommandEffect {
     /// already owns it for the `/model` choice, and core's own tests must not
     /// write the developer's home directory to exercise a command.
     PersistDogfood(bool),
+    PersistKong(bool),
     PersistSuggestions(bool),
 }
 
@@ -200,6 +202,7 @@ impl CommandRegistry {
             Box::new(exit::ExitCommand),
             Box::new(suggestions::SuggestionsCommand),
             Box::new(dogfood::DogfoodCommand),
+            Box::new(kong::KongCommand),
         ])
     }
 

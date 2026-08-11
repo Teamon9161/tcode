@@ -29,7 +29,7 @@ pub mod types;
 
 pub use agent::{
     Agent, AgentError, AgentEvent, CwdChange, PendingInput, PendingMessage, PendingMode,
-    RewindTarget, Session, DEFAULT_MAX_STEPS,
+    RewindTarget, Session, DEFAULT_MAX_STEPS, KONG_SYSTEM,
 };
 pub use agent_roles::{AgentRole, AgentRoleMeta, RoleDefault};
 pub use auto_mode::{

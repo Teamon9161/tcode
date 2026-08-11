@@ -862,6 +862,23 @@ pub fn slash_command(
                 });
                 return Ok(SlashResult::CompactStarted);
             }
+            tcode_core::commands::CommandEffect::PersistDogfood(on) => {
+                if let Ok(cf) = selected_config_file(supervisor) {
+                    Config::update_tcode_state(&cf, move |state| state.dogfood = on);
+                }
+            }
+            tcode_core::commands::CommandEffect::PersistKong(on) => {
+                if let Ok(cf) = selected_config_file(supervisor) {
+                    Config::update_tcode_state(&cf, move |state| state.kong = on);
+                }
+            }
+            tcode_core::commands::CommandEffect::PersistSuggestions(on) => {
+                if let Ok(cf) = selected_config_file(supervisor) {
+                    Config::update_tcode_state(&cf, move |state| {
+                        state.suggestions = Some(on)
+                    });
+                }
+            }
             _ => return Err("that command is not available in the desktop app".into()),
         }
     }

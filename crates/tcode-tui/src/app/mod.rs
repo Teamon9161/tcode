@@ -454,6 +454,7 @@ pub struct App {
     /// Mirror of `Session::dogfood` for the status line: a running turn owns
     /// the session, so the hint cannot read it directly.
     dogfood: bool,
+    kong: bool,
     pending_tool: Option<PendingCall>,
     /// Entries belonging to a concurrent group, completed in model-call
     /// order. Keeping them queued lets each result retain its own input.
@@ -577,6 +578,7 @@ impl App {
         let committed_mode = session.mode;
         let pending_mode = session.pending_mode.clone();
         let session_dogfood = session.dogfood();
+        let session_kong = session.kong();
         let cwd = session.tool_ctx.cwd.clone();
         let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let task_trace_root = task_trace_root(&session);
@@ -681,6 +683,7 @@ impl App {
             fresh_session,
             pending_plan_execution: None,
             dogfood: session_dogfood,
+            kong: session_kong,
             pending_tool: None,
             pending_batch: VecDeque::new(),
             progress: Vec::new(),
