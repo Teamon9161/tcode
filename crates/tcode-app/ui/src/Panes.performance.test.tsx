@@ -42,6 +42,7 @@ import type { Leaf, Tiling } from "./layout";
 import { Panes, type PaneContext } from "./Panes";
 import { BLANK, type SessionState } from "./session";
 import * as browser from "./webHost";
+import { yieldBrowser } from "./browserYield";
 import type { SessionInfo, Status } from "./types";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -202,6 +203,56 @@ describe("pane rendering cost", () => {
     expect(probes.invoke).toHaveBeenCalledWith("browser_bounds", {
       rect: { x: 0, y: 0, width: 700, height: 600 },
     });
+  });
+
+  it("coalesces browser geometry to one final IPC update while resizing", async () => {
+    const context = paneContext();
+    act(() =>
+      root.render(
+        <Panes
+          tiling={split(web, terminal, 0.5)}
+          context={context}
+          stateOf={idleState}
+          statusOf={idleStatus}
+        />,
+      ),
+    );
+    await flushFrames();
+    probes.invoke.mockClear();
+
+    const restore = yieldBrowser();
+    probes.invoke.mockClear();
+    for (const [ratio, width] of [
+      [0.55, 550],
+      [0.62, 620],
+      [0.7, 700],
+    ] as const) {
+      probes.box = { left: 0, top: 0, width, height: 600 };
+      act(() =>
+        root.render(
+          <Panes
+            tiling={split(web, terminal, ratio)}
+            context={context}
+            stateOf={idleState}
+            statusOf={idleStatus}
+          />,
+        ),
+      );
+      await flushFrames();
+    }
+
+    expect(
+      probes.invoke.mock.calls.filter(([name]) => name === "browser_bounds"),
+    ).toHaveLength(0);
+
+    restore();
+    await flushFrames();
+
+    expect(
+      probes.invoke.mock.calls.filter(([name]) => name === "browser_bounds"),
+    ).toEqual([
+      ["browser_bounds", { rect: { x: 0, y: 0, width: 700, height: 600 } }],
+    ]);
   });
 
   it("reports a pure browser-pane translation without re-rendering its subtree", async () => {

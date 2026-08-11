@@ -32,7 +32,11 @@ import {
 import { linkTarget } from "./links";
 import { LinkContext, type Follow } from "./Prose";
 import { basename } from "./show";
-import { yieldBrowser } from "./browserYield";
+import {
+  browserPlacementHeld,
+  registerBrowserPlacement,
+  yieldBrowser,
+} from "./browserYield";
 import * as browserHost from "./webHost";
 import { FolderMenu } from "./FolderMenu";
 import { statusLabel } from "./activity";
@@ -305,20 +309,56 @@ function PaneSlot({
     const key = `${bounds.x},${bounds.y},${bounds.width},${bounds.height}`;
     if (!first && key === placed.current) return;
     placed.current = key;
-    if (first) browserHost.mount(bounds);
-    else browserHost.moved(bounds);
+    if (first) {
+      browserHost.mount(bounds);
+      return;
+    }
+    return browserHost.moved(bounds);
   }, []);
 
   const scheduleWeb = useCallback(
     (first: boolean) => {
-      if (booked.current) return;
+      // A continuous divider/window resize owns the final placement. Reading a
+      // dirty layout and crossing IPC for intermediate frames is pure overhead,
+      // even while Electron correctly keeps the native page hidden.
+      if (booked.current || browserPlacementHeld()) return;
       booked.current = requestAnimationFrame(() => {
         booked.current = 0;
-        placeWeb(first);
+        if (!browserPlacementHeld()) void placeWeb(first);
       });
     },
     [placeWeb],
   );
+
+  useLayoutEffect(() => {
+    if (!web) return;
+    return registerBrowserPlacement(() => placeWeb(placed.current === ""));
+  }, [placeWeb, web]);
+
+  // Native window resizing has the same cost profile as dragging an internal
+  // seam: Chromium emits many geometry samples for one visible outcome. Keep
+  // the page out of the native tree until the resize goes quiet, then the
+  // registered placement above reads and sends exactly the final rectangle.
+  useEffect(() => {
+    if (!web) return;
+    let release: (() => void) | null = null;
+    let finish = 0;
+    const resized = () => {
+      release ??= yieldBrowser();
+      window.clearTimeout(finish);
+      finish = window.setTimeout(() => {
+        const done = release;
+        release = null;
+        done?.();
+      }, 80);
+    };
+    window.addEventListener("resize", resized);
+    return () => {
+      window.removeEventListener("resize", resized);
+      window.clearTimeout(finish);
+      release?.();
+    };
+  }, [web]);
 
   // Deliberately no dependency array: the slot can move without resizing, and
   // ResizeObserver does not report that case. The actual DOM read waits until

@@ -1,0 +1,475 @@
+{
+  "platform": "linux",
+  "versions": {
+    "electron": "43.3.0",
+    "chrome": "150.0.7871.212",
+    "node": "24.18.1"
+  },
+  "environment": {
+    "sessionType": "wayland",
+    "desktop": "KDE",
+    "waylandDisplay": "wayland-0",
+    "xDisplay": ":1",
+    "commandLine": [
+      "/home/teamon/code/rust/tcode/crates/tcode-app/node_modules/electron/dist/electron",
+      "spike/transparent-underlay.js"
+    ],
+    "displays": [
+      {
+        "accelerometerSupport": "unknown",
+        "bounds": {
+          "x": 0,
+          "y": 0,
+          "width": 1920,
+          "height": 1080
+        },
+        "colorDepth": 24,
+        "colorSpace": "{primaries:BT709, transfer:SRGB, matrix:RGB, range:FULL}",
+        "depthPerComponent": 8,
+        "detected": true,
+        "displayFrequency": 0,
+        "id": 67,
+        "internal": false,
+        "label": "Lenovo Group Limited T24a-20",
+        "maximumCursorSize": {
+          "width": 0,
+          "height": 0
+        },
+        "monochrome": false,
+        "nativeOrigin": {
+          "x": 0,
+          "y": 0
+        },
+        "rotation": 0,
+        "scaleFactor": 1,
+        "size": {
+          "width": 1920,
+          "height": 1080
+        },
+        "workArea": {
+          "x": 0,
+          "y": 0,
+          "width": 1920,
+          "height": 1080
+        },
+        "workAreaSize": {
+          "width": 1920,
+          "height": 1080
+        },
+        "touchSupport": "unknown"
+      },
+      {
+        "accelerometerSupport": "unknown",
+        "bounds": {
+          "x": 0,
+          "y": 1080,
+          "width": 1707,
+          "height": 1067
+        },
+        "colorDepth": 24,
+        "colorSpace": "{primaries:BT709, transfer:SRGB, matrix:RGB, range:FULL}",
+        "depthPerComponent": 8,
+        "detected": true,
+        "displayFrequency": 0,
+        "id": 83,
+        "internal": false,
+        "label": "Built-in Screen",
+        "maximumCursorSize": {
+          "width": 0,
+          "height": 0
+        },
+        "monochrome": false,
+        "nativeOrigin": {
+          "x": 0,
+          "y": 0
+        },
+        "rotation": 0,
+        "scaleFactor": 1.4997071027755737,
+        "size": {
+          "width": 1707,
+          "height": 1067
+        },
+        "workArea": {
+          "x": 0,
+          "y": 1080,
+          "width": 1707,
+          "height": 1067
+        },
+        "workAreaSize": {
+          "width": 1707,
+          "height": 1067
+        },
+        "touchSupport": "unknown"
+      }
+    ],
+    "gpuFeatureStatus": {
+      "2d_canvas": "disabled_software",
+      "direct_rendering_display_compositor": "disabled_off_ok",
+      "gpu_compositing": "disabled_software",
+      "multiple_raster_threads": "enabled_on",
+      "opengl": "disabled_off",
+      "rasterization": "disabled_software",
+      "raw_draw": "disabled_off_ok",
+      "skia_graphite": "disabled_off",
+      "trees_in_viz": "disabled_off",
+      "video_decode": "disabled_software",
+      "video_encode": "disabled_software",
+      "vulkan": "disabled_off",
+      "webgl": "disabled_off",
+      "webgpu": "disabled_off",
+      "webgpu_on_vk_via_gl_interop": "disabled_off",
+      "webnn": "disabled_off"
+    },
+    "gpu": {
+      "auxAttributes": {
+        "amdSwitchable": false,
+        "canSupportThreadedTextureMailbox": false,
+        "glImplementationParts": "(gl=none,angle=none)",
+        "glResetNotificationStrategy": 0,
+        "hardwareSupportsVulkan": false,
+        "inProcessGpu": true,
+        "initializationTime": 0,
+        "isAsan": false,
+        "isClangCoverage": false,
+        "jpegDecodeAcceleratorSupported": false,
+        "optimus": true,
+        "passthroughCmdDecoder": false,
+        "sandboxed": false,
+        "skiaBackendType": "None",
+        "subpixelFontRendering": true,
+        "targetCpuBits": 64,
+        "visibilityCallbackCallCount": 0
+      },
+      "gpuDevice": [
+        {
+          "active": true,
+          "deviceId": 9568,
+          "gpuPreference": 0,
+          "vendorId": 4318
+        },
+        {
+          "active": false,
+          "deviceId": 18086,
+          "gpuPreference": 0,
+          "vendorId": 32902
+        }
+      ]
+    }
+  },
+  "isolation": {
+    "browserWebPreferences": {
+      "preload": null,
+      "nodeIntegration": false,
+      "contextIsolation": true,
+      "sandbox": true,
+      "partition": "persist:tcode-transparent-underlay-spike"
+    },
+    "exposedGlobals": [],
+    "siblingOrder": [
+      "browser",
+      "app"
+    ]
+  },
+  "probes": {
+    "transparentOpening": {
+      "captureSource": {
+        "id": "screen:1:0:s",
+        "name": "Entire screen",
+        "displayId": "",
+        "size": {
+          "width": 966,
+          "height": 1080
+        },
+        "available": [
+          {
+            "id": "screen:1:0:s",
+            "name": "Entire screen",
+            "displayId": "",
+            "size": {
+              "width": 966,
+              "height": 1080
+            }
+          }
+        ]
+      },
+      "browserSample": {
+        "rgb": [
+          26,
+          62,
+          217
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 466,
+          "y": 190
+        },
+        "scale": 1
+      },
+      "browserClass": "browser",
+      "canvasSample": {
+        "rgb": [
+          26,
+          175,
+          90
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 536,
+          "y": 260
+        },
+        "scale": 1
+      },
+      "canvasClass": "canvas",
+      "chromeSample": {
+        "rgb": [
+          253,
+          253,
+          253
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 116,
+          "y": 110
+        },
+        "scale": 1
+      },
+      "chromeClass": "chrome",
+      "passed": true
+    },
+    "trustedOverlay": {
+      "sample": {
+        "rgb": [
+          215,
+          35,
+          34
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 536,
+          "y": 260
+        },
+        "scale": 1
+      },
+      "class": "popover",
+      "passed": true
+    },
+    "realPointerInput": {
+      "backend": "/dev/uinput relative mouse",
+      "target": {
+        "x": 371,
+        "y": 210
+      },
+      "appControl": {
+        "appClicks": 1,
+        "browserClicks": 0
+      },
+      "transparentOpening": {
+        "appClicks": 1,
+        "browserClicks": 0
+      },
+      "controlReachedTopAppView": true,
+      "reachedBrowserThroughTransparentPixels": false
+    },
+    "domOnlyOpeningMove": {
+      "captureSource": {
+        "id": "screen:3:0:s",
+        "name": "Entire screen",
+        "displayId": "",
+        "size": {
+          "width": 966,
+          "height": 1080
+        },
+        "available": [
+          {
+            "id": "screen:3:0:s",
+            "name": "Entire screen",
+            "displayId": "",
+            "size": {
+              "width": 966,
+              "height": 1080
+            }
+          }
+        ]
+      },
+      "nativeBoundsWrites": 1,
+      "beforeBounds": {
+        "x": 0,
+        "y": 0,
+        "width": 900,
+        "height": 620
+      },
+      "afterBounds": {
+        "x": 0,
+        "y": 0,
+        "width": 900,
+        "height": 620
+      },
+      "beforeViewport": {
+        "width": 900,
+        "height": 620
+      },
+      "afterViewport": {
+        "width": 900,
+        "height": 620
+      },
+      "oldOpeningClass": "chrome",
+      "oldOpeningSample": {
+        "rgb": [
+          222,
+          226,
+          235
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 316,
+          "y": 190
+        },
+        "scale": 1
+      },
+      "newOpeningClass": "chrome",
+      "newOpeningSample": {
+        "rgb": [
+          223,
+          223,
+          223
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 776,
+          "y": 460
+        },
+        "scale": 1
+      },
+      "appCaptureOldOpening": {
+        "rgb": [
+          225,
+          230,
+          238
+        ],
+        "alpha": 255
+      },
+      "appCaptureNewOpening": {
+        "rgb": [
+          0,
+          0,
+          0
+        ],
+        "alpha": 0
+      },
+      "afterInvalidateOldOpeningClass": "chrome",
+      "afterInvalidateOldOpeningSample": {
+        "rgb": [
+          222,
+          226,
+          235
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 316,
+          "y": 190
+        },
+        "scale": 1
+      },
+      "afterInvalidateNewOpeningClass": "chrome",
+      "afterInvalidateNewOpeningSample": {
+        "rgb": [
+          223,
+          223,
+          223
+        ],
+        "alpha": 255,
+        "physical": {
+          "x": 776,
+          "y": 460
+        },
+        "scale": 1
+      },
+      "passed": false
+    },
+    "browserRenderingAndCapture": {
+      "shots": [
+        {
+          "empty": false,
+          "size": {
+            "width": 900,
+            "height": 620
+          },
+          "pngBytes": 6418,
+          "canvasPixel": {
+            "rgb": [
+              20,
+              180,
+              90
+            ],
+            "alpha": 255
+          },
+          "portalPixel": {
+            "rgb": [
+              240,
+              180,
+              20
+            ],
+            "alpha": 255
+          }
+        },
+        {
+          "empty": false,
+          "size": {
+            "width": 900,
+            "height": 620
+          },
+          "pngBytes": 6418,
+          "canvasPixel": {
+            "rgb": [
+              20,
+              180,
+              90
+            ],
+            "alpha": 255
+          },
+          "portalPixel": {
+            "rgb": [
+              240,
+              180,
+              20
+            ],
+            "alpha": 255
+          }
+        },
+        {
+          "empty": false,
+          "size": {
+            "width": 900,
+            "height": 620
+          },
+          "pngBytes": 6418,
+          "canvasPixel": {
+            "rgb": [
+              20,
+              180,
+              90
+            ],
+            "alpha": 255
+          },
+          "portalPixel": {
+            "rgb": [
+              240,
+              180,
+              20
+            ],
+            "alpha": 255
+          }
+        }
+      ],
+      "portalPresentInAccessibilityTree": true,
+      "passed": true
+    },
+    "summary": {
+      "transparentOpening": true,
+      "trustedOverlay": true,
+      "realPointerInput": false,
+      "domOnlyOpeningMove": false,
+      "browserRenderingAndCapture": true
+    }
+  }
+}

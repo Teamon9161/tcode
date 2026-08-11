@@ -172,11 +172,15 @@ export function mount(rect: NonNullable<typeof bounds>) {
     .catch((error) => failed("cannot show the browser", error));
 }
 
-/** The pane moved or was resized. Cheap on purpose: this runs for every frame
- *  of a divider drag. */
-export function moved(rect: NonNullable<typeof bounds>) {
+/** The pane moved or was resized. During a continuous resize the geometry
+ *  coordinator calls this once with the final rectangle; ordinary structural
+ *  moves still arrive directly. The promise preserves bounds-before-visible
+ *  ordering when a yielded native page is restored. */
+export function moved(rect: NonNullable<typeof bounds>): Promise<void> {
   bounds = rect;
-  invoke("browser_bounds", { rect }).catch((error) => failed("cannot place the browser", error));
+  return invoke("browser_bounds", { rect })
+    .then(() => undefined)
+    .catch((error) => failed("cannot place the browser", error));
 }
 
 /**

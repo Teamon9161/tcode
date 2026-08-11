@@ -16,15 +16,63 @@ import { invoke } from "@ipc";
  */
 let wanted = false;
 let held = 0;
+let restoring = false;
+let restoreFrame = 0;
+let restoreRevision = 0;
+let placement: (() => void | Promise<void>) | null = null;
 
 function apply() {
-  invoke("browser_visible", { visible: wanted && held === 0 }).catch(() => {});
+  return invoke("browser_visible", {
+    visible: wanted && held === 0 && !restoring,
+  }).catch(() => {});
+}
+
+/** True while native geometry updates are intentionally being coalesced. */
+export function browserPlacementHeld(): boolean {
+  return held > 0 || restoring;
+}
+
+/**
+ * Register the one authoritative final geometry read for the browser pane.
+ *
+ * Divider and window resize events can outpace both paint and IPC. While the
+ * native page is yielded, ordinary slot effects skip their reads; the final
+ * release calls this once, then waits for the shell to acknowledge the bounds
+ * before making the page visible again.
+ */
+export function registerBrowserPlacement(
+  callback: () => void | Promise<void>,
+): () => void {
+  placement = callback;
+  return () => {
+    if (placement === callback) placement = null;
+  };
+}
+
+function scheduleRestore() {
+  // Popovers use the same coordinator even when this window has no browser
+  // pane. In that state there is neither geometry to settle nor a native view
+  // to reveal; scheduling a frame would only leak a late false-visibility IPC
+  // into the next interaction.
+  if (!wanted && !placement) return;
+  restoring = true;
+  const revision = ++restoreRevision;
+  restoreFrame = requestAnimationFrame(() => {
+    restoreFrame = 0;
+    Promise.resolve()
+      .then(() => placement?.())
+      .finally(() => {
+        if (revision !== restoreRevision || held > 0) return;
+        restoring = false;
+        void apply();
+      });
+  });
 }
 
 /** State what the pane wants. Temporary yields still take precedence. */
 export function setBrowserShown(visible: boolean) {
   wanted = visible;
-  apply();
+  void apply();
 }
 
 /**
@@ -33,7 +81,7 @@ export function setBrowserShown(visible: boolean) {
  * know whether a popover or drag currently owns the renderer.
  */
 export function syncBrowserVisibility() {
-  apply();
+  void apply();
 }
 
 /**
@@ -44,7 +92,13 @@ export function syncBrowserVisibility() {
  */
 export function yieldBrowser(): () => void {
   held += 1;
-  if (held === 1) apply();
+  if (held === 1) {
+    restoreRevision += 1;
+    if (restoreFrame) cancelAnimationFrame(restoreFrame);
+    restoreFrame = 0;
+    restoring = false;
+    void apply();
+  }
   let released = false;
   return () => {
     // Guarded because a React cleanup can run twice under StrictMode, and a
@@ -52,7 +106,7 @@ export function yieldBrowser(): () => void {
     if (released) return;
     released = true;
     held -= 1;
-    if (held === 0) apply();
+    if (held === 0) scheduleRestore();
   };
 }
 
@@ -60,4 +114,9 @@ export function yieldBrowser(): () => void {
 export function resetBrowserVisibility() {
   wanted = false;
   held = 0;
+  restoring = false;
+  restoreRevision += 1;
+  if (restoreFrame) cancelAnimationFrame(restoreFrame);
+  restoreFrame = 0;
+  placement = null;
 }

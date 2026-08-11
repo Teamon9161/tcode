@@ -112,6 +112,8 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
 9h. **浏览器窗格是原生 WebContentsView，一个 tab 一个 view，整体是窗口级单例**（`electron/browser.js` + `ui/src/webHost.ts` + `ui/src/web.ts` + `ui/src/WebPane.tsx`，`Pane` 的第三个变体 `{kind:"web"}`）。
 
+    **“浏览器在下、透明 app renderer 永久在上”已实测否决**（`spike/transparent-underlay.js` + `transparent-underlay-results.json`，Electron 43.3.0 / Linux KDE Wayland）。它能让网页与 canvas 透出，app popover 也能盖住网页，浏览器 `capturePage()` 连续三次稳定；但两个承重条件失败：原生 hit test 在最上层 app `WebContentsView` 停住，CSS `pointer-events: none` 不会把真实指针事件传给下面的 sibling；只用 DOM 移动透明开口时，新透明区域在 app 自己的 capture 里已经是 alpha 0，最终屏幕却仍保留原来不透明的 app 像素，连显式 `webContents.invalidate()` 也不清。除非 Electron 以后同时提供 **View 级 pass-through region** 并修掉动态透明区域的合成清除，否则不许用这条路替换现有的 yield + 最终 `setBounds`。
+
     **view 拿不到任何特权，这条是全仓库最容易静默破掉的一条。** 浏览器的 `webPreferences` **不给 preload**，`nodeIntegration: false` / `contextIsolation: true` / `sandbox: true`，且 `session.fromPartition("persist:tcode-browser")` 与 app 自己的 session 不同——那既隔离了存储，也让一个页面拿不到 `window.tcode`（preload 只注入 app view）。**破掉时什么都不会坏**：app 正常、浏览器正常、只是每个站点都被信任。`dispatch.rs::the_browser_views_are_isolated_from_the_app` 扫 `webPreferences` 块钉住它。没有 Tauri 的 capability 文件可填错，也正因为没有那个文件，破掉时更没有痕迹——别在 `create()` 里"顺手"加一个 preload。
 
     **一个 tab 一个 view，而且最后一个也照常销毁。** tab 装的是**活着的页面**（重载中的 dev server、填了一半的表单），拿一个 view 在几个地址间来回导航只留得住地址、留不住页面，那正是 tab 的全部意义。cookie 与登录属于浏览器不属于某个 tab，所以所有 tab 共用一个 partition——Electron 的 session 由 partition 持有、不由最后一个 view 持有，于是 wry 时代"最后一个 tab 永不销毁"的 workaround 没有存在的理由。`browser_close` 的返回值 `bool`（view 是否真的没了）保留，因为前端画哪一种由壳说了算。
@@ -305,7 +307,7 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     **转录的 key 按块在对话里的起始位置算，不按 item 下标**（`Transcript.tsx::keyOf`）。分组边界会移动——第二个 edit 一到，一个 item 变成一个两块的组，后面所有 item 往上挪一格，React 于是卸载重建改动点以下的每一步，连带丢掉所有展开状态。
 
-    **原生浏览器窗格是这套开销的放大器**（`WebPane.tsx`）。量它的矩形要用 `requestAnimationFrame`，不能在 layout effect 里直接 `getBoundingClientRect()`：那是在一次刚提交、布局还脏的时候读，会强制整篇文档同步布局——开着这个窗格时，窗口里**每一次**渲染都要付这笔钱。**让浏览器暂时让位只有一份实现**（`browserYield.ts` 的计数器，popover 与分隔条拖动共用，见硬规则 17）；拖动分隔条时必须让位，否则每个指针采样都在让平台把另一个进程里的整页重新布局一次。
+    **原生浏览器窗格是这套开销的放大器**（`WebPane.tsx`）。量它的矩形要用 `requestAnimationFrame`，不能在 layout effect 里直接 `getBoundingClientRect()`：那是在一次刚提交、布局还脏的时候读，会强制整篇文档同步布局——开着这个窗格时，窗口里**每一次**渲染都要付这笔钱。**让浏览器暂时让位只有一份实现**（`browserYield.ts` 的计数器，popover、分隔条拖动与连续窗口 resize 共用，见硬规则 17）；连续 resize 期间必须同时跳过 DOM 测量与 `browser_bounds` IPC，结束后只在下一帧读取一次最终 rect，等壳确认 bounds 后才恢复原生 view。只隐藏页面但照样逐帧测量/发 IPC，仍会让 renderer 反复强制布局并把主进程消息队列塞满；先恢复 visible 再补最终 bounds，则会把页面短暂画回旧位置。
 
 21b. **composer 的补全层只画底，绝不画字**（`Composer.tsx` 的 `.composer-mirror` + `completion.ts`）。让 `@path` 有颜色的通行做法是"镜像层画高亮的字 + textarea 文字透明"——**这条路在这里是封死的**：透明的 textarea 连 IME 的 preedit 一起藏掉，而那正是打中文的人唯一要看的东西。所以镜像层文字 `color: transparent`，只贡献 `@path` 底下那块 `--brand-wash`，真正的字形自始至终是 textarea 的。代价是两层的**每一个影响换行的度量必须一致**（字体、字号、行高、padding、宽度、`white-space`、以及 `resize()` 里同步过去的高度与滚动条 gutter）——错一点，色块就落在它标注的路径旁边，比不上色更糟。
 
