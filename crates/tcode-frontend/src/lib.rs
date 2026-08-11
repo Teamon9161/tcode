@@ -14,7 +14,10 @@ pub mod session;
 pub mod setup;
 
 pub use agent::{build_agent, AgentBuild};
-pub use boot::{boot, startup_mode, startup_rules, BootSpec, Booted, INTERACTIVE_AGENT_SYSTEM};
+pub use boot::{
+    boot, startup_mode, startup_rules, BootSpec, Booted, DisplayToolFactory,
+    INTERACTIVE_AGENT_SYSTEM,
+};
 pub use build::{
     agent_models, apply_agent_def_hints, build_agent_menu, build_menu, build_preset_menu,
     build_provider_setup, rebuild_from_config, RebuiltMenus,

@@ -11,6 +11,7 @@ const PAGE = `<!doctype html>
   body { margin: 0; font-family: sans-serif; background: white; }
   main { padding: 32px; }
   canvas { display: block; width: 320px; height: 180px; }
+  #open { display: inline-block; background-color: rgb(12, 34, 56); border: 3px solid rgb(78, 90, 123); }
   [role="dialog"] { position: fixed; inset: 80px; background: white; border: 2px solid black; padding: 24px; }
 </style>
 <main>
@@ -121,6 +122,18 @@ app.whenReady().then(async () => {
     assert.ok(firstTree.nodes.length > 0, "the healthy page needs a non-empty AX tree");
     const button = namedNode(firstTree.nodes, "button", "Open portal");
     assert.ok(button?.backendDOMNodeId, "the fixture button must be actionable");
+    const style = await verbs.browser_computed_style({
+      id: backgroundId,
+      ref: button.backendDOMNodeId,
+      url,
+      properties: ["display", "background-color", "border-style"],
+    });
+    assert.equal(style.url, url);
+    assert.deepEqual(style.styles, {
+      display: "inline-block",
+      "background-color": "rgb(12, 34, 56)",
+      "border-style": "solid",
+    });
 
     const before = await verbs.browser_screenshot({ id: backgroundId });
     assert.ok(before.data.length > 1000, "the canvas page needs a real screenshot");

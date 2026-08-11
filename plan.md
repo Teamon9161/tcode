@@ -193,15 +193,10 @@ loop {
 2. gpt订阅有图片生成模型吗
 3. acp支持
 12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行
-20. Tool friction — browser.screenshot：报告的可访问性快照已确认多个 Vega canvas 图表正常渲染，但截图工具返回“nothing to draw / probably blank”。这使它无法用于画布图表的最终视觉核验。若截图能等待 canvas 完成绘制，或在失败时说明是后台标签限制，将能避免误报空白页面。
 22. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
-24. Capability gap — Browser 工作树运行时：functions.browser 始终连接当前旧 tcode 进程，编辑后的 browser.js 无法在不重启会话的情况下加载，因此它继续复现旧的 AX/screenshot 故障，不能验证刚构建的实现。此次只能改用真实 Electron fixture 和临时 Electron 截图脚本。最小改进是允许启动一个基于当前工作树的隔离 Browser runtime，或提供明确的 runtime build id 与 reload 操作。
-  Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
-25. Tool friction — browser.navigate：为实际检查 Vite UI 预览，我导航到已成功启动的 http://localhost:5174，但工具返回了 tcode 内嵌浏览器的 render recovery 超时，且报告 paneVisible=false，导致无法取得页面快照或截图。我只能以测试和生产构建完成验证。最小改进是让 harness 的浏览器检查能直接加载本机开发服务器，或在页面不可见时不依赖该应用内浏览器的 compositor 恢复路径。
+24. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
 26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
-27. 用户没打开浏览器窗格的话怎么好像浏览器的preview就做不了，而且如果vision模型没有的话，应该直接不暴露snapshot能力？
 28. app prompt框上方的plan栏，展开后，再展开background，没法滚动，在长background的时候展开后看不全，也没法看phase了。
 29. app 侧边栏，我在想是不是recent上方直接显示会话session更好呢，而不是用project的方式组织，project统一还是放下方Recent那块显示，在recent点击new就创建一个新session, 这样的话就可以那些运行的会话标好序号，方便切换窗口了。然后就是比如现在earlier后面有序号，我有的项目比较多，一下点一下加载100多条就有点卡了，也有点占窗口，你看下怎么做好，分级不断点击加载，然后支持滚动还是怎样。
-30. Tool friction — browser：验证 UI 改动时，预览 tab 多次在 snapshot/navigate 上 3 秒超时（paneVisible=false），且失败后没有可操作的指引；截图又被"当前模型不能读图"拒绝。我被迫改用一次性 Electron 脚本加载同一 URL 读 DOM/computed style，多花了好几轮。最小改进：页面布局未就绪或不可见时，snapshot 返回明确原因（如"tab 不可见，先激活"）而非泛化超时；screenshot 至少允许存成文件供 view_image 使用。
-
-Capability gap — browser 无 JS 求值入口：要验证一个 CSS 改动（代码块背景/边框），无障碍树给不出任何 computed style，工具里也没有执行 JS 的通道，只能起 Electron 读 getComputedStyle。最小能力：一个"对 tab 执行 JS 表达式"的动作（或按选择器读 computed style 的专门查询），前端样式类改动就能在 harness 内完成验证，不必再造 Electron fixture。
+30. Tool friction — browser.snapshot：为验证一个搜索筛选结果，快照把页面中 180 行事件明细和所有图表可访问文本都返回，产生了 3,500 余行输出。若支持按元素 ref 截取快照或提供最大文本量参数，可避免长表页面的无关上下文开销。
+31. Tool friction — browser.screenshot：真实截图成功后，API 返回了“image(s) omitted: this API cannot carry images returned from a tool”，导致当前会话无法把像素交给 view_image 做二次检查。最小改进是将返回图片保留为可检查的 artifact/path，或允许工具返回的 image block 直接作为 view_image 输入；否则截图成功也只能验证尺寸和调用状态，不能检查实际像素。

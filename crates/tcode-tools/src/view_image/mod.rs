@@ -1,3 +1,4 @@
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
@@ -6,8 +7,8 @@ use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
 use tcode_core::{
-    ActiveModel, AgentModels, AgentRole, AutoSafety, ContentBlock, Message, ModelCell,
-    PermissionRequest, Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
+    images::NormalizedImage, ActiveModel, AgentModels, AgentRole, AutoSafety, ContentBlock,
+    Message, ModelCell, PermissionRequest, Request, Role, StreamEvent, Tool, ToolCtx, ToolOutput,
 };
 
 const SYSTEM: &str = include_str!("../../prompts/view-image-system.md");
@@ -29,6 +30,106 @@ impl ViewImageTool {
         self.pinned
             .resolve(AgentRole::Vision, &self.model)
             .expect("vision always inherits the main model")
+    }
+}
+
+/// Why an isolated vision request could not produce an answer.
+///
+/// Capability is separate from request failure so callers can give the user a
+/// configuration fix without claiming that a provider request was attempted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VisionError {
+    Unsupported(String),
+    Cancelled,
+    Request(String),
+    Empty,
+}
+
+impl fmt::Display for VisionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unsupported(model) => {
+                write!(
+                    formatter,
+                    "the configured vision model cannot view images ({model})"
+                )
+            }
+            Self::Cancelled => formatter.write_str("vision request cancelled by user"),
+            Self::Request(error) => write!(formatter, "vision request failed: {error}"),
+            Self::Empty => formatter.write_str("vision model returned no text"),
+        }
+    }
+}
+
+/// Ask one resolved vision model about already-normalized images.
+///
+/// This is the common transport for `view_image` and frontend-owned tools that
+/// acquire pixels without a file, such as the desktop browser screenshot. The
+/// request has its own cache scope and only its text answer returns to the
+/// parent ledger; image blocks never become permanent conversation history.
+pub async fn inspect_images(
+    model: ActiveModel,
+    images: Vec<(String, NormalizedImage)>,
+    prompt: &str,
+    ctx: &ToolCtx,
+    cancel: &CancellationToken,
+) -> Result<String, VisionError> {
+    if !model.provider.supports_vision() {
+        return Err(VisionError::Unsupported(model.describe()));
+    }
+    if cancel.is_cancelled() {
+        return Err(VisionError::Cancelled);
+    }
+
+    let mut content = Vec::with_capacity(images.len() * 2 + 1);
+    for (label, image) in images {
+        content.push(ContentBlock::Text {
+            text: format!("{label}:"),
+        });
+        content.push(image.into_block());
+    }
+    content.push(ContentBlock::Text {
+        text: prompt.to_string(),
+    });
+
+    let run = RUN.fetch_add(1, Ordering::Relaxed);
+    let request = Request {
+        model: model.provider.model().to_string(),
+        system: SYSTEM.to_string(),
+        system_suffix: None,
+        cache_scope: Some(format!("vision-{run}")),
+        messages: vec![Message {
+            role: Role::User,
+            content,
+        }],
+        tools: Vec::new(),
+        max_tokens: model.output_ceiling(2048),
+        effort: model.effort.clone(),
+    };
+    let mut stream = model
+        .provider
+        .stream(request, cancel.clone())
+        .await
+        .map_err(|error| VisionError::Request(error.to_string()))?;
+    let mut answer = String::new();
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(StreamEvent::TextDelta(text)) => answer.push_str(&text),
+            Ok(StreamEvent::Usage(usage)) => {
+                if let Some(reporter) = ctx.delegate_reporter() {
+                    let _ = reporter.send(tcode_core::DelegateEvent::Usage(usage));
+                }
+            }
+            Err(error) => return Err(VisionError::Request(error.to_string())),
+            _ => {}
+        }
+    }
+    if cancel.is_cancelled() {
+        Err(VisionError::Cancelled)
+    } else if answer.trim().is_empty() {
+        Err(VisionError::Empty)
+    } else {
+        Ok(answer)
     }
 }
 
@@ -93,7 +194,7 @@ impl Tool for ViewImageTool {
             ));
         }
 
-        let mut content = Vec::with_capacity(paths.len() * 2 + 1);
+        let mut images = Vec::with_capacity(paths.len());
         for raw_path in paths {
             if cancel.is_cancelled() {
                 return ToolOutput::err("view_image cancelled by user");
@@ -125,56 +226,18 @@ impl Tool for ViewImageTool {
                     return ToolOutput::err(format!("image normalization failed: {error}"))
                 }
             };
-            // Label each image with its path so the answer can reference
-            // images unambiguously (the system prompt tells the model to).
-            content.push(ContentBlock::Text {
-                text: format!("{path_str}:"),
-            });
             // Do not use freshness here: these blocks live only in this isolated
             // request, never in the parent ledger, so 'already in context' is false.
-            content.push(normalized.into_block());
+            images.push((path_str.to_string(), normalized));
         }
-        content.push(ContentBlock::Text {
-            text: prompt.to_string(),
-        });
 
-        let run = RUN.fetch_add(1, Ordering::Relaxed);
-        let request = Request {
-            model: model.provider.model().to_string(),
-            system: SYSTEM.to_string(),
-            system_suffix: None,
-            cache_scope: Some(format!("vision-{run}")),
-            messages: vec![Message {
-                role: Role::User,
-                content,
-            }],
-            tools: Vec::new(),
-            max_tokens: model.output_ceiling(2048),
-            effort: model.effort.clone(),
-        };
-        let mut stream = match model.provider.stream(request, cancel.clone()).await {
-            Ok(stream) => stream,
-            Err(error) => return ToolOutput::err(format!("vision request failed: {error}")),
-        };
-        let mut answer = String::new();
-        while let Some(event) = stream.next().await {
-            match event {
-                Ok(StreamEvent::TextDelta(text)) => answer.push_str(&text),
-                Ok(StreamEvent::Usage(usage)) => {
-                    if let Some(reporter) = ctx.delegate_reporter() {
-                        let _ = reporter.send(tcode_core::DelegateEvent::Usage(usage));
-                    }
-                }
-                Err(error) => return ToolOutput::err(format!("vision request failed: {error}")),
-                _ => {}
-            }
-        }
-        if cancel.is_cancelled() {
-            ToolOutput::err("view_image cancelled by user")
-        } else if answer.trim().is_empty() {
-            ToolOutput::err("vision model returned no text")
-        } else {
-            ToolOutput::ok(answer)
+        match inspect_images(model, images, prompt, ctx, cancel).await {
+            Ok(answer) => ToolOutput::ok(answer),
+            Err(VisionError::Unsupported(model)) => ToolOutput::err(format!(
+                "the configured vision model cannot view images ({model}). Choose a vision-capable model with /agents → vision or configure [agents.vision]."
+            )),
+            Err(VisionError::Cancelled) => ToolOutput::err("view_image cancelled by user"),
+            Err(error) => ToolOutput::err(error.to_string()),
         }
     }
 }

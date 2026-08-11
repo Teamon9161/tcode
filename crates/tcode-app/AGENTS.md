@@ -128,6 +128,10 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     **截图仍用 `webContents.capturePage()`，不用 `Page.captureScreenshot`，但后台 tab 必须先获得当前文档的 compositor surface。** 后者在隐藏 view 上交替成功/挂住，原先前者的“隐藏时 9/9”测量漏了关键生命周期：那是**先可见渲染过、再隐藏**的 view；agent tab 从出生起隐藏时，DOM/AX 树可以正常而 `capturePage()` 永远是 0×0。`browser.js::rendered` 把后台目标放到有效 bounds，暂时将当前 browser sibling 脱离 native tree，再让目标在 app renderer 下方可见并用一次有界 capture 驱动帧，最后按 `current`/`shown` 原样恢复；目标像素始终被 app 覆盖，agent 也没有改变当前 tab。navigate、snapshot、click/type/scroll/wait 与 screenshot 共用这一条，portal/canvas 的结果才能在隐藏前真正提交。`npm run test:browser` 用真实 Electron + loopback canvas/portal 页钉住这个生命周期，纯 Node 测试另钉住层级恢复与错误诊断。
 
+    **截图消费能力按模型动态路由，而不是按工具是否注册静态裁掉。** 主模型能看图时 `screenshot` 照常回 image block；主模型纯文本但 live `[agents.vision]` 指向可看图 provider 时，像素只进入一次隔离的 vision 请求，主会话只收到放在 `<web-page-content>` 里的文字观察；两边都不能看时在 capture 前明确拒绝并指向 `snapshot` 与 `/agents → vision`。`snapshot` 是 AX 文本/结构/ref，和 vision 能力无关，始终保留。role pin 必须共享 `tcode-frontend::boot` 解析出的同一个 `AgentModels` handle，不能在 app 里另读一份启动配置，否则 `/agents` 改完不会生效。
+
+    **样式查询不是任意 JS 入口。** `computed_style` 只接受最近一次 snapshot 实际打印的 `ref` 与 1–12 个静态白名单 CSS 属性；Rust 按 tab 暂存那组 emitted refs 和 snapshot URL，导航、历史、reload、关闭及可能改页的交互后立即失效。Rust 工具与 Electron 壳各自校验属性一次，壳在同一个 `rendered` 后台恢复队列内复核当前 URL 后，只运行自己持有的固定 `getComputedStyle` 函数；属性名作为 `Runtime.callFunctionOn` 的 value arguments 传入，绝不拼成代码，也不接受 selector。查询走同一个 `rendered` 后台恢复路径，页面答回的 CSS 值照 snapshot 一样进 `<web-page-content>` 围栏。为了让静态标题/段落也能被查，snapshot 中每个保留下来的具名 AX element 都带自己的 Chromium backend-node ref；不要以“方便验证”为由把这里拓宽成 eval。
+
     **模型只能碰它自己开的 tab，除非用户亲手交过去**（工具栏的 "Mention this page in the message" → 写进聚焦会话的 draft）。**绝不许加一个能列举 tab 的 action**：那会把用户正在浏览的 URL 送进模型 context，是隐私泄露披着能力的皮。交接写 draft 不是发消息、只带 URL 不带页面标题（标题是网站写的散文，不该进用户那一轮）。原设计里的 `@tab` 补全**没做也别做**：`@` 已经是文件命名空间，`mentions()`/`segments()`/`useKnownMentions()` 全把正文当路径用。
 
     **会话关闭时它的 tab 只 disown 不关**（`owner` 置 `null`，`agent` 不动——那是出处，不会变假）。这和下面那条是同一句话的两半。

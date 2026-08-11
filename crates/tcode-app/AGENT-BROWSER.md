@@ -154,7 +154,7 @@ BrowserManager                 ← 窗口级单例，活在 electron 壳里
       view: WebContentsView
 ```
 
-原本这里还有一行 `refs: Map<string, backendNodeId>`——最近一次 snapshot 的 ref 表。**实现时发现它不需要存在**，理由见下面"ref 从哪来：不建表"。壳里因此**没有任何按 tab 的状态**，`tabs` 数组里只有 id 和 view。
+原本这里还有一行 `refs: Map<string, backendNodeId>`——最近一次 snapshot 的 ref 表。**实现时发现壳里不需要它**：`ref` 直接是 Chromium 的 backend node id，不经壳翻译。Rust 工具另持一个短生命周期的 `tab → {snapshot URL, emitted backend ids}` 准入集合，只有 `computed_style` 用它拒绝模型未见过、或已被页面变更失效的 id；它不是 session 所有权映射，也不要求壳保存 ref 状态。`tabs` 数组仍只有 id 和 view。
 
 三条关系，每条都承重：
 
@@ -178,7 +178,7 @@ BrowserManager                 ← 窗口级单例，活在 electron 壳里
 
 **tab id 本身就是 capability，而 context 天然隔离。** 会话 A 的模型只知道 A 自己 `browser.open` 拿回来的那些 id;B 的 id 从来没进过 A 的 context，而 UUID 猜不出来。要越界只有一条路——用户自己把 id 从一边粘到另一边，那是用户的决定，不是漏洞。
 
-于是后端那半是**无状态的**：工具收一个 tab id，转发给壳，把结果带回来。没有表，没有生命周期，rewind 与 resume 什么都不用管，`closeSession` 也不用管。
+于是后端没有 session→tab 归属表，也没有需要随 ledger 对齐的 ref 翻译表；rewind、resume 与 `closeSession` 都不用管理 tab 所有权。`BrowserTool` 仍保留两个窄范围、按 tab 的观测缓存：同步审批所需的 host 备忘，以及仅供 `computed_style` 的最新 snapshot ref/URL 准入集；二者在页面可能变化后宁可清除而非猜测。
 
 ### 归属活在前端，而它已经在了
 
@@ -267,30 +267,29 @@ pub trait Shell: Send + Sync {
 |---|---|---|---|
 | `open` | — | 2 | 开 tab,返回 id,停在 `about:blank`。**没有 `profile` 参数**:第一版只有一个 partition |
 | `navigate` | `tab, url` | 2 | url 经 `crate::address::to_url`,与地址栏同一份判定 |
-| `snapshot` | `tab` | 2 | 过滤后的 a11y 树 + `ref`。**默认的"看"**;实现主体是过滤规则(见 Phase 0 第 2 条)。**没有 `cursor` 参数**——输出过大时走 `Tool::gates_output` 那条既有的溢出到文件的路,模型已经知道怎么 read/grep 它,再发明一套分页只是第二种要学的机制 |
+| `snapshot` | `tab` | 2 | 过滤后的 a11y 树 + `ref`。**默认的"看"**;实现主体是过滤规则(见 Phase 0 第 2 条)。每个保留下来的具名元素都带自己的 backend-node ref，除了交互还供 `computed_style` 精确定位；Rust 只准后者使用最近一次 snapshot 实际输出、且绑定该 snapshot URL 的 ref。**没有 `cursor` 参数**——输出过大时走 `Tool::gates_output` 那条既有的溢出到文件的路,模型已经知道怎么 read/grep 它,再发明一套分页只是第二种要学的机制 |
 | `close` | `tab` | 2 | |
-| `back` / `forward` / `reload` | `tab` | 3 | 只读。`back`/`forward` 之后**清掉 host 备忘**——页面去哪了这工具没看见,下一次 `click` 会要求先 snapshot |
+| `back` / `forward` / `reload` | `tab` | 3 | 只读。之后**清掉 host 备忘与 snapshot ref 准入集**——页面去哪了这工具没看见,下一次 `click` 会要求先 snapshot，下一次 `computed_style` 也只能查新快照 |
 | `click` | `tab, ref` | 3 | 真鼠标事件(`Input.dispatchMouseEvent`),不是 `element.click()`——后者跳过 hover/focus/遮挡层,页面看着能用其实没动 |
 | `type` | `tab, ref, text, submit?` | 3 | **替换**字段原有内容(用元素自己的 `select()`),`Input.insertText` 一次写完;`submit` 是真 Enter |
 | `scroll` | `tab, ref?, direction, amount?` | 3 | 带 `ref` 就在那个元素里滚 |
 | `wait` | `tab, text?` | 3 | 有 `text` 等这句话出现,没有就等页面不再加载(`isLoading()` 连续两次为假)。**没有 `for` 枚举**:一个可选参数就分得开,少一个概念 |
-| `screenshot` | `tab` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current；模型没有 vision 时直接报错并指向 `snapshot`,不静默降级 |
+| `computed_style` | `tab, ref, properties` | 3 | 只读一个**最近 snapshot 实际输出且 URL 仍相同**的元素的 1–12 个白名单 CSS computed values；Rust 与壳双重校验，固定函数 + value arguments，**没有 selector / JS eval** |
+| `screenshot` | `tab, prompt?` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current；主模型能看图就回 image block，纯文本主模型委派 live vision role 后只回围栏内文字，两边都不能看才在 capture 前拒绝并指向 `snapshot` |
 
 **`ref` 三种写法都收**(`ref_44` / `"44"` / `44`)。零猜测原则最小的一次应用:替代方案是模型花一个 turn 试出这工具要哪一种。
 
-多 action 单 schema 的代价这下真的到场了(12 个 action)。缓解还是那两条——description 按"看"和"做"分段列参数,错误信息自愈("先 snapshot,那也是 ref 的来源")。拆不拆等真看到模型在参数上出错再说,现在拆是猜。
+多 action 单 schema 的代价这下真的到场了(13 个 action)。缓解还是那两条——description 按"看"和"做"分段列参数,错误信息自愈("先 snapshot,那也是 ref 的来源")。拆不拆等真看到模型在参数上出错再说,现在拆是猜。
 
 **不给原始 `cdp` 逃生口。** ChatGPT 那份建议留一个,这里第一版不留:它会立刻变成模型的默认工具(什么都能干),然后语义层永远等不到反馈——真实用例会全部藏在 `Runtime.evaluate` 里,而我们看不到。真需要时再加,加的时候要审批,并且挂在 `/dogfood` 后面(`SlashCommand::hidden()` 的同一条理由)。
 
-### ref 从哪来：不建表
+### ref 从哪来：不建翻译表，但绑定 snapshot
 
-原来这里写的是"snapshot 时建一张 `ref_N → backendNodeId` 表存在壳里"。实现时发现那张表不需要存在：**`ref` 直接就是 `backendDOMNodeId`**（`Accessibility.getFullAXTree` 每个节点自带）。
+原来这里写的是“snapshot 时建一张 `ref_N → backendNodeId` 表存在壳里”。实现时发现那张**翻译**表不需要存在：**`ref` 直接就是 `backendDOMNodeId`**（`Accessibility.getFullAXTree` 每个节点自带），壳不保存它，也没有将 A tab 的编号转换给 B tab 的路径。
 
-于是三件事一起没了：壳里没有按 tab 的状态、没有"哪次 snapshot 的表"这个版本问题、也没有"把 A tab 的 ref 用到 B tab 上"这种错误——那是 Chromium 自己分配的 id，不是我们的下标。Phase 3 的 `click` 直接 `DOM.resolveNode(backendNodeId)` → 取 boundingRect → `Input.dispatchMouseEvent` 打中心点。
+但 `computed_style` 不能把 Chromium 内部 id 当作可猜的 API。Rust 在每次 snapshot 后按 tab 记录**实际写入模型输出的** backend ids 与该快照 URL；输出预算截掉的节点不进入集合。查询先要求命中这份最新准入集，再把 URL 一起交给壳；壳在 serialized `rendered` work 内、`DOM.resolveNode` 前复核当前 URL。navigate、history、reload、close 以及可能改页的交互清掉集合；页面自行跳转则被壳的 URL 复核挡住。
 
-**过期是白拿的**：节点没了，`DOM.resolveNode` 报错，那个错就是"重新 snapshot"的理由。对比一下自建表那条路——下标 7 永远解析得出某个东西，只是可能不是你以为的那个。
-
-**不改页面。** 不注入 `data-tcode-ref` 属性：那等于让观测手段污染被观测对象，而且 SPA 一次重渲染就把属性冲掉，症状是"点了个不存在的东西"。
+**过期仍是双保险**：即使节点在同一页面重渲染后消失，`DOM.resolveNode` 也会报错，理由仍是“重新 snapshot”。不注入 `data-tcode-ref` 属性：那会让观测手段污染被观测对象，而且 SPA 一次重渲染就把属性冲掉，症状是“点了个不存在的东西”。
 
 ## 权限与信任边界
 
@@ -320,11 +319,11 @@ pub trait Shell: Send + Sync {
 
 - 在持久 profile 上的**变更类**交互（`click` / `type`）要审批，descriptor 带 host。
 - **descriptor 是 `browser(interact <host>)`，click 和 type 共用一条**（原文写的是 `browser(click …)`）。理由就是上面那条判据本身：人在回答的问题是"这个 agent 能不能以我的身份在这个站点上动手"，那有**一个站点一个答案**，不是一个输入设备一个答案。具体点了哪个 ref、填了什么字，进 `summary`——那是给人读的；descriptor 是给**规则**写的。
-- 其余全部免审：`open` 造空 tab、`close` 销毁、`snapshot`/`screenshot` 读已经加载好的页、`scroll`/`wait` 什么都不动、`back`/`forward`/`reload` 重访这个浏览器已经请求过的页。判据不是"这个 action 危不危险"，是"它会不会在**别人的**服务器上留下痕迹"。
+- 其余全部免审：`open` 造空 tab、`close` 销毁、`snapshot`/`computed_style`/`screenshot` 读已经加载好的页、`scroll`/`wait` 什么都不动、`back`/`forward`/`reload` 重访这个浏览器已经请求过的页。判据不是"这个 action 危不危险"，是"它会不会在**别人的**服务器上留下痕迹"。
 
-**host 从哪来，这是这一节唯一有结构成本的地方。** `Tool::permission` 是同步的，问不到窗口。所以工具持一张 `tab → host` 的备忘（`BrowserTool::seen`），只由两处写入：这工具自己解析过的 `navigate`，和页面自己答回来的 `snapshot`/`screenshot` 的 url。**绝不采信模型说的 host**——那等于让模型自己写自己的权限描述符。
+**host 从哪来，这是这一节唯一有结构成本的地方。** `Tool::permission` 是同步的，问不到窗口。所以工具持一张 `tab → host` 的备忘（`BrowserTool::seen`），只由工具自己观测到的 URL 写入：它解析过的 `navigate`，以及页面答回来的 `snapshot`/`computed_style`/`screenshot`。**绝不采信模型说的 host**——那等于让模型自己写自己的权限描述符。
 
-备忘会过期（页面自己会跳），而过期**不会**造成错误的点击：`browser_click` / `browser_type` 把这个 host 一起传给壳，壳在派发事件**之前**拿实时 URL 比一次，不等就报错。放在壳里而不是多一次往返，是因为那样检查和动作之间没有窗口给页面跳走；壳在这儿不做判断，只比一个后端算好的值（`dispatch.rs::acting_on_a_tab_checks_the_page_has_not_moved` 钉住）。
+备忘会过期（页面自己会跳），而过期**不会**造成错误的点击：`browser_click` / `browser_type` 把这个 host 一起传给壳，壳在 serialized `rendered` work 内、派发事件**之前**拿实时 URL 比一次，不等就报错。放在壳里而不是多一次往返，是因为排队恢复 compositor 期间页面也可能跳转，只有检查与动作在同一队列工作内才没有窗口；壳在这儿不做判断，只比一个后端算好的值（`dispatch.rs::acting_on_a_tab_checks_the_page_has_not_moved` 钉住）。
 
 这也是为什么"没看过的 tab 不能点"：没有备忘 = 没有 host 可问 = 模型手里那个 `ref` 也不可能是真的。`permission()` 此时返回 `None`（无主题的审批面板问不出问题），`run` 直接拒并说"先 snapshot，那也是 ref 的来源"。
 
@@ -352,10 +351,10 @@ ChatGPT 那份把"agent 直接用你的 work session"当卖点，方向是对的
 
 **Phase 2 — 只读的浏览器工具。✅ 已完成。**
 
-- `src/browser.rs`：`BrowserTool`（`open` / `navigate` / `snapshot` / `close`），经 `BootSpec::display_tools` 注册，与 `ShowTool` 同一个钩子。**无状态**——没有 session→tab 表，没有 ref 表。
+- `src/browser.rs`：`BrowserTool`（`open` / `navigate` / `snapshot` / `close`），经 `BootSpec::display_tools` 注册，与 `ShowTool` 同一个钩子。没有 session→tab 表或 ref 翻译表；后续 `computed_style` 另用短生命周期 snapshot 准入集，不参与 session 生命周期。
 - `navigable()`：叠在 `address::to_url` 上的准入检查（只放 http/https、拒掉 viewer 端口、loopback 其余照常）。纯函数，5 条单测。
 - snapshot 的过滤 + 缩进 + 围栏（与 `web_fetch::fence_page` 同一个标签同一套转义）。
-- **`ref` 就是 Chromium 的 `backendDOMNodeId`**,所以哪儿都不用存 ref 表。它天然按 tab 唯一、天然会过期，而过期时 Phase 3 拿到的是 Chromium 的报错,不是"点了第 7 个现在是别的东西"。
+- **`ref` 就是 Chromium 的 `backendDOMNodeId`**,所以壳不存 ref 翻译表。`computed_style` 仍需 Rust 按 tab 记录最近 snapshot 实际输出的 ids 与 URL，页面变化后清空；这让内部 id 只有被观察到后才成为读取 capability。
 - 壳侧 `browser_snapshot`（`Accessibility.getFullAXTree`），**返回原始节点不做过滤**——过滤是要反复调、要测的判断，属于工具不属于壳。
 - tab 进 strip：`BROWSER_TAB_OPENED` 事件 + `knownTab` 去重 + `addTabBehind`（不抢焦点）。这**推翻了 `browser.js` 里那句"主进程自己造一个 tab 会让它出现在屏幕上却不在 strip 里"**，`AGENTS.md` 规则 9h 已同步。
 
@@ -370,9 +369,10 @@ ChatGPT 那份把"agent 直接用你的 work session"当卖点，方向是对的
 
 **顺带修了一个真 bug**：`webHost` 的事件订阅原来从窗格 mount 才开始。模型可以在窗格从没打开过的窗口里开 tab——那条通告发给了空气，之后打开窗格看到空 strip，又开了**第二个** tab，第一个页面存在但谁也够不着。现在窗口启动时就订阅（`App.tsx` 调 `browser.watch()`），并且 mount 时若没有 current 就选第一个。同一类问题的另一半：壳里 `rect` 的初值从 `0×0` 改成 `1280×800`——`place()` 会把 0 夹到 1px，而 1×1 viewport 不是"小页面"，是**停止排版**的页面，snapshot 出来的东西没人见过。
 
-**Phase 3 — 交互半边。✅ 已完成。** `click` / `type` / `scroll` / `wait` / `back` / `forward` / `reload` / `screenshot`，加变更类交互的按 host 审批（见权限第 3 条）与壳侧的实时 host 复核。
+**Phase 3 — 交互与像素/样式观测。✅ 已完成。** `click` / `type` / `scroll` / `wait` / `back` / `forward` / `reload` / `screenshot` / `computed_style`，加变更类交互的按 host 审批（见权限第 3 条）与壳侧的实时 host 复核。
 
-- **没有 ref 表**（Phase 2 就定了）：`ref` 是 `backendDOMNodeId`，`DOM.resolveNode` 拿不到就是"重新 snapshot"的理由。
+- **没有 ref 翻译表**：`ref` 是 `backendDOMNodeId`，具名静态元素也打印 ref，供 `computed_style` 定位；但 Rust 只允许查询最近 snapshot 实际打印、且 URL 仍绑定的 ref，并在页面可能改变时清空 admission set。`type` 在壳内再次确认目标是 input / textarea / contenteditable，避免静态 ref 把文本送进旧焦点。
+- **没有任意 JS 逃生口**：`computed_style` 的 CSS 属性名在 Rust 与 Electron 两层都过静态白名单，再作为 `Runtime.callFunctionOn` 的 value argument 交给固定函数；Rust 传入 snapshot URL，壳在同一条 serialized `rendered` work 内于 `DOM.resolveNode` 前复核它，结果与 snapshot 一样进页面内容围栏。
 - 坐标用页面里的 `getBoundingClientRect()`，不用 `DOM.getBoxModel`。两个都能答，但只有前者是**规范定义**的（相对 viewport，正是 `Input.dispatchMouseEvent` 要的）；后者的坐标系是 Chromium 的一个约定，这边验证不了，而搞错的症状是点偏几百像素——看起来像页面坏了，不像坐标系错了。
 - `wait` 的 needle 经 `JSON.stringify` 插值进表达式：模型从敌意页面上抄一句话来等，不能让那句话在页面里被执行。
 

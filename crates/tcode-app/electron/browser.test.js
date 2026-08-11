@@ -30,6 +30,10 @@ class FakeWebContentsView {
       getTitle: () => "",
       debugger: {
         isAttached: () => false,
+        attach() {},
+        sendCommand: async (method) => {
+          throw new Error(`unexpected CDP command: ${method}`);
+        },
       },
     };
     FakeWebContentsView.instances.push(this);
@@ -165,6 +169,118 @@ test("closing a background tab re-places the visible current tab", () => {
   verbs.browser_close({ id: background });
 
   expectShownAt(view, { x: 0, y: 0, width: 800, height: 600 });
+});
+
+
+test("computed style uses a fixed function and passes property names as values", async () => {
+  const { verbs, first, view } = harness();
+  const calls = [];
+  view.webContents.debugger.sendCommand = async (method, params) => {
+    calls.push([method, params]);
+    if (method === "DOM.enable") return {};
+    if (method === "DOM.resolveNode") return { object: { objectId: "node-7" } };
+    if (method === "Runtime.callFunctionOn") {
+      assert.equal(params.objectId, "node-7");
+      assert.match(params.functionDeclaration, /getComputedStyle/);
+      assert.ok(!params.functionDeclaration.includes("background-color"));
+      assert.deepEqual(params.arguments, [{ value: ["display", "background-color"] }]);
+      return { result: { value: { display: "block", "background-color": "rgb(1, 2, 3)" } } };
+    }
+    if (method === "Runtime.releaseObject") return {};
+    throw new Error(`unexpected CDP command: ${method}`);
+  };
+
+  const answer = await verbs.browser_computed_style({
+    id: first,
+    ref: 7,
+    url: "about:blank",
+    properties: ["display", "background-color"],
+  });
+
+  assert.deepEqual(answer, {
+    url: "about:blank",
+    styles: { display: "block", "background-color": "rgb(1, 2, 3)" },
+  });
+  assert.ok(calls.some(([method]) => method === "Runtime.releaseObject"));
+});
+
+test("computed style rechecks its snapshotted URL inside rendered work", async () => {
+  const { verbs, first, view } = harness();
+  view.url = "https://evil.example/";
+  let commands = 0;
+  view.webContents.debugger.sendCommand = async () => { commands += 1; };
+
+  await assert.rejects(
+    verbs.browser_computed_style({
+      id: first,
+      ref: 7,
+      url: "https://safe.example/",
+      properties: ["display"],
+    }),
+    /not the https:\/\/safe\.example\/ page you snapshotted/,
+  );
+  assert.equal(commands, 0, "the stale URL reached DOM.resolveNode");
+});
+
+test("computed style rejects non-whitelisted properties before touching the page", async () => {
+  const { verbs, first, view } = harness();
+  let commands = 0;
+  view.webContents.debugger.sendCommand = async () => { commands += 1; };
+
+  await assert.rejects(
+    verbs.browser_computed_style({ id: first, ref: 7, url: "about:blank", properties: ["content"] }),
+    /not a supported computed-style property/,
+  );
+  assert.equal(commands, 0);
+});
+
+
+test("typing a static snapshot ref stops before text insertion", async () => {
+  const { verbs, first, view } = harness();
+  const methods = [];
+  view.webContents.debugger.sendCommand = async (method, params) => {
+    methods.push(method);
+    if (method === "DOM.enable") return {};
+    if (method === "DOM.resolveNode") return { object: { objectId: "node-8" } };
+    if (method === "Runtime.callFunctionOn") {
+      assert.match(params.functionDeclaration, /isContentEditable/);
+      return { exceptionDetails: { text: "this element does not accept text" } };
+    }
+    if (method === "Runtime.releaseObject") return {};
+    throw new Error(`unexpected CDP command: ${method}`);
+  };
+
+  await assert.rejects(
+    verbs.browser_type({ id: first, ref: 8, host: "", text: "must not leak", submit: false }),
+    /does not accept text/,
+  );
+  assert.ok(!methods.includes("Input.insertText"));
+});
+
+
+test("a queued click rechecks its host at execution time", async () => {
+  const { verbs, first, view } = harness(100);
+  view.url = "https://safe.example/";
+  const methods = [];
+  let releaseSnapshot;
+  view.webContents.debugger.sendCommand = async (method) => {
+    methods.push(method);
+    if (method === "Accessibility.enable") {
+      return new Promise((resolve) => { releaseSnapshot = resolve; });
+    }
+    if (method === "Accessibility.getFullAXTree") return { nodes: [{ nodeId: "1" }] };
+    throw new Error(`unexpected CDP command: ${method}`);
+  };
+
+  const snapshot = verbs.browser_snapshot({ id: first });
+  while (!releaseSnapshot) await new Promise((resolve) => setTimeout(resolve, 0));
+  const click = verbs.browser_click({ id: first, ref: 7, host: "safe.example" });
+  view.url = "https://evil.example/";
+  releaseSnapshot({});
+
+  await snapshot;
+  await assert.rejects(click, /not safe\.example/);
+  assert.ok(!methods.includes("Input.dispatchMouseEvent"));
 });
 
 

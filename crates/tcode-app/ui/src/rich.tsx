@@ -257,7 +257,7 @@ function inline(token: Token, key: string): ReactNode {
     }
 
     case "strong":
-      return <strong>{inlines((token as Tokens.Strong).tokens, key)}</strong>;
+      return <strong className="prose-strong">{inlines((token as Tokens.Strong).tokens, key)}</strong>;
 
     case "em":
       return <em>{inlines((token as Tokens.Em).tokens, key)}</em>;

@@ -19,6 +19,12 @@ use tcode_tools::{AgentDef, AgentRegistry, ShellFilters, Skill};
 
 use crate::agent::{build_agent, AgentBuild};
 
+/// Build one frontend-only tool after model-role pins have been resolved. Most
+/// such tools ignore the argument; tools that delegate a part of their work
+/// (the desktop browser's screenshot) receive the exact live handle used by
+/// `view_image` and the model picker.
+pub type DisplayToolFactory = Box<dyn FnOnce(AgentModels) -> Arc<dyn Tool> + Send>;
+
 /// The interactive system prompt. It lives here rather than in a binary
 /// because every interactive frontend serves the same agent — a desktop
 /// session and a terminal session must not be talking to different personas.
@@ -38,10 +44,11 @@ pub struct BootSpec<'a> {
     /// otherwise silently get the ordinary one.
     pub agent: Option<String>,
     /// Capabilities this frontend can actually carry out, offered to the model
-    /// only where they mean something (`show` needs a pane to open). Empty for
-    /// frontends with nothing to show it in — a tool whose whole effect is
-    /// invisible would be a capability the model is told it has and does not.
-    pub display_tools: Vec<Arc<dyn Tool>>,
+    /// only where they mean something (`show` needs a pane to open). Factories
+    /// run after model-role resolution so a display tool can share the exact
+    /// live role pins rather than rebuilding configuration or capturing a
+    /// startup snapshot. Empty for frontends with nothing to show.
+    pub display_tools: Vec<DisplayToolFactory>,
 }
 
 /// The assembled agent plus the pieces frontends need alongside it.
@@ -141,6 +148,10 @@ pub async fn boot(spec: BootSpec<'_>) -> anyhow::Result<Booted> {
             model_cell.swap(model);
         }
     }
+    let display_tools = display_tools
+        .into_iter()
+        .map(|build| build(pinned.clone()))
+        .collect();
 
     let system = match &cli_agent {
         Some(def) => def.system.clone(),

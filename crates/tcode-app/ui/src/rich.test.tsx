@@ -82,6 +82,16 @@ describe("rich() still renders the document", () => {
     expect(html).toMatch(/<h[1-6]/);
   });
 
+  it("marks emphasis in prose and table cells for the shared Markdown style", () => {
+    const html = render(
+      "**模型不应该花 token 猜测状态。**\n\n| 实例 | 消灭的浪费 |\n|---|---|\n| **自愈式工具错误** | **省一个 turn** |",
+    );
+
+    expect(html).toContain('<strong class="prose-strong">模型不应该花 token 猜测状态。</strong>');
+    expect(html).toContain('<td><strong class="prose-strong">自愈式工具错误</strong></td>');
+    expect(html).toContain('<td><strong class="prose-strong">省一个 turn</strong></td>');
+  });
+
   it("typesets display math but leaves currency alone", () => {
     expect(render("$$x^2$$")).toContain("katex");
     expect(render("it costs $30 and $40 total")).not.toContain("katex");

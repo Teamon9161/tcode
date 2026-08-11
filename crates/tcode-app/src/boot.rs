@@ -162,6 +162,22 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
     let trusted_read_hosts =
         tcode_tools::trusted_read_hosts(config.auto_mode.trusted_read_hosts.clone());
 
+    // The two things this frontend has that the terminal does not: somewhere to
+    // put a rendered file (`ShowTool`), and a browser (`crate::browser`,
+    // `../AGENT-BROWSER.md`). Factories run after role resolution, so browser
+    // screenshots share the live vision assignment used by `view_image` and
+    // `/agents` rather than capturing a second configuration snapshot.
+    let display_tools: Vec<tcode_frontend::DisplayToolFactory> = vec![
+        Box::new(|_| Arc::new(tcode_tools::ShowTool)),
+        Box::new(move |vision| {
+            Arc::new(
+                crate::browser::BrowserTool::new(shell, viewer_port)
+                    .with_vision(vision)
+                    .with_trusted_read_hosts(trusted_read_hosts),
+            )
+        }),
+    ];
+
     // `boot` consumes the selection; the model menu needs it to mark which
     // option is current.
     let selection_for_menu = selection.clone();
@@ -171,22 +187,9 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
         selection,
         model_cell: model_cell.clone(),
         agent: None,
-        // The two things this frontend has that the terminal does not:
-        // somewhere to put a rendered file (`tcode_tools::ShowTool`), and a
-        // browser (`crate::browser`, `../AGENT-BROWSER.md`). Both are here
-        // rather than in `builtin_tools` for the same reason — a tool nobody
-        // can honour is worse than a missing one, because the model spends a
-        // call finding out. The browser shares `web_fetch`'s Auto Mode
-        // trusted-read fast path, so it is handed the same normalized host set
-        // (`boot` consumes the config list for the builtin tools; this clone
-        // keeps the two tools on the same list).
-        display_tools: vec![
-            Arc::new(tcode_tools::ShowTool),
-            Arc::new(
-                crate::browser::BrowserTool::new(shell, viewer_port)
-                    .with_trusted_read_hosts(trusted_read_hosts),
-            ),
-        ],
+        // Frontend-only capabilities are not handed to sub-agents: their work
+        // returns as a report and has no app pane of its own.
+        display_tools,
     })
     .await?;
 

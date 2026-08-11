@@ -195,6 +195,67 @@ function browserVerbs(
     );
   };
 
+  const STYLE_PROPERTIES = new Set([
+    "display",
+    "visibility",
+    "position",
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "color",
+    "background-color",
+    "border-color",
+    "border-width",
+    "border-style",
+    "opacity",
+    "z-index",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "line-height",
+    "padding",
+    "margin",
+    "gap",
+    "flex-direction",
+    "align-items",
+    "justify-content",
+    "transform",
+  ]);
+  const MAX_STYLE_PROPERTIES = 12;
+  const COMPUTED_STYLE = `function (properties) {
+    const view = this.ownerDocument && this.ownerDocument.defaultView;
+    if (!view) throw new Error("this element has no document");
+    const style = view.getComputedStyle(this);
+    return Object.fromEntries(
+      properties.map((property) => [property, style.getPropertyValue(property)]),
+    );
+  }`;
+
+  /** Validate page-style inputs again at the process boundary.
+   *  The Rust tool performs the same check for a precise model-facing error,
+   *  but shell verbs are independently callable and must not turn arbitrary
+   *  strings into a page execution surface. */
+  const styleProperties = (input) => {
+    if (!Array.isArray(input) || input.length < 1 || input.length > MAX_STYLE_PROPERTIES) {
+      throw new Error(`computed style needs 1-${MAX_STYLE_PROPERTIES} properties`);
+    }
+    const properties = input.map((raw) => {
+      if (typeof raw !== "string") throw new Error("computed style properties must be strings");
+      const property = raw.trim().toLowerCase();
+      if (!STYLE_PROPERTIES.has(property)) {
+        throw new Error(`'${raw}' is not a supported computed-style property`);
+      }
+      return property;
+    });
+    return [...new Set(properties)];
+  };
+
   /**
    * Where an element is, in viewport CSS pixels — which is what
    * `Input.dispatchMouseEvent` takes.
@@ -310,6 +371,16 @@ function browserVerbs(
       const view = find(current);
       window.contentView.addChildView(view);
       place(view);
+    }
+  };
+
+  const onUrl = (id, expected) => {
+    const at = find(id).webContents.getURL();
+    if (at !== expected) {
+      throw new Error(
+        `that tab is at ${at || "no page"}, not the ${expected} page you snapshotted — ` +
+          "snapshot it again before querying its computed style",
+      );
     }
   };
 
@@ -675,6 +746,17 @@ function browserVerbs(
       });
     },
 
+    async browser_computed_style(args) {
+      const properties = styleProperties(args.properties);
+      return rendered(args.id, async (view) => {
+        onUrl(args.id, args.url);
+        return {
+          url: view.webContents.getURL(),
+          styles: await onNode(args.id, args.ref, COMPUTED_STYLE, [properties]),
+        };
+      });
+    },
+
     /**
      * Click an element, with a real mouse event at its centre.
      *
@@ -685,8 +767,8 @@ function browserVerbs(
      * window's own browser is that what happens is what would have happened.
      */
     async browser_click(args) {
-      onHost(args.id, args.host);
       await rendered(args.id, async () => {
+        onHost(args.id, args.host);
         const at = await onNode(args.id, args.ref, CENTER, [true]);
         if (!at.width || !at.height) {
           throw new Error(`ref_${args.ref} has no size on screen — it is hidden or collapsed`);
@@ -716,12 +798,17 @@ function browserVerbs(
      * the one.
      */
     async browser_type(args) {
-      onHost(args.id, args.host);
       await rendered(args.id, async () => {
+        onHost(args.id, args.host);
         await onNode(
           args.id,
           args.ref,
           `function () {
+            const typeable = this.localName === "input" ||
+              this.localName === "textarea" || this.isContentEditable;
+            if (!typeable) {
+              throw new Error("this element does not accept text");
+            }
             this.focus();
             if (typeof this.select === "function") this.select();
           }`,

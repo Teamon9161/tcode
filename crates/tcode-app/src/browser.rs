@@ -5,42 +5,45 @@
 //!
 //!  - **Only the desktop app registers it** (`BootSpec::display_tools`, the same
 //!    hook `show` arrives through). There is no browser in a terminal.
-//!  - **No session-to-tab table, and no ref table.** A tab id is a capability
-//!    and a conversation only ever holds the ids it opened, so isolation
-//!    between sessions falls out of context isolation rather than out of
-//!    bookkeeping; a `ref` is Chromium's own node id, so nothing has to be kept
-//!    in step with a page. There is exactly one map here and it is neither of
-//!    those — see [`BrowserTool::seen`].
+//!  - **No session-to-tab table or ref translation table.** A tab id is a
+//!    capability and a conversation only ever holds the ids it opened, so
+//!    isolation between sessions falls out of context isolation rather than
+//!    bookkeeping. A `ref` remains Chromium's own node id, but the tool keeps a
+//!    short-lived per-tab admission set of refs it actually printed in the
+//!    latest snapshot; only `computed_style` needs that extra boundary.
 //!  - **The tab lives in the Electron main process**, so every action is a
 //!    [`Shell`] call. This module decides *what* to ask for and what to do with
 //!    the answer; the shell only knows how to work a `WebContentsView`.
 //!
 //! Phase 3 added the acting half — click, type, scroll, wait, the history
-//! buttons and a screenshot. That half is gated per host, and the *only* piece
-//! of state in this file exists to make that gate answerable: see [`seen`].
+//! buttons and a screenshot. Acting is gated per host through [`seen`], while
+//! [`refs`] admits `computed_style` only for elements the latest snapshot made
+//! visible to the model.
 //!
 //! [`seen`]: BrowserTool::seen
+//! [`refs`]: BrowserTool::refs
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 use tcode_core::{
-    AutoSafety, ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput, ToolUiMetadata,
+    AgentModels, AgentRole, AutoSafety, ContentBlock, PermissionRequest, Tool, ToolCtx, ToolOutput,
+    ToolUiMetadata,
 };
 
 use crate::sidecar::Shell;
 
-/// Roles worth addressing — the things `click` and `type` act on, and the
-/// reason a node gets a `ref` even with no accessible name.
+/// Roles worth addressing even when they have no accessible name.
 ///
-/// Everything else is printed for context and gets no `ref`, because a `ref` is
-/// a promise that the thing can be acted on. Handing one to a paragraph would
-/// be a promise this tool does not intend to keep.
+/// Named static elements also carry refs because `computed_style` can inspect
+/// them. Interactive elements need one even when unnamed so click/type remain
+/// possible; unnamed static wrappers are still filtered out.
 const INTERACTIVE: &[&str] = &[
     "button",
     "link",
@@ -86,6 +89,49 @@ const SNAPSHOT_MAX_BYTES: usize = 200 * 1024;
 /// `web_fetch` — see [`fence`].
 const PAGE_FENCE_END: &str = "</web-page-content>";
 
+/// Default question for delegated screenshots. Kept as prompt content rather
+/// than a Rust string so it can be reviewed and tuned with the other prompts.
+const SCREENSHOT_PROMPT: &str = include_str!("../prompts/browser-screenshot.md");
+
+/// CSS values the browser may expose through `computed_style`.
+///
+/// This is intentionally a property query rather than JavaScript evaluation:
+/// the model chooses only names from this list, while the shell owns the fixed
+/// `getComputedStyle` function that reads them.
+const STYLE_PROPERTIES: &[&str] = &[
+    "display",
+    "visibility",
+    "position",
+    "width",
+    "height",
+    "min-width",
+    "min-height",
+    "max-width",
+    "max-height",
+    "overflow",
+    "overflow-x",
+    "overflow-y",
+    "color",
+    "background-color",
+    "border-color",
+    "border-width",
+    "border-style",
+    "opacity",
+    "z-index",
+    "font-family",
+    "font-size",
+    "font-weight",
+    "line-height",
+    "padding",
+    "margin",
+    "gap",
+    "flex-direction",
+    "align-items",
+    "justify-content",
+    "transform",
+];
+const MAX_STYLE_PROPERTIES: usize = 12;
+
 pub struct BrowserTool {
     shell: Arc<dyn Shell>,
     /// The port `serve.rs` bound for the artifact viewer, if it bound one.
@@ -108,12 +154,27 @@ pub struct BrowserTool {
     /// anything the model said. A model naming its own host would be writing
     /// its own permission descriptor.
     seen: Mutex<HashMap<String, String>>,
+    /// The exact refs most recently printed by a snapshot, scoped to its URL.
+    ///
+    /// Chromium backend node ids are only opaque implementation identifiers;
+    /// this map makes the visible snapshot their admission capability rather
+    /// than letting a model guess ids it was never shown.
+    refs: Mutex<HashMap<String, SnapshotRefs>>,
     /// The startup-configured trusted public-read hosts, shared with
     /// `web_fetch` (one judgment: `tcode_tools::trusted_public_read`).
     /// `navigate` may skip the Auto Mode classifier for these; `click`/`type`
     /// never may — acting on a site as the user is a different question than
     /// reading it.
     trusted_read_hosts: tcode_tools::TrustedReadHosts,
+    /// Live role pins shared with `view_image`. `None` only exists in focused
+    /// tool tests that do not assemble a full frontend; production injects the
+    /// handle after config resolution through `BootSpec::display_tools`.
+    vision: Option<AgentModels>,
+}
+
+struct SnapshotRefs {
+    url: String,
+    ids: HashSet<i64>,
 }
 
 impl BrowserTool {
@@ -122,8 +183,18 @@ impl BrowserTool {
             shell,
             viewer_port,
             seen: Mutex::new(HashMap::new()),
+            refs: Mutex::new(HashMap::new()),
             trusted_read_hosts: tcode_tools::trusted_read_hosts(Vec::new()),
+            vision: None,
         }
+    }
+
+    /// Share the live vision-role assignments used by `view_image` and the
+    /// model picker. A later `/agents` change is visible on the next screenshot
+    /// because `AgentModels` is a swappable handle, not a startup snapshot.
+    pub fn with_vision(mut self, models: AgentModels) -> Self {
+        self.vision = Some(models);
+        self
     }
 
     /// Attach the startup-configured trusted public-read hosts. Empty keeps
@@ -154,6 +225,35 @@ impl BrowserTool {
 
     fn host_of(&self, tab: &str) -> Option<String> {
         self.seen.lock().expect("browser hosts").get(tab).cloned()
+    }
+
+    fn remember_refs(&self, tab: &str, url: &str, ids: HashSet<i64>) {
+        self.refs.lock().expect("browser refs").insert(
+            tab.into(),
+            SnapshotRefs {
+                url: url.into(),
+                ids,
+            },
+        );
+    }
+
+    fn snapshot_url_for(&self, tab: &str, id: i64) -> Result<String, String> {
+        let refs = self.refs.lock().expect("browser refs");
+        let Some(snapshot) = refs.get(tab) else {
+            return Err(format!(
+                "ref_{id} was not printed by a snapshot of tab {tab}. Take action=\"snapshot\" first."
+            ));
+        };
+        if !snapshot.ids.contains(&id) {
+            return Err(format!(
+                "ref_{id} was not printed by the latest snapshot of tab {tab}. Take a fresh snapshot first."
+            ));
+        }
+        Ok(snapshot.url.clone())
+    }
+
+    fn clear_refs(&self, tab: &str) {
+        self.refs.lock().expect("browser refs").remove(tab);
     }
 }
 
@@ -190,6 +290,36 @@ fn ref_of(input: &Value) -> Result<i64, String> {
         .trim_start_matches("ref_")
         .parse()
         .map_err(|_| format!("'{raw}' is not a ref — a snapshot writes them as ref_<number>"))
+}
+
+/// Validate and canonicalize the bounded CSS property query.
+fn style_properties(input: &Value) -> Result<Vec<String>, String> {
+    let properties = input["properties"]
+        .as_array()
+        .ok_or("computed_style needs `properties`: 1–12 CSS property names from the tool schema")?;
+    if properties.is_empty() || properties.len() > MAX_STYLE_PROPERTIES {
+        return Err(format!(
+            "computed_style needs between 1 and {MAX_STYLE_PROPERTIES} CSS properties"
+        ));
+    }
+
+    let mut valid = Vec::with_capacity(properties.len());
+    for property in properties {
+        let raw = property
+            .as_str()
+            .ok_or("every computed_style property must be a string")?;
+        let property = raw.trim().to_ascii_lowercase();
+        if !STYLE_PROPERTIES.contains(&property.as_str()) {
+            return Err(format!(
+                "'{raw}' is not a supported computed-style property. Use one of: {}.",
+                STYLE_PROPERTIES.join(", ")
+            ));
+        }
+        if !valid.contains(&property) {
+            valid.push(property);
+        }
+    }
+    Ok(valid)
 }
 
 /// Whether a URL points at this machine.
@@ -277,10 +407,11 @@ struct Node {
     name: String,
     /// Chromium's own id for the DOM node behind this one.
     ///
-    /// **This is the `ref`**, and that is why there is no ref table anywhere.
-    /// A number allocated by the browser needs no bookkeeping to stay
-    /// meaningful, cannot be handed to the wrong tab, and goes stale in the one
-    /// way that matters — `click` resolving it gets an error from Chromium
+    /// **This is the `ref`**. It is not translated through a tool-owned table;
+    /// a short-lived Rust admission set merely records which ids the latest
+    /// snapshot actually printed for `computed_style`. A browser-issued number
+    /// remains scoped to its page and goes stale in the one way that matters —
+    /// resolving it gets an error from Chromium
     /// rather than pressing whatever now occupies slot 7.
     backend_id: Option<i64>,
     ignored: bool,
@@ -324,7 +455,7 @@ fn useful(node: &Node) -> bool {
 /// the thing that actually contains it, rather than four times under nothing.
 /// The walk is bounded because a malformed tree is a page's to produce, not
 /// something to hang on.
-fn render(nodes: &[Node]) -> (String, usize) {
+fn render(nodes: &[Node]) -> (String, usize, HashSet<i64>) {
     use std::collections::HashMap;
 
     let by_id: HashMap<&str, &Node> = nodes.iter().map(|node| (node.id.as_str(), node)).collect();
@@ -346,6 +477,7 @@ fn render(nodes: &[Node]) -> (String, usize) {
     };
 
     let mut out = String::new();
+    let mut refs = HashSet::new();
     let mut written = 0usize;
     let mut omitted = 0usize;
     for node in nodes.iter().filter(|node| useful(node)) {
@@ -354,10 +486,10 @@ fn render(nodes: &[Node]) -> (String, usize) {
             continue;
         }
         let indent = "  ".repeat(depth_of(node).min(12));
-        let reference = match (INTERACTIVE.contains(&node.role.as_str()), node.backend_id) {
-            (true, Some(id)) => format!("ref_{id} "),
-            _ => String::new(),
-        };
+        let reference = node
+            .backend_id
+            .map(|id| format!("ref_{id} "))
+            .unwrap_or_default();
         if node.name.is_empty() {
             out.push_str(&format!("{indent}{reference}{}\n", node.role));
         } else {
@@ -366,10 +498,13 @@ fn render(nodes: &[Node]) -> (String, usize) {
                 node.role, node.name
             ));
         }
+        if let Some(id) = node.backend_id {
+            refs.insert(id);
+        }
         written += 1;
     }
     let _ = written;
-    (out, omitted)
+    (out, omitted, refs)
 }
 
 /// Wrap page text so the model can see where it starts and stops.
@@ -406,9 +541,11 @@ impl Tool for BrowserTool {
          Seeing: `open` (no arguments; answers a tab id, opened in the \
          background without taking the screen), `navigate` (`tab`, `url`), \
          `snapshot` (`tab`; the page's accessibility tree — this is how you see \
-         a page, and every element you can act on carries a `ref_<n>`), \
-         `screenshot` (`tab`; pixels, for layout questions `snapshot` cannot \
-         answer).\n\
+         a page, and each reported element carries a `ref_<n>`), \
+         `computed_style` (`tab`, `ref`, `properties`; read a bounded set of CSS \
+         values for one snapshot element), `screenshot` (`tab`, optional \
+         `prompt`; pixels for layout questions `snapshot` cannot answer; a \
+         specific prompt helps when a separate vision model inspects it).\n\
          \n\
          Acting: `click` (`tab`, `ref`), `type` (`tab`, `ref`, `text`, and \
          `submit: true` to press Enter after — this replaces what the field \
@@ -429,7 +566,7 @@ impl Tool for BrowserTool {
                 "action": {
                     "type": "string",
                     "enum": [
-                        "open", "navigate", "snapshot", "screenshot",
+                        "open", "navigate", "snapshot", "computed_style", "screenshot",
                         "click", "type", "scroll", "wait",
                         "back", "forward", "reload", "close"
                     ],
@@ -445,7 +582,14 @@ impl Tool for BrowserTool {
                 },
                 "ref": {
                     "type": "string",
-                    "description": "Which element, for `click`, `type` and a targeted `scroll`. The `ref_<n>` a snapshot printed beside it."
+                    "description": "Which element, for `computed_style`, `click`, `type` and a targeted `scroll`. The `ref_<n>` a snapshot printed beside it."
+                },
+                "properties": {
+                    "type": "array",
+                    "items": { "type": "string", "enum": STYLE_PROPERTIES },
+                    "minItems": 1,
+                    "maxItems": MAX_STYLE_PROPERTIES,
+                    "description": "For `computed_style`: the CSS properties to read from the snapshot element."
                 },
                 "text": {
                     "type": "string",
@@ -463,6 +607,10 @@ impl Tool for BrowserTool {
                 "amount": {
                     "type": "integer",
                     "description": "For `scroll`: how far, in pixels. Roughly one screen if omitted."
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "For `screenshot`: a concrete visual question. Used when a separate vision model must inspect the pixels."
                 }
             },
             "required": ["action"]
@@ -487,8 +635,9 @@ impl Tool for BrowserTool {
     /// specifics belong; the descriptor is what a *rule* is written against.
     ///
     /// Everything else is free, and by one test: it leaves no trace anywhere
-    /// but here. `open` makes a blank tab, `close` destroys one, `snapshot` and
-    /// `screenshot` read a page already loaded, `scroll` and `wait` move
+    /// but here. `open` makes a blank tab, `close` destroys one, `snapshot`,
+    /// `computed_style` and `screenshot` read a page already loaded, while
+    /// `scroll` and `wait` move
     /// nothing, and the history buttons revisit pages this browser has already
     /// asked for.
     fn permission(&self, input: &Value) -> PermissionRequest {
@@ -585,7 +734,7 @@ impl Tool for BrowserTool {
         if cancel.is_cancelled() {
             return ToolOutput::err("cancelled");
         }
-        match self.dispatch(&input, ctx).await {
+        match self.dispatch(&input, ctx, cancel).await {
             Ok(output) => output,
             Err(error) => ToolOutput::err(error),
         }
@@ -595,15 +744,20 @@ impl Tool for BrowserTool {
 /// Every action, for the error that lists them. One place, so a new action
 /// cannot be added to the schema and left out of the sentence a model reads
 /// when it guesses wrong.
-const ACTIONS: &str =
-    "open, navigate, snapshot, screenshot, click, type, scroll, wait, back, forward, reload, close";
+const ACTIONS: &str = "open, navigate, snapshot, computed_style, screenshot, click, type, scroll, \
+                       wait, back, forward, reload, close";
 
 impl BrowserTool {
     fn output(tab: &str, content: impl Into<String>) -> ToolOutput {
         ToolOutput::ok(content).with_ui_metadata(ToolUiMetadata::BrowserTab { id: tab.into() })
     }
 
-    async fn dispatch(&self, input: &Value, ctx: &ToolCtx) -> Result<ToolOutput, String> {
+    async fn dispatch(
+        &self,
+        input: &Value,
+        ctx: &ToolCtx,
+        cancel: &CancellationToken,
+    ) -> Result<ToolOutput, String> {
         match action_of(input) {
             Some("open") => {
                 // No `select`, and that omission is the feature: the shell reads
@@ -628,6 +782,7 @@ impl BrowserTool {
                 let url = navigable(raw, self.viewer_port)?;
                 self.call("browser_navigate", json!({ "id": tab, "url": url }))
                     .await?;
+                self.clear_refs(tab);
                 self.saw(tab, &url);
                 Ok(Self::output(
                     tab,
@@ -644,7 +799,8 @@ impl BrowserTool {
                 let title = page["title"].as_str().unwrap_or_default();
                 self.saw(tab, url);
                 let nodes = read_nodes(&page["nodes"]);
-                let (body, omitted) = render(&nodes);
+                let (body, omitted, refs) = render(&nodes);
+                self.remember_refs(tab, url, refs);
 
                 if body.is_empty() {
                     return Ok(Self::output(
@@ -656,10 +812,11 @@ impl BrowserTool {
                     ),
                     ));
                 }
-                let mut header = format!("tab {tab} — {url}");
+                let mut body = body;
                 if !title.is_empty() {
-                    header.push_str(&format!("  ({title})"));
+                    body = format!("Page title: {title}\n\n{body}");
                 }
+                let mut header = format!("tab {tab} — {url}");
                 if omitted > 0 {
                     header.push_str(&format!("  [{omitted} further elements not shown]"));
                 }
@@ -668,20 +825,62 @@ impl BrowserTool {
                     format!("{header}\n\n{}", fence(url, &body)),
                 ))
             }
+            Some("computed_style") => {
+                let tab = tab_of(input)?;
+                let element = ref_of(input)?;
+                let properties = style_properties(input)?;
+                let expected_url = self.snapshot_url_for(tab, element)?;
+                let answer = self
+                    .call(
+                        "browser_computed_style",
+                        json!({
+                            "id": tab,
+                            "ref": element,
+                            "url": expected_url,
+                            "properties": properties
+                        }),
+                    )
+                    .await?;
+                let url = answer["url"].as_str().unwrap_or("about:blank");
+                self.saw(tab, url);
+                let styles = answer["styles"]
+                    .as_object()
+                    .ok_or("the shell returned no computed styles for that element")?;
+                let body = serde_json::to_string_pretty(styles)
+                    .map_err(|error| format!("could not render computed styles: {error}"))?;
+                Ok(Self::output(
+                    tab,
+                    format!(
+                        "tab {tab} — {url} — computed style for ref_{element}\n\n{}",
+                        fence(url, &body)
+                    ),
+                ))
+            }
             Some("screenshot") => {
                 let tab = tab_of(input)?;
-                // Refused rather than degraded, because the degraded version is
-                // silent: the provider drops the image, the model gets a
-                // sentence saying a picture was attached, and it answers about
-                // a page it never saw.
-                if !sees_images(ctx) {
+                // A direct image block only works when the parent model can see
+                // it. Otherwise resolve the same live vision role `view_image`
+                // uses and return that isolated request's text — the pixels do
+                // not enter the parent ledger.
+                let direct = sees_images(ctx);
+                let delegated = if direct {
+                    None
+                } else {
+                    self.vision
+                        .as_ref()
+                        .zip(ctx.model.as_ref())
+                        .and_then(|(models, primary)| models.resolve(AgentRole::Vision, primary))
+                        .filter(|model| model.provider.supports_vision())
+                };
+                if !direct && delegated.is_none() {
                     return Err(
-                        "this model cannot read images. Use action=\"snapshot\" — the \
-                         accessibility tree carries the text, the structure and every element \
-                         you can act on."
+                        "neither the main model nor the configured vision model can read images. \
+                         Use action=\"snapshot\" for page text, structure and refs, or choose a \
+                         vision-capable model with /agents → vision."
                             .into(),
                     );
                 }
+
                 let shot = self
                     .call("browser_screenshot", json!({ "id": tab }))
                     .await?;
@@ -697,12 +896,50 @@ impl BrowserTool {
                     shot["width"].as_i64().unwrap_or(0),
                     shot["height"].as_i64().unwrap_or(0),
                 );
-                Ok(
-                    Self::output(tab, note).with_images(vec![ContentBlock::Image {
-                        media_type: "image/png".into(),
-                        data: data.into(),
-                    }]),
+
+                let Some(model) = delegated else {
+                    return Ok(
+                        Self::output(tab, note).with_images(vec![ContentBlock::Image {
+                            media_type: "image/png".into(),
+                            data: data.into(),
+                        }]),
+                    );
+                };
+
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(data)
+                    .map_err(|error| format!("the shell returned an invalid PNG: {error}"))?;
+                let image = tokio::task::spawn_blocking(move || {
+                    tcode_core::images::normalize_image(&bytes)
+                })
+                .await
+                .map_err(|error| format!("screenshot normalization failed: {error}"))?
+                .map_err(|error| format!("the browser screenshot is not usable: {error}"))?;
+                let question = input["prompt"]
+                    .as_str()
+                    .filter(|prompt| !prompt.trim().is_empty());
+                let prompt = match question {
+                    Some(question) => {
+                        format!("{SCREENSHOT_PROMPT}\n\nSpecific question: {question}")
+                    }
+                    None => SCREENSHOT_PROMPT.to_string(),
+                };
+                let answer = tcode_tools::inspect_images(
+                    model,
+                    vec![(format!("browser tab {tab}"), image)],
+                    &prompt,
+                    ctx,
+                    cancel,
                 )
+                .await
+                .map_err(|error| error.to_string())?;
+                Ok(Self::output(
+                    tab,
+                    format!(
+                        "{note}\n\nA separate vision model inspected the screenshot:\n{}",
+                        fence(url, &answer)
+                    ),
+                ))
             }
             Some(action @ ("click" | "type")) => {
                 let tab = tab_of(input)?;
@@ -714,6 +951,7 @@ impl BrowserTool {
                         json!({ "id": tab, "ref": element, "host": host }),
                     )
                     .await?;
+                    self.clear_refs(tab);
                     return Ok(Self::output(
                         tab,
                         format!(
@@ -731,6 +969,7 @@ impl BrowserTool {
                     json!({ "id": tab, "ref": element, "host": host, "text": text, "submit": submit }),
                 )
                 .await?;
+                self.clear_refs(tab);
                 Ok(Self::output(
                     tab,
                     format!(
@@ -757,6 +996,7 @@ impl BrowserTool {
                     args["ref"] = json!(ref_of(input)?);
                 }
                 self.call("browser_scroll", args).await?;
+                self.clear_refs(tab);
                 Ok(Self::output(
                     tab,
                     format!(
@@ -774,6 +1014,7 @@ impl BrowserTool {
                 let settled = self.call("browser_wait", args).await?["settled"]
                     .as_bool()
                     .unwrap_or(false);
+                self.clear_refs(tab);
                 Ok(Self::output(
                     tab,
                     match (settled, phrase) {
@@ -808,6 +1049,7 @@ impl BrowserTool {
             Some("reload") => {
                 let tab = tab_of(input)?;
                 self.call("browser_reload", json!({ "id": tab })).await?;
+                self.forget(tab);
                 Ok(Self::output(
                     tab,
                     format!("reloaded tab {tab}. Snapshot it once it has settled."),
@@ -844,6 +1086,7 @@ impl BrowserTool {
 
     fn forget(&self, tab: &str) {
         self.seen.lock().expect("browser hosts").remove(tab);
+        self.clear_refs(tab);
     }
 }
 
@@ -935,15 +1178,15 @@ mod tests {
     #[test]
     fn interactive_elements_carry_the_browsers_own_node_id_as_their_ref() {
         let nodes = read_nodes(&tree(vec![ax(node("1", None, "button", "Sign in", 42))]));
-        let (out, _) = render(&nodes);
+        let (out, _, _) = render(&nodes);
         assert_eq!(out.trim(), "ref_42 button \"Sign in\"");
     }
 
-    /// A `ref` is a promise that the thing can be acted on, so static text does
-    /// not get one. It is still printed: a page without its prose is a page
-    /// nobody can read.
+    /// Static named elements carry refs too: they are not necessarily click
+    /// targets, but `computed_style` can inspect them without accepting a
+    /// selector or arbitrary JavaScript.
     #[test]
-    fn static_text_is_printed_without_a_ref() {
+    fn static_text_is_printed_with_a_ref_for_style_queries() {
         let nodes = read_nodes(&tree(vec![ax(node(
             "1",
             None,
@@ -951,8 +1194,8 @@ mod tests {
             "Files changed",
             7,
         ))]));
-        let (out, _) = render(&nodes);
-        assert_eq!(out.trim(), "heading \"Files changed\"");
+        let (out, _, _) = render(&nodes);
+        assert_eq!(out.trim(), "ref_7 heading \"Files changed\"");
     }
 
     /// The measurement this filter exists for: a real page is mostly wrappers
@@ -967,7 +1210,7 @@ mod tests {
             ax(ignored),
             ax(node("3", Some("1"), "link", "Home", 3)),
         ]));
-        let (out, _) = render(&nodes);
+        let (out, _, _) = render(&nodes);
         assert_eq!(out.trim(), "ref_3 link \"Home\"");
     }
 
@@ -981,8 +1224,8 @@ mod tests {
             ax(node("3", Some("2"), "generic", "", 3)),
             ax(node("4", Some("3"), "link", "Home", 4)),
         ]));
-        let (out, _) = render(&nodes);
-        assert_eq!(out, "navigation \"Main\"\n  ref_4 link \"Home\"\n");
+        let (out, _, _) = render(&nodes);
+        assert_eq!(out, "ref_1 navigation \"Main\"\n  ref_4 link \"Home\"\n");
     }
 
     /// A tree that refers to itself is a page's to produce. It must cost a
@@ -993,7 +1236,7 @@ mod tests {
             ax(node("1", Some("2"), "link", "a", 1)),
             ax(node("2", Some("1"), "link", "b", 2)),
         ]));
-        let (out, _) = render(&nodes);
+        let (out, _, _) = render(&nodes);
         assert!(out.contains("ref_1 link \"a\""), "{out}");
     }
 

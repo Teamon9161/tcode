@@ -472,6 +472,7 @@ mod tests {
             // every verb somebody sends it, and the sidecar is now one of the
             // somebodies.
             "browser_snapshot",
+            "browser_computed_style",
             "browser_screenshot",
             "browser_click",
             "browser_type",

@@ -1855,7 +1855,7 @@ body.is-resizing {
 
 .code-block {
   border: 1px solid var(--line);
-  border-radius: var(--r-sm);
+  border-radius: var(--r-md);
   background: var(--bg);
   overflow: hidden;
 }
@@ -5110,6 +5110,12 @@ body.is-resizing {
   margin: var(--s-2) 0;
   border: 0;
   background: var(--line);
+}
+
+.prose-strong {
+  color: var(--ink);
+  font-synthesis-weight: auto;
+  font-weight: var(--weight-semibold);
 }
 
 .prose-link {

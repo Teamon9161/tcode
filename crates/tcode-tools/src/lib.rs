@@ -38,7 +38,7 @@ pub use skills::{
     discover_skills, parse_skill_echo, render_skill, wrap_skill_echo, Skill, SkillEcho,
     SkillSource, SkillTool,
 };
-pub use view_image::ViewImageTool;
+pub use view_image::{inspect_images, ViewImageTool, VisionError};
 pub use web::{
     trusted_public_read, trusted_read_hosts, FetchSummarizer, TrustedReadHosts, WebFetchTool,
 };
