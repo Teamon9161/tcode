@@ -2711,7 +2711,9 @@ impl Agent {
         session: &mut Session,
         events: &mpsc::Sender<AgentEvent>,
     ) -> Result<(), AgentError> {
-        for message in session.pending.take_at_safe_boundary() {
+        let messages = session.pending.take_at_safe_boundary();
+        let delivered = !messages.is_empty();
+        for message in messages {
             for instruction in message.instructions {
                 session.ledger.append(Entry::Instruction(instruction));
             }
@@ -2744,6 +2746,17 @@ impl Agent {
                 },
             )
             .await?;
+        }
+        if delivered {
+            session.ledger.append(Entry::Note(
+                "The message(s) above were typed while you were working — the user did not \
+                 interrupt or end your turn. Read what they said and decide the right response: \
+                 if they asked a question or added a requirement, address it and continue your \
+                 original task (updating your plan if you have one); if they asked you to stop, \
+                 change direction, or said your approach is wrong, follow their new instruction \
+                 instead. Do not treat a mid-turn message as an implicit signal to stop working."
+                    .into(),
+            ));
         }
         Ok(())
     }
