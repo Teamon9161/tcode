@@ -37,8 +37,14 @@ describe("imageFiles", () => {
   });
 
   it("does not duplicate distinct File objects for the same clipboard item", () => {
-    const fromFiles = new File(["image"], "clipboard.png", { type: "image/png" });
-    const fromItems = new File(["image"], "clipboard.png", { type: "image/png" });
+    // A bare `new File` stamps its own `lastModified` at construction, so two
+    // sibling calls can land in different milliseconds and split the dedup key
+    // (`name` + `size` + `lastModified`) — flaky across CI load. The two views
+    // of one clipboard item must carry identical metadata, which real engines
+    // do (both wrap the same underlying entry).
+    const lastModified = 1_700_000_000_000;
+    const fromFiles = new File(["image"], "clipboard.png", { type: "image/png", lastModified });
+    const fromItems = new File(["image"], "clipboard.png", { type: "image/png", lastModified });
     const transfer = {
       files: { 0: fromFiles, length: 1, item: () => fromFiles },
       items: [
