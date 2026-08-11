@@ -4,8 +4,7 @@ import type { Block } from "./blocks";
 import type { ProjectInfo, SessionInfo } from "./types";
 import {
   find,
-  moveProject,
-  railBands,
+  recentProjects,
   sessionTitle,
   type FoundSession,
 } from "./railData";
@@ -43,129 +42,35 @@ const PROJECTS = [
   project("/code/duck_ext", "duck_ext", 600),
 ];
 
-describe("railBands", () => {
-  it("gathers a folder's conversations under one heading", () => {
-    const { live } = railBands(SESSIONS, [], []);
-
-    expect(live.map((group) => group.path)).toEqual([
+describe("recentProjects", () => {
+  it("lists projects newest first even when one also has an open session", () => {
+    const recent = recentProjects(PROJECTS);
+    expect(recent.projects.map((entry) => entry.path)).toEqual([
       "/code/tcode",
       "/code/short_term_rs",
-    ]);
-    expect(live[0].sessions.map((entry) => entry.id)).toEqual(["s1", "s3"]);
-    expect(live[1].sessions.map((entry) => entry.id)).toEqual(["s2"]);
-  });
-
-  it("follows the arrangement the reader set", () => {
-    const { live } = railBands(
-      SESSIONS,
-      [],
-      ["/code/short_term_rs", "/code/tcode"],
-    );
-    expect(live.map((group) => group.path)).toEqual([
-      "/code/short_term_rs",
-      "/code/tcode",
-    ]);
-  });
-
-  // The point of storing only the folders that were moved: opening a new one must
-  // not scatter the ones already placed.
-  it("appends a folder the arrangement has never heard of", () => {
-    const { live } = railBands(
-      [...SESSIONS, session("s4", "/code/pybond", "pybond")],
-      [],
-      ["/code/short_term_rs", "/code/tcode"],
-    );
-    expect(live.map((group) => group.path)).toEqual([
-      "/code/short_term_rs",
-      "/code/tcode",
-      "/code/pybond",
-    ]);
-  });
-
-  it("leaves a stored folder that is no longer open out of the live band", () => {
-    const { live } = railBands(
-      SESSIONS,
-      [],
-      ["/code/gone", "/code/short_term_rs"],
-    );
-    expect(live.map((group) => group.path)).toEqual([
-      "/code/short_term_rs",
-      "/code/tcode",
-    ]);
-  });
-
-  // The whole reason the rail could absorb the launchpad: a folder with nothing
-  // open in it is still somewhere you can go.
-  it("lists visited folders with nothing open under recent, newest first", () => {
-    const { live, recent } = railBands(SESSIONS, PROJECTS, []);
-
-    expect(live.map((group) => group.path)).toEqual([
-      "/code/tcode",
-      "/code/short_term_rs",
-    ]);
-    expect(recent.map((group) => group.path)).toEqual([
       "/code/pybond",
       "/code/duck_ext",
     ]);
-    expect(recent[0].sessions).toEqual([]);
-    // The row needs the project's own facts to say when you were last there.
-    expect(recent[0].info?.last_active).toBe(700);
   });
 
-  // A folder cannot be in both bands: that was the launchpad's actual defect,
-  // where "Open" and "Projects" listed the same folder twice.
-  it("never puts one folder in both bands", () => {
-    const { live, recent } = railBands(SESSIONS, PROJECTS, []);
-    const both = live.filter((group) =>
-      recent.some((other) => other.path === group.path),
-    );
-    expect(both).toEqual([]);
-  });
-
-  it("caps recent and reports what it left for the finder", () => {
+  it("reveals a bounded step and reports the remaining project count", () => {
     const many = Array.from({ length: 12 }, (_at, index) =>
       project(`/code/p${index}`, `p${index}`, 1000 - index),
     );
-    const { recent, overflow } = railBands([], many, [], [], 8);
-
-    expect(recent).toHaveLength(8);
-    expect(overflow).toBe(4);
-    expect(recent[0].path).toBe("/code/p0");
+    const recent = recentProjects(many, [], 8);
+    expect(recent.projects).toHaveLength(8);
+    expect(recent.overflow).toBe(4);
   });
 
-  it("hides a folder from recent without touching the live band", () => {
-    const { live, recent } = railBands(
-      SESSIONS,
-      PROJECTS,
-      [],
-      ["/code/pybond", "/code/tcode"],
-    );
-
-    expect(recent.map((group) => group.path)).toEqual(["/code/duck_ext"]);
-    // Hiding must not be able to swallow a conversation that is open: the rail's
-    // whole job is to account for those.
-    expect(live.map((group) => group.path)).toContain("/code/tcode");
-  });
-});
-
-describe("moveProject", () => {
-  const { live } = railBands(SESSIONS, [], []);
-
-  it("writes out the whole order, not just the folder that moved", () => {
-    expect(moveProject(live, "/code/short_term_rs", 0)).toEqual([
-      "/code/short_term_rs",
-      "/code/tcode",
-    ]);
-  });
-
-  it("refuses to move past either end rather than clamping silently", () => {
-    expect(moveProject(live, "/code/tcode", -1)).toEqual([
+  it("hides only the selected recent project", () => {
+    expect(
+      recentProjects(PROJECTS, ["/code/pybond"]).projects.map(
+        (entry) => entry.path,
+      ),
+    ).toEqual([
       "/code/tcode",
       "/code/short_term_rs",
-    ]);
-    expect(moveProject(live, "/code/short_term_rs", 2)).toEqual([
-      "/code/tcode",
-      "/code/short_term_rs",
+      "/code/duck_ext",
     ]);
   });
 });

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::Context;
 
 use tcode_core::config::Config;
-use tcode_core::{ModelCell, Session};
+use tcode_core::{AgentModels, ModelCell, Session};
 use tcode_tools::ShellFilters;
 
 use crate::state::Supervisor;
@@ -56,8 +56,9 @@ Restarting tcode will try again; if it keeps failing, something on this machine 
 /// Opens further folders as sessions, after boot.
 ///
 /// The rail can open any folder, and each one is its own conversation
-/// with its own `ToolCtx` — but they all share the one `Arc<Agent>`, which is
-/// stateless. What this holds is the small amount of per-app context that
+/// with its own `ToolCtx` and `ModelCell`. They share one `Arc<Agent>`, whose
+/// process model is only a fallback for contexts that do not supply a cell.
+/// What this holds is the small amount of per-app context that
 /// `tcode_frontend::open_session` needs and that the agent does not carry.
 ///
 /// Configuration is re-read per folder rather than reused, because
@@ -65,10 +66,18 @@ Restarting tcode will try again; if it keeps failing, something on this machine 
 /// *its* hooks, permission rules and MCP servers, not the first one's.
 pub struct SessionFactory {
     config_file: PathBuf,
-    model_cell: ModelCell,
     shell_filters: Arc<ShellFilters>,
+    pinned: AgentModels,
+    agent_defs: Arc<tcode_tools::AgentRegistry>,
     opening_context: tcode_core::commands::OpeningContextFn,
     environment: tcode_core::commands::EnvironmentFn,
+}
+
+/// A newly opened conversation plus main-model menus built from the same
+/// folder config and live model cell.
+pub struct FactorySession {
+    pub session: Session,
+    pub main_pickers: crate::picker::MainPickers,
 }
 
 impl SessionFactory {
@@ -76,13 +85,15 @@ impl SessionFactory {
     /// per folder so project-level overrides apply to the folder being opened.
     pub fn new(
         config_file: PathBuf,
-        model_cell: ModelCell,
         shell_filters: Arc<ShellFilters>,
+        pinned: AgentModels,
+        agent_defs: Arc<tcode_tools::AgentRegistry>,
     ) -> Self {
         Self {
             config_file,
-            model_cell,
             shell_filters,
+            pinned,
+            agent_defs,
             opening_context: Arc::new(tcode_tools::startup_context_with_scratch),
             environment: Arc::new(tcode_tools::environment_snapshot),
         }
@@ -99,15 +110,33 @@ impl SessionFactory {
 
     /// Open `cwd` as a conversation. `resume` names an existing session log to
     /// replay (by id prefix); `None` starts a fresh one.
-    pub fn open(&self, cwd: &Path, resume: Option<String>) -> anyhow::Result<Session> {
+    pub fn open(&self, cwd: &Path, resume: Option<String>) -> anyhow::Result<FactorySession> {
         anyhow::ensure!(cwd.is_dir(), "{} is not a folder", cwd.display());
         let mut config = Config::load_at(&self.config_file, cwd)?;
+        tcode_providers::hydrate_codex_models(&mut config);
         let state = config.apply_active_preset();
-        tcode_frontend::open_session(tcode_frontend::SessionSpec {
+        let selection = config.select(None, None, &state)?;
+        let profile = config
+            .profiles
+            .get(&selection.profile)
+            .context("selected profile disappeared")?;
+        let active = tcode_providers::build_active(profile, &selection, &config.watchdog)?;
+        let model_cell = ModelCell::new(active);
+        let models = tcode_frontend::build_menu(&config, &selection, self.config_file.clone());
+        let presets = tcode_frontend::build_preset_menu(
+            &config,
+            &state,
+            cwd.to_path_buf(),
+            model_cell.clone(),
+            self.pinned.clone(),
+            self.agent_defs.clone(),
+            self.config_file.clone(),
+        );
+        let session = tcode_frontend::open_session(tcode_frontend::SessionSpec {
             cwd: cwd.to_path_buf(),
             config: &config,
             state: &state,
-            model_cell: self.model_cell.clone(),
+            model_cell,
             mode: tcode_frontend::startup_mode(None, &state, &config)?,
             rules: tcode_frontend::startup_rules(&config),
             resume: match resume {
@@ -117,6 +146,10 @@ impl SessionFactory {
             shell_filters: self.shell_filters.clone(),
             opening_context: self.opening_context.clone(),
             environment: self.environment.clone(),
+        })?;
+        Ok(FactorySession {
+            session,
+            main_pickers: crate::picker::MainPickers { models, presets },
         })
     }
 }
@@ -221,7 +254,12 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
         config_file: config_file.clone(),
     }));
 
-    let factory = SessionFactory::new(config_file, model_cell, booted.shell_filters.clone());
+    let factory = SessionFactory::new(
+        config_file,
+        booted.shell_filters.clone(),
+        booted.pinned.clone(),
+        booted.agent_defs.clone(),
+    );
     let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus, booted.skills));
 
     let mut warnings = booted.warnings;

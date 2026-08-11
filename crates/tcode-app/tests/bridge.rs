@@ -98,13 +98,19 @@ fn sink(collector: &Arc<Collector>) -> Arc<dyn Emit> {
 struct MockProvider {
     scripts: Mutex<VecDeque<Vec<StreamEvent>>>,
     requests: Mutex<Vec<Request>>,
+    vision: bool,
 }
 
 impl MockProvider {
     fn new(scripts: Vec<Vec<StreamEvent>>) -> Arc<Self> {
+        Self::with_vision(scripts, false)
+    }
+
+    fn with_vision(scripts: Vec<Vec<StreamEvent>>, vision: bool) -> Arc<Self> {
         Arc::new(Self {
             scripts: Mutex::new(scripts.into()),
             requests: Mutex::new(Vec::new()),
+            vision,
         })
     }
 
@@ -123,6 +129,9 @@ impl Provider for MockProvider {
     }
     fn cache_strategy(&self) -> CacheStrategy {
         CacheStrategy::ImplicitPrefix
+    }
+    fn supports_vision(&self) -> bool {
+        self.vision
     }
     async fn stream(
         &self,
@@ -232,24 +241,24 @@ fn factory() -> tcode_app::boot::SessionFactory {
 }
 
 /// A factory that can really open a session, for the one test that needs a
-/// second one to exist. The config file is empty on purpose: every default is
-/// fine here, and the model comes from the cell below rather than from disk.
+/// second one to exist. It selects a built-in profile with a harmless inline
+/// test key; no turn runs on the fresh session, so no network request is made.
 fn working_factory(dir: &std::path::Path) -> tcode_app::boot::SessionFactory {
     let config = dir.join("config.toml");
-    std::fs::write(&config, "").unwrap();
+    std::fs::write(
+        &config,
+        "default_profile = \"anthropic\"\n[profiles.anthropic]\napi_key = \"test-key\"\n",
+    )
+    .unwrap();
     factory_at(config)
 }
 
 fn factory_at(config: PathBuf) -> tcode_app::boot::SessionFactory {
     tcode_app::boot::SessionFactory::new(
         config,
-        ModelCell::new(ActiveModel {
-            provider: MockProvider::new(Vec::new()),
-            max_tokens: Some(1024),
-            context_window: 200_000,
-            effort: None,
-        }),
         Arc::new(tcode_tools::ShellFilters::disabled()),
+        tcode_core::AgentModels::default(),
+        Arc::new(tcode_tools::AgentRegistry::builtin()),
     )
 }
 
@@ -406,6 +415,90 @@ async fn a_mid_turn_mode_switch_gates_the_next_call_and_reports_its_boundary() {
     );
 }
 
+/// Images queued during a running turn use that turn's frozen capability even
+/// if the session is switched to a vision model before the queue is composed.
+#[tokio::test]
+async fn queued_images_follow_the_running_model_snapshot() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let target = cwd.path().join("note.txt");
+    let text_only = MockProvider::new(vec![
+        tool_use(
+            "call-1",
+            "write",
+            &serde_json::json!({ "path": target.to_string_lossy(), "content": "written\n" })
+                .to_string(),
+        ),
+        text_done("done"),
+    ]);
+    let agent = agent(text_only.clone(), cwd.path());
+    let cell = ModelCell::new(ActiveModel {
+        provider: text_only,
+        max_tokens: Some(1024),
+        context_window: 200_000,
+        effort: None,
+    });
+    let live = Session::new(
+        ToolCtx::new(cwd.path().to_path_buf(), 25_000).with_model(cell.clone()),
+        PermissionMode::Default,
+        PermissionRules::default(),
+    );
+    let handle = handle_of("s1", cwd.path().to_path_buf(), live);
+    let supervisor = Arc::new(Supervisor::new(
+        agent.clone(),
+        factory(),
+        menus(),
+        Vec::new(),
+    ));
+    supervisor.open(handle.clone());
+    let collector = Arc::new(Collector::default());
+    let turn = tokio::spawn({
+        let (agent, handle, emit) = (agent.clone(), handle.clone(), sink(&collector));
+        async move { run_turn(agent, handle, emit, say("write a note"), plain(), false).await }
+    });
+    let request = collector
+        .wait_for(APPROVAL_REQUEST, |payload| payload["session"] == "s1")
+        .await;
+
+    cell.swap(ActiveModel {
+        provider: MockProvider::with_vision(vec![text_done("queued done")], true),
+        max_tokens: Some(1024),
+        context_window: 200_000,
+        effort: None,
+    });
+    assert!(
+        !handle.input_supports_vision(&agent.model),
+        "the running turn keeps its text-only capability after the live cell switches"
+    );
+    tcode_app::commands::send_message(
+        &sink(&collector),
+        &supervisor,
+        "s1".into(),
+        "inspect this".into(),
+        Some(vec![tcode_app::commands::ImageInput {
+            media_type: "image/png".into(),
+            data: "AQID".into(),
+        }]),
+        None,
+    )
+    .unwrap();
+
+    let queued = handle.queued();
+    let saved = match queued[0].blocks.first() {
+        Some(ContentBlock::Text { text }) => text
+            .strip_prefix("[pasted image saved to ")
+            .and_then(|text| text.strip_suffix(']'))
+            .expect("the queued image was saved rather than discarded"),
+        other => panic!("expected a saved-image text block, got {other:?}"),
+    };
+    assert_eq!(std::fs::read(saved).unwrap(), [1, 2, 3]);
+    handle
+        .pending()
+        .answer(answer(&request["id"], "no"))
+        .unwrap();
+    turn.await.unwrap().unwrap();
+}
+
 /// The approval round trip, which is the one thing the desktop app cannot
 /// borrow from the terminal frontends: the request goes out as an event, the
 /// loop parks, and a command carries the answer back in.
@@ -524,7 +617,14 @@ async fn concurrent_sessions_never_cross_streams() {
     supervisor.open(handle_two.clone());
 
     let (a, b) = tokio::join!(
-        run_turn(agent_one, handle_one, emit.clone(), say("one"), plain(), false),
+        run_turn(
+            agent_one,
+            handle_one,
+            emit.clone(),
+            say("one"),
+            plain(),
+            false
+        ),
         run_turn(agent_two, handle_two, emit, say("two"), plain(), false),
     );
     a.unwrap();
@@ -1071,7 +1171,9 @@ async fn a_plan_flagged_turn_that_ends_without_a_plan_says_so() {
         })
         .collect::<Vec<_>>();
     assert!(
-        notes.iter().any(|text| text.contains("No plan was produced")),
+        notes
+            .iter()
+            .any(|text| text.contains("No plan was produced")),
         "{notes:?}"
     );
 }
@@ -1490,85 +1592,302 @@ async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
     assert_eq!(adopted.path(), session.plan().unwrap().path());
 }
 
-/// A pick from the webview has to reach the shared `ModelCell`, and the strip
-/// has to read that cell back.
-///
-/// This lives with the bridge tests because it *is* the boundary the desktop app
-/// adds: the frontend's `switch` closure builds the provider, and the only thing
-/// this crate contributes is handing the result to the cell every session reads
-/// through. Skipping that step type-checks, passes every other test, and shows
-/// up only as a chip that snaps back to its old value — which is how it shipped.
-#[test]
-fn a_model_pick_moves_the_shared_cell_and_the_strip_reads_it_back() {
-    let cell = ModelCell::new(ActiveModel {
-        provider: MockProvider::new(Vec::new()),
+/// A model pick is private to the addressed session, and the shared Agent
+/// resolves each turn through that session's ToolCtx rather than its fallback.
+#[tokio::test]
+async fn a_model_pick_moves_only_the_selected_session() {
+    let cwd = tempfile::tempdir().unwrap();
+    let fallback = MockProvider::new(Vec::new());
+    let selected = MockProvider::new(vec![text_done("selected answer")]);
+    let untouched = MockProvider::new(vec![text_done("untouched answer")]);
+    let agent = agent(fallback.clone(), cwd.path());
+
+    let cell_a = ModelCell::new(ActiveModel {
+        provider: fallback.clone(),
         max_tokens: Some(1024),
         context_window: 200_000,
         effort: None,
     });
+    let cell_b = ModelCell::new(ActiveModel {
+        provider: untouched.clone(),
+        max_tokens: Some(1024),
+        context_window: 300_000,
+        effort: None,
+    });
+    let session_a = Session::new(
+        ToolCtx::new(cwd.path().to_path_buf(), 25_000).with_model(cell_a.clone()),
+        PermissionMode::Default,
+        PermissionRules::default(),
+    );
+    let session_b = Session::new(
+        ToolCtx::new(cwd.path().to_path_buf(), 25_000).with_model(cell_b.clone()),
+        PermissionMode::Default,
+        PermissionRules::default(),
+    );
 
     let mut def = tcode_core::config::ModelDef::bare("mock-1");
     def.efforts = vec!["low".to_string(), "high".to_string()];
-    // Stands in for the real closure: what matters here is that whatever it
-    // returns becomes what the agent runs on.
-    let switch = Box::new(|_: &tcode_frontend::ModelOption, effort: Option<&str>| {
-        Ok(ActiveModel {
-            provider: MockProvider::new(Vec::new()),
-            max_tokens: Some(2048),
-            context_window: 400_000,
-            effort: effort.map(String::from),
-        })
-    });
-    let mut menus = tcode_app::picker::Pickers::unavailable(
-        PathBuf::from("/nonexistent/config.toml"),
-        "no provider is configured",
+    let picked = selected.clone();
+    let switch = Box::new(
+        move |_: &tcode_frontend::ModelOption, effort: Option<&str>| {
+            Ok(ActiveModel {
+                provider: picked.clone(),
+                max_tokens: Some(2048),
+                context_window: 400_000,
+                effort: effort.map(String::from),
+            })
+        },
     );
-    menus.models = tcode_frontend::ModelMenu {
+    let mut main_a = tcode_app::picker::MainPickers::unavailable("no presets in this test");
+    main_a.models = tcode_frontend::ModelMenu {
         options: vec![tcode_frontend::ModelOption {
             profile: "mock".to_string(),
-            def,
+            def: def.clone(),
         }],
         current: 0,
         switch,
     };
+    let handle_a = Arc::new(SessionHandle::with_main_pickers(
+        "a".into(),
+        cwd.path().to_path_buf(),
+        session_a,
+        main_a,
+    ));
+    let handle_b = handle_of("b", cwd.path().to_path_buf(), session_b);
 
-    tcode_app::picker::choose_model(&mut menus, &cell, 0, Some("high")).expect("the pick applies");
-
-    assert_eq!(cell.snapshot().effort.as_deref(), Some("high"));
-    assert_eq!(
-        cell.snapshot().context_window,
-        400_000,
-        "the new model is live"
+    let mut pickers = tcode_app::picker::Pickers::unavailable(
+        PathBuf::from("/nonexistent/config.toml"),
+        "no provider is configured",
     );
+    pickers.models.options = vec![tcode_frontend::ModelOption {
+        profile: "mock".to_string(),
+        def,
+    }];
+    let menus = Arc::new(std::sync::Mutex::new(pickers));
+    let supervisor = Arc::new(Supervisor::new(agent.clone(), factory(), menus, Vec::new()));
+    supervisor.open(handle_a.clone());
+    supervisor.open(handle_b.clone());
 
-    let state = tcode_app::picker::state_of(
-        &menus,
-        &cell,
-        &tcode_core::AgentModels::default(),
-        PermissionMode::Default,
+    tcode_app::commands::choose_model(&supervisor, "a".into(), 0, Some("high".into()))
+        .expect("the pick applies");
+
+    assert_eq!(cell_a.snapshot().effort.as_deref(), Some("high"));
+    assert_eq!(cell_a.snapshot().context_window, 400_000);
+    assert_eq!(cell_b.snapshot().effort, None);
+    assert_eq!(cell_b.snapshot().context_window, 300_000);
+    let state_a = tcode_app::commands::picker_state(&supervisor, "a".into()).unwrap();
+    let state_b = tcode_app::commands::picker_state(&supervisor, "b".into()).unwrap();
+    assert_eq!(state_a.effort.as_deref(), Some("high"));
+    assert_eq!(state_b.effort, None);
+
+    let collector = Arc::new(Collector::default());
+    run_turn(
+        agent.clone(),
+        handle_a,
+        sink(&collector),
+        say("use selected"),
+        plain(),
         false,
-    );
-    assert_eq!(
-        state.effort.as_deref(),
-        Some("high"),
-        "the chip must show what is running, not the definition's default"
-    );
+    )
+    .await
+    .unwrap();
+    run_turn(
+        agent,
+        handle_b,
+        sink(&collector),
+        say("stay untouched"),
+        plain(),
+        false,
+    )
+    .await
+    .unwrap();
 
-    // Out-of-range indices come from the webview, so they are data: refused, and
-    // nothing about the live model moves.
-    assert!(tcode_app::picker::choose_model(&mut menus, &cell, 7, None).is_err());
-    assert_eq!(cell.snapshot().effort.as_deref(), Some("high"));
+    assert_eq!(selected.requests().len(), 1);
+    assert_eq!(untouched.requests().len(), 1);
+    assert!(
+        fallback.requests().is_empty(),
+        "the Agent fallback is unused"
+    );
+}
+
+/// Saving a desktop preset names the session-owned main selection and the
+/// process-global role pin through their independent model catalogs.
+#[test]
+fn preset_save_keeps_main_and_role_index_domains_separate() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let provider = MockProvider::new(Vec::new());
+    let model = ModelCell::new(ActiveModel {
+        provider,
+        max_tokens: Some(1024),
+        context_window: 200_000,
+        effort: Some("medium".into()),
+    });
+
+    let mut main = tcode_app::picker::MainPickers::unavailable("unused");
+    main.models.options = vec![tcode_frontend::ModelOption {
+        profile: "project".into(),
+        def: tcode_core::config::ModelDef::bare("project-main"),
+    }];
+    main.models.current = 0;
+    main.presets.save = Box::new(|name, draft, main_models, role_models| {
+        assert_eq!(name, "team");
+        let main_at = draft.main.expect("main selection");
+        assert_eq!(main_models.options[main_at].def.name, "project-main");
+        let (_, role) = draft
+            .roles
+            .iter()
+            .find(|(kind, _)| kind == "explore")
+            .expect("explore role");
+        let tcode_frontend::AgentModelChoice::Model { option, effort } = role else {
+            panic!("explore is explicitly pinned")
+        };
+        assert_eq!(role_models[*option].def.name, "global-helper");
+        assert_eq!(effort.as_deref(), Some("high"));
+        Ok((
+            vec![tcode_frontend::PresetOption {
+                key: "team".into(),
+                label: "team".into(),
+            }],
+            0,
+            tcode_frontend::PresetSaveOutcome {
+                replaced: false,
+                changes: Vec::new(),
+            },
+        ))
+    });
+
+    let mut menus =
+        tcode_app::picker::Pickers::unavailable(cwd.path().join("config.toml"), "unused");
+    menus.models.options = vec![tcode_frontend::ModelOption {
+        profile: "global".into(),
+        def: tcode_core::config::ModelDef::bare("global-helper"),
+    }];
+    menus.agents = tcode_frontend::AgentMenu {
+        roles: vec![tcode_frontend::AgentRole {
+            key: "explore".into(),
+            label: "explore".into(),
+            allows_off: false,
+            section: tcode_frontend::RoleSection::Task,
+        }],
+        pins: vec![tcode_frontend::AgentModelChoice::Model {
+            option: 0,
+            effort: Some("high".into()),
+        }],
+        pin: Box::new(|_, _| Ok("unused".into())),
+    };
+
+    tcode_app::picker::save_preset(&mut main, &menus, &model, "team").unwrap();
+    assert_eq!(main.presets.current, Some(0));
+}
+
+#[test]
+fn a_new_session_uses_the_latest_persisted_picker_identity() {
+    tcode_core::home::testing::temp_home();
+    let cwd = tempfile::tempdir().unwrap();
+    let config = cwd.path().join("config.toml");
+    std::fs::write(
+        &config,
+        r#"
+default_profile = "local"
+
+[profiles.local]
+provider = "anthropic"
+api_key = "test-key"
+models = ["first", "second"]
+
+[presets.latest]
+profile = "local"
+model = "second"
+
+[tcode_state]
+profile = "local"
+model = "first"
+"#,
+    )
+    .unwrap();
+
+    let mut pickers = tcode_app::picker::Pickers::unavailable(config.clone(), "unused");
+    pickers.models.options = vec![
+        tcode_frontend::ModelOption {
+            profile: "local".into(),
+            def: tcode_core::config::ModelDef::bare("first"),
+        },
+        tcode_frontend::ModelOption {
+            profile: "local".into(),
+            def: tcode_core::config::ModelDef::bare("second"),
+        },
+    ];
+    pickers.models.current = 0;
+    pickers.presets.options = vec![tcode_frontend::PresetOption {
+        key: "latest".into(),
+        label: "latest".into(),
+    }];
+    pickers.presets.current = None;
+    let agent = agent(MockProvider::new(Vec::new()), cwd.path());
+    let supervisor = Arc::new(Supervisor::new(
+        agent,
+        factory_at(config.clone()),
+        Arc::new(std::sync::Mutex::new(pickers)),
+        Vec::new(),
+    ));
+
+    std::fs::write(
+        &config,
+        r#"
+default_profile = "local"
+
+[profiles.local]
+provider = "anthropic"
+api_key = "test-key"
+models = ["first", "second", "team-model"]
+
+[models."team-model"]
+label = "Team Model (fresh)"
+context_window = 345678
+efforts = ["low", "high"]
+
+[presets.latest]
+profile = "local"
+model = "team-model"
+
+[tcode_state]
+preset = "latest"
+"#,
+    )
+    .unwrap();
+    let handle = supervisor.open_folder(cwd.path(), None).unwrap();
+    let state = tcode_app::commands::picker_state(&supervisor, handle.id.clone()).unwrap();
+
+    let fresh = state
+        .models
+        .iter()
+        .position(|model| model.label == "Team Model (fresh)")
+        .expect("fresh model is present");
+    assert_eq!(state.model, fresh);
+    assert_eq!(state.preset, Some(0));
+    assert_eq!(state.models[fresh].efforts, ["low", "high"]);
+    assert_eq!(state.context_window, 345_678);
+    assert_eq!(
+        handle.model().unwrap().snapshot().provider.model(),
+        "team-model"
+    );
 }
 
 /// Desktop slash commands keep their ledger semantics in Core: the bridge only
 /// selects the current session and interprets frontend-only effects.
 #[tokio::test]
-async fn desktop_slash_commands_clear_the_current_ledger_and_open_the_resume_picker() {
+async fn desktop_clear_keeps_its_core_ledger_semantics() {
     tcode_core::home::testing::temp_home();
     let cwd = tempfile::tempdir().unwrap();
     let agent = agent(MockProvider::new(vec![text_done("answer")]), cwd.path());
     let handle = handle("s1", cwd.path().to_path_buf());
-    let supervisor = Supervisor::new(agent.clone(), factory(), menus(), Vec::new());
+    let supervisor = Arc::new(Supervisor::new(
+        agent.clone(),
+        factory(),
+        menus(),
+        Vec::new(),
+    ));
     supervisor.open(handle.clone());
 
     run_turn(
@@ -1593,11 +1912,22 @@ async fn desktop_slash_commands_clear_the_current_ledger_and_open_the_resume_pic
         "/clear must also remove archived history"
     );
 
-    let picker = supervisor.dispatch_slash("s1", "/resume").unwrap();
-    assert!(matches!(
-        picker.effects.as_slice(),
-        [tcode_core::commands::CommandEffect::OpenResumePicker]
-    ));
+    let offered = tcode_app::commands::slash_commands(&supervisor);
+    assert!(offered.iter().any(|command| command.name == "/clear"));
+    assert!(offered.iter().any(|command| command.name == "/compact"));
+    assert!(
+        offered.iter().all(|command| command.name != "/resume"),
+        "stored conversations live in the rail, not the composer menu"
+    );
+    let Err(error) = tcode_app::commands::slash_command(
+        &sink(&Arc::new(Collector::default())),
+        &supervisor,
+        "s1".into(),
+        "/resume".into(),
+    ) else {
+        panic!("desktop /resume must be unavailable")
+    };
+    assert!(error.contains("unsupported desktop command"), "{error}");
 }
 
 /// Manual compaction is a real turn boundary for the desktop bridge: it streams

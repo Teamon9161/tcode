@@ -64,7 +64,6 @@ import { TermPane } from "./TermPane";
 import { Approval } from "./Approval";
 import { ProgressStrip } from "./ProgressStrip";
 import { QueueStrip } from "./QueueStrip";
-import { ResumePicker } from "./ResumePicker";
 import { RewindBar } from "./RewindBar";
 import type { RewindTarget } from "./rewind";
 import type { PlanDecision } from "./PlanEditor";
@@ -160,10 +159,6 @@ export type PaneContext = {
   onWithdrawQueued: (session: string, index: number, text: string) => void;
   /** Stop the turn that owns this queue and send it straight away. */
   onSendQueuedNow: (session: string, turn: number) => void;
-  /** Replace this conversation with the stored session selected by bare `/resume`. */
-  onResume: (session: string, id: string) => void;
-  /** Close this conversation's bare `/resume` picker without changing its ledger. */
-  onDismissResume: (session: string) => void;
   /** Ask what going back to this point would cost; `null` withdraws the ask. */
   onAskRewind: (session: string, target: RewindTarget | null) => void;
   onRewind: (session: string, restoreFiles: boolean) => void;
@@ -853,14 +848,6 @@ function SessionPane({
           }
           onSendNow={(turn) => context.onSendQueuedNow(session, turn)}
         />
-
-        {state.resumePicker && (
-          <ResumePicker
-            sessions={state.resumePicker}
-            onChoose={(id) => context.onResume(session, id)}
-            onCancel={() => context.onDismissResume(session)}
-          />
-        )}
 
         {state.running && <TurnStatus phase={state.activity} />}
 

@@ -64,11 +64,11 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     `ask_user` 走同一个面板的另一条分支，**按 input 形状识别（有 `questions[]`）而不是按工具名**。它有 2–4 个选项、可能多选、可能带 `preview`，答案聚合格式必须与 TUI 的 `QuestionPage::answer` 一致（单问题只发答案，多问题发 `N. 问题 → 答案`；选 "Something else" 时只发用户写的话，不许带上被拒绝的选项标签）——模型读到的是同一条 harness note，两个前端给出不同格式就是给同一个契约两个定义。
 
-    **转录与 composer 之间那一摞是一条带子，只画一根缝**（`.dock`）。审批、rewind 问句、队列、resume 选择器、计划条各自带 `border-top` 时单独看都对，摞起来就不对：队列上面一条、计划条上面又一条，中间夹着的那个看起来成了一个框。规则是 `.dock { border-top }` + `.dock ~ .dock { border-top: 0 }`——最靠上的那个画缝，后面几个不画，加第六个不需要新规则。**新加一个停在 composer 上方的东西就带上 `dock` 类，别自己画线。**
+    **转录与 composer 之间那一摞是一条带子，只画一根缝**（`.dock`）。审批、rewind 问句、队列、计划条各自带 `border-top` 时单独看都对，摞起来就不对：队列上面一条、计划条上面又一条，中间夹着的那个看起来成了一个框。规则是 `.dock { border-top }` + `.dock ~ .dock { border-top: 0 }`——最靠上的那个画缝，后面几个不画，加第五个不需要新规则。**新加一个停在 composer 上方的东西就带上 `dock` 类，别自己画线。**
 
 9c. **窗口使用 app 自绘标题栏**（`electron/main.js` 的 `frame: false`）。`.topbar` 与其 `--chrome` 背景是应用主题的一部分，不能继承系统 caption 颜色；最小化、最大化、关闭由 `WindowControls` 调 `invoke`（壳答 `window_*` 命令），`WindowDragRegion` 将 `data-drag-region` 只放在不含交互控件的 `.topbar-gap`，并保留双击最大化。Electron 读 `-webkit-app-region` 起拖（`app.css` 的 `[data-drag-region]`），窗口控制按钮靠 `no-drag` 覆盖。浏览器是原生 WebContentsView，会在 HTML 之上接收命中，因此它只能由 pane body 的 DOM rect 定位在标题栏下方，绝不能覆盖 drag region 或窗口控制。
 
-    **topbar 里只放 app 级别的东西**（返回启动台、折叠会话栏、显示偏好），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于整个 app 还是属于某个会话"：会话栏属于 app，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。
+    **topbar 里只放 app 级别的东西**（折叠会话栏、显示偏好），不放会话名、路径，也不放作用于某个会话的动作。判据是"这东西属于整个 app 还是属于某个会话"：会话栏属于 app，所以它的折叠开关在这儿；文件索引属于某个会话，所以它下沉到了那个窗格自己的 header。**文件夹选择也不在这儿**——分屏之后两个窗格是两个文件夹，"当前文件夹"在这一层是猜的，所以它是每个窗格 header 上的 `FolderMenu`（同时兼任窗格身份，会话名本来就等于文件夹名，画两遍是同一个事实占两个元素）。
 
 9e. **转录里的每一步只有一种形状**（`Transcript.tsx` 的 `TraceGroup` + `.trace-*`）。单个调用、连续读、连续编辑、连续命令、并发批次、sub-agent run 全走同一个组件与同一套 class。**不许再为某一类步骤新写一个容器**——曾经有五个近乎相同的组件配五套 class，后果是同一个工具时而是圆角卡片、时而只有一条线，取决于它前后有没有同类邻居。步骤之间不画线也不画框，靠 `.transcript-inner` 的节奏分隔（连续步骤 `--s-1`，与散文之间 `--s-4`）。理由不是审美：这些东西**会嵌套**（组里装调用、run 里装整份转录），而嵌套卡片是明令禁止的，行靠缩进可以无限嵌。
 
@@ -242,7 +242,7 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
 15. **模型/preset/role/模式的选择逻辑不在这里重写**（硬规则 1 的具体一例）。`picker.rs` 只做两件事：把 `tcode-frontend` 的 `ModelMenu`/`PresetMenu`/`AgentMenu` 转成 webview 能画的 JSON，和把选择转回那三个结构自带的闭包。切模型、写 `[tcode_state]`、重建 provider、重建全部 role pin、校验 preset 名——全在闭包里，TUI 的 `/model` 与 `/agents` 用的是同一批。**第二份"切模型"实现 = 第二个几乎正确的优先级链**（CLI flag > `[tcode_state]` > preset > config）。
 
-    **闭包只到"建好新 provider"为止，装进共享 `ModelCell` 是调用方的活**（`picker::choose_model` 收 `&ModelCell` 并 `swap`，与 TUI 的 `apply_model` 同构）。preset 的 `apply` 闭包自己持有 cell 会顺手换掉，单选模型的 `switch` 不会——两者不对称，所以丢掉 `switch` 的返回值能编译、能过其余测试，表现只是"chip 弹回旧值、下个请求还是老模型"。`tests/bridge.rs` 有一条钉住它。同理，panel 显示的 effort 必须读 `ModelCell` 快照，不许读 `ModelDef::default_effort`——那是配置里的默认值，不是正在跑的值，读错就把一次生效的选择画成死控件。
+    **闭包只到“建好新 provider”为止，装进当前会话的 `ModelCell` 是调用方的活**（`picker::choose_model` / `choose_preset` 收 `&ModelCell` 并 `swap`，与 TUI 的 `apply_model` / `apply_preset` 同构）。`switch` 返回一个 `ActiveModel`；preset 的 `apply` 除重建两张菜单外也返回所选 `ActiveModel`。丢掉任一返回值都能编译、能过大部分测试，表现只是“chip 弹回旧值、下个请求还是老模型”。`tests/bridge.rs` 用两个会话钉住它。同理，panel 显示的 effort 必须读该会话的 `ModelCell` 快照，不许读 `ModelDef::default_effort`——那是配置里的默认值，不是正在跑的值，读错就把一次生效的选择画成死控件。
 
     **preset 一换，三张菜单一起换**：`apply` 返回重建后的 `ModelMenu` 与 `AgentMenu`，`choose_preset` 必须两个都装回去。留着旧的 `agents` 等于让 panel 列出已经不存在的 pin。
 
@@ -252,7 +252,7 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     **模式名一律显示原始 key**（`default` / `accept-edits` / `auto` / `unsafe`），与 `/mode`、config 文件、`PermissionMode::label()` 同一套词；另起一套好听的名字（"Ask first"）会让见过第一套的人以为是另一组模式。
 
-    **模式按会话，模型按进程**：模式是"这个对话可以不问就做什么"，两个文件夹并排开时天然该不同；模型走共享 `ModelCell`，本来就是全窗口一个。模式记进 `[tcode_state]` 当新会话默认，**包括 `unsafe`**，这条与 TUI 的 `/mode` 必须一致（`picker::remember_mode` 与 `App::persist_mode` 是同一条规则的两处实现）。`unsafe` 曾经是唯一例外（"一次性放行不得静默武装以后每个会话"），代价全落在真的那样工作的人身上：每开一个会话重选一次自己早就选过的东西，而那次重选不是一个决定。提醒由常显的模式 chip 承担——它一直在屏幕上，一次点击就能改。
+    **模式与主模型都按会话，持久化状态只当新会话默认**：模式是“这个对话可以不问就做什么”，模型是“这个对话下一轮找谁回答”；两个文件夹并排开时两者都天然可能不同。每个 `SessionHandle` 持有自己的 `ModelCell` 与 picker 位置，webview 的 model/preset/save 命令都必须带 session id；共享 `Agent.model` 只是没有 session cell 的兼容回退。`[tcode_state]` 仍记最后一次选择，供之后新开的会话使用，不许拿它反向改动已经打开的其他会话。显式 role pin 仍按进程配置，但 `inherit` 必须在调用时解析当前 session 的主模型。模式默认**包括 `unsafe`**，这条与 TUI 的 `/mode` 必须一致（`picker::remember_mode` 与 `App::persist_mode` 是同一条规则的两处实现）。`unsafe` 曾经是唯一例外（“一次性放行不得静默武装以后每个会话”），代价全落在真的那样工作的人身上：每开一个会话重选一次自己早就选过的东西，而那次重选不是一个决定。提醒由常显的模式 chip 承担——它一直在屏幕上，一次点击就能改。
 
     **turn 跑着时改模式是 stage 不是丢**（`SessionHandle::staged_mode`）：`Session` 被跑 turn 的一方 take 走了（硬规则 4），所以选择存下来、`put_back` 时落地，chip 上显示 `→`。别改成"忙时报错"——那是把所有权约束当成用户的问题。
 
@@ -270,11 +270,11 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     **Esc 的优先级写在 `Workspace.tsx` 里，不靠挂载顺序。** 它和 `seat.ts` 都在 window 捕获阶段，`stopPropagation` 分不开同一元素上的两个监听，先跑的是先挂的（就是窗格那个）。所以窗格的 Esc 显式让位给两样东西：开着的 `.seated`，以及正在被输入的 input/textarea（树里的重命名、编辑器里没存的改动）。**Esc 永远不许是那个把你正在写的东西扔掉的键。**
 
-18. **"窗口怎么画"的偏好留在 webview，不进 config**（`ui/src/display.ts` + `DisplayMenu.tsx` + `rail.ts` 的项目顺序，都在 `localStorage`）。判据是这个开关能不能改变 agent 做的事：不能，就不是配置。`[tcode_state]` / `config.toml` 里每加一个字段都要同步 `tcode-config` skill（根 CLAUDE.md 的硬要求），而"显示不显示推理"错了只值一次点击，不值一条配置契约。反过来也成立：**任何影响一次 turn 的行为、发送内容或落盘内容的开关，绝不许悄悄住进 `localStorage`。**
+18. **"窗口怎么画"的偏好留在 webview，不进 config**（`ui/src/display.ts` + `DisplayMenu.tsx`，以及 `railData.ts` 的 Recent 隐藏名单，都在 `localStorage`）。判据是这个开关能不能改变 agent 做的事：不能，就不是配置。`[tcode_state]` / `config.toml` 里每加一个字段都要同步 `tcode-config` skill（根 CLAUDE.md 的硬要求），而"显示不显示推理"错了只值一次点击，不值一条配置契约。反过来也成立：**任何影响一次 turn 的行为、发送内容或落盘内容的开关，绝不许悄悄住进 `localStorage`。**
 
-    偏好按作用域归属，和用量那两笔账同理（规则 16）：`Display` 从 App 顶层的 `DisplayContext` 下发，所以 sub-agent 的转录跟着同一个开关走——转录递归时读的是同一个 context，不需要一处一份。什么该粘住也要想清楚：**项目顺序粘住，折叠状态不粘**——顺序是设一次就依赖的排列，折叠是为了眼下几分钟把长列表收起来，上周那个决定不该让今天的会话栏一半是收着的。
+    偏好按作用域归属，和用量那两笔账同理（规则 16）：`Display` 从 App 顶层的 `DisplayContext` 下发，所以 sub-agent 的转录跟着同一个开关走——转录递归时读的是同一个 context，不需要一处一份。什么该粘住也要想清楚：**隐藏 Recent 项目粘住，展开/折叠与 reveal 数量不粘**——前者是长期整理，后两者只是眼下几分钟控制一条长列表，上周那个决定不该让今天的会话栏一半是展开的。
 
-    读存下来的值时它是**数据**：每个字段逐个校验，认不出的落回默认，`localStorage` 抛异常（webview 关了存储）也必须能开窗——`loadDisplay` / `loadOrder` 都这么写。
+    读存下来的值时它是**数据**：每个字段逐个校验，认不出的落回默认，`localStorage` 抛异常（webview 关了存储）也必须能开窗——`loadDisplay` / `loadHidden` 都这么写。
 
 19. **"这个会话忙不忙"只有开 turn 的那把锁答得了**（`SessionHandle::send_or_queue`）。跑着就入队、闲着就把消息**交还**给调用方去开 turn，两件事在同一把锁下完成——先问 `is_busy()` 再动作的写法，只会在"turn 刚好结束的那一瞬间打字"时丢消息，那正是最难复现也最气人的丢法。前端一律不自己判：`send_message` 返回当前队列，空数组=已开始发送，非空=这就是要画在 composer 上面的东西。
 
@@ -313,21 +313,21 @@ npm start                                 # 从 crate 根目录启动 Electron �
 
     配套三条：**补全菜单 portal + `useSeat`**（硬规则 17，composer 在 `<form>` 里，且窗格会裁掉它），**焦点永不离开输入框**（菜单行 `onMouseDown` preventDefault；键盘在输入框里处理，靠 `aria-activedescendant` 关联），**桌面端支持哪些斜杠命令只有一份名单**（`commands.rs::DESKTOP_COMMANDS`，dispatch 与菜单同读；两份名单会让菜单推荐一个 dispatcher 拒绝的命令）。**skill 是同一条规则的第二半**：`/名字` 是加载该 skill 的简写（与 TUI 的 `App::dispatch_skill` 同义），菜单与 dispatch 都读 `Supervisor::skills()`——那是 boot 时发现、并且**交给 `skill` 工具的同一份列表**（`tcode_frontend::Booted::skills`），第二次 discover 会让这个窗口推荐一个 agent 手上没有的 skill。fallback 排在命令之后，所以 skill 永远盖不住命令；名字都对不上仍旧报错，"`/` 能指的东西变多"不等于"打错也能跑"。补全与 `@path` 校验两个 command 都是 `async` + `spawn_blocking`（规则 22）——它们在**打字过程中**跑，同步版本会把画界面的那条线程按住。
 
-22. **读文件系统的 command 一律 `async` + `tokio::task::spawn_blocking`。** 同步 command 跑在**主线程**上（`send_message` 的注释里已经写了这条的另一半），而主线程就是画界面那条线程：`project_sessions` 曾经是同步的，于是启动台上展开一个项目（replay 那个文件夹下每一条 session log 取 preview）会把整个窗口冻住——按钮、拖动区、另外几个窗格里正在跑的会话，一起停到读完为止。debug 构建下九十条对话实测 ~250ms，release ~35ms，冷盘更久，而它**看起来完全像 UI 卡顿而不像后端慢**，因为卡住的确实是 UI。
+22. **读文件系统的 command 一律 `async` + `tokio::task::spawn_blocking`。** 同步 command 跑在**主线程**上（`send_message` 的注释里已经写了这条的另一半），而主线程就是画界面那条线程：`project_sessions` 曾经是同步的，于是侧栏展开一个项目（replay 那个文件夹下每一条 session log 取 preview）会把整个窗口冻住——按钮、拖动区、另外几个窗格里正在跑的会话，一起停到读完为止。debug 构建下九十条对话实测 ~250ms，release ~35ms，冷盘更久，而它**看起来完全像 UI 卡顿而不像后端慢**，因为卡住的确实是 UI。
 
     **是 `spawn_blocking` 不是 `spawn`**：这是文件 IO，而 `spawn` 落到的那个 runtime 正是每个 turn 跑在上面的那个，占住一个 worker 几百毫秒等于让正在对话的会话陪着一起等。
 
-    第三条：**侧栏的历史是按需读的，不是随组一起读的**。`Recent` 带展开一个项目会触发一次 `project_sessions`（那是它唯一的内容），但**有活跃会话的组不会**——它的历史藏在 `Earlier · N` 那一行后面，点了才读。少了这条，开着三个文件夹启动 app 就是启动瞬间并发三次全量 replay，而那正是窗口该显得最快的时刻。
+    第三条：**侧栏的历史是按需、按页读的**。顶部 `Sessions` 只是已有内存状态，绝不触发 history IO；`Recent` 的项目默认折叠，首次展开才调用 `project_sessions(before=null)`，而且只 replay 20 条有效 preview。后续每次 `Load older` 把上一页最后一个 log id 当 cursor，再读下一页；滚动本身不触发 IO。少了这条，一个有百条记录的项目展开一次就会 replay 全部 JSONL，而那正是窗口看起来像冻住的路径。
 
-23. **同一个对话在侧栏里只许出现一次**（`SessionInfo.log_id`，由 `Session::log_id()` → `SessionHandle.log_id` 一路带上来）。侧栏把"活跃会话"和"能 resume 的 log"画在同一个项目组里，而一个活跃会话**自己就在往某个 log 上写**：不去重的话它会同时是上面那行活跃对话和下面那行 resume 目标，点下面那行就是 `open_folder(path, resume=同一个 id)`——**两个 `Ledger` 挂到同一个 JSONL 上**，这不是显示问题，是写坏会话记录。所以 `openLogs` 命中的那行画成 `open` 且禁用，**不许改成隐藏**：静默漏掉今天的工作看起来就像历史丢了。webview 那侧的 session id 是 `uuid::Uuid::new_v4()`，和 store 的 id 完全是两套空间，别想着拿 id 直接比。
+23. **同一个 session log 只许被一个 `Ledger` 打开**（`SessionInfo.log_id`，由 `Session::log_id()` → `SessionHandle.log_id` 一路带上来）。顶部 live row 与 `Recent` 项目下的 stored row 是两种入口：前者切换正在跑的会话，后者浏览这个文件夹的历史；所以同一对话可以在两处被看见，但 stored row 命中 `openLogs` 时必须画成 `open` 且禁用。隐藏它会让今天的工作看起来像丢了；启用它会执行 `open_folder(path, resume=同一个 id)`，让**两个 `Ledger` 挂到同一个 JSONL 上**。webview 的 session id 是 `uuid::Uuid::new_v4()`，和 store id 是两套空间，不能直接比。
 
-    连带一条：**picker 的 preview 不许走 `resume_path`**。`SessionStore::list` 现在用 `store.rs::preview` 逐行浅解析（`LogEvent` 是 internally tagged，反序列化一次要先把整行缓冲成一棵泛型树，等于把每条工具结果、每张贴进来的图解析两遍）。它照样是**重放**而不是扫描——`append`/`truncate_tail`/`compact` 三个操作全都实现，少一个 `/clear` 掉的对话就会复活；而"只认这三个"是安全的，因为 `Ledger` 本来就只有这三种变更（根 CLAUDE.md 的设计约束 2）。
+    连带一条：**历史页的 preview 不许走 `resume_path`**。`SessionStore::list_page` 用 `store.rs::preview` 逐行浅解析（`LogEvent` 是 internally tagged，反序列化一次要先把整行缓冲成一棵泛型树，等于把每条工具结果、每张贴进来的图解析两遍）。它照样是**重放**而不是扫描——`append`/`truncate_tail`/`compact` 三个操作全都实现，少一个 `/clear` 掉的对话就会复活；而"只认这三个"是安全的，因为 `Ledger` 本来就只有这三种变更（根 CLAUDE.md 的设计约束 2）。
 
 24. **终端坞永远不是新窗格的落座点**（`layout.ts::seatFor` / `openBeside`）。终端不是普通窗格，是**横在窗口底部的一条带**——所以 `toggleTerminal` 切的是 **root** 而不是邻居，而且它**故意把焦点留在终端里**（开一个还要点进去的终端等于开了一半）。于是所有"在当前窗格旁边打开"的入口（`show` / `showBeside` / `openWeb`）读到那个焦点，就会去切这条坞：`Mod+J` 之后再点浏览器，浏览器落在底部 30% 的一半宽度里，而浏览器是**按窗格 DOM rect 定位的原生子 webview**，被压成一条缝之后整条底部看起来就是**一片白**——所以它是以"白屏"被报上来的，不是以"布局不对"。任何不带显式目标窗格的开窗都必须走 `openBeside`；窗口里只剩坞时新窗格开在**它上面**（`split(..., first: true)`），坞是这个窗口的地板。
 
     连带一条：**`show` 的"接管当前窗格"只认 `focused`，不许退回 `seatFor`**。接管是对"人正待着的那个窗格"做的；用兜底挑出来的窗格去接管，等于"给我看 duck_ext"把树里排第一的那个对话直接关掉了。这条在改上面那半时踩过一次，`layout.test.ts` 里钉着。
 
-25. **响应式规则一律写在 `app.css` 末尾，写在它要盖掉的组件下面。** media query **不增加特异性**，所以 `@media { .rail-lines { display: none } }` 会被文件后面任何一条同特异性的 `.rail-lines { display: flex }` 打赢。这条是踩出来的：那个 `max-width: 900px` 的块原本挨着文件开头的 shells，于是它下面每个组件都悄悄赢了——侧栏在 52px 的列里照画不误，`needs you`、会话数、`Earlier` 全都溢出到窗格上面去。**它看起来像溢出 bug，其实是层叠顺序 bug**，所以盯着看也看不出来。窄栏另外给自己的盒子加了 `overflow: hidden` 兜底：新加一个元素忘了进列表，代价是少一个标签，而不是一行字横在对话上。
+25. **响应式规则一律写在 `app.css` 末尾，写在它要盖掉的组件下面。** media query **不增加特异性**，所以 `@media { .rail-lines { display: none } }` 会被文件后面任何一条同特异性的 `.rail-lines { display: flex }` 打赢。这条是踩出来的：那个 `max-width: 900px` 的块原本挨着文件开头的 shells，于是它下面每个组件都悄悄赢了——侧栏在 52px 的列里照画不误，项目名、历史 preview、加载计数全都溢出到窗格上面去。**它看起来像溢出 bug，其实是层叠顺序 bug**，所以盯着看也看不出来。窄栏另外给自己的盒子加了 `overflow: hidden` 兜底：新加一个元素忘了进列表，代价是少一个标签，而不是一行字横在对话上。
 
 ## 现有结构
 
@@ -335,15 +335,15 @@ npm start                                 # 从 crate 根目录启动 Electron �
 - `src/state.rs`：`Supervisor`（agent + `SessionFactory` + 会话表 + 顺序）、`SessionHandle`（会话私有的 session/cancel/pending）、`run_turn`。
 - `src/commands.rs`：命令实现，薄封装，只做参数校验后转 `state`/`projects`。注册在 `dispatch::Registry`（`src/dispatch.rs`），sidecar 按名字查表。
 - `src/boot.rs`：app 的 composition root，外加 `SessionFactory`（开第二个文件夹时**按该文件夹重新加载 config**，因为 `.tcode/config.toml` 是项目级的）。
-- `src/projects.rs`：启动台的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；带 preview 的完整重放留给用户真打开的那个项目（`project_sessions`）。
+- `src/projects.rs`：侧栏 `Recent` 的数据源。`~/.tcode/projects/<id>/` 的目录名是路径的**有损**变换（`store::project_id` 把非字母数字全折成 `-`），反推不回文件夹，所以真实路径只从每条 session log 首行的 `Meta{cwd}` 读——每个项目一行，够便宜；preview 则由 `project_sessions` 按 stable cursor 每次 replay 20 条。
 - `tests/bridge.rs`：scripted provider 驱动真实 agent loop，断言事件流、审批往返、fail-closed、双会话隔离、忙会话拒绝第二个 turn。**测试不打真 API。**
-  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`rail.ts`（侧栏分带/排序/搜索，纯函数）、`Rail.tsx` + `RailProject.tsx`（唯一的导航面：live 带 + `Recent` 带，每个项目下挂活跃会话与按需加载的历史）、`Finder.tsx`（标题栏里的 `Mod+P`，搜活跃会话与全部文件夹）、`FolderPicker.tsx`（“在哪开新会话”的菜单体，folder chip 与侧栏 New 共用一份）、`FieldEmpty.tsx`（没有窗格时的窗格场空态）、`Workspace.tsx`（标题栏 + 可折叠的侧栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`browserYield.ts`（让原生浏览器窗格暂时让位的唯一计数器）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`rail` 场景是没有窗格的窗口——侧栏满着、窗格场空着，也是看合并后侧栏的地方；`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
+  - `ui/src/`：`types.ts`（wire 契约）、`blocks.ts` 与 `files.ts`（事件→块树 / 事件→文件清单，都是纯函数 reducer）、`session.ts`（每个会话的 UI 状态，窗格按 id 查）、`layout.ts`（窗格树，纯函数）、`railData.ts`（Recent/标题/查找的纯函数）、`Rail.tsx` + `RailProject.tsx`（唯一的导航面：顶部编号 Sessions + `Recent` 项目，项目历史按 cursor 显式翻页）、`Finder.tsx`（标题栏里的 `Mod+P`，搜活跃会话与全部文件夹）、`FolderPicker.tsx`（“在哪开新会话”的菜单体，folder chip 与侧栏 New 共用一份）、`FieldEmpty.tsx`（没有窗格时的窗格场空态）、`Workspace.tsx`（标题栏 + 可折叠的侧栏 + 窗格场）、`Panes.tsx`（窗格树的渲染与窗格外框；浏览器入口在会话窗格的文件工具组）、`FolderMenu.tsx`（窗格 header 上的身份兼文件夹选择器）、`seat.ts`（portal popover 的定位与消解，见硬规则 17）、`browserYield.ts`（让原生浏览器窗格暂时让位的唯一计数器）、`theme/`（token 契约与主题包）、`preview/`（只在 `--mode preview` 下加载的 fixture，`rail` 场景是没有窗格的窗口——侧栏满着、窗格场空着，也是看合并后侧栏的地方；`split` 场景是三窗格嵌套，专门用来看递归对不对；`plan` 场景是带评论与改动的审批面板；`model` 场景会自己把模型面板点开，因为静态看一遍看不到它；场景名进 URL 的 `?scene=`，所以一个状态可以直接链接、刷新也还在）。
   - **模型这一摊**：`picker.ts`（wire 类型 + 纯函数：按 profile 分组、pin 的措辞、effort 槽位）、`ModelPanel.tsx`（面板本体，见硬规则 15）、`Chips.tsx`（composer 下面那条：模式菜单 + 用量环 + 面板的触发 chip）。`mock-core.ts` 里的 picker fixture 是**可变的**，与其他静态 fixture 不同：这个面板的验收标准就是"选完能回读"，一个永远回答 `Opus 5 · high` 的 fixture 演示不出来。
   - **用量这一摊**：`usage.ts`（两笔账的类型 + 纯 reducer + 措辞：token 缩写、窗口名从 `window_minutes` 推、reset 倒计时）、`UsagePanel.tsx`（strip 上那个环 + 展开的面板）、`session.ts` 的 `LimitsContext`。见硬规则 16。窗口大小走 `picker_state.context_window`（读活着的 `ModelCell`，不是配置默认值——理由同 effort）。
   - **计划这一摊**：`plan.ts`（类型 + 全部纯操作：改/增删/换序/状态循环、计划条的行、`planChanges` 结构化比对）、`selection.ts`（选区→引用，纯函数）、`PlanEditor.tsx`（审批面板与计划窗格共用同一个编辑器、同一份 draft）、`ProgressStrip.tsx`（composer 上方那一行）、`components/SelectionBubble.tsx`。**编辑靠 id 认行**（`DraftPhase.id`，只在一次编辑里有效、不落盘），所以"改名"是改名而不是"删一个加一个"；按标题匹配那条路恰好在用户最认真的时候错得最狠。
   - **`blocks.ts` 不叫 `transcript.ts`**：那个名字与 `Transcript.tsx` 只差大小写，在不区分大小写的文件系统上 tsc 会把两个 import 解析成同一个文件，Windows 上直接构建失败。同理，新增模块别取只和某个组件差大小写的名字。
   - **块是树**：`run`（sub-agent）与 `batch` 持有子块。`TaskRunEvent` 裹的是一个完整的 `AgentEvent`，所以 sub-agent 的内容就是同一个 reducer 递归一层——嵌套 run 不需要任何额外代码。`runPairs` / `reportOf` 是这棵树上的两个纯查询，把委派调用和它的 run 认成一步（见硬规则 9f）。
-  - **会话栏这一摊**：`rail.ts`（纯函数：按 cwd 分组、项目换序、从第一条 user 块取会话标题 + 顺序的 `localStorage` 存取）、`Workspace.tsx` 的 `RailProject`。**会话名不是文件夹名**：会话名等于文件夹名，所以同一个文件夹开两个会话就是两条一模一样的行，会话栏能把它们都列出来却说不清哪个是哪个。文件夹上升成分组标题，行上写"这个会话是被要求做什么的"（第一条 prompt，不是最后一条——对话是为它开的那件事而存在，跟着最新消息改名等于每打一行字就改一次名）。换序用 Alt+方向 + hover 出来的两个按钮，与 `PlanEditor` 同一套词汇；**存下来的顺序只记被移动过的文件夹**，没记过的按到达顺序排在后面，这样新开一个文件夹不会把已经排好的打乱。
+  - **会话栏这一摊**：`railData.ts`（纯函数：Recent 按时间、每次 reveal 8 个、从第一条 user 块取会话标题、finder 查询）、`Rail.tsx`（顶部 flat Sessions + Recent/New）、`RailProject.tsx`（每页 20 条的 stored history）。**编号必须直接用 `sessions[]` 的顺序**：`Workspace.tsx` 的 `Mod+1…9` 也是这份数组，另排一次序就会让屏幕上的数字撒谎。live row 第一行写第一条 prompt，第二行写 `project · activity`；Recent 即使已有活跃会话也保留该 project，因为一个是切换正在跑的对话，一个是从这个文件夹新开/恢复。项目只按 `project_list` 的最近时间排序，不再持久化人工顺序；超出首屏的项目每次显式 reveal 8 个。
   - **文件树是"往哪儿去"的那个窗格，不是"看什么"的那个**（`layout.ts::browsing` / `browserPane`）。`openInspect` 复用 inspect 窗格时**跳过正在浏览的那个**，所以点一个文件是开在树旁边而不是把树顶掉，第二次点复用第一次开出来的那个窗格——"点击换文件、树不动"就是这一条，没有 tab 条也没有 preview 槽。`openAside`（右键 open in → 一个新窗格 / Mod+点击 / Mod+Enter）永远新分裂一个，这是"再开一个"这个明确的动作，和会话的 `show` / `showBeside` 是同一组区分。从树里分裂出来的窗格默认给树 `BROWSER_SHARE`（0.34）而不是一半：一列文件名和文件本身不是同量级的东西。
   - **外部打开的两条边界**（`src/openers.rs`）：webview 送的是**表里的 id**（`vscode`/`cursor`/`zed`/`reveal`），永远不是命令行——认不出就报错，不猜（规则 3）；路径先过 `Workspace::host_path`（与读写同一套 link/canonical 检查）再交出去。Windows 上 `code` 是 `.cmd`，`CreateProcess` 跑不了批处理，只能过 `cmd.exe`，所以**路径里含 cmd 元字符时整条拒绝**而不是加引号赌一把——仓库里允许有叫 `a&b.txt` 的文件，这个 app 不允许去跑它。检测是文件系统探测（PATH + 各平台固定安装位置），没装的编辑器**不进菜单**，而不是进了菜单点了才失败。
   - **一个 inspect 窗格是单值槽，不是 tab 容器**（`inspect.ts`）。它只持有一个 `Inspect` 值，栈底是文件索引；转录里的路径、文件行、run、artifact 全都只调 `open(...)`。前进/后退因此是白拿的，新增一种可检视的东西 = 加一个 `kind`，不是加一个 tab。**分屏没有削弱这条，反而更纯粹**：想同时看两样东西就分两个窗格，不是在一个窗格里长出 tab 条。每个会话只复用一个 inspect 窗格（`openInspect`），所以连开五样东西是五条历史记录而不是五个窗格。

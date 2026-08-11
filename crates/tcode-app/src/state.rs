@@ -20,7 +20,7 @@ use tokio_util::sync::CancellationToken;
 use tcode_core::progress::{Progress, ProgressState};
 use tcode_core::{
     commands::{CommandCtx, CommandOutcome, CommandRegistry, EnvironmentFn, OpeningContextFn},
-    Agent, AgentError, AgentEvent, ContentBlock, Session,
+    Agent, AgentError, AgentEvent, ContentBlock, ModelCell, Session,
 };
 
 use crate::boot::SessionFactory;
@@ -32,12 +32,18 @@ use crate::bridge::{
 struct TurnControl {
     id: Option<u64>,
     cancel: CancellationToken,
+    /// Vision capability of the model snapshotted by the running turn. Queued
+    /// images must be encoded for that model, not a mid-turn picker change.
+    supports_vision: Option<bool>,
 }
 
 /// One conversation, with everything that is private to it.
 pub struct SessionHandle {
     pub id: String,
     pub cwd: PathBuf,
+    /// Where transient files for this conversation live. Captured at open so
+    /// queued input can still save pasted images while a turn owns `Session`.
+    scratch_dir: PathBuf,
     /// The session log this conversation appends to. Captured here at open —
     /// like `progress` and `queue`, and for the same reason: the field lives on
     /// the `Session`, which is `None` for the whole of a running turn, and the
@@ -45,6 +51,13 @@ pub struct SessionHandle {
     pub log_id: Option<String>,
     /// `None` while a turn is running — see the module comment.
     session: Mutex<Option<Session>>,
+    /// The conversation's independently swappable main model. Kept outside
+    /// `session` so a pick can take effect while a running turn owns it; that
+    /// turn has already snapshotted its model, and the next one sees the swap.
+    model: Option<ModelCell>,
+    /// Main-model and preset metadata/closures loaded for this folder. Kept
+    /// outside `session` so the picker remains usable while a turn owns it.
+    pub(crate) main_pickers: Mutex<crate::picker::MainPickers>,
     /// The session's plan cell, held separately *because* of that `Option`: a
     /// phase flips and a draft reaches review while the turn owns the session,
     /// which is exactly when the plan surface has something new to show. Reading
@@ -90,6 +103,22 @@ pub enum TurnError {
 
 impl SessionHandle {
     pub fn new(id: String, cwd: PathBuf, session: Session) -> Self {
+        Self::with_main_pickers(
+            id,
+            cwd,
+            session,
+            crate::picker::MainPickers::unavailable("model picker unavailable in this session"),
+        )
+    }
+
+    pub fn with_main_pickers(
+        id: String,
+        cwd: PathBuf,
+        session: Session,
+        main_pickers: crate::picker::MainPickers,
+    ) -> Self {
+        let model = session.tool_ctx.model.clone();
+        let scratch_dir = session.tool_ctx.scratch_dir.clone();
         let monitor_signal = session
             .tool_ctx
             .background
@@ -99,6 +128,7 @@ impl SessionHandle {
         Self {
             id,
             cwd,
+            scratch_dir,
             log_id: session.log_id().map(str::to_owned),
             progress: session.tool_ctx.progress_cell(),
             queue: session.pending.clone(),
@@ -106,14 +136,37 @@ impl SessionHandle {
             monitor_signal,
             idle: Arc::new(Notify::new()),
             closed: CancellationToken::new(),
+            model,
+            main_pickers: Mutex::new(main_pickers),
             session: Mutex::new(Some(session)),
             turn: Mutex::new(TurnControl {
                 id: None,
                 cancel: CancellationToken::new(),
+                supports_vision: None,
             }),
             next_turn: std::sync::atomic::AtomicU64::new(0),
             pending: Pending::default(),
         }
+    }
+
+    /// The model cell and picker selection private to this conversation.
+    pub fn model(&self) -> Option<ModelCell> {
+        self.model.clone()
+    }
+
+    /// Vision capability to use when composing a prompt. While a turn owns the
+    /// session, queued input joins that turn at its next safe boundary and must
+    /// therefore match the turn's frozen model snapshot.
+    pub fn input_supports_vision(&self, fallback: &ModelCell) -> bool {
+        let running = self.turn.lock().unwrap().supports_vision;
+        running.unwrap_or_else(|| {
+            self.model
+                .as_ref()
+                .unwrap_or(fallback)
+                .snapshot()
+                .provider
+                .supports_vision()
+        })
     }
 
     /// The mode this conversation is under, and whether a running turn still
@@ -343,14 +396,10 @@ impl SessionHandle {
     }
 
     /// Where this session may drop files that are not the user's to keep —
-    /// pasted images the current model cannot see, for one. `None` while a turn
-    /// holds the session, which is also when nothing can be sent to it.
+    /// pasted images the current model cannot see, for one. This remains
+    /// available while a turn owns the `Session`, when new input is queued.
     pub fn scratch_dir(&self) -> Option<PathBuf> {
-        self.session
-            .lock()
-            .unwrap()
-            .as_ref()
-            .map(|session| session.tool_ctx.scratch_dir.clone())
+        Some(self.scratch_dir.clone())
     }
 
     /// This conversation's plan as it is right now, or `None` when it has none.
@@ -458,21 +507,32 @@ impl SessionHandle {
         }
     }
 
-    fn begin_turn(&self) -> (u64, CancellationToken) {
+    fn begin_turn(&self, session: &mut Session, fallback: &ModelCell) -> (u64, CancellationToken) {
         use std::sync::atomic::Ordering;
 
+        // One physical turn gets one immutable model view. Core, inherited
+        // helper roles, and queued-image composition all resolve through this
+        // exact snapshot even if the live session picker changes mid-turn.
+        let active = self.model.as_ref().unwrap_or(fallback).snapshot();
+        let supports_vision = active.provider.supports_vision();
+        session.tool_ctx.model = Some(ModelCell::new(active));
         let id = self.next_turn.fetch_add(1, Ordering::Relaxed);
         let cancel = CancellationToken::new();
         let mut control = self.turn.lock().unwrap();
         control.id = Some(id);
         control.cancel = cancel.clone();
+        control.supports_vision = Some(supports_vision);
         (id, cancel)
     }
 
-    fn finish_turn(&self, id: u64) {
+    fn finish_turn(&self, id: u64, session: &mut Session) {
+        // Reattach the conversation's live cell before it becomes idle or a
+        // queued successor starts. A picker change made mid-turn is now visible.
+        session.tool_ctx.model = self.model.clone();
         let mut control = self.turn.lock().unwrap();
         if control.id == Some(id) {
             control.id = None;
+            control.supports_vision = None;
         }
     }
 
@@ -563,10 +623,10 @@ pub struct Supervisor {
     commands: CommandRegistry,
     opening_context: OpeningContextFn,
     environment: EnvironmentFn,
-    /// The model/preset menus the composer's chips read and write. Process-wide
-    /// rather than per-session: they act on the shared `ModelCell` and on the
-    /// selected config file, both of which every conversation in this window
-    /// already shares.
+    /// Process-wide menu definitions, persisted defaults, and auxiliary-role
+    /// pins. Each `SessionHandle` keeps its own main-model cell and selected
+    /// model/preset row; applying a choice uses these menus to rebuild that
+    /// session while recording the default for sessions opened afterwards.
     menus: crate::picker::Menus,
     /// The skills `/name` can load, discovered once at boot and shared with the
     /// `skill` tool (`tcode_frontend::Booted::skills`). Reading the same list
@@ -654,11 +714,12 @@ impl Supervisor {
         cwd: &Path,
         resume: Option<String>,
     ) -> anyhow::Result<Arc<SessionHandle>> {
-        let session = self.factory.open(cwd, resume)?;
-        let handle = Arc::new(SessionHandle::new(
+        let opened = self.factory.open(cwd, resume)?;
+        let handle = Arc::new(SessionHandle::with_main_pickers(
             uuid::Uuid::new_v4().to_string(),
             cwd.to_path_buf(),
-            session,
+            opened.session,
+            opened.main_pickers,
         ));
         self.open(handle.clone());
         Ok(handle)
@@ -763,7 +824,7 @@ async fn run_monitor_turn(
     let Some(mut session) = handle.take() else {
         return Err(TurnError::Busy(handle.id.clone()));
     };
-    let (turn, cancel) = handle.begin_turn();
+    let (turn, cancel) = handle.begin_turn(&mut session, &agent.model);
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
     let approver = WebviewApprover::new(handle.id.clone(), emit.clone(), handle.pending());
@@ -786,8 +847,8 @@ async fn run_monitor_turn(
     let _ = pump.await;
     handle.pending.clear();
 
+    handle.finish_turn(turn, &mut session);
     let (next_session, waiting) = handle.put_back_or_take_queued(session);
-    handle.finish_turn(turn);
     if let Some(session) = next_session {
         let message = merge_queued(waiting).expect("non-empty queue reserves the session");
         return run_owned_turn(
@@ -828,7 +889,7 @@ pub async fn run_compact(
     let Some(mut session) = handle.take() else {
         return Err(TurnError::Busy(handle.id.clone()));
     };
-    let (turn, cancel) = handle.begin_turn();
+    let (turn, cancel) = handle.begin_turn(&mut session, &agent.model);
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let pump = tokio::spawn(pump_events(handle.id.clone(), emit.clone(), rx));
     emit.emit(
@@ -869,8 +930,8 @@ pub async fn run_compact(
     let _ = pump.await;
     handle.pending.clear();
 
+    handle.finish_turn(turn, &mut session);
     let (next_session, waiting) = handle.put_back_or_take_queued(session);
-    handle.finish_turn(turn);
     if let Some(session) = next_session {
         let message = merge_queued(waiting).expect("non-empty queue reserves the session");
         return run_owned_turn(
@@ -948,7 +1009,7 @@ async fn run_owned_turn(
     mut queued_echo: Option<(String, Vec<String>)>,
 ) -> Result<(), TurnError> {
     loop {
-        let (turn, cancel) = handle.begin_turn();
+        let (turn, cancel) = handle.begin_turn(&mut session, &agent.model);
 
         // Depth 1: the pump forwards as fast as the webview accepts, and a deeper
         // queue would only let the transcript drift further behind the ledger.
@@ -1018,8 +1079,8 @@ async fn run_owned_turn(
         // Whatever the turn's fate, no dialog it opened may still be answerable.
         handle.pending.clear();
 
+        handle.finish_turn(turn, &mut session);
         let (next_session, waiting) = handle.put_back_or_take_queued(session);
-        handle.finish_turn(turn);
         let Some(next_session) = next_session else {
             // The session is back only after no queued successor was reserved.
             let (context_tokens, context_estimated) = handle.context(&agent);

@@ -444,7 +444,7 @@ mod tests {
                 options: Vec::new(),
                 current: None,
                 apply: Box::new(|_| Err("no presets in test".to_string())),
-                save: Box::new(|_, _, _| Err("no presets in test".to_string())),
+                save: Box::new(|_, _, _, _| Err("no presets in test".to_string())),
             },
         )
     }

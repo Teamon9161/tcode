@@ -33,6 +33,8 @@ export type RoleChoice = {
 
 export type PickerState = {
   models: ModelChoice[];
+  /** Process-global catalog used by explicit role pins. */
+  role_models: ModelChoice[];
   model: number;
   effort: string | null;
   /** The running model's window, in tokens. What the context ring divides by. */

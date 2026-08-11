@@ -132,7 +132,8 @@ impl App {
     /// the TUI only takes the menus back and says what happened.
     pub(super) fn apply_preset(&mut self, name: &str) {
         match (self.presets.apply)(name) {
-            Ok((menu, agents, label, warnings)) => {
+            Ok((menu, agents, active, label, warnings)) => {
+                self.model.swap(active);
                 self.menu = menu;
                 self.agents = agents;
                 self.presets.current = self
@@ -155,7 +156,7 @@ impl App {
     pub(super) fn save_preset(&mut self, name: &str) {
         let draft = model_picker::PresetDraft {
             main: (!self.menu.options.is_empty()).then_some(self.menu.current),
-            main_effort: self.agent.model.snapshot().effort,
+            main_effort: self.model.snapshot().effort,
             roles: self
                 .agents
                 .roles
@@ -164,7 +165,7 @@ impl App {
                 .map(|(role, pin)| (role.key.clone(), pin.clone()))
                 .collect(),
         };
-        match (self.presets.save)(name, &draft, &self.menu) {
+        match (self.presets.save)(name, &draft, &self.menu, &self.menu.options) {
             Ok((options, current, outcome)) => {
                 self.presets.options = options;
                 self.presets.current = Some(current);
@@ -243,6 +244,7 @@ impl App {
                         };
                         match (self.provider_setup.refresh)() {
                             Ok((menu, agents, warnings)) => {
+                                self.model.swap(self.agent.model.snapshot());
                                 self.menu = menu;
                                 self.agents = agents;
                                 self.reply(format!("{who} · /model to pick a Codex model"));
@@ -270,6 +272,7 @@ impl App {
         let config = *done;
         match (self.provider_setup.apply)(config) {
             Ok((menu, agents, warnings)) => {
+                self.model.swap(self.agent.model.snapshot());
                 self.menu = menu;
                 self.agents = agents;
                 let current = self
@@ -289,8 +292,8 @@ impl App {
         }
     }
 
-    /// Hot-swap the shared ModelCell; a running turn finishes on its
-    /// snapshot, the next request uses the new model.
+    /// Hot-swap this session's `ModelCell`; a running turn finishes on its
+    /// snapshot, and the next request uses the new model.
     pub(super) fn apply_model(&mut self, index: usize, effort: Option<String>) {
         let Some(opt) = self.menu.options.get(index) else {
             return;
@@ -299,7 +302,7 @@ impl App {
             Ok(active) => {
                 let label = active.describe();
                 let name = active.provider.name().to_string();
-                self.agent.model.swap(active);
+                self.model.swap(active);
                 self.menu.current = index;
                 self.reply(format!("model → {name} · {label}"));
             }

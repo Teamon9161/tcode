@@ -101,7 +101,7 @@ fn config() -> crate::TuiConfig {
             options: Vec::new(),
             current: None,
             apply: Box::new(|_| Err("no presets in tests".into())),
-            save: Box::new(|_, _, _| Err("no presets in tests".into())),
+            save: Box::new(|_, _, _, _| Err("no presets in tests".into())),
         },
         provider_setup: crate::ProviderSetup {
             // Never the real ~/.tcode/config.toml: tests must neither depend
@@ -173,11 +173,17 @@ pub(super) fn app_for_plan_handoff(
         height,
         crate::TuiConfig {
             menu: ModelMenu {
-                options: vec![crate::model_picker::ModelOption {
-                    profile: "test".into(),
-                    def: tcode_core::config::ModelDef::bare("handoff-model"),
-                }],
-                current: 0,
+                options: vec![
+                    crate::model_picker::ModelOption {
+                        profile: "test".into(),
+                        def: tcode_core::config::ModelDef::bare("execution-model"),
+                    },
+                    crate::model_picker::ModelOption {
+                        profile: "test".into(),
+                        def: tcode_core::config::ModelDef::bare("planning-model"),
+                    },
+                ],
+                current: 1,
                 switch: Box::new(move |_, _| {
                     Ok(ActiveModel {
                         provider: Arc::new(PendingProvider(captured_requests.clone())),

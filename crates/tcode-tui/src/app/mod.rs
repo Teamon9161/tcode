@@ -44,8 +44,9 @@ use tcode_core::commands::{
     CommandCtx, CommandEffect, CommandMessage, CommandRegistry, MessageKind,
 };
 use tcode_core::{
-    Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver, BatchApproval, BatchAsk,
-    CohortMemberRun, ContentBlock, FolderTrust, PendingMessage, ReferenceCandidate, Session, Usage,
+    ActiveModel, Agent, AgentError, AgentEvent, Approval, ApprovalDecision, Approver,
+    BatchApproval, BatchAsk, CohortMemberRun, ContentBlock, FolderTrust, ModelCell, PendingMessage,
+    ReferenceCandidate, Session, Usage,
 };
 
 use tcode_importers::{
@@ -279,6 +280,12 @@ const BATCH_ITEM_INDENT: &str = "    ";
 
 pub struct App {
     agent: Arc<Agent>,
+    /// The current conversation's main model, retained while a turn owns the
+    /// `Session` so UI picks and status reads remain session-scoped.
+    model: ModelCell,
+    /// Vision capability of the model frozen by the running turn. Input queued
+    /// behind that turn must be encoded for it, not a mid-turn `/model` pick.
+    turn_supports_vision: Option<bool>,
     opening_context: OpeningContextFn,
     environment: EnvironmentFn,
     registry: CommandRegistry,
@@ -513,6 +520,8 @@ pub struct App {
 struct PlanExecution {
     plan: String,
     progress_path: PathBuf,
+    model: ActiveModel,
+    model_index: usize,
 }
 
 #[derive(Clone)]
@@ -563,6 +572,7 @@ impl App {
         // at a few frames a second.
         let (voice_tx, voice_rx) = mpsc::channel(16);
         let voice = Voice::new(voice_config, voice_tx, Voice::default_factory());
+        let model = agent.model_cell(&session).clone();
         let mode_label = session.mode.label().to_string();
         let committed_mode = session.mode;
         let pending_mode = session.pending_mode.clone();
@@ -601,6 +611,8 @@ impl App {
             .monitor_signal();
         Ok(Self {
             agent,
+            model,
+            turn_supports_vision: None,
             opening_context,
             environment,
             registry: CommandRegistry::builtin(),
@@ -880,11 +892,11 @@ impl App {
             menu: &self.menu,
             agents: &self.agents,
             presets: &self.presets,
-            effort: self.agent.model.snapshot().effort,
+            effort: self.model.snapshot().effort,
             // Live, not from the menus: a `/model` switch swaps the cell
             // without rebuilding them, and the vision row must reflect the
             // line-up actually running.
-            can_view_images: self.agent.models.can_view_images(&self.agent.model),
+            can_view_images: self.agent.models.can_view_images(&self.model),
             width: area_width(&self.terminal),
             height: area_height(&self.terminal),
         }
@@ -1132,7 +1144,7 @@ impl App {
             self.overlay = Some(overlay);
             return;
         };
-        let effort = self.agent.model.snapshot().effort;
+        let effort = self.model.snapshot().effort;
         match model_picker::Picker::with_title(&self.menu, effort.as_deref(), "◈ execution model")
         {
             Some(picker) => {
@@ -1180,11 +1192,11 @@ impl App {
             self.overlay = Some(Overlay::Approval(Box::new(dialog), reply));
             return;
         };
-        self.agent.model.swap(active);
-        self.menu.current = index;
         self.pending_plan_execution = Some(PlanExecution {
             plan,
             progress_path,
+            model: active,
+            model_index: index,
         });
         self.finish_approval(dialog, reply, approval);
     }
@@ -2420,6 +2432,7 @@ mod tests {
         );
 
         app.press(KeyCode::Enter);
+        app.press(KeyCode::Up);
         app.press(KeyCode::Enter);
         let approval = rx.try_recv().expect("the planning turn receives approval");
         assert!(approval.end_turn_after_execution);
@@ -2444,6 +2457,10 @@ mod tests {
         assert!(
             !frame.contains("Review plan"),
             "the prior planning transcript is not carried into the new session: {frame}"
+        );
+        assert_eq!(
+            app.menu.current, 0,
+            "the fresh session's picker follows its selected execution model"
         );
         assert_eq!(
             created_modes.lock().expect("mode log").as_slice(),
@@ -3482,6 +3499,30 @@ mod tests {
         };
         assert_eq!(img.placeholder(), "[Image #2]");
         assert_eq!(txt.placeholder(), "[Pasted text #7]");
+    }
+
+    #[test]
+    fn queued_images_use_the_running_turns_vision_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        assert!(
+            app.model.snapshot().provider.supports_vision(),
+            "the idle harness model accepts images"
+        );
+        app.turn_supports_vision = Some(false);
+        app.attachments.push(Attachment::Image {
+            id: 1,
+            bytes: vec![1, 2, 3],
+            media_type: "image/png",
+            label: "Image #1".into(),
+        });
+
+        let message = app.compose_draft("inspect [Image #1]".into());
+
+        assert!(matches!(
+            message.blocks.first(),
+            Some(ContentBlock::Text { .. })
+        ));
     }
 
     #[test]

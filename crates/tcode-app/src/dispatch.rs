@@ -218,10 +218,10 @@ impl Registry {
         result!(t, "slash_command", c::slash_command[emit, supervisor](session, line));
         value!(t, "tool_views", c::tool_views[supervisor]());
 
-        // Projects. Both read every log in a folder, so both are async and
-        // land on a blocking pool — rule 22.
+        // Project discovery is cheap; conversation previews are cursor-paged.
+        // Both use blocking file IO, so neither runs on the renderer thread.
         async_result!(t, "project_list", c::project_list[]());
-        async_result!(t, "project_sessions", c::project_sessions[](path));
+        async_result!(t, "project_sessions", c::project_sessions[](path, before));
 
         // The workspace.
         result!(
@@ -318,11 +318,15 @@ impl Registry {
         result!(
             t,
             "choose_model",
-            c::choose_model[supervisor](index, effort)
+            c::choose_model[supervisor](session, index, effort)
         );
-        result!(t, "choose_preset", c::choose_preset[supervisor](key));
+        result!(
+            t,
+            "choose_preset",
+            c::choose_preset[supervisor](session, key)
+        );
         result!(t, "pin_role", c::pin_role[supervisor](kind, pin));
-        result!(t, "save_preset", c::save_preset[supervisor](name));
+        result!(t, "save_preset", c::save_preset[supervisor](session, name));
 
         // What somebody typed in the address bar, as a URL. A backend command
         // and not a `browser_*` verb on purpose: it needs no view, and the

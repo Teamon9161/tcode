@@ -10,6 +10,7 @@ import type {
   OpenedSession,
   SessionInfo,
   StoredSession,
+  StoredSessionsPage,
 } from "../types";
 import type { PickerState, PinChoice } from "../picker";
 import { TERMINAL_OUTPUT } from "../types";
@@ -24,7 +25,7 @@ const PROJECTS: ProjectList = {
     {
       path: "/home/teamon/code/rust/tcode",
       name: "tcode",
-      session_count: 14,
+      session_count: 44,
       last_active: NOW - 60 * 12,
       exists: true,
     },
@@ -91,6 +92,11 @@ const HISTORY: StoredSession[] = [
     preview: "add a test for the ledger compact path",
     modified: NOW - 60 * 60 * 30,
   },
+  ...Array.from({ length: 41 }, (_item, index): StoredSession => ({
+    id: `0193${(0xed - index).toString(16).padStart(2, "0")}`,
+    preview: `older session ${index + 4}: keep the history list incremental`,
+    modified: NOW - 60 * 60 * (48 + index * 7),
+  })),
 ];
 
 const OPEN: SessionInfo[] = [];
@@ -120,6 +126,20 @@ const MODES = [
  */
 const PICKER: PickerState = {
   models: [
+    {
+      profile: "anthropic",
+      label: "Opus 5",
+      efforts: ["low", "medium", "high"],
+    },
+    {
+      profile: "anthropic",
+      label: "Sonnet 5",
+      efforts: ["low", "medium", "high"],
+    },
+    { profile: "openai", label: "gpt-5.1-codex", efforts: ["medium", "high"] },
+    { profile: "deepseek", label: "deepseek-v4-flash[1m]", efforts: [] },
+  ],
+  role_models: [
     {
       profile: "anthropic",
       label: "Opus 5",
@@ -809,8 +829,21 @@ export async function invoke<T>(
       return "/home/teamon/code/rust/tcode" as T;
     case "project_list":
       return PROJECTS as T;
-    case "project_sessions":
-      return HISTORY as T;
+    case "project_sessions": {
+      const before = typeof args?.before === "string" ? args.before : null;
+      const start = before
+        ? Math.max(0, HISTORY.findIndex((session) => session.id === before) + 1)
+        : 0;
+      const sessions = HISTORY.slice(start, start + 20);
+      const page: StoredSessionsPage = {
+        sessions,
+        next:
+          start + sessions.length < HISTORY.length
+            ? (sessions.at(-1)?.id ?? null)
+            : null,
+      };
+      return page as T;
+    }
     case "sessions":
       return OPEN as T;
     case "open_folder":
@@ -937,7 +970,6 @@ export async function invoke<T>(
       return [
         { name: "/compact", help: "summarize history · /compact <focus>" },
         { name: "/clear", help: "start a fresh conversation" },
-        { name: "/resume", help: "resume a session: /resume <id>" },
       ] as T;
     case "workspace_read_text":
       return readWorkspace(args) as T;

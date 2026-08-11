@@ -295,7 +295,7 @@ impl App {
     /// no box-width arithmetic to break on narrow terminals.
     pub(super) fn banner(&self) -> Vec<Line<'static>> {
         use unicode_width::UnicodeWidthStr;
-        let model = self.agent.model.snapshot();
+        let model = self.model.snapshot();
         let version = format!("v{}", env!("CARGO_PKG_VERSION"));
         let term_w = self.terminal.size().map(|s| s.width).unwrap_or(80) as usize;
 
@@ -497,7 +497,7 @@ impl App {
             Phase::Idle => None,
         };
         let width = area_width(&self.terminal);
-        let status_model_label = self.agent.model.snapshot().describe();
+        let status_model_label = self.model.snapshot().describe();
         let mode_label = self.mode_label.clone();
         // Rewind navigation and an overlay take over interaction, so status
         // values remain visible but are not clickable while either is active.
@@ -707,7 +707,7 @@ impl App {
         sections.push(Section::Input(input_lines));
         sections.push(Section::ContextMeter {
             used: self.meter.context_tokens,
-            window: self.agent.model.snapshot().context_window,
+            window: self.model.snapshot().context_window,
             estimated: self.meter.context_estimated,
         });
         if let Some(limits) = self.meter.rate_limits {
@@ -905,7 +905,7 @@ impl App {
             Span::styled("  mode ".to_string(), theme::dim()),
             Span::styled(self.mode_label.clone(), mode_style),
             Span::styled(" · ".to_string(), theme::dim()),
-            Span::styled(self.agent.model.snapshot().describe(), model_style),
+            Span::styled(self.model.snapshot().describe(), model_style),
         ];
         // A mode that silently changes what the model does must be visible
         // while it is on, not only in the line that switched it on.

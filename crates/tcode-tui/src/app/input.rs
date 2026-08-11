@@ -102,7 +102,10 @@ impl App {
                     label,
                 } => {
                     attachments.push(label);
-                    if self.agent.model.snapshot().provider.supports_vision() {
+                    let supports_vision = self
+                        .turn_supports_vision
+                        .unwrap_or_else(|| self.model.snapshot().provider.supports_vision());
+                    if supports_vision {
                         use base64::Engine as _;
                         blocks.push(ContentBlock::Image {
                             media_type: media_type.into(),

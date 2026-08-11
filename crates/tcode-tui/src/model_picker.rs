@@ -760,7 +760,7 @@ mod tests {
                 .collect(),
             current,
             apply: Box::new(|_| Err("not applied in tests".into())),
-            save: Box::new(|_, _, _| Err("not saved in tests".into())),
+            save: Box::new(|_, _, _, _| Err("not saved in tests".into())),
         }
     }
 

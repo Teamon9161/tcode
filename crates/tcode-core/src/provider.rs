@@ -135,11 +135,19 @@ impl ActiveModel {
     }
 }
 
-/// Shared, swappable model handle: the agent loop and sub-agents read
-/// through it, `/model` swaps it mid-session. Snapshots keep a whole
-/// turn on one consistent model.
+/// Swappable model handle shared by one conversation and the work it spawns.
+/// `/model` swaps that conversation's cell; snapshots keep a whole main turn
+/// on one consistent model.
 #[derive(Clone)]
 pub struct ModelCell(std::sync::Arc<std::sync::RwLock<ActiveModel>>);
+
+impl std::fmt::Debug for ModelCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ModelCell")
+            .field(&self.snapshot().describe())
+            .finish()
+    }
+}
 
 impl ModelCell {
     pub fn new(model: ActiveModel) -> Self {

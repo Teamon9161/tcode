@@ -8,8 +8,8 @@
 //! verbatim: the `Meta` line every session log opens with.
 //!
 //! That makes listing cheap by construction. Enumerating projects reads one
-//! line per project; the expensive full replay that produces conversation
-//! previews only happens for the project the user actually opens.
+//! line per project; replaying conversation previews happens only when the user
+//! expands one project, in bounded cursor pages.
 
 use std::fs;
 use std::io::{BufRead, BufReader};
@@ -43,6 +43,17 @@ pub struct StoredSession {
     pub preview: String,
     pub modified: Option<u64>,
 }
+
+/// A page of resumable conversations. `next` is the last session id returned;
+/// passing it back asks for strictly older logs, so newly created conversations
+/// cannot shift a page that is already open.
+#[derive(Debug, Serialize)]
+pub struct StoredSessionsPage {
+    pub sessions: Vec<StoredSession>,
+    pub next: Option<String>,
+}
+
+const SESSION_PAGE_SIZE: usize = 20;
 
 /// Every project with a session log, newest first.
 ///
@@ -132,16 +143,26 @@ fn modified_unix(path: &Path) -> Option<u64> {
         .map(|since| since.as_secs())
 }
 
-/// The conversations inside one project, newest first.
+/// One bounded page of conversations inside a project, newest first.
 ///
-/// Unlike [`list`], this replays each log — that is what produces a preview
-/// worth showing — so it runs only for a project the user has opened.
-pub fn sessions(cwd: &Path) -> Vec<StoredSession> {
+/// Producing each row replays its log to preserve rewind and compact semantics.
+/// The cursor keeps an expanded project cheap even when it has hundreds of logs:
+/// only the next page is parsed on each request.
+pub fn session_page(cwd: &Path, before: Option<&str>) -> StoredSessionsPage {
     let Some(data_dir) = tcode_core::store::project_data_dir(cwd) else {
-        return Vec::new();
+        return StoredSessionsPage {
+            sessions: Vec::new(),
+            next: None,
+        };
     };
-    SessionStore::list(&data_dir)
-        .unwrap_or_default()
+    let Ok(page) = SessionStore::list_page(&data_dir, before, SESSION_PAGE_SIZE) else {
+        return StoredSessionsPage {
+            sessions: Vec::new(),
+            next: None,
+        };
+    };
+    let sessions: Vec<StoredSession> = page
+        .sessions
         .into_iter()
         .map(|info| StoredSession {
             id: info.id,
@@ -151,7 +172,13 @@ pub fn sessions(cwd: &Path) -> Vec<StoredSession> {
                 .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
                 .map(|since| since.as_secs()),
         })
-        .collect()
+        .collect();
+    let next = if page.has_more {
+        sessions.last().map(|session| session.id.clone())
+    } else {
+        None
+    };
+    StoredSessionsPage { sessions, next }
 }
 
 /// Unix seconds now, for the frontend's relative timestamps. Sent with the

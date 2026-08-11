@@ -55,6 +55,15 @@ fn parse_progress_phases(items: &[serde_json::Value]) -> Vec<ProgressPhase> {
 }
 
 impl App {
+    /// Freeze the live session model for one physical turn. Core and inherited
+    /// helper roles resolve through this same cell, while picker changes update
+    /// `self.model` for the next turn.
+    fn freeze_turn_model(&mut self, session: &mut Session) {
+        let active = self.model.snapshot();
+        self.turn_supports_vision = Some(active.provider.supports_vision());
+        session.tool_ctx.model = Some(ModelCell::new(active));
+    }
+
     pub(super) fn start_turn(&mut self, message: PendingMessage) {
         let Some(mut session) = self.session.take() else {
             return;
@@ -96,6 +105,7 @@ impl App {
         }
         let blocks = message.blocks;
 
+        self.freeze_turn_model(&mut session);
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
         self.meter.start_turn();
@@ -177,6 +187,7 @@ impl App {
         self.clear_live_text();
         self.space_before_response = false;
 
+        self.freeze_turn_model(&mut session);
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
         self.meter.start_turn();
@@ -220,6 +231,7 @@ impl App {
         self.state_label = "compacting".into();
         // Compaction reports through the same event channel a turn does, so
         // its summary is baked by the one `Compacted` handler either way.
+        self.freeze_turn_model(&mut session);
         let (tx, rx) = mpsc::channel(64);
         self.events_rx = Some(rx);
         let cancel = CancellationToken::new();
@@ -257,6 +269,9 @@ impl App {
         self.pending_batch.clear();
 
         let (mut session, result) = done;
+        // The worker held a turn-private cell. Reattach the live session cell
+        // before any queued successor or idle helper resolves its model.
+        session.tool_ctx.model = Some(self.model.clone());
         let elapsed = match &self.phase {
             Phase::Running { started, .. } => self.meter.active_elapsed(*started),
             Phase::Idle => 0.0,
@@ -272,6 +287,7 @@ impl App {
             .set_context(session.last_prompt_tokens, estimated);
         self.session = Some(session);
         self.phase = Phase::Idle;
+        self.turn_supports_vision = None;
         self.events_rx = None;
         self.state_label.clear();
         // A switch staged during the closing (non-tool) output never reached a
@@ -339,6 +355,19 @@ impl App {
                 return;
             }
         };
+        self.menu.current = handoff.model_index;
+        let model = match session.tool_ctx.model.clone() {
+            Some(model) => {
+                model.swap(handoff.model);
+                model
+            }
+            None => {
+                let model = ModelCell::new(handoff.model);
+                session.tool_ctx.model = Some(model.clone());
+                model
+            }
+        };
+        self.model = model;
         if let Err(error) = session.adopt_progress(&handoff.progress_path) {
             self.bake(vec![Line::styled(
                 format!("cannot resume approved plan in fresh session: {error}"),

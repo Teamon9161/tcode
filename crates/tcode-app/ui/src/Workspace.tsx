@@ -83,8 +83,6 @@ export function Workspace({
   onInterrupt,
   onWithdrawQueued,
   onSendQueuedNow,
-  onResume,
-  onDismissResume,
   onAskRewind,
   onRewind,
   onAnswer,
@@ -110,8 +108,6 @@ export function Workspace({
   onInterrupt: (session: string) => void;
   onWithdrawQueued: PaneContext["onWithdrawQueued"];
   onSendQueuedNow: PaneContext["onSendQueuedNow"];
-  onResume: PaneContext["onResume"];
-  onDismissResume: PaneContext["onDismissResume"];
   onAskRewind: PaneContext["onAskRewind"];
   onRewind: PaneContext["onRewind"];
   onAnswer: (
@@ -583,8 +579,6 @@ export function Workspace({
       onInterrupt,
       onWithdrawQueued,
       onSendQueuedNow,
-      onResume,
-      onDismissResume,
       onAskRewind,
       onRewind,
       onAnswer,
@@ -626,8 +620,6 @@ export function Workspace({
       onInterrupt,
       onWithdrawQueued,
       onSendQueuedNow,
-      onResume,
-      onDismissResume,
       onAskRewind,
       onRewind,
       onAnswer,

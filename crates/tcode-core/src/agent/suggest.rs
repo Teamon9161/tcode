@@ -57,6 +57,7 @@ const ASK: &str = "What do I type next?";
 /// session. The request runs off the UI thread and is cancelled the moment the
 /// user starts typing, so it must not borrow the session.
 pub struct SuggestRequest {
+    model: crate::provider::ActiveModel,
     messages: Vec<Message>,
     expected_script: Option<WritingSystem>,
 }
@@ -119,7 +120,12 @@ impl Agent {
             ));
         }
         messages.push(text_message(Role::User, ASK.to_string()));
+        let model = self
+            .models
+            .resolve(AgentRole::Suggest, self.model_cell(session))
+            .expect("suggest always inherits the main model");
         Some(SuggestRequest {
+            model,
             messages,
             expected_script,
         })
@@ -131,10 +137,7 @@ impl Agent {
     /// spend the user's attention on a feature whose entire value is that it
     /// costs them none.
     pub async fn suggest(&self, req: SuggestRequest, cancel: CancellationToken) -> Option<String> {
-        let model = self
-            .models
-            .resolve(AgentRole::Suggest, &self.model)
-            .expect("suggest always inherits the main model");
+        let model = req.model;
         let request = Request {
             model: model.provider.model().to_string(),
             system: SUGGEST_SYSTEM.to_string(),

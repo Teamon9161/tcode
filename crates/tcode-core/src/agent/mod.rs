@@ -253,12 +253,14 @@ pub enum AgentError {
 }
 
 pub struct Agent {
-    /// Swappable model handle; each turn snapshots it once.
+    /// Fallback model for callers whose `Session` has no model cell. Normal
+    /// frontend sessions own an independent cell in `ToolCtx`; each turn
+    /// snapshots the resolved cell once.
     pub model: crate::provider::ModelCell,
     /// Pinned auxiliary model roles (`[agents.<role>]`, `/agents`). The agent
     /// resolves `compact` and `suggest` here; sub-agent kinds are resolved by
     /// the `task` tool, which shares the same handle. An unpinned role follows
-    /// `model`.
+    /// the current session's main model.
     pub models: crate::provider::AgentModels,
     pub tools: Vec<Arc<dyn Tool>>,
     pub system: String,
@@ -339,6 +341,13 @@ fn classifier_failure_notice(notice: String, reason: &str) -> String {
 }
 
 impl Agent {
+    /// The main model for this conversation. Sessions opened by a frontend own
+    /// an independent cell; the agent's cell remains a compatibility fallback
+    /// for tests and callers that construct a bare `ToolCtx`.
+    pub fn model_cell<'a>(&'a self, session: &'a Session) -> &'a crate::provider::ModelCell {
+        session.tool_ctx.model.as_ref().unwrap_or(&self.model)
+    }
+
     fn tool(&self, name: &str) -> Option<&Arc<dyn Tool>> {
         self.tools.iter().find(|t| t.name() == name)
     }
@@ -501,6 +510,7 @@ impl Agent {
         let request = ClassifierRequest {
             policy,
             cache_scope: session.classifier_cache_scope(),
+            primary: self.model_cell(session).clone(),
             transcript: ClassifierTranscript::from_ledger(&session.ledger),
         };
         match classifier.classify(request, check.cancel.clone()).await {
@@ -619,7 +629,7 @@ impl Agent {
         approver: &dyn Approver,
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
-        let model = self.model.snapshot();
+        let model = self.model_cell(session).snapshot();
         // A fresh user turn supersedes any pending plan expectation: the user
         // is steering now, so the turn-end guard must not police their own turn.
         session.clear_planning_expectation();
@@ -690,7 +700,7 @@ impl Agent {
         approver: &dyn Approver,
         cancel: CancellationToken,
     ) -> Result<(), AgentError> {
-        let model = self.model.snapshot();
+        let model = self.model_cell(session).snapshot();
         self.auto_compact_if_needed(session, &model, events, &cancel)
             .await?;
         self.note_background(session, events).await?;
@@ -748,7 +758,7 @@ impl Agent {
         approver: &dyn Approver,
         cancel: CancellationToken,
     ) -> Result<bool, AgentError> {
-        let model = self.model.snapshot();
+        let model = self.model_cell(session).snapshot();
         // A monitor wake is not the planning turn; a stale expectation (e.g.
         // from a turn that errored out) must not make it nudge about plans.
         session.clear_planning_expectation();

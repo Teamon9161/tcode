@@ -72,20 +72,19 @@ export function Chips({ meter }: { meter: Meter }) {
       <span className="chips-gap" />
 
       <UsagePanel meter={meter} window={state.context_window} />
-      <ModelPanel state={state} refresh={refresh} />
+      <ModelPanel session={session} state={state} refresh={refresh} />
     </div>
   );
 }
 
-/** The model is process-scoped, but some decisions — such as executing an
- * approved plan elsewhere — need to make that scope explicit before they run.
- * This is the same picker as the composer’s chip, not a second model switcher. */
+/** Some flows — such as executing an approved plan elsewhere — reuse the
+ * composer’s session-scoped model picker rather than growing a second one. */
 export function ModelPicker() {
   const session = useSession();
   const { state, failure, refresh } = usePicker(session);
   if (failure) return <p className="chips-note">{failure}</p>;
   if (!state) return null;
-  return <ModelPanel state={state} refresh={refresh} />;
+  return <ModelPanel session={session} state={state} refresh={refresh} />;
 }
 
 function usePicker(session: string) {

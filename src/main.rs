@@ -79,7 +79,8 @@ fn run_model_command(
             return;
         }
         match (presets.apply)(name) {
-            Ok((new_menu, new_agents, label, warnings)) => {
+            Ok((new_menu, new_agents, active, label, warnings)) => {
+                cell.swap(active);
                 *menu = new_menu;
                 *agents = new_agents;
                 presets.current = presets.options.iter().position(|o| o.key == name);
@@ -107,7 +108,7 @@ fn run_model_command(
                 .map(|(role, pin)| (role.key.clone(), pin.clone()))
                 .collect(),
         };
-        match (presets.save)(name, &draft, menu) {
+        match (presets.save)(name, &draft, menu, &menu.options) {
             Ok((options, current, outcome)) => {
                 presets.options = options;
                 presets.current = Some(current);
@@ -154,13 +155,13 @@ fn run_model_command(
     let found = which
         .parse::<usize>()
         .ok()
-        .and_then(|i| menu.options.get(i))
-        .or_else(|| menu.options.iter().find(|o| o.def.name == which));
-    let Some(opt) = found else {
+        .filter(|&index| index < menu.options.len())
+        .or_else(|| menu.options.iter().position(|o| o.def.name == which));
+    let Some(index) = found else {
         println!("{DIM}unknown model '{which}' — /model lists options{RESET}");
         return;
     };
-    match (menu.switch)(opt, effort) {
+    match (menu.switch)(&menu.options[index], effort) {
         Ok(active) => {
             println!(
                 "{DIM}model → {} · {}{RESET}",
@@ -168,6 +169,7 @@ fn run_model_command(
                 active.describe()
             );
             cell.swap(active);
+            menu.current = index;
         }
         Err(e) => println!("{DIM}cannot switch model: {e}{RESET}"),
     }
@@ -457,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
         cwd: cwd.clone(),
         config: &config,
         state: &state,
-        model_cell: model_cell.clone(),
+        model_cell: ModelCell::new(model_cell.snapshot()),
         mode,
         rules,
         resume,
@@ -518,7 +520,7 @@ async fn main() -> anyhow::Result<()> {
                 cwd: fresh_cwd.clone(),
                 config: &fresh_config,
                 state: &fresh_state,
-                model_cell: fresh_model_cell.clone(),
+                model_cell: ModelCell::new(fresh_model_cell.snapshot()),
                 mode: tcode_core::PermissionMode::Default,
                 rules: fresh_rules.clone(),
                 resume: tcode_frontend::ResumeSpec::New,
@@ -588,7 +590,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let registry = CommandRegistry::builtin();
-    let snapshot = model_cell.snapshot();
+    let session_model = agent.model_cell(&session).clone();
+    let snapshot = session_model.snapshot();
     println!(
         "{DIM}tcode v{} · {} · {} · mode {} · /help lists commands{RESET}",
         env!("CARGO_PKG_VERSION"),
@@ -624,7 +627,7 @@ async fn main() -> anyhow::Result<()> {
                     &mut menu,
                     &mut agent_menu,
                     &mut preset_menu,
-                    &model_cell,
+                    &session_model,
                 );
                 continue;
             }
@@ -902,6 +905,78 @@ async fn run_instruction_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Clone)]
+    struct NamedProvider(String);
+
+    #[async_trait::async_trait]
+    impl tcode_core::Provider for NamedProvider {
+        fn name(&self) -> &str {
+            "test"
+        }
+
+        fn model(&self) -> &str {
+            &self.0
+        }
+
+        fn cache_strategy(&self) -> tcode_core::CacheStrategy {
+            tcode_core::CacheStrategy::ImplicitPrefix
+        }
+
+        async fn stream(
+            &self,
+            _request: tcode_core::Request,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<tcode_core::EventStream, tcode_core::ProviderError> {
+            Err(tcode_core::ProviderError::Config(
+                "test provider does not stream".into(),
+            ))
+        }
+    }
+
+    fn named_model(name: &str) -> tcode_core::ActiveModel {
+        tcode_core::ActiveModel {
+            provider: std::sync::Arc::new(NamedProvider(name.to_string())),
+            max_tokens: None,
+            context_window: 100_000,
+            effort: None,
+        }
+    }
+
+    #[test]
+    fn a_plain_model_switch_updates_the_row_saved_by_the_next_preset() {
+        let cell = ModelCell::new(named_model("first"));
+        let mut menu = tcode_tui::ModelMenu {
+            options: vec![
+                tcode_tui::ModelOption {
+                    profile: "test".into(),
+                    def: tcode_core::config::ModelDef::bare("first"),
+                },
+                tcode_tui::ModelOption {
+                    profile: "test".into(),
+                    def: tcode_core::config::ModelDef::bare("second"),
+                },
+            ],
+            current: 0,
+            switch: Box::new(|option, _| Ok(named_model(&option.def.name))),
+        };
+        let mut agents = tcode_tui::AgentMenu {
+            roles: Vec::new(),
+            pins: Vec::new(),
+            pin: Box::new(|_, _| Err("unused".into())),
+        };
+        let mut presets = tcode_tui::PresetMenu {
+            options: Vec::new(),
+            current: None,
+            apply: Box::new(|_| Err("unused".into())),
+            save: Box::new(|_, _, _, _| Err("unused".into())),
+        };
+
+        run_model_command("second", &mut menu, &mut agents, &mut presets, &cell);
+
+        assert_eq!(cell.snapshot().provider.model(), "second");
+        assert_eq!(menu.current, 1);
+    }
 
     #[test]
     fn config_flag_uses_c_without_reassigning_prompt_p() {

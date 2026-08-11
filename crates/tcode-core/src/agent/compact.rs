@@ -57,7 +57,7 @@ impl Agent {
         // that threshold remains tied to the main conversation model's window.
         let model = self
             .models
-            .resolve(AgentRole::Compact, &self.model)
+            .resolve(AgentRole::Compact, self.model_cell(session))
             .expect("compact always inherits the main model");
         let req = Request {
             model: model.provider.model().to_string(),

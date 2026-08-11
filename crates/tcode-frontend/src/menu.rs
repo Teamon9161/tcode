@@ -11,6 +11,7 @@ use tcode_core::config::{Config, ModelDef};
 use tcode_core::ActiveModel;
 
 /// One selectable (profile, model) pair.
+#[derive(Clone)]
 pub struct ModelOption {
     pub profile: String,
     pub def: ModelDef,
@@ -85,8 +86,9 @@ pub struct PresetDraft {
 pub type MenuUpdate = (ModelMenu, AgentMenu, Vec<String>);
 
 /// Switch to a named line-up: persist the choice, rebuild the provider and
-/// every pin, and hand back the menus that describe the result.
-pub type PresetUpdate = (ModelMenu, AgentMenu, String, Vec<String>);
+/// every pin, and hand back the selected main model plus the menus that
+/// describe the result.
+pub type PresetUpdate = (ModelMenu, AgentMenu, ActiveModel, String, Vec<String>);
 
 /// Apply a named preset.
 pub type ApplyPresetFn = Box<dyn Fn(&str) -> Result<PresetUpdate, String> + Send + Sync>;
@@ -102,14 +104,15 @@ pub struct PresetSaveOutcome {
 }
 
 /// Write the live line-up out as `[presets.<name>]` and hand back the updated
-/// list, the index of the preset now in force, and what the write did. The
-/// menu travels with the draft because the draft is expressed in its indices:
-/// they mean nothing against a menu rebuilt since.
+/// list, the index of the preset now in force, and what the write did. Main and
+/// auxiliary-role choices carry independent indices: desktop sessions have a
+/// private main catalog while explicit role pins remain process-global.
 pub type SavePresetFn = Box<
     dyn Fn(
             &str,
             &PresetDraft,
             &ModelMenu,
+            &[ModelOption],
         ) -> Result<(Vec<PresetOption>, usize, PresetSaveOutcome), String>
         + Send
         + Sync,

@@ -1076,7 +1076,10 @@ mod tests {
             std::fs::read_to_string(files.join("project/notes.txt")).unwrap(),
             "keep me"
         );
-        assert!(trash_home.path().join("Trash/info/draft.md.trashinfo").exists());
+        assert!(trash_home
+            .path()
+            .join("Trash/info/draft.md.trashinfo")
+            .exists());
     }
 
     #[test]

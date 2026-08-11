@@ -692,6 +692,28 @@ fn preview(path: &Path) -> Option<SessionInfo> {
     })
 }
 
+/// A bounded slice of resumable conversations.
+#[derive(Debug)]
+pub struct SessionPage {
+    pub sessions: Vec<SessionInfo>,
+    pub has_more: bool,
+}
+
+fn session_logs(data_dir: &Path) -> Result<Vec<PathBuf>, StoreError> {
+    let sessions = data_dir.join("sessions");
+    let mut files: Vec<PathBuf> = fs::read_dir(&sessions)
+        .map_err(|_| StoreError::NoSession)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    files.sort();
+    files.reverse();
+    Ok(files)
+}
+
 impl SessionStore {
     /// List recent non-empty sessions in newest-first order. This is kept
     /// separate from `resume`: starting tcode creates a fresh log first, and
@@ -702,16 +724,42 @@ impl SessionStore {
     /// skipped rather than failing the list: one broken conversation must not
     /// empty the picker, and selecting it still reports the replay error.
     pub fn list(data_dir: &Path) -> Result<Vec<SessionInfo>, StoreError> {
-        let sessions = data_dir.join("sessions");
-        let mut files: Vec<PathBuf> = fs::read_dir(&sessions)
-            .map_err(|_| StoreError::NoSession)?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
-            .collect();
-        files.sort();
-        files.reverse();
+        Ok(session_logs(data_dir)?
+            .iter()
+            .filter_map(|path| preview(path))
+            .collect())
+    }
 
-        Ok(files.iter().filter_map(|path| preview(path)).collect())
+    /// List at most `limit` conversations older than `before`.
+    ///
+    /// The cursor is a session id rather than an offset. New conversations may
+    /// be created while a picker is open; an offset would then shift every older
+    /// row and either duplicate or skip one on the next request. Session ids are
+    /// the chronologically sortable log stems, so filtering before the last id
+    /// returned keeps a walk stable while new logs arrive.
+    pub fn list_page(
+        data_dir: &Path,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<SessionPage, StoreError> {
+        let files = session_logs(data_dir)?;
+        let mut sessions: Vec<SessionInfo> = files
+            .iter()
+            .filter(|path| {
+                let Some(cursor) = before else {
+                    return true;
+                };
+                path.file_stem()
+                    .is_some_and(|stem| stem.to_string_lossy().as_ref() < cursor)
+            })
+            // Read one valid preview past the requested page. Empty or damaged
+            // logs are skipped and therefore never create a false "more" row.
+            .filter_map(|path| preview(path))
+            .take(limit.saturating_add(1))
+            .collect();
+        let has_more = sessions.len() > limit;
+        sessions.truncate(limit);
+        Ok(SessionPage { sessions, has_more })
     }
 
     /// Start a new session log under `data_dir/sessions/`.
@@ -1386,6 +1434,51 @@ mod tests {
         let sessions = SessionStore::list(dir.path()).unwrap();
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, id);
+    }
+
+    #[test]
+    fn list_page_uses_a_stable_cursor_and_reads_only_the_requested_slice() {
+        let dir = tempfile::tempdir().unwrap();
+        for millis in 1..=5 {
+            let store = SessionStore::create_at_millis(dir.path(), dir.path(), millis).unwrap();
+            let mut ledger = Ledger::new();
+            ledger.attach_sink(Box::new(store));
+            ledger.append(text(&format!("conversation {millis}")));
+        }
+
+        let first = SessionStore::list_page(dir.path(), None, 2).unwrap();
+        assert_eq!(
+            first
+                .sessions
+                .iter()
+                .map(|session| session.last_user_preview.as_str())
+                .collect::<Vec<_>>(),
+            ["conversation 5", "conversation 4"]
+        );
+        assert!(first.has_more);
+
+        // A newer log arriving between requests must not move the next page.
+        let store = SessionStore::create_at_millis(dir.path(), dir.path(), 6).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("conversation 6"));
+        let cursor = first.sessions.last().unwrap().id.clone();
+
+        let second = SessionStore::list_page(dir.path(), Some(&cursor), 2).unwrap();
+        assert_eq!(
+            second
+                .sessions
+                .iter()
+                .map(|session| session.last_user_preview.as_str())
+                .collect::<Vec<_>>(),
+            ["conversation 3", "conversation 2"]
+        );
+        assert!(second.has_more);
+
+        let cursor = second.sessions.last().unwrap().id.clone();
+        let last = SessionStore::list_page(dir.path(), Some(&cursor), 2).unwrap();
+        assert_eq!(last.sessions[0].last_user_preview, "conversation 1");
+        assert!(!last.has_more);
     }
 
     #[test]

@@ -359,12 +359,13 @@ impl AgentTool {
         self
     }
 
-    /// The pinned model for `kind`, else a snapshot of the parent's. String
-    /// keyed so custom kinds resolve through `[agents.<name>]` for free.
-    fn model_for(&self, kind: &str) -> ActiveModel {
+    /// The pinned model for `kind`, else a snapshot of this conversation's
+    /// primary model. String keyed so custom kinds resolve through
+    /// `[agents.<name>]` for free.
+    fn model_for(&self, kind: &str, ctx: &ToolCtx) -> ActiveModel {
         self.pinned
             .get(kind)
-            .unwrap_or_else(|| self.model.snapshot())
+            .unwrap_or_else(|| ctx.model.as_ref().unwrap_or(&self.model).snapshot())
     }
 
     /// Build the common delegated inventory before an agent-specific policy is
@@ -973,7 +974,7 @@ impl AgentTool {
         extra: &[Arc<dyn Tool>],
     ) -> (Agent, Session, String) {
         let kind = &def.name;
-        let model = model_override.unwrap_or_else(|| self.model_for(kind));
+        let model = model_override.unwrap_or_else(|| self.model_for(kind, ctx));
         let model_name = model.provider.model().to_string();
         let model = ModelCell::new(model);
         let safety_classifier: Arc<dyn SafetyClassifier> = Arc::new(

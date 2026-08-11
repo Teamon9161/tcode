@@ -216,13 +216,11 @@ One shape per job, used everywhere:
 - **Row** — the default list affordance: hairline-separated, hover-tinted, full
   width. Projects, files and sessions in the rail are rows, not cards.
 
-  The rail's rows sit under a **group heading**, which is the folder. That is not
-  organisation for its own sake: a conversation is named after its folder, so two
-  in one folder were two identical rows and the list could account for both
-  without saying which was which. The heading answers *where*, the row answers
-  *what for* — the first thing the conversation was asked to do, over what it is
-  doing now. Folding a group keeps its count, and keeps "needs you" in words,
-  because the one fact this rail exists to publish must not be foldable away.
+  Open conversations are the exception: they sit as a **flat numbered list** at
+  the top because switching between running work is the rail's first job. Each
+  row answers *what for* with the first prompt, then *where and what now* with
+  `project · activity`. The number is not decoration: rows 1–9 are in the exact
+  array order used by `Mod+1…9`, so the label and shortcut cannot drift.
 - **Rail** — the app's only navigation surface, and the reason it has only one
   screen. There used to be a **launchpad** in front of the window: a full page of
   open sessions as cards and every project as a row, which every conversation was
@@ -232,38 +230,37 @@ One shape per job, used everywhere:
   conversations — at the price of a navigation mode. Both are list-shaped. They
   moved into the rail and the screen went.
 
-  So a **group heading is the project**, not "a folder that happens to hold a
-  live conversation", and the column has a head and two bands:
+  The column has two bands, in the order their urgency deserves:
 
-  - **live** — projects with a conversation open, in the order the reader
-    arranged, expanded by default. Nothing may push this down the column; it is
-    the product's whole question.
-   - **`Recent`** — folders visited and closed, newest first, collapsed by
-    default and **capped**. The column scrolls, so the cap is not about room —
-    it is about the *first screen*: forty folders above the fold means "what
-    needs me" arrives under a list of where you have been. The rest are one
-    click below (`N more`, which lifts the cap for the sitting and is not
-    remembered) or one search away.
+  - **`Sessions`** — every conversation open in this process, flat and in the
+    supervisor's switching order. Nothing project-shaped may push this list down
+    or reorder it independently of the keyboard shortcuts.
+  - **`Recent`** — every known project, including projects that also have an open
+    conversation, newest first and collapsed by default. A live row navigates one
+    running conversation; a project row starts or resumes work in that folder, so
+    the two are not duplicate affordances.
 
-  One rule covers both: the disclosure means *show me more of this project*, and
-  the two resting states come from what a project has rather than from which band
-  it is in. Opening a group shows its live conversations and, behind one more
-  row (`Earlier · 14`), the ones it can go back to. That row is not a fold being
-  coy — building those previews replays every log in the folder, so the count is
-  stated before the click, and a project with nothing live skips the row because
-  history is all it has.
+  The whole rail scrolls normally. `Recent` becomes sticky only when it reaches
+  the top, keeping `New` available without pinning a second permanent toolbar.
+  Project density is progressive rather than all-or-nothing: eight are revealed
+  at a time, with the remainder stated before the click.
 
-  **A conversation appears once.** A live session and the log it is writing to are
-  the same conversation, and the stored row for it says `open` and does nothing —
-  resuming it would put a second ledger on one file. That is what `log_id` on the
-  wire is for.
+  Expanding a project explicitly reads its newest **20** stored conversations.
+  `Load older` passes the last returned log id as a cursor and appends one more
+  page. A newer conversation created between clicks cannot shift that boundary,
+  and scrolling alone never starts disk work. This is deliberately not infinite
+  scroll: replaying previews is real IO, so every page is an intentional action
+  and the column's vertical size grows predictably.
 
-  A project's own acts are one hover `+` (a conversation here) and one `⋯`. The
-  menu is where reordering went: two permanent arrow buttons were taking width in
-  the one list that has none to spare, for something you do once and then rely on
-  for weeks. Alt+arrow still works — a menu is where a rare act is *found*, not
-  the only way to do it — and the items differ by band, because arranging is
-  meaningless where the order is a timestamp.
+  A stored row whose log is already attached to a live session stays visible,
+  says `open`, and is disabled. Hiding it would make today's history look lost;
+  enabling it would put a second ledger on one JSONL. `SessionInfo.log_id` is the
+  identity that enforces that boundary.
+
+  A project's own acts are one hover `+` (a fresh conversation there) and one
+  `⋯` menu containing `New session` and `Hide from recent`. The `Recent` heading's
+  compact `New` action opens the shared folder picker. Stored history is therefore
+  reached in the rail itself; the desktop composer does not offer `/resume`.
 - **Finder** — `Ctrl`+`P`, or the field-shaped button in the title bar. It
   searches open conversations and every folder, which is the pair the rail shows;
   what it deliberately does not search is stored conversations, because a preview
@@ -276,11 +273,11 @@ One shape per job, used everywhere:
   It sits in the title bar rather than in the rail, and that is the one placement
   decision worth keeping: finding a conversation is the way *back* to one, so it
   must not live inside the thing you folded away. Its width reads `--rail-w` so
-  it ends on the rail's own edge. `New conversation` went the other way, into the
-  rail's head, because it is the list's own act — it adds to what is below it.
-  It is a plain row, not a filled button: this column is scanned for what is
-  running, chroma and weight mean state here, and a permanent control is never
-  state.
+  it ends on the rail's own edge. `New` lives in the `Recent` heading because it
+  creates an entry in that project/history world, while the numbered Sessions
+  list remains only navigation. It is a plain compact action, not a filled
+  button: this column is scanned for what is running, chroma and weight mean
+  state here, and a permanent control is never state.
 - **Trace row** — every step in the transcript, whatever kind: one call, a run of
   reads, a run of edits, a concurrent batch, a delegated sub-agent. Chevron,
   label, state; expandable, and its contents indent beneath it. No border, no

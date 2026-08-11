@@ -132,8 +132,6 @@ function paneContext(sessions: SessionInfo[] = []): PaneContext {
     onInterrupt: none,
     onWithdrawQueued: none,
     onSendQueuedNow: none,
-    onResume: none,
-    onDismissResume: none,
     onAskRewind: none,
     onRewind: none,
     onAnswer: none,

@@ -695,8 +695,9 @@ impl FetchSummarizer {
         Self { model, pinned }
     }
 
-    fn model(&self) -> Option<ActiveModel> {
-        self.pinned.resolve(AgentRole::Fetch, &self.model)
+    fn model(&self, primary: Option<&ModelCell>) -> Option<ActiveModel> {
+        self.pinned
+            .resolve(AgentRole::Fetch, primary.unwrap_or(&self.model))
     }
 }
 
@@ -876,7 +877,10 @@ impl Tool for WebFetchTool {
         // `prompt` costs a model call, so it is honored only when `web-fetch`
         // is on. Its inherited mode deliberately snapshots the main model;
         // unconfigured is still off and returns the page directly.
-        let model = self.summarizer.as_ref().and_then(FetchSummarizer::model);
+        let model = self
+            .summarizer
+            .as_ref()
+            .and_then(|summarizer| summarizer.model(ctx.model.as_ref()));
         let Some(model) = model else {
             let mut out = fetch_output(&final_url, &text, None, extracted);
             out.content = format!(
@@ -1448,10 +1452,10 @@ mod tests {
         let pins = AgentModels::default();
         let summarizer = FetchSummarizer::new(primary.clone(), pins.clone());
 
-        assert!(summarizer.model().is_none(), "fetch defaults to off");
+        assert!(summarizer.model(None).is_none(), "fetch defaults to off");
         pins.pin_inherit(AgentRole::Fetch.key());
         assert_eq!(
-            summarizer.model().unwrap().provider.model(),
+            summarizer.model(None).unwrap().provider.model(),
             primary.snapshot().provider.model(),
             "an explicit inherit follows the live primary model"
         );

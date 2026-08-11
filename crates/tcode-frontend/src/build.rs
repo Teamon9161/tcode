@@ -15,6 +15,7 @@ use crate::menu::{
 /// The selected model and menus rebuilt from a config-file change.
 pub struct RebuiltMenus {
     pub selection: Selection,
+    pub active: ActiveModel,
     pub menu: ModelMenu,
     pub agents: AgentMenu,
     pub warnings: Vec<String>,
@@ -235,7 +236,7 @@ pub fn rebuild_from_config(
         .ok_or_else(|| format!("profile '{}' is not configured", selection.profile))?;
     let active = tcode_providers::build_active(profile, &selection, &config.watchdog)
         .map_err(|error| error.to_string())?;
-    model_cell.swap(active);
+    model_cell.swap(active.clone());
     let (models, warnings) = agent_models(&config, &selection);
     pinned.replace_all(&models);
 
@@ -249,6 +250,7 @@ pub fn rebuild_from_config(
     );
     Ok(RebuiltMenus {
         selection,
+        active,
         menu,
         agents,
         warnings,
@@ -407,18 +409,30 @@ pub fn build_preset_menu(
                 rebuilt.selection.model.display()
             ),
         };
-        Ok((rebuilt.menu, rebuilt.agents, label, rebuilt.warnings))
+        Ok((
+            rebuilt.menu,
+            rebuilt.agents,
+            rebuilt.active,
+            label,
+            rebuilt.warnings,
+        ))
     });
 
-    let save: SavePresetFn = Box::new(move |name, draft, menu| {
-        let named = |option: usize| -> Result<&ModelOption, String> {
-            menu.options
+    let save: SavePresetFn = Box::new(move |name, draft, main_menu, role_options| {
+        let main_named = |option: usize| -> Result<&ModelOption, String> {
+            main_menu
+                .options
                 .get(option)
-                .ok_or_else(|| "selected model disappeared".to_string())
+                .ok_or_else(|| "selected main model disappeared".to_string())
+        };
+        let role_named = |option: usize| -> Result<&ModelOption, String> {
+            role_options
+                .get(option)
+                .ok_or_else(|| "selected role model disappeared".to_string())
         };
         let mut preset = Preset::default();
         if let Some(option) = draft.main {
-            let option = named(option)?;
+            let option = main_named(option)?;
             preset.profile = Some(option.profile.clone());
             preset.model = Some(option.def.name.clone());
             preset.effort = draft.main_effort.clone();
@@ -431,7 +445,7 @@ pub fn build_preset_menu(
                 AgentModelChoice::Off => AgentConfig::from_shorthand("off"),
                 AgentModelChoice::Inherit => AgentConfig::from_shorthand("inherit"),
                 AgentModelChoice::Model { option, effort } => {
-                    let option = named(*option)?;
+                    let option = role_named(*option)?;
                     AgentConfig {
                         profile: Some(option.profile.clone()),
                         model: Some(option.def.name.clone()),

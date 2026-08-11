@@ -38,7 +38,7 @@ struct ClassifierStage {
 /// main ledger, so the safety model stays isolated from the agent's context.
 #[derive(Clone)]
 pub struct ProviderSafetyClassifier {
-    parent_model: ModelCell,
+    _parent_model: ModelCell,
     pinned: AgentModels,
     config: AutoClassifierConfig,
 }
@@ -48,7 +48,7 @@ impl ProviderSafetyClassifier {
     /// follows `/model`, while a pin takes effect on the next classification.
     pub fn new(parent_model: ModelCell, pinned: AgentModels) -> Self {
         Self {
-            parent_model,
+            _parent_model: parent_model,
             pinned,
             config: AutoClassifierConfig::default(),
         }
@@ -62,21 +62,21 @@ impl ProviderSafetyClassifier {
         self
     }
 
-    fn model(&self) -> crate::provider::ActiveModel {
+    fn model(&self, request: &ClassifierRequest) -> crate::provider::ActiveModel {
         self.pinned
-            .resolve(AgentRole::Auto, &self.parent_model)
+            .resolve(AgentRole::Auto, &request.primary)
             .expect("auto always inherits the main model")
     }
 
     async fn run_stage_once(
         &self,
+        model: &crate::provider::ActiveModel,
         request: &ClassifierRequest,
         suffix: &str,
         max_tokens: u32,
         effort: Option<String>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
-        let model = self.model();
         let messages = vec![Message {
             role: Role::User,
             content: request
@@ -125,6 +125,7 @@ impl ProviderSafetyClassifier {
     /// unresponsive classifier alive forever.
     async fn run_stage(
         &self,
+        model: &crate::provider::ActiveModel,
         request: &ClassifierRequest,
         stage: ClassifierStage,
         cancel: CancellationToken,
@@ -138,6 +139,7 @@ impl ProviderSafetyClassifier {
                 result = tokio::time::timeout(
                     stage.timeout,
                     self.run_stage_once(
+                        model,
                         request,
                         stage.suffix,
                         stage.max_tokens,
@@ -189,8 +191,13 @@ impl SafetyClassifier for ProviderSafetyClassifier {
         request: ClassifierRequest,
         cancel: CancellationToken,
     ) -> ClassifierDecision {
+        // One safety decision is one model operation: retries and the reasoned
+        // stage stay on the same provider even if the session model or global
+        // auto pin changes while the fast stage is in flight.
+        let model = self.model(&request);
         let fast = self
             .run_stage(
+                &model,
                 &request,
                 ClassifierStage {
                     name: "fast",
@@ -210,9 +217,10 @@ impl SafetyClassifier for ProviderSafetyClassifier {
         match fast_verdict(&fast) {
             Some(true) => ClassifierDecision::Allow,
             Some(false) => {
-                let effort = self.model().effort;
+                let effort = model.effort.clone();
                 let reasoned = self
                     .run_stage(
+                        &model,
                         &request,
                         ClassifierStage {
                             name: "reasoned",
@@ -354,6 +362,7 @@ mod tests {
         cancellations: Mutex<Vec<CancellationToken>>,
         captured_requests: Mutex<Vec<Request>>,
         requests: AtomicUsize,
+        swap_after_request: Mutex<Option<(ModelCell, ActiveModel)>>,
     }
 
     impl ScriptedProvider {
@@ -363,7 +372,12 @@ mod tests {
                 cancellations: Mutex::new(Vec::new()),
                 captured_requests: Mutex::new(Vec::new()),
                 requests: AtomicUsize::new(0),
+                swap_after_request: Mutex::new(None),
             }
+        }
+
+        fn swap_primary_after_next_request(&self, primary: ModelCell, model: ActiveModel) {
+            *self.swap_after_request.lock().unwrap() = Some((primary, model));
         }
     }
 
@@ -389,6 +403,9 @@ mod tests {
             self.requests.fetch_add(1, Ordering::Relaxed);
             self.captured_requests.lock().unwrap().push(req);
             self.cancellations.lock().unwrap().push(cancel);
+            if let Some((primary, model)) = self.swap_after_request.lock().unwrap().take() {
+                primary.swap(model);
+            }
             match self.scripts.lock().unwrap().pop_front().unwrap() {
                 Script::Pending => Ok(futures::stream::pending().boxed()),
                 Script::Output(output) => Ok(futures::stream::iter([
@@ -424,10 +441,11 @@ mod tests {
         )
     }
 
-    fn request() -> ClassifierRequest {
+    fn request(classifier: &ProviderSafetyClassifier) -> ClassifierRequest {
         ClassifierRequest {
             policy: "classifier policy".into(),
             cache_scope: "auto-classifier:test".into(),
+            primary: classifier._parent_model.clone(),
             transcript: ClassifierTranscript::default(),
         }
     }
@@ -436,7 +454,7 @@ mod tests {
     async fn provider_keeps_classifier_history_as_content_block_prefix() {
         let (classifier, provider) =
             classifier(vec![Script::Output("ALLOW"), Script::Output("ALLOW")]);
-        let mut first = request();
+        let mut first = request(&classifier);
         first.transcript.blocks = vec![
             "<user>\nrun the tests\n</user>".into(),
             "\n<tool-call name=shell>\n{\"command\":\"cargo test\"}\n</tool-call>".into(),
@@ -480,7 +498,7 @@ mod tests {
 
         assert_eq!(
             classifier
-                .classify(request(), CancellationToken::new())
+                .classify(request(&classifier), CancellationToken::new())
                 .await,
             ClassifierDecision::Allow
         );
@@ -501,13 +519,58 @@ mod tests {
 
         assert_eq!(
             classifier
-                .classify(request(), CancellationToken::new())
+                .classify(request(&classifier), CancellationToken::new())
                 .await,
             ClassifierDecision::Block {
                 reason: "The command changes tracked files.".into(),
             }
         );
         assert_eq!(provider.requests.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn one_decision_keeps_its_initial_model_across_both_stages() {
+        let first = Arc::new(ScriptedProvider::new(vec![
+            Script::Output("BLOCK"),
+            Script::Output("The command changes tracked files.\nBLOCK"),
+        ]));
+        let second = Arc::new(ScriptedProvider::new(vec![Script::Output("ALLOW")]));
+        let primary = ModelCell::new(ActiveModel {
+            provider: first.clone(),
+            max_tokens: Some(1_024),
+            context_window: 32_768,
+            effort: None,
+        });
+        first.swap_primary_after_next_request(
+            primary.clone(),
+            ActiveModel {
+                provider: second.clone(),
+                max_tokens: Some(1_024),
+                context_window: 32_768,
+                effort: None,
+            },
+        );
+        let classifier = ProviderSafetyClassifier::new(primary.clone(), AgentModels::default())
+            .with_config(AutoClassifierConfig {
+                fast_timeout: Duration::from_millis(50),
+                reasoned_timeout: Duration::from_millis(50),
+                retry_count: 0,
+            });
+        let request = ClassifierRequest {
+            policy: "classifier policy".into(),
+            cache_scope: "auto-classifier:frozen-model".into(),
+            primary,
+            transcript: ClassifierTranscript::default(),
+        };
+
+        assert_eq!(
+            classifier.classify(request, CancellationToken::new()).await,
+            ClassifierDecision::Block {
+                reason: "The command changes tracked files.".into(),
+            }
+        );
+        assert_eq!(first.requests.load(Ordering::Relaxed), 2);
+        assert_eq!(second.requests.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -518,7 +581,7 @@ mod tests {
         ]);
         assert_eq!(
             retry_classifier
-                .classify(request(), CancellationToken::new())
+                .classify(request(&retry_classifier), CancellationToken::new())
                 .await,
             ClassifierDecision::Allow
         );
@@ -530,7 +593,7 @@ mod tests {
         ]);
         assert!(matches!(
             classifier
-                .classify(request(), CancellationToken::new())
+                .classify(request(&classifier), CancellationToken::new())
                 .await,
             ClassifierDecision::Unavailable { reason }
                 if reason.contains("fast classifier failed after 2 attempts")

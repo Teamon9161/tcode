@@ -49,9 +49,11 @@ import { BackIcon, ChevronRight, PlusIcon, ReturnIcon } from "./components/Icons
 type View = { at: "model" } | { at: "agents" } | { at: "role"; key: string };
 
 export function ModelPanel({
+  session,
   state,
   refresh,
 }: {
+  session: string;
   state: PickerState;
   /** Re-read the picker after a change: every command here can move the rest. */
   refresh: () => void;
@@ -120,7 +122,7 @@ export function ModelPanel({
    *  worth more next to what was typed than replacing it. */
   const save = (name: string) => {
     if (name.trim().length === 0) return;
-    act(invoke("save_preset", { name })).then((ok) => ok && setNaming(null));
+    act(invoke("save_preset", { session, name })).then((ok) => ok && setNaming(null));
   };
 
   /** Arrow keys walk the rows, as they do in any list you can point at. */
@@ -222,7 +224,7 @@ export function ModelPanel({
                             kind: role.key,
                             pin: { kind: "model", index, effort },
                           })
-                        : invoke("choose_model", { index, effort }),
+                        : invoke("choose_model", { session, index, effort }),
                     )
                   }
                   onPin={(pin) => role && act(invoke("pin_role", { kind: role.key, pin }))}
@@ -238,7 +240,7 @@ export function ModelPanel({
 
             {view.at !== "agents" && (
               <div className="mpanel-foot">
-                <Effort state={state} role={role} onRun={act} />
+                <Effort state={state} role={role} session={session} onRun={act} />
 
                 {/* Presets belong to the main view: one names the whole line-up,
                     including every role, so it is not a property of one of them. */}
@@ -253,7 +255,7 @@ export function ModelPanel({
                             type="button"
                             data-row
                             className={`mseg-item${at === state.preset ? " is-on" : ""}`}
-                            onClick={() => act(invoke("choose_preset", { key: one.key }))}
+                            onClick={() => act(invoke("choose_preset", { session, key: one.key }))}
                           >
                             {one.label}
                           </button>
@@ -322,9 +324,9 @@ export function ModelPanel({
 /**
  * The models, under the profile that offers them.
  *
- * The same list serves the main model and a role's pin — a pin is a model
- * choice, and offering it in a different shape would make the reader learn the
- * list twice. What differs is the two rows on top, which only a role has.
+ * Main choices use the session's fresh folder catalog; role choices use the
+ * process-global pin catalog. They share one rendering shape, not one index
+ * domain. The extra follow/off rows only exist for roles.
  */
 function Models({
   state,
@@ -337,6 +339,7 @@ function Models({
   onPick: (index: number, effort: string | null) => void;
   onPin: (pin: PinChoice) => void;
 }) {
+  const models = role ? state.role_models : state.models;
   const current = role
     ? role.pin.kind === "model"
       ? role.pin.index
@@ -348,7 +351,7 @@ function Models({
       : null
     : state.effort;
 
-  if (state.models.length === 0) {
+  if (models.length === 0) {
     return (
       <p className="mpanel-empty">
         No provider is configured. Add one to <code>~/.tcode/config.toml</code>, or run{" "}
@@ -379,7 +382,7 @@ function Models({
         </>
       )}
 
-      {byProfile(state.models).map((group) => (
+      {byProfile(models).map((group) => (
         <div key={group.profile} className="mpanel-section">
           <p className="mpanel-group is-id">{group.profile}</p>
           {group.items.map(({ at, model }) => (
@@ -436,7 +439,7 @@ function Roles({
               <span className="mrow-mark" aria-hidden="true" />
               <span className="mrow-name">{role.label}</span>
               <span className={`mrow-meta${role.pin.kind === "model" ? " is-id" : ""}`}>
-                {pinLabel(role.pin, state.models)}
+                {pinLabel(role.pin, state.role_models)}
               </span>
               {role.key === "vision" && !state.can_view_images && (
                 <span className="mrow-warn">cannot view images</span>
@@ -462,14 +465,17 @@ function Roles({
 function Effort({
   state,
   role,
+  session,
   onRun,
 }: {
   state: PickerState;
   role: PickerState["roles"][number] | null;
+  session: string;
   onRun: (run: Promise<unknown>) => void;
 }) {
+  const models = role ? state.role_models : state.models;
   const at = role ? (role.pin.kind === "model" ? role.pin.index : -1) : state.model;
-  const model = state.models[at];
+  const model = models[at];
   const slots = effortSlots(model);
   if (slots.length === 0) return null;
 
@@ -494,7 +500,7 @@ function Effort({
                       kind: role.key,
                       pin: { kind: "model", index: at, effort },
                     })
-                  : invoke("choose_model", { index: at, effort }),
+                  : invoke("choose_model", { session, index: at, effort }),
               );
             }}
           >

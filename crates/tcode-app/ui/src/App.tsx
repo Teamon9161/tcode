@@ -387,15 +387,11 @@ export function App() {
           case "compact_started":
             patch(id, (state) => ({
               ...state,
-              resumePicker: null,
               running: true,
               failed: false,
               meter: { ...state.meter, turn: NO_USAGE },
               activity: "compacting history",
             }));
-            return;
-          case "resume_picker":
-            patch(id, (state) => ({ ...state, resumePicker: result.sessions }));
             return;
           case "notice":
             patch(id, (state) => ({
@@ -521,16 +517,6 @@ export function App() {
       }
     },
     [patch, dispatchSlash],
-  );
-
-  const resume = useCallback(
-    (id: string, stored: string) => dispatchSlash(id, `/resume ${stored}`),
-    [dispatchSlash],
-  );
-
-  const dismissResume = useCallback(
-    (id: string) => patch(id, (state) => ({ ...state, resumePicker: null })),
-    [patch],
   );
 
   const withdrawQueued = useCallback(
@@ -908,8 +894,6 @@ export function App() {
             onInterrupt={interrupt}
             onWithdrawQueued={withdrawQueued}
             onSendQueuedNow={sendQueuedNow}
-            onResume={resume}
-            onDismissResume={dismissResume}
             onAskRewind={askRewind}
             onRewind={rewind}
             onAnswer={answer}

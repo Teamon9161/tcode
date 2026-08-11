@@ -286,6 +286,9 @@ pub struct ClassifierRequest {
     /// Dedicated provider cache scope for this session's dynamic classifier
     /// prefix. It must not share a cache id with another session.
     pub cache_scope: String,
+    /// This session's main model. An inherited `auto` role resolves through
+    /// this cell rather than the process fallback captured at agent startup.
+    pub primary: crate::provider::ModelCell,
     pub transcript: ClassifierTranscript,
 }
 

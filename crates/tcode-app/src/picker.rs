@@ -22,11 +22,34 @@ use tcode_core::config::Config;
 use tcode_core::{AgentModels, ModelCell, PermissionMode};
 use tcode_frontend::{AgentMenu, AgentModelChoice, ModelMenu, PresetDraft, PresetMenu};
 
-/// The live menus, rebuilt whenever a choice replaces them.
-///
-/// Behind one lock rather than three: applying a preset returns a new model menu
-/// *and* a new agent menu *and* a new preset list, and half-updated menus would
-/// offer options that no longer describe anything.
+/// One conversation's main-model and preset menus. Their closures capture the
+/// same fresh folder config and `ModelCell` used to open that conversation.
+pub struct MainPickers {
+    pub models: ModelMenu,
+    pub presets: PresetMenu,
+}
+
+impl MainPickers {
+    pub fn unavailable(reason: &'static str) -> Self {
+        Self {
+            models: ModelMenu {
+                options: Vec::new(),
+                current: 0,
+                switch: Box::new(move |_, _| Err(reason.to_string())),
+            },
+            presets: PresetMenu {
+                options: Vec::new(),
+                current: None,
+                apply: Box::new(move |_| Err(reason.to_string())),
+                save: Box::new(move |_, _, _, _| Err(reason.to_string())),
+            },
+        }
+    }
+}
+
+/// Process-wide picker state. `models` is both the no-session fallback and the
+/// index domain for `agents`; an open conversation renders and switches through
+/// its private [`MainPickers`] instead.
 pub struct Pickers {
     pub models: ModelMenu,
     pub presets: PresetMenu,
@@ -47,18 +70,10 @@ impl Pickers {
     /// switching needs, which is a good sign it is the right fallback rather
     /// than a test fixture in disguise.
     pub fn unavailable(config_file: PathBuf, reason: &'static str) -> Self {
+        let main = MainPickers::unavailable(reason);
         Self {
-            models: ModelMenu {
-                options: Vec::new(),
-                current: 0,
-                switch: Box::new(move |_, _| Err(reason.to_string())),
-            },
-            presets: PresetMenu {
-                options: Vec::new(),
-                current: None,
-                apply: Box::new(move |_| Err(reason.to_string())),
-                save: Box::new(move |_, _, _| Err(reason.to_string())),
-            },
+            models: main.models,
+            presets: main.presets,
             agents: AgentMenu {
                 roles: Vec::new(),
                 pins: Vec::new(),
@@ -115,7 +130,7 @@ pub enum PinChoice {
     /// Follow the main model, live: this role moves with `/model`.
     Inherit,
     Model {
-        /// Index into `PickerState::models`.
+        /// Index into `PickerState::role_models`.
         index: usize,
         effort: Option<String>,
     },
@@ -147,6 +162,9 @@ pub struct RoleChoice {
 #[derive(Serialize)]
 pub struct PickerState {
     pub models: Vec<ModelChoice>,
+    /// Process-global model catalog used by explicit auxiliary-role pins. Its
+    /// indices are intentionally independent from this session's main models.
+    pub role_models: Vec<ModelChoice>,
     pub model: usize,
     /// The effort the agent is *running* on, read from the live `ModelCell`
     /// rather than from the model definition's default: this field is what the
@@ -202,6 +220,8 @@ pub fn mode_from_key(key: &str) -> Option<PermissionMode> {
 }
 
 pub fn state_of(
+    main_models: &ModelMenu,
+    main_presets: &PresetMenu,
     menus: &Pickers,
     model: &ModelCell,
     pinned: &AgentModels,
@@ -209,7 +229,16 @@ pub fn state_of(
     mode_staged: bool,
 ) -> PickerState {
     PickerState {
-        models: menus
+        models: main_models
+            .options
+            .iter()
+            .map(|option| ModelChoice {
+                profile: option.profile.clone(),
+                label: option.def.display().to_string(),
+                efforts: option.def.efforts.clone(),
+            })
+            .collect(),
+        role_models: menus
             .models
             .options
             .iter()
@@ -219,11 +248,12 @@ pub fn state_of(
                 efforts: option.def.efforts.clone(),
             })
             .collect(),
-        model: menus.models.current,
+        model: main_models
+            .current
+            .min(main_models.options.len().saturating_sub(1)),
         effort: model.snapshot().effort,
         context_window: model.snapshot().context_window,
-        presets: menus
-            .presets
+        presets: main_presets
             .options
             .iter()
             .map(|option| PresetChoice {
@@ -231,7 +261,7 @@ pub fn state_of(
                 label: option.label.clone(),
             })
             .collect(),
-        preset: menus.presets.current,
+        preset: main_presets.current,
         roles: menus
             .agents
             .roles
@@ -266,46 +296,55 @@ fn clone_mode(mode: &ModeChoice) -> ModeChoice {
     }
 }
 
-/// Switch the main model, live and in `[tcode_state]`.
+/// Switch the addressed session's main model, live, while persisting it as the
+/// default for sessions opened afterwards.
 ///
 /// The whole body is the frontend's `switch` closure; what is here is the index
 /// check, because the index came from the webview and is therefore data — plus
-/// the swap into the shared `ModelCell`, which is what makes the choice apply to
-/// the next request instead of only to the next process. The TUI's `apply_model`
-/// does exactly the same two steps around the same closure.
+/// the swap into the addressed session's `ModelCell`, which makes the choice
+/// apply to that conversation's next request. The TUI's `apply_model` does
+/// exactly the same two steps around the same closure.
 pub fn choose_model(
-    menus: &mut Pickers,
+    main: &mut MainPickers,
     model: &ModelCell,
     index: usize,
     effort: Option<&str>,
 ) -> Result<(), String> {
-    let option = menus
+    let option = main
         .models
         .options
         .get(index)
         .ok_or_else(|| format!("no model at position {index}"))?;
-    let active = (menus.models.switch)(option, effort)?;
+    let active = (main.models.switch)(option, effort)?;
     model.swap(active);
-    menus.models.current = index;
+    main.models.current = index;
+    main.presets.current = None;
     Ok(())
 }
 
-/// Apply a named preset: the main model plus every role, in one step.
+/// Apply a named preset: the selected session's main model plus every global
+/// role pin, in one step.
 ///
 /// All three menus are replaced, not two. A preset repins every role, so keeping
 /// the old `agents` would leave the panel listing pins that no longer exist —
 /// the frontend hands back a rebuilt `AgentMenu` precisely so nobody has to work
 /// out which rows moved.
-///
-/// The live `ModelCell` is *not* swapped here: the preset's own `apply` closure
-/// holds that cell and rebuilds through it, unlike `switch`. The two are
-/// asymmetric on purpose (see `choose_model`), so this is the one path that must
-/// not swap again.
-pub fn choose_preset(menus: &mut Pickers, key: &str) -> Result<String, String> {
-    let (models, agents, label, _warnings) = (menus.presets.apply)(key)?;
-    menus.models = models;
+pub fn choose_preset(
+    main: &mut MainPickers,
+    menus: &mut Pickers,
+    model: &ModelCell,
+    key: &str,
+) -> Result<String, String> {
+    let (models, agents, active, label, _warnings) = (main.presets.apply)(key)?;
+    model.swap(active);
+    // The returned AgentMenu indexes the returned model catalog. Keep that
+    // coordinate space process-global while only this session receives the new
+    // main menu.
+    menus.models.options = models.options.clone();
+    menus.models.current = models.current;
     menus.agents = agents;
-    menus.presets.current = menus
+    main.models = models;
+    main.presets.current = main
         .presets
         .options
         .iter()
@@ -346,14 +385,23 @@ pub fn pin_role(menus: &mut Pickers, kind: &str, choice: PinChoice) -> Result<St
 /// Write what is running out as `[presets.<name>]`.
 ///
 /// The draft is assembled here because only this layer holds the live line-up:
-/// the model menu's index, the effort from the shared cell, and every role's
-/// current pin. Naming the profiles and models behind those indices is the
-/// frontend's `save` closure, which is also where the name is validated — the
-/// name came from the webview, and the rules for it live with the config writer
-/// rather than in a second copy here.
-pub fn save_preset(menus: &mut Pickers, model: &ModelCell, name: &str) -> Result<(), String> {
+/// the session's model-menu index and effort, plus every process-global role
+/// pin. Naming the profiles and models behind those indices is the frontend's
+/// `save` closure, which is also where the name is validated — the name came
+/// from the webview, and the rules for it live with the config writer rather
+/// than in a second copy here.
+pub fn save_preset(
+    main: &mut MainPickers,
+    menus: &Pickers,
+    model: &ModelCell,
+    name: &str,
+) -> Result<(), String> {
     let draft = PresetDraft {
-        main: (!menus.models.options.is_empty()).then_some(menus.models.current),
+        main: main
+            .models
+            .options
+            .get(main.models.current)
+            .map(|_| main.models.current),
         main_effort: model.snapshot().effort,
         roles: menus
             .agents
@@ -363,11 +411,12 @@ pub fn save_preset(menus: &mut Pickers, model: &ModelCell, name: &str) -> Result
             .map(|(role, pin)| (role.key.clone(), pin.clone()))
             .collect(),
     };
-    let (options, current, _outcome) = (menus.presets.save)(name, &draft, &menus.models)?;
-    menus.presets.options = options;
-    // Saving switches to what was saved: the ad-hoc pins it was captured from
-    // are now spelled out under a name, so the preset is what is in force.
-    menus.presets.current = Some(current);
+    let (options, current, _outcome) =
+        (main.presets.save)(name, &draft, &main.models, &menus.models.options)?;
+    main.presets.options = options;
+    // Saving switches only this session's main line-up to the named identity;
+    // the auxiliary pins it captured are already process-global.
+    main.presets.current = Some(current);
     Ok(())
 }
 

@@ -26,9 +26,10 @@ impl ViewImageTool {
         Self { model, pinned }
     }
 
-    fn model_for_vision(&self) -> ActiveModel {
+    fn model_for_vision(&self, ctx: &ToolCtx) -> ActiveModel {
+        let primary = ctx.model.as_ref().unwrap_or(&self.model);
         self.pinned
-            .resolve(AgentRole::Vision, &self.model)
+            .resolve(AgentRole::Vision, primary)
             .expect("vision always inherits the main model")
     }
 }
@@ -186,7 +187,7 @@ impl Tool for ViewImageTool {
             return ToolOutput::err("missing required parameter: prompt");
         };
 
-        let model = self.model_for_vision();
+        let model = self.model_for_vision(ctx);
         if !model.provider.supports_vision() {
             return ToolOutput::err(format!(
                 "the configured vision model cannot view images ({}). Choose a vision-capable model with /agents → vision or configure [agents.vision].",

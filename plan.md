@@ -201,3 +201,6 @@ loop {
 30. Tool friction — browser.snapshot：为验证一个搜索筛选结果，快照把页面中 180 行事件明细和所有图表可访问文本都返回，产生了 3,500 余行输出。若支持按元素 ref 截取快照或提供最大文本量参数，可避免长表页面的无关上下文开销。
 31. Tool friction — browser.screenshot：真实截图成功后，API 返回了“image(s) omitted: this API cannot carry images returned from a tool”，导致当前会话无法把像素交给 view_image 做二次检查。最小改进是将返回图片保留为可检查的 artifact/path，或允许工具返回的 image block 直接作为 view_image 输入；否则截图成功也只能验证尺寸和调用状态，不能检查实际像素。
 32. app Append不显示diff
+33. Tool friction — browser.screenshot: 使用具体视觉检查 prompt 截图后，只返回了“image omitted: this API cannot carry images”，没有返回描述中预期的视觉模型结论。为完成检查，不得不通过临时 Electron 脚本保存截图，再调用 view_image。在图片不能进入主上下文时直接返回视觉子模型的文字结论即可消除这组额外调用。
+
+Capability gap — browser viewport sizing: 本次必须验证 900px 以下的 responsive rail，但 browser 工具没有调整 viewport 的动作。最终通过临时 BrowserWindow 设置 800px 宽度并截图。增加受限的 resize 动作，或给 screenshot 增加 viewport 宽高参数，就能直接完成响应式页面验证。

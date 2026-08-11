@@ -21,7 +21,7 @@ use serde::Serialize;
 use tcode_core::{config::Config, ContentBlock};
 
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
-use crate::projects::{self, ProjectInfo, StoredSession};
+use crate::projects::{self, ProjectInfo, StoredSessionsPage};
 use crate::state::{run_compact, run_turn, Supervisor};
 use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry, WorkspaceStat};
 
@@ -325,12 +325,14 @@ pub async fn project_list() -> Result<ProjectList, String> {
         .map_err(|error| format!("cannot read the project list: {error}"))
 }
 
-/// The resumable conversations inside one project. Separate from
-/// [`project_list`] because it replays every log to build previews —
-/// affordable for the one project a reader opened in the rail, not for all of
-/// them on every launch.
-pub async fn project_sessions(path: String) -> Result<Vec<StoredSession>, String> {
-    tokio::task::spawn_blocking(move || projects::sessions(Path::new(&path)))
+/// One bounded page of resumable conversations inside a project. `before` is
+/// the previous page's cursor; keeping it separate from [`project_list`] avoids
+/// parsing history for folders the reader never expands.
+pub async fn project_sessions(
+    path: String,
+    before: Option<String>,
+) -> Result<StoredSessionsPage, String> {
+    tokio::task::spawn_blocking(move || projects::session_page(Path::new(&path), before.as_deref()))
         .await
         .map_err(|error| format!("cannot read this project's conversations: {error}"))
 }
@@ -721,9 +723,6 @@ pub enum SlashResult {
         notice: Option<String>,
     },
     CompactStarted,
-    ResumePicker {
-        sessions: Vec<StoredSession>,
-    },
     /// A `/name` skill was loaded. Loading one is not a command that answers —
     /// it is a prompt — so this reports what `send_message` reports: the queue
     /// as it now stands, empty when the turn is already running. `prompt` is
@@ -746,7 +745,7 @@ pub enum SlashResult {
 /// offers. Two lists would let the menu advertise a command the dispatcher
 /// answers with "unsupported desktop command" — a completion for something
 /// that cannot be completed.
-const DESKTOP_COMMANDS: [&str; 3] = ["clear", "compact", "resume"];
+const DESKTOP_COMMANDS: [&str; 2] = ["clear", "compact"];
 
 /// What the composer offers after a `/`.
 #[derive(Serialize, Debug, PartialEq, Eq)]
@@ -862,14 +861,6 @@ pub fn slash_command(
                     }
                 });
                 return Ok(SlashResult::CompactStarted);
-            }
-            tcode_core::commands::CommandEffect::OpenResumePicker => {
-                let handle = supervisor
-                    .get(&session)
-                    .ok_or_else(|| format!("session '{session}' is not open"))?;
-                return Ok(SlashResult::ResumePicker {
-                    sessions: projects::sessions(&handle.cwd),
-                });
             }
             _ => return Err("that command is not available in the desktop app".into()),
         }
@@ -1037,7 +1028,7 @@ pub fn send_message(
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
     let agent = supervisor.agent();
-    let vision = agent.model.snapshot().provider.supports_vision();
+    let vision = handle.input_supports_vision(&agent.model);
     let input = compose(
         text.clone(),
         images.unwrap_or_default(),
@@ -1584,45 +1575,89 @@ pub fn picker_state(
     supervisor: &Arc<Supervisor>,
     session: String,
 ) -> Result<crate::picker::PickerState, String> {
-    let (mode, staged) = match supervisor.get(&session) {
-        Some(handle) => handle.mode(),
+    let handle = supervisor.get(&session);
+    let (mode, staged) = handle
+        .as_ref()
+        .map(|handle| handle.mode())
         // A window with no conversation open still wants the model chip.
-        None => (tcode_core::PermissionMode::default(), false),
-    };
-    let menus = supervisor.menus();
-    let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+        .unwrap_or_default();
     let agent = supervisor.agent();
-    Ok(crate::picker::state_of(
-        &menus,
-        &agent.model,
-        &agent.models,
-        mode,
-        staged,
-    ))
+    let model = handle
+        .as_ref()
+        .and_then(|handle| handle.model())
+        .unwrap_or_else(|| agent.model.clone());
+    let menus = supervisor.menus();
+    match handle {
+        Some(handle) => {
+            // Every path needing both locks takes the session-local owner first.
+            let main = handle
+                .main_pickers
+                .lock()
+                .map_err(|_| "session picker state is poisoned")?;
+            let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+            Ok(crate::picker::state_of(
+                &main.models,
+                &main.presets,
+                &menus,
+                &model,
+                &agent.models,
+                mode,
+                staged,
+            ))
+        }
+        None => {
+            let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+            Ok(crate::picker::state_of(
+                &menus.models,
+                &menus.presets,
+                &menus,
+                &model,
+                &agent.models,
+                mode,
+                staged,
+            ))
+        }
+    }
 }
 
 pub fn choose_model(
     supervisor: &Arc<Supervisor>,
+    session: String,
     index: usize,
     effort: Option<String>,
 ) -> Result<(), String> {
-    let menus = supervisor.menus();
-    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
-    // The agent's own cell, not a copy: every open session reads through it, so
-    // one swap moves the whole window (see AGENTS.md rule 15 — mode is per
-    // session, model is per process).
-    crate::picker::choose_model(
-        &mut menus,
-        &supervisor.agent().model,
-        index,
-        effort.as_deref(),
-    )
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let model = handle
+        .model()
+        .ok_or_else(|| format!("session '{session}' has no model"))?;
+    let mut main = handle
+        .main_pickers
+        .lock()
+        .map_err(|_| "session picker state is poisoned")?;
+    crate::picker::choose_model(&mut main, &model, index, effort.as_deref())?;
+    Ok(())
 }
 
-pub fn choose_preset(supervisor: &Arc<Supervisor>, key: String) -> Result<String, String> {
+pub fn choose_preset(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    key: String,
+) -> Result<String, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let model = handle
+        .model()
+        .ok_or_else(|| format!("session '{session}' has no model"))?;
+    let mut main = handle
+        .main_pickers
+        .lock()
+        .map_err(|_| "session picker state is poisoned")?;
     let menus = supervisor.menus();
     let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
-    crate::picker::choose_preset(&mut menus, &key)
+    crate::picker::choose_preset(&mut main, &mut menus, &model, &key)
 }
 
 /// Pin one sub-agent or helper role to a model, to the main model, or off.
@@ -1637,10 +1672,24 @@ pub fn pin_role(
 }
 
 /// Capture the live line-up as `[presets.<name>]`.
-pub fn save_preset(supervisor: &Arc<Supervisor>, name: String) -> Result<(), String> {
+pub fn save_preset(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    name: String,
+) -> Result<(), String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let model = handle
+        .model()
+        .ok_or_else(|| format!("session '{session}' has no model"))?;
+    let mut main = handle
+        .main_pickers
+        .lock()
+        .map_err(|_| "session picker state is poisoned")?;
     let menus = supervisor.menus();
-    let mut menus = menus.lock().map_err(|_| "picker state is poisoned")?;
-    crate::picker::save_preset(&mut menus, &supervisor.agent().model, name.trim())
+    let menus = menus.lock().map_err(|_| "picker state is poisoned")?;
+    crate::picker::save_preset(&mut main, &menus, &model, name.trim())
 }
 
 /// Choose the permission mode for one conversation.

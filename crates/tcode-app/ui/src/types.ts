@@ -223,9 +223,8 @@ export type SessionInfo = {
   name: string;
   /** Home directory, for rendering `~/…`. */
   home: string;
-  /** The session log this conversation appends to, when it is persisted. The
-   *  rail lists live conversations and resumable logs in one group, and this is
-   *  what stops one conversation appearing as both. */
+  /** The session log this conversation appends to, when it is persisted. Recent
+   *  project history marks this log as open so it cannot be resumed twice. */
   log_id: string | null;
 };
 
@@ -312,7 +311,6 @@ export type OpenedSession = {
 export type SlashResult =
   | { kind: "conversation"; opened: OpenedSession; notice: string | null }
   | { kind: "compact_started" }
-  | { kind: "resume_picker"; sessions: StoredSession[] }
   | { kind: "notice"; text: string; error: boolean }
   /** A `/name` skill was loaded and sent. It is a prompt, so it answers like
    *  `send_message`: `queued` empty means the turn is already running, and
@@ -335,6 +333,13 @@ export type StoredSession = {
   id: string;
   preview: string;
   modified: number | null;
+};
+
+/** A stable, newest-first page of stored conversations. Pass `next` back as
+ * `before`; a session created meanwhile cannot shift the older rows. */
+export type StoredSessionsPage = {
+  sessions: StoredSession[];
+  next: string | null;
 };
 
 export type ProjectList = {
