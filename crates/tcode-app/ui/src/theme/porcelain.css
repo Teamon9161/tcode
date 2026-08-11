@@ -70,6 +70,9 @@
   --syn-keyword: oklch(0.26 0.012 130);
   --syn-type: oklch(0.26 0.012 130);
   --syn-call: oklch(0.26 0.012 130);
+  --syn-heading: oklch(0.42 0.11 27); /* warm terracotta — structure, not content */
+  --syn-link: oklch(0.47 0.125 132); /* olive — same as --brand, links are actions */
+  --syn-emphasis: oklch(0.42 0.08 290); /* muted violet — distinct from body without shouting */
 
   /* ---- Diff ----------------------------------------------------------- */
   --diff-add-wash: oklch(0.972 0.028 132);

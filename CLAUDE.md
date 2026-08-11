@@ -58,7 +58,7 @@ Workspace：core / providers / importers / tools / **frontend** / tui + 根 bina
 **依赖方向单向：core 不知道 UI 存在。** `tcode-importers` 对来源文件只读复制，绝不修改。
 
 - `tcode-frontend` 是**UI 无关的共享装配层**：从 Config 到 `Arc<Agent>`（`boot`）、开会话带持久化（`open_session`）、模型/preset/agents 菜单数据、provider setup 状态机。三个前端（TUI / plain REPL / 桌面 app）共用。它绝不依赖 UI crate（含 crossterm/ratatui）。新写"某个前端要做的装配"时先问它是不是三家都一样——是就下沉到这里。
-- **不在 workspace 里的两个 crate**（各自链接本机原生依赖，`cargo build --workspace` 必须与它们无关，在各自目录里构建）：`tcode-voiced`（语音 sidecar）、`tcode-app`（Tauri 桌面前端，Linux 需 webkit2gtk + libsoup）。
+- **不在 workspace 里的两个 crate**（各自链接本机原生依赖，`cargo build --workspace` 必须与它们无关，在各自目录里构建）：`tcode-voiced`（语音 sidecar）、`tcode-app`（Electron 桌面前端，Rust 后端作为 sidecar 子进程）。
 
 各 crate 的内部结构自己读代码，硬规则在它自己的 `AGENTS.md` 里。
 

@@ -52,7 +52,7 @@
      a surface whose rule is that chroma means state.
      The derivation below is achromatic on purpose: four steps of the text
      ramp, plus the brand for keywords, which is identity ink rather than a new
-     hue. A theme that wants a coloured scheme overrides these seven names. */
+     hue. A theme that wants a coloured scheme overrides these eleven names. */
   --syn-comment: var(--faint);
   --syn-punct: var(--muted);
   --syn-plain: var(--body);
@@ -61,6 +61,9 @@
   --syn-keyword: var(--brand-text);
   --syn-type: var(--ink);
   --syn-call: var(--syn-type);
+  --syn-heading: var(--brand-text);
+  --syn-link: var(--brand-text);
+  --syn-emphasis: var(--body);
 
   /* ---- Diff ----------------------------------------------------------- */
   /* Additions and removals are the one place a review surface must be

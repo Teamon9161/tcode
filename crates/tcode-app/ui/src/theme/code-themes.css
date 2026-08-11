@@ -12,6 +12,9 @@
   --syn-keyword: oklch(0.48 0.18 27);
   --syn-type: oklch(0.43 0.13 255);
   --syn-call: oklch(0.46 0.15 300);
+  --syn-heading: oklch(0.44 0.18 27); /* github's red-orange for headings */
+  --syn-link: oklch(0.48 0.16 255); /* github blue for links */
+  --syn-emphasis: oklch(0.3 0.025 255); /* inherits ink weight — bold/italic carry themselves */
 }
 
 :root[data-code-theme="one-light"] {
@@ -23,6 +26,9 @@
   --syn-keyword: oklch(0.46 0.15 325);
   --syn-type: oklch(0.52 0.115 83);
   --syn-call: oklch(0.52 0.135 255);
+  --syn-heading: oklch(0.48 0.18 27); /* warm red — Atom's heading color */
+  --syn-link: oklch(0.5 0.13 255); /* blue — recognisable as a link */
+  --syn-emphasis: oklch(0.46 0.15 325); /* magenta tint, matching keyword family */
 }
 
 :root[data-code-theme="solarized-light"] {
@@ -34,4 +40,7 @@
   --syn-keyword: oklch(0.5 0.17 345);
   --syn-type: oklch(0.55 0.115 205);
   --syn-call: oklch(0.53 0.115 245);
+  --syn-heading: oklch(0.55 0.17 27); /* solarized orange */
+  --syn-link: oklch(0.53 0.135 245); /* solarized blue — matches call */
+  --syn-emphasis: oklch(0.5 0.17 345); /* solarized magenta — matches keyword */
 }

@@ -5059,6 +5059,19 @@ body.is-resizing {
   color: var(--syn-call);
   font-weight: var(--weight-medium);
 }
+.tok-heading {
+  color: var(--syn-heading);
+  font-weight: var(--weight-semibold);
+}
+.tok-link {
+  color: var(--syn-link);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.tok-emphasis {
+  color: var(--syn-emphasis);
+  font-style: italic;
+}
 
 /* ============================================================ prose */
 
@@ -7089,7 +7102,7 @@ button.strip-phase-line:hover .strip-phase-name {
    graphite hierarchy as the preview; links remain olive because they name an
    action once rendered, not because green is a generic syntax colour. */
 .workspace-editor .tok-heading {
-  color: var(--syn-plain);
+  color: var(--syn-heading);
   font-weight: var(--weight-semibold);
 }
 
@@ -7116,9 +7129,12 @@ button.strip-phase-line:hover .strip-phase-name {
 }
 
 .workspace-editor .tok-tagName,
-.workspace-editor .tok-attributeName,
-.workspace-editor .tok-link {
+.workspace-editor .tok-attributeName {
   color: var(--syn-keyword);
+}
+
+.workspace-editor .tok-link {
+  color: var(--syn-link);
 }
 
 .workspace-editor .tok-meta,
@@ -7128,10 +7144,12 @@ button.strip-phase-line:hover .strip-phase-name {
 }
 
 .workspace-editor .tok-emphasis {
+  color: var(--syn-emphasis);
   font-style: italic;
 }
 
 .workspace-editor .tok-strong {
+  color: var(--syn-emphasis);
   font-weight: var(--weight-semibold);
 }
 

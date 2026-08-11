@@ -25,10 +25,7 @@ impl SlashCommand for KongCommand {
             }
         };
         if on == ctx.session.kong() {
-            return CommandOutcome::info(format!(
-                "kong already {}",
-                if on { "on" } else { "off" }
-            ));
+            return CommandOutcome::info(format!("kong already {}", if on { "on" } else { "off" }));
         }
         ctx.session.set_kong(on);
         CommandOutcome::info(if on {

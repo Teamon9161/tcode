@@ -42,7 +42,10 @@ export type TokenKind =
   | "keyword"
   | "type"
   | "call"
-  | "punct";
+  | "punct"
+  | "heading"
+  | "link"
+  | "emphasis";
 
 const KINDS: TokenKind[] = [
   "plain",
@@ -53,6 +56,9 @@ const KINDS: TokenKind[] = [
   "type",
   "call",
   "punct",
+  "heading",
+  "link",
+  "emphasis",
 ];
 
 /** `plain` is `#000001`, `comment` is `#000002`, and so on: a colour a theme
@@ -97,7 +103,6 @@ const THEME: ThemeRegistrationRaw = {
       "constant.language",
       "variable.language",
       "entity.name.tag",
-      "markup.heading",
     ),
     paints(
       "type",
@@ -126,6 +131,25 @@ const THEME: ThemeRegistrationRaw = {
       "markup.fenced_code",
     ),
     paints("comment", "comment", "punctuation.definition.comment"),
+    paints(
+      "heading",
+      "markup.heading",
+      "punctuation.definition.heading",
+    ),
+    paints(
+      "link",
+      "markup.underline.link",
+      "string.other.link.title",
+      "string.other.link.description",
+    ),
+    paints(
+      "emphasis",
+      "markup.bold",
+      "markup.italic",
+      "punctuation.definition.bold",
+      "punctuation.definition.italic",
+      "markup.strikethrough",
+    ),
   ],
 };
 

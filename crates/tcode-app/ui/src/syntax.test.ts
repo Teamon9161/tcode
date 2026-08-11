@@ -35,7 +35,7 @@ describe("highlighting", () => {
     expect(highlight("let x = 1;", "cobol")).toBeNull();
   });
 
-  it("classifies a snippet into this app's own eight kinds", async () => {
+  it("classifies a snippet into this app's own token kinds", async () => {
     await loadGrammar("rust");
     const tokens = highlight(
       `// a comment
@@ -67,11 +67,23 @@ pub fn user_turn(&self) -> Result<u32> {
      index into `KINDS`, never a colour. A theme value leaking through here
      would be a literal colour no theme pack could reassign — the exact thing
      the hand-rolled highlighter existed to prevent. */
-  it("never returns a kind outside the eight", async () => {
+  it("never returns a kind outside the known set", async () => {
     await loadGrammar("markdown");
     const tokens = highlight("# Title\n\nSome **bold** and `code`.", "md") ?? [];
-    const allowed = ["plain", "comment", "string", "number", "keyword", "type", "call", "punct"];
+    const allowed = [
+      "plain", "comment", "string", "number", "keyword", "type", "call", "punct",
+      "heading", "link", "emphasis",
+    ];
     for (const token of tokens) expect(allowed).toContain(token.kind);
     expect(tokens.length).toBeGreaterThan(0);
+  });
+
+  it("classifies markdown structural elements into markup kinds", async () => {
+    await loadGrammar("markdown");
+    const tokens = highlight("# Heading\n\n**bold** and [link](https://x.com)", "md") ?? [];
+    expect(kinds(tokens, "# Heading")).toEqual(["heading"]);
+    expect(kinds(tokens, "**bold**")).toEqual(["emphasis"]);
+    expect(kinds(tokens, "link")).toEqual(["link"]);
+    expect(kinds(tokens, "https://x.com")).toEqual(["link"]);
   });
 });
