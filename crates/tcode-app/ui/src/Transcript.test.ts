@@ -6,6 +6,7 @@ import {
   changeSetLabel,
   groupTranscriptBlocks,
   isAtBottom,
+  latestBrowserCall,
   runInspect,
   runState,
 } from "./Transcript";
@@ -45,11 +46,16 @@ describe("groupTranscriptBlocks", () => {
   });
 
   it("collapses consecutive changes, but keeps a single change and execution boundaries direct", () => {
-    const grouped = groupTranscriptBlocks([tool("edit", "e1"), tool("write", "w1"), tool("multi_edit", "m1")]);
+    const grouped = groupTranscriptBlocks([
+      tool("edit", "e1"),
+      tool("write", "w1"),
+      tool("append", "a1"),
+      tool("multi_edit", "m1"),
+    ]);
     expect(grouped).toHaveLength(1);
     expect(grouped[0]).toMatchObject({
       kind: "changes",
-      blocks: [{ callId: "e1" }, { callId: "w1" }, { callId: "m1" }],
+      blocks: [{ callId: "e1" }, { callId: "w1" }, { callId: "a1" }, { callId: "m1" }],
     });
 
     const separated = groupTranscriptBlocks([
@@ -140,6 +146,13 @@ describe("groupTranscriptBlocks", () => {
       "exploration",
       "browser",
     ]);
+  });
+
+  it("keeps only the newest successful Browser call eligible for a live preview", () => {
+    const older = browser("b1", "tab-a");
+    const latest = browser("b2", "tab-b");
+    expect(latestBrowserCall([older, latest])).toBe("b2");
+    expect(latestBrowserCall([older, browser("failed", "tab-c", { error: true })])).toBe("b1");
   });
 
   // Reasoning used to be swept into the surrounding exploration group, from when

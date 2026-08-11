@@ -71,6 +71,7 @@ export const Transcript = memo(function Transcript({
     () => ({ points: rewindPoints(blocks, rewindTargets ?? []), onRewind }),
     [blocks, rewindTargets, onRewind],
   );
+  const latestBrowserCallId = useMemo(() => latestBrowserCall(blocks), [blocks]);
 
   // Layout effect, not effect: the scroll correction has to land in the same
   // frame as the new content, or a long delta paints once at the old offset.
@@ -107,6 +108,7 @@ export const Transcript = memo(function Transcript({
             blocks={blocks}
             onOpen={onOpen}
             onRevealBrowserTab={onRevealBrowserTab}
+            latestBrowserCallId={latestBrowserCallId}
           />
         </RewindContext.Provider>
       </div>
@@ -127,14 +129,18 @@ export function BlockList({
   onOpen,
   groupExploration = true,
   onRevealBrowserTab = () => {},
+  latestBrowserCallId,
 }: {
   blocks: Block[];
   onOpen: (value: Inspect) => void;
   /** Batches are already a deliberate grouping boundary. */
   groupExploration?: boolean;
   onRevealBrowserTab?: (tab: string) => void;
+  /** The one browser operation in this transcript that owns the live preview. */
+  latestBrowserCallId?: string | null;
 }) {
   const { thinking } = useDisplay();
+  const newestBrowserCall = latestBrowserCallId ?? latestBrowserCall(blocks);
   const pairs = useMemo(() => runPairs(blocks), [blocks]);
 
   // Two things leave the list before anything is grouped, so grouping stays one
@@ -174,6 +180,7 @@ export function BlockList({
             blocks={item.blocks}
             onOpen={onOpen}
             onReveal={onRevealBrowserTab}
+            showPreview={item.blocks.some((block) => block.callId === newestBrowserCall)}
           />
         ) : item.block.kind === "run" ? (
           <RunCall
@@ -182,6 +189,7 @@ export function BlockList({
             report={pairs.report.get(item.block.run)}
             onOpen={onOpen}
             onRevealBrowserTab={onRevealBrowserTab}
+            latestBrowserCallId={newestBrowserCall}
           />
         ) : (
           <BlockView
@@ -189,6 +197,7 @@ export function BlockList({
             block={item.block}
             onOpen={onOpen}
             onRevealBrowserTab={onRevealBrowserTab}
+            latestBrowserCallId={newestBrowserCall}
           />
         ),
       )}
@@ -332,6 +341,22 @@ function browserTabOf(block: ToolBlock): string | null {
   return metadata?.kind === "browser_tab" && metadata.id ? metadata.id : null;
 }
 
+/** The sole Browser trace that may subscribe to the live page thumbnail. */
+export function latestBrowserCall(blocks: Block[]): string | null {
+  let latest: string | null = null;
+  const visit = (items: Block[]) => {
+    for (const block of items) {
+      if (block.kind === "tool" && block.name === "browser" && browserTabOf(block)) {
+        latest = block.callId;
+      } else if (block.kind === "batch" || block.kind === "run") {
+        visit(block.blocks);
+      }
+    }
+  };
+  visit(blocks);
+  return latest;
+}
+
 /**
  * One thing that happened, drawn.
  *
@@ -347,10 +372,12 @@ const BlockView = memo(function BlockView({
   block,
   onOpen,
   onRevealBrowserTab,
+  latestBrowserCallId,
 }: {
   block: Block;
   onOpen: (value: Inspect) => void;
   onRevealBrowserTab: (tab: string) => void;
+  latestBrowserCallId: string | null;
 }) {
   switch (block.kind) {
     case "user":
@@ -377,6 +404,7 @@ const BlockView = memo(function BlockView({
           block={block}
           onOpen={onOpen}
           onRevealBrowserTab={onRevealBrowserTab}
+          latestBrowserCallId={latestBrowserCallId}
         />
       );
     // Reached only for a run whose parent call is not in the same list — the
@@ -387,6 +415,7 @@ const BlockView = memo(function BlockView({
           block={block}
           onOpen={onOpen}
           onRevealBrowserTab={onRevealBrowserTab}
+          latestBrowserCallId={latestBrowserCallId}
         />
       );
   }
@@ -718,18 +747,20 @@ function BrowserGroup({
   blocks,
   onOpen,
   onReveal,
+  showPreview,
 }: {
   tab: string;
   blocks: ToolBlock[];
   onOpen: (value: Inspect) => void;
   onReveal: (tab: string) => void;
+  showPreview: boolean;
 }) {
   return (
     <TraceGroup
       label="Browse page"
       count={blocks.length}
       failed={blocks.some((block) => block.result?.isError)}
-      footer={<BrowserPreview tab={tab} onReveal={onReveal} />}
+      footer={showPreview ? <BrowserPreview tab={tab} onReveal={onReveal} /> : undefined}
     >
       {blocks.map((block) => (
         <ToolCall key={block.callId} block={block} onOpen={onOpen} />
@@ -946,10 +977,12 @@ function BatchCall({
   block,
   onOpen,
   onRevealBrowserTab,
+  latestBrowserCallId,
 }: {
   block: Extract<Block, { kind: "batch" }>;
   onOpen: (value: Inspect) => void;
   onRevealBrowserTab: (tab: string) => void;
+  latestBrowserCallId: string | null;
 }) {
   const { editDetails } = useDisplay();
   const done = block.blocks.every((child) => child.kind !== "tool" || child.result !== undefined);
@@ -969,6 +1002,7 @@ function BatchCall({
         onOpen={onOpen}
         groupExploration={false}
         onRevealBrowserTab={onRevealBrowserTab}
+        latestBrowserCallId={latestBrowserCallId}
       />
     </TraceGroup>
   );
@@ -987,6 +1021,7 @@ const RunCall = memo(function RunCall({
   report,
   onOpen,
   onRevealBrowserTab,
+  latestBrowserCallId,
 }: {
   block: Extract<Block, { kind: "run" }>;
   /** The delegating call, whose result is the report this run came back with.
@@ -994,6 +1029,7 @@ const RunCall = memo(function RunCall({
   report?: ToolBlock;
   onOpen: (value: Inspect) => void;
   onRevealBrowserTab: (tab: string) => void;
+  latestBrowserCallId: string | null;
 }) {
   const [open, setOpen] = useState(false);
   const status = block.meta.status;
@@ -1042,6 +1078,7 @@ const RunCall = memo(function RunCall({
             blocks={steps}
             onOpen={onOpen}
             onRevealBrowserTab={onRevealBrowserTab}
+            latestBrowserCallId={latestBrowserCallId}
           />
           {block.blocks.length === 0 && <p className="run-waiting">starting…</p>}
           {report?.result?.content && (

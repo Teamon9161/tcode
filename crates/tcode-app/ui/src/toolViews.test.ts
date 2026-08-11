@@ -107,5 +107,10 @@ describe("a show call's pop-out target", () => {
       kind: "diff",
       callId: "c1",
     });
+    expect(inspectFor("append", { path: "a", content: "new tail" }, "c2")).toEqual({
+      kind: "diff",
+      callId: "c2",
+    });
+    expect(viewFor("append").body?.({ path: "a", content: "new tail" })).not.toBeNull();
   });
 });

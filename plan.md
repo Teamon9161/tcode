@@ -197,7 +197,6 @@ loop {
 24. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
 26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
 28. app prompt框上方的plan栏，展开后，再展开background，没法滚动，在长background的时候展开后看不全，也没法看phase了。
-29. app 侧边栏，我在想是不是recent上方直接显示会话session更好呢，而不是用project的方式组织，project统一还是放下方Recent那块显示，在recent点击new就创建一个新session, 这样的话就可以那些运行的会话标好序号，方便切换窗口了。然后就是比如现在earlier后面有序号，我有的项目比较多，一下点一下加载100多条就有点卡了，也有点占窗口，你看下怎么做好，分级不断点击加载，然后支持滚动还是怎样。
 30. Tool friction — browser.snapshot：为验证一个搜索筛选结果，快照把页面中 180 行事件明细和所有图表可访问文本都返回，产生了 3,500 余行输出。若支持按元素 ref 截取快照或提供最大文本量参数，可避免长表页面的无关上下文开销。
 31. Tool friction — browser.screenshot：真实截图成功后，API 返回了“image(s) omitted: this API cannot carry images returned from a tool”，导致当前会话无法把像素交给 view_image 做二次检查。最小改进是将返回图片保留为可检查的 artifact/path，或允许工具返回的 image block 直接作为 view_image 输入；否则截图成功也只能验证尺寸和调用状态，不能检查实际像素。
 32. app Append不显示diff

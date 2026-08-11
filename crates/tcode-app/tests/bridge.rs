@@ -991,6 +991,7 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
     let tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(Fake("read", BatchPolicy::ParallelReadOnly)),
         Arc::new(Fake("edit", BatchPolicy::ParallelPerFile)),
+        Arc::new(Fake("append", BatchPolicy::ParallelPerFile)),
         // Named like the real thing, and deliberately not it: routing comes from
         // the tool, so a look-alike must route like the ordinary tool it is.
         // The name list this replaced could not tell the two apart.
@@ -1014,6 +1015,7 @@ fn tool_views_report_routing_derived_from_the_live_tools() {
 
     // An edit's diff already told the story at the call site.
     assert!(find("edit").hide_success_result);
+    assert!(find("append").hide_success_result);
     assert!(!find("read").hide_success_result);
 
     assert_eq!(find("read").route, "transcript");

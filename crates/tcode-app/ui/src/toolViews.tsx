@@ -236,6 +236,7 @@ const VIEWS: Record<string, ToolView> = {
   show: showing,
   edit: editing,
   write: editing,
+  append: editing,
   multi_edit: editing,
   notebook_edit: editing,
   read: reading,

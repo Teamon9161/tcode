@@ -104,7 +104,7 @@ fn folder_name(cwd: &Path) -> String {
 /// site (see `plan.ts::isPlanSubmission`).
 ///
 /// `hide_success_result` stays a name list: it is a presentation judgement about
-/// four tools whose body is a diff, not a capability core has any opinion about.
+/// tools whose body is a diff, not a capability core has any opinion about.
 /// `display_name` is core's own answer (`Tool::display_name`), the same one the
 /// TUI's `RenderRegistry` snapshots. It travels because otherwise the webview
 /// has to invent a second naming rule for the same tools, and two title-casing
@@ -120,7 +120,7 @@ pub struct ToolViewMeta {
 
 /// Tools whose call body already showed the change, so a success line under it
 /// only repeats what the diff said.
-const BODY_IS_THE_RESULT: &[&str] = &["edit", "write", "multi_edit", "notebook_edit"];
+const BODY_IS_THE_RESULT: &[&str] = &["edit", "write", "append", "multi_edit", "notebook_edit"];
 
 /// Names a tool used to answer to, and the live tool that still owns their
 /// routing. Sessions on disk hold whatever the tool was called when they were
