@@ -38,6 +38,7 @@ import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
 import { Panes, type PaneContext } from "./Panes";
 import { SettingsPanel } from "./DisplayMenu";
+import { UpdateIndicator } from "./UpdateIndicator";
 import type { Display } from "./display";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import { Rail } from "./Rail";
@@ -707,6 +708,7 @@ export function Workspace({
             the left pane and another in the right. */}
         <WindowDragRegion />
         <SettingsPanel display={display} onChange={onDisplay} />
+        <UpdateIndicator />
         <WindowControls />
       </header>
 

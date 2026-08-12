@@ -10,18 +10,18 @@ export const CODE_THEMES = [
     detail: "The app's olive-and-graphite code palette.",
   },
   {
-    id: "github-light",
-    label: "GitHub Light",
-    detail: "Clear blue, red, purple, and green roles on paper.",
+    id: "github",
+    label: "GitHub",
+    detail: "Clear blue, red, purple, and green roles.",
   },
   {
-    id: "one-light",
-    label: "One Light",
+    id: "one",
+    label: "One",
     detail: "Atom's balanced violet, blue, and green syntax palette.",
   },
   {
-    id: "solarized-light",
-    label: "Solarized Light",
+    id: "solarized",
+    label: "Solarized",
     detail: "The classic low-glare blue, cyan, green, and magenta palette.",
   },
 ] as const;
@@ -31,6 +31,12 @@ export type CodeTheme = (typeof CODE_THEMES)[number]["id"];
 const KEY = "tcode.code-theme";
 const FALLBACK: CodeTheme = "porcelain";
 
+const LEGACY: Record<string, CodeTheme> = {
+  "github-light": "github",
+  "one-light": "one",
+  "solarized-light": "solarized",
+};
+
 function isCodeTheme(value: unknown): value is CodeTheme {
   return CODE_THEMES.some((theme) => theme.id === value);
 }
@@ -38,7 +44,9 @@ function isCodeTheme(value: unknown): value is CodeTheme {
 export function loadCodeTheme(): CodeTheme {
   try {
     const stored = window.localStorage.getItem(KEY);
-    return isCodeTheme(stored) ? stored : FALLBACK;
+    if (isCodeTheme(stored)) return stored;
+    if (stored && stored in LEGACY) return LEGACY[stored];
+    return FALLBACK;
   } catch {
     return FALLBACK;
   }

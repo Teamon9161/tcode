@@ -1,9 +1,15 @@
 /* Optional syntax palettes. These override only semantic code tokens, so the
- * app's status language and porcelain surfaces remain stable. The values follow
- * the public GitHub Light, One Light, and Solarized Light families rather than
- * importing a library palette that CodeMirror could not share. */
+ * app's status language and surface colours remain stable. Each named palette
+ * has a light and a dark half; the dark half activates automatically when the
+ * app theme is dark (`data-theme="dark"`), so the user's choice of code palette
+ * carries across both modes without a manual switch.
+ *
+ * The values follow the public GitHub, Atom One, and Solarized families rather
+ * than importing a library palette that CodeMirror could not share. */
 
-:root[data-code-theme="github-light"] {
+/* ==== GitHub ============================================================= */
+
+:root[data-code-theme="github"] {
   --syn-comment: oklch(0.56 0.016 255);
   --syn-punct: oklch(0.39 0.025 255);
   --syn-plain: oklch(0.3 0.025 255);
@@ -12,12 +18,28 @@
   --syn-keyword: oklch(0.48 0.18 27);
   --syn-type: oklch(0.43 0.13 255);
   --syn-call: oklch(0.46 0.15 300);
-  --syn-heading: oklch(0.44 0.18 27); /* github's red-orange for headings */
-  --syn-link: oklch(0.48 0.16 255); /* github blue for links */
-  --syn-emphasis: oklch(0.3 0.025 255); /* inherits ink weight — bold/italic carry themselves */
+  --syn-heading: oklch(0.44 0.18 27);
+  --syn-link: oklch(0.48 0.16 255);
+  --syn-emphasis: oklch(0.3 0.025 255);
 }
 
-:root[data-code-theme="one-light"] {
+:root[data-theme="dark"][data-code-theme="github"] {
+  --syn-comment: oklch(0.55 0.02 220);
+  --syn-punct: oklch(0.68 0.015 220);
+  --syn-plain: oklch(0.82 0.015 220);
+  --syn-string: oklch(0.82 0.08 235);
+  --syn-number: oklch(0.78 0.10 240);
+  --syn-keyword: oklch(0.72 0.17 25);
+  --syn-type: oklch(0.77 0.13 65);
+  --syn-call: oklch(0.76 0.12 300);
+  --syn-heading: oklch(0.72 0.17 25);
+  --syn-link: oklch(0.72 0.14 255);
+  --syn-emphasis: oklch(0.82 0.015 220);
+}
+
+/* ==== One (Atom) ========================================================= */
+
+:root[data-code-theme="one"] {
   --syn-comment: oklch(0.64 0.018 280);
   --syn-punct: oklch(0.36 0.025 280);
   --syn-plain: oklch(0.3 0.025 280);
@@ -26,12 +48,28 @@
   --syn-keyword: oklch(0.46 0.15 325);
   --syn-type: oklch(0.52 0.115 83);
   --syn-call: oklch(0.52 0.135 255);
-  --syn-heading: oklch(0.48 0.18 27); /* warm red — Atom's heading color */
-  --syn-link: oklch(0.5 0.13 255); /* blue — recognisable as a link */
-  --syn-emphasis: oklch(0.46 0.15 325); /* magenta tint, matching keyword family */
+  --syn-heading: oklch(0.48 0.18 27);
+  --syn-link: oklch(0.5 0.13 255);
+  --syn-emphasis: oklch(0.46 0.15 325);
 }
 
-:root[data-code-theme="solarized-light"] {
+:root[data-theme="dark"][data-code-theme="one"] {
+  --syn-comment: oklch(0.52 0.018 220);
+  --syn-punct: oklch(0.65 0.015 220);
+  --syn-plain: oklch(0.80 0.012 220);
+  --syn-string: oklch(0.72 0.12 145);
+  --syn-number: oklch(0.76 0.11 83);
+  --syn-keyword: oklch(0.72 0.15 325);
+  --syn-type: oklch(0.76 0.11 83);
+  --syn-call: oklch(0.72 0.14 255);
+  --syn-heading: oklch(0.72 0.17 27);
+  --syn-link: oklch(0.70 0.14 255);
+  --syn-emphasis: oklch(0.72 0.15 325);
+}
+
+/* ==== Solarized ========================================================== */
+
+:root[data-code-theme="solarized"] {
   --syn-comment: oklch(0.59 0.027 220);
   --syn-punct: oklch(0.46 0.035 220);
   --syn-plain: oklch(0.39 0.035 220);
@@ -40,7 +78,21 @@
   --syn-keyword: oklch(0.5 0.17 345);
   --syn-type: oklch(0.55 0.115 205);
   --syn-call: oklch(0.53 0.115 245);
-  --syn-heading: oklch(0.55 0.17 27); /* solarized orange */
-  --syn-link: oklch(0.53 0.135 245); /* solarized blue — matches call */
-  --syn-emphasis: oklch(0.5 0.17 345); /* solarized magenta — matches keyword */
+  --syn-heading: oklch(0.55 0.17 27);
+  --syn-link: oklch(0.53 0.135 245);
+  --syn-emphasis: oklch(0.5 0.17 345);
+}
+
+:root[data-theme="dark"][data-code-theme="solarized"] {
+  --syn-comment: oklch(0.55 0.03 220);
+  --syn-punct: oklch(0.62 0.025 220);
+  --syn-plain: oklch(0.75 0.025 220);
+  --syn-string: oklch(0.72 0.12 145);
+  --syn-number: oklch(0.76 0.12 80);
+  --syn-keyword: oklch(0.72 0.16 345);
+  --syn-type: oklch(0.72 0.11 205);
+  --syn-call: oklch(0.70 0.12 245);
+  --syn-heading: oklch(0.72 0.16 27);
+  --syn-link: oklch(0.70 0.14 245);
+  --syn-emphasis: oklch(0.72 0.16 345);
 }

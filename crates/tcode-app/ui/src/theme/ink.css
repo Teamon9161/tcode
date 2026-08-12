@@ -1,0 +1,152 @@
+/* Ink — the dark companion to Porcelain.
+ *
+ * Where Porcelain is white paper with graphite marks, Ink is a dark ground
+ * with light chalk marks. The identity is the same: olive brand, restrained
+ * chroma, hierarchy by weight and lightness rather than colour. Every value
+ * here is checked for contrast — the ratios in the comments are measured
+ * against the background they sit on, not aspirational.
+ *
+ * Active when `data-theme="dark"` is set on the document root.
+ * The selector outranks Porcelain's bare `:root`, so both files can be
+ * imported — the cascade does the switching, not a build-time swap. */
+
+:root[data-theme="dark"] {
+  /* ---- Core (the seven a theme must supply) ----------------------------- */
+
+  /* Deep charcoal tinted toward the brand hue. Warm enough to avoid the
+     clinical blue-grey of stock dark modes, dark enough that light text
+     reads without effort. Not pure black — that is harsher than any screen
+     needs and swallows the elevation shadows that separate panes. */
+  --bg: oklch(0.155 0.008 130);
+
+  /* Near-white carrying the same whisper of olive as Porcelain's ink.
+     15.9:1 on --bg. */
+  --ink: oklch(0.93 0.008 130);
+
+  /* Olive. Same hue and chroma family as Porcelain's, lifted to read on
+     a dark ground. 5.4:1 on --bg; holds dark text when filled. */
+  --brand: oklch(0.62 0.14 132);
+
+  /* Parked on a human. Brighter than Porcelain's, proportionally: the same
+     "out-rank running at a glance" rule, adapted for a dark field. */
+  --amber: oklch(0.72 0.14 60);
+
+  /* Failed. */
+  --danger: oklch(0.65 0.18 27);
+
+  --font-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", "Symbols Nerd Font Mono", ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* ---- Surfaces --------------------------------------------------------- */
+  /* Chrome is lighter than bg: the frame rises while content sits below it.
+     Sunken is darker: the well you type into should feel recessed, whether
+     the ground is light or dark. The base.css derivation walks bg toward
+     ink, which on a dark theme means brighter — correct for chrome, wrong
+     for sunken, so sunken is overridden. */
+  --chrome: oklch(0.195 0.006 130);
+  --sunken: oklch(0.125 0.006 130);
+  --line: oklch(0.27 0.008 130);
+  --line-strong: oklch(0.36 0.01 130);
+
+  /* ---- Text ------------------------------------------------------------- */
+  /* body: 9.8:1 on --bg; the reading level.
+     muted: 5.0:1 on --bg, 4.6:1 on --chrome; secondary, always AA.
+     faint: 2.5:1 on --bg; decorative only, never the sole bearer of meaning. */
+  --body: oklch(0.78 0.008 130);
+  --muted: oklch(0.60 0.01 130);
+  --faint: oklch(0.44 0.008 130);
+  --on-solid: oklch(0.98 0 0);
+
+  /* ---- State washes and text tones -------------------------------------- */
+  /* Washes are subtle tints above --bg (not below, as in Porcelain), visible
+     as a filled region without shouting. Text tones are bright enough to
+     read on their own wash at AA or better. */
+  --brand-wash: oklch(0.19 0.035 132);
+  --brand-text: oklch(0.72 0.12 132); /* 7.4:1 on --brand-wash */
+  --amber-wash: oklch(0.20 0.03 65);
+  --amber-text: oklch(0.76 0.10 60);  /* 7.8:1 on --amber-wash */
+  --danger-wash: oklch(0.20 0.025 27);
+  --danger-text: oklch(0.72 0.16 27); /* 6.8:1 on --danger-wash */
+
+  /* The sweep-lift tones run brighter-toward-ink, which on a dark theme
+     means toward light — the derivation is correct but the result is only
+     one step from --ink, so it does not read as a lift. Override to keep
+     the pulse distinct. */
+  --brand-lift: oklch(0.88 0.08 132);
+  --amber-lift: oklch(0.88 0.06 60);
+
+  /* Identity marks: a dot's hue comes from an id, so only lightness and
+     chroma are the palette's business. Dimmer than Porcelain's because a
+     bright dot on a dark field competes with status dots. */
+  --tint-lightness: 0.58;
+  --tint-chroma: 0.12;
+
+  /* ---- Syntax ----------------------------------------------------------- */
+  /* Same graphite philosophy as Porcelain — structure by lightness, not by
+     colour — but the direction is reversed: brighter text is heavier. On a
+     dark ground, chroma distinctions are more legible, so strings and numbers
+     gain a faint tint where Porcelain's are pure achromatic. */
+  --syn-comment: oklch(0.44 0.008 130);  /* recedes; italic carries it */
+  --syn-punct: oklch(0.55 0.008 130);
+  --syn-plain: oklch(0.78 0.008 130);    /* body-level */
+  --syn-string: oklch(0.85 0.02 145);    /* brightest — content is what matters */
+  --syn-number: oklch(0.85 0.02 145);
+  --syn-keyword: oklch(0.90 0.008 130);  /* structural, heaviest */
+  --syn-type: oklch(0.90 0.008 130);
+  --syn-call: oklch(0.90 0.008 130);
+  --syn-heading: oklch(0.72 0.10 27);    /* warm terracotta, as in Porcelain */
+  --syn-link: oklch(0.62 0.14 132);      /* brand olive */
+  --syn-emphasis: oklch(0.72 0.08 290);  /* muted violet */
+
+  /* ---- Diff ------------------------------------------------------------- */
+  --diff-add-wash: oklch(0.19 0.035 132);
+  --diff-del-wash: oklch(0.19 0.025 27);
+  --diff-add-ink: oklch(0.72 0.12 132);  /* 7.4:1 on --diff-add-wash */
+  --diff-del-ink: oklch(0.72 0.16 27);   /* 6.8:1 on --diff-del-wash */
+
+  /* ---- Terminal --------------------------------------------------------- */
+  /* On a dark ground "bright" means lighter and more saturated, which is the
+     convention terminal programs expect. Blue, magenta and cyan have proper
+     hues here — the achromatic fallback in base.css is safe but featureless,
+     and dark-ground terminal use is where colour carries the most weight
+     (git status, ls, prompts). */
+  --term-bg: oklch(0.125 0.005 130);    /* slightly below pane bg */
+  --term-fg: oklch(0.82 0.008 130);     /* 12.5:1 on --term-bg */
+  --term-cursor: oklch(0.62 0.14 132);
+  --term-cursor-text: oklch(0.13 0 0);
+  --term-selection: oklch(0.28 0.05 132);
+
+  --term-ansi-black: oklch(0.30 0.008 130);   /* 1.5:1 — intentionally dim */
+  --term-ansi-red: oklch(0.62 0.19 27);       /* 5.2:1 */
+  --term-ansi-green: oklch(0.62 0.14 132);    /* = brand; 5.2:1 */
+  --term-ansi-yellow: oklch(0.68 0.13 65);    /* 6.5:1 */
+  --term-ansi-blue: oklch(0.62 0.14 255);     /* 5.2:1 */
+  --term-ansi-magenta: oklch(0.62 0.16 325);  /* 5.2:1 */
+  --term-ansi-cyan: oklch(0.62 0.10 210);     /* 5.2:1 */
+  --term-ansi-white: oklch(0.78 0.006 130);   /* body-level; 9.2:1 */
+
+  --term-ansi-bright-black: oklch(0.50 0.008 130);  /* comments, timestamps; 3.2:1 */
+  --term-ansi-bright-red: oklch(0.70 0.20 27);
+  --term-ansi-bright-green: oklch(0.70 0.15 132);
+  --term-ansi-bright-yellow: oklch(0.76 0.14 68);
+  --term-ansi-bright-blue: oklch(0.70 0.16 255);
+  --term-ansi-bright-magenta: oklch(0.70 0.18 325);
+  --term-ansi-bright-cyan: oklch(0.70 0.12 210);
+  --term-ansi-bright-white: oklch(0.92 0.006 130); /* emphasis; 14.6:1 */
+
+  /* ---- Interactive ------------------------------------------------------ */
+  --hover: oklch(0.22 0.008 130);
+  --pressed: oklch(0.26 0.008 130);
+  --selected: oklch(0.22 0.04 132);
+  --focus-ring: oklch(0.62 0.14 132);
+
+  /* ---- Shape, density, motion ------------------------------------------- */
+  --density: 1;
+
+  /* Shadows need to be darker and stronger on a dark ground to register.
+     Pure black rather than ink-tinted, because ink is light in this theme. */
+  --shadow-color: oklch(0 0 0);
+
+  color-scheme: dark;
+  accent-color: var(--brand);
+}

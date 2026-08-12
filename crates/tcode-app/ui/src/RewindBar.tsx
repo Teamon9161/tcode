@@ -18,10 +18,6 @@ import { RewindIcon } from "./components/Icons";
  * rule 9b): the other panes are other conversations, and a question in this one
  * must not freeze them. It sits above the composer, on the same `--measure` axis
  * as everything else on the conversation's column.
- *
- * What it says is the count, in words, because that is the part no click takes
- * back. It deliberately does not preview the messages — they are on screen,
- * directly above, which is where the button was pressed.
  */
 export function RewindBar({
   preview,
@@ -36,16 +32,33 @@ export function RewindBar({
   onCancel: () => void;
 }) {
   const [restoreFiles, setRestoreFiles] = useState(false);
-  const messages = preview.dropped === 1 ? "1 message" : `${preview.dropped} messages`;
+  const n = preview.dropped;
 
   return (
     <section className="dock rewind-bar" aria-label="Go back to an earlier message">
       <div className="rewind-body">
-        <p className="rewind-question">
-          <RewindIcon size={13} />
-          Go back to this message? This drops the {messages} after it, and returns the
-          prompt to the composer to edit.
-        </p>
+        <div className="rewind-top">
+          <span className="rewind-icon" aria-hidden="true">
+            <RewindIcon size={14} />
+          </span>
+          <p className="rewind-question">
+            Drop {n === 1 ? "1 message" : `${n} messages`} and return the prompt to the
+            composer?
+          </p>
+          <div className="rewind-actions">
+            <button type="button" className="btn btn-ghost btn-sm" onClick={onCancel} disabled={busy}>
+              Cancel
+            </button>
+            <button
+              type="button"
+              className="btn btn-primary btn-sm"
+              onClick={() => onConfirm(restoreFiles)}
+              disabled={busy}
+            >
+              {busy ? "Going back…" : "Go back"}
+            </button>
+          </div>
+        </div>
 
         {preview.dirty && (
           <button
@@ -56,28 +69,9 @@ export function RewindBar({
             onClick={() => setRestoreFiles((was) => !was)}
           >
             <span className="chip-tick" aria-hidden="true" />
-            <span className="rewind-lines">
-              <span className="rewind-label">Also roll back the files it changed</span>
-              <span className="rewind-hint">
-                Anything edited since — by the agent or by you — goes back to how it was.
-              </span>
-            </span>
+            <span className="rewind-label">Also roll back files changed since this point</span>
           </button>
         )}
-
-        <div className="rewind-actions">
-          <button type="button" className="btn btn-ghost" onClick={onCancel} disabled={busy}>
-            Keep it
-          </button>
-          <button
-            type="button"
-            className="btn btn-primary"
-            onClick={() => onConfirm(restoreFiles)}
-            disabled={busy}
-          >
-            {busy ? "Going back…" : "Go back"}
-          </button>
-        </div>
       </div>
     </section>
   );

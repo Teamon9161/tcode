@@ -358,8 +358,8 @@ function base64(bytes: Uint8Array): string {
  * This is the whole of "the terminal follows the theme". xterm cannot read a
  * CSS variable — it paints to a canvas — so the values have to be resolved on
  * this side, which is also why `base.css` names all sixteen ANSI slots. Read
- * once per terminal: the theme is a compile-time import (`main.tsx`), so there
- * is no runtime switch to follow.
+ * once per terminal at creation; `refreshTheme` re-reads the tokens for all
+ * live terminals when the app theme changes at runtime.
  */
 function readTheme(): ITheme {
   return {
@@ -387,6 +387,13 @@ function readTheme(): ITheme {
   };
 }
 
+
+export function refreshTheme(): void {
+  const theme = readTheme();
+  for (const { term } of live.values()) {
+    term.options.theme = theme;
+  }
+}
 
 /** One `--term-*` token as something xterm can paint with, or nothing — a
  *  token that resolves to nothing is left to xterm's own default rather than

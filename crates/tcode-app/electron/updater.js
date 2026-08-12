@@ -10,57 +10,57 @@ function report(logger, error) {
   logger.error(`tcode: automatic update failed: ${errorText(error)}`);
 }
 
-async function askToDownload({ autoUpdater, dialog, window, info }) {
-  const answer = await dialog.showMessageBox(window, {
-    type: "info",
-    title: "Update available",
-    message: `tcode ${info.version} is available.`,
-    detail: "Download it now? tcode will ask before restarting to install it.",
-    buttons: ["Download", "Later"],
-    defaultId: 0,
-    cancelId: 1,
-    noLink: true,
-  });
-  if (answer.response === 0) await autoUpdater.downloadUpdate();
-}
-
-async function askToInstall({ autoUpdater, dialog, window, info }) {
-  const answer = await dialog.showMessageBox(window, {
-    type: "info",
-    title: "Update ready",
-    message: `tcode ${info.version} has finished downloading.`,
-    detail: "Restart tcode now to install the update?",
-    buttons: ["Restart and install", "Later"],
-    defaultId: 0,
-    cancelId: 1,
-    noLink: true,
-  });
-  if (answer.response === 0) autoUpdater.quitAndInstall();
-}
+const UPDATE_STATE = "tcode://update-state";
 
 /**
- * Configure the platform updater after the first window is usable. This module
- * has no renderer API: update consent is native UI owned by the main process.
+ * Configure the platform updater after the first window is usable.
+ *
+ * Downloads start automatically — the user should not have to approve a
+ * background fetch. A small indicator in the title bar shows progress and,
+ * once the download lands, becomes a "restart to update" button whose click
+ * calls `update_restart` (a shell verb registered by the caller).
+ *
+ * Returns a handle with `quitAndInstall()` when the updater is active, or
+ * `null` when it is not (dev mode, macOS).
  */
 function startAutomaticUpdates({
   isPackaged,
   platform = process.platform,
-  window,
-  dialog,
+  emit,
   logger = console,
   loadUpdater = () => require("electron-updater"),
 }) {
-  if (!supportsAutomaticUpdates({ isPackaged, platform })) return false;
+  if (!supportsAutomaticUpdates({ isPackaged, platform })) return null;
 
   const { autoUpdater } = loadUpdater();
-  autoUpdater.autoDownload = false;
-  autoUpdater.autoInstallOnAppQuit = false;
-  autoUpdater.on("error", (error) => report(logger, error));
-  autoUpdater.on("update-available", (info) => {
-    void askToDownload({ autoUpdater, dialog, window, info }).catch((error) => report(logger, error));
+  autoUpdater.autoDownload = true;
+  autoUpdater.autoInstallOnAppQuit = true;
+
+  let version = null;
+
+  autoUpdater.on("error", (error) => {
+    report(logger, error);
+    emit(UPDATE_STATE, null);
   });
+
+  autoUpdater.on("update-available", (info) => {
+    version = info.version;
+    emit(UPDATE_STATE, { state: "downloading", version, percent: 0 });
+  });
+
+  autoUpdater.on("download-progress", (progress) => {
+    emit(UPDATE_STATE, {
+      state: "downloading",
+      version,
+      percent: Math.round(progress.percent),
+    });
+  });
+
   autoUpdater.on("update-downloaded", (info) => {
-    void askToInstall({ autoUpdater, dialog, window, info }).catch((error) => report(logger, error));
+    emit(UPDATE_STATE, {
+      state: "ready",
+      version: info.version ?? version,
+    });
   });
 
   try {
@@ -68,7 +68,12 @@ function startAutomaticUpdates({
   } catch (error) {
     report(logger, error);
   }
-  return true;
+
+  return {
+    quitAndInstall() {
+      autoUpdater.quitAndInstall();
+    },
+  };
 }
 
 module.exports = { startAutomaticUpdates, supportsAutomaticUpdates };

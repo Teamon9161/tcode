@@ -382,6 +382,7 @@ app.whenReady().then(() => {
   // closure reading a `let` is the whole of it — the first frame cannot arrive
   // before this function returns.
   let verbs = {};
+  let updater = null;
   const sidecar = startSidecar(emit, async (method, args) => {
     const own = verbs[method];
     // Deliberately the same table the renderer's `invoke` reaches, not a
@@ -406,6 +407,10 @@ app.whenReady().then(() => {
   // views the browser pane is made of. Everything else is somebody else's.
   verbs = {
     ...windowVerbs(window),
+    update_restart() {
+      if (updater) updater.quitAndInstall();
+      return null;
+    },
     ...browserVerbs({
       window,
       appView: view,
@@ -441,7 +446,7 @@ app.whenReady().then(() => {
     if (shown) return;
     shown = true;
     window.show();
-    startAutomaticUpdates({ isPackaged: app.isPackaged, window, dialog });
+    updater = startAutomaticUpdates({ isPackaged: app.isPackaged, emit });
   };
   window.once("ready-to-show", showAndCheckForUpdates);
   // `BaseWindow` has no `ready-to-show` of its own — that belongs to the

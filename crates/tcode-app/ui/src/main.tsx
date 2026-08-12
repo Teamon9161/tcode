@@ -13,6 +13,7 @@ import "./theme/fonts.css";
 // Swapping the theme import here swaps the entire look.
 import "./theme/base.css";
 import "./theme/porcelain.css";
+import "./theme/ink.css";
 import "./theme/code-themes.css";
 // The emulator's structural CSS — cell geometry and the viewport, not colour;
 // its palette comes from `--term-*` through `termHost.ts`. Ahead of `app.css`
@@ -22,16 +23,16 @@ import "./app.css";
 
 import { SHELL } from "@ipc";
 import { loadCodeTheme, setCodeTheme } from "./codeTheme";
+import { initAppTheme } from "./appTheme";
+import { refreshTheme as refreshTermTheme } from "./termHost";
 import { App } from "./App";
 import { Boundary } from "./Boundary";
 
-// The title bar is app-drawn (rule 9c). Electron makes a region draggable by
-// reading `-webkit-app-region` off the computed style, so the drag surface is
-// an attribute (`components/drag.ts`) that `app.css` matches. Set before the
-// first paint; the design preview answers "preview" instead, so a preview never
-// inherits a drag region it has no window for.
 document.documentElement.dataset.shell = SHELL;
+initAppTheme();
 setCodeTheme(loadCodeTheme());
+
+window.addEventListener("tcode:theme-changed", () => refreshTermTheme());
 
 const root = document.getElementById("root");
 if (!root) throw new Error("index.html lost its #root");

@@ -2,19 +2,15 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const test = require("node:test");
 
-const { startAutomaticUpdates } = require("./updater");
+const { startAutomaticUpdates, supportsAutomaticUpdates } = require("./updater");
 
 function fakeUpdater() {
   const autoUpdater = new EventEmitter();
   autoUpdater.checks = 0;
-  autoUpdater.downloads = 0;
   autoUpdater.installs = 0;
   autoUpdater.checkForUpdates = () => {
     autoUpdater.checks += 1;
     return null;
-  };
-  autoUpdater.downloadUpdate = async () => {
-    autoUpdater.downloads += 1;
   };
   autoUpdater.quitAndInstall = () => {
     autoUpdater.installs += 1;
@@ -22,8 +18,12 @@ function fakeUpdater() {
   return autoUpdater;
 }
 
-function flush() {
-  return new Promise((resolve) => setImmediate(resolve));
+function collector() {
+  const events = [];
+  return {
+    emit(name, payload) { events.push({ name, payload }); },
+    events,
+  };
 }
 
 test("does not load the updater for development or macOS", () => {
@@ -35,69 +35,81 @@ test("does not load the updater for development or macOS", () => {
       startAutomaticUpdates({
         isPackaged,
         platform,
+        emit() {},
         loadUpdater() {
           throw new Error("the updater must not load");
         },
       }),
-      false,
+      null,
     );
   }
 });
 
-test("asks before downloading and before installing a Windows update", async () => {
+test("auto-downloads and emits progress events", () => {
   const autoUpdater = fakeUpdater();
-  const dialogs = [];
-  const started = startAutomaticUpdates({
+  const { emit, events } = collector();
+  const handle = startAutomaticUpdates({
     isPackaged: true,
     platform: "win32",
-    window: { id: 1 },
-    dialog: {
-      async showMessageBox(window, options) {
-        dialogs.push({ window, options });
-        return { response: 0 };
-      },
-    },
+    emit,
     logger: { error() {} },
-    loadUpdater() {
-      return { autoUpdater };
-    },
+    loadUpdater() { return { autoUpdater }; },
   });
 
-  assert.equal(started, true);
-  assert.equal(autoUpdater.autoDownload, false);
-  assert.equal(autoUpdater.autoInstallOnAppQuit, false);
+  assert.notEqual(handle, null);
+  assert.equal(autoUpdater.autoDownload, true);
+  assert.equal(autoUpdater.autoInstallOnAppQuit, true);
   assert.equal(autoUpdater.checks, 1);
 
   autoUpdater.emit("update-available", { version: "0.1.23" });
-  await flush();
-  assert.equal(autoUpdater.downloads, 1);
-  assert.equal(dialogs[0].options.buttons[0], "Download");
-
-  autoUpdater.emit("update-downloaded", { version: "0.1.23" });
-  await flush();
-  assert.equal(autoUpdater.installs, 1);
-  assert.equal(dialogs[1].options.buttons[0], "Restart and install");
-});
-
-test("leaves an available update alone when the user chooses later", async () => {
-  const autoUpdater = fakeUpdater();
-  const started = startAutomaticUpdates({
-    isPackaged: true,
-    platform: "linux",
-    window: { id: 1 },
-    dialog: {
-      async showMessageBox() {
-        return { response: 1 };
-      },
-    },
-    logger: { error() {} },
-    loadUpdater() {
-      return { autoUpdater };
-    },
+  assert.deepEqual(events.at(-1).payload, {
+    state: "downloading",
+    version: "0.1.23",
+    percent: 0,
   });
 
-  assert.equal(started, true);
-  autoUpdater.emit("update-available", { version: "0.1.23" });
-  await flush();
-  assert.equal(autoUpdater.downloads, 0);
+  autoUpdater.emit("download-progress", { percent: 42.7 });
+  assert.deepEqual(events.at(-1).payload, {
+    state: "downloading",
+    version: "0.1.23",
+    percent: 43,
+  });
+
+  autoUpdater.emit("update-downloaded", { version: "0.1.23" });
+  assert.deepEqual(events.at(-1).payload, {
+    state: "ready",
+    version: "0.1.23",
+  });
+});
+
+test("quitAndInstall triggers the updater", () => {
+  const autoUpdater = fakeUpdater();
+  const handle = startAutomaticUpdates({
+    isPackaged: true,
+    platform: "linux",
+    emit() {},
+    logger: { error() {} },
+    loadUpdater() { return { autoUpdater }; },
+  });
+
+  handle.quitAndInstall();
+  assert.equal(autoUpdater.installs, 1);
+});
+
+test("error clears the update state", () => {
+  const autoUpdater = fakeUpdater();
+  const { emit, events } = collector();
+  startAutomaticUpdates({
+    isPackaged: true,
+    platform: "win32",
+    emit,
+    logger: { error() {} },
+    loadUpdater() { return { autoUpdater }; },
+  });
+
+  autoUpdater.emit("update-available", { version: "0.1.24" });
+  assert.equal(events.at(-1).payload.state, "downloading");
+
+  autoUpdater.emit("error", new Error("network down"));
+  assert.equal(events.at(-1).payload, null);
 });

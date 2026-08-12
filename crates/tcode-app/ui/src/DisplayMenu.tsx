@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState, type ReactNode } from "react"
 import { createPortal } from "react-dom";
 import { invoke } from "@ipc";
 
+import { APP_THEMES, loadAppTheme, setAppTheme, type AppTheme } from "./appTheme";
 import { CODE_THEMES, loadCodeTheme, setCodeTheme, type CodeTheme } from "./codeTheme";
 import type { Display } from "./display";
 import { useSeat } from "./seat";
@@ -26,6 +27,7 @@ export function SettingsPanel({
   onChange: (next: Display) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [appTheme, setCurrentAppTheme] = useState<AppTheme>(() => loadAppTheme());
   const [codeTheme, setCurrentCodeTheme] = useState<CodeTheme>(() => loadCodeTheme());
   const [shell, setShell] = useState("");
   const [saving, setSaving] = useState(false);
@@ -102,7 +104,34 @@ export function SettingsPanel({
               <h2 className="settings-head" id="settings-appearance">
                 Appearance
               </h2>
-              <p className="settings-note">Code theme</p>
+              <p className="settings-note">App theme</p>
+              <div className="settings-choices">
+                {APP_THEMES.map((theme) => (
+                  <button
+                    key={theme.id}
+                    type="button"
+                    className={`settings-choice${appTheme === theme.id ? " is-on" : ""}`}
+                    aria-pressed={appTheme === theme.id}
+                    onClick={() => {
+                      setAppTheme(theme.id);
+                      setCurrentAppTheme(theme.id);
+                    }}
+                  >
+                    <span className="chip-tick" aria-hidden="true" />
+                    <span className="settings-choice-lines">
+                      <span className="settings-choice-label">{theme.label}</span>
+                      <span className="settings-choice-detail">{theme.detail}</span>
+                    </span>
+                  </button>
+                ))}
+              </div>
+
+            </section>
+
+            <SettingsDisclosure
+              label="Code theme"
+              summary={CODE_THEMES.find((t) => t.id === codeTheme)?.label ?? "Porcelain"}
+            >
               <div className="settings-choices">
                 {CODE_THEMES.map((theme) => (
                   <button
@@ -123,7 +152,7 @@ export function SettingsPanel({
                   </button>
                 ))}
               </div>
-            </section>
+            </SettingsDisclosure>
 
             <section className="settings-section" aria-labelledby="settings-conversation">
               <h2 className="settings-head" id="settings-conversation">

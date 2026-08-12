@@ -783,6 +783,47 @@ body.is-resizing {
   -webkit-app-region: no-drag;
 }
 
+/* ------------------------------------------------------------ update indicator */
+
+.update-ring {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+}
+
+.update-track {
+  fill: none;
+  stroke: var(--line);
+  stroke-width: 1.5;
+}
+
+.update-fill {
+  fill: none;
+  stroke: var(--brand);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  transition: stroke-dashoffset 0.4s var(--ease);
+}
+
+.update-pill {
+  padding: var(--s-1) var(--s-3);
+  border: none;
+  border-radius: var(--r-md);
+  background: var(--brand-wash);
+  color: var(--brand-text);
+  font-size: var(--text-xs);
+  font-family: var(--font-ui);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--dur-fast) var(--ease);
+}
+
+.update-pill:hover {
+  background: var(--hover);
+  color: var(--brand-text);
+}
+
 /* ------------------------------------------------------------ window controls */
 
 .window-controls {
@@ -869,6 +910,11 @@ body.is-resizing {
     background var(--dur-fast) var(--ease),
     border-color var(--dur-fast) var(--ease),
     color var(--dur-fast) var(--ease);
+}
+
+.btn-sm {
+  padding: var(--s-1) var(--s-3);
+  font-size: var(--text-xs);
 }
 
 .btn-primary {
@@ -5820,42 +5866,59 @@ body.is-resizing {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  background: var(--amber-wash);
+  border-top: 1px solid var(--line);
+  background: var(--bg);
 }
 
 .rewind-body {
   display: flex;
   flex-direction: column;
-  gap: var(--s-3);
+  gap: var(--s-2);
   width: 100%;
   max-width: var(--measure);
   margin-inline: auto;
   padding: var(--s-3) var(--s-5);
 }
 
-.rewind-question {
+.rewind-top {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   gap: var(--s-2);
-  margin: 0;
-  color: var(--ink);
-  font-size: var(--text-sm);
-  text-wrap: pretty;
 }
-.rewind-question svg {
+
+.rewind-icon {
   flex: none;
-  translate: 0 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--r-full);
+  background: var(--amber-wash);
   color: var(--amber-text);
 }
 
-/* Unticked, and absent when that era changed nothing. Dropping messages can be
-   undone by retyping; rolling a file back throws away edits that may have been
-   made by hand since, so it is a second decision and never a default. */
+.rewind-question {
+  flex: 1;
+  min-width: 0;
+  margin: 0;
+  color: var(--body);
+  font-size: var(--text-xs);
+  text-wrap: pretty;
+}
+
+.rewind-actions {
+  flex: none;
+  display: flex;
+  gap: var(--s-2);
+}
+
 .rewind-files {
   display: flex;
-  align-items: flex-start;
+  align-items: center;
   gap: var(--s-2);
-  padding: var(--s-2);
+  margin-left: 30px;
+  padding: var(--s-1) var(--s-2);
   border: 0;
   border-radius: var(--r-sm);
   background: none;
@@ -5865,33 +5928,16 @@ body.is-resizing {
 .rewind-files:hover {
   background: var(--hover);
 }
-.rewind-files .chip-tick {
-  margin-top: 3px;
-}
 .rewind-files.is-on .chip-tick {
   border-color: var(--brand);
   background: var(--brand);
 }
-.rewind-lines {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  min-width: 0;
-}
 .rewind-label {
-  color: var(--ink);
-  font-size: var(--text-xs);
-}
-.rewind-hint {
   color: var(--muted);
   font-size: var(--text-2xs);
-  text-wrap: pretty;
 }
-
-.rewind-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: var(--s-2);
+.rewind-files.is-on .rewind-label {
+  color: var(--body);
 }
 
 /* ---- the plan strip ---------------------------------------------------------
