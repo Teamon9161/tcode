@@ -3761,6 +3761,19 @@ body.is-resizing {
 .folder-chip[aria-expanded="true"] svg {
   color: var(--muted);
 }
+.folder-chip.is-pending {
+  cursor: default;
+  color: var(--muted);
+}
+.folder-chip.is-pending:hover {
+  background: transparent;
+  color: var(--muted);
+}
+.folder-chip.is-pending::after {
+  content: "preparing";
+  color: var(--faint);
+  font-size: var(--text-2xs);
+}
 /* The conversation's name, at the weight the pane header always gave it — the
    chip took the whole identity over, it did not demote it. */
 .folder-chip-name {

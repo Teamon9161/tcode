@@ -20,6 +20,7 @@ import {
   parentSplit,
   rotate,
   showBeside,
+  replaceSession,
   swap,
   sessionsInView,
   setRatio,
@@ -284,6 +285,25 @@ describe("parentSplit", () => {
   it("has none for the root", () => {
     const one = single(talk("tcode"));
     expect(parentSplit(one, id(one, "tcode"))).toBeNull();
+  });
+});
+
+describe("replaceSession", () => {
+  it("renames session panes and their inspect panes without moving them", () => {
+    const one = single(talk("pending"));
+    const two = split(one, id(one, "pending"), "row", diff("pending", "edit-1"));
+    const sessionPane = id(two, "pending");
+    const inspectPane = id(two, "pending:diff");
+
+    const opened = replaceSession(two, "pending", "real");
+
+    expect(shape(opened)).toBe("row(real, real:diff)");
+    expect(panes(opened).map((leaf) => leaf.id)).toEqual([sessionPane, inspectPane]);
+  });
+
+  it("does nothing when the placeholder is gone", () => {
+    const one = single(talk("tcode"));
+    expect(replaceSession(one, "pending", "real")).toBe(one);
   });
 });
 

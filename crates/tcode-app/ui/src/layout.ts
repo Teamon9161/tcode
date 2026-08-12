@@ -421,6 +421,37 @@ export function closeSession(tiling: Tiling, session: string): Tiling {
   return out;
 }
 
+/** Rename a conversation everywhere the pane tree refers to it, preserving the
+ *  pane ids and navigation stacks. Used when the webview has shown an immediate
+ *  local placeholder for a folder that the backend is still opening. */
+export function replaceSession(
+  tiling: Tiling,
+  from: string,
+  to: string,
+): Tiling {
+  if (!tiling.root || from === to) return tiling;
+  const rewrite = (pane: Pane): Pane => {
+    if (pane.kind === "session" && pane.session === from) {
+      return { ...pane, session: to };
+    }
+    if (pane.kind === "inspect" && pane.session === from) {
+      return { ...pane, session: to };
+    }
+    return pane;
+  };
+  const walk = (node: Layout): Layout => {
+    if (node.kind === "leaf") {
+      const pane = rewrite(node.pane);
+      return pane === node.pane ? node : { ...node, pane };
+    }
+    const a = walk(node.a);
+    const b = walk(node.b);
+    return a === node.a && b === node.b ? node : { ...node, a, b };
+  };
+  const root = walk(tiling.root);
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
 /** Puts something else in a pane, keeping its place and its id. */
 export function updatePane(tiling: Tiling, id: string, pane: Pane): Tiling {
   if (!tiling.root) return tiling;

@@ -654,8 +654,8 @@ async fn concurrent_sessions_never_cross_streams() {
 /// Changing a folder on a newly opened conversation replaces its startup
 /// context without creating another session; its identity and workspace surface
 /// follow the new folder.
-#[test]
-fn changing_a_fresh_conversation_folder_keeps_its_session_and_updates_the_workspace() {
+#[tokio::test]
+async fn changing_a_fresh_conversation_folder_keeps_its_session_and_updates_the_workspace() {
     tcode_core::home::testing::temp_home();
     let source = tempfile::tempdir().unwrap();
     let target = tempfile::tempdir().unwrap();
@@ -675,11 +675,15 @@ fn changing_a_fresh_conversation_folder_keeps_its_session_and_updates_the_worksp
         id.clone(),
         target.path().display().to_string(),
     )
+    .await
     .unwrap();
 
     assert_eq!(opened.session.id, id);
     assert_eq!(supervisor.ids(), [id]);
-    assert_eq!(handle.cwd(), target.path().canonicalize().unwrap());
+    assert_eq!(
+        handle.cwd(),
+        tcode_app::paths::canonical_dir(target.path()).unwrap()
+    );
     assert_eq!(
         tcode_app::commands::workspace_list(&supervisor, handle.id.clone(), None)
             .unwrap()

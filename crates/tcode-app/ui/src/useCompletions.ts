@@ -166,8 +166,8 @@ export function useCompletions({
  * answer does, and a path drawn as ordinary text for one beat is a far smaller
  * lie than one drawn as resolved before anybody checked.
  */
-export function useKnownMentions(session: string, text: string): Set<string> {
-  const paths = useMemo(() => mentions(text).map((found) => found.path), [text]);
+export function useKnownMentions(session: string, text: string, enabled = true): Set<string> {
+  const paths = useMemo(() => (enabled ? mentions(text).map((found) => found.path) : []), [enabled, text]);
   const wanted = paths.join("\n");
   const [known, setKnown] = useState<Set<string>>(new Set());
   // Read inside the effect so a new array of the same paths does not re-ask.

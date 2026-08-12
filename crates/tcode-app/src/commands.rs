@@ -338,19 +338,31 @@ pub async fn project_sessions(
 }
 
 /// Open a folder as a session, optionally resuming one of its logs.
-pub fn open_folder(
+///
+/// Opening a session builds the cached startup context for that folder: project
+/// tree, layered instructions, auto memory, git status, progress inventory and
+/// the JSONL store. Those are all blocking filesystem or child-process probes,
+/// and their cost depends on the folder. Keep them off the command dispatcher so
+/// clicking "new session" cannot freeze the window while they run.
+pub async fn open_folder(
     supervisor: &Arc<Supervisor>,
     path: String,
     resume: Option<String>,
 ) -> Result<OpenedSession, String> {
-    // Canonicalize before anything else: the session id, the project data
-    // directory and the rail's grouping all key on the path, and two
-    // spellings of one folder would otherwise become two projects.
-    let cwd = crate::paths::canonical_dir(Path::new(&path))
-        .map_err(|error| format!("cannot open {path}: {error}"))?;
-    let handle = supervisor
-        .open_folder(&cwd, resume)
-        .map_err(|error| error.to_string())?;
+    let supervisor_for_prepare = supervisor.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        // Canonicalize before anything else: the session id, the project data
+        // directory and the rail's grouping all key on the path, and two
+        // spellings of one folder would otherwise become two projects.
+        let cwd = crate::paths::canonical_dir(Path::new(&path))
+            .map_err(|error| format!("cannot open {path}: {error}"))?;
+        supervisor_for_prepare
+            .prepare_folder(&cwd, resume)
+            .map_err(|error| error.to_string())
+    })
+    .await
+    .map_err(|error| format!("cannot open folder: {error}"))??;
+    supervisor.open(handle.clone());
     eprintln!(
         "tcode-app: session {} open on {}",
         handle.id,
@@ -362,23 +374,28 @@ pub fn open_folder(
 /// Switch an existing conversation to another folder without creating a new
 /// session. The core session keeps its `/cd` history semantics and the desktop
 /// handle updates its workspace root to match.
-pub fn change_folder(
+pub async fn change_folder(
     supervisor: &Arc<Supervisor>,
     session: String,
     path: String,
 ) -> Result<OpenedSession, String> {
-    let cwd = crate::paths::canonical_dir(Path::new(&path))
-        .map_err(|error| format!("cannot change to {path}: {error}"))?;
-    supervisor.change_folder(&session, &cwd)?;
-    let handle = supervisor
-        .get(&session)
-        .expect("a changed open session remains registered");
-    eprintln!(
-        "tcode-app: session {} changed directory to {}",
-        handle.id,
-        handle.cwd().display()
-    );
-    Ok(OpenedSession::of(&handle, &supervisor.agent()))
+    let supervisor = supervisor.clone();
+    tokio::task::spawn_blocking(move || {
+        let cwd = crate::paths::canonical_dir(Path::new(&path))
+            .map_err(|error| format!("cannot change to {path}: {error}"))?;
+        supervisor.change_folder(&session, &cwd)?;
+        let handle = supervisor
+            .get(&session)
+            .expect("a changed open session remains registered");
+        eprintln!(
+            "tcode-app: session {} changed directory to {}",
+            handle.id,
+            handle.cwd().display()
+        );
+        Ok(OpenedSession::of(&handle, &supervisor.agent()))
+    })
+    .await
+    .map_err(|error| format!("cannot change folder: {error}"))?
 }
 
 /// Close a session, cancelling its turn if one is running.

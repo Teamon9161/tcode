@@ -27,6 +27,7 @@ import { applyFileEvent } from "./files";
 import {
   EMPTY,
   closeSession as closePanesOf,
+  replaceSession,
   show,
   showBeside,
   type Tiling,
@@ -64,6 +65,20 @@ import { Workspace } from "./Workspace";
 import { Mark, Wordmark } from "./components/Mark";
 import { WindowControls, WindowDragRegion } from "./components/WindowControls";
 import { uniquePasted } from "./paste";
+
+let pendingSessionSeq = 0;
+
+function pendingSession(path: string): SessionInfo {
+  const normalized = path.replace(/[\\/]+$/, "");
+  const name = normalized.split(/[\\/]/).filter(Boolean).pop() || path;
+  return {
+    id: `pending-${Date.now().toString(36)}-${(pendingSessionSeq += 1).toString(36)}`,
+    cwd: path,
+    name,
+    home: "",
+    log_id: null,
+  };
+}
 
 export function App() {
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
@@ -115,6 +130,7 @@ export function App() {
    */
   const held = useRef(states);
   held.current = states;
+  const pendingOpen = useRef(new Set<string>());
   const planRefreshes = useRef(new PlanRefreshes());
 
   /**
@@ -306,42 +322,82 @@ export function App() {
 
   const openFolder = useCallback(
     async (path: string, resume?: string) => {
-      const opened = await invoke<OpenedSession>("open_folder", {
-        path,
-        resume: resume ?? null,
-      });
-      const { session, history } = opened;
-      const replayed = replayLedger(history);
-      setSessions((current) =>
-        current.some((open) => open.id === session.id)
-          ? current
-          : [...current, session],
-      );
+      const pending = pendingSession(path);
+      pendingOpen.current.add(pending.id);
+      setSessions((current) => [...current, pending]);
       setStates((current) => ({
         ...current,
-        [session.id]: {
+        [pending.id]: {
           ...BLANK,
-          ...replayed,
-          // The backend measured the prompt it would actually send. Sizing this
-          // from `history` was wrong in both directions at once: short by the
-          // system prompt and the tool schemas, and long by every entry a
-          // compaction had already moved out of the window.
-          meter: adoptContext(
-            BLANK.meter,
-            opened.context_tokens,
-            opened.context_estimated,
-          ),
-          activity: history.length > 0 ? "resumed" : BLANK.activity,
+          running: true,
+          startedAt: Date.now(),
+          activity: resume ? "resuming conversation" : "preparing workspace",
         },
       }));
-      setTiling((current) => show(current, session.id, fieldAspect()));
-      // A resumed conversation may already be working through a plan — it is on
-      // disk, and the session adopted it — so the strip must not wait for the next
-      // turn to find that out.
-      readPlan(session.id);
-      // Same reasoning for going back: a resumed conversation's earlier prompts
-      // are rewind points from the moment it opens, not once a turn has run.
-      refreshTurnState(session.id);
+      setTiling((current) => show(current, pending.id, fieldAspect()));
+
+      try {
+        const opened = await invoke<OpenedSession>("open_folder", {
+          path,
+          resume: resume ?? null,
+        });
+        const { session, history } = opened;
+        const replayed = replayLedger(history);
+        const stillOpen = pendingOpen.current.delete(pending.id);
+        if (!stillOpen) {
+          await invoke("close_session", { session: session.id }).catch(() => {});
+          return;
+        }
+        setSessions((current) =>
+          current.map((open) => (open.id === pending.id ? session : open)),
+        );
+        setStates((current) => {
+          const pendingState = current[pending.id] ?? BLANK;
+          const { [pending.id]: _pending, ...rest } = current;
+          return {
+            ...rest,
+            [session.id]: {
+              ...BLANK,
+              ...replayed,
+              draft: pendingState.draft,
+              attachments: pendingState.attachments,
+              planFirst: pendingState.planFirst,
+              // The backend measured the prompt it would actually send. Sizing this
+              // from `history` was wrong in both directions at once: short by the
+              // system prompt and the tool schemas, and long by every entry a
+              // compaction had already moved out of the window.
+              meter: adoptContext(
+                BLANK.meter,
+                opened.context_tokens,
+                opened.context_estimated,
+              ),
+              activity: history.length > 0 ? "resumed" : BLANK.activity,
+            },
+          };
+        });
+        setTiling((current) => replaceSession(current, pending.id, session.id));
+        // A resumed conversation may already be working through a plan — it is on
+        // disk, and the session adopted it — so the strip must not wait for the next
+        // turn to find that out.
+        readPlan(session.id);
+        // Same reasoning for going back: a resumed conversation's earlier prompts
+        // are rewind points from the moment it opens, not once a turn has run.
+        refreshTurnState(session.id);
+      } catch (error) {
+        const stillOpen = pendingOpen.current.delete(pending.id);
+        if (!stillOpen) return;
+        setStates((current) => ({
+          ...current,
+          [pending.id]: {
+            ...(current[pending.id] ?? BLANK),
+            ...TURN_ENDED,
+            failed: true,
+            activity: "failed",
+            blocks: [errorBlock(String(error))],
+          },
+        }));
+        throw error;
+      }
     },
     [readPlan, refreshTurnState],
   );
@@ -374,7 +430,11 @@ export function App() {
 
   const closeSession = useCallback(
     async (id: string) => {
-      await invoke("close_session", { session: id }).catch(() => {});
+      if (id.startsWith("pending-")) {
+        pendingOpen.current.delete(id);
+      } else {
+        await invoke("close_session", { session: id }).catch(() => {});
+      }
       // The browser tabs this conversation opened stay open and stop being
       // attributed to it. Closing a conversation must not take away a page
       // somebody is reading — the same sentence `closePanesOf` obeys by

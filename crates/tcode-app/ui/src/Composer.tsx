@@ -162,9 +162,9 @@ export function Composer({
     session,
     text,
     caret,
-    enabled: !composing.current,
+    enabled: !disabled && !composing.current,
   });
-  const known = useKnownMentions(session, text);
+  const known = useKnownMentions(session, text, !disabled);
   const listId = useId();
   const open = completions.items.length > 0;
 
@@ -222,11 +222,11 @@ export function Composer({
   const isCurrent = useRef(current);
   isCurrent.current = current;
   useEffect(() => {
-    if (running || disabled || !isCurrent.current) return;
+    if (running || !isCurrent.current) return;
     const active = document.activeElement;
     if (active !== field.current && isTyping(active)) return;
     field.current?.focus();
-  }, [running, disabled]);
+  }, [running]);
 
   useEffect(() => {
     resize(composing.current);
@@ -379,13 +379,14 @@ export function Composer({
           onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
           onFocus={(event) => setCaret(event.currentTarget.selectionStart)}
           placeholder={
-            running
-              ? "running — type to queue, Esc to stop"
-              : planFirst
-                ? "Describe what to plan"
-                : "Ask for something in this folder"
+            disabled
+              ? "Preparing workspace — you can draft here"
+              : running
+                ? "running — type to queue, Esc to stop"
+                : planFirst
+                  ? "Describe what to plan"
+                  : "Ask for something in this folder"
           }
-          disabled={disabled}
           onChange={(event) => {
             change(event.target.value);
             // The input event is the one thing that always carries the new
@@ -474,7 +475,7 @@ export function Composer({
               if (sendable) submit();
               return;
             }
-            if (event.key === "Escape" && running) {
+            if (event.key === "Escape" && running && !disabled) {
               event.preventDefault();
               onInterrupt();
             }
@@ -488,7 +489,7 @@ export function Composer({
             `--faint` with nothing to send and `--ink` once there is — the state
             is carried by the same mark getting darker, which is as quiet as a
             control can be while still being one. */}
-        {running ? (
+        {running && !disabled ? (
           <button
             type="button"
             className="composer-key is-stop"

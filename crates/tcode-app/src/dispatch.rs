@@ -176,8 +176,8 @@ impl Registry {
         value!(t, "plan", c::plan[supervisor](session));
         result!(t, "write_plan", c::write_plan[supervisor](session, phases));
         result!(t, "execute_plan_elsewhere", c::execute_plan_elsewhere[emit, supervisor](session));
-        result!(t, "open_folder", c::open_folder[supervisor](path, resume));
-        result!(
+        async_result!(t, "open_folder", c::open_folder[supervisor](path, resume));
+        async_result!(
             t,
             "change_folder",
             c::change_folder[supervisor](session, path)

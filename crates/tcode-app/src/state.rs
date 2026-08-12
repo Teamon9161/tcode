@@ -761,6 +761,25 @@ impl Supervisor {
         self.watch(handle);
     }
 
+    /// Build `cwd` as a new session without registering it. This may do blocking
+    /// folder-specific work (config reload, startup context, session log IO), so
+    /// callers that serve a UI command can run it on a blocking thread and then
+    /// call [`Self::open`] back on the async side.
+    pub fn prepare_folder(
+        &self,
+        cwd: &Path,
+        resume: Option<String>,
+    ) -> anyhow::Result<Arc<SessionHandle>> {
+        let opened = self.factory.open(cwd, resume)?;
+        Ok(Arc::new(SessionHandle::with_main_pickers(
+            uuid::Uuid::new_v4().to_string(),
+            cwd.to_path_buf(),
+            opened.session,
+            opened.capabilities,
+            opened.main_pickers,
+        )))
+    }
+
     /// Open `cwd` as a new session and register it. `resume` replays an
     /// existing log for that folder.
     pub fn open_folder(
@@ -768,14 +787,7 @@ impl Supervisor {
         cwd: &Path,
         resume: Option<String>,
     ) -> anyhow::Result<Arc<SessionHandle>> {
-        let opened = self.factory.open(cwd, resume)?;
-        let handle = Arc::new(SessionHandle::with_main_pickers(
-            uuid::Uuid::new_v4().to_string(),
-            cwd.to_path_buf(),
-            opened.session,
-            opened.capabilities,
-            opened.main_pickers,
-        ));
+        let handle = self.prepare_folder(cwd, resume)?;
         self.open(handle.clone());
         Ok(handle)
     }

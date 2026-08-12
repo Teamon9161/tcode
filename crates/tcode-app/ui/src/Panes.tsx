@@ -746,6 +746,7 @@ function SessionPane({
   );
 
   if (!info) return <p className="pane-empty">this conversation was closed</p>;
+  const pending = session.startsWith("pending-");
 
   return (
     <>
@@ -756,17 +757,24 @@ function SessionPane({
             the answer to "which folder"; making it the control for it too is
             what let the rail stop carrying a button that started a different
             kind of thing than everything else in it. */}
-        <FolderMenu
-          name={info.name}
-          cwd={info.cwd}
-          home={info.home}
-          onChangeFolder={(path) => context.onChangeFolder(session, path)}
-        />
+        {pending ? (
+          <span className="folder-chip is-pending" title={info.cwd}>
+            {info.name}
+          </span>
+        ) : (
+          <FolderMenu
+            name={info.name}
+            cwd={info.cwd}
+            home={info.home}
+            onChangeFolder={(path) => context.onChangeFolder(session, path)}
+          />
+        )}
         <button
           className="icon-btn"
           onClick={() => context.onToggleFiles(leaf.id, session)}
           aria-label={`Files ${info.name} touched`}
-          title={`Files ${info.name} touched`}
+          title={pending ? "Workspace is still opening" : `Files ${info.name} touched`}
+          disabled={pending}
         >
           <FileIcon size={14} />
         </button>
@@ -774,7 +782,8 @@ function SessionPane({
           className="icon-btn"
           onClick={() => context.onToggleWorkspace(leaf.id, session)}
           aria-label={`Browse ${info.name} workspace`}
-          title={`Browse ${info.name} workspace`}
+          title={pending ? "Workspace is still opening" : `Browse ${info.name} workspace`}
+          disabled={pending}
         >
           <FolderIcon size={14} />
         </button>
@@ -878,7 +887,7 @@ function SessionPane({
         <Composer
           value={state.draft}
           running={state.running}
-          disabled={false}
+          disabled={pending}
           current={leaf.id === context.focus}
           attachments={state.attachments}
           meter={state.meter}
