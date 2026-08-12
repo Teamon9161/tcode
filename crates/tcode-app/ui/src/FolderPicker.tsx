@@ -20,9 +20,9 @@ import { FolderIcon } from "./components/Icons";
  * the opening record of every session log, and there is no registry to write to.
  * So adding a folder is not a second action that overlaps with this one, it is
  * the last row of this one: the list holds the folders tcode already knows, and
- * `Choose a folder…` is how one that is not in it gets there. Both rows do the
- * same thing on the way out — open a conversation — which is why the heading can
- * say so once, at the top, for every item under it.
+ * `Choose a folder…` is how one that is not in it gets there.
+ * `FolderPickerBody` draws the common list; the rail starts a new conversation
+ * while a pane header applies the selected folder to its existing conversation.
  */
 export function FolderPicker({
   /** Marked rather than removed, where there is one: seeing where you are is
@@ -41,82 +41,15 @@ export function FolderPicker({
    *  menu that vanishes with the reason on it has told nobody anything. */
   onDone: () => void;
 }) {
-  const [data, setData] = useState<ProjectList | null>(null);
-  const [failure, setFailure] = useState<string | null>(null);
-
-  // Read when the menu is opened, not when its trigger is drawn: this is a list
-  // of every folder tcode has ever worked in, and most triggers are never
-  // asked. Mounting *is* opening, since the popover only renders while open.
-  useEffect(() => {
-    invoke<ProjectList>("project_list")
-      .then((value) => {
-        setData(value);
-        setFailure(null);
-      })
-      .catch((error) => setFailure(String(error)));
-  }, []);
-
-  const start = (path: string) => {
-    onOpenFolder(path).then(onDone, (error) => setFailure(String(error)));
-  };
-
-  // A native dialog belongs to whoever owns the window, so this is a shell
-  // command like `window_*` rather than a plugin import — `null` is a cancelled
-  // dialog, which is an answer and not a failure.
-  const pick = async () => {
-    const chosen = await invoke<string | null>("dialog_open_folder").catch(
-      (error) => {
-        setFailure(`the folder picker could not open: ${String(error)}`);
-        return null;
-      },
-    );
-    if (typeof chosen === "string") start(chosen);
-  };
-
-  // Folders that are gone are left out. The rail lists them — an account of
-  // everywhere tcode has been is worth having, and silently dropping one looks
-  // identical to a bug — but this menu has exactly one job, and an item that
-  // cannot be opened does not do it.
-  const projects = (data?.projects ?? []).filter((project) => project.exists);
-
   return (
-    <>
-      <p className="fmenu-head">Start a conversation in</p>
-
-      {failure && (
-        <p className="fmenu-note" role="alert">
-          {failure}
-        </p>
-      )}
-
-      <div className="fmenu-list">
-        {!data && !failure && <p className="fmenu-note">reading folders…</p>}
-        {data && projects.length === 0 && (
-          <p className="fmenu-note">
-            No folder has a conversation in it yet. Choose one below to start.
-          </p>
-        )}
-        {projects.map((project) => (
-          <FolderItem
-            key={project.path}
-            project={project}
-            home={data?.home ?? home}
-            current={project.path === current}
-            onPick={() => start(project.path)}
-          />
-        ))}
-      </div>
-
-      <button
-        type="button"
-        className="fmenu-pick"
-        role="menuitem"
-        onClick={pick}
-      >
-        <FolderIcon size={14} />
-        Choose a folder…
-      </button>
-    </>
+    <FolderPickerBody
+      current={current}
+      home={home}
+      onPick={onOpenFolder}
+      onDone={onDone}
+      heading="Start a conversation in"
+      empty="No folder has a conversation in it yet. Choose one below to start."
+    />
   );
 }
 
@@ -146,5 +79,110 @@ function FolderItem({
         keep={3}
       />
     </button>
+  );
+}
+
+
+/** The same familiar folder list, applied to the conversation that opened it. */
+export function SwitchFolderPicker({
+  current,
+  home,
+  onChangeFolder,
+  onDone,
+}: {
+  current: string;
+  home: string;
+  onChangeFolder: (path: string) => Promise<void>;
+  onDone: () => void;
+}) {
+  return (
+    <FolderPickerBody
+      current={current}
+      home={home}
+      onPick={onChangeFolder}
+      onDone={onDone}
+      heading="Switch this conversation to"
+      empty="No folder has a conversation in it yet. Choose one below to switch this conversation."
+    />
+  );
+}
+
+function FolderPickerBody({
+  current,
+  home,
+  onPick,
+  onDone,
+  heading,
+  empty,
+}: {
+  current?: string;
+  home: string;
+  onPick: (path: string) => Promise<void>;
+  onDone: () => void;
+  heading: string;
+  empty: string;
+}) {
+  const [data, setData] = useState<ProjectList | null>(null);
+  const [failure, setFailure] = useState<string | null>(null);
+
+  useEffect(() => {
+    invoke<ProjectList>("project_list")
+      .then((value) => {
+        setData(value);
+        setFailure(null);
+      })
+      .catch((error) => setFailure(String(error)));
+  }, []);
+
+  const pickFolder = (path: string) => {
+    onPick(path).then(onDone, (error) => setFailure(String(error)));
+  };
+
+  const pick = async () => {
+    const chosen = await invoke<string | null>("dialog_open_folder").catch(
+      (error) => {
+        setFailure(`the folder picker could not open: ${String(error)}`);
+        return null;
+      },
+    );
+    if (typeof chosen === "string") pickFolder(chosen);
+  };
+
+  const projects = (data?.projects ?? []).filter((project) => project.exists);
+
+  return (
+    <>
+      <p className="fmenu-head">{heading}</p>
+
+      {failure && (
+        <p className="fmenu-note" role="alert">
+          {failure}
+        </p>
+      )}
+
+      <div className="fmenu-list">
+        {!data && !failure && <p className="fmenu-note">reading folders…</p>}
+        {data && projects.length === 0 && <p className="fmenu-note">{empty}</p>}
+        {projects.map((project) => (
+          <FolderItem
+            key={project.path}
+            project={project}
+            home={data?.home ?? home}
+            current={project.path === current}
+            onPick={() => pickFolder(project.path)}
+          />
+        ))}
+      </div>
+
+      <button
+        type="button"
+        className="fmenu-pick"
+        role="menuitem"
+        onClick={pick}
+      >
+        <FolderIcon size={14} />
+        Choose a folder…
+      </button>
+    </>
   );
 }

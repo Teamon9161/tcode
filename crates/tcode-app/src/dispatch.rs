@@ -177,6 +177,11 @@ impl Registry {
         result!(t, "write_plan", c::write_plan[supervisor](session, phases));
         result!(t, "execute_plan_elsewhere", c::execute_plan_elsewhere[emit, supervisor](session));
         result!(t, "open_folder", c::open_folder[supervisor](path, resume));
+        result!(
+            t,
+            "change_folder",
+            c::change_folder[supervisor](session, path)
+        );
         value!(t, "close_session", c::close_session[supervisor](session));
         result!(t, "send_message", c::send_message[emit, supervisor](session, text, images, plan));
         result!(t, "queued", c::queued[supervisor](session));

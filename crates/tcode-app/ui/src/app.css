@@ -3674,10 +3674,9 @@ body.is-resizing {
 
 /* ============================================================ folder chip */
 
-/* Which folder this conversation is in, in the pane header where the path
-   already was. It keeps the path's own type — a folder is an identifier, so it
-   is set in the machine face like every other path in this app — and gains only
-   what says it is a control: a hover surface and a chevron. */
+/* The current conversation's directory switcher belongs in its own pane
+   header: split panes may have different roots. Its visible label is only the
+   directory name; the full path is deliberately reserved for hover. */
 .folder-box {
   display: flex;
   flex: 1;
@@ -3724,14 +3723,6 @@ body.is-resizing {
   font-size: var(--text-sm);
   font-weight: var(--weight-semibold);
 }
-.folder-chip-path {
-  min-width: 0;
-  overflow: hidden;
-  font-family: var(--font-mono);
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-
 /* Down out of the header, aligned to the chip's left edge — the one popover in
    the window that opens downward, because it hangs from the top of a pane
    rather than sitting above the composer. */
@@ -3743,9 +3734,7 @@ body.is-resizing {
   max-height: min(24rem, calc(var(--seat-below, 100vh) - var(--s-4)));
 }
 
-/* Says what picking one does. Every item here starts a conversation rather than
-   moving this one — a session's folder is fixed when it opens — and that is the
-   single thing about this menu that could be misread. */
+/* Describes the directory-switch action offered by this conversation's menu. */
 .fmenu-head {
   margin: 0;
   padding: var(--s-2) var(--s-3) var(--s-1);

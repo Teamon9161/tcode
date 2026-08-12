@@ -6,6 +6,7 @@ import {
   canForceSaveWorkspaceText,
   canSaveWorkspaceText,
   diskChangedWorkspaceFileSession,
+  forgetWorkspaceFileSessions,
   newWorkspaceFileSession,
   reloadNeedsConfirmation,
   reloadedWorkspaceFileSession,
@@ -25,6 +26,18 @@ const file = (text: string, revision = "revision", truncated = false): Workspace
 });
 
 describe("workspace file sessions", () => {
+  it("forgets cached workspace drafts when its conversation moves folders", () => {
+    const value = newWorkspaceFileSession(file("saved"), true);
+    rememberWorkspaceFileSession("one", "notes.md", value);
+    rememberWorkspaceFileSession("two", "notes.md", value);
+
+    forgetWorkspaceFileSessions("one");
+
+    expect(workspaceFileSession("one", "notes.md")).toBeNull();
+    expect(workspaceFileSession("two", "notes.md")).toEqual(value);
+    forgetWorkspaceFileSessions("two");
+  });
+
   it("keeps clean and dirty state scoped to its session and path", () => {
     const value = newWorkspaceFileSession(file("saved"), true);
     rememberWorkspaceFileSession("one", "notes.md", { ...value, text: "edited" });

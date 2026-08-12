@@ -47,8 +47,8 @@ impl SessionInfo {
     fn of(handle: &crate::state::SessionHandle) -> Self {
         Self {
             id: handle.id.clone(),
-            cwd: handle.cwd.display().to_string(),
-            name: folder_name(&handle.cwd),
+            cwd: handle.cwd().display().to_string(),
+            name: folder_name(&handle.cwd()),
             log_id: handle.log_id.clone(),
             home: tcode_core::home_dir()
                 .map(|home| home.display().to_string())
@@ -354,7 +354,29 @@ pub fn open_folder(
     eprintln!(
         "tcode-app: session {} open on {}",
         handle.id,
-        handle.cwd.display()
+        handle.cwd().display()
+    );
+    Ok(OpenedSession::of(&handle, &supervisor.agent()))
+}
+
+/// Switch an existing conversation to another folder without creating a new
+/// session. The core session keeps its `/cd` history semantics and the desktop
+/// handle updates its workspace root to match.
+pub fn change_folder(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+) -> Result<OpenedSession, String> {
+    let cwd = crate::paths::canonical_dir(Path::new(&path))
+        .map_err(|error| format!("cannot change to {path}: {error}"))?;
+    supervisor.change_folder(&session, &cwd)?;
+    let handle = supervisor
+        .get(&session)
+        .expect("a changed open session remains registered");
+    eprintln!(
+        "tcode-app: session {} changed directory to {}",
+        handle.id,
+        handle.cwd().display()
     );
     Ok(OpenedSession::of(&handle, &supervisor.agent()))
 }
@@ -450,7 +472,7 @@ fn session_workspace(supervisor: &Supervisor, session: &str) -> Result<Workspace
     let handle = supervisor
         .get(session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
-    Workspace::open(&handle.cwd).map_err(|error| error.to_string())
+    Workspace::open(&handle.cwd()).map_err(|error| error.to_string())
 }
 
 /// How many completions a menu shows before the answer is "keep typing".
@@ -874,9 +896,7 @@ pub fn slash_command(
             }
             tcode_core::commands::CommandEffect::PersistSuggestions(on) => {
                 if let Ok(cf) = selected_config_file(supervisor) {
-                    Config::update_tcode_state(&cf, move |state| {
-                        state.suggestions = Some(on)
-                    });
+                    Config::update_tcode_state(&cf, move |state| state.suggestions = Some(on));
                 }
             }
             _ => return Err("that command is not available in the desktop app".into()),
@@ -930,8 +950,8 @@ pub fn skill_prompt(
     // body that mentions scratch gets a real path either way.
     let scratch = handle
         .scratch_dir()
-        .unwrap_or_else(|| tcode_core::store::scratchpad_dir(&handle.cwd));
-    let rendered = tcode_tools::render_skill(skill, &body, args, &handle.cwd, &scratch);
+        .unwrap_or_else(|| tcode_core::store::scratchpad_dir(&handle.cwd()));
+    let rendered = tcode_tools::render_skill(skill, &body, args, &handle.cwd(), &scratch);
     Ok(tcode_tools::wrap_skill_echo(name, args, &rendered))
 }
 
@@ -1369,7 +1389,7 @@ pub fn shown_file(
     let handle = supervisor
         .get(&session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
-    load_shown(Path::new(&path), &handle.cwd, binary)
+    load_shown(Path::new(&path), &handle.cwd(), binary)
 }
 
 /// The persisted desktop preferences which have a runtime effect.
@@ -1491,9 +1511,9 @@ pub fn serve_url(
     let file = if file.is_absolute() {
         file.to_path_buf()
     } else {
-        handle.cwd.join(file)
+        handle.cwd().join(file)
     };
-    serve.get()?.url(&file, &handle.cwd)
+    serve.get()?.url(&file, &handle.cwd())
 }
 
 /// The command's whole body, reachable without a window (AGENTS.md rule 2).

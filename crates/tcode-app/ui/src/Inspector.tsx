@@ -74,6 +74,7 @@ export const InspectView = memo(function InspectView({
     case "workspace-tree":
       return (
         <WorkspaceFiles
+          key={cwd}
           cwd={cwd}
           onOpenFile={(path) => onOpen({ kind: "workspace-file", path })}
           onOpenAside={(path) => onOpenAside({ kind: "workspace-file", path })}
@@ -81,7 +82,7 @@ export const InspectView = memo(function InspectView({
         />
       );
     case "workspace-file":
-      return <WorkspaceFile key={`${session}:${value.path}`} path={value.path} />;
+      return <WorkspaceFile key={`${session}:${cwd}:${value.path}`} path={value.path} />;
     case "file":
       return <FileView value={value} blocks={blocks} cwd={cwd} onOpen={onOpen} />;
     case "diff":

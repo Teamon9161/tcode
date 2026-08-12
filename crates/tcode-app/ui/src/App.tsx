@@ -42,6 +42,7 @@ import {
   type SessionState,
 } from "./session";
 import { replayLedger } from "./replay";
+import { forgetWorkspaceFileSessions } from "./workspaceDrafts";
 import {
   adoptContext,
   applyUsage,
@@ -343,6 +344,32 @@ export function App() {
       refreshTurnState(session.id);
     },
     [readPlan, refreshTurnState],
+  );
+
+  const changeFolder = useCallback(
+    async (id: string, path: string) => {
+      const opened = await invoke<OpenedSession>("change_folder", {
+        session: id,
+        path,
+      });
+      const { session: changed, context_tokens, context_estimated } = opened;
+      forgetWorkspaceFileSessions(id);
+      setSessions((current) =>
+        current.map((session) => (session.id === id ? changed : session)),
+      );
+      setStates((current) => ({
+        ...current,
+        [id]: {
+          ...(current[id] ?? BLANK),
+          meter: adoptContext(
+            current[id]?.meter ?? BLANK.meter,
+            context_tokens,
+            context_estimated,
+          ),
+        },
+      }));
+    },
+    [],
   );
 
   const closeSession = useCallback(
@@ -913,6 +940,7 @@ export function App() {
             onPlanFirst={setPlanFirst}
             onCloseSession={closeSession}
             onOpenFolder={openFolder}
+            onChangeFolder={changeFolder}
           />
         </LimitsContext.Provider>
       </DisplayContext.Provider>

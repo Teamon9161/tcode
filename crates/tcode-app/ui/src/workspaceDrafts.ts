@@ -45,6 +45,13 @@ export function rememberWorkspaceFileSession(
   sessions.set(keyOf(session, path), value);
 }
 
+export function forgetWorkspaceFileSessions(session: string): void {
+  const prefix = `${JSON.stringify([session]).slice(0, -1)},`;
+  for (const key of sessions.keys()) {
+    if (key.startsWith(prefix)) sessions.delete(key);
+  }
+}
+
 export function newWorkspaceFileSession(
   file: WorkspaceTextView,
   markdown: boolean,

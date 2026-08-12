@@ -179,8 +179,9 @@ export type PaneContext = {
   onSavePlan: (session: string) => void;
   onPlanOpen: (session: string, open: boolean) => void;
   onPlanFirst: (session: string, on: boolean) => void;
-  /** Start a conversation in another folder, from this pane's folder chip. */
-  onOpenFolder: (path: string) => Promise<void>;
+  /** Switch this existing conversation to another folder without changing its
+   * session identity, transcript, or pane. */
+  onChangeFolder: (session: string, path: string) => Promise<void>;
 };
 
 /**
@@ -759,7 +760,7 @@ function SessionPane({
           name={info.name}
           cwd={info.cwd}
           home={info.home}
-          onOpenFolder={context.onOpenFolder}
+          onChangeFolder={(path) => context.onChangeFolder(session, path)}
         />
         <button
           className="icon-btn"

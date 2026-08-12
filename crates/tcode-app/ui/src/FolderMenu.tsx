@@ -2,33 +2,29 @@ import { useCallback, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
 import { useSeat } from "./seat";
-import { FolderPicker } from "./FolderPicker";
-import { Path } from "./components/Path";
+import { SwitchFolderPicker } from "./FolderPicker";
 import { ChevronDown } from "./components/Icons";
 
 /**
- * Which folder this conversation is in, and where to start the next one.
+ * The directory for this conversation, with an in-place switcher.
  *
- * It lives in the pane's own header, at the top, because that is where "which
- * folder" was already being answered — the header has shown the path since the
- * first version, it was just not clickable. Making the answer the control is
- * what lets the rail carry one `New conversation` button instead of a second
- * list of folders.
+ * It lives in the pane's own header because split panes can show conversations
+ * from different folders. The visible label stays to the directory name; the
+ * complete path remains available through the control's hover title.
  *
  * A pane rather than the title bar, and that is load-bearing rather than
  * convenient: with the window split there are two conversations on screen in two
  * folders, so "the current folder" is not a question the window can answer
  * (AGENTS.md rule 9c). Each pane can, and does.
  *
- * Picking never moves this conversation. A session's folder is fixed at the
- * moment it opens — the agent works inside it and nowhere else — so every item
- * here *starts* one, which is what `FolderPicker`'s heading says.
+ * Picking applies the same `/cd` semantics to this conversation. Its session
+ * identity and transcript stay in place; only its workspace root changes.
  */
 export function FolderMenu({
   name,
   cwd,
   home,
-  onOpenFolder,
+  onChangeFolder,
 }: {
   /** The folder's own name, which is also the conversation's. It is carried
    *  here rather than beside the chip because it was the same word twice: a
@@ -37,7 +33,7 @@ export function FolderMenu({
   name: string;
   cwd: string;
   home: string;
-  onOpenFolder: (path: string) => Promise<void>;
+  onChangeFolder: (path: string) => Promise<void>;
 }) {
   const [open, setOpen] = useState(false);
   const trigger = useRef<HTMLButtonElement>(null);
@@ -62,11 +58,11 @@ export function FolderMenu({
         type="button"
         className="folder-chip"
         aria-expanded={open}
+        aria-label={`Switch directory for ${name}: ${cwd}`}
         onClick={() => setOpen((was) => !was)}
-        title="Start a conversation in another folder"
+        title={cwd}
       >
         <span className="folder-chip-name">{name}</span>
-        <Path className="folder-chip-path" path={cwd} home={home} keep={3} />
         <ChevronDown size={12} />
       </button>
 
@@ -78,10 +74,10 @@ export function FolderMenu({
             role="menu"
             aria-label="Folders"
           >
-            <FolderPicker
+            <SwitchFolderPicker
               current={cwd}
               home={home}
-              onOpenFolder={onOpenFolder}
+              onChangeFolder={onChangeFolder}
               onDone={() => setOpen(false)}
             />
           </div>,

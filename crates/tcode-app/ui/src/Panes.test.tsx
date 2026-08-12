@@ -10,9 +10,9 @@ const mocks = vi.hoisted(() => {
     value: () => null,
     configurable: true,
   });
-  return { invoke: vi.fn() };
+  return { invoke: vi.fn(), listen: vi.fn().mockResolvedValue(() => {}) };
 });
-vi.mock("@ipc", () => ({ invoke: mocks.invoke }));
+vi.mock("@ipc", () => ({ invoke: mocks.invoke, listen: mocks.listen }));
 
 import { navOf, type Inspect } from "./inspect";
 import type { Tiling } from "./layout";
@@ -87,7 +87,7 @@ function paneContext(focus = "inspect-pane"): PaneContext {
     onSavePlan: none,
     onPlanOpen: none,
     onPlanFirst: none,
-    onOpenFolder: async () => {},
+    onChangeFolder: async () => {},
   };
 }
 
@@ -96,6 +96,24 @@ async function draw(value: Inspect, nextContext = context) {
     root.render(
       <Panes
         tiling={tiling(value)}
+        context={nextContext}
+        stateOf={() => BLANK}
+        statusOf={() => "idle"}
+      />,
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
+
+async function drawSession(nextContext = context) {
+  await act(async () => {
+    root.render(
+      <Panes
+        tiling={{
+          root: { kind: "leaf", id: "session-pane", pane: { kind: "session", session: "s" } },
+          focus: "session-pane",
+        }}
         context={nextContext}
         stateOf={() => BLANK}
         statusOf={() => "idle"}
@@ -122,6 +140,31 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+});
+
+describe("conversation pane folder switcher", () => {
+  it("shows only the directory name and keeps its full path on hover", async () => {
+    mocks.invoke.mockResolvedValue({
+      models: [],
+      role_models: [],
+      model: -1,
+      effort: null,
+      context_window: 0,
+      presets: [],
+      preset: null,
+      roles: [],
+      modes: [],
+      mode: "default",
+      mode_staged: false,
+      can_view_images: false,
+    });
+    await drawSession();
+
+    const chip = container.querySelector<HTMLButtonElement>(".folder-chip")!;
+    expect(chip.textContent).toBe("project");
+    expect(chip.title).toBe("/project");
+    expect(chip.getAttribute("aria-label")).toBe("Switch directory for project: /project");
+  });
 });
 
 describe("workspace file pane header", () => {

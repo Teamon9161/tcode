@@ -1351,6 +1351,7 @@ export function Preview() {
                 onPlanFirst={() => {}}
                 onCloseSession={() => {}}
                 onOpenFolder={async () => pick("session")}
+                onChangeFolder={async () => pick("session")}
               />
             </div>
           </div>

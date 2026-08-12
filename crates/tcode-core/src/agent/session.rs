@@ -721,7 +721,7 @@ impl Session {
     /// A pre-turn `/cd` may replace it; the session log keeps the last version.
     pub fn set_startup_context(&mut self, startup: StartupContext) {
         debug_assert!(
-            self.opening_context.is_empty(),
+            self.ledger.is_empty(),
             "startup context may only be recorded before tcode sends a request"
         );
         self.opening_context = startup.text;

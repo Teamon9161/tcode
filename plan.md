@@ -199,5 +199,5 @@ loop {
 24. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
 26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
 28. app prompt框上方的plan栏，展开后，再展开background，没法滚动，在长background的时候展开后看不全，也没法看phase了。
-32. app Append不显示diff
 33. Tool friction — agent(explore)：我要求复审“当前 working-tree diff”，但只读 agent 没有 git/diff 能力，也未在工具描述中说明这一限制，因此改为扫描完整文件树，使用了 44 次工具调用和约 225 万输入 token，并且阶段性报告与最终报告的关注点不一致。最小改进是让只读 agent 可读取 git diff，或在派发时自动附带当前 patch；至少应在 agent 能力描述中明确其无法查看 working-tree diff。
+34. app, ai关闭页面后,浏览器preview如果是对于abound:blank就别显示了吧, 这个属于无效信息.

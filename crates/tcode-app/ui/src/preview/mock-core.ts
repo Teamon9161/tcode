@@ -846,6 +846,7 @@ export async function invoke<T>(
     }
     case "sessions":
       return OPEN as T;
+    case "change_folder":
     case "open_folder":
       return {
         session: {

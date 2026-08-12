@@ -93,6 +93,7 @@ export function Workspace({
   onPlanFirst,
   onCloseSession,
   onOpenFolder,
+  onChangeFolder,
   display,
   onDisplay,
 }: {
@@ -125,6 +126,7 @@ export function Workspace({
   /** `resume` replays a stored log rather than starting a fresh conversation;
    *  the rail's earlier-conversation rows are the only caller that passes it. */
   onOpenFolder: (path: string, resume?: string) => Promise<void>;
+  onChangeFolder: PaneContext["onChangeFolder"];
   display: Display;
   onDisplay: (next: Display) => void;
 }) {
@@ -588,6 +590,7 @@ export function Workspace({
       onPlanOpen,
       onPlanFirst,
       onOpenFolder,
+      onChangeFolder,
     }),
     [
       sessions,
@@ -629,6 +632,7 @@ export function Workspace({
       onPlanOpen,
       onPlanFirst,
       onOpenFolder,
+      onChangeFolder,
     ],
   );
 

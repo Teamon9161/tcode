@@ -645,6 +645,45 @@ async fn concurrent_sessions_never_cross_streams() {
     assert_eq!(supervisor.ids().len(), 2);
 }
 
+/// Changing a folder on a newly opened conversation replaces its startup
+/// context without creating another session; its identity and workspace surface
+/// follow the new folder.
+#[test]
+fn changing_a_fresh_conversation_folder_keeps_its_session_and_updates_the_workspace() {
+    tcode_core::home::testing::temp_home();
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    std::fs::write(target.path().join("only-in-target.txt"), "target\n").unwrap();
+    let agent = agent(MockProvider::new(Vec::new()), source.path());
+    let supervisor = Arc::new(Supervisor::new(
+        agent,
+        working_factory(source.path()),
+        menus(),
+        Vec::new(),
+    ));
+    let handle = supervisor.open_folder(source.path(), None).unwrap();
+    let id = handle.id.clone();
+
+    let opened = tcode_app::commands::change_folder(
+        &supervisor,
+        id.clone(),
+        target.path().display().to_string(),
+    )
+    .unwrap();
+
+    assert_eq!(opened.session.id, id);
+    assert_eq!(supervisor.ids(), [id]);
+    assert_eq!(handle.cwd(), target.path().canonicalize().unwrap());
+    assert_eq!(
+        tcode_app::commands::workspace_list(&supervisor, handle.id.clone(), None)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect::<Vec<_>>(),
+        ["only-in-target.txt"]
+    );
+}
+
 /// One session runs one turn at a time. The `Session` is *taken* for the
 /// duration, so a second send while one is running is refused by ownership
 /// rather than by a flag that could drift.
@@ -1583,7 +1622,11 @@ async fn an_approved_plan_can_be_handed_to_a_fresh_session() {
     let (fresh, instructions) =
         tcode_app::state::hand_off_plan(&supervisor, "s1").expect("an approved plan travels");
     assert_ne!(fresh.id, session.id);
-    assert_eq!(fresh.cwd, session.cwd, "the same folder, a clean context");
+    assert_eq!(
+        fresh.cwd(),
+        session.cwd(),
+        "the same folder, a clean context"
+    );
     assert_eq!(instructions.len(), 1);
     assert!(instructions[0].contains("Execute the approved plan"));
     assert!(

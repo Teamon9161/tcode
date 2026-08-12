@@ -140,7 +140,7 @@ function paneContext(sessions: SessionInfo[] = []): PaneContext {
     onSavePlan: none,
     onPlanOpen: none,
     onPlanFirst: none,
-    onOpenFolder: async () => {},
+    onChangeFolder: async () => {},
   };
 }
 

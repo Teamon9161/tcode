@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use tokio::sync::Notify;
@@ -40,7 +40,10 @@ struct TurnControl {
 /// One conversation, with everything that is private to it.
 pub struct SessionHandle {
     pub id: String,
-    pub cwd: PathBuf,
+    /// The workspace root for this session. It follows `/cd`-style directory
+    /// changes, while the session log and scratch directory keep their original
+    /// conversation identity.
+    cwd: RwLock<PathBuf>,
     /// Where transient files for this conversation live. Captured at open so
     /// queued input can still save pasted images while a turn owns `Session`.
     scratch_dir: PathBuf,
@@ -127,7 +130,7 @@ impl SessionHandle {
             .monitor_signal();
         Self {
             id,
-            cwd,
+            cwd: RwLock::new(cwd),
             scratch_dir,
             log_id: session.log_id().map(str::to_owned),
             progress: session.tool_ctx.progress_cell(),
@@ -147,6 +150,45 @@ impl SessionHandle {
             next_turn: std::sync::atomic::AtomicU64::new(0),
             pending: Pending::default(),
         }
+    }
+
+    /// The workspace root for this conversation. It remains available while a
+    /// turn owns the core session, so workspace views can safely read it.
+    pub fn cwd(&self) -> PathBuf {
+        self.cwd.read().unwrap().clone()
+    }
+
+    /// Change this idle conversation's workspace using Core's `/cd` semantics.
+    /// A desktop window may show several folders at once, so unlike `/cd` this
+    /// deliberately never mutates the process-wide working directory.
+    pub fn change_cwd(
+        &self,
+        cwd: &Path,
+        opening_context: &OpeningContextFn,
+        environment: &EnvironmentFn,
+    ) -> Result<tcode_core::CwdChange, String> {
+        let mut held = self
+            .session
+            .lock()
+            .map_err(|_| "this conversation encountered an internal error while changing directories; close it and open a new conversation")?;
+        let session = held
+            .as_mut()
+            .ok_or("this conversation is busy; wait for the current turn to finish")?;
+        let change = session.change_cwd(&cwd.to_string_lossy())?;
+        if change.refresh_opening_context {
+            let startup = opening_context(
+                &change.new,
+                &session.tool_ctx.scratch_dir,
+                &session.tool_ctx.instruction_discovery,
+            );
+            session.set_startup_context(startup);
+        } else if change.changed {
+            session.sync_environment(environment(&change.new), change.memory_note.clone());
+        }
+        if change.changed {
+            *self.cwd.write().unwrap() = change.new.clone();
+        }
+        Ok(change)
     }
 
     /// The model cell and picker selection private to this conversation.
@@ -609,7 +651,7 @@ pub fn hand_off_plan(
         ));
     }
     let handle = supervisor
-        .open_folder(&origin.cwd, None)
+        .open_folder(&origin.cwd(), None)
         .map_err(|error| format!("cannot open a session for the approved plan: {error}"))?;
     handle.adopt_plan(plan.path())?;
     let instruction = tcode_core::commands::plan::execution_instruction(&plan.body());
@@ -758,6 +800,15 @@ impl Supervisor {
             &self.environment,
             line,
         )
+    }
+
+    /// Switch an existing idle conversation to another workspace without
+    /// replacing its ledger, session id, or pane.
+    pub fn change_folder(&self, id: &str, cwd: &Path) -> Result<tcode_core::CwdChange, String> {
+        let handle = self
+            .get(id)
+            .ok_or_else(|| format!("session '{id}' is not open"))?;
+        handle.change_cwd(cwd, &self.opening_context, &self.environment)
     }
 
     pub fn ids(&self) -> Vec<String> {
