@@ -94,6 +94,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
 
@@ -114,6 +115,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         let outcome = CdCommand.run(&mut ctx, "definitely-missing-dir-xyz");

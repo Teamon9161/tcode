@@ -52,6 +52,9 @@ pub struct SessionHandle {
     /// the `Session`, which is `None` for the whole of a running turn, and the
     /// rail asks "which stored logs are already open" whenever it draws.
     pub log_id: Option<String>,
+    /// Current frontend/tool capability snapshot for this app session. Needed
+    /// by `/resume`, which replaces the core Session in place.
+    capabilities: tcode_core::RuntimeCapabilities,
     /// `None` while a turn is running — see the module comment.
     session: Mutex<Option<Session>>,
     /// The conversation's independently swappable main model. Kept outside
@@ -105,11 +108,17 @@ pub enum TurnError {
 }
 
 impl SessionHandle {
-    pub fn new(id: String, cwd: PathBuf, session: Session) -> Self {
+    pub fn new(
+        id: String,
+        cwd: PathBuf,
+        session: Session,
+        capabilities: tcode_core::RuntimeCapabilities,
+    ) -> Self {
         Self::with_main_pickers(
             id,
             cwd,
             session,
+            capabilities,
             crate::picker::MainPickers::unavailable("model picker unavailable in this session"),
         )
     }
@@ -118,6 +127,7 @@ impl SessionHandle {
         id: String,
         cwd: PathBuf,
         session: Session,
+        capabilities: tcode_core::RuntimeCapabilities,
         main_pickers: crate::picker::MainPickers,
     ) -> Self {
         let model = session.tool_ctx.model.clone();
@@ -133,6 +143,7 @@ impl SessionHandle {
             cwd: RwLock::new(cwd),
             scratch_dir,
             log_id: session.log_id().map(str::to_owned),
+            capabilities,
             progress: session.tool_ctx.progress_cell(),
             queue: session.pending.clone(),
             pending_mode: session.pending_mode.clone(),
@@ -399,6 +410,7 @@ impl SessionHandle {
             session,
             opening_context,
             environment,
+            capabilities: self.capabilities.clone(),
             turn_usage: tcode_core::Usage::default(),
         };
         registry
@@ -761,6 +773,7 @@ impl Supervisor {
             uuid::Uuid::new_v4().to_string(),
             cwd.to_path_buf(),
             opened.session,
+            opened.capabilities,
             opened.main_pickers,
         ));
         self.open(handle.clone());

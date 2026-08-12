@@ -398,6 +398,32 @@ fn stream_error_message(data: &Value) -> String {
     }
 }
 
+fn stream_error(data: &Value) -> ProviderError {
+    let message = stream_error_message(data);
+    ProviderError::Api {
+        status: stream_error_status(data, &message),
+        message,
+    }
+}
+
+fn stream_error_status(data: &Value, message: &str) -> u16 {
+    let code = non_empty_string(data["response"]["error"]["code"].as_str())
+        .or_else(|| non_empty_string(data["error"]["code"].as_str()))
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if code.contains("rate_limit") {
+        return 429;
+    }
+    let message = message.to_ascii_lowercase();
+    if code.contains("overload")
+        || message.contains("overloaded")
+        || message.contains("you can retry your request")
+    {
+        return 503;
+    }
+    0
+}
+
 #[async_trait]
 impl Provider for CodexProvider {
     fn name(&self) -> &str {
@@ -518,10 +544,7 @@ impl Provider for CodexProvider {
                         return;
                     }
                     "response.failed" | "error" => {
-                        yield Err(ProviderError::Api {
-                            status: 0,
-                            message: stream_error_message(&data),
-                        });
+                        yield Err(stream_error(&data));
                         return;
                     }
                     _ => {}
@@ -780,6 +803,55 @@ mod tests {
             stream_error_message(&data),
             "response failed (code: model_not_found)"
         );
+    }
+
+    #[test]
+    fn overloaded_stream_error_is_retryable() {
+        let data = json!({
+            "type": "error",
+            "error": {
+                "message": "Our servers are currently overloaded. Please try again later."
+            },
+        });
+        let error = stream_error(&data);
+
+        assert!(
+            matches!(error, ProviderError::Api { status: 503, .. }),
+            "{error:?}"
+        );
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn generic_retryable_stream_error_is_retryable() {
+        let data = json!({
+            "type": "error",
+            "error": {
+                "message": "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists."
+            },
+        });
+        let error = stream_error(&data);
+
+        assert!(
+            matches!(error, ProviderError::Api { status: 503, .. }),
+            "{error:?}"
+        );
+        assert!(error.retryable());
+    }
+
+    #[test]
+    fn rate_limit_stream_error_is_retryable() {
+        let data = json!({
+            "type": "error",
+            "error": { "code": "rate_limit_exceeded", "message": "Try again later." },
+        });
+        let error = stream_error(&data);
+
+        assert!(
+            matches!(error, ProviderError::Api { status: 429, .. }),
+            "{error:?}"
+        );
+        assert!(error.retryable());
     }
 
     #[test]

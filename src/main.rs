@@ -464,6 +464,7 @@ async fn main() -> anyhow::Result<()> {
         rules,
         resume,
         shell_filters: shell_filters.clone(),
+        capabilities: tcode_frontend::capabilities_from_tools("tui", &agent.tools),
         opening_context: opening_context.clone(),
         environment: environment.clone(),
     })?;
@@ -515,6 +516,7 @@ async fn main() -> anyhow::Result<()> {
         let fresh_shell_filters = shell_filters.clone();
         let fresh_opening_context = opening_context.clone();
         let fresh_environment = environment.clone();
+        let fresh_capabilities = tcode_frontend::capabilities_from_tools("tui", &agent.tools);
         let fresh_session = tcode_tui::FreshSession(Arc::new(move || {
             tcode_frontend::open_session(tcode_frontend::SessionSpec {
                 cwd: fresh_cwd.clone(),
@@ -525,6 +527,7 @@ async fn main() -> anyhow::Result<()> {
                 rules: fresh_rules.clone(),
                 resume: tcode_frontend::ResumeSpec::New,
                 shell_filters: fresh_shell_filters.clone(),
+                capabilities: fresh_capabilities.clone(),
                 opening_context: fresh_opening_context.clone(),
                 environment: fresh_environment.clone(),
             })
@@ -655,6 +658,7 @@ async fn main() -> anyhow::Result<()> {
                     session: &mut session,
                     opening_context: &opening_context,
                     environment: &environment,
+                    capabilities: tcode_frontend::capabilities_from_tools("plain", &agent.tools),
                     turn_usage,
                 },
                 &line,

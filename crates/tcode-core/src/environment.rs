@@ -31,6 +31,71 @@ pub struct EnvironmentSnapshot {
     pub date: String,
 }
 
+/// Frontend and tool availability facts for the live harness runtime.
+///
+/// Tool definitions are sent out-of-band on every provider request, but the
+/// append-only conversation still needs a model-visible breadcrumb when a
+/// persisted conversation moves between frontends with different capabilities.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeCapabilities {
+    pub frontend: String,
+    pub tools: Vec<String>,
+}
+
+impl RuntimeCapabilities {
+    pub fn new(
+        frontend: impl Into<String>,
+        tools: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        let mut tools = tools.into_iter().map(Into::into).collect::<Vec<_>>();
+        tools.sort();
+        tools.dedup();
+        Self {
+            frontend: frontend.into(),
+            tools,
+        }
+    }
+
+    pub fn diff_note(&self, current: &Self) -> Option<String> {
+        let added = current
+            .tools
+            .iter()
+            .filter(|tool| !self.tools.contains(tool))
+            .cloned()
+            .collect::<Vec<_>>();
+        let removed = self
+            .tools
+            .iter()
+            .filter(|tool| !current.tools.contains(tool))
+            .cloned()
+            .collect::<Vec<_>>();
+        if self.frontend == current.frontend && added.is_empty() && removed.is_empty() {
+            return None;
+        }
+        let mut lines = Vec::new();
+        if self.frontend != current.frontend {
+            lines.push(format!(
+                "Frontend: {} → {}",
+                self.frontend, current.frontend
+            ));
+        }
+        if !added.is_empty() {
+            lines.push(format!("Tools now available: {}", added.join(", ")));
+        }
+        if !removed.is_empty() {
+            lines.push(format!("Tools no longer available: {}", removed.join(", ")));
+        }
+        Some(format!(
+            "Runtime frontend/tool capabilities changed since the model last received a capability update:\n{}\n\nFuture tool calls must use only the tools in the current request. Do not rely on frontend-only panes, browser tabs, tab refs, or displayed artifacts from another frontend unless the current tools can inspect or recreate them.",
+            lines
+                .iter()
+                .map(|line| format!("- {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ))
+    }
+}
+
 impl EnvironmentSnapshot {
     /// Human-readable changes that affect how the model should operate.
     ///

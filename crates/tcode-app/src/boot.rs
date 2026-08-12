@@ -71,6 +71,7 @@ pub struct SessionFactory {
     agent_defs: Arc<tcode_tools::AgentRegistry>,
     opening_context: tcode_core::commands::OpeningContextFn,
     environment: tcode_core::commands::EnvironmentFn,
+    capabilities: tcode_core::RuntimeCapabilities,
 }
 
 /// A newly opened conversation plus main-model menus built from the same
@@ -78,6 +79,7 @@ pub struct SessionFactory {
 pub struct FactorySession {
     pub session: Session,
     pub main_pickers: crate::picker::MainPickers,
+    pub capabilities: tcode_core::RuntimeCapabilities,
 }
 
 impl SessionFactory {
@@ -88,6 +90,7 @@ impl SessionFactory {
         shell_filters: Arc<ShellFilters>,
         pinned: AgentModels,
         agent_defs: Arc<tcode_tools::AgentRegistry>,
+        capabilities: tcode_core::RuntimeCapabilities,
     ) -> Self {
         Self {
             config_file,
@@ -96,6 +99,7 @@ impl SessionFactory {
             agent_defs,
             opening_context: Arc::new(tcode_tools::startup_context_with_scratch),
             environment: Arc::new(tcode_tools::environment_snapshot),
+            capabilities,
         }
     }
 
@@ -144,12 +148,14 @@ impl SessionFactory {
                 None => tcode_frontend::ResumeSpec::New,
             },
             shell_filters: self.shell_filters.clone(),
+            capabilities: self.capabilities.clone(),
             opening_context: self.opening_context.clone(),
             environment: self.environment.clone(),
         })?;
         Ok(FactorySession {
             session,
             main_pickers: crate::picker::MainPickers { models, presets },
+            capabilities: self.capabilities.clone(),
         })
     }
 }
@@ -259,6 +265,7 @@ pub async fn start(cwd: PathBuf, shell: Arc<dyn crate::sidecar::Shell>) -> anyho
         booted.shell_filters.clone(),
         booted.pinned.clone(),
         booted.agent_defs.clone(),
+        tcode_frontend::capabilities_from_tools("app", &booted.agent.tools),
     );
     let supervisor = Arc::new(Supervisor::new(booted.agent, factory, menus, booted.skills));
 

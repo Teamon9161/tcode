@@ -1901,7 +1901,12 @@ mod tests {
         session
             .ledger
             .append(Entry::Instruction("private project rule".into()));
-        let handle = crate::state::SessionHandle::new("session".into(), cwd.path().into(), session);
+        let handle = crate::state::SessionHandle::new(
+            "session".into(),
+            cwd.path().into(),
+            session,
+            tcode_core::RuntimeCapabilities::new("app", std::iter::empty::<&str>()),
+        );
 
         // `OpenedSession::of` is this call plus an agent read; asserting on the
         // filter directly keeps the test free of a provider it has no use for.

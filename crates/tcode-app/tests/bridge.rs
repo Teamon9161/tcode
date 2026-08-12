@@ -259,6 +259,7 @@ fn factory_at(config: PathBuf) -> tcode_app::boot::SessionFactory {
         Arc::new(tcode_tools::ShellFilters::disabled()),
         tcode_core::AgentModels::default(),
         Arc::new(tcode_tools::AgentRegistry::builtin()),
+        tcode_core::RuntimeCapabilities::new("app", std::iter::empty::<&str>()),
     )
 }
 
@@ -269,7 +270,12 @@ fn handle(id: &str, cwd: PathBuf) -> Arc<SessionHandle> {
 
 /// The same, for the tests that care what is already in the ledger.
 fn handle_of(id: &str, cwd: PathBuf, session: Session) -> Arc<SessionHandle> {
-    Arc::new(SessionHandle::new(id.to_string(), cwd, session))
+    Arc::new(SessionHandle::new(
+        id.to_string(),
+        cwd,
+        session,
+        tcode_core::RuntimeCapabilities::new("app", std::iter::empty::<&str>()),
+    ))
 }
 
 fn say(text: &str) -> Vec<ContentBlock> {
@@ -1696,6 +1702,7 @@ async fn a_model_pick_moves_only_the_selected_session() {
         "a".into(),
         cwd.path().to_path_buf(),
         session_a,
+        tcode_core::RuntimeCapabilities::new("app", std::iter::empty::<&str>()),
         main_a,
     ));
     let handle_b = handle_of("b", cwd.path().to_path_buf(), session_b);

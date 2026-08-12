@@ -440,6 +440,7 @@ impl App {
             session,
             opening_context: &self.opening_context,
             environment: &self.environment,
+            capabilities: self.capabilities.clone(),
             turn_usage: self.meter.turn,
         };
         let outcome = self

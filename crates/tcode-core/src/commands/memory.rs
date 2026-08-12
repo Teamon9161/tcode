@@ -49,6 +49,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         let outcome = MemoryCommand.run(&mut ctx, "off");
@@ -62,6 +63,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         let outcome = MemoryCommand.run(&mut ctx, "on");
@@ -77,6 +79,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         let outcome = MemoryCommand.run(&mut ctx, "bogus");

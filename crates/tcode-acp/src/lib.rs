@@ -412,6 +412,7 @@ async fn build_session(state: &ServerState, params: &Value) -> anyhow::Result<Ac
         rules,
         resume: tcode_frontend::ResumeSpec::New,
         shell_filters,
+        capabilities: tcode_frontend::capabilities_from_tools("acp", &agent.tools),
         opening_context: Arc::new(tcode_tools::startup_context_with_scratch),
         environment: Arc::new(tcode_tools::environment_snapshot),
     })?;

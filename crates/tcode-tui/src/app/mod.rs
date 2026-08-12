@@ -288,6 +288,7 @@ pub struct App {
     turn_supports_vision: Option<bool>,
     opening_context: OpeningContextFn,
     environment: EnvironmentFn,
+    capabilities: tcode_core::RuntimeCapabilities,
     registry: CommandRegistry,
     /// The same discovery the `skill` tool uses, handed in by the caller so a
     /// `/name` line that misses both `UI_COMMANDS` and the registry can fall
@@ -595,6 +596,7 @@ impl App {
         // step with the UI even when tcode was launched with `--resume`.
         session.last_prompt_tokens = context_tokens;
         let renderers = RenderRegistry::from_tools(&agent.tools);
+        let capabilities = tcode_frontend::capabilities_from_tools("tui", &agent.tools);
         let mut terminal = Terminal::new(surface)?;
         // EnterAlternateScreen does not guarantee a blank physical buffer: on
         // some terminals a prior tcode frame survives a leave/re-enter cycle.
@@ -617,6 +619,7 @@ impl App {
             turn_supports_vision: None,
             opening_context,
             environment,
+            capabilities,
             registry: CommandRegistry::builtin(),
             skills,
             session: Some(session),

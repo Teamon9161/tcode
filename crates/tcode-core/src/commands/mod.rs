@@ -25,7 +25,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::agent::Session;
-use crate::environment::{EnvironmentSnapshot, StartupContext};
+use crate::environment::{EnvironmentSnapshot, RuntimeCapabilities, StartupContext};
 use crate::types::Usage;
 
 /// Rebuild cwd-specific startup context when `/cd` runs before any
@@ -139,6 +139,7 @@ pub struct CommandCtx<'a> {
     pub session: &'a mut Session,
     pub opening_context: &'a OpeningContextFn,
     pub environment: &'a EnvironmentFn,
+    pub capabilities: RuntimeCapabilities,
     /// The frontend's display tally for `/cost` (the TUI includes delegated
     /// sub-agent usage; the plain REPL passes `session.turn_usage`).
     pub turn_usage: Usage,
@@ -295,6 +296,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         assert!(registry

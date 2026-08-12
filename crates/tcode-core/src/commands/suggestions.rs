@@ -60,6 +60,7 @@ mod tests {
             session: &mut session,
             opening_context: &opening,
             environment: &environment,
+            capabilities: crate::RuntimeCapabilities::new("test", std::iter::empty::<&str>()),
             turn_usage: Usage::default(),
         };
         assert!(!ctx.session.suggestions(), "off by default");

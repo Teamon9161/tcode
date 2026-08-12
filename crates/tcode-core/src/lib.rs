@@ -40,7 +40,7 @@ pub use background::{BackgroundTasks, HarnessNoteSink, TaskShared, TaskStatus};
 pub use checkpoint::CheckpointStore;
 pub use config::FolderTrust;
 pub use cwd_scope::{CwdScoped, CwdScopes};
-pub use environment::{EnvironmentSnapshot, GitSnapshot, StartupContext};
+pub use environment::{EnvironmentSnapshot, GitSnapshot, RuntimeCapabilities, StartupContext};
 pub use export::export_markdown;
 pub use home::{home_dir, TCODE_HOME};
 pub use hooks::{HookDef, HookEvent, Hooks};

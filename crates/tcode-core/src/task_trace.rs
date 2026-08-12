@@ -315,6 +315,8 @@ fn replay_into(
                 | LogEvent::EnvironmentChanged { .. }
                 | LogEvent::EnvironmentObserved { .. }
                 | LogEvent::EnvironmentDelivered { .. }
+                | LogEvent::RuntimeCapabilitiesObserved { .. }
+                | LogEvent::RuntimeCapabilitiesDelivered { .. }
                 | LogEvent::Checkpoint { .. }
                 | LogEvent::ProgressAdopted { .. } => {}
             }

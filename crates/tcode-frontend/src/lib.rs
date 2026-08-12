@@ -27,7 +27,7 @@ pub use menu::{
     PinFn, PresetDraft, PresetMenu, PresetOption, PresetSaveOutcome, PresetUpdate, ProviderSetup,
     RoleSection, SavePresetFn, SwitchFn,
 };
-pub use session::{open_session, ResumeSpec, SessionSpec};
+pub use session::{capabilities_from_tools, open_session, ResumeSpec, SessionSpec};
 // `Key`/`View`/`Progress` etc. stay behind `setup::` — they only read right
 // next to the state machine they belong to.
 pub use setup::{CodexLogin, LoginUpdate, Setup};

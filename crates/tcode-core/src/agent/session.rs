@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::FolderTrust;
 use crate::cwd_scope::{CwdScoped, CwdScopes};
-use crate::environment::{EnvironmentSnapshot, StartupContext};
+use crate::environment::{EnvironmentSnapshot, RuntimeCapabilities, StartupContext};
 use crate::ledger::{Entry, Ledger};
 use crate::permission::{PermissionMode, PermissionRules};
 use crate::template::PromptVariables;
@@ -292,6 +292,13 @@ pub struct Session {
     /// The last environment explicitly represented in the system prefix or a
     /// model-facing environment Note.
     delivered_environment: Option<EnvironmentSnapshot>,
+    /// The latest actual frontend/tool capability set, persisted even if the
+    /// user has not yet sent it to the model.
+    capabilities: Option<RuntimeCapabilities>,
+    /// The last frontend/tool capability set explicitly represented in a
+    /// model-facing Note.
+    delivered_capabilities: Option<RuntimeCapabilities>,
+    pending_capability_delivery: bool,
     /// One coalesced directory instruction awaiting a genuine user delivery
     /// point. Repeated `/cd` replaces it rather than growing append-only
     /// model history with unobserved intermediate directories.
@@ -354,6 +361,9 @@ impl Session {
             folder_trust_known: false,
             environment: None,
             delivered_environment: None,
+            capabilities: None,
+            delivered_capabilities: None,
+            pending_capability_delivery: false,
             pending_environment_instruction: None,
             pending_environment_delivery: false,
             pending_memory_note: None,
@@ -742,6 +752,8 @@ impl Session {
         startup: StartupContext,
         environment: Option<EnvironmentSnapshot>,
         delivered_environment: Option<EnvironmentSnapshot>,
+        capabilities: Option<RuntimeCapabilities>,
+        delivered_capabilities: Option<RuntimeCapabilities>,
     ) {
         let StartupContext {
             text,
@@ -754,6 +766,9 @@ impl Session {
             // the Note, so its final stored snapshot is model-known.
             self.environment.clone().or(Some(startup_environment))
         });
+        self.capabilities = capabilities;
+        self.delivered_capabilities = delivered_capabilities;
+        self.pending_capability_delivery = false;
         self.pending_environment_instruction = None;
         self.pending_environment_delivery = false;
         self.pending_memory_note = None;
@@ -805,6 +820,34 @@ impl Session {
         self.pending_environment_delivery = true;
     }
 
+    /// Record the live frontend/tool capability set immediately, but defer the
+    /// model-facing explanation until the next legal user delivery point.
+    pub fn sync_capabilities(&mut self, current: RuntimeCapabilities) {
+        self.ledger
+            .record_aux(&crate::store::LogEvent::RuntimeCapabilitiesObserved {
+                capabilities: current.clone(),
+            });
+        self.capabilities = Some(current);
+        self.pending_capability_delivery = true;
+    }
+
+    /// Mark a fresh conversation's capability baseline as already represented
+    /// by the current request's tool definitions. There is no need to spend a
+    /// first-turn note saying what the API is already telling the model.
+    pub fn set_capabilities_delivered(&mut self, current: RuntimeCapabilities) {
+        self.ledger
+            .record_aux(&crate::store::LogEvent::RuntimeCapabilitiesObserved {
+                capabilities: current.clone(),
+            });
+        self.ledger
+            .record_aux(&crate::store::LogEvent::RuntimeCapabilitiesDelivered {
+                capabilities: current.clone(),
+            });
+        self.capabilities = Some(current.clone());
+        self.delivered_capabilities = Some(current);
+        self.pending_capability_delivery = false;
+    }
+
     /// Defer the model-facing explanation of an immediately applied memory
     /// setting. A second toggle replaces the first explanation before either
     /// reaches append-only history.
@@ -822,6 +865,24 @@ impl Session {
             .into_iter()
             .collect::<Vec<_>>();
         entries.extend(self.take_progress_note().map(Entry::Note));
+        if std::mem::take(&mut self.pending_capability_delivery) {
+            if let Some(current) = self.capabilities.clone() {
+                let note = self
+                    .delivered_capabilities
+                    .as_ref()
+                    .and_then(|previous| previous.diff_note(&current));
+                if note.is_some() || self.delivered_capabilities.is_none() {
+                    self.delivered_capabilities = Some(current.clone());
+                    self.ledger
+                        .record_aux(&crate::store::LogEvent::RuntimeCapabilitiesDelivered {
+                            capabilities: current,
+                        });
+                }
+                if let Some(note) = note {
+                    entries.push(Entry::Note(note));
+                }
+            }
+        }
         if !std::mem::take(&mut self.pending_environment_delivery) {
             return entries;
         }
@@ -1049,7 +1110,8 @@ mod tests {
     use super::{PendingInput, PendingMessage, Session};
     use crate::cwd_scope::CwdScoped;
     use crate::{
-        ContentBlock, Entry, EnvironmentSnapshot, PermissionMode, PermissionRules, ToolCtx,
+        ContentBlock, Entry, EnvironmentSnapshot, PermissionMode, PermissionRules,
+        RuntimeCapabilities, ToolCtx,
     };
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -1563,5 +1625,90 @@ mod tests {
         assert_eq!(session.ledger.len(), entries);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn same_runtime_capabilities_are_persisted_without_a_model_note() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::for_test(root, 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        session.ledger.append(Entry::Note("history".into()));
+        session.set_capabilities_delivered(RuntimeCapabilities::new("tui", ["bash", "read"]));
+        let entries_after_baseline = session.ledger.len();
+
+        session.sync_capabilities(RuntimeCapabilities::new("tui", ["read", "bash"]));
+
+        assert!(session.take_deferred_context_entries().is_empty());
+        assert_eq!(session.ledger.len(), entries_after_baseline);
+    }
+
+    #[test]
+    fn frontend_switch_capabilities_are_deferred_until_user_delivery() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::for_test(root, 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        session.ledger.append(Entry::Note("history".into()));
+        session.set_capabilities_delivered(RuntimeCapabilities::new("tui", ["bash", "read"]));
+        let entries_after_baseline = session.ledger.len();
+
+        session.sync_capabilities(RuntimeCapabilities::new(
+            "app",
+            ["bash", "browser", "read", "show"],
+        ));
+        assert_eq!(
+            session.ledger.len(),
+            entries_after_baseline,
+            "capability observations are metadata until delivery"
+        );
+
+        let entries = session.take_deferred_context_entries();
+        assert!(matches!(
+            entries.as_slice(),
+            [Entry::Note(text)]
+                if text.contains("Runtime frontend/tool capabilities changed")
+                    && text.contains("Frontend: tui")
+                    && text.contains("app")
+                    && text.contains("Tools now available: browser, show")
+                    && text.contains("current request")
+        ));
+        let entries_after_delivery = session.ledger.len();
+        session.sync_capabilities(RuntimeCapabilities::new(
+            "app",
+            ["show", "read", "browser", "bash"],
+        ));
+        assert!(session.take_deferred_context_entries().is_empty());
+        assert_eq!(session.ledger.len(), entries_after_delivery);
+    }
+
+    #[test]
+    fn legacy_sessions_without_capability_baseline_adopt_current_snapshot_silently() {
+        let root = std::env::temp_dir();
+        let mut session = Session::new(
+            ToolCtx::for_test(root, 1_000),
+            PermissionMode::Default,
+            PermissionRules::default(),
+        );
+        session.ledger.append(Entry::Note("history".into()));
+        session.sync_capabilities(RuntimeCapabilities::new("tui", ["bash", "read"]));
+
+        assert!(session.take_deferred_context_entries().is_empty());
+        session.sync_capabilities(RuntimeCapabilities::new("app", ["bash", "read", "show"]));
+        let entries = session.take_deferred_context_entries();
+        assert!(matches!(
+            entries.as_slice(),
+            [Entry::Note(text)]
+                if text.contains("Runtime frontend/tool capabilities changed")
+                    && text.contains("Frontend: tui")
+                    && text.contains("app")
+                    && text.contains("Tools now available: show")
+        ));
+        session.sync_capabilities(RuntimeCapabilities::new("app", ["show", "read", "bash"]));
+        assert!(session.take_deferred_context_entries().is_empty());
     }
 }

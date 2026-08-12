@@ -14,8 +14,8 @@ use anyhow::Context;
 use tcode_core::commands::{EnvironmentFn, OpeningContextFn};
 use tcode_core::config::{Config, ModelState};
 use tcode_core::{
-    CheckpointStore, CwdScoped, ModelCell, PermissionMode, PermissionRules, Resumed, Session,
-    SessionStore, ToolCtx,
+    CheckpointStore, CwdScoped, ModelCell, PermissionMode, PermissionRules, Resumed,
+    RuntimeCapabilities, Session, SessionStore, ToolCtx,
 };
 
 /// How a session's ledger is seeded.
@@ -41,6 +41,10 @@ pub struct SessionSpec<'a> {
     /// The `/cd`-aware shell filter chain the tools already hold; registering it
     /// is what makes `/cd` re-read the new directory's `.tcode/filters.toml`.
     pub shell_filters: Arc<dyn CwdScoped>,
+    /// Current frontend/tool capability set for this live session. It is
+    /// compared with the persisted baseline on resume and delivered as a note
+    /// only when it changed.
+    pub capabilities: RuntimeCapabilities,
     pub opening_context: OpeningContextFn,
     pub environment: EnvironmentFn,
 }
@@ -58,6 +62,7 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
         rules,
         resume,
         shell_filters,
+        capabilities,
         opening_context,
         environment,
     } = spec;
@@ -94,6 +99,7 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
             &session.tool_ctx.scratch_dir,
             &session.tool_ctx.instruction_discovery,
         ));
+        session.set_capabilities_delivered(capabilities);
         return Ok(session);
     };
     // Before this run's log exists, so the empty log we are about to create is
@@ -111,6 +117,8 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
                 environment: previous_environment,
                 delivered_environment,
                 progress,
+                capabilities: previous_capabilities,
+                delivered_capabilities,
             } = resumed;
             let session_id = store.id.clone();
             let ckpt_dir = data_dir.join("checkpoints").join(&session_id);
@@ -125,8 +133,15 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
                     &session.tool_ctx.instruction_discovery,
                 )
             });
-            session.restore_startup_context(startup, previous_environment, delivered_environment);
+            session.restore_startup_context(
+                startup,
+                previous_environment,
+                delivered_environment,
+                previous_capabilities,
+                delivered_capabilities,
+            );
             session.sync_environment((environment)(&cwd), None);
+            session.sync_capabilities(capabilities);
             // Re-read the plan rather than trusting the log: the record says
             // what was true when tcode stopped, and the file is the one piece
             // of this conversation the user can edit while it is not running.
@@ -145,7 +160,17 @@ pub fn open_session(spec: SessionSpec<'_>) -> anyhow::Result<Session> {
                 &session.tool_ctx.scratch_dir,
                 &session.tool_ctx.instruction_discovery,
             ));
+            session.set_capabilities_delivered(capabilities);
         }
     }
     Ok(session)
+}
+
+/// Snapshot the live frontend/tool capability set that will accompany provider
+/// requests for a session opened by this frontend.
+pub fn capabilities_from_tools(
+    frontend: impl Into<String>,
+    tools: &[Arc<dyn tcode_core::Tool>],
+) -> RuntimeCapabilities {
+    RuntimeCapabilities::new(frontend, tools.iter().map(|tool| tool.name()))
 }

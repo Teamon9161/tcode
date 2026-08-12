@@ -9,7 +9,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::environment::{EnvironmentSnapshot, StartupContext};
+use crate::environment::{EnvironmentSnapshot, RuntimeCapabilities, StartupContext};
 use crate::ledger::{Entry, Ledger, LedgerSink};
 
 /// One line in the session log. `Append`/`TruncateTail`/`Compact`
@@ -44,6 +44,17 @@ pub enum LogEvent {
     /// from context the model can safely rely on after resume.
     EnvironmentDelivered {
         environment: EnvironmentSnapshot,
+    },
+    /// Latest frontend/tool capability set observed by this process. It may be
+    /// newer than what the model has seen because frontend switches are
+    /// coalesced until a legal append boundary.
+    RuntimeCapabilitiesObserved {
+        capabilities: RuntimeCapabilities,
+    },
+    /// Latest frontend/tool capability set whose explanatory Note was actually
+    /// appended, or the startup baseline for a new session.
+    RuntimeCapabilitiesDelivered {
+        capabilities: RuntimeCapabilities,
     },
     Append {
         entry: Entry,
@@ -670,6 +681,11 @@ pub struct Resumed {
     /// append-only context. Sessions with a startup snapshot always have this
     /// baseline; older logs without one may omit it.
     pub delivered_environment: Option<EnvironmentSnapshot>,
+    /// The last frontend/tool capability set observed before tcode stopped.
+    pub capabilities: Option<RuntimeCapabilities>,
+    /// The last frontend/tool capability set explicitly delivered into the
+    /// model's append-only context.
+    pub delivered_capabilities: Option<RuntimeCapabilities>,
     /// The progress file this conversation was last working through. Only the
     /// path survives; the plan is re-read from disk on resume.
     pub progress: Option<PathBuf>,
@@ -959,6 +975,8 @@ impl SessionStore {
         let mut startup = None;
         let mut environment = None;
         let mut delivered_environment = None;
+        let mut capabilities = None;
+        let mut delivered_capabilities = None;
         let mut progress = None;
         let mut id = path
             .file_stem()
@@ -993,6 +1011,16 @@ impl SessionStore {
                     environment: snapshot,
                 } => {
                     delivered_environment = Some(snapshot);
+                }
+                LogEvent::RuntimeCapabilitiesObserved {
+                    capabilities: snapshot,
+                } => {
+                    capabilities = Some(snapshot);
+                }
+                LogEvent::RuntimeCapabilitiesDelivered {
+                    capabilities: snapshot,
+                } => {
+                    delivered_capabilities = Some(snapshot);
                 }
                 // Before `Entry::UserNote` existed, approval annotations were
                 // persisted as a pre-formatted machine note. Upgrade that
@@ -1051,6 +1079,8 @@ impl SessionStore {
             startup,
             environment,
             delivered_environment,
+            capabilities,
+            delivered_capabilities,
             progress,
         })
     }
@@ -1150,6 +1180,42 @@ mod tests {
         assert_eq!(resumed.startup, Some(startup));
         assert_eq!(resumed.environment, Some(environment("/temporary", 1)));
         assert_eq!(resumed.delivered_environment, Some(environment("/old", 0)));
+    }
+
+    #[test]
+    fn resume_old_logs_without_capability_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("legacy prompt"));
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        assert_eq!(resumed.capabilities, None);
+        assert_eq!(resumed.delivered_capabilities, None);
+        assert_eq!(resumed.ledger.entries().len(), 1);
+    }
+
+    #[test]
+    fn resume_replays_capability_observed_and_delivered_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        let delivered = RuntimeCapabilities::new("tui", ["bash", "read"]);
+        let observed = RuntimeCapabilities::new("app", ["bash", "browser", "read", "show"]);
+        ledger.record_aux(&LogEvent::RuntimeCapabilitiesDelivered {
+            capabilities: delivered.clone(),
+        });
+        ledger.record_aux(&LogEvent::RuntimeCapabilitiesObserved {
+            capabilities: observed.clone(),
+        });
+        ledger.append(text("continue later"));
+
+        let resumed = SessionStore::resume(dir.path(), None).unwrap();
+        assert_eq!(resumed.capabilities, Some(observed));
+        assert_eq!(resumed.delivered_capabilities, Some(delivered));
+        assert_eq!(resumed.ledger.entries().len(), 1);
     }
 
     /// One clock for the whole scratchpad: the harness's overflow files and the
