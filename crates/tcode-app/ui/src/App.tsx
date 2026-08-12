@@ -34,7 +34,13 @@ import {
 import { draftOf, fromDraft, type Plan, type PlanDraft } from "./plan";
 import { PlanRefreshes } from "./planRefresh";
 import type { PlanDecision } from "./PlanEditor";
-import { BLANK, LimitsContext, type SessionState } from "./session";
+import {
+  BLANK,
+  LimitsContext,
+  TURN_ENDED,
+  turnBegan,
+  type SessionState,
+} from "./session";
 import { replayLedger } from "./replay";
 import {
   adoptContext,
@@ -44,7 +50,7 @@ import {
   type Limits,
 } from "./usage";
 import { ToolMetaProvider, type ToolMeta } from "./toolViews";
-import { phaseOf } from "./activity";
+import { phaseOf, retryFrom } from "./activity";
 import {
   DisplayContext,
   loadDisplay,
@@ -179,13 +185,20 @@ export function App() {
     browser.watch();
     const subscriptions = [
       listen<SessionEvent>(AGENT_EVENT, ({ payload }) => {
-        patch(payload.session, (state) => ({
-          ...state,
-          blocks: applyEvent(state.blocks, payload.event),
-          files: applyFileEvent(state.files, payload.event),
-          meter: applyUsage(state.meter, payload.event),
-          activity: phaseOf(payload.event) ?? state.activity,
-        }));
+        patch(payload.session, (state) => {
+          // The deadline is fixed here, where the event's delay is still fresh.
+          // `null` leaves the standing answer alone for the events that are not
+          // about retrying, which is nearly all of them.
+          const retry = retryFrom(payload.event, Date.now());
+          return {
+            ...state,
+            blocks: applyEvent(state.blocks, payload.event),
+            files: applyFileEvent(state.files, payload.event),
+            meter: applyUsage(state.meter, payload.event),
+            activity: phaseOf(payload.event) ?? state.activity,
+            retry: retry === "clear" ? null : (retry ?? state.retry),
+          };
+        });
         // Which conversation is driving which browser tab. It is read here
         // because this is the only stream carrying both facts at once — the
         // backend has no session id to put on the tab itself, on purpose.
@@ -218,8 +231,7 @@ export function App() {
       listen<TurnStarted>(TURN_STARTED, ({ payload }) => {
         patch(payload.session, (state) => ({
           ...state,
-          running: true,
-          failed: false,
+          ...turnBegan(state),
           activity:
             payload.kind === "monitor" ? "monitor event" : state.activity,
         }));
@@ -227,7 +239,7 @@ export function App() {
       listen<TurnFinished>(TURN_FINISHED, ({ payload }) => {
         patch(payload.session, (state) => ({
           ...state,
-          running: false,
+          ...TURN_ENDED,
           approval: null,
           failed: payload.error !== null,
           activity: payload.error ? "failed" : "done",
@@ -387,8 +399,7 @@ export function App() {
           case "compact_started":
             patch(id, (state) => ({
               ...state,
-              running: true,
-              failed: false,
+              ...turnBegan(state),
               meter: { ...state.meter, turn: NO_USAGE },
               activity: "compacting history",
             }));
@@ -413,8 +424,7 @@ export function App() {
                 ? { ...state, queued: result.queued }
                 : {
                     ...state,
-                    running: true,
-                    failed: false,
+                    ...turnBegan(state),
                     meter: { ...state.meter, turn: NO_USAGE },
                     blocks: [...state.blocks, userBlock(result.prompt, [])],
                     activity: "sending",
@@ -425,7 +435,7 @@ export function App() {
       } catch (error) {
         patch(id, (state) => ({
           ...state,
-          running: false,
+          ...TURN_ENDED,
           failed: true,
           blocks: [...state.blocks, errorBlock(String(error))],
         }));
@@ -486,8 +496,7 @@ export function App() {
             ? { ...state, queued }
             : {
                 ...state,
-                running: true,
-                failed: false,
+                ...turnBegan(state),
                 // The receipt is per turn, so it is zeroed where the turn is
                 // submitted. Not on `AgentEvent::Started`: core emits that per
                 // model request, and a six-step turn would end up reporting
@@ -510,7 +519,7 @@ export function App() {
       } catch (error) {
         patch(id, (state) => ({
           ...state,
-          running: false,
+          ...TURN_ENDED,
           failed: true,
           blocks: [...state.blocks, errorBlock(String(error))],
         }));
@@ -779,7 +788,7 @@ export function App() {
             [session.id]: {
               ...BLANK,
               ...replayed,
-              running: true,
+              ...turnBegan(BLANK),
               activity: "executing the plan",
               meter: adoptContext(
                 BLANK.meter,

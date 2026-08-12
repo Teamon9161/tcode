@@ -1,5 +1,6 @@
 import { createContext, useContext } from "react";
 
+import type { Retry } from "./activity";
 import type { Block } from "./blocks";
 import type { TouchedFile } from "./files";
 import type { Pasted } from "./paste";
@@ -75,6 +76,50 @@ export type SessionState = {
   /** What this conversation occupies, what the last turn cost, and what the
    *  subscription has left. Folded from the event stream by `usage.ts`. */
   meter: Meter;
+  /**
+   * When the turn in flight began, by the webview's clock, or `null` when none
+   * is. Stamped where the turn is *submitted* rather than where the backend
+   * says it started, because the wait for the first event is part of what the
+   * elapsed reading is asked about — that gap is the longest quiet moment in a
+   * turn and the one that most needs a number under it.
+   *
+   * Local clock on both ends of the subtraction, unlike `time.ts::ago`: the
+   * start is stamped here and read here, so a webview clock that disagrees with
+   * the backend's cancels out instead of being compared across the two.
+   */
+  startedAt: number | null;
+  /** The backoff this turn is sitting out, or `null`. See `activity.ts`. */
+  retry: Retry | null;
+};
+
+/**
+ * The fields that say "a turn is now running", for the several places that
+ * start one: the composer, a slash command, a compaction, a plan handed to a
+ * fresh session, and the backend announcing a turn nobody typed.
+ *
+ * A helper rather than five spreads because the clock is the part that is easy
+ * to get wrong: an optimistic start and the backend's `TURN_STARTED` for the
+ * same turn both pass through here, and the second must not restamp the first —
+ * a reading that jumps back to `0s` a second in reports the round trip as the
+ * turn.
+ */
+export function turnBegan(state: SessionState): Pick<
+  SessionState,
+  "running" | "failed" | "startedAt" | "retry"
+> {
+  return {
+    running: true,
+    failed: false,
+    startedAt: state.running && state.startedAt !== null ? state.startedAt : Date.now(),
+    retry: null,
+  };
+}
+
+/** The mirror of `turnBegan`: nothing is in flight, so nothing is being timed. */
+export const TURN_ENDED: Pick<SessionState, "running" | "startedAt" | "retry"> = {
+  running: false,
+  startedAt: null,
+  retry: null,
 };
 
 /**
@@ -130,4 +175,6 @@ export const BLANK: SessionState = {
   planOpen: false,
   handoffPending: false,
   meter: NO_METER,
+  startedAt: null,
+  retry: null,
 };

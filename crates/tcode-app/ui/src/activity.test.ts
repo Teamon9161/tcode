@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 
-import { phaseOf, statusLabel } from "./activity";
+import {
+  elapsedLabel,
+  phaseOf,
+  retryFrom,
+  secondsLeft,
+  statusLabel,
+} from "./activity";
 import type { AgentEvent } from "./types";
 
 /**
@@ -72,5 +78,71 @@ describe("phaseOf", () => {
     // A variant core added after this file was written, which the open end of
     // the wire union lets through.
     expect(phase({ type: "SomethingNew", data: {} })).toBeNull();
+  });
+});
+
+/**
+ * The readings beside the phase. They exist because a wait produces exactly two
+ * questions the phase cannot answer — how long, and how much has come back —
+ * and the terminal has printed both since its first version.
+ */
+describe("retryFrom", () => {
+  it("turns the event's delay into a deadline, so the countdown cannot drift", () => {
+    // Decrementing a stored remainder on a timer drifts against the backend
+    // that is actually waiting, and drifts differently in a pane nobody is
+    // looking at. A deadline computed once is the same answer from anywhere.
+    expect(
+      retryFrom(
+        { type: "Retrying", data: { attempt: 2, max: 5, error: "reset", delay_ms: 4_000 } },
+        1_000,
+      ),
+    ).toEqual({ attempt: 2, max: 5, until: 5_000 });
+  });
+
+  it("clears on the request that ends the wait rather than on the clock", () => {
+    // A provider answering early leaves a countdown ticking under a turn that
+    // is already streaming, unless the next request itself is the signal.
+    expect(retryFrom({ type: "Started" }, 1_000)).toBe("clear");
+  });
+
+  it("says nothing about the events that are not about retrying", () => {
+    expect(retryFrom({ type: "TextDelta", data: "…" }, 1_000)).toBeNull();
+    expect(retryFrom({ type: "Usage", data: {} }, 1_000)).toBeNull();
+  });
+});
+
+describe("elapsedLabel", () => {
+  it("counts in seconds while somebody is plausibly watching", () => {
+    expect(elapsedLabel(0)).toBe("0s");
+    expect(elapsedLabel(12_400)).toBe("12s");
+    expect(elapsedLabel(59_999)).toBe("59s");
+  });
+
+  it("switches to minutes rather than printing a number nobody divides", () => {
+    // The TUI prints raw seconds forever because a status line has one column
+    // to spend. This row has the width, and `421s` is not read as seven
+    // minutes without doing the arithmetic.
+    expect(elapsedLabel(60_000)).toBe("1m 00s");
+    expect(elapsedLabel(421_000)).toBe("7m 01s");
+    expect(elapsedLabel(3_600_000)).toBe("1h 00m");
+    expect(elapsedLabel(7_845_000)).toBe("2h 10m");
+  });
+
+  it("never counts backwards from a clock that moved", () => {
+    expect(elapsedLabel(-5_000)).toBe("0s");
+  });
+});
+
+describe("secondsLeft", () => {
+  it("rounds up, so the last second is shown rather than skipped", () => {
+    expect(secondsLeft(5_000, 1_000)).toBe(4);
+    expect(secondsLeft(5_000, 4_200)).toBe(1);
+  });
+
+  it("runs out at zero instead of sitting at one", () => {
+    // The retry itself takes a moment; a countdown frozen at `1s` is a worse
+    // lie than one that admits it is out of numbers.
+    expect(secondsLeft(5_000, 5_000)).toBe(0);
+    expect(secondsLeft(5_000, 9_000)).toBe(0);
   });
 });

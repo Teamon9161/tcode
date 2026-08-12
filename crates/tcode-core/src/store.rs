@@ -326,6 +326,10 @@ const EMPTY_GRACE: Duration = Duration::from_secs(3600);
 pub fn sweep_old_sessions(data_dir: &Path) {
     let sessions_dir = data_dir.join("sessions");
     let checkpoints_dir = data_dir.join("checkpoints");
+    // Recover conversations that older `/clear` hid inside another session's
+    // log as truncated segments. Must run before the retention scan, so the
+    // extracted files are counted toward the keep limit.
+    extract_cleared_segments(&sessions_dir);
     let Ok(entries) = fs::read_dir(&sessions_dir) else {
         return;
     };
@@ -372,6 +376,126 @@ pub fn sweep_old_sessions(data_dir: &Path) {
             }
         }
     }
+}
+
+/// One-time migration: older `/clear` recorded `truncate_tail(0)` inside the
+/// same session file, hiding earlier conversations from the picker. This scans
+/// each log for full-clear events and writes the earlier segments as separate
+/// session files so they become independently resumable.
+///
+/// Idempotent: extracted files get a deterministic id derived from the
+/// original session, so a second run finds them already present and skips.
+fn extract_cleared_segments(sessions_dir: &Path) {
+    let Ok(entries) = fs::read_dir(sessions_dir) else {
+        return;
+    };
+    let paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .collect();
+    for path in paths {
+        let _ = extract_segments_from(&path, sessions_dir);
+    }
+}
+
+/// Extract pre-clear segments from one session file. Returns the number of
+/// segments written (0 when there is nothing to extract).
+fn extract_segments_from(path: &Path, sessions_dir: &Path) -> Option<usize> {
+    let file = File::open(path).ok()?;
+    let lines: Vec<String> = BufReader::new(file)
+        .lines()
+        .collect::<Result<_, _>>()
+        .ok()?;
+
+    // Quick scan: does this file even have a full clear?
+    if !lines
+        .iter()
+        .any(|line| line.contains("\"truncate_tail\"") && line.contains("\"len\":0"))
+    {
+        return Some(0);
+    }
+
+    // Parse just enough: collect meta/startup header, then split on
+    // truncate_tail(0) boundaries.
+    let mut header_lines: Vec<&str> = Vec::new(); // meta + startup_context
+    let mut segments: Vec<Vec<&str>> = Vec::new(); // segments before clear
+    let mut current: Vec<&str> = Vec::new();
+    let mut meta_cwd = String::new();
+    let mut meta_created: u64 = 0;
+    for line in &lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Cheap shape check without full deserialization.
+        let shape: LineShape = serde_json::from_str(trimmed).ok()?;
+        match shape.ev.as_str() {
+            "meta" => {
+                header_lines.push(line);
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(trimmed) {
+                    meta_cwd = v["cwd"].as_str().unwrap_or_default().to_string();
+                    meta_created = v["created_unix"].as_u64().unwrap_or(0);
+                }
+            }
+            "startup_context" | "environment_observed" | "environment_delivered"
+            | "environment_changed" => {
+                header_lines.push(line);
+            }
+            "truncate_tail" if shape.len == Some(0) => {
+                if current.iter().any(|l| l.contains("\"ev\":\"append\"")) {
+                    segments.push(std::mem::take(&mut current));
+                } else {
+                    current.clear();
+                }
+            }
+            _ => {
+                current.push(line);
+            }
+        }
+    }
+    // `current` holds the tail segment (the one that survived all clears);
+    // leave it in the original file.
+
+    if segments.is_empty() {
+        return Some(0);
+    }
+
+    let mut written = 0;
+    for (i, segment) in segments.iter().enumerate() {
+        // Deterministic id: original session timestamp + offset, so a re-run
+        // of the migration finds the file already present.
+        let segment_millis = (meta_created as u128) * 1000 + i as u128 + 1;
+        let segment_id = format!("{segment_millis:013x}");
+        let segment_path = sessions_dir.join(format!("{segment_id}.jsonl"));
+        // Skip if already extracted.
+        let Ok(mut file) = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&segment_path)
+        else {
+            continue;
+        };
+        // Write header.
+        let meta = serde_json::json!({
+            "ev": "meta",
+            "id": segment_id,
+            "cwd": meta_cwd,
+            "created_unix": meta_created + i as u64,
+        });
+        let _ = writeln!(file, "{}", meta);
+        for header in &header_lines {
+            if header.contains("\"startup_context\"") {
+                let _ = writeln!(file, "{header}");
+            }
+        }
+        // Write segment events.
+        for event_line in segment {
+            let _ = writeln!(file, "{event_line}");
+        }
+        written += 1;
+    }
+    Some(written)
 }
 
 /// Did anyone say anything in this session? Stops at the first entry, so the
@@ -1751,5 +1875,61 @@ mod tests {
         };
         assert!(note.contains("t2"), "{note}");
         assert!(!note.contains("t1"), "{note}");
+    }
+
+    #[test]
+    fn extract_segments_recovers_cleared_conversations() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        fs::create_dir_all(&sessions).unwrap();
+
+        // Simulate old /clear behavior: two conversations in one file,
+        // separated by truncate_tail(0).
+        let store = SessionStore::create(dir.path(), dir.path()).unwrap();
+        let mut ledger = Ledger::new();
+        ledger.attach_sink(Box::new(store));
+        ledger.append(text("first conversation prompt"));
+        ledger.append(Entry::Assistant(vec![ContentBlock::Text {
+            text: "first answer".into(),
+        }]));
+        // Old /clear: truncate to 0
+        ledger.truncate_tail(0);
+        // Second conversation in same session
+        ledger.append(text("second conversation prompt"));
+        drop(ledger);
+
+        // Before migration: only the second conversation is visible.
+        let before = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].last_user_preview, "second conversation prompt");
+
+        // Run extraction.
+        extract_cleared_segments(&sessions);
+
+        // After migration: both conversations are visible.
+        let after = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(after.len(), 2);
+        let previews: Vec<&str> = after.iter().map(|s| s.last_user_preview.as_str()).collect();
+        assert!(previews.contains(&"first conversation prompt"));
+        assert!(previews.contains(&"second conversation prompt"));
+
+        // The extracted session is independently resumable.
+        let extracted = after
+            .iter()
+            .find(|s| s.last_user_preview == "first conversation prompt")
+            .unwrap();
+        let resumed = SessionStore::resume(dir.path(), Some(&extracted.id)).unwrap();
+        assert!(resumed
+            .ledger
+            .entries()
+            .iter()
+            .any(|e| matches!(e, Entry::User(blocks) if blocks.iter().any(
+                |b| matches!(b, ContentBlock::Text { text } if text == "first conversation prompt")
+            ))));
+
+        // Idempotent: running again does not create duplicates.
+        extract_cleared_segments(&sessions);
+        let again = SessionStore::list(dir.path()).unwrap();
+        assert_eq!(again.len(), 2);
     }
 }

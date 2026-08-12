@@ -45,7 +45,12 @@ function tint(owner: string | null): React.CSSProperties | undefined {
   for (let at = 0; at < owner.length; at += 1) {
     hash = (hash * 31 + owner.charCodeAt(at)) >>> 0;
   }
-  return { background: `oklch(0.68 0.15 ${hash % 360})` };
+  // Only the hue is computed here, because only the hue is this file's answer.
+  // How light and how saturated a mark on this paper may be is the theme's
+  // (`--tint-lightness` / `--tint-chroma`): a fixed pair baked in here would
+  // survive a palette change and turn into the one chip on screen still lit for
+  // the previous one.
+  return { "--tint-hue": hash % 360 } as React.CSSProperties;
 }
 
 /**
@@ -237,7 +242,7 @@ export function WebPane({
                     is what says what it means. */}
                 {each.agent && (
                   <span
-                    className="tab-agent"
+                    className={`tab-agent${each.owner ? " is-owned" : ""}`}
                     style={tint(each.owner)}
                     role="img"
                     aria-label={agentHint(each, nameOf)}

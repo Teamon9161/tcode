@@ -171,23 +171,37 @@ parts — a pulsing dot, and a soft highlight sweeping the line beside it — no
 two effects that happened to accumulate; nothing else in the interface animates
 at all, and a second continuous animation anywhere else is a bug.
 
-The sweep is a band of `--brand` at low alpha travelling the row at constant
-speed, then holding past the right edge for a beat so two passes read as two
-events rather than a loop. The geometry is the TUI's (`theme.rs::shimmer_color`
-— one soft band, constant speed, a dwell between passes), because the two
-frontends should not report the same fact with two different rhythms. Constant
-speed rather than eased: an eased sweep reads as something arriving, and nothing
-arrives here.
+The sweep is a band a few characters wide crossing the phase at constant speed,
+then resting off the end for a beat so two passes read as two events rather than
+a loop. The geometry is the TUI's (`theme.rs::shimmer_color` — one soft band,
+constant speed, a dwell between passes), because the two frontends should not
+report the same fact with two different rhythms. Constant speed rather than
+eased: an eased sweep reads as something arriving, and nothing arrives here.
 
-**It travels the surface, never the glyphs.** `background-clip: text` over a
-gradient is banned outright, and it would also have to overwrite the phase's own
-colour — where the whole idea, in the terminal and here, is that a live line is
-lifted without losing its identity. So the text holds one solid colour and the
-sheet under it moves.
+**What moves is the letters' own colour.** Each glyph is lifted toward a denser
+tone of the hue it is already written in as the band passes, and settles back
+behind it — the terminal lifts its cells toward white on a dark ground, and this
+is the same act on light paper. Nothing behind the words is tinted and nothing
+in front of them is drawn: a wash under the row is a second object competing
+with the phase for the same glance, and it puts the readings beside the phase
+inside a highlight that has nothing to do with them.
+
+The lift is per glyph, which is the band's geometry stated directly rather than
+imitated. `background-clip: text` over a gradient is banned outright — it is one
+moving object pretending to be many, and it has to overwrite the phase's own
+colour, where the whole idea in both frontends is that a live line is lifted
+without losing its identity.
+
+Every value in it is a token: `--brand-lift` / `--amber-lift` are what a swept
+glyph is lifted to, `--sweep-step` is how long the band takes to reach the next
+glyph and `--sweep-dwell` is the rest between passes. The component hands the
+stylesheet a count and an index and nothing else. A theme retunes the app's one
+animation from `:root`, which is the token rule applied to the one place where
+it would have been easiest to bake a number in.
 
 Under `prefers-reduced-motion` the dot resolves to a static filled dot and the
-band comes to rest off the edge. Nothing is lost: the wash, the brand-coloured
-text and the phase's own words all still say a turn is running, which is the
+letters hold the status hue they settle to anyway. Nothing is lost: that colour,
+the dot and the phase's own words all still say a turn is running, which is the
 rule that motion may not be the only carrier of a state.
 
 ## Component vocabulary
@@ -419,6 +433,27 @@ One shape per job, used everywhere:
   those is it doing" is answered nowhere else. It said the word `working` for
   every second of every turn, which was the least it could have said and the
   most it could have been wrong about.
+
+  Two readings follow the phase and nothing else does: **how long** it has been
+  running and **how much** has come back (`1m 12s`, `↓ 3.9k`). They are the two
+  questions a wait produces that the phase cannot answer, and the terminal has
+  printed both since its first version — a window that reports less than the
+  terminal it replaces is asking to be left running in a terminal. Mono,
+  tabular, `--muted`: numbers that change under the eye, so proportional digits
+  would make a still row look like it is twitching, and they are readings taken
+  *during* a state rather than the state itself, so the state colour is not
+  theirs to wear. No `Esc to stop` tail: the terminal needs it because a key is
+  the only way to stop a turn there, while here the stop button and its
+  shortcut are two rows below.
+
+  A backoff takes the row over instead of sharing it — the circular arrow, the
+  attempt count, and a countdown — in amber rather than red, because the turn
+  has not failed, it is waiting. The phase it interrupted is about to be retried
+  from the top, so leaving it beside the countdown would name a step that is not
+  currently happening. The countdown runs off a deadline computed where the
+  event landed, never a remainder decremented on a timer: the second drifts
+  against the backend that is actually waiting, and drifts differently in a pane
+  nobody is looking at.
 
   The words are `activity.ts`, derived from the event stream, and they are the
   TUI's `state_label` verbatim. Not a wire contract — nothing breaks if they

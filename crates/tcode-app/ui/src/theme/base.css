@@ -43,6 +43,25 @@
   --danger-wash: color-mix(in oklab, var(--danger) 12%, var(--bg));
   --danger-text: color-mix(in oklab, var(--danger) 88%, var(--ink));
 
+  /* What a glyph of the running phase is lifted to as the sweep crosses it, for
+     the two states that line has. Derived from the text tone above rather than
+     invented, because it is that same tone momentarily denser — the terminal
+     lifts its cells toward white on a dark ground, and this is the same act on
+     light paper. A theme with a paler ground overrides these; a theme that
+     ignores them still gets the lift, which is why they have a derivation here
+     rather than being required of every palette. */
+  --brand-lift: color-mix(in oklab, var(--brand-text) 45%, var(--ink));
+  --amber-lift: color-mix(in oklab, var(--amber-text) 45%, var(--ink));
+
+  /* How light and how saturated an *identity* mark may be — a dot standing for
+     "which conversation opened this", where the hue is derived from an id and
+     carries no meaning of its own. Only these two are the palette's business;
+     the hue arrives with the thing being marked. Without them the derived
+     colours would be the one set on screen still lit for a palette the theme
+     replaced, since nothing else about them refers to a token. */
+  --tint-lightness: 0.68;
+  --tint-chroma: 0.15;
+
   /* ---- Syntax --------------------------------------------------------- */
   /* Code colouring is part of the theme, not of a highlighting library. The
      library (shiki) only says which kind each token is; the theme it is handed
@@ -202,11 +221,17 @@
   --dur-fast: 120ms;
   --dur: 180ms;
   --dur-slow: 220ms;
-  /* One pass of the running sweep, including the beat of rest at the end. Far
-     longer than any transition because it is not one: transitions answer an
+  /* The running sweep, as the two facts that define it: how long the band takes
+     to move from one glyph of the phase to the next, and how long it rests off
+     the end before starting again. A pass therefore takes as long as the phase
+     is wide, at one speed — the TUI's own (`theme.rs::shimmer_color`, 1.5
+     columns per 100ms tick), so the two frontends report one fact at one tempo.
+
+     Far longer than any transition because it is not one: transitions answer an
      action and must not be waited for, while this reports a state that lasts
      minutes and must not become a strobe beside text somebody is reading. */
-  --dur-sweep: 2600ms;
+  --sweep-step: 67ms;
+  --sweep-dwell: 1100ms;
 
   /* ---- Stacking ------------------------------------------------------- */
   /* Semantic, in the order things actually overlap. */

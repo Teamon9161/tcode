@@ -39,7 +39,13 @@ import {
 } from "./browserYield";
 import * as browserHost from "./webHost";
 import { FolderMenu } from "./FolderMenu";
-import { statusLabel } from "./activity";
+import {
+  elapsedLabel,
+  secondsLeft,
+  statusLabel,
+  type Retry,
+} from "./activity";
+import { tokens } from "./usage";
 import { sessionTitle } from "./railData";
 import { StatusDot } from "./components/Status";
 import {
@@ -849,7 +855,14 @@ function SessionPane({
           onSendNow={(turn) => context.onSendQueuedNow(session, turn)}
         />
 
-        {state.running && <TurnStatus phase={state.activity} />}
+        {state.running && (
+          <TurnStatus
+            phase={state.activity}
+            startedAt={state.startedAt}
+            retry={state.retry}
+            outTokens={state.meter.turn.output_tokens}
+          />
+        )}
 
         {state.plan &&
           !(state.approval && isPlanReview(state.approval.input)) && (
@@ -885,16 +898,128 @@ function SessionPane({
  * The turn's live state belongs with the next prompt, not in the record above
  * it. The transcript is scrollable history; this stays adjacent to the composer
  * so its answer survives while someone reads earlier messages.
+ *
+ * Three readings, in the order they are asked for. **What** it is doing carries
+ * the sweep and the state colour, because it is the one that changes. **How
+ * long** it has been at it and **how much** has come back are the two questions
+ * a wait actually produces, and they were on the wire and unread here while the
+ * terminal has printed both since its first version — a window that shows less
+ * than the terminal it replaces is asking to be left running in a terminal.
+ * They are quiet, tabular and to the right: read on purpose, never glanced at
+ * by accident.
+ *
+ * No `Esc to stop` tail, which is the one thing on the TUI's line that is not
+ * carried over. The terminal has to say it because a key is the only way to
+ * stop a turn there; here the stop control is a button two rows below with the
+ * shortcut in its own tooltip, and printing the key beside it would be the same
+ * instruction given twice in one glance.
  */
-function TurnStatus({ phase }: { phase: string }) {
+function TurnStatus({
+  phase,
+  startedAt,
+  retry,
+  outTokens,
+}: {
+  phase: string;
+  startedAt: number | null;
+  retry: Retry | null;
+  outTokens: number;
+}) {
+  const now = useNow(retry ? 250 : 1_000);
+  // A backoff takes the line over rather than sharing it. This is the one state
+  // where "what is it doing" is answered by a number going down, and the phase
+  // it interrupted (`writing`, `calling a tool`) is about to be retried from
+  // the top anyway — leaving it beside the countdown would name a step that is
+  // not currently happening.
+  if (retry) {
+    const left = secondsLeft(retry.until, now);
+    return (
+      <p className="working is-retrying" aria-live="polite">
+        {/* The TUI's `↻` in this app's one icon geometry — the same circular
+            arrow the reload control uses, because it is the same act. */}
+        <RefreshIcon size={12} />
+        <Sweeping text={`Retrying (${retry.attempt}/${retry.max})`} />
+        <span className="working-meta">{left > 0 ? `in ${left}s` : "now…"}</span>
+      </p>
+    );
+  }
   return (
     <p className="working" aria-live="polite">
-      <span className="working-spinner" aria-hidden>
-        ✦
-      </span>
-      <span className="working-phase">{statusLabel(phase)}</span>
+      <StatusDot status="running" />
+      <Sweeping text={statusLabel(phase)} />
+      {startedAt !== null && (
+        <span className="working-meta">{elapsedLabel(now - startedAt)}</span>
+      )}
+      {outTokens > 0 && (
+        <span className="working-meta" title="Tokens this turn has produced">
+          ↓ {tokens(outTokens)}
+        </span>
+      )}
     </p>
   );
+}
+
+/**
+ * The live label, one span per character.
+ *
+ * The sweep is a lift of the **text's own colour**, exactly as
+ * `theme.rs::shimmer_color` does it: a soft band crosses the word, each glyph
+ * lifting as it passes and settling back to the status hue behind it. The word
+ * is never overwritten by the highlight and nothing behind it is tinted — a
+ * live line is lifted without losing its identity, which is the whole idea in
+ * both frontends.
+ *
+ * Per glyph, and per glyph is the point: a gradient clipped to the letterforms
+ * would be one moving object pretending to be many, and it is banned here for
+ * its own reasons (DESIGN.md § Motion). Each character carries the same
+ * keyframes offset by its position, which is the band's geometry stated
+ * directly — constant speed, a few glyphs wide, a beat of rest between passes.
+ *
+ * What this hands the stylesheet is a **count and an index**, never a duration
+ * or a colour. Both ends of the lift and both terms of the tempo are theme
+ * tokens (`theme/base.css`), so a palette can retune the whole effect without
+ * touching this file, which is rule 8 applied to the one thing in the app that
+ * moves.
+ */
+function Sweeping({ text }: { text: string }) {
+  const glyphs = [...text];
+  return (
+    <span
+      className="working-phase"
+      style={{ "--sweep-len": glyphs.length } as CSSProperties}
+    >
+      {glyphs.map((glyph, at) => (
+        <span
+          key={at}
+          className="working-glyph"
+          style={{ "--sweep-at": at } as CSSProperties}
+        >
+          {glyph}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/**
+ * A clock that ticks only while something is reading it.
+ *
+ * One timer per running turn, and none at all once the turns are done: this
+ * component is unmounted when nothing is in flight, so an idle window — the
+ * usual state of an app somebody leaves open — schedules nothing. The interval
+ * is the resolution of the smallest digit on screen, not a frame rate: the
+ * sweep beside it is the style engine's to run, and a tick that redrew it would
+ * be this component asking to drive an animation it does not own. Re-rendering
+ * cannot disturb it either — the glyphs and their custom properties come out
+ * identical, so React writes nothing and the animations keep their clock.
+ */
+function useNow(everyMs: number): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const tick = setInterval(() => setNow(Date.now()), everyMs);
+    return () => clearInterval(tick);
+  }, [everyMs]);
+  return now;
 }
 
 function InspectPane({

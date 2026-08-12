@@ -1268,6 +1268,9 @@ export function Preview() {
           planOpen: scene === "session",
           meter: METER,
           activity: ACTIVITY.a,
+          // A turn that has been going a while, so the running line's readings
+          // are on screen with something in them rather than at `0s ↓ 0`.
+          startedAt: Date.now() - 94_000,
         }
       : {
           ...BLANK,
@@ -1275,6 +1278,10 @@ export function Preview() {
           running: true,
           meter: OTHER_METER,
           activity: ACTIVITY[id] ?? BLANK.activity,
+          startedAt: Date.now() - 7_000,
+          // The second pane is where the backoff can be looked at, since it is
+          // a state that otherwise only appears when a provider misbehaves.
+          retry: id === "b" ? { attempt: 2, max: 5, until: Date.now() + 4_000 } : null,
         };
 
   return (

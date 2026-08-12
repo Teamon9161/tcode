@@ -621,6 +621,10 @@ body.is-resizing {
  * sits on it like a full stop. `align-self` puts it back on the middle of the
  * line it belongs to. The neutral fill is for the moment between a tab being
  * opened and its conversation acting on it, when nobody has claimed it yet. */
+/* Which conversation opened this tab, as a dot. `--muted` until one is known;
+   once one is, `WebPane.tsx` supplies the hue it derived from the session id
+   and the theme supplies everything else, so the mark is legible on whatever
+   paper the palette chose. */
 .tab-agent {
   flex: none;
   align-self: center;
@@ -628,6 +632,9 @@ body.is-resizing {
   height: 6px;
   border-radius: 50%;
   background: var(--muted);
+}
+.tab-agent.is-owned {
+  background: oklch(var(--tint-lightness) var(--tint-chroma) var(--tint-hue));
 }
 
 /* The terminal's only: a page cannot exit. Said in words, never in colour
@@ -989,6 +996,15 @@ body.is-resizing {
 .dot-running {
   color: var(--brand);
   animation: breathe 1.8s var(--ease) infinite;
+}
+/* The pulse resolves to a static filled dot, which is what DESIGN.md promised
+   and what the glyph set was drawn for: running and idle share the diamond and
+   differ in colour, so nothing here was ever carried by motion alone. */
+@media (prefers-reduced-motion: reduce) {
+  .dot-running,
+  .mark-core-running {
+    animation: none;
+  }
 }
 .dot-waiting {
   color: var(--amber);
@@ -1960,9 +1976,9 @@ body.is-resizing {
 }
 
 /* The live state is fixed immediately above the composer rather than appended
-   to the scrollable record. Its only motion is the same soft lift the TUI gives
-   each status glyph: a highlight crosses the text without adding a panel behind
-   it. */
+   to the scrollable record, and it is the app's one continuously animated
+   object (DESIGN.md § Motion): a pulsing dot, and a soft band lifting the
+   colour of the phase's letters as it crosses them. */
 .pane-body.is-stage > .working {
   flex: none;
 }
@@ -1977,45 +1993,92 @@ body.is-resizing {
   padding: 0 var(--s-5) var(--s-2);
   color: var(--brand-text);
   font-size: var(--text-base);
+  /* Which pair of theme tones this row's sweep runs between. Only the choice
+     is made here — both values are the theme's, so a palette can retune the
+     lift without this file knowing (`theme/base.css` § State). */
+  --sweep-rest: var(--brand-text);
+  --sweep-lift: var(--brand-lift);
 }
 
-.working-spinner {
-  flex: none;
-  color: var(--brand);
-}
+/* The words. It is the part allowed to shrink: a batch label can be long, and
+   the readings beside it must not be pushed off the row by it.
 
-/* A text-only version of the TUI shimmer. The resting colour remains the
-   status hue; a narrow lift moves across the glyphs and rests off the end. */
+   One pass is however long the band needs to cross this many glyphs, plus the
+   rest at the end — the arithmetic is here rather than in `Panes.tsx` because
+   both terms are the theme's to set. The component supplies only the count,
+   which is a fact about the label and not a design value. */
 .working-phase {
   min-width: 0;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
-  background: linear-gradient(
-    90deg,
-    var(--brand-text) 0%,
-    var(--brand-text) 42%,
-    color-mix(in oklab, var(--brand-text) 45%, var(--ink)) 50%,
-    var(--brand-text) 58%,
-    var(--brand-text) 100%
-  );
-  background-size: 250% 100%;
-  background-position: 100% 0;
-  -webkit-background-clip: text;
-  background-clip: text;
-  -webkit-text-fill-color: transparent;
-  animation: working-text-sweep var(--dur-sweep) linear infinite;
+  color: var(--brand-text);
+  --sweep-cycle: calc(var(--sweep-len) * var(--sweep-step) + var(--sweep-dwell));
 }
 
-@keyframes working-text-sweep {
+/* The sweep, and it is the *text's own colour* that moves — nothing behind the
+   words is tinted and nothing in front of them is drawn. Each glyph runs the
+   same keyframes offset by its position, which is `theme.rs::shimmer_color`
+   stated directly: a band a few characters wide crossing at constant speed,
+   lifting each letter as it passes and leaving the status hue behind it, then
+   resting off the end for a beat so two passes read as two events rather than
+   as a loop.
+
+   `Panes.tsx` sets the cycle from the label's length, so the band's speed does
+   not depend on how much there is to cross — the terminal's rhythm, because the
+   two frontends should not report one fact at two tempos. */
+.working-glyph {
+  animation: working-lift var(--sweep-cycle) linear infinite;
+  animation-delay: calc(var(--sweep-at) * var(--sweep-step));
+  /* A space between two spans is still a space; without this the browser is
+     free to collapse the one that ends up at a line boundary. */
+  white-space: pre;
+}
+
+@keyframes working-lift {
   0% {
-    background-position: 100% 0;
+    color: var(--sweep-rest);
   }
-  72% {
-    background-position: 0 0;
+  6% {
+    color: var(--sweep-lift);
   }
+  13%,
   100% {
-    background-position: 0 0;
+    color: var(--sweep-rest);
+  }
+}
+
+/* Elapsed and produced. Quiet, mono and tabular — these are numbers that change
+   under the eye, and proportional digits make a still row look like it is
+   twitching. `--muted` rather than the state colour, and no sweep: they are
+   readings taken *during* the state, not the state itself, and a highlight
+   crossing a running clock would make the two look like one moving thing. */
+.working-meta {
+  flex: none;
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+/* A backoff is a fault the turn is recovering from, so it takes the row's
+   colour with it — the same amber the rest of the app warns in, never red: the
+   turn has not failed, it is waiting. */
+.working.is-retrying {
+  color: var(--amber-text);
+  --sweep-rest: var(--amber-text);
+  --sweep-lift: var(--amber-lift);
+}
+.working.is-retrying .working-phase {
+  color: var(--amber-text);
+}
+
+/* Nothing is lost when motion is off: the letters hold the status hue they
+   settle to anyway, and that colour, the dot and the phase's own words all
+   still say a turn is running. */
+@media (prefers-reduced-motion: reduce) {
+  .working-glyph {
+    animation: none;
   }
 }
 
