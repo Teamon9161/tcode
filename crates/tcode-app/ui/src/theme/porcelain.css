@@ -33,7 +33,7 @@
   --danger: oklch(0.545 0.2 27);
 
   --font-ui: "Instrument Sans Variable", ui-sans-serif, system-ui, sans-serif;
-  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  --font-mono: "IBM Plex Mono", "Symbols Nerd Font Mono", ui-monospace, "SF Mono", Menlo, monospace;
 
   /* ---- Surfaces ------------------------------------------------------- */
   /* Neutrals tinted toward the brand's own hue at chroma 0.004–0.008: cool

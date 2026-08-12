@@ -1,0 +1,14 @@
+/* Bundled font faces that are not provided by Fontsource packages.
+ *
+ * Symbols Nerd Font Mono is the app terminal's icon fallback. It is deliberately
+ * not the primary mono face: IBM Plex Mono keeps owning text, while this face
+ * fills the Private Use Area glyphs used by Powerline, Starship, eza, lazygit
+ * and other terminal tools when the user's machine has no Nerd Font installed.
+ */
+@font-face {
+  font-family: "Symbols Nerd Font Mono";
+  src: url("../assets/fonts/symbols-nerd-font/SymbolsNerdFontMono-Regular.ttf") format("truetype");
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+}

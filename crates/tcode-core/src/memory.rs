@@ -394,7 +394,7 @@ impl MemoryManager {
             }
         }
         append_source_markers(&mut note, new_sources.iter());
-        append_sources(&mut note, new_sources.iter(), INSTRUCTION_CAP);
+        append_dynamic_sources(&mut note, new_sources.iter(), INSTRUCTION_CAP);
         Some(MemoryUpdate {
             note,
             affected_roots,
@@ -519,7 +519,7 @@ impl MemoryManager {
             note.push('\n');
         }
         append_source_markers(&mut note, dynamic.iter().copied());
-        append_sources(&mut note, dynamic.into_iter(), INSTRUCTION_CAP);
+        append_dynamic_sources(&mut note, dynamic.into_iter(), INSTRUCTION_CAP);
         Some(note)
     }
 
@@ -589,6 +589,60 @@ fn append_sources<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBu
                 "\n[truncated: {end} of {} bytes of this file are shown; the instruction \
                  budget ran out here. Read {} directly if the task touches an area the \
                  loaded part does not cover.]\n",
+                text.len(),
+                source.display()
+            ));
+        }
+        out.push('\n');
+    }
+}
+
+fn append_dynamic_sources<'a>(
+    out: &mut String,
+    sources: impl Iterator<Item = &'a PathBuf>,
+    cap: usize,
+) {
+    let sources: Vec<&PathBuf> = sources.collect();
+    if sources.is_empty() {
+        return;
+    }
+    out.push_str("Instruction files discovered in this batch:\n");
+    for source in &sources {
+        out.push_str(&format!("- {}\n", source.display()));
+    }
+    let start = out.len();
+    let total = sources.len();
+    for (index, source) in sources.into_iter().enumerate() {
+        if out.len().saturating_sub(start) >= cap {
+            out.push_str(&format!(
+                "... (instruction budget exhausted before showing {}; read it directly if this task touches its area)\n",
+                source.display()
+            ));
+            break;
+        }
+        let Some(text) = instruction_text(source) else {
+            continue;
+        };
+        out.push_str(&format!("## {}\n", source.display()));
+        let remaining = cap.saturating_sub(out.len().saturating_sub(start));
+        let remaining_sources = total.saturating_sub(index);
+        let slice_budget = if remaining_sources <= 1 {
+            remaining
+        } else {
+            remaining / remaining_sources
+        };
+        if text.len() <= slice_budget {
+            out.push_str(&text);
+        } else {
+            let mut end = slice_budget;
+            while end > 0 && !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            out.push_str(&text[..end]);
+            out.push_str(&format!(
+                "\n[truncated: {end} of {} bytes of this file are shown; other newly \
+                 discovered instruction files also need budget. Read {} directly if the \
+                 task touches this area.]\n",
                 text.len(),
                 source.display()
             ));
@@ -1050,6 +1104,47 @@ mod tests {
         let update = manager.discover_for_paths(&[marked.join("x.rs")]).unwrap();
         assert!(update.note.contains("load me"));
         assert!(!update.note.contains("must not load"));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dynamic_instruction_note_names_every_new_source_before_budgeted_bodies() {
+        let base = temp("dynamic-budget-fairness");
+        let home = base.join("home");
+        let root = base.join("repo");
+        let first = root.join("crates/first");
+        let second = root.join("crates/second");
+        fs::create_dir_all(home.join(".tcode")).unwrap();
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        fs::write(
+            first.join("AGENTS.md"),
+            format!("FIRST-HEAD\n{}FIRST-TAIL", "filler line\n".repeat(2_000)),
+        )
+        .unwrap();
+        fs::write(second.join("AGENTS.md"), "SECOND-RULE").unwrap();
+
+        let mut manager = MemoryManager::new_with_home(&root, Some(home));
+        let update = manager
+            .discover_for_paths(&[first.join("src/lib.rs"), second.join("src/lib.rs")])
+            .unwrap();
+
+        assert!(update
+            .note
+            .contains("Instruction files discovered in this batch"));
+        assert!(
+            update.note.contains("first") && update.note.contains("AGENTS.md"),
+            "{}",
+            update.note
+        );
+        assert!(
+            update.note.contains("second") && update.note.contains("AGENTS.md"),
+            "{}",
+            update.note
+        );
+        assert!(update.note.contains("FIRST-HEAD"), "{}", update.note);
+        assert!(update.note.contains("SECOND-RULE"), "{}", update.note);
         let _ = fs::remove_dir_all(base);
     }
 

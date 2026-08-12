@@ -92,6 +92,23 @@ function failed(what: string, error: unknown) {
   publish({ failure: `${what}: ${String(error)}` });
 }
 
+/**
+ * xterm paints cells itself. If the symbols fallback is still loading when the
+ * first prompt arrives, private-use glyphs can be rasterized as tofu and kept in
+ * the terminal's canvas until something later causes a full redraw. Wait for the
+ * face used by `--font-mono`, but treat failure as a normal browser fallback so
+ * a broken font asset never prevents the user from getting a shell.
+ */
+async function loadTerminalFonts(fontFamily: string, fontSize: number): Promise<void> {
+  const fonts = document.fonts;
+  if (!fonts) return;
+  try {
+    await fonts.load(`${fontSize}px ${fontFamily}`, "\ue0b0\ue795");
+  } catch {
+    // A missing fallback font gives tofu for icons, not a dead terminal.
+  }
+}
+
 // ------------------------------------------------------------------ the panel
 
 /**
@@ -188,10 +205,14 @@ export async function open(cwd: string) {
   for (const other of live.values()) other.host.style.display = "none";
   mount.appendChild(host);
 
+  const fontFamily = tokenValue("--font-mono") || "monospace";
+  const fontSize = Number.parseInt(tokenValue("--text-sm"), 10) || 13;
+  await loadTerminalFonts(fontFamily, fontSize);
+
   const term = new Terminal({
     theme: readTheme(),
-    fontFamily: tokenValue("--font-mono") || "monospace",
-    fontSize: Number.parseInt(tokenValue("--text-sm"), 10) || 13,
+    fontFamily,
+    fontSize,
     lineHeight: 1.35,
     cursorBlink: true,
     // Deep enough that a build's output is still there when it finishes, and

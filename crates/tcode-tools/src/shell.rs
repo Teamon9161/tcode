@@ -1,5 +1,5 @@
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -16,6 +16,7 @@ use tcode_core::{
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_TIMEOUT_MS: u64 = 600_000;
 const FINAL_TAIL_LINES: usize = 80;
+const PIPE_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputMode {
@@ -385,6 +386,67 @@ async fn resolution_hint(kind: ShellKind, script: &str, cwd: &std::path::Path) -
     resolution_note(&String::from_utf8_lossy(&output.stdout))
 }
 
+fn format_shell_output(out_buf: &[u8], err_buf: &[u8]) -> String {
+    let mut out = String::from_utf8_lossy(out_buf).into_owned();
+    let err = String::from_utf8_lossy(err_buf);
+    if !err.trim().is_empty() {
+        out.push_str("\n--- stderr ---\n");
+        out.push_str(err.trim_end());
+    }
+    out
+}
+
+fn append_partial_output(message: &mut String, bufs: (Vec<u8>, Vec<u8>)) {
+    let partial = format_shell_output(&bufs.0, &bufs.1);
+    if partial.trim().is_empty() {
+        return;
+    }
+    message.push_str("\n--- output before termination ---\n");
+    message.push_str(partial.trim_end());
+}
+
+fn shared_pipe_buffer() -> Arc<Mutex<Vec<u8>>> {
+    Arc::new(Mutex::new(Vec::new()))
+}
+
+fn spawn_pipe_capture(
+    mut pipe: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> tokio::task::JoinHandle<Vec<u8>> {
+    tokio::spawn(async move {
+        let mut local = [0u8; 8192];
+        loop {
+            let read = pipe.read(&mut local).await;
+            let Ok(n) = read else {
+                break;
+            };
+            if n == 0 {
+                break;
+            }
+            buf.lock()
+                .expect("pipe buffer lock")
+                .extend_from_slice(&local[..n]);
+        }
+        Arc::try_unwrap(buf)
+            .map(|mutex| mutex.into_inner().expect("pipe buffer lock"))
+            .unwrap_or_else(|buf| buf.lock().expect("pipe buffer lock").clone())
+    })
+}
+
+async fn await_pipe_capture(reader: tokio::task::JoinHandle<Vec<u8>>) -> Vec<u8> {
+    reader.await.unwrap_or_default()
+}
+
+async fn drain_pipe_capture(
+    reader: tokio::task::JoinHandle<Vec<u8>>,
+    buf: Arc<Mutex<Vec<u8>>>,
+) -> Vec<u8> {
+    match tokio::time::timeout(PIPE_DRAIN_TIMEOUT, reader).await {
+        Ok(Ok(bytes)) => bytes,
+        _ => buf.lock().expect("pipe buffer lock").clone(),
+    }
+}
+
 impl ShellTool {
     /// Detach a long-running command: the process is owned by a supervisor
     /// task, its output streams into the background registry, and the model
@@ -649,29 +711,18 @@ impl Tool for ShellTool {
             }
         };
 
-        let mut stdout_pipe = child.stdout.take().expect("piped stdout");
-        let mut stderr_pipe = child.stderr.take().expect("piped stderr");
-        let reader = async {
-            let (mut out_buf, mut err_buf) = (Vec::new(), Vec::new());
-            let _ = tokio::join!(
-                stdout_pipe.read_to_end(&mut out_buf),
-                stderr_pipe.read_to_end(&mut err_buf)
-            );
-            (out_buf, err_buf)
-        };
+        let stdout_pipe = child.stdout.take().expect("piped stdout");
+        let stderr_pipe = child.stderr.take().expect("piped stderr");
+        let stdout_buf = shared_pipe_buffer();
+        let stderr_buf = shared_pipe_buffer();
+        let stdout_reader = spawn_pipe_capture(stdout_pipe, stdout_buf.clone());
+        let stderr_reader = spawn_pipe_capture(stderr_pipe, stderr_buf.clone());
 
         tokio::select! {
-            ((out_buf, err_buf), status) = async {
-                let bufs = reader.await;
-                let status = child.wait().await;
-                (bufs, status)
-            } => {
-                let mut out = String::from_utf8_lossy(&out_buf).into_owned();
-                let err = String::from_utf8_lossy(&err_buf);
-                if !err.trim().is_empty() {
-                    out.push_str("\n--- stderr ---\n");
-                    out.push_str(err.trim_end());
-                }
+            status = child.wait() => {
+                let out_buf = await_pipe_capture(stdout_reader).await;
+                let err_buf = await_pipe_capture(stderr_reader).await;
+                let mut out = format_shell_output(&out_buf, &err_buf);
                 let code = status.as_ref().ok().and_then(|s| s.code()).unwrap_or(-1);
                 let silent = out.trim().is_empty();
                 if silent {
@@ -722,6 +773,9 @@ impl Tool for ShellTool {
                 if let Some(diag) = kill_process_tree(&mut child).await {
                     message.push_str(&format!(" {diag}"));
                 }
+                let out_buf = drain_pipe_capture(stdout_reader, stdout_buf).await;
+                let err_buf = drain_pipe_capture(stderr_reader, stderr_buf).await;
+                append_partial_output(&mut message, (out_buf, err_buf));
                 ToolOutput::err(message)
             }
             _ = cancel.cancelled() => {
@@ -729,6 +783,9 @@ impl Tool for ShellTool {
                 if let Some(diag) = kill_process_tree(&mut child).await {
                     message.push_str(&format!(" {diag}"));
                 }
+                let out_buf = drain_pipe_capture(stdout_reader, stdout_buf).await;
+                let err_buf = drain_pipe_capture(stderr_reader, stderr_buf).await;
+                append_partial_output(&mut message, (out_buf, err_buf));
                 ToolOutput::err(message)
             }
         }
@@ -1019,6 +1076,47 @@ mod tests {
         let raw = std::fs::read_to_string(path).unwrap();
         assert!(raw.contains("line 0"));
         assert!(raw.contains("line 84"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn foreground_timeout_includes_output_captured_before_kill() {
+        let root =
+            std::env::temp_dir().join(format!("tcode-shell-timeout-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        tcode_core::home::testing::temp_home();
+        let ctx = ToolCtx::with_scratch_dir(root.clone(), 10_000, root.join("scratch"));
+        let (kind, command) = if cfg!(windows) {
+            (
+                ShellKind::PowerShell,
+                "Write-Output 'stdout-before-timeout'; cmd /c \"echo stderr-before-timeout 1>&2\"; Start-Sleep -Seconds 30",
+            )
+        } else {
+            (
+                ShellKind::Bash,
+                "echo stdout-before-timeout; echo stderr-before-timeout >&2; sleep 30",
+            )
+        };
+        let output = ShellTool::new(kind)
+            .run(
+                json!({ "command": command, "timeout_ms": 1000 }),
+                &ctx,
+                &CancellationToken::new(),
+            )
+            .await;
+        assert!(output.is_error, "{}", output.content);
+        assert!(output.content.contains("timed out"), "{}", output.content);
+        assert!(
+            output.content.contains("stdout-before-timeout"),
+            "{}",
+            output.content
+        );
+        assert!(
+            output.content.contains("stderr-before-timeout"),
+            "{}",
+            output.content
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

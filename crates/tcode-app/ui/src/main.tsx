@@ -6,6 +6,7 @@ import { createRoot } from "react-dom/client";
 import "@fontsource-variable/instrument-sans";
 import "@fontsource/ibm-plex-mono/400.css";
 import "@fontsource/ibm-plex-mono/500.css";
+import "./theme/fonts.css";
 
 // Order matters: base.css declares the token contract with derived fallbacks,
 // the theme assigns the real values on top, and components read tokens only.
