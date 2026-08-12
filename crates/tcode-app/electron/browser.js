@@ -78,10 +78,11 @@ const FORCE_LAYOUT = `document.documentElement &&
 
 function withTimeout(promise, ms, what) {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(
-      () => reject(new Error(`${what} did not answer within ${ms}ms`)),
-      ms,
-    );
+    const timer = setTimeout(() => {
+      const error = new Error(`${what} did not answer within ${ms}ms`);
+      error.name = "TimeoutError";
+      reject(error);
+    }, ms);
     promise.then(
       (value) => {
         clearTimeout(timer);
@@ -94,6 +95,13 @@ function withTimeout(promise, ms, what) {
     );
   });
 }
+
+/** Let a native child-view stack change reach Electron before probing its frame.
+ *  A DOM layout read alone cannot make that promise: the target and the app
+ *  cover are sibling `WebContentsView`s, composed outside either renderer.
+ *  One macrotask is too early on some Viz paths, so leave one short frame
+ *  budget for the native compositor before asking it to capture. */
+const compositorTurn = () => new Promise((resolve) => setTimeout(resolve, 50));
 
 /** Where a tab starts. Deliberately not a search engine or a vendor page: the
  *  app has no business making a request nobody asked for. */
@@ -434,6 +442,7 @@ function browserVerbs(
       };
       const paint = async (when) => {
         try {
+          await compositorTurn();
           await withTimeout(
             contents.executeJavaScript(FORCE_LAYOUT),
             renderTimeout,
@@ -452,6 +461,9 @@ function browserVerbs(
               if (!probe.isEmpty()) return;
               last = new Error(`browser ${when} frame was empty`);
             } catch (error) {
+              // Electron cannot cancel an in-flight capture. Retrying after it
+              // timed out would queue more work behind the same stuck Viz path.
+              if (error?.name === "TimeoutError") throw error;
               last = error;
             }
             if (Date.now() < until) {
@@ -470,6 +482,11 @@ function browserVerbs(
       if (!appView) throw new Error("the app renderer is unavailable for background capture");
       const cover = shown && current ? find(current) : null;
       if (cover) window.contentView.removeChildView(cover);
+      // Reattaching the app view is deliberate. On an otherwise empty browser
+      // tree, adding an already-attached sibling is not a reliable compositor
+      // reorder on every Electron/Viz path; detach it so this is unambiguously
+      // target below cover before the first frame is requested.
+      window.contentView.removeChildView(appView);
       window.contentView.addChildView(view, 0);
       window.contentView.addChildView(appView);
       view.setVisible(true);

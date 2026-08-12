@@ -782,6 +782,11 @@ function BrowserPreview({ tab, onReveal }: { tab: string; onReveal: (tab: string
   );
   const url = preview?.url || known?.url || "about:blank";
 
+  // A closed or not-yet-navigated native tab only has Chromium's placeholder
+  // address. Showing an empty preview for it makes a finished browser step look
+  // like it still has a page to inspect.
+  if (url === "about:blank") return null;
+
   return (
     <div className="browser-preview">
       <div className="browser-preview-bar">

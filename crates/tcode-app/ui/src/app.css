@@ -5918,6 +5918,7 @@ body.is-resizing {
    owned by one box, not re-granted per child. */
 .strip-body {
   display: flex;
+  flex: 1 1 auto;
   flex-direction: column;
   width: 100%;
   min-height: 0;
@@ -6015,7 +6016,20 @@ body.is-resizing {
    the plan's progress look like a stray green decoration, so it has no separate
    meter. */
 
+/* The expanded background and phase list are one document, so they share one
+   scroll box. A separate scrolling `<ol>` let a long background consume the
+   strip's whole height and left neither its end nor any phase reachable. */
+.strip-expanded {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-gutter: stable both-edges;
+}
+
 .strip-background {
+  flex: none;
   padding-top: var(--s-2);
 }
 .strip-background-toggle {
@@ -6045,7 +6059,6 @@ body.is-resizing {
   gap: var(--s-1);
   margin-block: 0;
   padding: var(--s-3) 0;
-  overflow-y: auto;
   font-size: var(--text-base);
 }
 .strip-phase {

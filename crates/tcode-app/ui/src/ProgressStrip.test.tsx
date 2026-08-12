@@ -51,6 +51,9 @@ describe("ProgressStrip", () => {
     expect(disclosure.getAttribute("aria-expanded")).toBe("true");
     expect(detail.querySelector(".prose-h2")?.textContent).toBe("Context");
     expect(detail.querySelector("strong")?.textContent).toBe("Preserve");
+    const scroller = container.querySelector(".strip-expanded")!;
+    expect(scroller.querySelector(".strip-background .strip-detail")).toBe(detail);
+    expect(scroller.querySelector(".strip-phases")).not.toBeNull();
   });
 
   it("does not render the background disclosure while the strip is collapsed", () => {

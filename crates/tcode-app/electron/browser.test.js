@@ -60,7 +60,12 @@ function harness(renderTimeout = 10, thumbnailDelay = 120) {
   const partition = {
     setPermissionRequestHandler() {},
   };
-  const appView = { name: "app" };
+  const appView = {
+    name: "app",
+    webContents: {
+      capturePage: async () => fakeImage(),
+    },
+  };
   const children = [appView];
   const contentView = {
     addChildView(view, index) {
@@ -100,6 +105,14 @@ function expectShownAt(view, rect) {
     ["visible", true],
     ["bounds", rect],
   ]);
+}
+
+async function waitFor(check, timeout = 1_000) {
+  const until = Date.now() + timeout;
+  while (!check()) {
+    if (Date.now() >= until) throw new Error("timed out waiting for test condition");
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  }
 }
 
 test("a hidden browser defers divider bounds until it is shown", () => {
@@ -430,11 +443,50 @@ test("a transient Viz failure is retried within the render budget", async () => 
 });
 
 
+test("a no-pane browser screenshot restores the cover above the agent tab", async () => {
+  const { verbs, first, appView, children } = harness();
+  verbs.browser_close({ id: first });
+  const id = verbs.browser_open({ select: false });
+  const target = FakeWebContentsView.instances[1];
+
+  await verbs.browser_navigate({ id, url: "https://example.com/" });
+
+  assert.deepEqual(children, [target, appView]);
+  assert.deepEqual(target.operations.filter(([kind]) => kind === "visible").slice(-2), [
+    ["visible", true],
+    ["visible", false],
+  ]);
+});
+
+
+test("a timed-out initial frame does not queue another capture", async () => {
+  const { verbs } = harness(20);
+  const backgroundId = verbs.browser_open({ select: false });
+  const background = FakeWebContentsView.instances[1];
+  let captures = 0;
+  background.webContents.capturePage = () => {
+    captures += 1;
+    return new Promise(() => {});
+  };
+
+  background.operations.length = 0;
+  await assert.rejects(
+    verbs.browser_navigate({ id: backgroundId, url: "https://example.com/" }),
+    /browser (?:initial|result) frame did not answer within/,
+  );
+  assert.equal(captures, 1, "a hung capture must not accumulate retry calls");
+  assert.deepEqual(background.operations.filter(([kind]) => kind === "visible"), [
+    ["visible", true],
+    ["visible", false],
+  ]);
+});
+
+
 test("navigation publishes a resized transient Browser thumbnail", async () => {
   const { verbs, first, events } = harness(100, 0);
 
   await verbs.browser_navigate({ id: first, url: "https://example.com/report" });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await waitFor(() => events.some((event) => event.name === BROWSER_THUMBNAIL));
 
   const thumbnails = events.filter((event) => event.name === BROWSER_THUMBNAIL);
   assert.equal(thumbnails.length, 1);
@@ -458,7 +510,7 @@ test("thumbnail requests coalesce per tab and retain the newest revision", async
 
   verbs.browser_select({ id: first });
   verbs.browser_select({ id: first });
-  await new Promise((resolve) => setTimeout(resolve, 10));
+  await waitFor(() => events.some((event) => event.name === BROWSER_THUMBNAIL));
 
   const thumbnails = events.filter((event) => event.name === BROWSER_THUMBNAIL);
   assert.equal(captures, 2, "one readiness probe and one thumbnail capture");
@@ -472,7 +524,7 @@ test("an in-flight thumbnail is discarded when its exact tab closes", async () =
   view.webContents.capturePage = () => new Promise((resolve) => { finishCapture = resolve; });
 
   verbs.browser_select({ id: first });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  while (!finishCapture) await new Promise((resolve) => setTimeout(resolve, 0));
   verbs.browser_close({ id: first });
   finishCapture(fakeImage());
   await new Promise((resolve) => setTimeout(resolve, 10));

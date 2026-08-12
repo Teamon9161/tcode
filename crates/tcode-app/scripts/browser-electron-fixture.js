@@ -109,15 +109,38 @@ app.whenReady().then(async () => {
     });
     const rect = { x: 0, y: 0, width: 1000, height: 730 };
 
+    // This is the agent's first browser action in a window: no browser pane has
+    // ever selected a tab, so the recovery path must create a target frame
+    // below the app cover without depending on any current native sibling.
+    const noPaneId = verbs.browser_open({ select: false, agent: true });
+    const noPaneView = window.contentView.children.find((view) => view !== appView);
+    assert.ok(noPaneView, "a no-pane browser tab must be attached");
+    browserViews.push(noPaneView);
+    assert.equal(noPaneView.getVisible(), false, "a no-pane agent tab must start hidden");
+    await verbs.browser_navigate({ id: noPaneId, url });
+    const noPaneShot = await verbs.browser_screenshot({ id: noPaneId });
+    assert.ok(noPaneShot.data.length > 1000, "a no-pane screenshot needs real pixels");
+    assert.equal(noPaneView.getVisible(), false, "a no-pane screenshot must restore hidden state");
+    assert.deepEqual(
+      window.contentView.children,
+      [noPaneView, appView],
+      "a no-pane screenshot must restore the app cover above the agent tab",
+    );
+    verbs.browser_close({ id: noPaneId });
+
     const selectedId = verbs.browser_open({ rect, select: true });
-    browserViews.push(window.contentView.children.at(-1));
+    const selectedView = window.contentView.children.at(-1);
+    assert.ok(selectedView, "a selected browser tab must be attached");
+    browserViews.push(selectedView);
     verbs.browser_show({ rect });
     await verbs.browser_navigate({ id: selectedId, url: "data:text/html,<body>selected tab</body>" });
-    const selectedView = browserViews[0];
 
     const backgroundId = verbs.browser_open({ select: false, agent: true });
-    browserViews.push(window.contentView.children.at(-1));
-    const backgroundView = browserViews[1];
+    const backgroundView = window.contentView.children.find(
+      (view) => view !== appView && view !== selectedView,
+    );
+    assert.ok(backgroundView, "a background browser tab must be attached");
+    browserViews.push(backgroundView);
     assert.equal(backgroundView.getVisible(), false, "the agent tab must start hidden");
 
     await verbs.browser_navigate({ id: backgroundId, url });
@@ -191,7 +214,7 @@ app.whenReady().then(async () => {
     process.exitCode = 1;
   } finally {
     for (const view of browserViews) {
-      if (!view.webContents.isDestroyed()) view.webContents.close();
+      if (view.webContents && !view.webContents.isDestroyed()) view.webContents.close();
     }
     if (appView && !appView.webContents.isDestroyed()) appView.webContents.close();
     if (window && !window.isDestroyed()) window.destroy();

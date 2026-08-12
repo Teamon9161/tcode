@@ -97,64 +97,66 @@ export function ProgressStrip({
           </button>
         </div>
 
-        {expanded && plan.background && (
-          <div className="strip-background">
-            <button
-              type="button"
-              className="strip-background-toggle"
-              onClick={() => setBackgroundOpen((was) => !was)}
-              aria-expanded={backgroundOpen}
-            >
-              {backgroundOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-              Background
-            </button>
-            {backgroundOpen && <Prose className="strip-detail" text={plan.background} />}
-          </div>
-        )}
-
         {expanded && (
-          <ol className="strip-phases">
-            {rows.map((row) => {
-              const key = row.path.join(".");
-              // The running phase's prose is open because that is the one being
-              // read at a glance; the rest are one click, not nowhere. The
-              // detail is the plan — a phase title is only its index (see the
-              // `progress` tool) — so "what does this phase actually mean" had
-              // no answer here at all until the phase happened to be running.
-              const open = shown[key] ?? row.status === "in_progress";
-              const detail = row.detail.trim();
-              return (
-                <li
-                  key={key}
-                  className={`strip-phase is-${row.status}${row.depth > 0 ? " is-nested" : ""}`}
+          <div className="strip-expanded">
+            {plan.background && (
+              <div className="strip-background">
+                <button
+                  type="button"
+                  className="strip-background-toggle"
+                  onClick={() => setBackgroundOpen((was) => !was)}
+                  aria-expanded={backgroundOpen}
                 >
-                  {detail ? (
-                    <button
-                      type="button"
-                      className="strip-phase-line"
-                      onClick={() => setShown((was) => ({ ...was, [key]: !open }))}
-                      aria-expanded={open}
-                      title={open ? "Hide what this phase covers" : "Show what this phase covers"}
-                    >
-                      <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
-                      <span className="strip-phase-name">{row.phase}</span>
-                      <span className="strip-phase-chevron" aria-hidden="true">
-                        {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                  {backgroundOpen ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                  Background
+                </button>
+                {backgroundOpen && <Prose className="strip-detail" text={plan.background} />}
+              </div>
+            )}
+
+            <ol className="strip-phases">
+              {rows.map((row) => {
+                const key = row.path.join(".");
+                // The running phase's prose is open because that is the one being
+                // read at a glance; the rest are one click, not nowhere. The
+                // detail is the plan — a phase title is only its index (see the
+                // `progress` tool) — so "what does this phase actually mean" had
+                // no answer here at all until the phase happened to be running.
+                const open = shown[key] ?? row.status === "in_progress";
+                const detail = row.detail.trim();
+                return (
+                  <li
+                    key={key}
+                    className={`strip-phase is-${row.status}${row.depth > 0 ? " is-nested" : ""}`}
+                  >
+                    {detail ? (
+                      <button
+                        type="button"
+                        className="strip-phase-line"
+                        onClick={() => setShown((was) => ({ ...was, [key]: !open }))}
+                        aria-expanded={open}
+                        title={open ? "Hide what this phase covers" : "Show what this phase covers"}
+                      >
+                        <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
+                        <span className="strip-phase-name">{row.phase}</span>
+                        <span className="strip-phase-chevron" aria-hidden="true">
+                          {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                        </span>
+                      </button>
+                    ) : (
+                      // Nothing to open, so nothing that looks openable: a phase
+                      // with no prose gets no control rather than a dead one.
+                      <span className="strip-phase-line is-plain">
+                        <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
+                        <span className="strip-phase-name">{row.phase}</span>
                       </span>
-                    </button>
-                  ) : (
-                    // Nothing to open, so nothing that looks openable: a phase
-                    // with no prose gets no control rather than a dead one.
-                    <span className="strip-phase-line is-plain">
-                      <span className={`strip-mark is-${row.status}`}>{STATUS_MARK[row.status]}</span>
-                      <span className="strip-phase-name">{row.phase}</span>
-                    </span>
-                  )}
-                  {open && detail && <Prose className="strip-detail" text={detail} />}
-                </li>
-              );
-            })}
-          </ol>
+                    )}
+                    {open && detail && <Prose className="strip-detail" text={detail} />}
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
         )}
       </div>
     </section>

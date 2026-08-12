@@ -194,10 +194,10 @@ loop {
 1. 图表数据绑定（`show` 第二阶段，`{"$file": "pnl.csv"}`）——**计划已写，未实现**，执行细节与"可能不做"的前提检查见 `crates/tcode-app/DATA-BINDING.md`。
 2. gpt订阅有图片生成模型吗
 3. acp支持
-12. app plan模式execute in new session应该支持切换模型,现在直接就是原模型执行
-22. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
-24. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
-26. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
-28. app prompt框上方的plan栏，展开后，再展开background，没法滚动，在长background的时候展开后看不全，也没法看phase了。
-33. Tool friction — agent(explore)：我要求复审“当前 working-tree diff”，但只读 agent 没有 git/diff 能力，也未在工具描述中说明这一限制，因此改为扫描完整文件树，使用了 44 次工具调用和约 225 万输入 token，并且阶段性报告与最终报告的关注点不一致。最小改进是让只读 agent 可读取 git diff，或在派发时自动附带当前 patch；至少应在 agent 能力描述中明确其无法查看 working-tree diff。
-34. app, ai关闭页面后,浏览器preview如果是对于abound:blank就别显示了吧, 这个属于无效信息.
+4. 图片查看器为啥用白色背景，一般不都是淡黑色还什么的吗，而且图片至少也要居中吧， 然后还支持放大和缩小，类似放大镜的那种icon，方向键左右可以换图片，这种有现成的库吗。
+5. Tool friction — shell 自托管构建隔离：当前 harness 正在使用仓库的 target/debug/tcode.exe，导致 cargo test --workspace 无法替换该文件；为保留会话和构建产物，只能切换目标目录并重新编译整个 workspace，额外耗时约 69 秒。若 harness 从仓库 target 外的副本启动，或自动保留独立的 harness target，正常 workspace 验证即可复用现有缓存
+6. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
+7. Tool friction — agent(explore)：我要求复审“当前 working-tree diff”，但只读 agent 没有 git/diff 能力，也未在工具描述中说明这一限制，因此改为扫描完整文件树，使用了 44 次工具调用和约 225 万输入 token，并且阶段性报告与最终报告的关注点不一致。最小改进是让只读 agent 可读取 git diff，或在派发时自动附带当前 patch；至少应在 agent 能力描述中明确其无法查看 working-tree diff。
+9. bash：为验证精确的“无当前 tab、pane 未显示”Electron 生命周期，我运行了最小隔离探针与扩展回归，两次都只有整体命令超时、没有阶段性输出或后台日志路径。随后只能手工给 fixture 插入 console.error 并反复执行，仍无法得到是哪一个 native lifecycle 操作卡住的可靠证据。若 bash 对超时命令能自动保留并返回 stdout/stderr 增量与子进程树/日志路径，会直接减少这类 GUI/Electron 排查的额外编辑与运行轮次。
+    bash：真实 Electron 回归在 fixture cleanup 抛出未处理 rejection 后不退出，前台 bash 超时只报告“command timed out”，不保留阶段性 stdout/stderr。为判断产品截图是否已通过，只能改用后台任务、写入临时阶段日志、再读取后台日志。若超时结果能直接附带截至超时的 stdout/stderr 尾部和仍存活子进程摘要，这几轮诊断编辑与重跑可以避免。
+11. terminal好像不能显示一些常见图标?
