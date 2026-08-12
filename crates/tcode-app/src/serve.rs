@@ -50,10 +50,14 @@ use std::sync::{Arc, Mutex};
 use bytes::Bytes;
 use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Empty};
 use hyper::body::Incoming;
-use hyper::header::{HeaderValue, CACHE_CONTROL, CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST};
+use hyper::header::{
+    HeaderValue, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_EXPOSE_HEADERS, CACHE_CONTROL,
+    CONTENT_SECURITY_POLICY, CONTENT_TYPE, HOST,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode, Uri};
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::TokioIo;
 use percent_encoding::{percent_decode_str, utf8_percent_encode, AsciiSet, CONTROLS};
 use tokio::net::TcpListener;
@@ -249,6 +253,12 @@ async fn route(
         return Err(StatusCode::NOT_FOUND);
     }
 
+    if request.method() == Method::OPTIONS {
+        let mut response = Response::new(empty());
+        served_file_headers(response.headers_mut());
+        return Ok(response);
+    }
+
     let mut parts = request.uri().clone().into_parts();
     parts.path_and_query = Some(
         format!("/{rest}")
@@ -274,10 +284,7 @@ async fn route(
     // A report is looked at again after the script that wrote it is re-run, and
     // the reload button in `Shown.tsx` is the whole affordance for that. A
     // cached response would make it a button that does nothing.
-    head.headers
-        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    head.headers
-        .insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(POLICY));
+    served_file_headers(&mut head.headers);
     if let Some(typed) = utf8(head.headers.get(CONTENT_TYPE)) {
         head.headers.insert(CONTENT_TYPE, typed);
     }
@@ -286,6 +293,27 @@ async fn route(
         head,
         body.map_err(std::io::Error::other).boxed_unsync(),
     ))
+}
+
+fn served_file_headers(headers: &mut hyper::HeaderMap) {
+    headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(CONTENT_SECURITY_POLICY, HeaderValue::from_static(POLICY));
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_ORIGIN,
+        HeaderValue::from_static("app://tcode"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, HEAD, OPTIONS"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static("Range"),
+    );
+    headers.insert(
+        ACCESS_CONTROL_EXPOSE_HEADERS,
+        HeaderValue::from_static("Accept-Ranges, Content-Length, Content-Range"),
+    );
 }
 
 /// Textual types get an explicit `charset=utf-8`.
@@ -339,6 +367,19 @@ mod tests {
         let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
         let headers = response.headers().clone();
         (status, response.bytes().await.unwrap().to_vec(), headers)
+    }
+
+    async fn options(url: &str) -> (StatusCode, hyper::HeaderMap) {
+        let response = reqwest::Client::new()
+            .request(reqwest::Method::OPTIONS, url)
+            .header("origin", "app://tcode")
+            .header("access-control-request-method", "GET")
+            .header("access-control-request-headers", "range")
+            .send()
+            .await
+            .unwrap();
+        let status = StatusCode::from_u16(response.status().as_u16()).unwrap();
+        (status, response.headers().clone())
     }
 
     #[tokio::test]
@@ -426,6 +467,25 @@ mod tests {
             .unwrap();
         assert_eq!(response.status().as_u16(), 206);
         assert_eq!(response.bytes().await.unwrap().to_vec(), b"2345");
+    }
+
+    #[tokio::test]
+    async fn a_range_preflight_is_allowed_for_pdf_js() {
+        let (serve, dir) = started().await;
+        std::fs::write(dir.path().join("paper.pdf"), b"%PDF fixture").unwrap();
+        let url = serve
+            .url(&dir.path().join("paper.pdf"), dir.path())
+            .unwrap();
+
+        let (status, headers) = options(&url).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers[ACCESS_CONTROL_ALLOW_ORIGIN], "app://tcode");
+        assert_eq!(headers[ACCESS_CONTROL_ALLOW_METHODS], "GET, HEAD, OPTIONS");
+        assert_eq!(headers[ACCESS_CONTROL_ALLOW_HEADERS], "Range");
+        assert_eq!(
+            headers[ACCESS_CONTROL_EXPOSE_HEADERS],
+            "Accept-Ranges, Content-Length, Content-Range"
+        );
     }
 
     /// The shape a generated report actually has, request by request.

@@ -38,6 +38,8 @@ export type Shown =
   /** Delimited rows, drawn as a table with a bounded number of them on screen. */
   | { as: "table"; separator: string }
   | { as: "image" }
+  /** A PDF paper, rendered by PaperView so selection can feed the composer. */
+  | { as: "paper" }
   /** Prose, through the same restricted markdown renderer the transcript uses. */
   | { as: "doc" }
   | { as: "text" };
@@ -58,9 +60,9 @@ type View = {
   ext: string[];
   load?: Load;
   /** The live workspace has a different route from an artifact viewer: images
-   * stay render-only, Markdown has preview/edit modes, and every other UTF-8
-   * file opens as source in the editor. */
-  workspace?: "image" | "markdown";
+   * stay render-only, Markdown has preview/edit modes, PDF opens as a paper
+   * inspect object, and every other UTF-8 file opens as source in the editor. */
+  workspace?: "image" | "markdown" | "paper";
   /**
    * A constant, except where the extension genuinely does not settle it. `.json`
    * is a container, not a kind of thing: an echarts option and a config file
@@ -82,6 +84,7 @@ const VIEWS: View[] = [
     workspace: "image",
     as: { as: "image" },
   },
+  { ext: ["pdf"], load: "served", workspace: "paper", as: { as: "paper" } },
   { ext: ["md", "markdown"], workspace: "markdown", as: { as: "doc" } },
   {
     ext: ["json"],
@@ -108,11 +111,14 @@ export function loadOf(path: string): Load {
 
 /** The live workspace route is deliberately distinct from `loadOf`: an HTML
  * artifact is served as an isolated document, while that same path selected
- * from the workspace tree is editable UTF-8 source. Image and Markdown facts
+ * from the workspace tree is editable UTF-8 source. PDF is the opposite shape:
+ * it is served in both cases, but the workspace opens a session-scoped paper
+ * surface rather than the generic artifact viewer. Image and Markdown facts
  * still come from the shared registry rather than a component-local suffix
  * list. */
 export type WorkspaceRoute =
   | { load: "bytes"; as: "image" }
+  | { load: "served"; as: "paper" }
   | { load: "text"; as: "markdown" | "editor" };
 
 export function workspaceRouteOf(path: string): WorkspaceRoute {
@@ -121,6 +127,8 @@ export function workspaceRouteOf(path: string): WorkspaceRoute {
       return { load: "bytes", as: "image" };
     case "markdown":
       return { load: "text", as: "markdown" };
+    case "paper":
+      return { load: "served", as: "paper" };
     default:
       return { load: "text", as: "editor" };
   }

@@ -2,6 +2,7 @@ import { useMemo } from "react";
 
 import type { Block } from "./blocks";
 import type { SandboxKind } from "./sandbox/protocol";
+import { workspaceRouteOf } from "./show";
 
 /**
  * What an inspect pane is showing.
@@ -32,6 +33,9 @@ export type Inspect =
   /** A workspace file selected from the live tree. Its editor arrives in the
    * next stage; it remains a distinct value from transcript snapshots. */
   | { kind: "workspace-file"; path: string }
+  /** A PDF document opened as a live reading surface tied to this session's
+   * composer, not as editable UTF-8 source and not as the window browser. */
+  | { kind: "paper"; path: string; documentId?: string }
   /** A file as some call saw it. `at` pins a specific call; without it, the
    *  most recent one wins. */
   | { kind: "file"; path: string; at?: string }
@@ -109,6 +113,14 @@ export function navOf(value: Inspect): Nav {
   return { entries: [value], at: 0 };
 }
 
+export function inspectForPath(
+  path: string,
+): Extract<Inspect, { kind: "paper" | "workspace-file" }> {
+  return workspaceRouteOf(path).as === "paper"
+    ? { kind: "paper", path }
+    : { kind: "workspace-file", path };
+}
+
 export function navValue(nav: Nav): Inspect {
   return nav.entries[nav.at] ?? nav.entries[0];
 }
@@ -144,6 +156,8 @@ export function inspectTitle(value: Inspect): string {
     case "workspace-tree":
       return "Workspace";
     case "workspace-file":
+      return basename(value.path);
+    case "paper":
       return basename(value.path);
     case "file":
       return basename(value.path);

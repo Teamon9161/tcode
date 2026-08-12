@@ -254,6 +254,45 @@ const SHOWN: Record<string, string> = {
   ].join("\n"),
 };
 
+const PDF_FIXTURE = makePdf([
+  "Paper Mode MVP",
+  "Select text on this page, then use Translate, Explain, or Ask.",
+  "The prompt lands in the existing composer draft.",
+]);
+
+function makePdf(lines: string[]): string {
+  const stream = [
+    "BT",
+    "/F1 18 Tf",
+    "72 740 Td",
+    "24 TL",
+    ...lines.map((line, index) => `${index === 0 ? "" : "T* "}(${pdfString(line)}) Tj`),
+    "ET",
+  ].join("\n");
+  const objects = [
+    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
+    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
+    "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    `5 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`,
+  ];
+  let body = "%PDF-1.4\n";
+  const offsets = [0];
+  for (const object of objects) {
+    offsets.push(body.length);
+    body += object;
+  }
+  const xref = body.length;
+  body += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+  body += offsets.slice(1).map((offset) => `${String(offset).padStart(10, "0")} 00000 n \n`).join("");
+  body += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF\n`;
+  return body;
+}
+
+function pdfString(value: string): string {
+  return value.replace(/[\\()]/g, (char) => `\\${char}`);
+}
+
 /**
  * A URL a frame can really load, standing in for the loopback origin.
  *
@@ -270,10 +309,12 @@ const SERVED = new Map<string, string>();
 function servedUrl(path: string): string {
   const existing = SERVED.get(path);
   if (existing) return existing;
-  const body =
-    SHOWN[path.slice(path.lastIndexOf(".") + 1)] ??
-    "<p>no fixture for this file</p>";
-  const url = URL.createObjectURL(new Blob([body], { type: "text/html" }));
+  const extension = path.slice(path.lastIndexOf(".") + 1);
+  const body = extension === "pdf"
+    ? PDF_FIXTURE
+    : SHOWN[extension] ?? "<p>no fixture for this file</p>";
+  const type = extension === "pdf" ? "application/pdf" : "text/html";
+  const url = URL.createObjectURL(new Blob([body], { type }));
   SERVED.set(path, url);
   return url;
 }
@@ -422,6 +463,7 @@ function fixtureWorkspaces(): Record<string, WorkspaceFixture> {
           "</html>",
         ].join("\n"),
       },
+      "docs/fixture-paper.pdf": { kind: "file", revision: 1 },
       fixtures: { kind: "directory", revision: 1 },
       "fixtures/truncated.log": {
         kind: "file",

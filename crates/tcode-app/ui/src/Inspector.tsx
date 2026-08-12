@@ -4,7 +4,7 @@ import { findRun, findToolCall, reportOf, runSteps, type Block } from "./blocks"
 import { Diff } from "./components/Diff";
 import { Code } from "./components/Code";
 import { languageOf } from "./diff";
-import { useFileHistory, type Inspect } from "./inspect";
+import { useFileHistory, inspectForPath, type Inspect } from "./inspect";
 import { relativeTo, type TouchedFile } from "./files";
 import { FilesView } from "./FilePanel";
 import { WorkspaceFiles } from "./WorkspaceFiles";
@@ -15,6 +15,7 @@ import { ShownView } from "./Shown";
 import { agentKind, BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
 import { PlanEditor } from "./PlanEditor";
+import { PaperView } from "./PaperView";
 import { useSession } from "./session";
 import { draftOf, type Plan, type PlanDraft } from "./plan";
 
@@ -51,6 +52,7 @@ export const InspectView = memo(function InspectView({
   onOpen,
   onOpenAside,
   onMention,
+  onPaperPrompt,
   onPlanDraft,
   onSavePlan,
 }: {
@@ -63,6 +65,7 @@ export const InspectView = memo(function InspectView({
   onOpen: (next: Inspect) => void;
   onOpenAside: (next: Inspect) => void;
   onMention: (path: string) => void;
+  onPaperPrompt: (prompt: string) => void;
   onPlanDraft: (draft: PlanDraft) => void;
   onSavePlan: () => void;
 }) {
@@ -76,13 +79,15 @@ export const InspectView = memo(function InspectView({
         <WorkspaceFiles
           key={cwd}
           cwd={cwd}
-          onOpenFile={(path) => onOpen({ kind: "workspace-file", path })}
-          onOpenAside={(path) => onOpenAside({ kind: "workspace-file", path })}
+          onOpenFile={(path) => onOpen(inspectForPath(path))}
+          onOpenAside={(path) => onOpenAside(inspectForPath(path))}
           onMention={onMention}
         />
       );
     case "workspace-file":
       return <WorkspaceFile key={`${session}:${cwd}:${value.path}`} path={value.path} />;
+    case "paper":
+      return <PaperView key={`${session}:${cwd}:${value.path}`} path={value.path} onPrompt={onPaperPrompt} />;
     case "file":
       return <FileView value={value} blocks={blocks} cwd={cwd} onOpen={onOpen} />;
     case "diff":

@@ -255,6 +255,17 @@ export function Workspace({
     [onDraft],
   );
 
+  const appendPaperPrompt = useCallback(
+    (session: string, prompt: string) => {
+      const draft = latestStateOf.current(session).draft;
+      onDraft(
+        session,
+        draft.trim() ? `${draft.replace(/\s+$/, "")}\n\n${prompt}` : prompt,
+      );
+    },
+    [onDraft],
+  );
+
   // Esc closes the pane you are looking into, before it reaches the composer's
   // interrupt. A conversation pane ignores it: Esc must never be the key that
   // removes the thing you are typing into.
@@ -563,6 +574,7 @@ export function Workspace({
       onOpen: open,
       onOpenAside: openBeside,
       onMention: mention,
+      onPaperPrompt: appendPaperPrompt,
       onNavigate: goTo,
       onToggleFiles: toggleFiles,
       onToggleWorkspace: toggleWorkspace,
@@ -605,6 +617,7 @@ export function Workspace({
       open,
       openBeside,
       mention,
+      appendPaperPrompt,
       goTo,
       toggleFiles,
       toggleWorkspace,

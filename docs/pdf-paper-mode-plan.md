@@ -720,80 +720,149 @@ PDF 工作区可以有局部面板，但它们不承担聊天职责：
 
 ## 12. MVP 范围
 
-第一版只做最能改变论文阅读体验的部分。
+第一版要刻意做小：先验证 Paper Mode 是否能作为 tcode 现有 inspect/workspace/composer 体系里的一个文档上下文能力跑通，而不是一开始就实现完整论文知识库。
 
-### 必做
+### MVP 0.1 必做
 
-1. 打开本地 PDF。
-2. PDF.js 页面渲染、翻页、缩放。
-3. 用户选择文字。
-4. 选区动作：翻译、解释、提问，并接入 tcode 现有聊天框。
-5. 高亮保存和恢复。
-6. Paper Context Bridge：把当前页、选区、标注和框选区域注册为聊天可引用上下文。
-7. PyMuPDF 后端提取每页文本和 bbox。
-8. SQLite 保存 document、page、annotation、conversation、message。
-9. 当前页重点总结。
+1. `.pdf` 从 workspace tree 打开为 session-scoped inspect object：`{ kind: "paper", path }`。
+2. 不走 `workspace-file` editor，不走 `WebPane`，不使用 Chromium 内置 PDF viewer 作为核心。
+3. React inspect pane 内用 PDF.js 渲染 PDF。
+4. PDF bytes 复用现有 `serve_url` / `serve.rs` 安全 loopback origin；必要时只补最窄的 CORS/CSP 支持。
+5. 支持最基本的页码、上一页/下一页、缩放和加载/错误状态。
+6. 用户选择文字后出现轻量动作菜单：Translate、Explain、Ask。
+7. 选区动作只把可编辑 prompt 写入当前 session 的现有 composer draft，不自动发送，不新增 AI 侧栏。
+8. prompt 中包含文件名、页码和选区原文，作为用户引用的上下文。
+9. 增加 preview scene 和前端测试，确保 PDF 不再按普通文本文件打开。
 
-### 暂不做
+### MVP 0.1 暂不做
 
-1. PDF 原文覆盖式全文翻译。
-2. 多人协作。
-3. 写回原 PDF 文件。
-4. 复杂表格抽取。
-5. 扫描版 OCR。
-6. 跨论文知识库。
-7. 移动端适配。
+1. 高亮保存和恢复。
+2. PyMuPDF 后端提取每页文本和 bbox。
+3. SQLite document/page/block/chunk 存储。
+4. 独立 conversation/message 表。
+5. 结构化 `paper context blocks` 进入 `send_message`。
+6. 当前页重点总结。
+7. Paper Map。
+8. 图表框选提问。
+9. embeddings / RAG / 跨页问答。
+10. OCR 和扫描版 PDF。
+11. PDF 原文覆盖式全文翻译。
+12. 多人协作。
+13. 写回原 PDF 文件。
+14. 移动端适配。
+
+### MVP 之后的顺序
+
+1. **MVP 0.2：高亮和恢复**，只存 `pageNumber + pdfRects + selectedText + color`，不复制聊天历史。
+2. **MVP 0.3：结构化聊天上下文**，让 `send_message` 接收 typed paper context，而不是把所有上下文编码进自然语言 draft。
+3. **MVP 0.4：后端页面文本和 bbox**，再引入 PyMuPDF 或 Rust/Python helper，建立 document/page/block 的持久结构。
+4. **MVP 0.5：当前页总结和引用跳转**，在有可靠 page text 后再生成页级摘要和可点击 citation。
+5. **后续增强：Paper Map、图表框选、RAG、OCR、跨论文知识库。**
 
 ## 13. 实施阶段
 
-### Phase 1：可控打开和基础 viewer
+本节的阶段顺序以 **MVP 0.1 先跑通产品闭环** 为准。后端解析、标注持久化和检索都重要，但它们不应该挡在第一版 viewer 和 composer bridge 前面。
 
-目标：替代浏览器内置 PDF viewer，拥有可控的 PDF.js viewer。
+### Phase 1：PDF inspect 路由
+
+目标：PDF 成为 tcode workspace/inspect 体系里的文档检视对象，而不是普通文本文件、WebPane 页面或独立插件。
 
 任务：
 
-- 建立 Paper Mode 前端页面。
-- 接入 PDF.js。
-- 支持本地 PDF 安全加载。
-- 支持页码、缩放、滚动和搜索。
-- 提供 document id 和 page number 状态。
+- 在 `Inspect` union 中新增 `{ kind: "paper"; path: string; documentId?: string }`。
+- 在 `show.ts` 的扩展名事实表里登记 `.pdf`。
+- workspace tree 点开 `.pdf` 时打开 `paper` inspect，而不是 `workspace-file` editor。
+- 如果 `show` 工具显示 PDF，也进入 `paper` inspect，而不是默认 text/shown 路线。
 
 验收：
 
-- 能打开本地 PDF。
-- PDF 渲染稳定。
-- 切换缩放后页面正常。
-- 能知道当前页。
+- 从 workspace tree 打开 PDF 时，pane header 显示 PDF 文件名。
+- PDF 不再进入 CodeMirror 或 UTF-8 text loader。
+- 不新增 pane kind，不新增 tab strip，不使用 WebPane。
 
-### Phase 2：文本选择和坐标绑定
+### Phase 2：PDF.js viewer MVP
 
-目标：用户选中文字后，系统能知道选中了哪段文本和它在 PDF 中的位置。
+目标：在 React inspect pane 内可控渲染 PDF。
 
 任务：
 
-- 启用 PDF.js text layer。
-- 捕获 selection。
-- 计算 selection rects。
-- 将 screen rects 转换为 PDF 坐标。
-- 建立 selected text、page number、pdfRects 的数据结构。
+- 新增 `PaperView` 组件。
+- 通过现有 `serve_url` 获取安全 loopback URL。
+- 引入 `pdfjs-dist`，使用本地 worker，不依赖 CDN。
+- 渲染页面 canvas 和 text layer。
+- 支持加载状态、错误状态、上一页/下一页、页码和缩放。
+- 验证 PDF.js fetch 是否需要 `serve.rs` 增加受限 CORS/CSP header；若需要，只补 PDF.js fetch 的最小支持。
 
 验收：
 
-- 用户选择一句话后，PDF 面板能产生准确的 PaperContextEvent，聊天框能引用该原文。
-- 缩放后同一高亮位置仍能正确重绘。
-- 跨行 selection 能保存多个 rect。
+- 本地 workspace 内 PDF 可显示第一页。
+- 翻页和缩放可用。
+- URL 仍受 session workspace boundary 保护。
+- PDF.js worker 在打包产物中本地加载。
 
-### Phase 3：后端 PDF 解析
+### Phase 3：选区写入现有 composer
 
-目标：后端能提取每页文本、文本块和 bbox，为 AI 上下文提供可靠来源。
+目标：选区翻译、解释和提问走 tcode 现有聊天框，而不是新增 AI 侧栏或自动创建第二套会话。
 
 任务：
 
-- 引入 PyMuPDF。
-- 建立 import document pipeline。
+- 捕获 PDF text layer selection。
+- 记录当前 page number 和 selected text；PDF rect 坐标可以先只作为后续接口保留，不要求 MVP 0.1 持久化。
+- 显示轻量 selection menu：Translate、Explain、Ask。
+- 点击动作后，把可编辑 prompt 写入当前 session composer draft。
+- prompt 明确包含文件名、页码和选区原文。
+- 不自动发送；用户仍然通过现有 composer 修改并回车。
+
+验收：
+
+- 用户选择文字后可一键生成“翻译这段 / 解释这段 / 问这段”的 draft。
+- draft 出现在打开该 paper pane 的同一个 session composer 中。
+- transcript 中没有第二套聊天历史，UI 上没有新的 AI 侧栏。
+
+### Phase 4：高亮和恢复
+
+目标：把阅读动作沉淀为可恢复的文档标注，但仍不复制聊天历史。
+
+任务：
+
+- 实现 highlight annotation layer。
+- 存储 `documentId/path/hash`、`pageNumber`、`pdfRects`、`selectedText`、`color`。
+- 重新打开 PDF 时恢复高亮。
+- 后续再补 `TextQuoteSelector` 与轻微版本变化恢复。
+
+验收：
+
+- 高亮刷新后仍存在。
+- 缩放后高亮位置正确。
+- 数据模型没有独立 message 表。
+
+### Phase 5：结构化 paper context
+
+目标：把自然语言 draft 中的引用升级成 typed context，减少 prompt 字符串约定。
+
+任务：
+
+- 定义 `PaperContextEvent` / typed context block。
+- 扩展 `send_message` 的输入，让前端提交用户文本和 paper context blocks。
+- 后端把这些 block 作为用户引用的文档上下文组装给模型，不伪装成 harness/system 指令。
+- 聊天回答可以记录 citation metadata，后续点击跳回 PDF。
+
+验收：
+
+- 模型看到结构化的文件、页码、选区和原文。
+- 用户仍只使用现有 composer 和 transcript。
+- 前端不能借此写入 harness 指令正文。
+
+### Phase 6：后端页面文本和 bbox
+
+目标：为页级总结、附近上下文和后续图表/检索提供可靠文本来源。
+
+任务：
+
+- 引入 PyMuPDF 或 Rust/Python helper。
+- 建立 document/page/block 的持久结构。
 - 提取 page text、text blocks、bbox、page size。
-- 写入 SQLite。
-- 提供按 page、block、rect 查询文本的 API。
+- 提供按 page 和 rect 查询附近文本块的 API。
 
 验收：
 
@@ -801,53 +870,17 @@ PDF 工作区可以有局部面板，但它们不承担聊天职责：
 - 能根据 page 和 rect 找到附近文本块。
 - 双栏论文的基本 reading order 可用。
 
-### Phase 4：聊天上下文桥接 MVP
+### Phase 7：当前页重点和 Paper Map
 
-目标：选区翻译、解释和提问通过 tcode 现有聊天框完成，而不是新增一个平行 AI 侧栏。
-
-任务：
-
-- 建立 PaperContextEvent 协议。
-- 实现 Translate、Explain、Ask actions，将选区、页码和 PDF 坐标注入聊天框。
-- 组装选区、前后文、页码和章节上下文。
-- 保存 conversation 和 messages，并记录它们关联的 document、page、annotation。
-- 回答中带 page citation，点击引用可以跳回 PDF 页面。
-
-验收：
-
-- 选中文字后可一键把“翻译这段”发送到现有聊天框。
-- 可以在现有聊天框针对选区追问。
-- 问答历史绑定到当前 PDF，但 UI 上不出现第二套聊天系统。
-
-### Phase 5：高亮、划线和笔记
-
-目标：用户能将理解过程沉淀为可恢复的标注。
-
-任务：
-
-- 实现 highlight annotation layer。
-- 实现 underline annotation layer。
-- 存储 pdfRects、selectedText、textAnchor、color、comment。
-- 重新打开 PDF 时恢复标注。
-- 标注点击后打开相关问答和笔记。
-
-验收：
-
-- 高亮在刷新后仍存在。
-- 缩放后高亮位置正确。
-- 点击高亮能看到当时的问题、回答或笔记。
-
-### Phase 6：当前页重点和 Paper Map
-
-目标：从“问选区”扩展到“理解页面和整篇论文”。
+目标：从选区问答扩展到页面和整篇论文的导航理解。
 
 任务：
 
 - 实现当前页重点总结。
-- 提取或生成论文标题、摘要、章节结构。
+- 提取或生成标题、摘要、章节结构。
 - 生成 Paper Map。
 - 从 Paper Map 跳转到 PDF 页面。
-- 将用户高亮和问题纳入 Paper Map。
+- 将用户高亮和问题按章节聚合。
 
 验收：
 
@@ -855,40 +888,23 @@ PDF 工作区可以有局部面板，但它们不承担聊天职责：
 - Paper Map 能帮助快速定位方法、实验、结论、限制。
 - 用户问题和高亮可按章节聚合。
 
-### Phase 7：图表框选提问
+### Phase 8：图表框选、OCR 和全文检索
 
-目标：支持对论文图表和公式区域提问。
+目标：补齐论文阅读里最重的增强能力。
 
 任务：
 
-- 实现区域框选工具。
-- 将框选区域转为 PDF rect。
-- 后端渲染该区域为图片。
-- 提取附近 caption 和正文引用。
+- 实现区域框选工具和 PDF rect 转换。
+- 后端渲染局部图片并提取附近 caption。
 - 将图片和文本上下文发送给多模态模型。
+- 对扫描版 PDF 引入 OCR。
+- 建立 chunking、embeddings 和 top-k 检索。
 
 验收：
 
 - 框选图表后可以问“这张图说明什么”。
-- 回答能结合 caption 和正文解释图表作用。
-
-### Phase 8：检索和跨页问答
-
-目标：支持全文语义问答，而不只回答当前选区。
-
-任务：
-
-- 建立 chunking 策略。
-- 生成 embeddings。
-- 选择向量存储。
-- 实现 top-k 检索。
-- 回答中引用页码和原文片段。
-
-验收：
-
-- 用户能问“这篇论文的核心贡献是什么”。
-- 用户能问“实验结果支持了哪些结论”。
-- 回答带引用，不编造。
+- 全文问题回答带页码和原文引用。
+- 扫描版 PDF 能进入可解释路径，而不是静默失败。
 
 ## 14. 风险和难点
 
@@ -979,50 +995,22 @@ PDF 缩放、旋转、版本变化都可能影响标注位置。
 - 如果目标是 tcode 自用或内部研究工具，选 PDF.js + PyMuPDF。
 - 如果目标是商业协作型 PDF 产品，再评估 Apryse/Nutrient。
 
-## 16. 最小技术原型建议
+## 16. 原型路线说明
 
-可以先做一个独立 prototype，而不是直接塞进 tcode 主流程。
+早期可以用独立 prototype 验证 PDF.js、PyMuPDF 和 SQLite 的组合，但对当前 tcode-app 来说，**不要再从独立 `paper-mode-prototype` 开始实现 MVP 0.1**。
 
-目录草案：
+原因：tcode-app 已经有 pane、inspect、workspace tree、loopback file serving 和唯一 composer。独立 prototype 会重新发明这些边界，尤其容易重新长出第二套 AI 侧栏和第二套聊天历史。
+
+如果未来需要隔离验证某个 PDF 技术点，可以只做 throwaway spike，例如：
 
 ```text
-paper-mode-prototype/
-  frontend/
-    src/
-      PdfViewer.tsx
-      AnnotationLayer.tsx
-      AiSidebar.tsx
-      selection.ts
-      coordinates.ts
-  backend/
-    app.py
-    extract_pdf.py
-    database.py
-    ai.py
-  data/
-    paper_mode.sqlite
+paper-mode-spike/
+  PdfViewer.tsx        # 验证 PDF.js worker、text layer、selection rect
+  extract_pdf.py       # 验证 PyMuPDF bbox 与 reading order
+  notes.md             # 记录结论，成功后迁回 tcode-app
 ```
 
-原型技术栈：
-
-- Frontend：Vite + React + PDF.js。
-- Backend：FastAPI + PyMuPDF + SQLite。
-- API：REST 或 WebSocket。
-
-API 草案：
-
-```http
-POST /documents/import
-GET  /documents/{id}
-GET  /documents/{id}/file
-GET  /documents/{id}/pages/{pageNumber}
-POST /documents/{id}/annotations
-GET  /documents/{id}/annotations
-POST /documents/{id}/ai/translate
-POST /documents/{id}/ai/explain
-POST /documents/{id}/ai/ask
-POST /documents/{id}/ai/page-summary
-```
+这个 spike 不承担产品结构，不包含 `AiSidebar`，也不定义最终 API。真正产品实现仍以第 19 节为准：`Inspect(kind: "paper") + PaperView + serve_url + composer draft bridge`。
 
 ## 17. 推荐优先级
 
@@ -1042,20 +1030,17 @@ POST /documents/{id}/ai/page-summary
 
 ## 18. 最终推荐
 
-建议先走 **PDF.js + PyMuPDF + SQLite + Paper Context Bridge**。
+长期组合仍然是 **PDF.js + PyMuPDF + SQLite + Paper Context Bridge**，但第一版不要一次性实现完整组合。
 
-不要从零写 PDF 渲染器；不要把浏览器内置 PDF viewer 当核心；也暂时不需要商业 SDK。
+MVP 0.1 先实现：
 
-先实现一个能做到以下事情的 MVP：
+- PDF 作为 `{ kind: "paper" }` inspect object 打开。
+- React pane 内用 PDF.js 渲染本地 PDF。
+- PDF bytes 复用 `serve_url` / `serve.rs`。
+- 用户选中文字后，一键把翻译、解释或提问 prompt 写入现有 composer draft。
+- 不新增第二套聊天，不自动发送，不先做 PyMuPDF、SQLite 文档库、高亮恢复、当前页总结或 RAG。
 
-- 打开本地 PDF。
-- 选中文字。
-- 一键翻译和解释。
-- 对选区追问。
-- 保存高亮。
-- 当前页重点。
-
-这会立刻覆盖论文阅读中最常见、最有价值的场景，并且为后续图表提问、Paper Map、全文检索和跨论文知识库打好基础。
+这样能最快验证 Paper Mode 的产品边界和技术底座。等 viewer、selection 和 composer bridge 跑通后，再依次加入高亮恢复、typed paper context、后端 page text/bbox、当前页总结、Paper Map、图表框选和全文检索。
 
 
 ## 19. 结合 tcode-app 现状后的修正版接入方案

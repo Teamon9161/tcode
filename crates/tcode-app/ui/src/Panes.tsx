@@ -118,6 +118,10 @@ export type PaneContext = {
    *  does. It writes a draft rather than sending, because naming a file is the
    *  start of a sentence somebody is still writing. */
   onMention: (session: string, path: string) => void;
+  /** Put a prompt produced inside a paper pane into this conversation's composer.
+   *  It is still a draft: translation/explanation are suggested next words, not
+   *  a hidden send. */
+  onPaperPrompt: (session: string, prompt: string) => void;
   onNavigate: (pane: string, step: typeof navBack) => void;
   onToggleFiles: (pane: string, session: string) => void;
   onToggleWorkspace: (pane: string, session: string) => void;
@@ -1057,7 +1061,7 @@ function InspectPane({
   // a whole file run through a grammar, and it is memoized so that typing in
   // the pane beside it does not tokenise the file again.
   const held = pane?.session ?? "";
-  const { onOpen, onOpenAside, onMention, onPlanDraft, onSavePlan } = context;
+  const { onOpen, onOpenAside, onMention, onPaperPrompt, onPlanDraft, onSavePlan } = context;
   const openHere = useCallback(
     (next: Inspect) => onOpen(leaf.id, held, next),
     [onOpen, leaf.id, held],
@@ -1069,6 +1073,10 @@ function InspectPane({
   const mention = useCallback(
     (path: string) => onMention(held, path),
     [onMention, held],
+  );
+  const paperPrompt = useCallback(
+    (prompt: string) => onPaperPrompt(held, prompt),
+    [onPaperPrompt, held],
   );
   const changeDraft = useCallback(
     (next: PlanDraft) => onPlanDraft(held, next),
@@ -1133,7 +1141,9 @@ function InspectPane({
         </div>
         <span
           className="pane-name"
-          title={value.kind === "workspace-file" ? value.path : undefined}
+          title={
+            value.kind === "workspace-file" || value.kind === "paper" ? value.path : undefined
+          }
         >
           {activeFileControls?.dirty && (
             <span
@@ -1192,7 +1202,11 @@ function InspectPane({
 
       <div
         className={`pane-body is-inspect${
-          value.kind === "workspace-file" ? " is-workspace-file" : ""
+          value.kind === "workspace-file"
+            ? " is-workspace-file"
+            : value.kind === "paper"
+              ? " is-paper"
+              : ""
         }`}
       >
         <WorkspaceFileControlsContext.Provider value={registerFileControls}>
@@ -1206,6 +1220,7 @@ function InspectPane({
             onOpen={openHere}
             onOpenAside={openAside}
             onMention={mention}
+            onPaperPrompt={paperPrompt}
             onPlanDraft={changeDraft}
             onSavePlan={save}
           />

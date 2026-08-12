@@ -13,6 +13,35 @@ const mocks = vi.hoisted(() => {
   return { invoke: vi.fn(), listen: vi.fn().mockResolvedValue(() => {}) };
 });
 vi.mock("@ipc", () => ({ invoke: mocks.invoke, listen: mocks.listen }));
+vi.mock("pdfjs-dist", () => ({
+  GlobalWorkerOptions: {},
+  TextLayer: class {
+    container: HTMLElement;
+
+    constructor({ container }: { container: HTMLElement }) {
+      this.container = container;
+    }
+
+    render = vi.fn().mockImplementation(() => {
+      this.container.textContent = "Paper selection";
+      return Promise.resolve();
+    });
+    cancel = vi.fn();
+  },
+  getDocument: vi.fn(() => ({
+    destroy: vi.fn(),
+    promise: Promise.resolve({
+      numPages: 1,
+      cleanup: vi.fn().mockResolvedValue(undefined),
+      getPage: vi.fn().mockResolvedValue({
+        getViewport: vi.fn(() => ({ width: 600, height: 800 })),
+        render: vi.fn(() => ({ cancel: vi.fn(), promise: Promise.resolve() })),
+        streamTextContent: vi.fn(),
+      }),
+    }),
+  })),
+}));
+vi.mock("pdfjs-dist/build/pdf.worker.mjs?url", () => ({ default: "pdf.worker.mjs" }));
 
 import { navOf, type Inspect } from "./inspect";
 import type { Tiling } from "./layout";
@@ -60,6 +89,7 @@ function paneContext(focus = "inspect-pane"): PaneContext {
     onOpen: none,
     onOpenAside: none,
     onMention: none,
+    onPaperPrompt: none,
     onNavigate: none,
     onToggleFiles: none,
     onToggleWorkspace: none,
@@ -164,6 +194,58 @@ describe("conversation pane folder switcher", () => {
     expect(chip.textContent).toBe("project");
     expect(chip.title).toBe("/project");
     expect(chip.getAttribute("aria-label")).toBe("Switch directory for project: /project");
+  });
+});
+
+describe("paper pane", () => {
+  it("names the PDF and keeps workspace file controls away", async () => {
+    mocks.invoke.mockResolvedValue("http://127.0.0.1:1000/token/paper.pdf");
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const name = container.querySelector<HTMLElement>(".pane-name")!;
+    expect(name.textContent).toBe("paper.pdf");
+    expect(name.title).toBe("docs/paper.pdf");
+    expect(container.querySelector(".pane-body.is-paper")).not.toBeNull();
+    expect(container.querySelector('[aria-label="Read this file again"]')).toBeNull();
+    expect(mocks.invoke).toHaveBeenCalledWith("serve_url", { session: "s", path: "docs/paper.pdf" });
+  });
+
+  it("turns selected PDF text into a composer draft action", async () => {
+    const onPaperPrompt = vi.fn();
+    context = { ...context, onPaperPrompt };
+    mocks.invoke.mockResolvedValue("http://127.0.0.1:1000/token/paper.pdf");
+    await draw({ kind: "paper", path: "docs/paper.pdf" }, context);
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    layer.textContent = "Paper selection";
+    const textNode = layer.firstChild!;
+    const selectionSpy = vi.spyOn(window, "getSelection").mockReturnValue({
+      rangeCount: 1,
+      isCollapsed: false,
+      anchorNode: textNode,
+      focusNode: textNode,
+      toString: () => "Paper selection",
+      getRangeAt: () => ({
+        getClientRects: () => [{ left: 120, top: 160, width: 180, height: 24 }],
+      }),
+      removeAllRanges: vi.fn(),
+    } as unknown as Selection);
+
+    const stage = container.querySelector<HTMLElement>(".paper-stage")!;
+    await act(async () => {
+      stage.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".paper-selection-menu .chip:nth-child(2)")!.click();
+      await Promise.resolve();
+    });
+    selectionSpy.mockRestore();
+
+    expect(onPaperPrompt).toHaveBeenCalledWith(
+      "s",
+      'Explain the selected text from @paper("paper.pdf", page 1):\n\nPaper selection',
+    );
   });
 });
 

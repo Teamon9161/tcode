@@ -70,6 +70,9 @@ describe("what a shown file is drawn as", () => {
     expect(workspaceRouteOf("out/report.html")).toEqual({ load: "text", as: "editor" });
 
     expect(workspaceRouteOf("README.md")).toEqual({ load: "text", as: "markdown" });
+    expect(workspaceRouteOf("paper.pdf")).toEqual({ load: "served", as: "paper" });
+    expect(isServed("paper.pdf")).toBe(true);
+    expect(shownAs("paper.pdf", "")).toEqual({ as: "paper" });
     expect(workspaceRouteOf("plot.png")).toEqual({ load: "bytes", as: "image" });
     for (const path of ["plot.svg", "flow.mmd", "data.csv", "data.tsv", "chart.json", "main.rs"]) {
       expect(workspaceRouteOf(path)).toEqual({ load: "text", as: "editor" });

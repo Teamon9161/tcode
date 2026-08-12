@@ -885,6 +885,7 @@ const SCENES = [
   "workspace-image",
   "workspace-edge",
   "workspace-expanded",
+  "paper",
   "approval",
   "command",
   "question",
@@ -1033,6 +1034,16 @@ function workspaceExpanded(): Tiling {
   });
 }
 
+/** The Paper Mode MVP surface: a PDF owns the inspect pane and selection actions
+ * write prompts into the existing composer instead of opening a second chat. */
+function paper(): Tiling {
+  const one = solo();
+  return openInspect(one, panes(one)[0].id, "a", {
+    kind: "paper",
+    path: "docs/fixture-paper.pdf",
+  });
+}
+
 /**
  * A conversation beside the window's browser.
  *
@@ -1075,6 +1086,7 @@ function layoutFor(scene: Scene): Tiling {
   if (scene === "workspace-image") return workspaceImage();
   if (scene === "workspace-edge") return workspaceEdge();
   if (scene === "workspace-expanded") return workspaceExpanded();
+  if (scene === "paper") return paper();
   return solo();
 }
 

@@ -113,6 +113,7 @@ function paneContext(sessions: SessionInfo[] = []): PaneContext {
     onOpen: none,
     onOpenAside: none,
     onMention: none,
+    onPaperPrompt: none,
     onNavigate: none,
     onToggleFiles: none,
     onToggleWorkspace: none,

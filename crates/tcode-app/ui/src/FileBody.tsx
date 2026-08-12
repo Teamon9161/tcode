@@ -47,6 +47,8 @@ export function FileBody({
       return <Sandbox kind={view.sandbox} source={body} label={label} />;
     case "framed":
       return <Framed path={path} label={label} revision={revision} inline={inline} />;
+    case "paper":
+      return <p className="inspect-empty">open this PDF in a pane to read it</p>;
     case "image":
       // `body` is a `data:` URL built by the backend, which is why this needs no
       // asset protocol and no `same-origin` anywhere near it.

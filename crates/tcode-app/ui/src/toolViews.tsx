@@ -3,7 +3,7 @@ import { createContext, useContext, type ReactNode } from "react";
 import type { ToolResult } from "./blocks";
 import { Diff } from "./components/Diff";
 import { isEditShape } from "./diff";
-import type { Inspect } from "./inspect";
+import { inspectForPath, type Inspect } from "./inspect";
 import { planBody } from "./plan";
 import { Prose } from "./Prose";
 import { basename } from "./show";
@@ -157,24 +157,28 @@ const pattern: ToolView = {
 const showing: ToolView = {
   body: (input) => {
     const value = shownValue(input);
-    return value ? <ShownView value={value} inline /> : null;
+    if (!value || value.kind === "paper") return null;
+    return <ShownView value={value} inline />;
   },
   inspect: (input) => shownValue(input),
   summary: (input) => targetPath(input),
   preferInputSummary: true,
 };
 
-function shownValue(input: unknown): Extract<Inspect, { kind: "shown" }> | null {
+function shownValue(input: unknown): Extract<Inspect, { kind: "shown" | "paper" }> | null {
   const path = targetPath(input);
   if (!path) return null;
   const label =
     typeof input === "object" && input !== null
       ? (input as Record<string, unknown>).label
       : null;
+  const named = typeof label === "string" && label.trim() ? label.trim() : basename(path);
+  const opened = inspectForPath(path);
+  if (opened.kind === "paper") return opened;
   return {
     kind: "shown",
     path,
-    label: typeof label === "string" && label.trim() ? label.trim() : basename(path),
+    label: named,
   };
 }
 

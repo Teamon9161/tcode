@@ -49,10 +49,12 @@ const WINDOW_STATE = "tcode://window-state";
 // `default-src 'self'` and must never gain `unsafe-inline` or `unsafe-eval` —
 // that is the layer stopping KaTeX's and the markdown renderer's output from
 // executing. `frame-src` names the loopback origin `serve.rs` binds, which is
-// the *other* frame in rule 11b and deliberately not this one.
+// the *other* frame in rule 11b and deliberately not this one. `connect-src`
+// keeps ordinary app requests on this origin while allowing PDF.js to fetch the
+// same tokenized loopback files that framed reports load as documents.
 const CSP =
   "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
-  "frame-src 'self' http://127.0.0.1:*";
+  "connect-src 'self' http://127.0.0.1:*; frame-src 'self' http://127.0.0.1:*";
 
 // Enough to serve `ui/dist` correctly. A module script with the wrong type does
 // not load at all, so guessing is not an option — and `net.fetch` on a `file:`
