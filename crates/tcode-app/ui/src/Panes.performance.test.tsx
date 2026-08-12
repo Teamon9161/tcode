@@ -37,6 +37,14 @@ vi.mock("@ipc", () => ({
   invoke: probes.invoke,
   listen: vi.fn().mockResolvedValue(() => {}),
 }));
+// PaperView loads pdfjs-dist at import time, which touches the browser-only
+// DOMMatrix global. This suite never renders a paper pane, so a stub is enough.
+vi.mock("pdfjs-dist", () => ({
+  GlobalWorkerOptions: {},
+  TextLayer: class {},
+  getDocument: vi.fn(),
+}));
+vi.mock("pdfjs-dist/build/pdf.worker.mjs?url", () => ({ default: "pdf.worker.mjs" }));
 
 import type { Leaf, Tiling } from "./layout";
 import { Panes, type PaneContext } from "./Panes";
