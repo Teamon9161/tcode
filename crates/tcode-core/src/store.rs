@@ -438,7 +438,9 @@ fn extract_segments_from(path: &Path, sessions_dir: &Path) -> Option<usize> {
                     meta_created = v["created_unix"].as_u64().unwrap_or(0);
                 }
             }
-            "startup_context" | "environment_observed" | "environment_delivered"
+            "startup_context"
+            | "environment_observed"
+            | "environment_delivered"
             | "environment_changed" => {
                 header_lines.push(line);
             }
@@ -1919,13 +1921,11 @@ mod tests {
             .find(|s| s.last_user_preview == "first conversation prompt")
             .unwrap();
         let resumed = SessionStore::resume(dir.path(), Some(&extracted.id)).unwrap();
-        assert!(resumed
-            .ledger
-            .entries()
-            .iter()
-            .any(|e| matches!(e, Entry::User(blocks) if blocks.iter().any(
+        assert!(resumed.ledger.entries().iter().any(
+            |e| matches!(e, Entry::User(blocks) if blocks.iter().any(
                 |b| matches!(b, ContentBlock::Text { text } if text == "first conversation prompt")
-            ))));
+            ))
+        ));
 
         // Idempotent: running again does not create duplicates.
         extract_cleared_segments(&sessions);

@@ -391,11 +391,17 @@ async fn a_prompt_queued_mid_turn_lands_after_the_tool_results() {
         })
         .collect();
     // Not between the call and its result: the tool_use must be answered first.
+    // The harness note after the queued prompt tells the model that the new
+    // message was not an implicit interruption of its original task.
     assert_eq!(
         kinds,
-        ["user", "assistant", "results", "user", "assistant"],
+        ["user", "assistant", "results", "user", "other", "assistant"],
         "queued input lands only after the batch commits"
     );
+    assert!(matches!(
+        session.ledger.entries().get(4),
+        Some(Entry::Note(note)) if note.contains("did not interrupt or end your turn")
+    ));
 
     // On the wire it rides in the same user message as the tool results, which
     // is what makes it legal to append there at all.

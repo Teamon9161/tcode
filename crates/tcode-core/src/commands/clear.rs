@@ -27,9 +27,8 @@ impl SlashCommand for ClearCommand {
                 let session_id = store.id.clone();
                 ctx.session.ledger = crate::Ledger::new();
                 ctx.session.ledger.attach_sink(Box::new(store));
-                ctx.session.checkpoints = crate::CheckpointStore::new(
-                    data_dir.join("checkpoints").join(&session_id),
-                );
+                ctx.session.checkpoints =
+                    crate::CheckpointStore::new(data_dir.join("checkpoints").join(&session_id));
                 ctx.session.bind_scratch_session(&session_id);
                 ctx.session.set_startup_context((ctx.opening_context)(
                     &ctx.session.tool_ctx.cwd,
