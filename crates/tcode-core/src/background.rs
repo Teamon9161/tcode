@@ -65,8 +65,6 @@ struct MonitorInner {
 struct MonitorState {
     description: String,
     quiet: Duration,
-    /// Shared with the frontend so an event can wake an idle session.
-    signal: Arc<Notify>,
     inner: Mutex<MonitorInner>,
 }
 
@@ -84,11 +82,17 @@ pub struct TaskShared {
     pub status: Mutex<TaskStatus>,
     /// Cancelling this kills the child process.
     pub kill: CancellationToken,
+    /// Shared with the frontend so a task exit or monitor event can wake an idle session.
+    signal: Arc<Notify>,
     monitor: Option<MonitorState>,
 }
 
 impl TaskShared {
-    fn new(log_path: PathBuf, monitor: Option<MonitorState>) -> Result<Self, String> {
+    fn new(
+        log_path: PathBuf,
+        signal: Arc<Notify>,
+        monitor: Option<MonitorState>,
+    ) -> Result<Self, String> {
         if let Some(parent) = log_path.parent() {
             std::fs::create_dir_all(parent).map_err(|e| {
                 format!(
@@ -118,6 +122,7 @@ impl TaskShared {
             lines: Mutex::new(0),
             status: Mutex::new(TaskStatus::Running),
             kill: CancellationToken::new(),
+            signal,
             monitor,
         })
     }
@@ -160,7 +165,7 @@ impl TaskShared {
             }
             inner.first_pending.get_or_insert(now);
         }
-        monitor.signal.notify_one();
+        self.signal.notify_one();
     }
 
     pub fn line_count(&self) -> usize {
@@ -169,11 +174,9 @@ impl TaskShared {
 
     pub fn set_status(&self, status: TaskStatus) {
         *self.status.lock().expect("task status lock") = status;
-        // A monitor's exit is itself an event: wake an idle session so the
-        // completion note (and any last pending lines) reach the model now.
-        if let Some(monitor) = &self.monitor {
-            monitor.signal.notify_one();
-        }
+        // Task exit is itself an event: wake an idle session so the completion
+        // note (and any last pending monitor lines) reach the model now.
+        self.signal.notify_one();
     }
 
     pub fn status(&self) -> TaskStatus {
@@ -366,7 +369,6 @@ impl BackgroundTasks {
             Some(MonitorState {
                 description: description.to_string(),
                 quiet,
-                signal: self.signal.clone(),
                 inner: Mutex::new(MonitorInner::default()),
             }),
         )
@@ -381,6 +383,7 @@ impl BackgroundTasks {
         let id = format!("{prefix}{}", self.tasks.len() + 1);
         let shared = Arc::new(TaskShared::new(
             self.dir.join(format!("{id}.log")),
+            self.signal.clone(),
             monitor,
         )?);
         self.tasks.push(Task {
@@ -430,23 +433,22 @@ impl BackgroundTasks {
         }
     }
 
-    /// When an idle session should wake to deliver monitor activity: the
-    /// oldest undelivered event plus that monitor's quiet window (bursts
-    /// coalesce, delivery latency stays bounded), or now for a finished
-    /// monitor whose completion the model has not heard yet. `None` while
-    /// there is nothing to deliver.
+    /// When an idle session should wake to deliver background activity: monitor
+    /// events after their quiet window, or now for any finished task or
+    /// background-agent completion whose note the model has not heard yet.
+    /// `None` while there is nothing to deliver.
     pub fn monitor_wake_deadline(&self) -> Option<Instant> {
         // A delivered background-agent completion wakes immediately, like a
-        // finished monitor: there is nothing to coalesce, the run is already done.
+        // finished task: there is nothing to coalesce, the run is already done.
         let inbox_now =
             (!self.inbox.lock().expect("harness note inbox").is_empty()).then(Instant::now);
         self.tasks
             .iter()
             .filter_map(|task| {
-                let monitor = task.shared.monitor.as_ref()?;
                 if !task.notified && task.shared.status() != TaskStatus::Running {
                     return Some(Instant::now());
                 }
+                let monitor = task.shared.monitor.as_ref()?;
                 let inner = monitor.inner.lock().expect("monitor lock");
                 (!inner.pending.is_empty() || inner.dropped > 0)
                     .then(|| inner.first_pending.unwrap_or_else(Instant::now) + monitor.quiet)
@@ -589,6 +591,8 @@ mod tests {
 
         shared.append_output("line1\nline2\n");
         shared.set_status(TaskStatus::Exited(0));
+        let deadline = reg.monitor_wake_deadline().unwrap();
+        assert!(deadline <= Instant::now() + Duration::from_millis(50));
         let notes = texts(reg.take_notes());
         assert_eq!(notes.len(), 1);
         assert!(notes[0].contains("b1"));
@@ -604,6 +608,7 @@ mod tests {
         assert!(!headline.contains("b1.log"));
         // Delivered exactly once.
         assert!(reg.take_notes().is_empty());
+        assert!(reg.monitor_wake_deadline().is_none());
         assert!(reg.running().is_empty());
         let _ = std::fs::remove_file(&shared.log_path);
     }
@@ -635,6 +640,26 @@ mod tests {
         // Delivered exactly once.
         assert!(reg.take_notes().is_empty());
         assert!(reg.monitor_wake_deadline().is_none());
+    }
+
+    #[tokio::test]
+    async fn normal_background_exit_signals_idle_frontend() {
+        let mut reg = reg();
+        let signal = reg.monitor_signal();
+        let (id, shared) = reg.register("cargo test").unwrap();
+        assert_eq!(id, "b1");
+
+        let notified = signal.notified();
+        tokio::pin!(notified);
+        shared.set_status(TaskStatus::Exited(0));
+        tokio::time::timeout(Duration::from_millis(50), notified)
+            .await
+            .expect("normal background task exit should wake idle frontend");
+
+        let notes = texts(reg.take_notes());
+        assert_eq!(notes.len(), 1, "{notes:?}");
+        assert!(notes[0].contains("Background task b1 exited with code 0"));
+        let _ = std::fs::remove_file(&shared.log_path);
     }
 
     #[test]
