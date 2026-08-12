@@ -3,15 +3,20 @@ import { createRoot, type Root } from "react-dom/client";
 import { EditorSelection, EditorState, type Extension } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { undo } from "@codemirror/commands";
+import { forceParsing } from "@codemirror/language";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   WorkspaceEditor,
   type WorkspaceEditorSnapshot,
 } from "./WorkspaceEditor";
+import { loadEditorLanguage } from "./editorLanguage";
 import { workspaceEditorExtensions } from "./workspaceEditorSetup";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+// CodeMirror measures selection layers after a grammar arrives. jsdom has no
+// range geometry; an empty rect list is its honest no-layout answer.
+Object.defineProperty(Range.prototype, "getClientRects", { value: () => [], configurable: true });
 
 let container: HTMLDivElement;
 let root: Root;
@@ -29,11 +34,13 @@ function draw(
   state?: EditorState | null,
   initialOffset?: number | null,
   initialFallbackScroll?: number,
+  languageLoader: (path: string) => Promise<Extension | null> = loaded,
+  path = "src/main.rs",
 ) {
   act(() => {
     root.render(
       <WorkspaceEditor
-        path="src/main.rs"
+        path={path}
         initialDoc={doc}
         initialState={state}
         initialOffset={initialOffset}
@@ -41,7 +48,7 @@ function draw(
         onSnapshot={(next) => {
           snapshot = next;
         }}
-        languageLoader={loaded}
+        languageLoader={languageLoader}
       />,
     );
   });
@@ -116,6 +123,31 @@ describe("WorkspaceEditor", () => {
 
     expect(editor.state).not.toBe(stateBeforeParser);
     expect(editor.state.doc.toString()).toBe("before after");
+  });
+
+  it("uses the shared syntax theme inside Markdown fenced code blocks", async () => {
+    const editor = draw(
+      "```rust\nfn main() { println!(\"hi\"); }\n```",
+      null,
+      null,
+      0,
+      loadEditorLanguage,
+      "README.md",
+    );
+
+    await act(async () => {
+      for (let i = 0; i < 10; i += 1) {
+        forceParsing(editor, editor.state.doc.length, 1000);
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      }
+    });
+
+    const code = editor.dom.textContent ?? "";
+    const keyword = editor.dom.querySelector(".tok-keyword")?.textContent ?? "";
+    const string = editor.dom.querySelector(".tok-string")?.textContent ?? "";
+    expect(code).toContain("fn main");
+    expect(keyword).toContain("fn");
+    expect(string).toContain("hi");
   });
 
   it("restores selection and undo history in a fresh view", () => {

@@ -15,10 +15,10 @@
   --syn-plain: oklch(0.3 0.025 255);
   --syn-string: oklch(0.4 0.105 255);
   --syn-number: oklch(0.46 0.14 300);
-  --syn-keyword: oklch(0.48 0.18 27);
+  --syn-keyword: oklch(0.48 0.14 350);
   --syn-type: oklch(0.43 0.13 255);
   --syn-call: oklch(0.46 0.15 300);
-  --syn-heading: oklch(0.44 0.18 27);
+  --syn-heading: oklch(0.46 0.14 350);
   --syn-link: oklch(0.48 0.16 255);
   --syn-emphasis: oklch(0.3 0.025 255);
 }
@@ -27,12 +27,12 @@
   --syn-comment: oklch(0.55 0.02 220);
   --syn-punct: oklch(0.68 0.015 220);
   --syn-plain: oklch(0.82 0.015 220);
-  --syn-string: oklch(0.82 0.08 235);
-  --syn-number: oklch(0.78 0.10 240);
-  --syn-keyword: oklch(0.72 0.17 25);
-  --syn-type: oklch(0.77 0.13 65);
-  --syn-call: oklch(0.76 0.12 300);
-  --syn-heading: oklch(0.72 0.17 25);
+  --syn-string: oklch(0.80 0.06 235);
+  --syn-number: oklch(0.78 0.07 240);
+  --syn-keyword: oklch(0.74 0.12 350);
+  --syn-type: oklch(0.76 0.09 80);
+  --syn-call: oklch(0.74 0.09 280);
+  --syn-heading: oklch(0.74 0.12 350);
   --syn-link: oklch(0.72 0.14 255);
   --syn-emphasis: oklch(0.82 0.015 220);
 }
@@ -48,7 +48,7 @@
   --syn-keyword: oklch(0.46 0.15 325);
   --syn-type: oklch(0.52 0.115 83);
   --syn-call: oklch(0.52 0.135 255);
-  --syn-heading: oklch(0.48 0.18 27);
+  --syn-heading: oklch(0.48 0.15 325);
   --syn-link: oklch(0.5 0.13 255);
   --syn-emphasis: oklch(0.46 0.15 325);
 }
@@ -62,7 +62,7 @@
   --syn-keyword: oklch(0.72 0.15 325);
   --syn-type: oklch(0.76 0.11 83);
   --syn-call: oklch(0.72 0.14 255);
-  --syn-heading: oklch(0.72 0.17 27);
+  --syn-heading: oklch(0.72 0.15 325);
   --syn-link: oklch(0.70 0.14 255);
   --syn-emphasis: oklch(0.72 0.15 325);
 }
@@ -78,7 +78,7 @@
   --syn-keyword: oklch(0.5 0.17 345);
   --syn-type: oklch(0.55 0.115 205);
   --syn-call: oklch(0.53 0.115 245);
-  --syn-heading: oklch(0.55 0.17 27);
+  --syn-heading: oklch(0.52 0.17 345);
   --syn-link: oklch(0.53 0.135 245);
   --syn-emphasis: oklch(0.5 0.17 345);
 }
@@ -92,7 +92,7 @@
   --syn-keyword: oklch(0.72 0.16 345);
   --syn-type: oklch(0.72 0.11 205);
   --syn-call: oklch(0.70 0.12 245);
-  --syn-heading: oklch(0.72 0.16 27);
+  --syn-heading: oklch(0.72 0.16 345);
   --syn-link: oklch(0.70 0.14 245);
   --syn-emphasis: oklch(0.72 0.16 345);
 }

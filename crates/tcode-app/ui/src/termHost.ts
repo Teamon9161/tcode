@@ -213,7 +213,6 @@ export async function open(cwd: string) {
     theme: readTheme(),
     fontFamily,
     fontSize,
-    lineHeight: 1.35,
     cursorBlink: true,
     // Deep enough that a build's output is still there when it finishes, and
     // bounded so a runaway process cannot grow the window's memory forever.

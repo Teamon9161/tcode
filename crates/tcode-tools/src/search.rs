@@ -1,6 +1,7 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -82,19 +83,92 @@ const PRUNE_DIRS: &[&str] = &[
     "AppData",
 ];
 
-fn walk_builder(base: &Path, follow_links: bool) -> ignore::WalkBuilder {
+fn is_pruned_dir_name(name: &str) -> bool {
+    PRUNE_DIRS.contains(&name)
+}
+
+#[derive(Debug, Default)]
+struct PruneReport {
+    counts: Mutex<BTreeMap<String, usize>>,
+}
+
+impl PruneReport {
+    fn record(&self, name: &str) {
+        let mut counts = self.counts.lock().unwrap();
+        *counts.entry(name.to_string()).or_default() += 1;
+    }
+
+    fn note(&self) -> Option<String> {
+        let counts = self.counts.lock().unwrap();
+        if counts.is_empty() {
+            return None;
+        }
+        let total: usize = counts.values().sum();
+        let names = counts
+            .iter()
+            .map(|(name, count)| {
+                if *count == 1 {
+                    format!("{name}/")
+                } else {
+                    format!("{name}/ × {count}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let noun = if total == 1 {
+            "directory was"
+        } else {
+            "directories were"
+        };
+        Some(format!(
+            "[{total} pruned {noun} skipped: {names} — set `path` inside one explicitly to search it]"
+        ))
+    }
+}
+
+fn path_arg_allows_pruned_descend(path: Option<&str>) -> bool {
+    let Some(path) = path else {
+        return false;
+    };
+    let parts: Vec<&str> = path
+        .split(['/', '\\'])
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect();
+    let Some(pruned_index) = parts.iter().position(|part| is_pruned_dir_name(part)) else {
+        return false;
+    };
+    parts[pruned_index] != "node_modules" || pruned_index + 1 < parts.len()
+}
+
+fn should_prune_entry(entry: &ignore::DirEntry, allow_cache_descend: bool) -> bool {
+    !allow_cache_descend
+        && entry.file_type().is_some_and(|t| t.is_dir())
+        && entry.file_name().to_str().is_some_and(is_pruned_dir_name)
+}
+
+fn walk_builder(
+    base: &Path,
+    follow_links: bool,
+    allow_cache_descend: bool,
+    prune_report: Option<Arc<PruneReport>>,
+) -> ignore::WalkBuilder {
     let mut b = ignore::WalkBuilder::new(base);
     // Search hidden files (.github/, .config/, dotfiles are routinely wanted);
     // heavy/VCS dirs are pruned explicitly below instead of by the blunt
     // "skip everything starting with a dot" rule.
     b.follow_links(follow_links)
         .hidden(false)
-        .filter_entry(|entry| {
-            !(entry.file_type().is_some_and(|t| t.is_dir())
-                && entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|n| PRUNE_DIRS.contains(&n)))
+        .filter_entry(move |entry| {
+            if should_prune_entry(entry, allow_cache_descend) {
+                if let Some(report) = &prune_report {
+                    if let Some(name) = entry.file_name().to_str() {
+                        report.record(name);
+                    }
+                }
+                false
+            } else {
+                true
+            }
         });
     b
 }
@@ -323,8 +397,8 @@ impl Tool for GrepTool {
         let Some(pattern) = input["pattern"].as_str() else {
             return ToolOutput::err("missing required parameter: pattern");
         };
-        let base = input["path"]
-            .as_str()
+        let path_arg = input["path"].as_str();
+        let base = path_arg
             .map(|p| ctx.resolve(p))
             .unwrap_or_else(|| ctx.cwd.clone());
         if !base.exists() {
@@ -373,6 +447,7 @@ impl Tool for GrepTool {
         let pattern = pattern.to_string();
         let cwd = ctx.cwd.clone();
         let cancel = cancel.clone();
+        let allow_cache_descend = path_arg_allows_pruned_descend(path_arg);
 
         // The walk reads many files and runs its own thread pool — keep it off
         // the async runtime.
@@ -383,7 +458,15 @@ impl Tool for GrepTool {
             let timed_out = AtomicBool::new(false);
             let start = Instant::now();
 
-            walk_builder(&base, false).build_parallel().run(|| {
+            let prune_report = Arc::new(PruneReport::default());
+            walk_builder(
+                &base,
+                false,
+                allow_cache_descend,
+                Some(prune_report.clone()),
+            )
+            .build_parallel()
+            .run(|| {
                 let mut searcher = SearcherBuilder::new()
                     .line_number(true)
                     .before_context(before)
@@ -500,6 +583,7 @@ impl Tool for GrepTool {
             let files = files.load(Ordering::Relaxed);
             let skipped_oversized = skipped_oversized.load(Ordering::Relaxed);
             let timed_out = timed_out.load(Ordering::Relaxed);
+            let prune_note = prune_report.note();
 
             // Page by *matches*, cutting the groups that straddle a window edge
             // instead of keeping them whole. Keeping them whole is what the
@@ -552,7 +636,11 @@ impl Tool for GrepTool {
                         MAX_FILE_BYTES / 1024
                     ));
                 }
-                m.push_str("\n[.gitignore entries and built/cache directories are excluded]");
+                if let Some(note) = &prune_note {
+                    m.push('\n');
+                    m.push_str(note);
+                }
+                m.push_str("\n[.gitignore entries are excluded]");
                 if timed_out {
                     m.push_str(&format!(
                         "\n[search timed out after {}s before finishing — narrow the path or glob]",
@@ -607,6 +695,10 @@ impl Tool for GrepTool {
                 out.push_str(&format!(
                     "\n[{hidden} further matches in {capped_files} {noun} not shown — over {MAX_MATCHES_PER_FILE} per file; re-run with `path` set to one of them for the rest]"
                 ));
+            }
+            if let Some(note) = &prune_note {
+                out.push('\n');
+                out.push_str(note);
             }
             out
         })
@@ -686,8 +778,8 @@ impl Tool for GlobTool {
         let Some(pattern) = input["pattern"].as_str() else {
             return ToolOutput::err("missing required parameter: pattern");
         };
-        let base = input["path"]
-            .as_str()
+        let path_arg = input["path"].as_str();
+        let base = path_arg
             .map(|p| ctx.resolve(p))
             .unwrap_or_else(|| ctx.cwd.clone());
         let glob = match build_glob(pattern) {
@@ -702,66 +794,74 @@ impl Tool for GlobTool {
         // pinned a runtime thread and serialized any batch it was part of.
         let walk_base = base.clone();
         let walk_cancel = cancel.clone();
-        let (mut hits, timed_out, skipped_directory_links) =
+        let allow_cache_descend = path_arg_allows_pruned_descend(path_arg);
+        let (mut hits, timed_out, skipped_directory_links, prune_note) =
             match tokio::task::spawn_blocking(move || {
                 let hits: Mutex<Vec<(std::time::SystemTime, PathBuf)>> = Mutex::new(Vec::new());
                 let timed_out = AtomicBool::new(false);
                 let skipped_directory_links = AtomicUsize::new(0);
+                let prune_report = Arc::new(PruneReport::default());
                 let start = Instant::now();
-                walk_builder(&walk_base, follow_links)
-                    .build_parallel()
-                    .run(|| {
-                        let glob = &glob;
-                        let base: &Path = &walk_base;
-                        let hits = &hits;
-                        let timed_out = &timed_out;
-                        let skipped_directory_links = &skipped_directory_links;
-                        let cancel = &walk_cancel;
-                        Box::new(move |result| {
-                            use ignore::WalkState;
-                            if cancel.is_cancelled() {
-                                return WalkState::Quit;
-                            }
-                            if start.elapsed() > SEARCH_DEADLINE {
-                                timed_out.store(true, Ordering::Relaxed);
-                                return WalkState::Quit;
-                            }
-                            let Ok(entry) = result else {
-                                return WalkState::Continue;
-                            };
-                            if !follow_links
+                walk_builder(
+                    &walk_base,
+                    follow_links,
+                    allow_cache_descend,
+                    Some(prune_report.clone()),
+                )
+                .build_parallel()
+                .run(|| {
+                    let glob = &glob;
+                    let base: &Path = &walk_base;
+                    let hits = &hits;
+                    let timed_out = &timed_out;
+                    let skipped_directory_links = &skipped_directory_links;
+                    let cancel = &walk_cancel;
+                    Box::new(move |result| {
+                        use ignore::WalkState;
+                        if cancel.is_cancelled() {
+                            return WalkState::Quit;
+                        }
+                        if start.elapsed() > SEARCH_DEADLINE {
+                            timed_out.store(true, Ordering::Relaxed);
+                            return WalkState::Quit;
+                        }
+                        let Ok(entry) = result else {
+                            return WalkState::Continue;
+                        };
+                        if !follow_links
                                 && entry.path_is_symlink()
                                 // The walker exposes symlink metadata while it is not
                                 // following links. Query the path to test the link target.
                                 && std::fs::metadata(entry.path())
                                     .is_ok_and(|metadata| metadata.is_dir())
-                            {
-                                skipped_directory_links.fetch_add(1, Ordering::Relaxed);
-                                return WalkState::Continue;
-                            }
-                            // The walk already knows the file type — `path.is_file()`
-                            // spent an extra stat on every entry in the tree.
-                            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                                return WalkState::Continue;
-                            }
-                            let path = entry.path();
-                            if !glob_matches(glob, path, base) {
-                                return WalkState::Continue;
-                            }
-                            let mtime = entry
-                                .metadata()
-                                .ok()
-                                .and_then(|m| m.modified().ok())
-                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-                            // Locked only on a hit, not per entry walked.
-                            hits.lock().unwrap().push((mtime, path.to_path_buf()));
-                            WalkState::Continue
-                        })
-                    });
+                        {
+                            skipped_directory_links.fetch_add(1, Ordering::Relaxed);
+                            return WalkState::Continue;
+                        }
+                        // The walk already knows the file type — `path.is_file()`
+                        // spent an extra stat on every entry in the tree.
+                        if !entry.file_type().is_some_and(|t| t.is_file()) {
+                            return WalkState::Continue;
+                        }
+                        let path = entry.path();
+                        if !glob_matches(glob, path, base) {
+                            return WalkState::Continue;
+                        }
+                        let mtime = entry
+                            .metadata()
+                            .ok()
+                            .and_then(|m| m.modified().ok())
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        // Locked only on a hit, not per entry walked.
+                        hits.lock().unwrap().push((mtime, path.to_path_buf()));
+                        WalkState::Continue
+                    })
+                });
                 (
                     hits.into_inner().unwrap(),
                     timed_out.load(Ordering::Relaxed),
                     skipped_directory_links.load(Ordering::Relaxed),
+                    prune_report.note(),
                 )
             })
             .await
@@ -784,6 +884,10 @@ impl Tool for GlobTool {
                 m.push_str(&format!(
                     "\n[{skipped_directory_links} {noun} skipped — set follow_symlinks=true to search their targets]"
                 ));
+            }
+            if let Some(note) = &prune_note {
+                m.push('\n');
+                m.push_str(note);
             }
             if timed_out {
                 m.push_str(&format!(
@@ -819,6 +923,10 @@ impl Tool for GlobTool {
                 offset + shown,
                 offset + shown
             ));
+        }
+        if let Some(note) = &prune_note {
+            out.push('\n');
+            out.push_str(note);
         }
         ToolOutput::ok(out)
     }
@@ -946,10 +1054,7 @@ mod tests {
         let out = grep(&dir, json!({ "pattern": "TARGET", "glob": "large.rs" })).await;
         assert!(out.starts_with("no matches for /TARGET/ (0 files scanned, glob large.rs)"));
         assert!(out.contains("[1 file over 512 KiB skipped"), "{out}");
-        assert!(
-            out.contains("[.gitignore entries and built/cache directories are excluded]"),
-            "{out}"
-        );
+        assert!(out.contains("[.gitignore entries are excluded]"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -965,14 +1070,104 @@ mod tests {
         let grep_out = grep(&dir, json!({ "pattern": "TARGET" })).await;
         assert!(grep_out.contains("a.rs:\n1: TARGET"), "{grep_out}");
         for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
-            assert!(!grep_out.contains(cache), "{grep_out}");
+            assert!(
+                !grep_out
+                    .replace('\\', "/")
+                    .contains(&format!("{cache}/hidden.rs")),
+                "{grep_out}"
+            );
         }
 
         let glob_out = glob(&dir, "*.rs").await;
         assert!(glob_out.contains("a.rs"), "{glob_out}");
         for cache in ["zig-cache", "zig-out", ".pytest_cache", ".next"] {
-            assert!(!glob_out.contains(cache), "{glob_out}");
+            assert!(
+                !glob_out.contains(&format!("{cache}/hidden.rs")),
+                "{glob_out}"
+            );
         }
+        assert!(
+            glob_out.contains("[4 pruned directories were skipped:"),
+            "{glob_out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_searches_pruned_children_inside_explicit_pruned_path() {
+        let dir = scratch("explicit-pruned-path", "");
+        let package = dir
+            .join("node_modules")
+            .join("@codemirror")
+            .join("lang-markdown");
+        let dist = package.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(package.join("README.md"), "docs\n").unwrap();
+        std::fs::write(dist.join("index.d.ts"), "export {};\n").unwrap();
+
+        let out = glob_input(
+            &dir,
+            json!({ "path": "node_modules/@codemirror/lang-markdown", "pattern": "**/*.d.ts" }),
+        )
+        .await;
+        assert_eq!(
+            out.replace('\\', "/"),
+            "node_modules/@codemirror/lang-markdown/dist/index.d.ts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn glob_reports_pruned_directories_even_when_other_files_match() {
+        let dir = scratch("glob-prune-note", "");
+        let dist = dir.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dir.join("package.json"), "{}\n").unwrap();
+        std::fs::write(dist.join("index.d.ts"), "export {};\n").unwrap();
+
+        let out = glob(&dir, "*").await;
+        let normalized = out.replace('\\', "/");
+        assert!(normalized.contains("package.json"), "{out}");
+        assert!(!normalized.contains("dist/index.d.ts"), "{out}");
+        assert!(
+            out.contains("[1 pruned directory was skipped: dist/ — set `path` inside one explicitly to search it]"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_pruned_directories_when_no_match_survives() {
+        let dir = scratch("grep-prune-note", "miss\n");
+        let dist = dir.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("hidden.rs"), "TARGET\n").unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET" })).await;
+        assert!(
+            out.starts_with("no matches for /TARGET/ (1 files scanned)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("[1 pruned directory was skipped: dist/ — set `path` inside one explicitly to search it]"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_searches_explicit_pruned_path() {
+        let dir = scratch("grep-explicit-pruned", "miss\n");
+        let dist = dir.join("dist");
+        std::fs::create_dir_all(&dist).unwrap();
+        std::fs::write(dist.join("hidden.rs"), "TARGET\n").unwrap();
+
+        let out = grep(&dir, json!({ "path": "dist", "pattern": "TARGET" })).await;
+        assert!(
+            out.starts_with("dist\\hidden.rs:\n1: TARGET")
+                || out.starts_with("dist/hidden.rs:\n1: TARGET"),
+            "{out}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
