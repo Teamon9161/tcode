@@ -201,3 +201,4 @@ loop {
 9. bash：为验证精确的“无当前 tab、pane 未显示”Electron 生命周期，我运行了最小隔离探针与扩展回归，两次都只有整体命令超时、没有阶段性输出或后台日志路径。随后只能手工给 fixture 插入 console.error 并反复执行，仍无法得到是哪一个 native lifecycle 操作卡住的可靠证据。若 bash 对超时命令能自动保留并返回 stdout/stderr 增量与子进程树/日志路径，会直接减少这类 GUI/Electron 排查的额外编辑与运行轮次。
     bash：真实 Electron 回归在 fixture cleanup 抛出未处理 rejection 后不退出，前台 bash 超时只报告“command timed out”，不保留阶段性 stdout/stderr。为判断产品截图是否已通过，只能改用后台任务、写入临时阶段日志、再读取后台日志。若超时结果能直接附带截至超时的 stdout/stderr 尾部和仍存活子进程摘要，这几轮诊断编辑与重跑可以避免。
 11. terminal好像不能显示一些常见图标?
+12.  Tool friction — directory-scoped instructions loader: 这次工具路径同时触发了 tcode-core、tcode-providers、tcode-tools 的目录规则，但 harness note 先完整塞入很长的 tcode-core/AGENTS.md 后耗尽预算，导致 tcode-providers/AGENTS.md 和 tcode-tools/AGENTS.md 没有自动加载，我必须额外手动 read 两个文件。最小改进是发现多个 scoped instruction 文件时，优先给每个文件的路径和短摘要，或按即将触达的 mutation/test 文件优先加载对应 crate，而不是让第一个长文件挤掉后续文件；这样能减少一次补读往返，并避免漏看实际触达 crate 的硬规则。

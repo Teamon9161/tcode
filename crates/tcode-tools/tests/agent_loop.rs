@@ -4055,6 +4055,72 @@ async fn compact_retries_retryable_failure_before_replacing_history() {
     ));
 }
 
+#[tokio::test]
+async fn compact_retries_codex_retryable_stream_error_before_replacing_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let main = MockProvider::new(vec![]);
+    let compact = Arc::new(PartialFailureProvider {
+        scripts: Mutex::new(
+            vec![
+                vec![
+                    Ok(StreamEvent::Started),
+                    Err(ProviderError::Api {
+                        status: 503,
+                        message: "An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists."
+                            .into(),
+                    }),
+                ],
+                text_done("recovered summary").into_iter().map(Ok).collect(),
+            ]
+            .into(),
+        ),
+        requests: Mutex::new(Vec::new()),
+    });
+    let mut agent = agent(main);
+    agent.models.pin(
+        AgentRole::Compact.key(),
+        ActiveModel {
+            provider: compact.clone(),
+            max_tokens: Some(1024),
+            context_window: 200_000,
+            effort: None,
+        },
+    );
+    agent.watchdog = WatchdogConfig {
+        idle_timeout_secs: 5,
+        connect_timeout_secs: 20,
+        max_retries: 1,
+        initial_backoff_ms: 1,
+        max_backoff_ms: 5,
+    };
+    let mut session = session(dir.path(), PermissionMode::Default);
+    session.ledger.append(Entry::User(vec![ContentBlock::Text {
+        text: "history that must not be replaced by the failed attempt".into(),
+    }]));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+
+    agent
+        .compact(&mut session, &tx, &CancellationToken::new())
+        .await
+        .expect("retryable compact stream error should recover");
+    drop(tx);
+    let mut events = Vec::new();
+    while let Some(event) = rx.recv().await {
+        events.push(event);
+    }
+
+    assert!(matches!(
+        events.as_slice(),
+        [AgentEvent::Retrying { attempt: 1, error, .. }, AgentEvent::Compacted(summary)]
+            if error.contains("retry your request") && summary == "recovered summary"
+    ));
+    assert_eq!(compact.requests.lock().unwrap().len(), 2);
+    assert!(matches!(
+        session.ledger.entries(),
+        [Entry::Summary(summary)] if summary == "recovered summary"
+    ));
+}
+
 /// A reply cut off at `max_tokens` produces no text and no tool call, which on
 /// the wire looks exactly like a model that decided it was done. The turn must
 /// not end there: the model is told what happened and goes again, which is all

@@ -1,6 +1,6 @@
 [package]
 name = "tcode-app"
-version = "0.1.25"
+version = "0.1.26"
 edition = "2021"
 description = "Desktop backend for tcode: the sidecar an Electron shell spawns"
 
