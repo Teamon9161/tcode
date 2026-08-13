@@ -7516,15 +7516,19 @@ button.strip-phase-line:hover .strip-phase-name {
 
 .paper-stage {
   position: relative;
-  display: grid;
   flex: 1;
-  align-items: start;
-  justify-items: center;
   min-width: 0;
   min-height: 0;
-  padding: var(--s-4);
   overflow: auto;
   background: var(--sunken);
+}
+
+.paper-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: var(--s-4);
 }
 
 .paper-status {
@@ -7597,10 +7601,31 @@ button.strip-phase-line:hover .strip-phase-name {
   background: var(--brand-wash);
 }
 
+.paper-highlight-layer {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+}
+
+.paper-highlight-rect {
+  position: absolute;
+  opacity: 0.35;
+  border-radius: 2px;
+  pointer-events: auto;
+  cursor: pointer;
+  transition: opacity var(--dur-fast);
+}
+
+.paper-highlight-rect:hover {
+  opacity: 0.55;
+}
+
 .paper-selection-menu {
   position: absolute;
   z-index: var(--z-dropdown);
   display: flex;
+  align-items: center;
   gap: var(--s-1);
   padding: var(--s-1);
   border: 1px solid var(--line);
@@ -7608,6 +7633,37 @@ button.strip-phase-line:hover .strip-phase-name {
   background: var(--bg);
   box-shadow: var(--shadow-lift);
   transform: translate(-50%, calc(-100% - var(--s-2)));
+}
+
+.paper-menu-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
+
+.paper-color-picks {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.paper-color-dot {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  border: 1.5px solid transparent;
+  border-radius: 50%;
+  padding: 0;
+  cursor: pointer;
+  transition: border-color var(--dur-fast);
+}
+
+.paper-color-dot.is-active {
+  border-color: var(--ink);
+}
+
+.paper-color-dot:hover:not(.is-active) {
+  border-color: var(--faint);
 }
 
 /* ============================================================ narrow window

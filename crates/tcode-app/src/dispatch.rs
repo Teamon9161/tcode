@@ -351,6 +351,10 @@ impl Registry {
         // living in the Electron main process. See `crate::address`.
         result!(t, "resolve_url", crate::address::resolve_url[](input));
 
+        // Paper highlights.
+        result!(t, "paper_highlights_load", c::paper_highlights_load[supervisor](session, path));
+        result!(t, "paper_highlights_save", c::paper_highlights_save[supervisor](session, path, highlights));
+
         Self(t)
     }
 

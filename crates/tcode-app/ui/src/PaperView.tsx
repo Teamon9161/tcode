@@ -6,13 +6,17 @@ import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 import { useSession } from "./session";
 import { basename } from "./show";
 import { paperPrompt, summarizePaperPrompt, type PaperAction } from "./paperPrompt";
-import { ChevronRight, ChevronDown, SparkleIcon, ListTreeIcon, ZoomInIcon, ZoomOutIcon } from "./components/Icons";
+import { ChevronRight, ChevronDown, SparkleIcon, ListTreeIcon, ZoomInIcon, ZoomOutIcon, HighlighterIcon } from "./components/Icons";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
 const MIN_SCALE = 0.6;
 const MAX_SCALE = 2.4;
 const SCALE_STEP = 0.2;
+const PAGE_GAP = 12;
+const RENDER_BUFFER = 1;
+
+const HIGHLIGHT_COLORS = ["#facc15", "#86efac", "#93c5fd", "#fca5a5", "#d8b4fe"] as const;
 
 type Status =
   | { kind: "loading"; detail: string }
@@ -21,6 +25,7 @@ type Status =
 
 type SelectionMenu = {
   text: string;
+  page: number;
   top: number;
   left: number;
 };
@@ -29,6 +34,19 @@ type OutlineItem = {
   title: string;
   dest: unknown;
   items: OutlineItem[];
+};
+
+type PageDimensions = {
+  width: number;
+  height: number;
+};
+
+export type PaperHighlight = {
+  id: string;
+  pageNumber: number;
+  rects: Array<[number, number, number, number]>;
+  selectedText: string;
+  color: string;
 };
 
 async function resolveOutlinePage(doc: PDFDocumentProxy, dest: unknown): Promise<number | null> {
@@ -43,6 +61,54 @@ async function resolveOutlinePage(doc: PDFDocumentProxy, dest: unknown): Promise
   }
 }
 
+function captureSelectionRects(pageShell: HTMLElement, scale: number): Array<[number, number, number, number]> {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return [];
+
+  const range = selection.getRangeAt(0);
+  const clientRects = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
+  if (clientRects.length === 0) return [];
+
+  const shellRect = pageShell.getBoundingClientRect();
+  const pdfRects: Array<[number, number, number, number]> = [];
+
+  for (const cr of clientRects) {
+    const x = (cr.left - shellRect.left) / scale;
+    const y = (cr.top - shellRect.top) / scale;
+    const w = cr.width / scale;
+    const h = cr.height / scale;
+    pdfRects.push([x, y, w, h]);
+  }
+
+  return mergeOverlappingRects(pdfRects);
+}
+
+function mergeOverlappingRects(rects: Array<[number, number, number, number]>): Array<[number, number, number, number]> {
+  if (rects.length <= 1) return rects;
+  const sorted = [...rects].sort((a, b) => a[1] - b[1] || a[0] - b[0]);
+  const merged: Array<[number, number, number, number]> = [sorted[0]];
+  for (let i = 1; i < sorted.length; i++) {
+    const [x, y, w, h] = sorted[i];
+    const last = merged[merged.length - 1];
+    const [lx, ly, lw, lh] = last;
+    if (Math.abs(y - ly) < 2 && x <= lx + lw + 2) {
+      const nx = Math.min(lx, x);
+      const ny = Math.min(ly, y);
+      const nr = Math.max(lx + lw, x + w);
+      const nb = Math.max(ly + lh, y + h);
+      merged[merged.length - 1] = [nx, ny, nr - nx, nb - ny];
+    } else {
+      merged.push([x, y, w, h]);
+    }
+  }
+  return merged;
+}
+
+let highlightIdCounter = 0;
+function nextHighlightId(): string {
+  return `hl_${Date.now()}_${highlightIdCounter++}`;
+}
+
 export function PaperView({
   path,
   onPrompt,
@@ -51,26 +117,32 @@ export function PaperView({
   onPrompt?: (prompt: string) => void;
 }) {
   const session = useSession();
-  const canvas = useRef<HTMLCanvasElement>(null);
-  const textLayer = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
-  const shell = useRef<HTMLDivElement>(null);
+  const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   const [url, setUrl] = useState<string | null>(null);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
+  const [pageDims, setPageDims] = useState<PageDimensions[]>([]);
   const [pageNumber, setPageNumber] = useState(1);
   const [scale, setScale] = useState(1);
   const [menu, setMenu] = useState<SelectionMenu | null>(null);
   const [status, setStatus] = useState<Status>({ kind: "loading", detail: "preparing PDF" });
   const [outline, setOutline] = useState<OutlineItem[] | null>(null);
   const [outlineOpen, setOutlineOpen] = useState(false);
+  const [visiblePages, setVisiblePages] = useState<Set<number>>(new Set([1]));
+  const scrollingToPage = useRef(false);
+  const [highlights, setHighlights] = useState<PaperHighlight[]>([]);
+  const [highlightColor, setHighlightColor] = useState(HIGHLIGHT_COLORS[0]);
 
   useEffect(() => {
     let live = true;
     setUrl(null);
     setDocument(null);
+    setPageDims([]);
     setPageNumber(1);
     setMenu(null);
     setOutline(null);
+    setVisiblePages(new Set([1]));
+    setHighlights([]);
     setStatus({ kind: "loading", detail: "preparing PDF" });
 
     invoke<string>("serve_url", { session, path })
@@ -83,6 +155,12 @@ export function PaperView({
         if (live) setStatus({ kind: "failed", detail: String(error) });
       });
 
+    invoke<PaperHighlight[]>("paper_highlights_load", { session, path })
+      .then((loaded) => {
+        if (live && loaded) setHighlights(loaded);
+      })
+      .catch(() => {});
+
     return () => {
       live = false;
     };
@@ -94,12 +172,23 @@ export function PaperView({
     const task = getDocument({ url });
 
     task.promise
-      .then((loaded) => {
+      .then(async (loaded) => {
+        if (!live) {
+          void loaded.cleanup();
+          return;
+        }
+        const dims: PageDimensions[] = [];
+        for (let i = 1; i <= loaded.numPages; i++) {
+          const page = await loaded.getPage(i);
+          const vp = page.getViewport({ scale: 1 });
+          dims.push({ width: vp.width, height: vp.height });
+        }
         if (!live) {
           void loaded.cleanup();
           return;
         }
         setDocument(loaded);
+        setPageDims(dims);
         setStatus({ kind: "ready" });
         loaded.getOutline().then((items) => {
           if (live && items && items.length > 0) setOutline(items as OutlineItem[]);
@@ -121,77 +210,84 @@ export function PaperView({
     };
   }, [document]);
 
-  useLayoutEffect(() => {
-    if (!document || !canvas.current || !textLayer.current) return;
-    let live = true;
-    const targetCanvas = canvas.current;
-    const targetTextLayer = textLayer.current;
-    const context = targetCanvas.getContext("2d");
-    if (!context) {
-      setStatus({ kind: "failed", detail: "this system cannot create a PDF canvas" });
-      return;
+  // IntersectionObserver to track visible pages
+  useEffect(() => {
+    const stageEl = stage.current;
+    if (!stageEl || pageDims.length === 0) return;
+
+    const ratios = new Map<number, number>();
+    const observer = new IntersectionObserver(
+      (entries) => {
+        for (const entry of entries) {
+          const pageNum = Number(entry.target.getAttribute("data-page"));
+          if (!pageNum) continue;
+          ratios.set(pageNum, entry.intersectionRatio);
+          if (entry.intersectionRatio <= 0) ratios.delete(pageNum);
+        }
+
+        const visible = new Set<number>();
+        let bestPage = 1;
+        let bestRatio = 0;
+        for (const [num, ratio] of ratios) {
+          visible.add(num);
+          if (ratio > bestRatio) {
+            bestRatio = ratio;
+            bestPage = num;
+          }
+        }
+
+        if (visible.size > 0) {
+          setVisiblePages(visible);
+          if (!scrollingToPage.current) {
+            setPageNumber(bestPage);
+          }
+        }
+      },
+      {
+        root: stageEl,
+        threshold: [0, 0.1, 0.25, 0.5, 0.75, 1],
+      },
+    );
+
+    for (const [, el] of pageRefs.current) {
+      observer.observe(el);
     }
 
-    setMenu(null);
-    targetTextLayer.replaceChildren();
-    setStatus({ kind: "loading", detail: `rendering page ${pageNumber}` });
-
-    const shellEl = shell.current;
-    if (shellEl) shellEl.style.setProperty("--total-scale-factor", String(scale));
-
-    let cancelTextLayer: (() => void) | null = null;
-    let renderTask: { cancel: () => void; promise: Promise<unknown> } | null = null;
-
-    document
-      .getPage(pageNumber)
-      .then((page) => {
-        if (!live) return undefined;
-        const viewport = page.getViewport({ scale });
-        const pixelRatio = window.devicePixelRatio || 1;
-        targetCanvas.width = Math.floor(viewport.width * pixelRatio);
-        targetCanvas.height = Math.floor(viewport.height * pixelRatio);
-        targetCanvas.style.width = `${viewport.width}px`;
-        targetCanvas.style.height = `${viewport.height}px`;
-        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
-        context.clearRect(0, 0, viewport.width, viewport.height);
-
-        renderTask = page.render({ canvas: targetCanvas, canvasContext: context, viewport });
-        const text = new TextLayer({
-          textContentSource: page.streamTextContent(),
-          container: targetTextLayer,
-          viewport,
-        });
-        cancelTextLayer = () => text.cancel();
-
-        return Promise.all([renderTask.promise, text.render()]);
-      })
-      .then(() => {
-        if (live) {
-          setStatus({ kind: "ready" });
-          stage.current?.scrollTo(0, 0);
-        }
-      })
-      .catch((error) => {
-        if (!live || isRenderingCancel(error)) return;
-        setStatus({ kind: "failed", detail: String(error) });
-      });
-
-    return () => {
-      live = false;
-      renderTask?.cancel();
-      cancelTextLayer?.();
-    };
-  }, [document, pageNumber, scale]);
+    return () => observer.disconnect();
+  }, [pageDims, scale]);
 
   const refreshSelection = useCallback(() => {
-    const layer = textLayer.current;
     const scroller = stage.current;
     const selection = window.getSelection();
-    if (!layer || !scroller || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+    if (!scroller || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
       setMenu(null);
       return;
     }
-    if (!inside(layer, selection.anchorNode) || !inside(layer, selection.focusNode)) {
+
+    const anchor = selection.anchorNode;
+    if (!anchor) {
+      setMenu(null);
+      return;
+    }
+
+    let selectionPage = 0;
+    const anchorEl = anchor instanceof HTMLElement ? anchor : anchor.parentElement;
+    if (anchorEl) {
+      const shell = anchorEl.closest("[data-page]");
+      if (shell) selectionPage = Number(shell.getAttribute("data-page"));
+    }
+    if (!selectionPage) {
+      setMenu(null);
+      return;
+    }
+
+    const textLayerEl = anchorEl?.closest(".paper-text-layer") ?? anchorEl?.querySelector(".paper-text-layer");
+    if (!textLayerEl) {
+      setMenu(null);
+      return;
+    }
+    const focusEl = selection.focusNode instanceof HTMLElement ? selection.focusNode : selection.focusNode?.parentElement;
+    if (!focusEl?.closest(".paper-text-layer")) {
       setMenu(null);
       return;
     }
@@ -207,6 +303,7 @@ export function PaperView({
     const stageRect = scroller.getBoundingClientRect();
     setMenu({
       text,
+      page: selectionPage,
       left: rect.left - stageRect.left + scroller.scrollLeft + rect.width / 2,
       top: rect.top - stageRect.top + scroller.scrollTop,
     });
@@ -215,11 +312,49 @@ export function PaperView({
   const sendPrompt = useCallback(
     (action: PaperAction) => {
       if (!menu || !onPrompt) return;
-      onPrompt(paperPrompt(action, path, pageNumber, menu.text));
+      onPrompt(paperPrompt(action, path, menu.page, menu.text));
       setMenu(null);
       window.getSelection()?.removeAllRanges();
     },
-    [menu, onPrompt, pageNumber, path],
+    [menu, onPrompt, path],
+  );
+
+  const addHighlight = useCallback(() => {
+    if (!menu) return;
+
+    const pageShell = pageRefs.current.get(menu.page);
+    if (!pageShell) return;
+
+    const rects = captureSelectionRects(pageShell, scale);
+    if (rects.length === 0) return;
+
+    const hl: PaperHighlight = {
+      id: nextHighlightId(),
+      pageNumber: menu.page,
+      rects,
+      selectedText: menu.text,
+      color: highlightColor,
+    };
+
+    setHighlights((prev) => {
+      const next = [...prev, hl];
+      invoke("paper_highlights_save", { session, path, highlights: next }).catch(() => {});
+      return next;
+    });
+
+    setMenu(null);
+    window.getSelection()?.removeAllRanges();
+  }, [menu, scale, highlightColor, session, path]);
+
+  const removeHighlight = useCallback(
+    (id: string) => {
+      setHighlights((prev) => {
+        const next = prev.filter((h) => h.id !== id);
+        invoke("paper_highlights_save", { session, path, highlights: next }).catch(() => {});
+        return next;
+      });
+    },
+    [session, path],
   );
 
   const summarizePaper = useCallback(() => {
@@ -229,11 +364,21 @@ export function PaperView({
 
   const goToPage = useCallback(
     (page: number) => {
-      const total = document?.numPages ?? 0;
+      const total = pageDims.length;
       if (total === 0) return;
-      setPageNumber(Math.max(1, Math.min(total, page)));
+      const target = Math.max(1, Math.min(total, page));
+      setPageNumber(target);
+
+      const el = pageRefs.current.get(target);
+      if (el && stage.current) {
+        scrollingToPage.current = true;
+        el.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => {
+          scrollingToPage.current = false;
+        }, 600);
+      }
     },
-    [document],
+    [pageDims.length],
   );
 
   const jumpToOutlineDest = useCallback(
@@ -245,43 +390,13 @@ export function PaperView({
     [document, goToPage],
   );
 
-  useEffect(() => {
-    const layer = textLayer.current;
-    if (!layer) return;
-    const onDown = (event: MouseEvent) => {
-      if (event.button !== 0) return;
-      const rect = layer.getBoundingClientRect();
-      if (rect.width === 0) return;
-      const clickedRight = (event.clientX - rect.left) > rect.width / 2;
-
-      const muted: HTMLElement[] = [];
-      for (const span of layer.querySelectorAll<HTMLElement>("span")) {
-        const left = parseFloat(span.style.left);
-        if (Number.isNaN(left)) continue;
-        if ((left >= 50) !== clickedRight) {
-          span.style.userSelect = "none";
-          muted.push(span);
-        }
-      }
-      if (muted.length === 0) return;
-
-      const restore = () => {
-        for (const el of muted) el.style.userSelect = "";
-        window.removeEventListener("mouseup", restore, true);
-      };
-      window.addEventListener("mouseup", restore, true);
-    };
-    layer.addEventListener("mousedown", onDown);
-    return () => layer.removeEventListener("mousedown", onDown);
-  }, []);
-
   const zoomIn = useCallback(() => setScale((at) => Math.min(MAX_SCALE, roundScale(at + SCALE_STEP))), []);
   const zoomOut = useCallback(() => setScale((at) => Math.max(MIN_SCALE, roundScale(at - SCALE_STEP))), []);
 
   useEffect(() => {
     const el = stage.current;
     if (!el) return;
-    const total = document?.numPages ?? 0;
+    const total = pageDims.length;
 
     const onKey = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
@@ -300,24 +415,14 @@ export function PaperView({
       }
       if (event.altKey || mod) return;
       switch (event.key) {
-        case "ArrowLeft":
-        case "PageUp":
-          event.preventDefault();
-          setPageNumber((at) => Math.max(1, at - 1));
-          break;
-        case "ArrowRight":
-        case "PageDown":
-          event.preventDefault();
-          setPageNumber((at) => Math.min(total || at, at + 1));
-          break;
         case "Home":
           event.preventDefault();
-          setPageNumber(1);
+          goToPage(1);
           break;
         case "End":
           if (total > 0) {
             event.preventDefault();
-            setPageNumber(total);
+            goToPage(total);
           }
           break;
       }
@@ -328,13 +433,6 @@ export function PaperView({
         event.preventDefault();
         if (event.deltaY < 0) zoomIn();
         else if (event.deltaY > 0) zoomOut();
-        return;
-      }
-      const threshold = 30;
-      if (event.deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - threshold) {
-        if (total > 0) setPageNumber((at) => Math.min(total, at + 1));
-      } else if (event.deltaY < 0 && el.scrollTop <= threshold) {
-        setPageNumber((at) => Math.max(1, at - 1));
       }
     };
 
@@ -344,12 +442,24 @@ export function PaperView({
       el.removeEventListener("keydown", onKey);
       el.removeEventListener("wheel", onWheel);
     };
-  }, [zoomIn, zoomOut, document]);
+  }, [zoomIn, zoomOut, pageDims.length, goToPage]);
 
-  const pages = document?.numPages ?? 0;
+  const setPageRef = useCallback((pageNum: number, el: HTMLDivElement | null) => {
+    if (el) pageRefs.current.set(pageNum, el);
+    else pageRefs.current.delete(pageNum);
+  }, []);
+
+  const pages = pageDims.length;
   const canPrev = pageNumber > 1;
   const canNext = pages > 0 && pageNumber < pages;
   const ready = status.kind === "ready";
+
+  const renderBuffer = new Set<number>();
+  for (const v of visiblePages) {
+    for (let i = v - RENDER_BUFFER; i <= v + RENDER_BUFFER; i++) {
+      if (i >= 1 && i <= pages) renderBuffer.add(i);
+    }
+  }
 
   return (
     <div className="paper-view">
@@ -381,13 +491,13 @@ export function PaperView({
             </button>
           )}
           <span className="paper-sep" />
-          <button type="button" className="paper-btn" onClick={() => setPageNumber((at) => Math.max(1, at - 1))} disabled={!canPrev} aria-label="Previous page" title="Previous page">
+          <button type="button" className="paper-btn" onClick={() => goToPage(pageNumber - 1)} disabled={!canPrev} aria-label="Previous page" title="Previous page">
             <ChevronRight size={15} className="paper-icon-flip" />
           </button>
           <span className="paper-page">
             {pageNumber}{pages ? ` / ${pages}` : ""}
           </span>
-          <button type="button" className="paper-btn" onClick={() => setPageNumber((at) => Math.min(pages || at, at + 1))} disabled={!canNext} aria-label="Next page" title="Next page">
+          <button type="button" className="paper-btn" onClick={() => goToPage(pageNumber + 1)} disabled={!canNext} aria-label="Next page" title="Next page">
             <ChevronRight size={15} />
           </button>
           <span className="paper-sep" />
@@ -418,29 +528,225 @@ export function PaperView({
           onScroll={() => setMenu(null)}
         >
           {status.kind === "loading" && <p className="paper-status">{status.detail}…</p>}
-          <div ref={shell} className="paper-page-shell">
-            <canvas ref={canvas} className="paper-canvas" />
-            <div ref={textLayer} className="paper-text-layer" />
+          <div className="paper-pages">
+            {pageDims.map((dims, i) => {
+              const num = i + 1;
+              const shouldRender = renderBuffer.has(num);
+              const pageHighlights = highlights.filter((h) => h.pageNumber === num);
+              return (
+                <PageSlot
+                  key={num}
+                  pageNum={num}
+                  dims={dims}
+                  scale={scale}
+                  doc={shouldRender ? document : null}
+                  setRef={setPageRef}
+                  highlights={pageHighlights}
+                  onRemoveHighlight={removeHighlight}
+                />
+              );
+            })}
           </div>
-          {menu && onPrompt && (
+          {menu && (
             <div
               className="paper-selection-menu"
               style={{ left: menu.left, top: menu.top }}
               onMouseDown={(event) => event.preventDefault()}
             >
-              <button type="button" className="chip" onClick={() => sendPrompt("translate")}>
-                Translate
+              <button type="button" className="chip" onClick={addHighlight} title="Highlight selected text">
+                <HighlighterIcon size={14} />
               </button>
-              <button type="button" className="chip" onClick={() => sendPrompt("explain")}>
-                Explain
-              </button>
-              <button type="button" className="chip" onClick={() => sendPrompt("ask")}>
-                Ask
-              </button>
+              <span className="paper-color-picks">
+                {HIGHLIGHT_COLORS.map((c) => (
+                  <button
+                    key={c}
+                    type="button"
+                    className={`paper-color-dot${c === highlightColor ? " is-active" : ""}`}
+                    style={{ background: c }}
+                    onClick={() => setHighlightColor(c)}
+                    aria-label={`Highlight color ${c}`}
+                  />
+                ))}
+              </span>
+              {onPrompt && (
+                <>
+                  <span className="paper-menu-sep" />
+                  <button type="button" className="chip" onClick={() => sendPrompt("translate")}>
+                    Translate
+                  </button>
+                  <button type="button" className="chip" onClick={() => sendPrompt("explain")}>
+                    Explain
+                  </button>
+                  <button type="button" className="chip" onClick={() => sendPrompt("ask")}>
+                    Ask
+                  </button>
+                </>
+              )}
             </div>
           )}
         </div>
       </div>
+    </div>
+  );
+}
+
+function PageSlot({
+  pageNum,
+  dims,
+  scale,
+  doc,
+  setRef,
+  highlights,
+  onRemoveHighlight,
+}: {
+  pageNum: number;
+  dims: PageDimensions;
+  scale: number;
+  doc: PDFDocumentProxy | null;
+  setRef: (pageNum: number, el: HTMLDivElement | null) => void;
+  highlights: PaperHighlight[];
+  onRemoveHighlight: (id: string) => void;
+}) {
+  const shellRef = useRef<HTMLDivElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const textLayerRef = useRef<HTMLDivElement>(null);
+  const [rendered, setRendered] = useState(false);
+
+  const scaledWidth = dims.width * scale;
+  const scaledHeight = dims.height * scale;
+
+  useEffect(() => {
+    const el = shellRef.current;
+    if (!el) return;
+    setRef(pageNum, el);
+    return () => setRef(pageNum, null);
+  }, [pageNum, setRef]);
+
+  useLayoutEffect(() => {
+    if (!doc || !canvasRef.current || !textLayerRef.current) {
+      setRendered(false);
+      return;
+    }
+
+    let live = true;
+    const targetCanvas = canvasRef.current;
+    const targetTextLayer = textLayerRef.current;
+    const context = targetCanvas.getContext("2d");
+    if (!context) return;
+
+    targetTextLayer.replaceChildren();
+
+    const shellEl = shellRef.current;
+    if (shellEl) shellEl.style.setProperty("--total-scale-factor", String(scale));
+
+    let cancelTextLayer: (() => void) | null = null;
+    let renderTask: { cancel: () => void; promise: Promise<unknown> } | null = null;
+
+    doc
+      .getPage(pageNum)
+      .then((page) => {
+        if (!live) return undefined;
+        const viewport = page.getViewport({ scale });
+        const pixelRatio = window.devicePixelRatio || 1;
+        targetCanvas.width = Math.floor(viewport.width * pixelRatio);
+        targetCanvas.height = Math.floor(viewport.height * pixelRatio);
+        targetCanvas.style.width = `${viewport.width}px`;
+        targetCanvas.style.height = `${viewport.height}px`;
+        context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+        context.clearRect(0, 0, viewport.width, viewport.height);
+
+        renderTask = page.render({ canvas: targetCanvas, canvasContext: context, viewport });
+        const text = new TextLayer({
+          textContentSource: page.streamTextContent(),
+          container: targetTextLayer,
+          viewport,
+        });
+        cancelTextLayer = () => text.cancel();
+
+        return Promise.all([renderTask.promise, text.render()]);
+      })
+      .then(() => {
+        if (live) setRendered(true);
+      })
+      .catch((error) => {
+        if (!live || isRenderingCancel(error)) return;
+      });
+
+    return () => {
+      live = false;
+      renderTask?.cancel();
+      cancelTextLayer?.();
+    };
+  }, [doc, pageNum, scale]);
+
+  // Dual-column selection limiter
+  useEffect(() => {
+    const layer = textLayerRef.current;
+    if (!layer || !doc) return;
+    const onDown = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const rect = layer.getBoundingClientRect();
+      if (rect.width === 0) return;
+      const clickedRight = (event.clientX - rect.left) > rect.width / 2;
+
+      const allSpans = layer.querySelectorAll<HTMLElement>("span");
+      const muted: HTMLElement[] = [];
+      for (const span of allSpans) {
+        const left = parseFloat(span.style.left);
+        if (Number.isNaN(left)) continue;
+        if ((left >= 50) !== clickedRight) {
+          muted.push(span);
+        }
+      }
+      if (muted.length === 0 || muted.length === allSpans.length) return;
+      for (const el of muted) el.style.userSelect = "none";
+
+      const restore = () => {
+        for (const el of muted) el.style.userSelect = "";
+        window.removeEventListener("mouseup", restore, true);
+      };
+      window.addEventListener("mouseup", restore, true);
+    };
+    layer.addEventListener("mousedown", onDown);
+    return () => layer.removeEventListener("mousedown", onDown);
+  }, [doc]);
+
+  return (
+    <div
+      ref={shellRef}
+      className="paper-page-shell"
+      data-page={pageNum}
+      style={{ width: scaledWidth, height: scaledHeight }}
+    >
+      {doc && (
+        <>
+          <canvas ref={canvasRef} className="paper-canvas" />
+          {highlights.length > 0 && (
+            <div className="paper-highlight-layer">
+              {highlights.map((hl) => (
+                <div key={hl.id} className="paper-highlight-group">
+                  {hl.rects.map(([x, y, w, h], i) => (
+                    <div
+                      key={i}
+                      className="paper-highlight-rect"
+                      style={{
+                        left: x * scale,
+                        top: y * scale,
+                        width: w * scale,
+                        height: h * scale,
+                        background: hl.color,
+                      }}
+                      title={hl.selectedText}
+                      onDoubleClick={() => onRemoveHighlight(hl.id)}
+                    />
+                  ))}
+                </div>
+              ))}
+            </div>
+          )}
+          <div ref={textLayerRef} className="paper-text-layer" />
+        </>
+      )}
     </div>
   );
 }

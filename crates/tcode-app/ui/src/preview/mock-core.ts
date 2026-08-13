@@ -255,27 +255,56 @@ const SHOWN: Record<string, string> = {
 };
 
 const PDF_FIXTURE = makePdf([
-  "Paper Mode MVP",
-  "Select text on this page, then use Translate, Explain, or Ask.",
-  "The prompt lands in the existing composer draft.",
+  [
+    "Paper Mode MVP",
+    "Select text on this page, then use Translate, Explain, or Ask.",
+    "The prompt lands in the existing composer draft.",
+  ],
+  [
+    "Page Two",
+    "Continuous scrolling lets you see two pages at once.",
+    "This page should appear below page one without a hard jump.",
+  ],
+  [
+    "Page Three",
+    "The viewer virtualizes rendering so only visible pages are drawn.",
+    "Scrolling back up should also be smooth.",
+  ],
 ]);
 
-function makePdf(lines: string[]): string {
-  const stream = [
-    "BT",
-    "/F1 18 Tf",
-    "72 740 Td",
-    "24 TL",
-    ...lines.map((line, index) => `${index === 0 ? "" : "T* "}(${pdfString(line)}) Tj`),
-    "ET",
-  ].join("\n");
-  const objects = [
-    "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
-    "2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
-    "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>\nendobj\n",
-    "4 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-    `5 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`,
-  ];
+function makePdf(pages: string[][]): string {
+  const objects: string[] = [];
+  let objIndex = 1;
+
+  const catalogIndex = objIndex++;
+  const pagesIndex = objIndex++;
+  const fontIndex = objIndex++;
+
+  const pageIndices: number[] = [];
+  const streamIndices: number[] = [];
+  for (let i = 0; i < pages.length; i++) {
+    pageIndices.push(objIndex++);
+    streamIndices.push(objIndex++);
+  }
+
+  objects.push(`${catalogIndex} 0 obj\n<< /Type /Catalog /Pages ${pagesIndex} 0 R >>\nendobj\n`);
+  const kids = pageIndices.map((idx) => `${idx} 0 R`).join(" ");
+  objects.push(`${pagesIndex} 0 obj\n<< /Type /Pages /Kids [${kids}] /Count ${pages.length} >>\nendobj\n`);
+  objects.push(`${fontIndex} 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n`);
+
+  for (let i = 0; i < pages.length; i++) {
+    const stream = [
+      "BT",
+      "/F1 18 Tf",
+      "72 740 Td",
+      "24 TL",
+      ...pages[i].map((line, li) => `${li === 0 ? "" : "T* "}(${pdfString(line)}) Tj`),
+      "ET",
+    ].join("\n");
+    objects.push(`${pageIndices[i]} 0 obj\n<< /Type /Page /Parent ${pagesIndex} 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 ${fontIndex} 0 R >> >> /Contents ${streamIndices[i]} 0 R >>\nendobj\n`);
+    objects.push(`${streamIndices[i]} 0 obj\n<< /Length ${stream.length} >>\nstream\n${stream}\nendstream\nendobj\n`);
+  }
+
   let body = "%PDF-1.4\n";
   const offsets = [0];
   for (const object of objects) {
@@ -305,6 +334,7 @@ function pdfString(value: string): string {
  * `FileBody.test.tsx` and `boundary.test.ts`, which do not depend on this.
  */
 const SERVED = new Map<string, string>();
+const paperHighlights = new Map<string, unknown[]>();
 
 function servedUrl(path: string): string {
   const existing = SERVED.get(path);
@@ -958,6 +988,14 @@ export async function invoke<T>(
     }
     case "serve_url":
       return servedUrl(String(args?.path ?? "")) as T;
+    case "paper_highlights_load":
+      return (paperHighlights.get(String(args?.path ?? "")) ?? []) as T;
+    case "paper_highlights_save": {
+      const hlPath = String(args?.path ?? "");
+      const hls = (args as any)?.highlights ?? [];
+      paperHighlights.set(hlPath, hls);
+      return null as T;
+    }
     // The browser's verbs all succeed and do nothing, which is the honest
     // fixture: the page is a native webview the OS composites over the pane,
     // and a design preview running in an ordinary browser tab has nothing to

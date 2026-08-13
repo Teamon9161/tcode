@@ -10,6 +10,13 @@ const mocks = vi.hoisted(() => {
     value: () => null,
     configurable: true,
   });
+  if (!globalThis.IntersectionObserver) {
+    (globalThis as any).IntersectionObserver = class {
+      observe() {}
+      unobserve() {}
+      disconnect() {}
+    };
+  }
   return { invoke: vi.fn(), listen: vi.fn().mockResolvedValue(() => {}) };
 });
 vi.mock("@ipc", () => ({ invoke: mocks.invoke, listen: mocks.listen }));
@@ -33,6 +40,7 @@ vi.mock("pdfjs-dist", () => ({
     promise: Promise.resolve({
       numPages: 1,
       cleanup: vi.fn().mockResolvedValue(undefined),
+      getOutline: vi.fn().mockResolvedValue(null),
       getPage: vi.fn().mockResolvedValue({
         getViewport: vi.fn(() => ({ width: 600, height: 800 })),
         render: vi.fn(() => ({ cancel: vi.fn(), promise: Promise.resolve() })),
@@ -408,7 +416,9 @@ describe("conversation pane folder switcher", () => {
 
 describe("paper pane", () => {
   it("names the PDF and keeps workspace file controls away", async () => {
-    mocks.invoke.mockResolvedValue("http://127.0.0.1:1000/token/paper.pdf");
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
     await draw({ kind: "paper", path: "docs/paper.pdf" });
 
     const name = container.querySelector<HTMLElement>(".pane-name")!;
@@ -422,7 +432,9 @@ describe("paper pane", () => {
   it("turns selected PDF text into a composer draft action", async () => {
     const onPaperPrompt = vi.fn();
     context = { ...context, onPaperPrompt };
-    mocks.invoke.mockResolvedValue("http://127.0.0.1:1000/token/paper.pdf");
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
     await draw({ kind: "paper", path: "docs/paper.pdf" }, context);
 
     const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
@@ -446,7 +458,7 @@ describe("paper pane", () => {
       await Promise.resolve();
     });
     await act(async () => {
-      container.querySelector<HTMLButtonElement>(".paper-selection-menu .chip:nth-child(2)")!.click();
+      container.querySelectorAll<HTMLButtonElement>(".paper-selection-menu .paper-menu-sep ~ .chip")[1]!.click();
       await Promise.resolve();
     });
     selectionSpy.mockRestore();

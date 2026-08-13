@@ -338,3 +338,10 @@ export const ListTreeIcon = (props: IconProps) => (
     <path d="M10 4h10M10 12h10M10 20h10M4 4h.01M4 12h.01M4 20h.01" />
   </Glyph>
 );
+
+export const HighlighterIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M17.5 2.5 5.3 14.7a2 2 0 0 0-.5.9l-.8 3.6a.5.5 0 0 0 .6.6l3.6-.8a2 2 0 0 0 .9-.5L21.3 6.3a2.12 2.12 0 0 0 0-3l-.8-.8a2.12 2.12 0 0 0-3 0z" />
+    <path d="m2 22 2-2" />
+  </Glyph>
+);

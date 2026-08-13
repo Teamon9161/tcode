@@ -2050,6 +2050,64 @@ pub fn interrupt(supervisor: &Arc<Supervisor>, session: String) -> Result<(), St
     Ok(())
 }
 
+// ── Paper highlights ────────────────────────────────────────────────
+
+fn paper_highlights_file(
+    supervisor: &Arc<Supervisor>,
+    session: &str,
+    path: &str,
+) -> Result<PathBuf, String> {
+    let handle = supervisor
+        .get(session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let home = tcode_core::home_dir()
+        .ok_or_else(|| "cannot determine home directory".to_string())?;
+    let cwd = handle.cwd();
+    let project_dir = tcode_core::store::project_dir_in(
+        &home,
+        &cwd.to_string_lossy(),
+    );
+    let paper_dir = project_dir.join("paper");
+    let slug: String = path
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' })
+        .collect();
+    Ok(paper_dir.join(format!("{slug}.json")))
+}
+
+pub fn paper_highlights_load(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+) -> Result<serde_json::Value, String> {
+    let file = paper_highlights_file(supervisor, &session, &path)?;
+    if !file.exists() {
+        return Ok(serde_json::Value::Array(vec![]));
+    }
+    let data = std::fs::read_to_string(&file)
+        .map_err(|e| format!("cannot read highlights: {e}"))?;
+    serde_json::from_str(&data)
+        .map_err(|e| format!("invalid highlights file: {e}"))
+}
+
+pub fn paper_highlights_save(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+    highlights: serde_json::Value,
+) -> Result<(), String> {
+    let file = paper_highlights_file(supervisor, &session, &path)?;
+    if let Some(parent) = file.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create paper directory: {e}"))?;
+    }
+    let data = serde_json::to_string_pretty(&highlights)
+        .map_err(|e| format!("cannot serialize highlights: {e}"))?;
+    std::fs::write(&file, data)
+        .map_err(|e| format!("cannot write highlights: {e}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
