@@ -1,13 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { invoke } from "@ipc";
 import { getDocument, GlobalWorkerOptions, TextLayer, type PDFDocumentProxy } from "pdfjs-dist";
-import type { TextItem } from "pdfjs-dist/types/src/display/api";
 import workerUrl from "pdfjs-dist/build/pdf.worker.mjs?url";
 
 import { useSession } from "./session";
 import { basename } from "./show";
-import { paperPrompt, summarizePaperPrompt, summarizePagePrompt, type PaperAction } from "./paperPrompt";
-import { ChevronRight, ChevronDown } from "./components/Icons";
+import { paperPrompt, summarizePaperPrompt, type PaperAction } from "./paperPrompt";
+import { ChevronRight, ChevronDown, SparkleIcon, ListTreeIcon, ZoomInIcon, ZoomOutIcon } from "./components/Icons";
 
 GlobalWorkerOptions.workerSrc = workerUrl;
 
@@ -31,23 +30,6 @@ type OutlineItem = {
   dest: unknown;
   items: OutlineItem[];
 };
-
-async function extractPageText(doc: PDFDocumentProxy, pageNum: number): Promise<string> {
-  const page = await doc.getPage(pageNum);
-  const content = await page.getTextContent();
-  return content.items
-    .filter((item): item is TextItem => "str" in item)
-    .map((item) => item.str)
-    .join("");
-}
-
-async function extractAllText(doc: PDFDocumentProxy): Promise<string[]> {
-  const texts: string[] = [];
-  for (let i = 1; i <= doc.numPages; i++) {
-    texts.push(await extractPageText(doc, i));
-  }
-  return texts;
-}
 
 async function resolveOutlinePage(doc: PDFDocumentProxy, dest: unknown): Promise<number | null> {
   try {
@@ -81,7 +63,6 @@ export function PaperView({
   const [status, setStatus] = useState<Status>({ kind: "loading", detail: "preparing PDF" });
   const [outline, setOutline] = useState<OutlineItem[] | null>(null);
   const [outlineOpen, setOutlineOpen] = useState(false);
-  const [summarizing, setSummarizing] = useState(false);
 
   useEffect(() => {
     let live = true;
@@ -185,7 +166,10 @@ export function PaperView({
         return Promise.all([renderTask.promise, text.render()]);
       })
       .then(() => {
-        if (live) setStatus({ kind: "ready" });
+        if (live) {
+          setStatus({ kind: "ready" });
+          stage.current?.scrollTo(0, 0);
+        }
       })
       .catch((error) => {
         if (!live || isRenderingCancel(error)) return;
@@ -238,22 +222,10 @@ export function PaperView({
     [menu, onPrompt, pageNumber, path],
   );
 
-  const summarizePaper = useCallback(async () => {
-    if (!document || !onPrompt || summarizing) return;
-    setSummarizing(true);
-    try {
-      const texts = await extractAllText(document);
-      onPrompt(summarizePaperPrompt(path, texts, document.numPages));
-    } finally {
-      setSummarizing(false);
-    }
-  }, [document, onPrompt, path, summarizing]);
-
-  const summarizePage = useCallback(async () => {
-    if (!document || !onPrompt) return;
-    const text = await extractPageText(document, pageNumber);
-    onPrompt(summarizePagePrompt(path, pageNumber, text));
-  }, [document, onPrompt, path, pageNumber]);
+  const summarizePaper = useCallback(() => {
+    if (!onPrompt) return;
+    onPrompt(summarizePaperPrompt(path));
+  }, [onPrompt, path]);
 
   const goToPage = useCallback(
     (page: number) => {
@@ -309,6 +281,8 @@ export function PaperView({
   useEffect(() => {
     const el = stage.current;
     if (!el) return;
+    const total = document?.numPages ?? 0;
+
     const onKey = (event: KeyboardEvent) => {
       const mod = event.ctrlKey || event.metaKey;
       if (mod && !event.altKey) {
@@ -325,7 +299,6 @@ export function PaperView({
         return;
       }
       if (event.altKey || mod) return;
-      const total = document?.numPages ?? 0;
       switch (event.key) {
         case "ArrowLeft":
         case "PageUp":
@@ -349,12 +322,22 @@ export function PaperView({
           break;
       }
     };
+
     const onWheel = (event: WheelEvent) => {
-      if (!(event.ctrlKey || event.metaKey)) return;
-      event.preventDefault();
-      if (event.deltaY < 0) zoomIn();
-      else if (event.deltaY > 0) zoomOut();
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        if (event.deltaY < 0) zoomIn();
+        else if (event.deltaY > 0) zoomOut();
+        return;
+      }
+      const threshold = 30;
+      if (event.deltaY > 0 && el.scrollTop + el.clientHeight >= el.scrollHeight - threshold) {
+        if (total > 0) setPageNumber((at) => Math.min(total, at + 1));
+      } else if (event.deltaY < 0 && el.scrollTop <= threshold) {
+        setPageNumber((at) => Math.max(1, at - 1));
+      }
     };
+
     el.addEventListener("keydown", onKey);
     el.addEventListener("wheel", onWheel, { passive: false });
     return () => {
@@ -376,49 +359,44 @@ export function PaperView({
           {outline && (
             <button
               type="button"
-              className="chip"
+              className="paper-btn"
               aria-expanded={outlineOpen}
+              aria-label="Toggle outline"
+              title="Outline"
               onClick={() => setOutlineOpen((v) => !v)}
             >
-              Outline
+              <ListTreeIcon size={15} />
             </button>
           )}
           {onPrompt && (
-            <>
-              <button
-                type="button"
-                className="chip"
-                onClick={summarizePage}
-                disabled={!ready}
-                title="Summarize this page"
-              >
-                Page
-              </button>
-              <button
-                type="button"
-                className="chip"
-                onClick={summarizePaper}
-                disabled={!ready || summarizing}
-                title="Summarize entire paper"
-              >
-                {summarizing ? "Extracting…" : "Summarize"}
-              </button>
-            </>
+            <button
+              type="button"
+              className="paper-btn"
+              onClick={summarizePaper}
+              disabled={!ready}
+              aria-label="Summarize paper"
+              title="Summarize this paper"
+            >
+              <SparkleIcon size={15} />
+            </button>
           )}
           <span className="paper-sep" />
-          <button type="button" className="chip" onClick={() => setPageNumber((at) => Math.max(1, at - 1))} disabled={!canPrev}>
-            Previous
+          <button type="button" className="paper-btn" onClick={() => setPageNumber((at) => Math.max(1, at - 1))} disabled={!canPrev} aria-label="Previous page" title="Previous page">
+            <ChevronRight size={15} className="paper-icon-flip" />
           </button>
-          <span className="paper-page">Page {pageNumber}{pages ? ` of ${pages}` : ""}</span>
-          <button type="button" className="chip" onClick={() => setPageNumber((at) => Math.min(pages || at, at + 1))} disabled={!canNext}>
-            Next
+          <span className="paper-page">
+            {pageNumber}{pages ? ` / ${pages}` : ""}
+          </span>
+          <button type="button" className="paper-btn" onClick={() => setPageNumber((at) => Math.min(pages || at, at + 1))} disabled={!canNext} aria-label="Next page" title="Next page">
+            <ChevronRight size={15} />
           </button>
-          <button type="button" className="chip" onClick={zoomOut} disabled={scale <= MIN_SCALE}>
-            −
+          <span className="paper-sep" />
+          <button type="button" className="paper-btn" onClick={zoomOut} disabled={scale <= MIN_SCALE} aria-label="Zoom out" title="Zoom out">
+            <ZoomOutIcon size={15} />
           </button>
           <span className="paper-page">{Math.round(scale * 100)}%</span>
-          <button type="button" className="chip" onClick={zoomIn} disabled={scale >= MAX_SCALE}>
-            +
+          <button type="button" className="paper-btn" onClick={zoomIn} disabled={scale >= MAX_SCALE} aria-label="Zoom in" title="Zoom in">
+            <ZoomInIcon size={15} />
           </button>
         </div>
       </div>

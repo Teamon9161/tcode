@@ -1441,75 +1441,19 @@ MVP 0.1 已跑通"选文字 → 动作菜单 → 写入 composer"的闭环。0.1
 
 ### 20.2 本阶段新增
 
-#### 20.2.1 全文文本提取（前端）
+#### 20.2.1 一键总结论文（Summarize Paper）
 
-用 PDF.js 的 `page.getTextContent()` 提取全部页面文本。这是总结功能的基础。
+toolbar 新增 Summarize 图标按钮（SparkleIcon，不依赖选区，始终可用）。点击后：
 
-```ts
-async function extractFullText(doc: PDFDocumentProxy): Promise<string[]> {
-  const pages: string[] = [];
-  for (let i = 1; i <= doc.numPages; i++) {
-    const page = await doc.getPage(i);
-    const content = await page.getTextContent();
-    const text = content.items
-      .filter((item): item is TextItem => "str" in item)
-      .map((item) => item.str)
-      .join("");
-    pages.push(text);
-  }
-  return pages;
-}
-```
+1. 用 `@path` mention 机制引用整篇 PDF 文件，让 AI 直接读取原文
+2. 附加一句简洁的总结指令
+3. 写入 composer draft，用户可编辑后发送
 
-对超长论文（>50 页），取前 30 页 + 最后 5 页（结论/参考文献），避免超出 context window。
+prompt 生成：`@docs/paper.pdf Summarize this paper: core thesis, method, key findings, limitations, and important terms.`
 
-#### 20.2.2 一键总结论文（Summarize Paper）
+**不提取 page text**：PDF.js 的 `getTextContent()` 对双栏/公式/表格的提取不准确，与其发一堆不准的文字，不如让 AI 通过 `@path` 直接读取原始 PDF 文件。
 
-toolbar 新增 Summarize 按钮（不依赖选区，始终可用）。点击后：
-
-1. 提取全文文本
-2. 生成结构化 prompt，要求 AI 输出：
-   - 一句话核心论点
-   - 研究动机与问题定义
-   - 方法要点（3-5 条）
-   - 主要发现与结论
-   - 局限性与未来方向
-   - 关键术语表（如有）
-3. 写入 composer draft
-
-prompt 模板：
-
-```text
-Summarize this academic paper @paper("filename"):
-
-<paper-text>
-{全文或截断文本}
-</paper-text>
-
-Please provide a structured summary:
-1. **Core thesis** (one sentence)
-2. **Motivation & problem**
-3. **Method** (3-5 key points)
-4. **Main findings & conclusions**
-5. **Limitations & future work**
-6. **Key terms** (if domain-specific)
-```
-
-#### 20.2.3 当前页总结（Summarize Page）
-
-toolbar 新增 Page 按钮，提取当前页文本，写入：
-
-```text
-Summarize page {N} of @paper("filename"):
-
-<page-text>
-{当前页文本}
-</page-text>
-
-Explain what this page covers: key points, definitions, formulas if any, and how it connects to the paper's overall argument.
-```
-
-#### 20.2.4 Outline/TOC 侧栏
+#### 20.2.2 Outline/TOC 侧栏
 
 PDF.js 的 `doc.getOutline()` 返回章节树。在 paper-bar 下方增加可折叠 Outline 面板：
 
@@ -1518,13 +1462,25 @@ PDF.js 的 `doc.getOutline()` 返回章节树。在 paper-bar 下方增加可折
 - 当前页所在章节高亮
 - 没有 outline 的 PDF 隐藏该按钮
 
-#### 20.2.5 键盘翻页
+#### 20.2.3 键盘翻页
 
 - `←` / `→`：上一页 / 下一页
 - `PgUp` / `PgDn`：上一页 / 下一页
 - `Home` / `End`：第一页 / 最后一页
 
 只在 paper-stage 聚焦时生效，不干扰 composer 输入。
+
+#### 20.2.4 滚轮自动翻页
+
+滚到页面底部时自动跳到下一页，滚到页面顶部时自动跳到上一页。阈值 30px。翻页后自动滚到顶部。
+
+#### 20.2.5 图标化工具栏
+
+toolbar 按钮全部改为 icon button（`.paper-btn`），与 image viewer 的 `.image-viewer-btn` 同形。去掉文字按钮，用 title tooltip 提供说明：
+- SparkleIcon → Summarize
+- ListTreeIcon → Outline
+- ChevronRight（翻转）→ Previous page / ChevronRight → Next page
+- ZoomOutIcon / ZoomInIcon → 缩放
 
 ### 20.3 不做（留给 0.2+）
 

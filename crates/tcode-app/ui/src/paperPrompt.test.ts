@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { paperPrompt, summarizePaperPrompt, summarizePagePrompt } from "./paperPrompt";
+import { paperPrompt, summarizePaperPrompt } from "./paperPrompt";
 
 describe("paper selection prompts", () => {
   it("keeps the source and selected text editable in the draft", () => {
@@ -17,34 +17,14 @@ describe("paper selection prompts", () => {
 });
 
 describe("summarize paper prompt", () => {
-  it("includes all pages for short papers", () => {
-    const texts = ["Page one text", "Page two text", "Page three text"];
-    const result = summarizePaperPrompt("docs/paper.pdf", texts, 3);
-    expect(result).toContain('@paper("paper.pdf")');
-    expect(result).toContain("--- Page 1 ---\nPage one text");
-    expect(result).toContain("--- Page 3 ---\nPage three text");
-    expect(result).toContain("Core thesis");
-    expect(result).toContain("Limitations & future work");
-    expect(result).not.toContain("omitted");
+  it("mentions the file with @path so the AI reads it directly", () => {
+    const result = summarizePaperPrompt("docs/paper.pdf");
+    expect(result).toContain("@docs/paper.pdf");
+    expect(result).toContain("Summarize");
   });
 
-  it("truncates long papers keeping head and tail", () => {
-    const texts = Array.from({ length: 50 }, (_, i) => `Text of page ${i + 1}`);
-    const result = summarizePaperPrompt("long.pdf", texts, 50);
-    expect(result).toContain("--- Page 1 ---");
-    expect(result).toContain("--- Page 30 ---");
-    expect(result).toContain("[... pages 31–45 omitted ...]");
-    expect(result).toContain("--- Page 46 ---");
-    expect(result).toContain("--- Page 50 ---");
-    expect(result).not.toContain("--- Page 31 ---\nText of page 31");
-  });
-});
-
-describe("summarize page prompt", () => {
-  it("includes page number and text", () => {
-    const result = summarizePagePrompt("paper.pdf", 5, "  Some page text here.  ");
-    expect(result).toContain('page 5 of @paper("paper.pdf")');
-    expect(result).toContain("Some page text here.");
-    expect(result).toContain("key points");
+  it("quotes paths that contain spaces", () => {
+    const result = summarizePaperPrompt("docs/my paper.pdf");
+    expect(result).toContain('@"docs/my paper.pdf"');
   });
 });

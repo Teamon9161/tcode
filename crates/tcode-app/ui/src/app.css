@@ -7381,8 +7381,41 @@ button.strip-phase-line:hover .strip-phase-name {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: var(--s-2);
+  gap: var(--s-1);
   flex-wrap: wrap;
+}
+
+.paper-btn {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--body);
+  cursor: pointer;
+}
+
+.paper-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.paper-btn:not(:disabled):hover {
+  background: var(--hover);
+  color: var(--ink);
+}
+
+.paper-btn:focus-visible {
+  outline: 1px solid var(--focus-ring);
+  outline-offset: -1px;
+}
+
+.paper-icon-flip {
+  transform: scaleX(-1);
 }
 
 .paper-page {

@@ -326,3 +326,15 @@ export const SettingsIcon = (props: IconProps) => (
     <circle cx="10" cy="16" r="2.3" />
   </Glyph>
 );
+
+export const SparkleIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M12 2v4M12 18v4M4.93 4.93l2.83 2.83M16.24 16.24l2.83 2.83M2 12h4M18 12h4M4.93 19.07l2.83-2.83M16.24 7.76l2.83-2.83" />
+  </Glyph>
+);
+
+export const ListTreeIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M10 4h10M10 12h10M10 20h10M4 4h.01M4 12h.01M4 20h.01" />
+  </Glyph>
+);
