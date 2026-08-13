@@ -208,7 +208,20 @@ export function WebPane({
    * driven by.
    */
   const onTabKeys = (event: React.KeyboardEvent) => {
-    if (!(event.ctrlKey || event.metaKey) || !event.shiftKey || event.altKey) return;
+    if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+    if (!event.shiftKey) {
+      if (event.key === "=" || event.key === "+") {
+        event.preventDefault();
+        browser.zoom(0.1);
+      } else if (event.key === "-") {
+        event.preventDefault();
+        browser.zoom(-0.1);
+      } else if (event.key === "0") {
+        event.preventDefault();
+        browser.resetZoom();
+      }
+      return;
+    }
     if (event.key === "T" || event.key === "t") {
       event.preventDefault();
       void browser.open();

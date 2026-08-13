@@ -742,6 +742,18 @@ function browserVerbs(
       return null;
     },
 
+    browser_zoom(args) {
+      const contents = find(args.id).webContents;
+      const current = contents.getZoomFactor();
+      if (args.reset) {
+        contents.setZoomFactor(1);
+      } else {
+        const next = Math.min(3, Math.max(0.25, current + (args.delta ?? 0)));
+        contents.setZoomFactor(next);
+      }
+      return { zoom: contents.getZoomFactor() };
+    },
+
     /**
      * What is on a page, as the accessibility tree sees it.
      *

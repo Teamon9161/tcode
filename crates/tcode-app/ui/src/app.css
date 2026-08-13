@@ -7418,6 +7418,9 @@ button.strip-phase-line:hover .strip-phase-name {
   position: relative;
   background: var(--bg);
   box-shadow: var(--shadow-lift);
+  --total-scale-factor: 1;
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
 }
 
 .paper-canvas {
@@ -7427,17 +7430,45 @@ button.strip-phase-line:hover .strip-phase-name {
 .paper-text-layer {
   position: absolute;
   inset: 0;
-  overflow: hidden;
+  overflow: clip;
   line-height: 1;
   text-align: initial;
+  text-size-adjust: none;
+  -webkit-text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 0;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
 }
 
-.paper-text-layer :where(span, br) {
-  position: absolute;
+.paper-text-layer > :not(.markedContent),
+.paper-text-layer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+
+.paper-text-layer .markedContent {
+  display: contents;
+}
+
+.paper-text-layer :is(span, br) {
   color: transparent;
+  position: absolute;
+  white-space: pre;
   cursor: text;
   transform-origin: 0% 0%;
-  white-space: pre;
+  user-select: text;
+}
+
+.paper-text-layer span[role="img"] {
+  user-select: none;
+  cursor: default;
 }
 
 .paper-text-layer ::selection {

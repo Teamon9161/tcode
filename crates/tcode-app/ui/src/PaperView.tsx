@@ -35,6 +35,7 @@ export function PaperView({
   const canvas = useRef<HTMLCanvasElement>(null);
   const textLayer = useRef<HTMLDivElement>(null);
   const stage = useRef<HTMLDivElement>(null);
+  const shell = useRef<HTMLDivElement>(null);
   const [url, setUrl] = useState<string | null>(null);
   const [document, setDocument] = useState<PDFDocumentProxy | null>(null);
   const [pageNumber, setPageNumber] = useState(1);
@@ -110,6 +111,9 @@ export function PaperView({
     targetTextLayer.replaceChildren();
     setStatus({ kind: "loading", detail: `rendering page ${pageNumber}` });
 
+    const shellEl = shell.current;
+    if (shellEl) shellEl.style.setProperty("--total-scale-factor", String(scale));
+
     let cancelTextLayer: (() => void) | null = null;
     let renderTask: { cancel: () => void; promise: Promise<unknown> } | null = null;
 
@@ -123,8 +127,6 @@ export function PaperView({
         targetCanvas.height = Math.floor(viewport.height * pixelRatio);
         targetCanvas.style.width = `${viewport.width}px`;
         targetCanvas.style.height = `${viewport.height}px`;
-        targetTextLayer.style.width = `${viewport.width}px`;
-        targetTextLayer.style.height = `${viewport.height}px`;
         context.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
         context.clearRect(0, 0, viewport.width, viewport.height);
 
@@ -192,6 +194,69 @@ export function PaperView({
     [menu, onPrompt, pageNumber, path],
   );
 
+  useEffect(() => {
+    const layer = textLayer.current;
+    if (!layer) return;
+    const onDown = (event: MouseEvent) => {
+      if (event.button !== 0) return;
+      const rect = layer.getBoundingClientRect();
+      if (rect.width === 0) return;
+      const clickedRight = (event.clientX - rect.left) > rect.width / 2;
+
+      const muted: HTMLElement[] = [];
+      for (const span of layer.querySelectorAll<HTMLElement>("span")) {
+        const left = parseFloat(span.style.left);
+        if (Number.isNaN(left)) continue;
+        if ((left >= 50) !== clickedRight) {
+          span.style.userSelect = "none";
+          muted.push(span);
+        }
+      }
+      if (muted.length === 0) return;
+
+      const restore = () => {
+        for (const el of muted) el.style.userSelect = "";
+        window.removeEventListener("mouseup", restore, true);
+      };
+      window.addEventListener("mouseup", restore, true);
+    };
+    layer.addEventListener("mousedown", onDown);
+    return () => layer.removeEventListener("mousedown", onDown);
+  }, []);
+
+  const zoomIn = useCallback(() => setScale((at) => Math.min(MAX_SCALE, roundScale(at + SCALE_STEP))), []);
+  const zoomOut = useCallback(() => setScale((at) => Math.max(MIN_SCALE, roundScale(at - SCALE_STEP))), []);
+
+  useEffect(() => {
+    const el = stage.current;
+    if (!el) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
+      if (event.key === "=" || event.key === "+") {
+        event.preventDefault();
+        zoomIn();
+      } else if (event.key === "-") {
+        event.preventDefault();
+        zoomOut();
+      } else if (event.key === "0") {
+        event.preventDefault();
+        setScale(1);
+      }
+    };
+    const onWheel = (event: WheelEvent) => {
+      if (!(event.ctrlKey || event.metaKey)) return;
+      event.preventDefault();
+      if (event.deltaY < 0) zoomIn();
+      else if (event.deltaY > 0) zoomOut();
+    };
+    el.addEventListener("keydown", onKey);
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => {
+      el.removeEventListener("keydown", onKey);
+      el.removeEventListener("wheel", onWheel);
+    };
+  }, [zoomIn, zoomOut]);
+
   const pages = document?.numPages ?? 0;
   const canPrev = pageNumber > 1;
   const canNext = pages > 0 && pageNumber < pages;
@@ -208,11 +273,11 @@ export function PaperView({
           <button type="button" className="chip" onClick={() => setPageNumber((at) => Math.min(pages || at, at + 1))} disabled={!canNext}>
             Next
           </button>
-          <button type="button" className="chip" onClick={() => setScale((at) => Math.max(MIN_SCALE, roundScale(at - SCALE_STEP)))} disabled={scale <= MIN_SCALE}>
+          <button type="button" className="chip" onClick={zoomOut} disabled={scale <= MIN_SCALE}>
             −
           </button>
           <span className="paper-page">{Math.round(scale * 100)}%</span>
-          <button type="button" className="chip" onClick={() => setScale((at) => Math.min(MAX_SCALE, roundScale(at + SCALE_STEP)))} disabled={scale >= MAX_SCALE}>
+          <button type="button" className="chip" onClick={zoomIn} disabled={scale >= MAX_SCALE}>
             +
           </button>
         </div>
@@ -222,13 +287,14 @@ export function PaperView({
       <div
         ref={stage}
         className="paper-stage"
+        tabIndex={-1}
         aria-busy={status.kind === "loading"}
         onMouseUp={refreshSelection}
         onKeyUp={refreshSelection}
         onScroll={() => setMenu(null)}
       >
         {status.kind === "loading" && <p className="paper-status">{status.detail}…</p>}
-        <div className="paper-page-shell">
+        <div ref={shell} className="paper-page-shell">
           <canvas ref={canvas} className="paper-canvas" />
           <div ref={textLayer} className="paper-text-layer" />
         </div>

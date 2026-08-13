@@ -349,6 +349,18 @@ export function reload() {
   invoke("browser_reload", { id: tab.id }).catch((error) => failed("cannot reload", error));
 }
 
+export function zoom(delta: number) {
+  const tab = currentTab(state.tabs);
+  if (!tab) return;
+  invoke("browser_zoom", { id: tab.id, delta }).catch(() => {});
+}
+
+export function resetZoom() {
+  const tab = currentTab(state.tabs);
+  if (!tab) return;
+  invoke("browser_zoom", { id: tab.id, reset: true }).catch(() => {});
+}
+
 /**
  * A page the window was asked for — a link followed in a conversation.
  *
