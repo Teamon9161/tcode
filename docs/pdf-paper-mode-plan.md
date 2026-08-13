@@ -1424,3 +1424,123 @@ MVP 可能涉及这些文件：
 - 不把 PDF 当普通 text file/editor 打开。
 
 最终修正建议：**`Inspect(kind: "paper") + React/PDF.js PaperView + serve.rs 安全文件 URL + PaperContextEvent 注入现有 Composer`。**
+
+
+## 20. MVP 0.1.5：一键总结与论文导航增强
+
+MVP 0.1 已跑通"选文字 → 动作菜单 → 写入 composer"的闭环。0.1.5 在不引入后端改动的前提下，纯前端补齐最高投入产出比的论文阅读能力。
+
+### 20.1 已实现（MVP 0.1 基线）
+
+- PDF.js 渲染（canvas + text layer + HiDPI）
+- 单页翻页 + 缩放（按钮 + 键盘 Ctrl±/0 + 滚轮）
+- 双栏 selection 限制器（按点击侧静音对面栏 span）
+- 选区浮动菜单：Translate / Explain / Ask
+- paperPrompt 生成 `@paper("file", page N)` 引用
+- 写入 composer draft，不自动发送
+
+### 20.2 本阶段新增
+
+#### 20.2.1 全文文本提取（前端）
+
+用 PDF.js 的 `page.getTextContent()` 提取全部页面文本。这是总结功能的基础。
+
+```ts
+async function extractFullText(doc: PDFDocumentProxy): Promise<string[]> {
+  const pages: string[] = [];
+  for (let i = 1; i <= doc.numPages; i++) {
+    const page = await doc.getPage(i);
+    const content = await page.getTextContent();
+    const text = content.items
+      .filter((item): item is TextItem => "str" in item)
+      .map((item) => item.str)
+      .join("");
+    pages.push(text);
+  }
+  return pages;
+}
+```
+
+对超长论文（>50 页），取前 30 页 + 最后 5 页（结论/参考文献），避免超出 context window。
+
+#### 20.2.2 一键总结论文（Summarize Paper）
+
+toolbar 新增 Summarize 按钮（不依赖选区，始终可用）。点击后：
+
+1. 提取全文文本
+2. 生成结构化 prompt，要求 AI 输出：
+   - 一句话核心论点
+   - 研究动机与问题定义
+   - 方法要点（3-5 条）
+   - 主要发现与结论
+   - 局限性与未来方向
+   - 关键术语表（如有）
+3. 写入 composer draft
+
+prompt 模板：
+
+```text
+Summarize this academic paper @paper("filename"):
+
+<paper-text>
+{全文或截断文本}
+</paper-text>
+
+Please provide a structured summary:
+1. **Core thesis** (one sentence)
+2. **Motivation & problem**
+3. **Method** (3-5 key points)
+4. **Main findings & conclusions**
+5. **Limitations & future work**
+6. **Key terms** (if domain-specific)
+```
+
+#### 20.2.3 当前页总结（Summarize Page）
+
+toolbar 新增 Page 按钮，提取当前页文本，写入：
+
+```text
+Summarize page {N} of @paper("filename"):
+
+<page-text>
+{当前页文本}
+</page-text>
+
+Explain what this page covers: key points, definitions, formulas if any, and how it connects to the paper's overall argument.
+```
+
+#### 20.2.4 Outline/TOC 侧栏
+
+PDF.js 的 `doc.getOutline()` 返回章节树。在 paper-bar 下方增加可折叠 Outline 面板：
+
+- 点击章节跳转到对应页码（`outline[i].dest` → `doc.getPageIndex()`）
+- 嵌套层级用缩进表示
+- 当前页所在章节高亮
+- 没有 outline 的 PDF 隐藏该按钮
+
+#### 20.2.5 键盘翻页
+
+- `←` / `→`：上一页 / 下一页
+- `PgUp` / `PgDn`：上一页 / 下一页
+- `Home` / `End`：第一页 / 最后一页
+
+只在 paper-stage 聚焦时生效，不干扰 composer 输入。
+
+### 20.3 不做（留给 0.2+）
+
+- 高亮持久化与恢复（MVP 0.2）
+- AI 回答 → PDF 页面跳转（需后端 citation metadata，MVP 0.5）
+- 逐页走读模式（需连续请求编排）
+- 图表框选提问（需 canvas 截图 + vision model）
+- 连续滚动模式（需多页虚拟化渲染）
+- PDF 内搜索（Ctrl+F 跨页）
+- 记住阅读位置（需存储）
+- 术语表自动提取
+- 多论文对比
+
+### 20.4 设计约束
+
+1. **纯前端**：不新增后端命令、不引入 PyMuPDF、不加 SQLite。全部用 PDF.js 客户端能力。
+2. **composer 是唯一 AI 入口**：总结按钮写 draft 到 composer，用户决定发送。不自动发送、不新增 AI 侧栏。
+3. **不改 pane 结构**：outline 是 PaperView 内部的面板，不是新 pane kind。
+4. **token 样式**：新增 CSS 一律用 `var(--token)`，不写字面颜色/圆角/字号。

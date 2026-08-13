@@ -1,12 +1,20 @@
-import { useEffect, useRef } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 
-import { ChevronRight, CloseIcon } from "./components/Icons";
+import { ChevronRight, CloseIcon, FitIcon, ZoomInIcon, ZoomOutIcon } from "./components/Icons";
 
 export type GalleryImage = {
   url: string;
   label: string;
 };
+
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 10;
+const ZOOM_STEP = 1.2;
+
+function clampZoom(z: number) {
+  return Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+}
 
 /**
  * One focussed, full-screen reading surface for a related set of images.
@@ -29,9 +37,30 @@ export function ImageViewer({
 }) {
   const close = useRef<HTMLButtonElement>(null);
   const restore = useRef<HTMLElement | null>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const current = index === null ? null : images[index] ?? null;
   const canMove = images.length > 1;
   const open = index !== null;
+
+  const [zoom, setZoom] = useState(1);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const dragging = useRef(false);
+  const dragStart = useRef({ x: 0, y: 0 });
+  const panStart = useRef({ x: 0, y: 0 });
+
+  const resetView = useCallback(() => {
+    setZoom(1);
+    setPan({ x: 0, y: 0 });
+  }, []);
+
+  const zoomBy = useCallback((factor: number) => {
+    setZoom((prev) => clampZoom(prev * factor));
+  }, []);
+
+  // Reset view when switching images
+  useEffect(() => {
+    resetView();
+  }, [index, resetView]);
 
   useEffect(() => {
     if (!open) return;
@@ -52,6 +81,26 @@ export function ImageViewer({
         onClose();
         return;
       }
+
+      // Ctrl+= / Ctrl+- for zoom
+      if (event.ctrlKey || event.metaKey) {
+        if (event.key === "=" || event.key === "+") {
+          event.preventDefault();
+          zoomBy(ZOOM_STEP);
+          return;
+        }
+        if (event.key === "-") {
+          event.preventDefault();
+          zoomBy(1 / ZOOM_STEP);
+          return;
+        }
+        if (event.key === "0") {
+          event.preventDefault();
+          resetView();
+          return;
+        }
+      }
+
       if (!canMove || index === null) return;
       if (event.key === "ArrowLeft") {
         event.preventDefault();
@@ -65,11 +114,61 @@ export function ImageViewer({
     return () => {
       window.removeEventListener("keydown", onKeyDown, true);
     };
-  }, [canMove, images.length, index, onClose, onIndex]);
+  }, [canMove, images.length, index, onClose, onIndex, zoomBy, resetView]);
+
+  // Wheel zoom on the stage
+  useEffect(() => {
+    if (!open) return;
+    const stage = stageRef.current;
+    if (!stage) return;
+    const onWheel = (event: WheelEvent) => {
+      if (event.ctrlKey || event.metaKey) {
+        event.preventDefault();
+        const factor = event.deltaY < 0 ? ZOOM_STEP : 1 / ZOOM_STEP;
+        setZoom((prev) => clampZoom(prev * factor));
+      }
+    };
+    stage.addEventListener("wheel", onWheel, { passive: false });
+    return () => stage.removeEventListener("wheel", onWheel);
+  }, [open]);
+
+  // Drag-to-pan
+  useEffect(() => {
+    if (!open) return;
+    const onMove = (event: MouseEvent) => {
+      if (!dragging.current) return;
+      setPan({
+        x: panStart.current.x + (event.clientX - dragStart.current.x),
+        y: panStart.current.y + (event.clientY - dragStart.current.y),
+      });
+    };
+    const onUp = () => {
+      dragging.current = false;
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [open]);
 
   if (!current || index === null) return null;
 
   const move = (by: number) => onIndex((index + by + images.length) % images.length);
+
+  const onStageMouseDown = (event: React.MouseEvent) => {
+    if (event.button !== 0) return;
+    // Only start drag on the image area, not on step buttons
+    if ((event.target as HTMLElement).closest("button")) return;
+    event.preventDefault();
+    dragging.current = true;
+    dragStart.current = { x: event.clientX, y: event.clientY };
+    panStart.current = { ...pan };
+  };
+
+  const isZoomed = zoom !== 1;
+  const zoomPercent = Math.round(zoom * 100);
 
   return createPortal(
     <div
@@ -89,6 +188,37 @@ export function ImageViewer({
             {current.label}
             {canMove && <span>{index + 1} of {images.length}</span>}
           </p>
+          <div className="image-viewer-controls">
+            <button
+              type="button"
+              className="image-viewer-btn"
+              onClick={() => zoomBy(1 / ZOOM_STEP)}
+              aria-label="Zoom out"
+              title="Zoom out (Ctrl+-)"
+            >
+              <ZoomOutIcon size={16} />
+            </button>
+            <span className="image-viewer-zoom-level">{zoomPercent}%</span>
+            <button
+              type="button"
+              className="image-viewer-btn"
+              onClick={() => zoomBy(ZOOM_STEP)}
+              aria-label="Zoom in"
+              title="Zoom in (Ctrl++)"
+            >
+              <ZoomInIcon size={16} />
+            </button>
+            <button
+              type="button"
+              className="image-viewer-btn"
+              onClick={resetView}
+              aria-label="Fit to screen"
+              title="Fit to screen (Ctrl+0)"
+              disabled={!isZoomed && pan.x === 0 && pan.y === 0}
+            >
+              <FitIcon size={16} />
+            </button>
+          </div>
           <button
             ref={close}
             type="button"
@@ -101,7 +231,13 @@ export function ImageViewer({
           </button>
         </header>
 
-        <div className="image-viewer-stage">
+        <div
+          ref={stageRef}
+          className="image-viewer-stage"
+          style={{ cursor: isZoomed ? "grab" : undefined }}
+          onMouseDown={onStageMouseDown}
+          onDoubleClick={resetView}
+        >
           {canMove && (
             <button
               type="button"
@@ -113,7 +249,16 @@ export function ImageViewer({
               <ChevronRight size={22} />
             </button>
           )}
-          <img src={current.url} alt={current.label} />
+          <div className="image-viewer-canvas">
+            <img
+              src={current.url}
+              alt={current.label}
+              draggable={false}
+              style={{
+                transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`,
+              }}
+            />
+          </div>
           {canMove && (
             <button
               type="button"

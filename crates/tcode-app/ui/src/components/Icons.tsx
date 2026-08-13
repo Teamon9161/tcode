@@ -297,6 +297,28 @@ export const TerminalIcon = (props: IconProps) => (
   </Glyph>
 );
 
+export const ZoomInIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <circle cx="11" cy="11" r="7.5" />
+    <path d="m16.5 16.5 4 4" />
+    <path d="M8 11h6M11 8v6" />
+  </Glyph>
+);
+
+export const ZoomOutIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <circle cx="11" cy="11" r="7.5" />
+    <path d="m16.5 16.5 4 4" />
+    <path d="M8 11h6" />
+  </Glyph>
+);
+
+export const FitIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M4 14v4a2 2 0 0 0 2 2h4M14 20h4a2 2 0 0 0 2-2v-4M20 10V6a2 2 0 0 0-2-2h-4M10 4H6a2 2 0 0 0-2 2v4" />
+  </Glyph>
+);
+
 export const SettingsIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="M4 8h10M18 8h2M4 16h4M12 16h8" />

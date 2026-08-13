@@ -7392,6 +7392,95 @@ button.strip-phase-line:hover .strip-phase-name {
   white-space: nowrap;
 }
 
+.paper-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--line);
+}
+
+.paper-body {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+.paper-outline {
+  flex: none;
+  width: 220px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  border-right: 1px solid var(--line);
+  padding: var(--s-2) 0;
+  font-size: var(--text-xs);
+  background: var(--bg);
+}
+
+.paper-outline-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.paper-outline-item {
+  margin: 0;
+}
+
+.paper-outline-row {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-1);
+  padding-inline: var(--s-2);
+}
+
+.paper-outline-toggle {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--faint);
+  cursor: pointer;
+}
+
+.paper-outline-toggle:hover {
+  color: var(--body);
+}
+
+.paper-outline-toggle-spacer {
+  flex: none;
+  width: 16px;
+}
+
+.paper-outline-link {
+  flex: 1;
+  min-width: 0;
+  padding: var(--s-1) 0;
+  border: none;
+  background: none;
+  color: var(--body);
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: var(--r-sm);
+}
+
+.paper-outline-link:hover {
+  color: var(--brand);
+}
+
+.paper-outline-link.is-current {
+  color: var(--brand);
+  font-weight: 600;
+}
+
 .paper-stage {
   position: relative;
   display: grid;
@@ -7568,7 +7657,8 @@ button.strip-phase-line:hover .strip-phase-name {
 
 /* The image viewer is an inspection surface, not a second pane: it gives the
    source image the entire working window while keeping the conversation behind
-   it intact. */
+   it intact. The stage uses a dark translucent background so the image reads
+   against a neutral field regardless of theme. */
 .image-viewer-backdrop {
   position: fixed;
   z-index: var(--z-dialog);
@@ -7593,7 +7683,6 @@ button.strip-phase-line:hover .strip-phase-name {
 .image-viewer-head {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: var(--s-3);
   min-height: 42px;
   padding: var(--s-1) var(--s-2) var(--s-1) var(--s-3);
@@ -7615,6 +7704,21 @@ button.strip-phase-line:hover .strip-phase-name {
   flex: none;
   color: var(--muted);
 }
+.image-viewer-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+  margin-left: auto;
+}
+.image-viewer-zoom-level {
+  min-width: 3.5ch;
+  text-align: center;
+  font-size: var(--text-xs);
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+.image-viewer-btn,
 .image-viewer-close,
 .image-viewer-step {
   display: grid;
@@ -7626,15 +7730,25 @@ button.strip-phase-line:hover .strip-phase-name {
   color: var(--body);
   cursor: pointer;
 }
+.image-viewer-btn {
+  width: 28px;
+  height: 28px;
+}
+.image-viewer-btn:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
 .image-viewer-close {
   width: 30px;
   height: 30px;
 }
+.image-viewer-btn:not(:disabled):hover,
 .image-viewer-close:hover,
 .image-viewer-step:hover {
   background: var(--hover);
   color: var(--ink);
 }
+.image-viewer-btn:focus-visible,
 .image-viewer-close:focus-visible,
 .image-viewer-step:focus-visible {
   outline: 1px solid var(--focus-ring);
@@ -7648,16 +7762,26 @@ button.strip-phase-line:hover .strip-phase-name {
   min-height: 0;
   height: 100%;
   padding: var(--s-3);
-  background: var(--bg);
+  background: color-mix(in oklab, var(--ink) 12%, var(--bg));
 }
-.image-viewer-stage img {
+.image-viewer-canvas {
+  display: grid;
+  place-items: center;
+  min-width: 0;
+  min-height: 0;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+}
+.image-viewer-canvas img {
   display: block;
   max-width: 100%;
   max-height: 100%;
   width: auto;
   height: auto;
-  margin: auto;
   object-fit: contain;
+  transform-origin: center center;
+  transition: transform 0.15s ease-out;
 }
 .image-viewer-step {
   width: 36px;
