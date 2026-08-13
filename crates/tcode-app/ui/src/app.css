@@ -35,6 +35,7 @@
    separates a pane from the window it sits in, and adding a line where the tone
    already changed is what makes a window look assembled out of parts. */
 .panes {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
@@ -184,11 +185,62 @@
   background: transparent;
   transition: background var(--dur-fast) var(--ease);
 }
-/* While a seam is being dragged the window is not a document to select from.
-   Set for the length of the drag by `Panes.tsx`, cleared on pointerup and on
-   the cancel the platform can send instead. */
-body.is-resizing {
+/* While a seam or pane header is being dragged the window is not a document to
+   select from. Both states are owned by `Panes.tsx` and cleared on every normal
+   release, platform cancellation, Escape, and unmount. */
+body.is-resizing,
+body.is-pane-dragging {
   user-select: none;
+}
+
+/* Pane relocation starts only from header space that is not itself a control or
+   name. The actual pane stays put while the hand moves; this cursor is the only
+   feedback on the source, leaving the destination preview to say what happens. */
+.panes.is-split .pane-head {
+  cursor: grab;
+}
+.panes.is-split .pane-head :is(button, a, input, textarea, select, .folder-chip, .pane-name-text) {
+  cursor: revert;
+}
+body.is-pane-dragging,
+body.is-pane-dragging .pane-head {
+  cursor: grabbing;
+}
+
+/* One restrained destination, never a floating pane clone. Its rectangle is
+   either the target itself (exchange) or the half that receives the source. */
+.pane-drop-preview {
+  position: absolute;
+  z-index: var(--z-sticky);
+  display: grid;
+  place-items: center;
+  padding: calc(var(--gutter) / 2 + var(--s-2));
+  pointer-events: none;
+  border: 1px solid var(--brand);
+  border-radius: var(--r-sm);
+  background: color-mix(in oklab, var(--brand-wash) 82%, transparent);
+  box-shadow: inset 0 0 0 calc(var(--gutter) / 2) color-mix(in oklab, var(--brand) 9%, transparent);
+  animation: pane-drop-in var(--dur-fast) var(--ease);
+}
+.pane-drop-preview span {
+  padding: 2px var(--s-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-xs);
+  background: var(--bg);
+  color: var(--brand-text);
+  font-size: var(--text-2xs);
+  font-weight: var(--weight-medium);
+  box-shadow: var(--shadow-lift);
+}
+@keyframes pane-drop-in {
+  from {
+    opacity: 0;
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .pane-drop-preview {
+    animation: none;
+  }
 }
 
 .seam.is-row {
@@ -7588,4 +7640,85 @@ button.strip-phase-line:hover .strip-phase-name {
   .image-viewer { border-radius: var(--r-md); }
   .image-viewer-stage { padding: var(--s-1); }
   .image-viewer-step { width: 30px; }
+}
+
+
+/* ---- pane layout help ------------------------------------------------------
+
+   A window-level reference, anchored under the layout glyph. It stays compact:
+   the content is a vocabulary, not a second settings surface. */
+.layout-help {
+  left: var(--seat-left, var(--s-4));
+  top: calc(var(--seat-top, var(--s-6)) + var(--s-1));
+  width: min(25rem, calc(100vw - var(--s-6)));
+  max-width: calc(100vw - var(--seat-left, 0px) - var(--s-4));
+  max-height: calc(var(--seat-below, 100vh) - var(--s-3));
+  overflow-y: auto;
+}
+.layout-help-head {
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+.layout-help-head h2 {
+  margin: 0;
+  color: var(--ink);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+}
+.layout-help-head p {
+  margin: var(--s-1) 0 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+.layout-help-keys {
+  display: flex;
+  flex-direction: column;
+  gap: var(--s-1);
+  margin: 0;
+  padding: var(--s-2);
+}
+.layout-help-keys > div {
+  display: grid;
+  grid-template-columns: minmax(10rem, auto) minmax(0, 1fr);
+  gap: var(--s-3);
+  align-items: baseline;
+  padding: var(--s-1) var(--s-2);
+}
+.layout-help-keys dt {
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+}
+.layout-help-keys dd {
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--text-xs);
+}
+
+/* Keyboard resize is intentionally modal, so its exit cannot be hidden in a
+   tooltip. It occupies the title bar's drag-region space without moving or
+   covering any pane content. */
+.pane-resize-hint {
+  display: flex;
+  align-items: baseline;
+  gap: var(--s-2);
+  flex: none;
+  padding: 0 var(--s-2);
+  color: var(--muted);
+  font-size: var(--text-xs);
+  pointer-events: none;
+}
+.pane-resize-hint strong {
+  color: var(--ink);
+  font-weight: var(--weight-semibold);
+}
+.pane-resize-hint kbd {
+  padding: 1px var(--s-1);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: var(--sunken);
+  color: var(--ink);
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
 }

@@ -33,8 +33,10 @@ export function inTerminal(target: EventTarget | null): boolean {
  *    leave is a trap. The cost is that a terminal can no longer be sent a bare
  *    `^J` (line feed, which is what `Enter` sends anyway); that is the price of
  *    the one binding this pane exists behind.
- *  - `Mod+Alt+←↑↓→` and `Mod+Alt+R`, which move between panes and turn a seam.
- *    Nothing in a shell uses `Ctrl+Alt`.
+ *  - `Mod+Alt+←↑↓→`, with Shift for exchange; `Enter` for promote;
+ *    `F` for expand; `Space` for resize mode; and `R`/`S` for seam actions.
+ *    Nothing in a shell uses `Ctrl+Alt`, and keeping the whole layout vocabulary
+ *    here prevents one of those actions from also reaching the PTY.
  *  - `Mod+Shift+T` / `Mod+Shift+W`, the tab verbs, spelled the way every
  *    terminal emulator already spells them.
  *
@@ -45,7 +47,7 @@ export function inTerminal(target: EventTarget | null): boolean {
 export function appOwnedInTerminal(event: KeyboardEvent): boolean {
   if (!modKey(event)) return false;
   if (event.altKey) {
-    return /^(Arrow(Left|Right|Up|Down)|r|R)$/.test(event.key);
+    return /^(Arrow(Left|Right|Up|Down)|Enter| |f|F|r|R|s|S)$/.test(event.key);
   }
   if (event.shiftKey) return /^[tTwW]$/.test(event.key);
   return event.key === "j" || event.key === "J";

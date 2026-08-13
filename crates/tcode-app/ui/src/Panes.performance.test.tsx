@@ -115,6 +115,8 @@ function paneContext(sessions: SessionInfo[] = []): PaneContext {
     split: true,
     onFocus: none,
     onClosePane: none,
+    onMovePane: none,
+    onPaneDragging: none,
     onRotate: none,
     onSwap: none,
     onRatio: none,

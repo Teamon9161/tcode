@@ -43,6 +43,7 @@ vi.mock("pdfjs-dist", () => ({
 }));
 vi.mock("pdfjs-dist/build/pdf.worker.mjs?url", () => ({ default: "pdf.worker.mjs" }));
 
+import { browserPlacementHeld, resetBrowserVisibility } from "./browserYield";
 import { navOf, type Inspect } from "./inspect";
 import type { Tiling } from "./layout";
 import { Panes, type PaneContext } from "./Panes";
@@ -75,6 +76,49 @@ function tiling(value: Inspect): Tiling {
   };
 }
 
+function twoSessions(): Tiling {
+  return {
+    root: {
+      kind: "split",
+      id: "split",
+      dir: "row",
+      ratio: 0.5,
+      a: { kind: "leaf", id: "pane-a", pane: { kind: "session", session: "s" } },
+      b: { kind: "leaf", id: "pane-b", pane: { kind: "session", session: "t" } },
+    },
+    focus: "pane-a",
+  };
+}
+
+function rect(left: number, top: number, width: number, height: number): DOMRect {
+  return {
+    x: left,
+    y: top,
+    left,
+    top,
+    width,
+    height,
+    right: left + width,
+    bottom: top + height,
+    toJSON: () => ({}),
+  };
+}
+
+function pointer(type: string, x: number, y: number, pointerId = 1): PointerEvent {
+  const event = new MouseEvent(type, {
+    clientX: x,
+    clientY: y,
+    button: 0,
+    bubbles: true,
+    cancelable: true,
+  }) as PointerEvent;
+  Object.defineProperties(event, {
+    pointerId: { value: pointerId },
+    isPrimary: { value: true },
+  });
+  return event;
+}
+
 function paneContext(focus = "inspect-pane"): PaneContext {
   const none = () => {};
   return {
@@ -83,6 +127,8 @@ function paneContext(focus = "inspect-pane"): PaneContext {
     split: true,
     onFocus: none,
     onClosePane: none,
+    onMovePane: none,
+    onPaneDragging: none,
     onRotate: none,
     onSwap: none,
     onRatio: none,
@@ -154,12 +200,48 @@ async function drawSession(nextContext = context) {
   });
 }
 
+async function drawTwo(nextContext: PaneContext) {
+  mocks.invoke.mockResolvedValue({
+    models: [],
+    role_models: [],
+    model: -1,
+    effort: null,
+    context_window: 0,
+    presets: [],
+    preset: null,
+    roles: [],
+    modes: [],
+    mode: "default",
+    mode_staged: false,
+    can_view_images: false,
+  });
+  await act(async () => {
+    root.render(
+      <Panes
+        tiling={twoSessions()}
+        context={nextContext}
+        stateOf={() => BLANK}
+        statusOf={() => "idle"}
+      />,
+    );
+    await Promise.resolve();
+  });
+  const field = container.querySelector<HTMLElement>(".panes-field")!;
+  const a = container.querySelector<HTMLElement>('[data-pane="pane-a"]')!;
+  const b = container.querySelector<HTMLElement>('[data-pane="pane-b"]')!;
+  field.getBoundingClientRect = () => rect(0, 0, 1000, 600);
+  a.getBoundingClientRect = () => rect(0, 0, 500, 600);
+  b.getBoundingClientRect = () => rect(500, 0, 500, 600);
+  return { a, b };
+}
+
 function editor(): EditorView | null {
   const dom = container.querySelector<HTMLElement>(".cm-editor");
   return dom ? EditorView.findFromDOM(dom) : null;
 }
 
 beforeEach(() => {
+  resetBrowserVisibility();
   container = document.createElement("div");
   document.body.appendChild(container);
   root = createRoot(container);
@@ -170,6 +252,133 @@ beforeEach(() => {
 afterEach(() => {
   act(() => root.unmount());
   container.remove();
+});
+
+describe("pane header drag", () => {
+  it("commits one center exchange only after release", async () => {
+    const onMovePane = vi.fn();
+    const onPaneDragging = vi.fn();
+    const next = {
+      ...paneContext("pane-a"),
+      sessions: [
+        { id: "s", cwd: "/a", name: "a", home: "/home/me", log_id: null },
+        { id: "t", cwd: "/b", name: "b", home: "/home/me", log_id: null },
+      ],
+      onMovePane,
+      onPaneDragging,
+    };
+    const { a } = await drawTwo(next);
+    const header = a.querySelector<HTMLElement>(".pane-head")!;
+
+    act(() => {
+      header.dispatchEvent(pointer("pointerdown", 100, 16));
+      window.dispatchEvent(pointer("pointermove", 750, 300));
+    });
+    expect(onMovePane).not.toHaveBeenCalled();
+    expect(onPaneDragging).toHaveBeenCalledWith(true);
+    expect(browserPlacementHeld()).toBe(true);
+    expect(container.querySelector(".pane-drop-preview.is-center")?.textContent).toBe(
+      "Exchange panes",
+    );
+
+    act(() => window.dispatchEvent(pointer("pointerup", 750, 300)));
+    expect(onMovePane).toHaveBeenCalledOnce();
+    expect(onMovePane).toHaveBeenCalledWith("pane-a", "pane-b", "center");
+    expect(onPaneDragging).toHaveBeenLastCalledWith(false);
+  });
+
+  it.each([
+    [510, 300, "left", "Place left"],
+    [990, 300, "right", "Place right"],
+    [750, 5, "up", "Place above"],
+    [750, 595, "down", "Place below"],
+  ] as const)("classifies the target edge as %s,%s %s", async (x, y, zone, label) => {
+    const onMovePane = vi.fn();
+    const next = {
+      ...paneContext("pane-a"),
+      sessions: [
+        { id: "s", cwd: "/a", name: "a", home: "/home/me", log_id: null },
+        { id: "t", cwd: "/b", name: "b", home: "/home/me", log_id: null },
+      ],
+      onMovePane,
+    };
+    const { a } = await drawTwo(next);
+    const header = a.querySelector<HTMLElement>(".pane-head")!;
+
+    act(() => {
+      header.dispatchEvent(pointer("pointerdown", 100, 16));
+      window.dispatchEvent(pointer("pointermove", x, y));
+      window.dispatchEvent(pointer("pointerup", x, y));
+    });
+    expect(onMovePane).toHaveBeenCalledWith("pane-a", "pane-b", zone);
+    expect(container.textContent).not.toContain(label);
+  });
+
+  it("survives the focus render caused by its own pointer down", async () => {
+    const onMovePane = vi.fn();
+    let next = {
+      ...paneContext("pane-b"),
+      sessions: [
+        { id: "s", cwd: "/a", name: "a", home: "/home/me", log_id: null },
+        { id: "t", cwd: "/b", name: "b", home: "/home/me", log_id: null },
+      ],
+      onMovePane,
+      onFocus: (focus: string) => {
+        next = { ...next, focus };
+        root.render(
+          <Panes
+            tiling={twoSessions()}
+            context={next}
+            stateOf={() => BLANK}
+            statusOf={() => "idle"}
+          />,
+        );
+      },
+    };
+    const { a } = await drawTwo(next);
+    const header = a.querySelector<HTMLElement>(".pane-head")!;
+
+    act(() => {
+      header.dispatchEvent(pointer("pointerdown", 100, 16));
+      window.dispatchEvent(pointer("pointermove", 750, 300));
+      window.dispatchEvent(pointer("pointerup", 750, 300));
+    });
+    expect(onMovePane).toHaveBeenCalledWith("pane-a", "pane-b", "center");
+  });
+
+  it("cancels with Escape and does not steal a header button", async () => {
+    const onMovePane = vi.fn();
+    const onPaneDragging = vi.fn();
+    const next = {
+      ...paneContext("pane-a"),
+      sessions: [
+        { id: "s", cwd: "/a", name: "a", home: "/home/me", log_id: null },
+        { id: "t", cwd: "/b", name: "b", home: "/home/me", log_id: null },
+      ],
+      onMovePane,
+      onPaneDragging,
+    };
+    const { a } = await drawTwo(next);
+    const header = a.querySelector<HTMLElement>(".pane-head")!;
+    act(() => {
+      header.dispatchEvent(pointer("pointerdown", 100, 16));
+      window.dispatchEvent(pointer("pointermove", 750, 300));
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    });
+    expect(onMovePane).not.toHaveBeenCalled();
+    expect(onPaneDragging).toHaveBeenLastCalledWith(false);
+    expect(browserPlacementHeld()).toBe(false);
+    expect(container.querySelector(".pane-drop-preview")).toBeNull();
+
+    const close = a.querySelector<HTMLElement>('[aria-label="Hide a"]')!;
+    act(() => {
+      close.dispatchEvent(pointer("pointerdown", 450, 16));
+      window.dispatchEvent(pointer("pointermove", 750, 300));
+      window.dispatchEvent(pointer("pointerup", 750, 300));
+    });
+    expect(onPaneDragging).toHaveBeenCalledTimes(2);
+    expect(onMovePane).not.toHaveBeenCalled();
+  });
 });
 
 describe("conversation pane folder switcher", () => {

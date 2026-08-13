@@ -1166,7 +1166,23 @@ function FirstRun() {
         </div>
         <div>
           <dt>{MOD} + Alt + ← ↑ ↓ →</dt>
-          <dd>move between panes</dd>
+          <dd>focus a pane</dd>
+        </div>
+        <div>
+          <dt>{MOD} + Alt + Shift + ← ↑ ↓ →</dt>
+          <dd>exchange with a neighbor</dd>
+        </div>
+        <div>
+          <dt>{MOD} + Alt + Enter</dt>
+          <dd>make this pane a main half</dd>
+        </div>
+        <div>
+          <dt>{MOD} + Alt + F</dt>
+          <dd>expand or restore this pane</dd>
+        </div>
+        <div>
+          <dt>{MOD} + Alt + Space</dt>
+          <dd>resize mode</dd>
         </div>
         <div>
           <dt>{MOD} + W</dt>

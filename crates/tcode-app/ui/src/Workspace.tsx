@@ -10,6 +10,7 @@ import {
   findLeaf,
   focusPane,
   focused,
+  movePane,
   navigate,
   openAside,
   openInspect,
@@ -17,10 +18,13 @@ import {
   paneSession,
   panes,
   parentSplit,
+  promotePane,
+  resizePane,
   rotate,
   sessionsInView,
   setRatio,
   swap,
+  swapPanes,
   show,
   showBeside,
   toggleTerminal,
@@ -36,6 +40,7 @@ import { GlobeIcon, SidebarIcon, TerminalIcon } from "./components/Icons";
 import { cwdForTerminal } from "./terminal";
 import { sessionTitle, type FoundSession } from "./railData";
 import { Finder } from "./Finder";
+import { LayoutHelp } from "./LayoutHelp";
 import { Panes, type PaneContext } from "./Panes";
 import { SettingsPanel } from "./DisplayMenu";
 import { UpdateIndicator } from "./UpdateIndicator";
@@ -136,6 +141,16 @@ export function Workspace({
   // A temporary viewing mode, not a layout operation: keeping it here preserves
   // the full tiling tree and every pane's local state for the return trip.
   const [expanded, setExpanded] = useState<string | null>(null);
+  // Resize is modal so the arrows remain easy to press. The pane id is captured
+  // on entry: a mode that silently follows a later focus change would resize a
+  // different pane than the one named when it began.
+  const [resizeTarget, setResizeTarget] = useState<string | null>(null);
+  // A ref because the Escape listener must observe drag activation immediately,
+  // before React's state scheduling can render another handler closure.
+  const paneDragging = useRef(false);
+  const setPaneDragging = useCallback((dragging: boolean) => {
+    paneDragging.current = dragging;
+  }, []);
   // The page the browser has been asked for, if any. Window-level like the
   // browser itself: a link is followed *into* the one browser this window has,
   // whichever conversation it was written in.
@@ -153,8 +168,39 @@ export function Workspace({
   latestStateOf.current = stateOf;
 
   useEffect(() => {
-    if (expanded && !findLeaf(tiling, expanded)) setExpanded(null);
+    if (
+      expanded &&
+      (expanded !== tiling.focus || !findLeaf(tiling, expanded))
+    ) {
+      setExpanded(null);
+    }
   }, [expanded, tiling]);
+
+  useEffect(() => {
+    if (
+      resizeTarget &&
+      (narrow || resizeTarget !== tiling.focus || !findLeaf(tiling, resizeTarget))
+    ) {
+      setResizeTarget(null);
+    }
+  }, [narrow, resizeTarget, tiling]);
+
+  useEffect(() => {
+    if (!resizeTarget) return;
+    document.body.classList.add("is-keyboard-resizing");
+    const onKey = (event: KeyboardEvent) => {
+      const direction = ARROWS[event.key];
+      if (!direction) return;
+      event.preventDefault();
+      event.stopPropagation();
+      onTiling((current) => resizePane(current, resizeTarget, direction));
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("keydown", onKey, true);
+      document.body.classList.remove("is-keyboard-resizing");
+    };
+  }, [resizeTarget, onTiling]);
 
   // Bound once rather than written inline in the rail's props, for the reason
   // every handler here is: a fresh arrow each render is a changed prop.
@@ -272,6 +318,7 @@ export function Workspace({
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
+      if (paneDragging.current) return;
       // Escape belongs to the innermost thing that can take it, and this — the
       // pane — is the outermost. Both of the things ahead of it listen on
       // `window` in the capture phase too, where `stopPropagation` cannot
@@ -284,6 +331,12 @@ export function Workspace({
       // editor. Escape must never be the key that throws away what you were
       // writing — that is the same rule the composer's own Escape follows.
       if (document.querySelector(".seated")) return;
+      if (resizeTarget) {
+        event.preventDefault();
+        event.stopPropagation();
+        setResizeTarget(null);
+        return;
+      }
       if (isTyping(event.target)) return;
       if (expanded) {
         event.stopPropagation();
@@ -297,7 +350,7 @@ export function Workspace({
     };
     window.addEventListener("keydown", onKey, true);
     return () => window.removeEventListener("keydown", onKey, true);
-  }, [tiling, onTiling, expanded]);
+  }, [tiling, onTiling, expanded, resizeTarget]);
 
   /**
    * Driving the layout from the keyboard.
@@ -309,10 +362,14 @@ export function Workspace({
    *   Mod+N            start a fresh conversation in this pane's folder
    *   Mod+1…9          show that conversation here
    *   Mod+Shift+1…9    open it beside this one
-   *   Mod+Alt+←↑↓→     move focus to the pane that way
-   *   Mod+W            close this pane (the conversation keeps running)
-   *   Mod+Alt+R        turn this split from side-by-side to stacked
-   *   Mod+Alt+S        exchange the two sides of this split
+   *   Mod+Alt+←↑↓→           focus the pane that way
+   *   Mod+Alt+Shift+←↑↓→     exchange this pane with its neighbor
+   *   Mod+Alt+Enter          promote this pane to a root half
+   *   Mod+Alt+F              temporarily expand or restore this pane
+   *   Mod+Alt+Space          enter pane resize mode (arrows grow, Esc exits)
+   *   Mod+W                  close this pane (the conversation keeps running)
+   *   Mod+Alt+R              turn this split from side-by-side to stacked
+   *   Mod+Alt+S              exchange both sides of this split
    *   Mod+J            show, focus, or hide the terminals
    *
    * Digits are read from `event.code`, not `event.key`: with Shift down the
@@ -329,6 +386,7 @@ export function Workspace({
     const onKey = (event: KeyboardEvent) => {
       if (!(event.ctrlKey || event.metaKey)) return;
       const shell = inTerminal(event.target);
+      if (resizeTarget) return;
 
       // First, because it is the one binding that has to work from anywhere —
       // including from inside the terminal it hides.
@@ -386,15 +444,36 @@ export function Workspace({
 
       if (event.altKey && ARROWS[event.key]) {
         event.preventDefault();
-        const boxes = new Map<string, Box>();
-        for (const node of document.querySelectorAll<HTMLElement>(
-          "[data-pane]",
-        )) {
-          const id = node.dataset.pane;
-          if (id) boxes.set(id, node.getBoundingClientRect());
+        const next = nearestPane(paneBoxes(), tiling.focus, ARROWS[event.key]);
+        if (next) {
+          onTiling((current) =>
+            event.shiftKey
+              ? swapPanes(current, current.focus, next)
+              : focusPane(current, next),
+          );
         }
-        const next = nearestPane(boxes, tiling.focus, ARROWS[event.key]);
-        if (next) onTiling((current) => focusPane(current, next));
+        return;
+      }
+
+      if (event.altKey && event.key === "Enter") {
+        event.preventDefault();
+        onTiling((current) => promotePane(current, current.focus));
+        return;
+      }
+
+      if (event.altKey && (event.key === "f" || event.key === "F")) {
+        event.preventDefault();
+        const pane = tiling.focus;
+        setExpanded((current) => (current === pane ? null : pane));
+        return;
+      }
+
+      if (event.altKey && event.code === "Space") {
+        event.preventDefault();
+        if (!narrow && tiling.root?.kind === "split") {
+          setExpanded(null);
+          setResizeTarget(tiling.focus);
+        }
         return;
       }
 
@@ -427,7 +506,7 @@ export function Workspace({
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [sessions, tiling, onTiling, onOpenFolder]);
+  }, [sessions, tiling, onTiling, onOpenFolder, narrow, resizeTarget]);
 
   // Each of these is written once rather than rebuilt in the object literal
   // below, and that is not tidiness: a pane compares the handlers it was given
@@ -552,6 +631,11 @@ export function Workspace({
     (seam: string) => onTiling((current) => swap(current, seam)),
     [onTiling],
   );
+  const movePaneByDrag = useCallback<PaneContext["onMovePane"]>(
+    (moving, target, drop) =>
+      onTiling((current) => movePane(current, moving, target, drop)),
+    [onTiling],
+  );
   const toggleExpanded = useCallback(
     (pane: string) => {
       onTiling((current) => focusPane(current, pane));
@@ -568,6 +652,8 @@ export function Workspace({
       split,
       onFocus: focusOn,
       onClosePane: closePane,
+      onMovePane: movePaneByDrag,
+      onPaneDragging: setPaneDragging,
       onRotate: turnSeam,
       onSwap: swapSeam,
       onRatio: ratio,
@@ -611,6 +697,8 @@ export function Workspace({
       split,
       focusOn,
       closePane,
+      movePaneByDrag,
+      setPaneDragging,
       turnSeam,
       swapSeam,
       ratio,
@@ -715,6 +803,15 @@ export function Workspace({
         >
           <TerminalIcon size={15} />
         </button>
+        <LayoutHelp />
+        {resizeTarget && (
+          <div className="pane-resize-hint" role="status">
+            <strong>Resize pane</strong>
+            <span>Arrows grow</span>
+            <kbd>Esc</kbd>
+            <span>done</span>
+          </div>
+        )}
         {/* What the window draws, not what any conversation holds — which is why
             it passes the bar's own test (rule 9c) where a session action would
             not. With the window split, "show reasoning" cannot mean one thing in
@@ -748,6 +845,7 @@ export function Workspace({
           context={context}
           stateOf={stateOf}
           statusOf={statusOf}
+          resizeTarget={resizeTarget}
         />
       ) : (
         <FieldEmpty />
@@ -762,6 +860,15 @@ const ARROWS: Record<string, Dir4> = {
   ArrowUp: "up",
   ArrowDown: "down",
 };
+
+function paneBoxes(): Map<string, Box> {
+  const boxes = new Map<string, Box>();
+  for (const node of document.querySelectorAll<HTMLElement>("[data-pane]")) {
+    const id = node.dataset.pane;
+    if (id) boxes.set(id, node.getBoundingClientRect());
+  }
+  return boxes;
+}
 
 /** True while the window is too narrow to tile. `matchMedia` rather than a
  *  resize listener: the browser only tells us when the answer changes. */

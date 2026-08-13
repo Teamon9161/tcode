@@ -7,6 +7,7 @@ import {
   useRef,
   useState,
   type CSSProperties,
+  type PointerEvent as ReactPointerEvent,
   type RefObject,
 } from "react";
 
@@ -25,6 +26,7 @@ import {
   frames,
   paneSession,
   type Leaf,
+  type PaneDrop,
   type PlacedDivider,
   type Rect,
   type Tiling,
@@ -105,6 +107,10 @@ export type PaneContext = {
   split: boolean;
   onFocus: (pane: string) => void;
   onClosePane: (pane: string) => void;
+  /** Commit one completed header drag; pointer movement never reaches layout. */
+  onMovePane: (moving: string, target: string, drop: PaneDrop) => void;
+  /** Lets outer Escape handlers stand down while this inner interaction owns it. */
+  onPaneDragging: (dragging: boolean) => void;
   /** Turn a seam: the two panes it separates swap between beside and stacked. */
   onRotate: (divider: string) => void;
   /** Exchange the two subtrees the seam separates, preserving their pane ids. */
@@ -201,17 +207,116 @@ export function Panes({
   context,
   stateOf,
   statusOf,
+  resizeTarget = null,
 }: {
   tiling: Tiling;
   context: PaneContext;
   stateOf: (session: string) => SessionState;
   statusOf: (session: string) => Status;
+  resizeTarget?: string | null;
 }) {
   const field = useRef<HTMLDivElement>(null);
+  const [dropPreview, setDropPreview] = useState<DropPreview | null>(null);
+  const drag = useRef<PaneDrag | null>(null);
+  const movePane = useRef(context.onMovePane);
+  const paneDragging = useRef(context.onPaneDragging);
+  movePane.current = context.onMovePane;
+  paneDragging.current = context.onPaneDragging;
   const { panes, dividers } = useMemo(() => frames(tiling), [tiling]);
   const expanded = panes.some(({ leaf }) => leaf.id === context.expanded)
     ? context.expanded
     : null;
+
+  const finishDrag = useCallback(
+    (commit: boolean) => {
+      const current = drag.current;
+      if (!current) return;
+      drag.current = null;
+      window.removeEventListener("pointermove", current.move, true);
+      window.removeEventListener("pointerup", current.up, true);
+      window.removeEventListener("pointercancel", current.cancel, true);
+      window.removeEventListener("keydown", current.key, true);
+      document.body.classList.remove("is-pane-dragging");
+      if (current.active) paneDragging.current(false);
+      setDropPreview(null);
+      const dropped = commit && current.active ? current.drop : null;
+      if (dropped) {
+        movePane.current(current.moving, dropped.target, dropped.zone);
+        // Let React commit the final tree first. If FLIP starts, its counted
+        // browser hold overlaps this release; otherwise the coordinator reads
+        // the one final placement on the following frame.
+        if (current.restore) requestAnimationFrame(current.restore);
+      } else {
+        current.restore?.();
+      }
+    },
+    [],
+  );
+
+  const beginDrag = useCallback(
+    (event: ReactPointerEvent<HTMLElement>, moving: string) => {
+      if (
+        expanded ||
+        !context.split ||
+        event.button !== 0 ||
+        !event.isPrimary ||
+        !dragHandle(event.target)
+      ) {
+        return;
+      }
+
+      const pointerId = event.pointerId;
+      const started = { x: event.clientX, y: event.clientY };
+      const current: PaneDrag = {
+        moving,
+        started,
+        active: false,
+        drop: null,
+        restore: null,
+        move: () => {},
+        up: () => {},
+        cancel: () => {},
+        key: () => {},
+      };
+      current.move = (moved) => {
+        if (moved.pointerId !== pointerId) return;
+        if (!current.active) {
+          if (Math.hypot(moved.clientX - started.x, moved.clientY - started.y) < 6) {
+            return;
+          }
+          current.active = true;
+          current.restore = yieldBrowser();
+          paneDragging.current(true);
+          document.body.classList.add("is-pane-dragging");
+          window.getSelection()?.removeAllRanges();
+        }
+        current.drop = dropAt(field.current, moving, moved.clientX, moved.clientY);
+        setDropPreview(current.drop);
+      };
+      current.up = (released) => {
+        if (released.pointerId !== pointerId) return;
+        finishDrag(true);
+      };
+      current.cancel = (cancelled) => {
+        if (cancelled.pointerId !== pointerId) return;
+        finishDrag(false);
+      };
+      current.key = (key) => {
+        if (key.key !== "Escape") return;
+        key.preventDefault();
+        key.stopImmediatePropagation();
+        finishDrag(false);
+      };
+      drag.current = current;
+      window.addEventListener("pointermove", current.move, true);
+      window.addEventListener("pointerup", current.up, true);
+      window.addEventListener("pointercancel", current.cancel, true);
+      window.addEventListener("keydown", current.key, true);
+    },
+    [context.split, expanded, finishDrag],
+  );
+
+  useEffect(() => () => finishDrag(false), [finishDrag]);
   if (!tiling.root) return null;
 
   return (
@@ -229,9 +334,21 @@ export function Panes({
               statusOf={statusOf}
               expanded={expanded === leaf.id}
               hidden={!visible}
+              resizing={resizeTarget !== null}
+              onDragStart={beginDrag}
             />
           );
         })}
+        {dropPreview && (
+          <div
+            className={`pane-drop-preview is-${dropPreview.zone}`}
+            style={dropPreview.style}
+            role="status"
+            aria-live="polite"
+          >
+            <span>{dropLabel(dropPreview.zone)}</span>
+          </div>
+        )}
         {!expanded &&
           dividers.map((divider) => (
             <Divider
@@ -249,6 +366,111 @@ export function Panes({
 }
 
 const WHOLE: Rect = { left: 0, top: 0, width: 1, height: 1 };
+
+const DRAG_INTERACTIVE =
+  'button, a, input, textarea, select, option, .folder-chip, .pane-name-text, [role="button"], [role="tab"], [contenteditable="true"]';
+
+type DropPreview = {
+  target: string;
+  zone: PaneDrop;
+  style: CSSProperties;
+};
+
+type PaneDrag = {
+  moving: string;
+  started: { x: number; y: number };
+  active: boolean;
+  drop: DropPreview | null;
+  restore: (() => void) | null;
+  move: (event: PointerEvent) => void;
+  up: (event: PointerEvent) => void;
+  cancel: (event: PointerEvent) => void;
+  key: (event: KeyboardEvent) => void;
+};
+
+function dragHandle(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) return false;
+  const header = target.closest(".pane-head");
+  return !!header && !target.closest(DRAG_INTERACTIVE);
+}
+
+function dropAt(
+  field: HTMLDivElement | null,
+  moving: string,
+  x: number,
+  y: number,
+): DropPreview | null {
+  if (!field) return null;
+  const area = field.getBoundingClientRect();
+  if (x < area.left || x > area.right || y < area.top || y > area.bottom) {
+    return null;
+  }
+
+  const targets = field.querySelectorAll<HTMLElement>(".pane[data-pane]");
+  for (const pane of targets) {
+    const target = pane.dataset.pane;
+    if (!target || target === moving) continue;
+    const rect = pane.getBoundingClientRect();
+    if (x < rect.left || x > rect.right || y < rect.top || y > rect.bottom) {
+      continue;
+    }
+
+    const horizontal = (x - rect.left) / rect.width;
+    const vertical = (y - rect.top) / rect.height;
+    const distances = [
+      ["left", horizontal],
+      ["right", 1 - horizontal],
+      ["up", vertical],
+      ["down", 1 - vertical],
+    ] as const;
+    const [nearest, distance] = distances.reduce((best, next) =>
+      next[1] < best[1] ? next : best,
+    );
+    const zone: PaneDrop = distance < 0.27 ? nearest : "center";
+    const preview = previewRect(rect, area, zone);
+    return {
+      target,
+      zone,
+      style: {
+        left: `${preview.left}px`,
+        top: `${preview.top}px`,
+        width: `${preview.width}px`,
+        height: `${preview.height}px`,
+      },
+    };
+  }
+  return null;
+}
+
+function previewRect(target: DOMRect, field: DOMRect, zone: PaneDrop) {
+  let left = target.left - field.left;
+  let top = target.top - field.top;
+  let width = target.width;
+  let height = target.height;
+  if (zone === "left" || zone === "right") {
+    width /= 2;
+    if (zone === "right") left += width;
+  } else if (zone === "up" || zone === "down") {
+    height /= 2;
+    if (zone === "down") top += height;
+  }
+  return { left, top, width, height };
+}
+
+function dropLabel(drop: PaneDrop): string {
+  switch (drop) {
+    case "center":
+      return "Exchange panes";
+    case "left":
+      return "Place left";
+    case "right":
+      return "Place right";
+    case "up":
+      return "Place above";
+    case "down":
+      return "Place below";
+  }
+}
 
 /** A rect of the field as CSS percentages. */
 function box(rect: Rect): CSSProperties {
@@ -278,6 +500,8 @@ function PaneSlot({
   statusOf,
   expanded,
   hidden,
+  resizing,
+  onDragStart,
 }: {
   leaf: Leaf;
   rect: Rect;
@@ -286,8 +510,13 @@ function PaneSlot({
   statusOf: (session: string) => Status;
   expanded: boolean;
   hidden: boolean;
+  resizing: boolean;
+  onDragStart: (event: ReactPointerEvent<HTMLElement>, pane: string) => void;
 }) {
   const webBody = useRef<HTMLDivElement>(null);
+  const slot = useRef<HTMLDivElement>(null);
+  const lastRect = useRef<DOMRect | null>(null);
+  const motion = useRef<Animation | null>(null);
   const placed = useRef("");
   const booked = useRef(0);
   const web = leaf.pane.kind === "web";
@@ -302,6 +531,64 @@ function PaneSlot({
     [context.sessions, stateOf],
   );
   const webNameOf = web ? nameOf : undefined;
+
+  // FLIP keeps the absolute layout final while painting the previous rectangle
+  // as a transform. Pane ids and DOM ownership never change. Continuous pointer
+  // and keyboard resizing opt out: those movements already follow the hand and
+  // interpolation would only add lag.
+  useLayoutEffect(() => {
+    const node = slot.current;
+    if (!node) return;
+    motion.current?.cancel();
+    motion.current = null;
+    const next = node.getBoundingClientRect();
+    const previous = lastRect.current;
+    lastRect.current = next;
+
+    if (
+      !previous ||
+      hidden ||
+      resizing ||
+      typeof node.animate !== "function" ||
+      document.body.classList.contains("is-resizing") ||
+      document.body.classList.contains("is-keyboard-resizing") ||
+      window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    ) {
+      return;
+    }
+
+    const dx = previous.left - next.left;
+    const dy = previous.top - next.top;
+    const sx = next.width ? previous.width / next.width : 1;
+    const sy = next.height ? previous.height / next.height : 1;
+    if (
+      Math.abs(dx) < 0.5 &&
+      Math.abs(dy) < 0.5 &&
+      Math.abs(sx - 1) < 0.001 &&
+      Math.abs(sy - 1) < 0.001
+    ) {
+      return;
+    }
+
+    const restore = yieldBrowser();
+    const animation = node.animate(
+      [
+        {
+          transformOrigin: "top left",
+          transform: `translate(${dx}px, ${dy}px) scale(${sx}, ${sy})`,
+        },
+        { transformOrigin: "top left", transform: "none" },
+      ],
+      { duration: 180, easing: "cubic-bezier(0.22, 1, 0.36, 1)" },
+    );
+    motion.current = animation;
+    const finish = () => {
+      if (motion.current === animation) motion.current = null;
+      restore?.();
+    };
+    animation.addEventListener("finish", finish, { once: true });
+    animation.addEventListener("cancel", finish, { once: true });
+  }, [rect, hidden, web, resizing]);
 
   const placeWeb = useCallback((first: boolean) => {
     const measured = webBody.current?.getBoundingClientRect();
@@ -383,6 +670,7 @@ function PaneSlot({
 
   useEffect(
     () => () => {
+      motion.current?.cancel();
       if (booked.current) cancelAnimationFrame(booked.current);
     },
     [],
@@ -390,6 +678,7 @@ function PaneSlot({
 
   return (
     <div
+      ref={slot}
       className={`pane-slot${hidden ? " is-hidden" : ""}`}
       style={box(rect)}
     >
@@ -402,6 +691,7 @@ function PaneSlot({
         webNameOf={webNameOf}
         expanded={expanded}
         hidden={hidden}
+        onDragStart={onDragStart}
       />
     </div>
   );
@@ -519,8 +809,10 @@ function Divider({
         width: `${within.width * 100}%`,
       };
 
-  const turn = row ? "Stack these panes" : "Put these panes side by side";
-  const exchange = "Swap these panes";
+  const turn = row
+    ? "Stack both sides of this split"
+    : "Put both sides of this split side by side";
+  const exchange = "Swap both sides of this split";
 
   return (
     <div className={`seam is-${dir}`} style={place}>
@@ -535,8 +827,10 @@ function Divider({
         onKeyDown={(event) => {
           const less = row ? "ArrowLeft" : "ArrowUp";
           const more = row ? "ArrowRight" : "ArrowDown";
-          if (event.key === less) onRatio(id, ratio - 0.02);
-          if (event.key === more) onRatio(id, ratio + 0.02);
+          if (event.key !== less && event.key !== more) return;
+          event.preventDefault();
+          event.stopPropagation();
+          onRatio(id, event.key === less ? ratio - 0.02 : ratio + 0.02);
         }}
       />
       <button
@@ -584,6 +878,7 @@ const Pane = memo(function Pane({
   webNameOf,
   expanded,
   hidden,
+  onDragStart,
 }: {
   leaf: Leaf;
   context: PaneContext;
@@ -597,6 +892,7 @@ const Pane = memo(function Pane({
    *  browser's native webview needs it told separately (`hidden` in WebPane):
    *  CSS visibility does not reach it. */
   hidden: boolean;
+  onDragStart: (event: ReactPointerEvent<HTMLElement>, pane: string) => void;
 }) {
   const current = context.split && leaf.id === context.focus;
   const session = paneSession(leaf.pane) ?? "";
@@ -629,7 +925,10 @@ const Pane = memo(function Pane({
       // Read back by the directional focus keys, which need boxes rather than
       // the tree to answer "what is to the left of here" (see `focus.ts`).
       data-pane={leaf.id}
-      onPointerDownCapture={() => context.onFocus(leaf.id)}
+      onPointerDownCapture={(event) => {
+        context.onFocus(leaf.id);
+        onDragStart(event, leaf.id);
+      }}
     >
       {/* A pane is where "which conversation" is answered, so it is where the
           answer is published. Leaves that need it — a `show` artifact loading
@@ -700,13 +999,15 @@ const Pane = memo(function Pane({
 function ExpandPane({ leaf, context }: { leaf: Leaf; context: PaneContext }) {
   const expanded = context.expanded === leaf.id;
   if (!context.split && !expanded) return null;
+  const action = expanded ? "Restore this pane's size" : "Expand this pane";
   return (
     <button
       className="icon-btn"
       onClick={() => context.onToggleExpanded(leaf.id)}
       aria-pressed={expanded}
-      aria-label={expanded ? "Restore this pane's size" : "Expand this pane"}
-      title={expanded ? "Restore this pane's size" : "Expand this pane"}
+      aria-label={action}
+      aria-keyshortcuts="Control+Alt+F Meta+Alt+F"
+      title={`${action} (${MOD}+Alt+F)`}
     >
       {expanded ? <CollapseIcon size={14} /> : <ExpandIcon size={14} />}
     </button>
@@ -1145,15 +1446,17 @@ function InspectPane({
             value.kind === "workspace-file" || value.kind === "paper" ? value.path : undefined
           }
         >
-          {activeFileControls?.dirty && (
-            <span
-              className="workspace-file-dirty"
-              role="img"
-              aria-label="Unsaved changes"
-              title={`Unsaved changes — ${MOD}+S saves`}
-            />
-          )}
-          {inspectTitle(value)}
+          <span className="pane-name-text">
+            {activeFileControls?.dirty && (
+              <span
+                className="workspace-file-dirty"
+                role="img"
+                aria-label="Unsaved changes"
+                title={`Unsaved changes — ${MOD}+S saves`}
+              />
+            )}
+            {inspectTitle(value)}
+          </span>
         </span>
         {activeFileControls?.onMode && activeFileControls.mode && (
           <button

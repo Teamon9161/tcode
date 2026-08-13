@@ -8,6 +8,7 @@ import {
   focusPane,
   focused,
   frames,
+  movePaneBeside,
   navigate,
   openAside,
   openInspect,
@@ -18,10 +19,13 @@ import {
   browserPane,
   panes,
   parentSplit,
+  promotePane,
+  resizePane,
   rotate,
   showBeside,
   replaceSession,
   swap,
+  swapPanes,
   sessionsInView,
   setRatio,
   show,
@@ -466,6 +470,153 @@ describe("dividers", () => {
     expect(setRatio(one, id(one, "tcode"), 0.3)).toBe(one);
     expect(rotate(one, id(one, "tcode"))).toBe(one);
     expect(swap(one, id(one, "tcode"))).toBe(one);
+  });
+});
+
+describe("focused pane arrangement", () => {
+  function three(): Tiling {
+    const one = single(talk("a"));
+    const two = split(one, id(one, "a"), "row", talk("b"));
+    return split(two, id(two, "b"), "col", talk("c"));
+  }
+
+  it("swaps two leaves across tree levels without moving their subtrees", () => {
+    const before = three();
+    const a = id(before, "a");
+    const c = id(before, "c");
+    const moved = swapPanes(before, c, a);
+
+    expect(shape(moved)).toBe("row(c, col(b, a))");
+    expect(id(moved, "a")).toBe(a);
+    expect(id(moved, "c")).toBe(c);
+    expect(at(moved)).toBe("c");
+    expect(widths(moved)).toMatchObject({ c: 0.5, a: 0.5 });
+  });
+
+  it("leaves invalid leaf operations unchanged", () => {
+    const before = three();
+    const a = id(before, "a");
+    const splitId = before.root!.id;
+    expect(swapPanes(before, a, a)).toBe(before);
+    expect(swapPanes(before, a, "gone")).toBe(before);
+    expect(swapPanes(before, a, splitId)).toBe(before);
+    expect(movePaneBeside(before, a, a, "left")).toBe(before);
+    expect(movePaneBeside(before, a, "gone", "right")).toBe(before);
+    expect(movePaneBeside(before, splitId, a, "up")).toBe(before);
+    expect(promotePane(before, splitId)).toBe(before);
+  });
+
+  it.each([
+    ["left", "row(row(c, a), b)"],
+    ["right", "row(row(a, c), b)"],
+    ["up", "row(col(c, a), b)"],
+    ["down", "row(col(a, c), b)"],
+  ] as const)("moves a pane to the target's %s edge", (edge, expected) => {
+    const before = three();
+    const c = id(before, "c");
+    const moved = movePaneBeside(before, c, id(before, "a"), edge);
+
+    expect(shape(moved)).toBe(expected);
+    expect(id(moved, "c")).toBe(c);
+    expect(at(moved)).toBe("c");
+  });
+
+  it("collapses the source branch before reinserting beside a cross-level target", () => {
+    const before = three();
+    const c = id(before, "c");
+    const moved = movePaneBeside(before, c, id(before, "a"), "right");
+
+    expect(shape(moved)).toBe("row(row(a, c), b)");
+    expect(panes(moved).map((leaf) => label(leaf.pane)).sort()).toEqual([
+      "a",
+      "b",
+      "c",
+    ]);
+    expect(id(moved, "c")).toBe(c);
+    expect(at(moved)).toBe("c");
+  });
+
+  it("moves between siblings without duplicating or dropping either leaf", () => {
+    const one = single(talk("a"));
+    const before = split(one, id(one, "a"), "row", talk("b"));
+    const a = id(before, "a");
+    const b = id(before, "b");
+    const moved = movePaneBeside(before, a, b, "down");
+
+    expect(shape(moved)).toBe("col(b, a)");
+    expect(id(moved, "a")).toBe(a);
+    expect(id(moved, "b")).toBe(b);
+    expect(at(moved)).toBe("a");
+  });
+
+  it("keeps a target inside the source pane's former sibling subtree", () => {
+    const before = three();
+    const a = id(before, "a");
+    const c = id(before, "c");
+    const moved = movePaneBeside(before, a, c, "up");
+
+    expect(shape(moved)).toBe("col(b, col(a, c))");
+    expect(id(moved, "a")).toBe(a);
+    expect(id(moved, "c")).toBe(c);
+    expect(at(moved)).toBe("a");
+  });
+
+  it("promotes a lower-right pane to the right half and packs the others left", () => {
+    const before = three();
+    const c = id(before, "c");
+    const promoted = promotePane(before, c);
+
+    expect(shape(promoted)).toBe("row(col(b, a), c)");
+    expect(id(promoted, "c")).toBe(c);
+    expect(at(promoted)).toBe("c");
+    expect(widths(promoted)).toEqual({ b: 0.5, a: 0.5, c: 0.5 });
+  });
+
+  it("keeps a promoted pane on the side it already occupied", () => {
+    const before = three();
+    const b = id(before, "b");
+    expect(shape(promotePane(before, b))).toBe("row(col(a, c), b)");
+
+    const leftNested = split(before, id(before, "a"), "col", talk("d"));
+    const d = id(leftNested, "d");
+    expect(shape(promotePane(leftNested, d))).toBe(
+      "row(d, col(a, col(b, c)))",
+    );
+  });
+
+  it("does not promote a pane that is already attached to the root", () => {
+    const before = three();
+    expect(promotePane(before, id(before, "a"))).toBe(before);
+    expect(promotePane(before, "gone")).toBe(before);
+  });
+
+  it("grows the focused pane toward the nearest boundary on that path", () => {
+    const before = three();
+    const c = id(before, "c");
+
+    const left = resizePane(before, c, "left", 0.1);
+    expect(left.root).toMatchObject({ kind: "split", ratio: 0.4 });
+    expect(widths(left).c).toBeCloseTo(0.6);
+
+    const up = resizePane(before, c, "up", 0.1);
+    const cRect = frames(up).panes.find(({ leaf }) => leaf.id === c)!.rect;
+    expect(cRect.height).toBeCloseTo(0.6);
+  });
+
+  it("clamps keyboard growth through the shared ratio bounds", () => {
+    const before = three();
+    const c = id(before, "c");
+    const grown = resizePane(before, c, "left", 1);
+    expect(grown.root).toMatchObject({ kind: "split", ratio: 0.1 });
+    expect(widths(grown).c).toBeCloseTo(0.9);
+  });
+
+  it("does not resize through an outside edge or an unknown pane", () => {
+    const before = three();
+    const c = id(before, "c");
+    expect(resizePane(before, c, "right")).toBe(before);
+    expect(resizePane(before, c, "down")).toBe(before);
+    expect(resizePane(before, "gone", "left")).toBe(before);
   });
 });
 

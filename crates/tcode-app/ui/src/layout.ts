@@ -755,6 +755,143 @@ export function swap(tiling: Tiling, id: string): Tiling {
   return root === tiling.root ? tiling : { ...tiling, root };
 }
 
+/** Exchanges two individual panes, wherever they sit in the tree.
+ *
+ * This is deliberately not `swap`: that function acts on a seam, so either
+ * side may be a whole subtree. This one acts on the two leaves the reader can
+ * point at. The complete leaves move — ids included — which is what lets the
+ * focused pane keep focus and lets React keep its transcript, draft and live
+ * terminal host mounted while its rectangle changes. */
+export function swapPanes(tiling: Tiling, first: string, second: string): Tiling {
+  if (!tiling.root || first === second) return tiling;
+  const a = findNode(tiling.root, first);
+  const b = findNode(tiling.root, second);
+  if (!a || a.kind !== "leaf" || !b || b.kind !== "leaf") return tiling;
+
+  const root = replacePair(tiling.root, first, b, second, a);
+  return root === tiling.root ? tiling : { ...tiling, root };
+}
+
+export type PaneEdge = "left" | "right" | "up" | "down";
+export type PaneDrop = PaneEdge | "center";
+
+/** Applies the one structural change represented by a completed pane drag. */
+export function movePane(
+  tiling: Tiling,
+  moving: string,
+  target: string,
+  drop: PaneDrop,
+): Tiling {
+  return drop === "center"
+    ? swapPanes(tiling, moving, target)
+    : movePaneBeside(tiling, moving, target, drop);
+}
+
+/** Detaches one pane and tiles it against an edge of another pane.
+ *
+ * The source's old split collapses before the target is located, so moving a
+ * leaf across tree levels never leaves an empty branch and still works when the
+ * target lives in the source's former sibling subtree. The complete source
+ * leaf is re-used — id included — preserving every mounted pane-owned state in
+ * the flat renderer. */
+export function movePaneBeside(
+  tiling: Tiling,
+  moving: string,
+  target: string,
+  edge: PaneEdge,
+): Tiling {
+  if (!tiling.root || moving === target) return tiling;
+  const source = findNode(tiling.root, moving);
+  const destination = findNode(tiling.root, target);
+  if (
+    !source ||
+    source.kind !== "leaf" ||
+    !destination ||
+    destination.kind !== "leaf"
+  ) {
+    return tiling;
+  }
+
+  const detached = without(tiling.root, moving);
+  if (!detached) return tiling;
+  const dir: Dir = edge === "left" || edge === "right" ? "row" : "col";
+  const first = edge === "left" || edge === "up";
+  const root = mapNode(detached, target, (node) => ({
+    kind: "split",
+    id: nextId(),
+    dir,
+    ratio: 0.5,
+    a: first ? source : node,
+    b: first ? node : source,
+  }));
+  // Both leaves were validated before detaching, so the target must survive in
+  // `detached`; retain the guard so a future broader detach cannot corrupt it.
+  return root === detached ? tiling : { root, focus: moving };
+}
+
+/** Promotes a nested pane into the root-level half of the field.
+ *
+ * In `row(A, col(B, C))`, promoting C produces `row(col(B, A), C)`: C gets
+ * the right half it was already visually inside, while A and B share the other
+ * half. This is Hyprland Dwindle's stable `movetoroot` operation in this tree's
+ * vocabulary. It is a real layout change, unlike the temporary expanded view;
+ * every pane remains visible and the root ratio remains whatever the reader
+ * dragged it to.
+ *
+ * A pane already attached directly to the root is already main and is left
+ * alone. Unknown ids and split ids are no-ops, matching the other operations in
+ * this module. */
+export function promotePane(tiling: Tiling, id: string): Tiling {
+  const root = tiling.root;
+  if (!root || root.kind === "leaf") return tiling;
+  const chosen = findNode(root, id);
+  if (!chosen || chosen.kind !== "leaf") return tiling;
+  if (root.a.id === id || root.b.id === id) return tiling;
+
+  const inA = !!findNode(root.a, id);
+  if (!inA && !findNode(root.b, id)) return tiling;
+  const branch = inA ? root.a : root.b;
+  const other = inA ? root.b : root.a;
+  const packed = mapNode(branch, id, () => other);
+  // `id` was found below `branch`, so this can only stay identical if the tree
+  // was concurrently malformed. Refusing to duplicate `chosen` is safer than
+  // trying to recover a tree this pure function did not create.
+  if (packed === branch) return tiling;
+
+  const promoted: Split = inA
+    ? { ...root, a: chosen, b: packed }
+    : { ...root, a: packed, b: chosen };
+  return { ...tiling, root: promoted };
+}
+
+/** Grows a pane toward one edge by moving the nearest divider that forms that
+ * edge. A right-hand pane grows left by decreasing the closest row split; a
+ * top pane grows down by increasing the closest column split, and so on.
+ *
+ * Looking up the ancestor path is the important distinction from `setRatio`:
+ * the divider may be several tree levels away. At the outside edge there is no
+ * such divider, so the operation is a no-op rather than shrinking some unrelated
+ * side. */
+export function resizePane(
+  tiling: Tiling,
+  id: string,
+  direction: "left" | "right" | "up" | "down",
+  amount = 0.04,
+): Tiling {
+  if (!tiling.root || !findLeaf(tiling, id) || amount <= 0) return tiling;
+  const horizontal = direction === "left" || direction === "right";
+  const axis: Dir = horizontal ? "row" : "col";
+  const wantsA = direction === "right" || direction === "down";
+  const path = ancestors(tiling.root, id);
+  const edge = [...path]
+    .reverse()
+    .find(({ split, inA }) => split.dir === axis && inA === wantsA);
+  if (!edge) return tiling;
+
+  const delta = wantsA ? amount : -amount;
+  return setRatio(tiling, edge.split.id, edge.split.ratio + delta);
+}
+
 /** A box as fractions of the field, 0–1. */
 export type Rect = { left: number; top: number; width: number; height: number };
 
@@ -845,6 +982,38 @@ function mapNode(
   const a = mapNode(node.a, id, fn);
   const b = mapNode(node.b, id, fn);
   return a === node.a && b === node.b ? node : { ...node, a, b };
+}
+
+/** Replaces two nodes in one walk. Used for leaf movement so neither replacement
+ * can hide the other from a second traversal when the panes are nested. */
+function replacePair(
+  node: Layout,
+  first: string,
+  atFirst: Layout,
+  second: string,
+  atSecond: Layout,
+): Layout {
+  if (node.id === first) return atFirst;
+  if (node.id === second) return atSecond;
+  if (node.kind === "leaf") return node;
+  const a = replacePair(node.a, first, atFirst, second, atSecond);
+  const b = replacePair(node.b, first, atFirst, second, atSecond);
+  return a === node.a && b === node.b ? node : { ...node, a, b };
+}
+
+/** Root-to-leaf split path, including which side contains the leaf. */
+function ancestors(
+  node: Layout,
+  id: string,
+): Array<{ split: Split; inA: boolean }> {
+  if (node.kind === "leaf") return [];
+  if (findNode(node.a, id)) {
+    return [{ split: node, inA: true }, ...ancestors(node.a, id)];
+  }
+  if (findNode(node.b, id)) {
+    return [{ split: node, inA: false }, ...ancestors(node.b, id)];
+  }
+  return [];
 }
 
 function without(node: Layout, id: string): Layout | null {
