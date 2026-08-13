@@ -97,6 +97,14 @@ describe("WorkspaceFile routes live workspace content", () => {
     expect(container.querySelector("textarea")).toBeNull();
   });
 
+  it("offers CSV files as a spreadsheet preview without changing their default editor route", async () => {
+    mocks.invoke.mockResolvedValue(textView("data.csv", "a,b\n1,2\n"));
+    await draw("data.csv");
+
+    expect(editor()?.state.doc.toString()).toBe("a,b\n1,2\n");
+    expect(controls?.openAs).toEqual({ kind: "spreadsheet", path: "data.csv" });
+  });
+
   it("shows Markdown first, then restores editor selection and text across mode switches", async () => {
     mocks.invoke.mockResolvedValue(textView("README.md", "# title"));
     await draw("README.md");

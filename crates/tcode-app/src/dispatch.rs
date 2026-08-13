@@ -299,6 +299,18 @@ impl Registry {
         );
         result!(t, "serve_url", c::serve_url[supervisor, serve](session, path));
 
+        // Spreadsheet xlsx ↔ IronCalc native format conversion.
+        result!(
+            t,
+            "spreadsheet_load",
+            c::spreadsheet_load[supervisor](session, path)
+        );
+        result!(
+            t,
+            "spreadsheet_save",
+            c::spreadsheet_save[supervisor](session, path, data)
+        );
+
         // The terminal. The PTY stays on this side of the pipe — see
         // `AGENTS.md` rule 9i for why it is worth keeping behind the same
         // audited boundary.
@@ -719,7 +731,8 @@ mod tests {
     /// two copies; that shell is gone, so this pins the Electron copy — a
     /// header the `app://` handler writes on every response — and the rule
     /// that never changed: no `script-src`, so scripts fall back to
-    /// `default-src 'self'`, which carries neither unsafe token. Adding the
+    /// `default-src`. That fallback may carry `wasm-unsafe-eval` for IronCalc,
+    /// but it must not carry JavaScript's broader unsafe tokens. Adding the
     /// directive at all is the change that needs looking at, whatever value it
     /// is given.
     #[test]
@@ -744,8 +757,12 @@ mod tests {
             "the policy grew a `script-src`. Scripts used to fall back to `default-src \
              'self'`; whatever this directive says now, it is the one change rule 11 is about"
         );
+        let tokens: Vec<&str> = policy
+            .split(|ch: char| ch.is_ascii_whitespace() || ch == ';')
+            .filter(|token| !token.is_empty())
+            .collect();
         assert!(
-            !policy.contains("unsafe-eval"),
+            !tokens.contains(&"'unsafe-eval'"),
             "`unsafe-eval` in the app's policy — see rule 11 and `ui/src/math.tsx`"
         );
     }

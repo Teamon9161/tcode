@@ -40,6 +40,10 @@ export type Shown =
   | { as: "image" }
   /** A PDF paper, rendered by PaperView so selection can feed the composer. */
   | { as: "paper" }
+  /** An xlsx spreadsheet, rendered by SpreadsheetView with IronCalc. */
+  | { as: "spreadsheet" }
+  /** A docx document, rendered read-only by DocumentView with docx-preview. */
+  | { as: "document" }
   /** Prose, through the same restricted markdown renderer the transcript uses. */
   | { as: "doc" }
   | { as: "text" };
@@ -62,7 +66,7 @@ type View = {
   /** The live workspace has a different route from an artifact viewer: images
    * stay render-only, Markdown has preview/edit modes, PDF opens as a paper
    * inspect object, and every other UTF-8 file opens as source in the editor. */
-  workspace?: "image" | "markdown" | "paper";
+  workspace?: "image" | "markdown" | "paper" | "spreadsheet" | "document";
   /**
    * A constant, except where the extension genuinely does not settle it. `.json`
    * is a container, not a kind of thing: an echarts option and a config file
@@ -85,6 +89,9 @@ const VIEWS: View[] = [
     as: { as: "image" },
   },
   { ext: ["pdf"], load: "served", workspace: "paper", as: { as: "paper" } },
+  { ext: ["xlsx"], load: "served", workspace: "spreadsheet", as: { as: "spreadsheet" } },
+  { ext: ["xls"], load: "served", workspace: "spreadsheet", as: { as: "spreadsheet" } },
+  { ext: ["docx"], load: "served", workspace: "document", as: { as: "document" } },
   { ext: ["md", "markdown"], workspace: "markdown", as: { as: "doc" } },
   {
     ext: ["json"],
@@ -118,7 +125,7 @@ export function loadOf(path: string): Load {
  * list. */
 export type WorkspaceRoute =
   | { load: "bytes"; as: "image" }
-  | { load: "served"; as: "paper" }
+  | { load: "served"; as: "paper" | "spreadsheet" | "document" }
   | { load: "text"; as: "markdown" | "editor" };
 
 export function workspaceRouteOf(path: string): WorkspaceRoute {
@@ -129,6 +136,10 @@ export function workspaceRouteOf(path: string): WorkspaceRoute {
       return { load: "text", as: "markdown" };
     case "paper":
       return { load: "served", as: "paper" };
+    case "spreadsheet":
+      return { load: "served", as: "spreadsheet" };
+    case "document":
+      return { load: "served", as: "document" };
     default:
       return { load: "text", as: "editor" };
   }

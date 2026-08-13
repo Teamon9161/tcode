@@ -496,6 +496,22 @@ describe("workspace file pane header", () => {
     expect(chip.getAttribute("aria-label")).toBe("Edit Markdown");
   });
 
+  it("opens shown CSV artifacts as spreadsheet previews on request", async () => {
+    const onOpen = vi.fn();
+    context = { ...context, onOpen };
+    mocks.invoke.mockResolvedValue({ body: "a,b\n1,2\n", bytes: 8, truncated: false });
+    await draw({ kind: "shown", path: "out/data.csv", label: "data.csv" }, context);
+
+    const button = container.querySelector<HTMLButtonElement>('[aria-label="Preview as spreadsheet"]')!;
+    expect(button).not.toBeNull();
+    act(() => button.click());
+
+    expect(onOpen).toHaveBeenCalledWith("inspect-pane", "s", {
+      kind: "spreadsheet",
+      path: "out/data.csv",
+    });
+  });
+
   it("shows an unsaved dot ahead of the name and clears it on save", async () => {
     mocks.invoke.mockImplementation((command: string, args: { path: string; text?: string }) =>
       command === "workspace_read_text"
@@ -534,6 +550,22 @@ describe("workspace file pane header", () => {
     expect(container.querySelector('[aria-label="Read this file again"]')).not.toBeNull();
     expect(container.querySelector(".workspace-file-mode")).toBeNull();
     expect(container.querySelector(".workspace-file-save")).toBeNull();
+  });
+
+  it("opens CSV files as a spreadsheet from the pane header action", async () => {
+    const onOpen = vi.fn();
+    context = { ...context, onOpen };
+    mocks.invoke.mockResolvedValue(textView("data.csv", "a,b\n1,2\n"));
+    await draw({ kind: "workspace-file", path: "data.csv" }, context);
+
+    const button = container.querySelector<HTMLButtonElement>('[aria-label="Preview as spreadsheet"]')!;
+    expect(button).not.toBeNull();
+    act(() => button.click());
+
+    expect(onOpen).toHaveBeenCalledWith("inspect-pane", "s", {
+      kind: "spreadsheet",
+      path: "data.csv",
+    });
   });
 
   it("hides a stale registration immediately when navigation selects another path", async () => {

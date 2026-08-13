@@ -36,6 +36,11 @@ export type Inspect =
   /** A PDF document opened as a live reading surface tied to this session's
    * composer, not as editable UTF-8 source and not as the window browser. */
   | { kind: "paper"; path: string; documentId?: string }
+  /** A spreadsheet opened with IronCalc. Legacy .xls files are converted to a
+   * value-only preview by the backend and stay read-only in this pane. */
+  | { kind: "spreadsheet"; path: string }
+  /** A docx document rendered read-only with docx-preview. */
+  | { kind: "document"; path: string }
   /** A file as some call saw it. `at` pins a specific call; without it, the
    *  most recent one wins. */
   | { kind: "file"; path: string; at?: string }
@@ -115,10 +120,18 @@ export function navOf(value: Inspect): Nav {
 
 export function inspectForPath(
   path: string,
-): Extract<Inspect, { kind: "paper" | "workspace-file" }> {
-  return workspaceRouteOf(path).as === "paper"
-    ? { kind: "paper", path }
-    : { kind: "workspace-file", path };
+): Extract<Inspect, { kind: "paper" | "spreadsheet" | "document" | "workspace-file" }> {
+  const route = workspaceRouteOf(path);
+  switch (route.as) {
+    case "paper":
+      return { kind: "paper", path };
+    case "spreadsheet":
+      return { kind: "spreadsheet", path };
+    case "document":
+      return { kind: "document", path };
+    default:
+      return { kind: "workspace-file", path };
+  }
 }
 
 export function navValue(nav: Nav): Inspect {
@@ -158,6 +171,10 @@ export function inspectTitle(value: Inspect): string {
     case "workspace-file":
       return basename(value.path);
     case "paper":
+      return basename(value.path);
+    case "spreadsheet":
+      return basename(value.path);
+    case "document":
       return basename(value.path);
     case "file":
       return basename(value.path);

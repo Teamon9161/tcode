@@ -62,6 +62,7 @@ import {
   PencilIcon,
   RefreshIcon,
   RowsIcon,
+  SpreadsheetIcon,
   SwapIcon,
 } from "./components/Icons";
 import { Transcript } from "./Transcript";
@@ -1479,6 +1480,18 @@ function InspectPane({
             }
           >
             <PencilIcon size={12} />
+          </button>
+        )}
+        {activeFileControls?.openAs && (
+          <button
+            type="button"
+            className="icon-btn"
+            onClick={() => openHere(activeFileControls.openAs!)}
+            disabled={activeFileControls.loading || activeFileControls.saving}
+            aria-label="Preview as spreadsheet"
+            title="Preview as spreadsheet"
+          >
+            <SpreadsheetIcon size={14} />
           </button>
         )}
         {activeFileControls && (

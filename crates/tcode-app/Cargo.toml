@@ -69,6 +69,9 @@ libc = "0.2"
 # Recycle Bin on Windows, Trash on macOS — the one cross-platform answer to
 # "recoverable delete".
 trash = "5"
+ironcalc = "0.8"
+calamine = "0.36.1"
+csv = "1"
 
 [dev-dependencies]
 tempfile = "3"

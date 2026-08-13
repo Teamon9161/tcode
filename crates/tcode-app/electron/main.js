@@ -45,15 +45,18 @@ const APP_ICON = path.join(
 /** Mirrors `bridge::WINDOW_STATE`, which mirrors `ui/src/types.ts`. */
 const WINDOW_STATE = "tcode://window-state";
 
-// The app's one Content-Security-Policy. Rule 11: `script-src` falls back to
-// `default-src 'self'` and must never gain `unsafe-inline` or `unsafe-eval` —
-// that is the layer stopping KaTeX's and the markdown renderer's output from
-// executing. `frame-src` names the loopback origin `serve.rs` binds, which is
-// the *other* frame in rule 11b and deliberately not this one. `connect-src`
-// keeps ordinary app requests on this origin while allowing PDF.js to fetch the
-// same tokenized loopback files that framed reports load as documents.
+// The app's one Content-Security-Policy. Rule 11: scripts fall back to
+// `default-src 'self'`, and the policy must never gain `unsafe-inline` or
+// `unsafe-eval` — that is the layer stopping KaTeX's and the markdown renderer's
+// output from executing. IronCalc is the one app-owned dependency that needs
+// WebAssembly compilation, so `wasm-unsafe-eval` is named on the fallback
+// directive without permitting JavaScript string evaluation. `frame-src` names
+// the loopback origin `serve.rs` binds, which is the *other* frame in rule 11b
+// and deliberately not this one. `connect-src` keeps ordinary app requests on
+// this origin while allowing PDF.js to fetch the same tokenized loopback files
+// that framed reports load as documents.
 const CSP =
-  "default-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
+  "default-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
   "connect-src 'self' http://127.0.0.1:*; frame-src 'self' http://127.0.0.1:*";
 
 // Enough to serve `ui/dist` correctly. A module script with the wrong type does

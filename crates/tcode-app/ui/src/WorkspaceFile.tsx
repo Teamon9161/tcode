@@ -4,7 +4,7 @@ import { invoke } from "@ipc";
 import { FileBody } from "./FileBody";
 import { Prose } from "./Prose";
 import { useSession } from "./session";
-import { basename, workspaceRouteOf } from "./show";
+import { basename, extensionOf, workspaceRouteOf } from "./show";
 import type { WorkspaceBinaryView, WorkspaceStatView, WorkspaceTextView } from "./types";
 import {
   canForceSaveWorkspaceText,
@@ -42,6 +42,12 @@ const POLL_MS = 2000;
 export function WorkspaceFile({ path }: { path: string }) {
   const session = useSession();
   const route = useMemo(() => workspaceRouteOf(path), [path]);
+  const extension = extensionOf(path);
+  const spreadsheetPreview = useMemo(
+    () =>
+      extension === "csv" || extension === "tsv" ? ({ kind: "spreadsheet", path } as const) : undefined,
+    [extension, path],
+  );
   const [document, setDocument] = useState<WorkspaceFileSession | null>(() =>
     route.load === "text" ? workspaceFileSession(session, path) : null,
   );
@@ -297,6 +303,7 @@ export function WorkspaceFile({ path }: { path: string }) {
       path,
       mode: route.as === "markdown" ? (document?.mode ?? "preview") : null,
       onMode: route.as === "markdown" ? changeMode : null,
+      openAs: spreadsheetPreview,
       onReload: () => reload(false),
       onSave: route.load === "text" ? () => submit(false) : null,
       dirty,
@@ -316,6 +323,7 @@ export function WorkspaceFile({ path }: { path: string }) {
       saveEnabled,
       saving,
       session,
+      spreadsheetPreview,
       submit,
     ],
   );

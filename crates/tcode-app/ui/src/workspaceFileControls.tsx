@@ -1,5 +1,6 @@
 import { createContext, useContext, useLayoutEffect } from "react";
 
+import type { Inspect } from "./inspect";
 import type { WorkspaceMode } from "./workspaceDrafts";
 
 export type WorkspaceFileControls = {
@@ -7,6 +8,7 @@ export type WorkspaceFileControls = {
   path: string;
   mode: WorkspaceMode | null;
   onMode: ((mode: WorkspaceMode) => void) | null;
+  openAs?: Inspect;
   onReload: () => void;
   onSave: (() => void) | null;
   dirty: boolean;

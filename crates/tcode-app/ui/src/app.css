@@ -7753,3 +7753,110 @@ button.strip-phase-line:hover .strip-phase-name {
   font-family: var(--font-mono);
   font-size: var(--text-2xs);
 }
+
+/* ---------------------------------------------------------------- spreadsheet */
+
+.spreadsheet-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.spreadsheet-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  flex: none;
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.spreadsheet-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--body);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.spreadsheet-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+
+.spreadsheet-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.spreadsheet-body .ic-editor-container {
+  background: var(--bg);
+  color: var(--ink);
+}
+
+/* ---------------------------------------------------------------- document */
+
+.document-view {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  height: 100%;
+}
+
+.document-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s-3);
+  flex: none;
+  padding: var(--s-3);
+  border-bottom: 1px solid var(--line);
+}
+
+.document-title {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--body);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.document-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--s-2);
+}
+
+.document-body {
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+  background: var(--sunken);
+}
+
+.document-body .docx-wrapper {
+  background: var(--sunken) !important;
+  padding: var(--s-4) !important;
+}
+
+.document-body .docx-wrapper > section.docx {
+  background: var(--bg) !important;
+  box-shadow: var(--shadow-lift);
+  margin-bottom: var(--s-4);
+}

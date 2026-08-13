@@ -241,6 +241,16 @@ export const ImageIcon = (props: IconProps) => (
   </Glyph>
 );
 
+export const SpreadsheetIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <rect x="4.5" y="5" width="15" height="14" rx="2" />
+    <path d="M4.5 10h15" />
+    <path d="M4.5 14.5h15" />
+    <path d="M10 5v14" />
+    <path d="M15 5v14" />
+  </Glyph>
+);
+
 export const CheckIcon = (props: IconProps) => (
   <Glyph {...props}>
     <path d="m5 12.5 4.5 4.5L19 7" />

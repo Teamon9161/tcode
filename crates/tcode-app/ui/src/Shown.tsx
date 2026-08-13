@@ -6,7 +6,7 @@ import { FileBody } from "./FileBody";
 import { relativeTo } from "./files";
 import type { Inspect } from "./inspect";
 import { useSession } from "./session";
-import { isBinary, isServed } from "./show";
+import { extensionOf, isBinary, isServed } from "./show";
 
 /** Mirrors `ShownFile` in `src/commands.rs`. */
 type ShownFile = { body: string; bytes: number; truncated: boolean };
@@ -41,17 +41,21 @@ export function ShownView({
   value,
   cwd,
   inline = false,
+  onOpen,
 }: {
   value: Extract<Inspect, { kind: "shown" }>;
   /** Only the pane spells out the path; inline, the tool row above already has
    *  it, and repeating it costs a line of every artifact in the transcript. */
   cwd?: string;
   inline?: boolean;
+  onOpen?: (next: Inspect) => void;
 }) {
   const session = useSession();
   const [file, setFile] = useState<ShownFile | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [reload, setReload] = useState(0);
+  const extension = extensionOf(value.path);
+  const canPreviewSpreadsheet = !inline && (extension === "csv" || extension === "tsv");
 
   useEffect(() => {
     let live = true;
@@ -87,6 +91,16 @@ export function ShownView({
           <p className="inspect-path" title={value.path}>
             {relativeTo(cwd ?? "", value.path)}
           </p>
+        )}
+        {canPreviewSpreadsheet && (
+          <button
+            type="button"
+            className="chip"
+            onClick={() => onOpen?.({ kind: "spreadsheet", path: value.path })}
+            aria-label="Preview as spreadsheet"
+          >
+            Preview as spreadsheet
+          </button>
         )}
         <button
           type="button"

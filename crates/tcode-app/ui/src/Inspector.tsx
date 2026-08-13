@@ -16,6 +16,8 @@ import { agentKind, BlockList } from "./Transcript";
 import { displayToolOutput } from "./toolViews";
 import { PlanEditor } from "./PlanEditor";
 import { PaperView } from "./PaperView";
+import { SpreadsheetView } from "./SpreadsheetView";
+import { DocumentView } from "./DocumentView";
 import { useSession } from "./session";
 import { draftOf, type Plan, type PlanDraft } from "./plan";
 
@@ -88,6 +90,10 @@ export const InspectView = memo(function InspectView({
       return <WorkspaceFile key={`${session}:${cwd}:${value.path}`} path={value.path} />;
     case "paper":
       return <PaperView key={`${session}:${cwd}:${value.path}`} path={value.path} onPrompt={onPaperPrompt} />;
+    case "spreadsheet":
+      return <SpreadsheetView key={`${session}:${cwd}:${value.path}`} path={value.path} />;
+    case "document":
+      return <DocumentView key={`${session}:${cwd}:${value.path}`} path={value.path} />;
     case "file":
       return <FileView value={value} blocks={blocks} cwd={cwd} onOpen={onOpen} />;
     case "diff":
@@ -108,7 +114,7 @@ export const InspectView = memo(function InspectView({
         </div>
       );
     case "shown":
-      return <ShownView value={value} cwd={cwd} />;
+      return <ShownView value={value} cwd={cwd} onOpen={onOpen} />;
     case "doc":
       return <Prose className="doc" text={value.text} />;
     case "plan":

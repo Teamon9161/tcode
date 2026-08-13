@@ -64,6 +64,9 @@ const OPENERS: &[Opener] = &[
 /// because every desktop this ships on has one.
 pub const REVEAL: &str = "reveal";
 
+/// The id of the system default application entry.
+pub const SYSTEM: &str = "system";
+
 /// What the file manager is called where this is running. Its own name, because
 /// "reveal in file manager" is the kind of generic phrasing that reads as though
 /// the app does not know which platform it is on.
@@ -113,12 +116,42 @@ pub fn open(id: &str, path: &Path) -> Result<(), String> {
     if id == REVEAL {
         return reveal(path);
     }
+    if id == SYSTEM {
+        return open_system(path);
+    }
     let opener = OPENERS
         .iter()
         .find(|opener| opener.id == id)
         .ok_or_else(|| format!("unknown opener '{id}'"))?;
     let program = locate(opener).ok_or_else(|| format!("{} is not installed", opener.name))?;
     spawn(&program, path).map_err(|error| format!("could not open {}: {error}", opener.name))
+}
+
+/// Open the file with the platform's default application.
+fn open_system(path: &Path) -> Result<(), String> {
+    let failed = |error: std::io::Error| format!("could not open with system default: {error}");
+    if cfg!(windows) {
+        Command::new("cmd")
+            .arg("/C")
+            .arg("start")
+            .arg("")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(failed)
+    } else if cfg!(target_os = "macos") {
+        Command::new("open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(failed)
+    } else {
+        Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map(|_| ())
+            .map_err(failed)
+    }
 }
 
 /// Show the entry in the platform's file manager, selected where that is

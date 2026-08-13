@@ -49,6 +49,10 @@ export function FileBody({
       return <Framed path={path} label={label} revision={revision} inline={inline} />;
     case "paper":
       return <p className="inspect-empty">open this PDF in a pane to read it</p>;
+    case "spreadsheet":
+      return <p className="inspect-empty">open this spreadsheet in a pane to view it</p>;
+    case "document":
+      return <p className="inspect-empty">open this document in a pane to view it</p>;
     case "image":
       // `body` is a `data:` URL built by the backend, which is why this needs no
       // asset protocol and no `same-origin` anywhere near it.

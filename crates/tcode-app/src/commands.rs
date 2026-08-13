@@ -1639,6 +1639,234 @@ fn media_type(path: &Path) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------- spreadsheets
+//
+// The frontend's IronCalc WASM model loads the native `.ic` binary format,
+// not xlsx directly. These commands bridge the gap: the backend reads `.xlsx`
+// with the Rust `ironcalc` crate, converts legacy `.xls` and delimited text
+// values through value-only importers, serialises to native bytes, and returns
+// them as base64. Saving reverses the `.xlsx` path only.
+
+pub fn spreadsheet_load(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+) -> Result<String, String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let file = resolve_path(&path, &handle.cwd());
+    let model = spreadsheet_load_model(&file)?;
+    let bytes = model.to_bytes();
+    use base64::Engine as _;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
+fn spreadsheet_load_model(file: &Path) -> Result<ironcalc::base::Model<'static>, String> {
+    if is_legacy_xls(file) {
+        return load_xls_as_ironcalc(file);
+    }
+    if let Some(separator) = delimited_separator(file) {
+        return load_delimited_as_ironcalc(file, separator);
+    }
+
+    let display = file.display().to_string();
+    ironcalc::import::load_from_xlsx(&display, "en", "UTC", "en")
+        .map_err(|error| format!("cannot load spreadsheet: {error}"))
+}
+
+fn is_legacy_xls(file: &Path) -> bool {
+    file.extension()
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("xls"))
+}
+
+fn delimited_separator(file: &Path) -> Option<u8> {
+    let extension = file.extension()?;
+    if extension.eq_ignore_ascii_case("csv") {
+        Some(b',')
+    } else if extension.eq_ignore_ascii_case("tsv") {
+        Some(b'\t')
+    } else {
+        None
+    }
+}
+
+fn load_xls_as_ironcalc(file: &Path) -> Result<ironcalc::base::Model<'static>, String> {
+    use calamine::{open_workbook_auto, Reader};
+
+    let mut workbook = open_workbook_auto(file)
+        .map_err(|error| format!("cannot open legacy .xls spreadsheet: {error}"))?;
+    let sheet_names = workbook.sheet_names().to_vec();
+    let mut model = ironcalc::base::Model::new_empty("legacy.xls", "en", "UTC", "en")
+        .map_err(|error| format!("cannot create spreadsheet model: {error}"))?;
+
+    if sheet_names.is_empty() {
+        return Ok(model);
+    }
+
+    for (sheet_index, original_name) in sheet_names.iter().enumerate() {
+        let target_index = sheet_index as u32;
+        let sheet_name = safe_sheet_name(original_name, sheet_index, &mut model);
+        if sheet_index == 0 {
+            model
+                .rename_sheet_by_index(0, &sheet_name)
+                .map_err(|error| format!("cannot create sheet '{sheet_name}': {error}"))?;
+        } else {
+            model
+                .add_sheet(&sheet_name)
+                .map_err(|error| format!("cannot create sheet '{sheet_name}': {error}"))?;
+        }
+
+        let range = workbook
+            .worksheet_range(original_name)
+            .map_err(|error| format!("cannot read sheet '{original_name}': {error}"))?;
+        let (row_offset, column_offset) = range.start().unwrap_or((0, 0));
+        for (row, column, value) in range.used_cells() {
+            let Some(input) = calamine_data_to_input(value) else {
+                continue;
+            };
+            let row = row_offset
+                .checked_add(row as u32)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| format!("cell row is too large in sheet '{original_name}'"))?;
+            let column = column_offset
+                .checked_add(column as u32)
+                .and_then(|value| value.checked_add(1))
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| format!("cell column is too large in sheet '{original_name}'"))?;
+            model
+                .set_user_input(target_index, row, column, input)
+                .map_err(|error| format!("cannot set cell in sheet '{original_name}': {error}"))?;
+        }
+    }
+    model.evaluate();
+    Ok(model)
+}
+
+fn load_delimited_as_ironcalc(
+    file: &Path,
+    separator: u8,
+) -> Result<ironcalc::base::Model<'static>, String> {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(separator)
+        .has_headers(false)
+        .flexible(true)
+        .from_path(file)
+        .map_err(|error| format!("cannot open delimited spreadsheet preview: {error}"))?;
+    let mut model = ironcalc::base::Model::new_empty("delimited", "en", "UTC", "en")
+        .map_err(|error| format!("cannot create spreadsheet model: {error}"))?;
+
+    for (row_index, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| format!("cannot read delimited row: {error}"))?;
+        let row = i32::try_from(row_index + 1)
+            .map_err(|_| "row index is too large for spreadsheet preview".to_string())?;
+        for (column_index, value) in record.iter().enumerate() {
+            if value.is_empty() {
+                continue;
+            }
+            let column = i32::try_from(column_index + 1)
+                .map_err(|_| "column index is too large for spreadsheet preview".to_string())?;
+            model
+                .set_user_input(0, row, column, literal_spreadsheet_text(value))
+                .map_err(|error| format!("cannot set delimited cell: {error}"))?;
+        }
+    }
+    model.evaluate();
+    Ok(model)
+}
+
+fn calamine_data_to_input(value: &calamine::Data) -> Option<String> {
+    use calamine::Data;
+
+    match value {
+        Data::Empty => None,
+        Data::Int(value) => Some(value.to_string()),
+        Data::Float(value) => Some(value.to_string()),
+        Data::Bool(value) => Some(value.to_string()),
+        Data::String(value) => Some(literal_spreadsheet_text(value)),
+        Data::DateTime(value) => Some(value.to_string()),
+        Data::DateTimeIso(value) => Some(literal_spreadsheet_text(value)),
+        Data::DurationIso(value) => Some(literal_spreadsheet_text(value)),
+        Data::Error(value) => Some(value.to_string()),
+    }
+}
+
+fn literal_spreadsheet_text(value: &str) -> String {
+    format!("'{value}")
+}
+
+fn safe_sheet_name(
+    original: &str,
+    sheet_index: usize,
+    model: &mut ironcalc::base::Model<'_>,
+) -> String {
+    let mut base: String = original
+        .chars()
+        .map(|ch| match ch {
+            '\\' | '/' | '*' | '?' | ':' | '[' | ']' => '_',
+            ch => ch,
+        })
+        .collect();
+    if base.trim().is_empty() {
+        base = format!("Sheet{}", sheet_index + 1);
+    }
+    base = base.chars().take(31).collect();
+
+    let mut candidate = base.clone();
+    let mut suffix = 2;
+    while model
+        .workbook
+        .get_worksheet_names()
+        .iter()
+        .enumerate()
+        .any(|(index, name)| index != sheet_index && name.eq_ignore_ascii_case(&candidate))
+    {
+        let marker = format!("_{suffix}");
+        let prefix_len = 31usize.saturating_sub(marker.chars().count());
+        candidate = format!(
+            "{}{}",
+            base.chars().take(prefix_len).collect::<String>(),
+            marker
+        );
+        suffix += 1;
+    }
+    candidate
+}
+
+pub fn spreadsheet_save(
+    supervisor: &Arc<Supervisor>,
+    session: String,
+    path: String,
+    data: String,
+) -> Result<(), String> {
+    let handle = supervisor
+        .get(&session)
+        .ok_or_else(|| format!("session '{session}' is not open"))?;
+    let file = resolve_path(&path, &handle.cwd());
+    if is_legacy_xls(&file) || delimited_separator(&file).is_some() {
+        return Err("saving converted spreadsheet previews is not supported".into());
+    }
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&data)
+        .map_err(|error| format!("invalid data: {error}"))?;
+    let model = ironcalc::base::Model::from_bytes(&bytes, "en")
+        .map_err(|error| format!("cannot decode model: {error}"))?;
+    ironcalc::export::save_to_xlsx(&model, &file.display().to_string())
+        .map_err(|error| format!("cannot save spreadsheet: {error}"))?;
+    Ok(())
+}
+
+fn resolve_path(path: &str, cwd: &Path) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
 // ---------------------------------------------------------------- pickers
 //
 // Thin, like everything here: the menus and their apply-closures come from
@@ -1916,6 +2144,99 @@ mod tests {
 
         let refused = load_shown(&outside, dir.path(), false).unwrap_err();
         assert!(refused.contains("outside"), "{refused}");
+    }
+
+    #[test]
+    fn xls_data_conversion_preserves_literals_and_typed_values() {
+        assert_eq!(calamine_data_to_input(&calamine::Data::Empty), None);
+        assert_eq!(
+            calamine_data_to_input(&calamine::Data::String("=not a formula".into())),
+            Some("'=not a formula".into())
+        );
+        assert_eq!(
+            calamine_data_to_input(&calamine::Data::String("00123".into())),
+            Some("'00123".into())
+        );
+        assert_eq!(
+            calamine_data_to_input(&calamine::Data::Int(42)),
+            Some("42".into())
+        );
+        assert_eq!(
+            calamine_data_to_input(&calamine::Data::Float(3.5)),
+            Some("3.5".into())
+        );
+        assert_eq!(
+            calamine_data_to_input(&calamine::Data::Bool(true)),
+            Some("true".into())
+        );
+    }
+
+    #[test]
+    fn xls_sheet_names_are_valid_and_distinct_for_ironcalc() {
+        let mut model = ironcalc::base::Model::new_empty("legacy.xls", "en", "UTC", "en").unwrap();
+        let first = safe_sheet_name(
+            "bad/name:that-is-way-too-long-to-fit-in-excel",
+            0,
+            &mut model,
+        );
+        model.rename_sheet_by_index(0, &first).unwrap();
+        let duplicate = safe_sheet_name(
+            "bad/name:that-is-way-too-long-to-fit-in-excel",
+            1,
+            &mut model,
+        );
+        model.add_sheet(&duplicate).unwrap();
+
+        assert_eq!(first.chars().count(), 31);
+        assert!(!first.contains(['\\', '/', '*', '?', ':', '[', ']']));
+        assert_ne!(first.to_lowercase(), duplicate.to_lowercase());
+        assert!(duplicate.chars().count() <= 31);
+    }
+
+    #[test]
+    fn xls_conversion_writes_values_into_an_ironcalc_model() {
+        let mut model = ironcalc::base::Model::new_empty("legacy.xls", "en", "UTC", "en").unwrap();
+        let input = calamine_data_to_input(&calamine::Data::String("00123".into())).unwrap();
+        model.set_user_input(0, 1, 1, input).unwrap();
+        model
+            .set_user_input(
+                0,
+                1,
+                2,
+                calamine_data_to_input(&calamine::Data::Int(42)).unwrap(),
+            )
+            .unwrap();
+        model.evaluate();
+
+        assert_eq!(model.get_formatted_cell_value(0, 1, 1).unwrap(), "00123");
+        assert_eq!(model.get_formatted_cell_value(0, 1, 2).unwrap(), "42");
+    }
+
+    #[test]
+    fn xls_paths_are_not_saved_as_xlsx_payloads() {
+        assert!(is_legacy_xls(Path::new("legacy.XLS")));
+        assert!(!is_legacy_xls(Path::new("modern.xlsx")));
+    }
+
+    #[test]
+    fn delimited_files_convert_to_literal_read_only_spreadsheet_models() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("trades.csv");
+        std::fs::write(&file, "code,name\n00123,=not a formula\n").unwrap();
+
+        let model = load_delimited_as_ironcalc(&file, b',').unwrap();
+        assert_eq!(model.get_formatted_cell_value(0, 2, 1).unwrap(), "00123");
+        assert_eq!(
+            model.get_formatted_cell_value(0, 2, 2).unwrap(),
+            "=not a formula"
+        );
+    }
+
+    #[test]
+    fn tsv_paths_are_converted_but_not_saved_as_xlsx_payloads() {
+        assert_eq!(delimited_separator(Path::new("data.CSV")), Some(b','));
+        assert_eq!(delimited_separator(Path::new("data.tsv")), Some(b'\t'));
+        assert_eq!(delimited_separator(Path::new("modern.xlsx")), None);
     }
 
     #[test]
