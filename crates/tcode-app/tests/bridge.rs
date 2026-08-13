@@ -687,6 +687,7 @@ async fn changing_a_fresh_conversation_folder_keeps_its_session_and_updates_the_
     assert_eq!(
         tcode_app::commands::workspace_list(&supervisor, handle.id.clone(), None)
             .unwrap()
+            .entries
             .into_iter()
             .map(|entry| entry.name)
             .collect::<Vec<_>>(),

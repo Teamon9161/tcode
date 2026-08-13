@@ -47,6 +47,15 @@ pub struct WorkspaceEntry {
     pub kind: EntryKind,
 }
 
+/// One listed directory: every child safe to send over the wire, plus the
+/// entries skipped because the host filesystem can hold names this UI boundary
+/// deliberately will not echo back as workspace paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceDirectory {
+    pub entries: Vec<WorkspaceEntry>,
+    pub warnings: Vec<String>,
+}
+
 /// A bounded UTF-8 text file response.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TextFile {
@@ -190,46 +199,76 @@ impl Workspace {
 
     /// List one directory without recursing. `None` means the workspace root;
     /// all `Some` values must be non-empty relative wire paths.
-    pub fn list(&self, path: Option<&str>) -> Result<Vec<WorkspaceEntry>, WorkspaceError> {
+    pub fn list(&self, path: Option<&str>) -> Result<WorkspaceDirectory, WorkspaceError> {
         let (directory, wire_directory) = match path {
             Some(path) => (self.resolve_existing_dir(path)?, path.to_owned()),
             None => (self.root.clone(), String::new()),
         };
         let mut entries = Vec::new();
+        let mut warnings = Vec::new();
         let reader = fs::read_dir(&directory).map_err(|source| WorkspaceError::Io {
             path: directory.clone(),
             source,
         })?;
 
         for item in reader {
-            let item = item.map_err(|source| WorkspaceError::Io {
-                path: directory.clone(),
-                source,
-            })?;
-            let name = item
-                .file_name()
-                .into_string()
-                .map_err(|name| WorkspaceError::InvalidName(name.to_string_lossy().into_owned()))?;
+            let item = match item {
+                Ok(item) => item,
+                Err(source) => {
+                    warnings.push(format!("skipped an unreadable entry: {source}"));
+                    continue;
+                }
+            };
+            let name = match item.file_name().into_string() {
+                Ok(name) => name,
+                Err(name) => {
+                    warnings.push(format!(
+                        "skipped '{}': file name is not valid UTF-8",
+                        visible_name(&name.to_string_lossy())
+                    ));
+                    continue;
+                }
+            };
             // Names returned by the OS are never reused directly. Refusing an
             // unrepresentable/reserved component keeps every listed path safe
             // to send back on the wire, including when a directory was created
-            // outside this service.
-            validate_name(&name)?;
+            // outside this service. A bad sibling must not make the whole folder
+            // disappear, so listing reports it as a warning and carries on.
+            if validate_name(&name).is_err() {
+                warnings.push(format!(
+                    "skipped '{}': invalid file name",
+                    visible_name(&name)
+                ));
+                continue;
+            }
             let full = item.path();
-            let metadata = fs::symlink_metadata(&full).map_err(|source| WorkspaceError::Io {
-                path: full.clone(),
-                source,
-            })?;
+            let metadata = match fs::symlink_metadata(&full) {
+                Ok(metadata) => metadata,
+                Err(source) => {
+                    warnings.push(format!("skipped '{}': {source}", visible_name(&name)));
+                    continue;
+                }
+            };
             let kind = if is_link(&metadata) {
                 EntryKind::Link
             } else if metadata.is_file() {
-                self.assert_canonical_inside(&full)?;
+                if let Err(error) = self.assert_canonical_inside(&full) {
+                    warnings.push(format!("skipped '{}': {error}", visible_name(&name)));
+                    continue;
+                }
                 EntryKind::File
             } else if metadata.is_dir() {
-                self.assert_canonical_inside(&full)?;
+                if let Err(error) = self.assert_canonical_inside(&full) {
+                    warnings.push(format!("skipped '{}': {error}", visible_name(&name)));
+                    continue;
+                }
                 EntryKind::Directory
             } else {
-                return Err(WorkspaceError::UnsupportedEntry(full.display().to_string()));
+                warnings.push(format!(
+                    "skipped '{}': not a regular file, directory, or link",
+                    visible_name(&name)
+                ));
+                continue;
             };
             let path = if wire_directory.is_empty() {
                 name.clone()
@@ -239,7 +278,7 @@ impl Workspace {
             entries.push(WorkspaceEntry { name, path, kind });
         }
         entries.sort_by(|left, right| left.name.cmp(&right.name));
-        Ok(entries)
+        Ok(WorkspaceDirectory { entries, warnings })
     }
 
     /// Entries that could finish a partly-typed workspace path.
@@ -263,9 +302,10 @@ impl Workspace {
             None => ("", prefix),
         };
         let directory = (!directory.is_empty()).then_some(directory);
-        let Ok(mut entries) = self.list(directory) else {
+        let Ok(listing) = self.list(directory) else {
             return Vec::new();
         };
+        let mut entries = listing.entries;
         let wanted = fragment.to_lowercase();
         entries.retain(|entry| entry.name.to_lowercase().starts_with(&wanted));
         // Names that start with a dot are real answers but rarely the one being
@@ -722,6 +762,10 @@ fn validate_name(name: &str) -> Result<(), WorkspaceError> {
     Ok(())
 }
 
+fn visible_name(name: &str) -> String {
+    name.escape_debug().to_string()
+}
+
 fn is_drive_prefixed(path: &str) -> bool {
     path.as_bytes()
         .get(0..2)
@@ -924,11 +968,56 @@ mod tests {
         let name = "ChatGPT Image 2026年7月31日 09:44:44.png";
         fs::write(root.path().join(name), "image placeholder").unwrap();
 
+        let listed = workspace.list(None).unwrap();
         assert!(matches!(
-            workspace.list(None).unwrap().as_slice(),
+            listed.entries.as_slice(),
             [WorkspaceEntry { name: listed, path, kind: EntryKind::File }] if listed == name && path == name
         ));
+        assert!(listed.warnings.is_empty());
         assert_eq!(workspace.read(name).unwrap().text, "image placeholder");
+    }
+
+    #[test]
+    fn ordinary_pdf_names_are_listed_and_reachable() {
+        let (root, workspace) = workspace();
+        let name = "In-Sample and Out-of-Sample Sharpe Ratios for Linear Predictive Models.pdf";
+        fs::write(root.path().join(name), "pdf placeholder").unwrap();
+
+        let listed = workspace.list(None).unwrap();
+        assert!(matches!(
+            listed.entries.as_slice(),
+            [WorkspaceEntry { name: listed, path, kind: EntryKind::File }] if listed == name && path == name
+        ));
+        assert!(listed.warnings.is_empty());
+    }
+
+    #[test]
+    fn list_skips_control_character_names_without_losing_the_folder() {
+        let (root, workspace) = workspace();
+        fs::write(root.path().join("visible.txt"), "visible").unwrap();
+        fs::write(
+            root.path().join(
+                "In-Sample and Out-of-Sample Sharpe Ratios\nfor Linear Predictive Models.pdf",
+            ),
+            "pdf placeholder",
+        )
+        .unwrap();
+
+        let listing = workspace.list(None).unwrap();
+        assert_eq!(
+            listing.entries,
+            [WorkspaceEntry {
+                name: "visible.txt".to_owned(),
+                path: "visible.txt".to_owned(),
+                kind: EntryKind::File,
+            }]
+        );
+        assert_eq!(listing.warnings.len(), 1);
+        assert!(
+            listing.warnings[0].contains(r"Ratios\nfor Linear Predictive Models.pdf"),
+            "{:?}",
+            listing.warnings
+        );
     }
 
     #[test]
@@ -941,7 +1030,7 @@ mod tests {
             .create_file(Some("alpha"), "nested.txt", "n")
             .unwrap();
 
-        let entries = workspace.list(None).unwrap();
+        let entries = workspace.list(None).unwrap().entries;
         assert_eq!(
             entries
                 .iter()
@@ -949,7 +1038,39 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["alpha", "middle.txt", "z.txt"]
         );
-        assert_eq!(workspace.list(Some("alpha")).unwrap().len(), 1);
+        assert_eq!(workspace.list(Some("alpha")).unwrap().entries.len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_skips_unrepresentable_unix_names_without_losing_the_folder() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let (root, workspace) = workspace();
+        fs::write(root.path().join("visible.txt"), "visible").unwrap();
+        fs::write(
+            root.path()
+                .join(PathBuf::from(OsString::from_vec(vec![0xff]))),
+            "bad",
+        )
+        .unwrap();
+
+        let listing = workspace.list(None).unwrap();
+        assert_eq!(
+            listing.entries,
+            [WorkspaceEntry {
+                name: "visible.txt".to_owned(),
+                path: "visible.txt".to_owned(),
+                kind: EntryKind::File,
+            }]
+        );
+        assert_eq!(listing.warnings.len(), 1);
+        assert!(
+            listing.warnings[0].contains("file name is not valid UTF-8"),
+            "{:?}",
+            listing.warnings
+        );
     }
 
     #[test]
@@ -1149,8 +1270,9 @@ mod tests {
             return; // Windows may deny symlink creation without Developer Mode.
         }
 
+        let listing = workspace.list(None).unwrap();
         assert!(matches!(
-            workspace.list(None).unwrap().as_slice(),
+            listing.entries.as_slice(),
             [WorkspaceEntry { name, kind: EntryKind::Link, .. }] if name == "escape"
         ));
         assert!(matches!(

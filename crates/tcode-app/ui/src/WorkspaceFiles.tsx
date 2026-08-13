@@ -33,6 +33,7 @@ import {
   toggleWorkspaceDirectory,
   visibleWorkspaceTree,
   type WorkspaceEntry,
+  type WorkspaceList,
   type WorkspaceTreeNode,
 } from "./workspaceTree";
 
@@ -101,6 +102,7 @@ export function WorkspaceFiles({
   const [filter, setFilter] = useState("");
   const [loading, setLoading] = useState<ReadonlySet<string>>(new Set());
   const [failure, setFailure] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
   const [creating, setCreating] = useState<Creating | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [menu, setMenu] = useState<Menu | null>(null);
@@ -117,9 +119,15 @@ export function WorkspaceFiles({
   const loadDirectory = useCallback(
     (path: string) => {
       setFailure(null);
+      setWarning(null);
       setLoading((current) => new Set(current).add(path));
-      return invoke<WorkspaceEntry[]>("workspace_list", { session, path: path || null })
-        .then((entries) => setTree((current) => replaceWorkspaceChildren(current, path, entries)))
+      return invoke<WorkspaceList>("workspace_list", { session, path: path || null })
+        .then((listing) => {
+          setTree((current) => replaceWorkspaceChildren(current, path, listing.entries));
+          if (listing.warnings.length > 0) {
+            setWarning(listing.warnings.join("; "));
+          }
+        })
         .catch((error) => setFailure(`could not load this folder: ${String(error)}`))
         .finally(() => setLoading((current) => {
           const next = new Set(current);
@@ -138,6 +146,7 @@ export function WorkspaceFiles({
     setCreating(null);
     setRenaming(null);
     setMenu(null);
+    setWarning(null);
     void loadDirectory(WORKSPACE_ROOT);
   }, [loadDirectory]);
 
@@ -322,6 +331,8 @@ export function WorkspaceFiles({
           {failure}
         </p>
       )}
+
+      {warning && <p className="workspace-note">{warning}</p>}
 
       {/* What the filter did and did not look at, said once beneath the field it
           qualifies rather than as a tag on every closed folder. It answers both

@@ -3,6 +3,7 @@ import { beforeEach, describe, expect, it } from "vitest";
 import { invoke, resetPreviewFixtures } from "./mock-core";
 
 type Entry = { name: string; path: string; kind: "file" | "directory" | "link" };
+type Listing = { entries: Entry[]; warnings: string[] };
 type TextView = {
   path: string;
   text: string;
@@ -19,16 +20,16 @@ beforeEach(resetPreviewFixtures);
 
 describe("preview workspace fixture", () => {
   it("keeps relative workspace trees independent for each session", async () => {
-    const root = await call<Entry[]>("workspace_list", { session: "a", path: null });
-    expect(root).toEqual(expect.arrayContaining([
+    const root = await call<Listing>("workspace_list", { session: "a", path: null });
+    expect(root.entries).toEqual(expect.arrayContaining([
       { name: "crates", path: "crates", kind: "directory" },
       { name: "empty-fixture", path: "empty-fixture", kind: "directory" },
       { name: "outside-workspace", path: "outside-workspace", kind: "link" },
     ]));
 
-    const nested = await call<Entry[]>("workspace_list", { session: "a", path: "crates/tcode-app/src" });
-    expect(nested.map((entry) => entry.path)).toContain("crates/tcode-app/src/Workspace.tsx");
-    await expect(call<Entry[]>("workspace_list", { session: "a", path: "empty-fixture" })).resolves.toEqual([]);
+    const nested = await call<Listing>("workspace_list", { session: "a", path: "crates/tcode-app/src" });
+    expect(nested.entries.map((entry) => entry.path)).toContain("crates/tcode-app/src/Workspace.tsx");
+    await expect(call<Listing>("workspace_list", { session: "a", path: "empty-fixture" })).resolves.toEqual({ entries: [], warnings: [] });
 
     const aReadme = await call<TextView>("workspace_read_text", { session: "a", path: "README.md" });
     const bReadme = await call<TextView>("workspace_read_text", { session: "b", path: "README.md" });
@@ -86,7 +87,7 @@ describe("preview workspace fixture", () => {
     expect(renamed).toEqual({ name: "final.md", path: "empty-fixture/final.md", kind: "file" });
 
     await call<void>("workspace_delete", { session: "a", path: "empty-fixture/final.md" });
-    await expect(call<Entry[]>("workspace_list", { session: "a", path: "empty-fixture" })).resolves.toEqual([]);
+    await expect(call<Listing>("workspace_list", { session: "a", path: "empty-fixture" })).resolves.toEqual({ entries: [], warnings: [] });
   });
 
   it("returns deterministic revisions and exposes the post-save remote conflict", async () => {

@@ -199,3 +199,4 @@ loop {
 6. Tool friction — read: crates/tcode-app/ui/src/Rail.tsx 第 88 行在字符串里用了 NUL 作分隔符（sessions.map(s => s.cwd).join("\0")），read 因此把整个文件判为 binary 拒读，我被迫用 tr '\0' '|' 走 bash 看内容，丢了行号与分页能力，还多花了几次探测。JS 源码里用 NUL 当分隔符是合法常见模式（"\0" 是转义字符，文件本身是 UTF-8 文本）；最小改进是让 read 对"含 NUL 但其余为合法 UTF-8"的文件降级读取，把 NUL 显示为转义（如 \0），而不是整文件判 binary。
 7. Tool friction — agent(explore)：我要求复审“当前 working-tree diff”，但只读 agent 没有 git/diff 能力，也未在工具描述中说明这一限制，因此改为扫描完整文件树，使用了 44 次工具调用和约 225 万输入 token，并且阶段性报告与最终报告的关注点不一致。最小改进是让只读 agent 可读取 git diff，或在派发时自动附带当前 patch；至少应在 agent 能力描述中明确其无法查看 working-tree diff。
 11. terminal好像不能显示一些常见图标?
+12. dark 模式下rewind的go back按钮鼠标不hover几乎看不到文字.

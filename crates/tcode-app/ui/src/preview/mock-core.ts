@@ -335,6 +335,7 @@ type WorkspaceFixture = {
   changedAfterFirstSave: boolean;
 };
 type WorkspaceEntry = { name: string; path: string; kind: WorkspaceKind };
+type WorkspaceList = { entries: WorkspaceEntry[]; warnings: string[] };
 type WorkspaceText = {
   path: string;
   text: string;
@@ -596,7 +597,7 @@ function statWorkspace(args: Record<string, unknown> | undefined): WorkspaceStat
 
 function listWorkspace(
   args: Record<string, unknown> | undefined,
-): WorkspaceEntry[] {
+): WorkspaceList {
   const [, fixture] = workspaceFor(args);
   const path =
     args?.path === null || args?.path === undefined
@@ -606,9 +607,12 @@ function listWorkspace(
     throw new Error(`workspace path '${path}' is not a directory`);
   if (path && !fixture.nodes[path])
     throw new Error(`workspace path '${path}' does not exist`);
-  return Object.entries(fixture.nodes)
-    .filter(([entryPath]) => parentOf(entryPath) === path)
-    .map(([entryPath, node]) => entryFor(entryPath, node));
+  return {
+    entries: Object.entries(fixture.nodes)
+      .filter(([entryPath]) => parentOf(entryPath) === path)
+      .map(([entryPath, node]) => entryFor(entryPath, node)),
+    warnings: [],
+  };
 }
 
 /** The completion menu's source, filtered exactly as `Workspace::complete`

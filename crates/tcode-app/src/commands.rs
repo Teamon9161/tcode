@@ -23,7 +23,9 @@ use tcode_core::{config::Config, ContentBlock};
 use crate::bridge::{ApprovalAnswer, Emit, TURN_FINISHED};
 use crate::projects::{self, ProjectInfo, StoredSessionsPage};
 use crate::state::{run_compact, run_turn, Supervisor};
-use crate::workspace::{EntryKind, TextFile, Workspace, WorkspaceEntry, WorkspaceStat};
+use crate::workspace::{
+    EntryKind, TextFile, Workspace, WorkspaceDirectory, WorkspaceEntry, WorkspaceStat,
+};
 
 /// What the frontend needs to render a session before any turn has run.
 #[derive(Serialize)]
@@ -427,6 +429,26 @@ impl From<WorkspaceEntry> for WorkspaceEntryView {
     }
 }
 
+/// One workspace directory listing in the webview contract.
+#[derive(Serialize, Debug, PartialEq, Eq)]
+pub struct WorkspaceDirectoryView {
+    pub entries: Vec<WorkspaceEntryView>,
+    pub warnings: Vec<String>,
+}
+
+impl From<WorkspaceDirectory> for WorkspaceDirectoryView {
+    fn from(listing: WorkspaceDirectory) -> Self {
+        Self {
+            entries: listing
+                .entries
+                .into_iter()
+                .map(WorkspaceEntryView::from)
+                .collect(),
+            warnings: listing.warnings,
+        }
+    }
+}
+
 /// A text file response in the webview contract.
 #[derive(Serialize, Debug, PartialEq, Eq)]
 pub struct WorkspaceTextView {
@@ -545,10 +567,10 @@ pub fn workspace_list(
     supervisor: &Arc<Supervisor>,
     session: String,
     path: Option<String>,
-) -> Result<Vec<WorkspaceEntryView>, String> {
+) -> Result<WorkspaceDirectoryView, String> {
     session_workspace(supervisor, &session)?
         .list(path.as_deref())
-        .map(|entries| entries.into_iter().map(WorkspaceEntryView::from).collect())
+        .map(WorkspaceDirectoryView::from)
         .map_err(|error| error.to_string())
 }
 

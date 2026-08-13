@@ -6,6 +6,11 @@ export type WorkspaceEntry = {
   kind: "file" | "directory" | "link";
 };
 
+export type WorkspaceList = {
+  entries: WorkspaceEntry[];
+  warnings: string[];
+};
+
 /** A loaded directory's direct children, plus the directories open in this pane.
  * Missing `children[path]` means deliberately not loaded yet; an empty array means
  * it was loaded and is empty. That distinction keeps filtering honest. */
