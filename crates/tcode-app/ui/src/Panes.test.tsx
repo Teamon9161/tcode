@@ -248,6 +248,13 @@ function editor(): EditorView | null {
   return dom ? EditorView.findFromDOM(dom) : null;
 }
 
+function textSpan(text: string, box: DOMRect): HTMLSpanElement {
+  const span = document.createElement("span");
+  span.textContent = text;
+  span.getBoundingClientRect = () => box;
+  return span;
+}
+
 beforeEach(() => {
   resetBrowserVisibility();
   container = document.createElement("div");
@@ -467,6 +474,203 @@ describe("paper pane", () => {
       "s",
       'Explain the selected text from @paper("paper.pdf", page 1):\n\nPaper selection',
     );
+  });
+  it("adds selected PDF text as a readable highlight and removes it with one click", async () => {
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    const shell = container.querySelector<HTMLElement>(".paper-page-shell")!;
+    shell.getBoundingClientRect = () => rect(100, 100, 600, 800);
+    layer.replaceChildren();
+    const first = document.createElement("span");
+    first.style.left = "16px";
+    first.style.top = "180px";
+    first.textContent = "risk";
+    first.getBoundingClientRect = () => rect(116, 280, 180, 19);
+    const second = document.createElement("span");
+    second.style.left = "360px";
+    second.style.top = "180px";
+    second.textContent = "return";
+    second.getBoundingClientRect = () => rect(460, 280, 221, 19);
+    layer.append(first, second);
+    const textNode = first.firstChild!;
+    vi.spyOn(layer, "getBoundingClientRect").mockReturnValue(rect(100, 100, 600, 800));
+    const selection = {
+      rangeCount: 1,
+      isCollapsed: false,
+      anchorNode: textNode,
+      focusNode: textNode,
+      toString: () => "risk and return",
+      getRangeAt: () => ({
+        getClientRects: () => [
+          rect(116, 280, 565, 19),
+        ],
+        intersectsNode: (node: Node) => node === first || node === second,
+      }),
+      removeAllRanges: vi.fn(),
+    } as unknown as Selection;
+    const selectionSpy = vi.spyOn(window, "getSelection").mockReturnValue(selection);
+
+    const stage = container.querySelector<HTMLElement>(".paper-stage")!;
+    await act(async () => {
+      stage.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('.paper-selection-menu [title="Highlight selected text"]')!.click();
+      await Promise.resolve();
+    });
+
+    const saveCalls = mocks.invoke.mock.calls.filter(([cmd]) => cmd === "paper_highlights_save");
+    expect(saveCalls).toHaveLength(1);
+    expect(saveCalls[0][1].highlights[0].rects).toEqual([[16, 180, 565, 19]]);
+    const marker = container.querySelector<HTMLElement>(".paper-highlight-rect")!;
+    expect(marker.tagName).toBe("DIV");
+    expect(marker.getAttribute("title")).toBe("risk and return");
+
+    await act(async () => {
+      stage.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+      await Promise.resolve();
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".paper-selection-menu .chip")!.click();
+      await Promise.resolve();
+    });
+    const lastSave = mocks.invoke.mock.calls.filter(([cmd]) => cmd === "paper_highlights_save").at(-1)!;
+    expect(lastSave[1].highlights).toEqual([]);
+    selectionSpy.mockRestore();
+  });
+
+  it("limits PDF text selection to the column under right-column whitespace", async () => {
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    layer.replaceChildren();
+    const left = textSpan("left", rect(116, 280, 220, 18));
+    const right = textSpan("right", rect(706, 280, 240, 18));
+    const leftNext = textSpan("left next", rect(116, 306, 250, 18));
+    const rightNext = textSpan("right next", rect(706, 306, 230, 18));
+    layer.append(left, right, leftNext, rightNext);
+
+    act(() => {
+      layer.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, clientX: 690, clientY: 280 }));
+    });
+    expect(left.style.userSelect).toBe("none");
+    expect(right.style.userSelect).toBe("");
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    });
+
+    act(() => {
+      layer.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, clientX: 980, clientY: 280 }));
+    });
+    expect(left.style.userSelect).toBe("none");
+    expect(right.style.userSelect).toBe("");
+    act(() => {
+      window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    });
+    expect(left.style.userSelect).toBe("");
+  });
+
+  it("keeps right-column text selected when the drag ends in trailing whitespace", async () => {
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    layer.replaceChildren();
+    const left = textSpan("left", rect(116, 280, 220, 18));
+    const right = textSpan("right words", rect(706, 280, 240, 18));
+    const leftNext = textSpan("left next", rect(116, 306, 250, 18));
+    const rightNext = textSpan("right next", rect(706, 306, 230, 18));
+    layer.append(left, right, leftNext, rightNext);
+
+    const originalCaret = document.caretPositionFromPoint;
+    Object.defineProperty(document, "caretPositionFromPoint", {
+      configurable: true,
+      value: (x: number) => {
+        if (x < 800) return { offsetNode: right.firstChild!, offset: 0, getClientRect: () => null };
+        return { offsetNode: layer, offset: 0, getClientRect: () => null };
+      },
+    });
+    try {
+      act(() => {
+        layer.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, clientX: 706, clientY: 280 }));
+        window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: 980, clientY: 280 }));
+      });
+      expect(window.getSelection()?.toString()).toBe("right words");
+      expect(left.style.userSelect).toBe("");
+    } finally {
+      Object.defineProperty(document, "caretPositionFromPoint", {
+        configurable: true,
+        value: originalCaret,
+      });
+    }
+  });
+
+  it("does not synthesize a selection from a click in column whitespace", async () => {
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    layer.replaceChildren();
+    const left = textSpan("left", rect(116, 280, 220, 18));
+    const right = textSpan("right words", rect(706, 280, 240, 18));
+    const leftNext = textSpan("left next", rect(116, 306, 250, 18));
+    const rightNext = textSpan("right next", rect(706, 306, 230, 18));
+    layer.append(left, right, leftNext, rightNext);
+
+    const originalCaret = document.caretPositionFromPoint;
+    Object.defineProperty(document, "caretPositionFromPoint", {
+      configurable: true,
+      value: () => ({ offsetNode: layer, offset: 0, getClientRect: () => null }),
+    });
+    window.getSelection()?.removeAllRanges();
+    try {
+      act(() => {
+        layer.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, clientX: 690, clientY: 280 }));
+        window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true, clientX: 690, clientY: 280 }));
+      });
+      expect(window.getSelection()?.toString()).toBe("");
+      expect(container.querySelector(".paper-selection-menu")).toBeNull();
+    } finally {
+      Object.defineProperty(document, "caretPositionFromPoint", {
+        configurable: true,
+        value: originalCaret,
+      });
+    }
+  });
+
+  it("does not treat normal single-column word gaps as columns", async () => {
+    mocks.invoke.mockImplementation((cmd: string) =>
+      cmd === "paper_highlights_load" ? Promise.resolve([]) : Promise.resolve("http://127.0.0.1:1000/token/paper.pdf"),
+    );
+    await draw({ kind: "paper", path: "docs/paper.pdf" });
+
+    const layer = container.querySelector<HTMLElement>(".paper-text-layer")!;
+    layer.replaceChildren();
+    const first = textSpan("one", rect(116, 280, 72, 18));
+    const second = textSpan("two", rect(206, 280, 84, 18));
+    const third = textSpan("three", rect(116, 306, 90, 18));
+    const fourth = textSpan("four", rect(226, 306, 92, 18));
+    layer.append(first, second, third, fourth);
+
+    act(() => {
+      layer.dispatchEvent(new MouseEvent("mousedown", { button: 0, bubbles: true, clientX: 196, clientY: 280 }));
+    });
+    expect(first.style.userSelect).toBe("");
+    expect(second.style.userSelect).toBe("");
+    expect(third.style.userSelect).toBe("");
+    expect(fourth.style.userSelect).toBe("");
   });
 });
 

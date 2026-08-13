@@ -13,10 +13,14 @@ GlobalWorkerOptions.workerSrc = workerUrl;
 const MIN_SCALE = 0.6;
 const MAX_SCALE = 2.4;
 const SCALE_STEP = 0.2;
-const PAGE_GAP = 12;
 const RENDER_BUFFER = 1;
 
 const HIGHLIGHT_COLORS = ["#facc15", "#86efac", "#93c5fd", "#fca5a5", "#d8b4fe"] as const;
+const COLUMN_GAP_FACTOR = 0.75;
+const COLUMN_BUCKET = 24;
+const SAME_LINE_TOLERANCE = 3;
+const COLUMN_DRAG_THRESHOLD = 6;
+type HighlightColor = (typeof HIGHLIGHT_COLORS)[number];
 
 type Status =
   | { kind: "loading"; detail: string }
@@ -28,6 +32,7 @@ type SelectionMenu = {
   page: number;
   top: number;
   left: number;
+  highlightId: string | null;
 };
 
 type OutlineItem = {
@@ -61,47 +66,234 @@ async function resolveOutlinePage(doc: PDFDocumentProxy, dest: unknown): Promise
   }
 }
 
-function captureSelectionRects(pageShell: HTMLElement, scale: number): Array<[number, number, number, number]> {
+function rectsOverlap(a: DOMRect, b: DOMRect): boolean {
+  return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+}
+
+function selectedLineRects(pageShell: HTMLElement): DOMRect[] {
   const selection = window.getSelection();
   if (!selection || selection.rangeCount === 0) return [];
 
   const range = selection.getRangeAt(0);
-  const clientRects = Array.from(range.getClientRects()).filter((r) => r.width > 0 && r.height > 0);
-  if (clientRects.length === 0) return [];
-
   const shellRect = pageShell.getBoundingClientRect();
-  const pdfRects: Array<[number, number, number, number]> = [];
+  const lineRects = Array.from(pageShell.querySelectorAll<HTMLElement>(".paper-text-layer span"))
+    .filter((span) => !span.matches('[role="img"]'))
+    .map((span) => ({ span, rect: span.getBoundingClientRect() }))
+    .filter(({ span, rect }) => rect.width > 0 && rect.height > 0 && rectsOverlap(rect, shellRect) && range.intersectsNode(span))
+    .map(({ rect }) => rect);
 
-  for (const cr of clientRects) {
-    const x = (cr.left - shellRect.left) / scale;
-    const y = (cr.top - shellRect.top) / scale;
-    const w = cr.width / scale;
-    const h = cr.height / scale;
-    pdfRects.push([x, y, w, h]);
+  const rows: DOMRect[][] = [];
+  for (const rect of lineRects.sort((a, b) => a.top - b.top || a.left - b.left)) {
+    const row = rows.find((candidate) => Math.abs(candidate[0].top - rect.top) <= SAME_LINE_TOLERANCE);
+    if (row) row.push(rect);
+    else rows.push([rect]);
   }
 
-  return mergeOverlappingRects(pdfRects);
+  return rows.map((row) => {
+    const left = Math.min(...row.map((rect) => rect.left));
+    const top = Math.min(...row.map((rect) => rect.top));
+    const right = Math.max(...row.map((rect) => rect.right));
+    const bottom = Math.max(...row.map((rect) => rect.bottom));
+    return DOMRect.fromRect({
+      x: left,
+      y: top,
+      width: right - left,
+      height: bottom - top,
+    });
+  });
 }
 
-function mergeOverlappingRects(rects: Array<[number, number, number, number]>): Array<[number, number, number, number]> {
-  if (rects.length <= 1) return rects;
-  const sorted = [...rects].sort((a, b) => a[1] - b[1] || a[0] - b[0]);
-  const merged: Array<[number, number, number, number]> = [sorted[0]];
-  for (let i = 1; i < sorted.length; i++) {
-    const [x, y, w, h] = sorted[i];
-    const last = merged[merged.length - 1];
-    const [lx, ly, lw, lh] = last;
-    if (Math.abs(y - ly) < 2 && x <= lx + lw + 2) {
-      const nx = Math.min(lx, x);
-      const ny = Math.min(ly, y);
-      const nr = Math.max(lx + lw, x + w);
-      const nb = Math.max(ly + lh, y + h);
-      merged[merged.length - 1] = [nx, ny, nr - nx, nb - ny];
-    } else {
-      merged.push([x, y, w, h]);
+function rangeRects(pageShell: HTMLElement): DOMRect[] {
+  const selection = window.getSelection();
+  if (!selection || selection.rangeCount === 0) return [];
+
+  const range = selection.getRangeAt(0);
+  const shellRect = pageShell.getBoundingClientRect();
+  const rows: DOMRect[][] = [];
+  for (const rect of Array.from(range.getClientRects())
+    .filter((item) => item.width > 0 && item.height > 0 && rectsOverlap(item, shellRect))
+    .sort((a, b) => a.top - b.top || a.left - b.left)) {
+    const row = rows.find((candidate) => Math.abs(candidate[0].top - rect.top) <= SAME_LINE_TOLERANCE);
+    if (row) row.push(rect);
+    else rows.push([rect]);
+  }
+
+  return rows.map((row) => {
+    const left = Math.min(...row.map((rect) => rect.left));
+    const top = Math.min(...row.map((rect) => rect.top));
+    const right = Math.max(...row.map((rect) => rect.right));
+    const bottom = Math.max(...row.map((rect) => rect.bottom));
+    return DOMRect.fromRect({ x: left, y: top, width: right - left, height: bottom - top });
+  });
+}
+
+function captureSelectionRects(pageShell: HTMLElement, scale: number): Array<[number, number, number, number]> {
+  const lineRects = selectedLineRects(pageShell);
+  const rects = lineRects.length > 0 ? lineRects : rangeRects(pageShell);
+  if (rects.length === 0) return [];
+
+  const shellRect = pageShell.getBoundingClientRect();
+  return rects.map((rect) => [
+    (rect.left - shellRect.left) / scale,
+    (rect.top - shellRect.top) / scale,
+    rect.width / scale,
+    rect.height / scale,
+  ]);
+}
+
+function selectionOverlappingHighlight(pageShell: HTMLElement, scale: number, highlights: PaperHighlight[]): PaperHighlight | null {
+  const rects = captureSelectionRects(pageShell, scale);
+  if (rects.length === 0) return null;
+
+  for (const highlight of highlights) {
+    for (const a of rects) {
+      for (const b of highlight.rects) {
+        if (pdfRectsOverlap(a, b)) return highlight;
+      }
     }
   }
-  return merged;
+  return null;
+}
+
+function pdfRectsOverlap(a: [number, number, number, number], b: [number, number, number, number]): boolean {
+  return a[0] < b[0] + b[2] && a[0] + a[2] > b[0] && a[1] < b[1] + b[3] && a[1] + a[3] > b[1];
+}
+
+type CaretPoint = { node: Node; offset: number };
+
+type ColumnDrag = {
+  side: "left" | "right";
+  boundary: number;
+  spans: HTMLElement[];
+  anchor: CaretPoint | null;
+  startX: number;
+  startY: number;
+};
+
+function caretFromPoint(x: number, y: number): CaretPoint | null {
+  const doc = document as Document & {
+    caretPositionFromPoint?: (x: number, y: number) => { offsetNode: Node; offset: number } | null;
+    caretRangeFromPoint?: (x: number, y: number) => Range | null;
+  };
+  const position = doc.caretPositionFromPoint?.(x, y);
+  if (position) return { node: position.offsetNode, offset: position.offset };
+  const range = doc.caretRangeFromPoint?.(x, y);
+  if (range) return { node: range.startContainer, offset: range.startOffset };
+  return null;
+}
+
+function columnBoundary(spans: HTMLElement[]): number | null {
+  const rects = spans
+    .map((span) => span.getBoundingClientRect())
+    .filter((rect) => rect.width > 0 && rect.height > 0)
+    .sort((a, b) => a.top - b.top || a.left - b.left);
+  if (rects.length < 4) return null;
+
+  const rows: DOMRect[][] = [];
+  for (const rect of rects) {
+    const row = rows.find((candidate) => Math.abs(candidate[0].top - rect.top) <= SAME_LINE_TOLERANCE);
+    if (row) row.push(rect);
+    else rows.push([rect]);
+  }
+
+  const candidates = new Map<number, { total: number; count: number }>();
+  for (const row of rows) {
+    const sorted = row.sort((a, b) => a.left - b.left);
+    for (let i = 1; i < sorted.length; i++) {
+      const prev = sorted[i - 1];
+      const next = sorted[i];
+      const gap = next.left - prev.right;
+      const lineHeight = Math.max(1, Math.min(prev.height, next.height));
+      if (gap <= lineHeight * COLUMN_GAP_FACTOR) continue;
+      const midpoint = prev.right + gap / 2;
+      const bucket = Math.round(midpoint / COLUMN_BUCKET);
+      const existing = candidates.get(bucket) ?? { total: 0, count: 0 };
+      existing.total += midpoint;
+      existing.count += 1;
+      candidates.set(bucket, existing);
+    }
+  }
+
+  const minimumRows = Math.max(2, Math.ceil(rows.length * 0.2));
+  let best: { total: number; count: number } | null = null;
+  for (const candidate of candidates.values()) {
+    if (candidate.count < minimumRows) continue;
+    if (!best || candidate.count > best.count) best = candidate;
+  }
+  return best ? best.total / best.count : null;
+}
+
+function sideOf(x: number, boundary: number | null): "single" | "left" | "right" {
+  if (boundary === null) return "single";
+  return x < boundary ? "left" : "right";
+}
+
+function caretSpan(point: CaretPoint | null): HTMLElement | null {
+  const node = point?.node;
+  const element = node instanceof HTMLElement ? node : node?.parentElement;
+  const span = element?.closest<HTMLElement>(".paper-text-layer span");
+  return span && !span.matches('[role="img"]') ? span : null;
+}
+
+function sameColumnCaret(point: CaretPoint | null, side: "left" | "right", boundary: number): CaretPoint | null {
+  const span = caretSpan(point);
+  if (!span) return null;
+  const rect = span.getBoundingClientRect();
+  return sideOf(rect.left + rect.width / 2, boundary) === side ? point : null;
+}
+
+function textEnd(span: HTMLElement): CaretPoint | null {
+  const node = span.firstChild;
+  if (!node) return null;
+  return { node, offset: node.textContent?.length ?? 0 };
+}
+
+function textStart(span: HTMLElement): CaretPoint | null {
+  const node = span.firstChild;
+  if (!node) return null;
+  return { node, offset: 0 };
+}
+
+function blankLineEnd(spans: HTMLElement[], side: "left" | "right", boundary: number, x: number, y: number): CaretPoint | null {
+  const sameSide = spans.filter((span) => {
+    const rect = span.getBoundingClientRect();
+    return sideOf(rect.left + rect.width / 2, boundary) === side;
+  });
+  const row = sameSide.filter((span) => {
+    const rect = span.getBoundingClientRect();
+    return y >= rect.top - SAME_LINE_TOLERANCE && y <= rect.bottom + SAME_LINE_TOLERANCE;
+  });
+  if (row.length === 0) return null;
+  const before = row
+    .filter((span) => span.getBoundingClientRect().left <= x)
+    .sort((a, b) => b.getBoundingClientRect().right - a.getBoundingClientRect().right)[0];
+  if (before) return textEnd(before);
+  const after = row
+    .filter((span) => span.getBoundingClientRect().right >= x)
+    .sort((a, b) => a.getBoundingClientRect().left - b.getBoundingClientRect().left)[0];
+  return after ? textStart(after) : null;
+}
+
+function correctColumnSelection(drag: ColumnDrag, event: MouseEvent): void {
+  const moved = Math.hypot(event.clientX - drag.startX, event.clientY - drag.startY);
+  if (moved < COLUMN_DRAG_THRESHOLD) return;
+
+  const selection = window.getSelection();
+  if (!selection) return;
+
+  const focus = sameColumnCaret(caretFromPoint(event.clientX, event.clientY), drag.side, drag.boundary)
+    ?? blankLineEnd(drag.spans, drag.side, drag.boundary, event.clientX, event.clientY);
+  if (!drag.anchor || !focus) return;
+  selection.removeAllRanges();
+  const range = document.createRange();
+  try {
+    range.setStart(drag.anchor.node, drag.anchor.offset);
+    range.setEnd(focus.node, focus.offset);
+  } catch {
+    range.setStart(focus.node, focus.offset);
+    range.setEnd(drag.anchor.node, drag.anchor.offset);
+  }
+  selection.addRange(range);
 }
 
 let highlightIdCounter = 0;
@@ -131,7 +323,7 @@ export function PaperView({
   const [visiblePages, setVisiblePages] = useState<Set<number>>(new Set([1]));
   const scrollingToPage = useRef(false);
   const [highlights, setHighlights] = useState<PaperHighlight[]>([]);
-  const [highlightColor, setHighlightColor] = useState(HIGHLIGHT_COLORS[0]);
+  const [highlightColor, setHighlightColor] = useState<HighlightColor>(HIGHLIGHT_COLORS[0]);
 
   useEffect(() => {
     let live = true;
@@ -300,14 +492,17 @@ export function PaperView({
       return;
     }
 
+    const pageShell = pageRefs.current.get(selectionPage);
+    const overlapping = pageShell ? selectionOverlappingHighlight(pageShell, scale, highlights) : null;
     const stageRect = scroller.getBoundingClientRect();
     setMenu({
       text,
       page: selectionPage,
       left: rect.left - stageRect.left + scroller.scrollLeft + rect.width / 2,
       top: rect.top - stageRect.top + scroller.scrollTop,
+      highlightId: overlapping?.id ?? null,
     });
-  }, []);
+  }, [highlights, scale]);
 
   const sendPrompt = useCallback(
     (action: PaperAction) => {
@@ -356,6 +551,13 @@ export function PaperView({
     },
     [session, path],
   );
+
+  const removeSelectionHighlight = useCallback(() => {
+    if (!menu?.highlightId) return;
+    removeHighlight(menu.highlightId);
+    setMenu(null);
+    window.getSelection()?.removeAllRanges();
+  }, [menu, removeHighlight]);
 
   const summarizePaper = useCallback(() => {
     if (!onPrompt) return;
@@ -542,7 +744,6 @@ export function PaperView({
                   doc={shouldRender ? document : null}
                   setRef={setPageRef}
                   highlights={pageHighlights}
-                  onRemoveHighlight={removeHighlight}
                 />
               );
             })}
@@ -553,21 +754,29 @@ export function PaperView({
               style={{ left: menu.left, top: menu.top }}
               onMouseDown={(event) => event.preventDefault()}
             >
-              <button type="button" className="chip" onClick={addHighlight} title="Highlight selected text">
-                <HighlighterIcon size={14} />
-              </button>
-              <span className="paper-color-picks">
-                {HIGHLIGHT_COLORS.map((c) => (
-                  <button
-                    key={c}
-                    type="button"
-                    className={`paper-color-dot${c === highlightColor ? " is-active" : ""}`}
-                    style={{ background: c }}
-                    onClick={() => setHighlightColor(c)}
-                    aria-label={`Highlight color ${c}`}
-                  />
-                ))}
-              </span>
+              {menu.highlightId ? (
+                <button type="button" className="chip" onClick={removeSelectionHighlight} title="Remove highlight from selected text">
+                  Remove highlight
+                </button>
+              ) : (
+                <>
+                  <button type="button" className="chip" onClick={addHighlight} title="Highlight selected text">
+                    <HighlighterIcon size={14} />
+                  </button>
+                  <span className="paper-color-picks">
+                    {HIGHLIGHT_COLORS.map((c) => (
+                      <button
+                        key={c}
+                        type="button"
+                        className={`paper-color-dot${c === highlightColor ? " is-active" : ""}`}
+                        style={{ background: c }}
+                        onClick={() => setHighlightColor(c)}
+                        aria-label={`Highlight color ${c}`}
+                      />
+                    ))}
+                  </span>
+                </>
+              )}
               {onPrompt && (
                 <>
                   <span className="paper-menu-sep" />
@@ -597,7 +806,6 @@ function PageSlot({
   doc,
   setRef,
   highlights,
-  onRemoveHighlight,
 }: {
   pageNum: number;
   dims: PageDimensions;
@@ -605,12 +813,11 @@ function PageSlot({
   doc: PDFDocumentProxy | null;
   setRef: (pageNum: number, el: HTMLDivElement | null) => void;
   highlights: PaperHighlight[];
-  onRemoveHighlight: (id: string) => void;
 }) {
   const shellRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const textLayerRef = useRef<HTMLDivElement>(null);
-  const [rendered, setRendered] = useState(false);
+  const [, setRendered] = useState(false);
 
   const scaledWidth = dims.width * scale;
   const scaledHeight = dims.height * scale;
@@ -679,29 +886,34 @@ function PageSlot({
     };
   }, [doc, pageNum, scale]);
 
-  // Dual-column selection limiter
   useEffect(() => {
     const layer = textLayerRef.current;
     if (!layer || !doc) return;
     const onDown = (event: MouseEvent) => {
       if (event.button !== 0) return;
-      const rect = layer.getBoundingClientRect();
-      if (rect.width === 0) return;
-      const clickedRight = (event.clientX - rect.left) > rect.width / 2;
+      const allSpans = Array.from(layer.querySelectorAll<HTMLElement>("span"))
+        .filter((span) => !span.matches('[role="img"]'));
+      const boundary = columnBoundary(allSpans);
+      const clickedSide = sideOf(event.clientX, boundary);
+      if (clickedSide === "single" || boundary === null) return;
 
-      const allSpans = layer.querySelectorAll<HTMLElement>("span");
-      const muted: HTMLElement[] = [];
-      for (const span of allSpans) {
-        const left = parseFloat(span.style.left);
-        if (Number.isNaN(left)) continue;
-        if ((left >= 50) !== clickedRight) {
-          muted.push(span);
-        }
-      }
+      const drag: ColumnDrag = {
+        side: clickedSide,
+        boundary,
+        spans: allSpans,
+        anchor: caretFromPoint(event.clientX, event.clientY) ?? blankLineEnd(allSpans, clickedSide, boundary, event.clientX, event.clientY),
+        startX: event.clientX,
+        startY: event.clientY,
+      };
+      const muted = allSpans.filter((span) => {
+        const center = span.getBoundingClientRect().left + span.getBoundingClientRect().width / 2;
+        return sideOf(center, boundary) !== clickedSide;
+      });
       if (muted.length === 0 || muted.length === allSpans.length) return;
       for (const el of muted) el.style.userSelect = "none";
 
-      const restore = () => {
+      const restore = (up: MouseEvent) => {
+        correctColumnSelection(drag, up);
         for (const el of muted) el.style.userSelect = "";
         window.removeEventListener("mouseup", restore, true);
       };
@@ -737,7 +949,6 @@ function PageSlot({
                         background: hl.color,
                       }}
                       title={hl.selectedText}
-                      onDoubleClick={() => onRemoveHighlight(hl.id)}
                     />
                   ))}
                 </div>
@@ -838,10 +1049,6 @@ function roundScale(value: number): number {
 
 function isRenderingCancel(error: unknown): boolean {
   return error instanceof Error && /cancel/i.test(error.name);
-}
-
-function inside(container: HTMLElement, node: Node | null): boolean {
-  return !!node && (node === container || container.contains(node));
 }
 
 function firstUsableRect(range: Range): DOMRect | null {

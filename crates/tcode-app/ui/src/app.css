@@ -7598,27 +7598,22 @@ button.strip-phase-line:hover .strip-phase-name {
 }
 
 .paper-text-layer ::selection {
-  background: var(--brand-wash);
+  background: color-mix(in oklab, var(--brand) 18%, transparent);
+  color: transparent;
 }
 
 .paper-highlight-layer {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  z-index: 0;
+  z-index: 1;
+  mix-blend-mode: multiply;
 }
 
 .paper-highlight-rect {
   position: absolute;
   opacity: 0.35;
   border-radius: 2px;
-  pointer-events: auto;
-  cursor: pointer;
-  transition: opacity var(--dur-fast);
-}
-
-.paper-highlight-rect:hover {
-  opacity: 0.55;
 }
 
 .paper-selection-menu {
