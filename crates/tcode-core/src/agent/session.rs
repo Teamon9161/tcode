@@ -975,8 +975,9 @@ impl Session {
         let memory_note = {
             let mut memory = self.tool_ctx.memory.lock().expect("memory lock");
             memory.restore_from_entries(self.ledger.entries());
+            let freshness = self.tool_ctx.freshness.lock().expect("freshness lock");
             memory
-                .discover_for_paths(std::slice::from_ref(&new))
+                .discover_for_paths_with_freshness(std::slice::from_ref(&new), &freshness)
                 .map(|update| update.note)
         };
         Ok(CwdChange {

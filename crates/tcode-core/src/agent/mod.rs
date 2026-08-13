@@ -2798,7 +2798,8 @@ impl Agent {
         }
         let mut memory = session.tool_ctx.memory.lock().expect("memory lock");
         memory.restore_from_entries(session.ledger.entries());
-        memory.discover_for_paths(&paths)
+        let freshness = session.tool_ctx.freshness.lock().expect("freshness lock");
+        memory.discover_for_paths_with_freshness(&paths, &freshness)
     }
 
     fn affected_mutations(

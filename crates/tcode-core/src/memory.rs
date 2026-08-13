@@ -275,6 +275,22 @@ impl MemoryManager {
     }
 
     pub fn discover_for_paths(&mut self, paths: &[PathBuf]) -> Option<MemoryUpdate> {
+        self.discover_for_paths_inner(paths, None)
+    }
+
+    pub fn discover_for_paths_with_freshness(
+        &mut self,
+        paths: &[PathBuf],
+        freshness: &crate::freshness::FreshnessTracker,
+    ) -> Option<MemoryUpdate> {
+        self.discover_for_paths_inner(paths, Some(freshness))
+    }
+
+    fn discover_for_paths_inner(
+        &mut self,
+        paths: &[PathBuf],
+        freshness: Option<&crate::freshness::FreshnessTracker>,
+    ) -> Option<MemoryUpdate> {
         let mut new_sources = Vec::new();
         let mut new_rule_keys = HashSet::new();
         let mut rule_targets = Vec::new();
@@ -394,7 +410,7 @@ impl MemoryManager {
             }
         }
         append_source_markers(&mut note, new_sources.iter());
-        append_dynamic_sources(&mut note, new_sources.iter(), INSTRUCTION_CAP);
+        append_dynamic_sources(&mut note, new_sources.iter(), INSTRUCTION_CAP, freshness);
         Some(MemoryUpdate {
             note,
             affected_roots,
@@ -519,7 +535,7 @@ impl MemoryManager {
             note.push('\n');
         }
         append_source_markers(&mut note, dynamic.iter().copied());
-        append_dynamic_sources(&mut note, dynamic.into_iter(), INSTRUCTION_CAP);
+        append_dynamic_sources(&mut note, dynamic.into_iter(), INSTRUCTION_CAP, None);
         Some(note)
     }
 
@@ -601,6 +617,7 @@ fn append_dynamic_sources<'a>(
     out: &mut String,
     sources: impl Iterator<Item = &'a PathBuf>,
     cap: usize,
+    freshness: Option<&crate::freshness::FreshnessTracker>,
 ) {
     let sources: Vec<&PathBuf> = sources.collect();
     if sources.is_empty() {
@@ -623,32 +640,131 @@ fn append_dynamic_sources<'a>(
         let Some(text) = instruction_text(source) else {
             continue;
         };
+        let already_seen = dynamic_source_seen(source, &text, freshness);
         out.push_str(&format!("## {}\n", source.display()));
-        let remaining = cap.saturating_sub(out.len().saturating_sub(start));
-        let remaining_sources = total.saturating_sub(index);
-        let slice_budget = if remaining_sources <= 1 {
-            remaining
-        } else {
-            remaining / remaining_sources
-        };
-        if text.len() <= slice_budget {
-            out.push_str(&text);
-        } else {
-            let mut end = slice_budget;
-            while end > 0 && !text.is_char_boundary(end) {
-                end -= 1;
+        match already_seen {
+            SourceSeen::Full => {
+                out.push_str(
+                    "Already loaded from a prior read of the unchanged instruction file in this conversation; apply that content from the earlier tool result.\n",
+                );
+                continue;
             }
-            out.push_str(&text[..end]);
-            out.push_str(&format!(
-                "\n[truncated: {end} of {} bytes of this file are shown; other newly \
-                 discovered instruction files also need budget. Read {} directly if the \
-                 task touches this area.]\n",
-                text.len(),
-                source.display()
-            ));
+            SourceSeen::Prefix { next_line, byte } => {
+                out.push_str(&format!(
+                    "Earlier reads already loaded this instruction file through line {}; only the unread remainder is shown below. To inspect the unread remainder directly, read {} with offset={next_line}; use force=true only if you need to re-read the already seen prefix.\n",
+                    next_line.saturating_sub(1),
+                    source.display()
+                ));
+                append_one_dynamic_source(
+                    out,
+                    source,
+                    &text,
+                    byte,
+                    cap.saturating_sub(out.len().saturating_sub(start)),
+                    total.saturating_sub(index),
+                );
+            }
+            SourceSeen::None => append_one_dynamic_source(
+                out,
+                source,
+                &text,
+                0,
+                cap.saturating_sub(out.len().saturating_sub(start)),
+                total.saturating_sub(index),
+            ),
         }
         out.push('\n');
     }
+}
+
+fn append_one_dynamic_source(
+    out: &mut String,
+    source: &Path,
+    text: &str,
+    start_byte: usize,
+    remaining: usize,
+    remaining_sources: usize,
+) {
+    let slice_budget = if remaining_sources <= 1 {
+        remaining
+    } else {
+        remaining / remaining_sources
+    };
+    let text = &text[start_byte..];
+    if text.len() <= slice_budget {
+        out.push_str(text);
+    } else {
+        let mut end = slice_budget;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&text[..end]);
+        let shown = start_byte + end;
+        out.push_str(&format!(
+            "\n[truncated: {shown} of {} bytes of this file are shown; other newly \
+             discovered instruction files also need budget. Read {} directly if the \
+             task touches this area.]\n",
+            start_byte + text.len(),
+            source.display()
+        ));
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum SourceSeen {
+    None,
+    Prefix { next_line: usize, byte: usize },
+    Full,
+}
+
+fn dynamic_source_seen(
+    source: &Path,
+    text: &str,
+    freshness: Option<&crate::freshness::FreshnessTracker>,
+) -> SourceSeen {
+    let Some(freshness) = freshness else {
+        return SourceSeen::None;
+    };
+    let hash = crate::freshness::content_hash(text.as_bytes());
+    match freshness.visibility(source, hash) {
+        crate::freshness::Visibility::Full => SourceSeen::Full,
+        crate::freshness::Visibility::Partial(ranges) => seen_prefix(text, &ranges)
+            .map(|(next_line, byte)| SourceSeen::Prefix { next_line, byte })
+            .unwrap_or(SourceSeen::None),
+        crate::freshness::Visibility::Unseen | crate::freshness::Visibility::Stale => {
+            SourceSeen::None
+        }
+    }
+}
+
+fn seen_prefix(text: &str, ranges: &[(usize, usize)]) -> Option<(usize, usize)> {
+    let prefix_end_line = ranges
+        .iter()
+        .filter(|(start, _)| *start == 1)
+        .map(|(_, end)| *end)
+        .max()?;
+    let total_lines = text.lines().count();
+    if prefix_end_line >= total_lines {
+        return Some((total_lines + 1, text.len()));
+    }
+    let byte = byte_offset_for_line(text, prefix_end_line + 1).unwrap_or(text.len());
+    Some((prefix_end_line + 1, byte))
+}
+
+fn byte_offset_for_line(text: &str, line: usize) -> Option<usize> {
+    if line <= 1 {
+        return Some(0);
+    }
+    let mut current = 1;
+    for (index, ch) in text.char_indices() {
+        if ch == '\n' {
+            current += 1;
+            if current == line {
+                return Some(index + ch.len_utf8());
+            }
+        }
+    }
+    None
 }
 
 fn append_source_markers<'a>(out: &mut String, sources: impl Iterator<Item = &'a PathBuf>) {
@@ -1145,6 +1261,81 @@ mod tests {
         );
         assert!(update.note.contains("FIRST-HEAD"), "{}", update.note);
         assert!(update.note.contains("SECOND-RULE"), "{}", update.note);
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dynamic_instruction_note_summarizes_a_fully_read_source() {
+        let base = temp("dynamic-source-full-freshness");
+        let home = base.join("home");
+        let root = base.join("repo");
+        let nested = root.join("crates/app");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("AGENTS.md");
+        let body = "app rule\nsecond line\n";
+        fs::write(&source, body).unwrap();
+
+        let mut freshness = crate::freshness::FreshnessTracker::default();
+        let source = canonical_or_normal(&source);
+        freshness.record_read(
+            &source,
+            crate::freshness::content_hash(body.as_bytes()),
+            None,
+        );
+
+        let mut manager = MemoryManager::new_with_home(&root, Some(home));
+        let update = manager
+            .discover_for_paths_with_freshness(&[nested.join("src/lib.rs")], &freshness)
+            .unwrap();
+
+        assert!(
+            update.note.contains("Already loaded from a prior read"),
+            "{}",
+            update.note
+        );
+        assert!(update.note.contains("tcode-memory-source:"));
+        assert!(
+            !update.note.contains("app rule\nsecond line"),
+            "the unchanged body should not be paid for twice: {}",
+            update.note
+        );
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn dynamic_instruction_note_keeps_unread_tail_after_prefix_read() {
+        let base = temp("dynamic-source-prefix-freshness");
+        let home = base.join("home");
+        let root = base.join("repo");
+        let nested = root.join("crates/app");
+        fs::create_dir_all(root.join(".git")).unwrap();
+        fs::create_dir_all(&nested).unwrap();
+        let source = nested.join("AGENTS.md");
+        let body = "line 1\nline 2\nline 3\nline 4\n";
+        fs::write(&source, body).unwrap();
+
+        let mut freshness = crate::freshness::FreshnessTracker::default();
+        let source = canonical_or_normal(&source);
+        freshness.record_read(
+            &source,
+            crate::freshness::content_hash(body.as_bytes()),
+            Some((1, 2)),
+        );
+
+        let mut manager = MemoryManager::new_with_home(&root, Some(home));
+        let update = manager
+            .discover_for_paths_with_freshness(&[nested.join("src/lib.rs")], &freshness)
+            .unwrap();
+
+        assert!(
+            update.note.contains("through line 2") && update.note.contains("offset=3"),
+            "{}",
+            update.note
+        );
+        assert!(!update.note.contains("line 1\n"), "{}", update.note);
+        assert!(!update.note.contains("line 2\n"), "{}", update.note);
+        assert!(update.note.contains("line 3\nline 4"), "{}", update.note);
         let _ = fs::remove_dir_all(base);
     }
 
