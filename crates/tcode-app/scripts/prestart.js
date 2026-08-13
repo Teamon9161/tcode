@@ -46,7 +46,7 @@ const frontendStale =
 
 if (frontendStale) {
   console.log("ui/dist is stale — building the frontend…");
-  execFileSync("npm", ["--prefix", "ui", "run", "build"], { cwd: root, stdio: "inherit", shell: true });
+  execFileSync("npm", ["--silent", "--prefix", "ui", "run", "build"], { cwd: root, stdio: "inherit", shell: true });
 } else {
   console.log("ui/dist is up to date.");
 }

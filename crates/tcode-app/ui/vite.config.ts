@@ -70,6 +70,11 @@ export default defineConfig(({ mode }) => {
       // byte the app loads is its own, and a build setting is the cheaper thing
       // to change than the sentence that says so.
       assetsInlineLimit: (file) => (file.endsWith(".woff2") || file.endsWith(".woff") ? false : undefined),
+      // The desktop bundle intentionally ships a large self-contained app
+      // shell, plus lazy Shiki grammar chunks. Keep the build warning threshold
+      // above the expected app shell so `npm start` reports actionable issues
+      // instead of repeating the same known size note.
+      chunkSizeWarningLimit: 2048,
     },
     // `@ipc` is the whole seam (`src/ipc.ts`), so swapping that one specifier
     // is what puts the design preview on fixtures. It is a bare specifier

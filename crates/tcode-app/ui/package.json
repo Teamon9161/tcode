@@ -5,10 +5,10 @@
   "type": "module",
   "scripts": {
     "build:sandbox": "node scripts/build-sandbox.mjs",
-    "dev": "npm run build:sandbox && vite",
-    "build": "npm run build:sandbox && tsc --noEmit && vite build",
+    "dev": "node scripts/build-sandbox.mjs && vite",
+    "build": "node scripts/build-sandbox.mjs && tsc --noEmit && vite build",
     "preview": "vite preview",
-    "preview:ui": "npm run build:sandbox && vite --mode preview --open",
+    "preview:ui": "node scripts/build-sandbox.mjs && vite --mode preview --open",
     "test": "vitest run"
   },
   "dependencies": {
