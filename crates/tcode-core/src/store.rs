@@ -249,6 +249,21 @@ pub fn tool_output_dir(cwd: &Path) -> PathBuf {
     scratchpad_dir(cwd).join("tool-output")
 }
 
+/// Where the window's browser saves files a page hands it — for the user's own
+/// manual downloads and the `browser` tool's alike.
+///
+/// **Window-level, not per-project**, and that is the whole reason it lives here
+/// beside `home_dir()` rather than under `project_data_dir`: the browser is one
+/// shared instance, a person's manual download belongs to no session, and the
+/// working folder can change mid-download, so there is no project to key on.
+/// Kept under `~/.tcode` so a download never lands in the workspace as git
+/// noise, and stable across folder switches so an in-flight file does not lose
+/// its home. `None` only when there is no home directory at all, the same
+/// condition every other `~/.tcode` path answers `None` to.
+pub fn downloads_dir() -> Option<PathBuf> {
+    Some(crate::home_dir()?.join(".tcode").join("downloads"))
+}
+
 /// Where this project's progress files live: `<project-data>/progress/`.
 /// Runtime state, not part of the user's repository — an agent writing into a
 /// repo is git noise and accidental commits; anyone who wants a plan tracked

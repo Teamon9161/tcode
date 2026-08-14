@@ -39,7 +39,10 @@
 const {
   WebContentsView: NativeWebContentsView,
   session: nativeSession,
+  shell: nativeShell,
 } = require("electron");
+const path = require("path");
+const fs = require("fs");
 
 /** Mirrors `browser::BROWSER_NAVIGATED`, which mirrors `ui/src/types.ts`. */
 const BROWSER_NAVIGATED = "tcode://browser-navigated";
@@ -58,6 +61,13 @@ const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
 /** A transient low-resolution page preview for the app renderer. Never sent to
  *  the sidecar, ledger or model. Mirrors `ui/src/types.ts`. */
 const BROWSER_THUMBNAIL = "tcode://browser-thumbnail";
+/**
+ * The window's download list, for the app's download manager. Mirrors
+ * `ui/src/types.ts`. Carries every download this run — the user's own and the
+ * model's alike — because the browser is one shared instance and its download
+ * shelf is the same shelf whoever started the file.
+ */
+const BROWSER_DOWNLOAD = "tcode://browser-download";
 
 /**
  * How long any one CDP command may take.
@@ -129,10 +139,11 @@ const PARTITION = "persist:tcode-browser";
  * tests, and is deliberately not reimplemented here.
  */
 function browserVerbs(
-  { window, appView, emit, resolveUrl },
+  { window, appView, emit, resolveUrl, downloadsDir },
   {
     WebContentsView = NativeWebContentsView,
     session = nativeSession,
+    shell = nativeShell,
     renderTimeout = RENDER_TIMEOUT,
     thumbnailDelay = 120,
   } = {},
@@ -171,6 +182,159 @@ function browserVerbs(
   let rect = { x: 0, y: 0, width: 1280, height: 800 };
   /** Whether the pane wants the browser on screen at all. */
   let shown = false;
+
+  // ---- Downloads ---------------------------------------------------------
+  //
+  // One handler for the whole partition, so a file the user saves by clicking a
+  // link in the visible pane and a file the model saves by driving a background
+  // tab travel the identical path: auto-accepted — there is nobody to answer
+  // Chromium's save dialog for an agent tab, and the user has the app's own
+  // shelf instead — written into one window-level directory, and tracked so both
+  // the model (`browser_download`) and the download manager (BROWSER_DOWNLOAD)
+  // can see what is in flight and what has landed. The directory is
+  // `~/.tcode/downloads`, resolved once by the backend (`downloads_dir`); this
+  // process never composes a `~/.tcode` path of its own (`../CLAUDE.md`).
+
+  /** Every download this run, oldest first. Each carries the tab it began in so
+   *  `browser_download` can answer for one tab while the UI shows them all. */
+  const downloadList = [];
+  let downloadSeq = 0;
+
+  /** A server-supplied filename is data, not a path (rule 3): reduce it to a
+   *  single path component so `../../etc/foo` cannot escape the directory, and
+   *  give an empty or dot-only name a real one. */
+  const safeName = (name) => {
+    const cleaned = Array.from(String(name ?? ""))
+      // Strip C0 control characters (code points below 0x20) without spelling a
+      // control literal into the source; `path.basename` below drops the path
+      // separators, so between them a server name becomes one plain filename.
+      .filter((ch) => ch.codePointAt(0) >= 0x20)
+      .join("")
+      .trim();
+    // `path.basename` drops any directory components a hostile name carried,
+    // leaving one filename that cannot escape the downloads directory.
+    const base = path.basename(cleaned);
+    return base && base !== "." && base !== ".." ? base : "download";
+  };
+
+  /** A path that does not overwrite an existing one, `report (1).pdf` style. */
+  const uniquePath = (dir, name) => {
+    fs.mkdirSync(dir, { recursive: true });
+    const ext = path.extname(name);
+    const stem = name.slice(0, name.length - ext.length);
+    for (let i = 0; i < 10000; i += 1) {
+      const candidate = path.join(dir, i === 0 ? name : `${stem} (${i})${ext}`);
+      if (!fs.existsSync(candidate)) return candidate;
+    }
+    return path.join(dir, `${stem}-${Date.now()}${ext}`);
+  };
+
+  /** Reject a path the UI hands back that is not inside the downloads
+   *  directory, so open/reveal cannot be turned on anything else. */
+  const withinDownloads = (candidate) => {
+    const resolved = path.resolve(String(candidate ?? ""));
+    const root = path.resolve(downloadsDir);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new Error("that path is not in the downloads directory");
+    }
+    return resolved;
+  };
+
+  /** The serializable face of a record — all but its completion promise. */
+  const downloadView = (record) => ({
+    id: record.id,
+    tabId: record.tabId,
+    url: record.url,
+    filename: record.filename,
+    path: record.path,
+    state: record.state,
+    receivedBytes: record.receivedBytes,
+    totalBytes: record.totalBytes,
+    startedAt: record.startedAt,
+  });
+
+  // `updated` fires many times a second; the shelf only needs a smooth bar. A
+  // start and a completion are published at once, progress on a short timer.
+  let downloadTimer = null;
+  const publishDownloads = (immediate) => {
+    const send = () => {
+      downloadTimer = null;
+      emit(BROWSER_DOWNLOAD, { downloads: downloadList.map(downloadView) });
+    };
+    if (immediate) {
+      if (downloadTimer) clearTimeout(downloadTimer);
+      send();
+    } else if (!downloadTimer) {
+      downloadTimer = setTimeout(send, 200);
+    }
+  };
+
+  /** Forget one download: stop a transfer still in flight, optionally delete
+   *  the file, and drop the record. File deletion is confined to the downloads
+   *  directory, the same guard open/reveal use, so nothing else can be removed.
+   *  Does not publish — the caller does, once, after a batch. */
+  const removeRecord = (record, deleteFile) => {
+    if (record.state === "progressing") {
+      try {
+        record.item.cancel();
+      } catch {
+        // Already finished between the click and here; nothing to stop.
+      }
+    }
+    if (deleteFile) {
+      try {
+        fs.rmSync(withinDownloads(record.path), { force: true });
+      } catch {
+        // Best effort: a file held open elsewhere, or already gone, is not a
+        // reason to keep the record the person asked to be rid of.
+      }
+    }
+    const at = downloadList.indexOf(record);
+    if (at >= 0) downloadList.splice(at, 1);
+  };
+
+  session
+    .fromPartition(PARTITION)
+    .on("will-download", (_event, item, contents) => {
+      const tab = tabs.find((entry) => entry.view.webContents === contents);
+      const savePath = uniquePath(downloadsDir, safeName(item.getFilename()));
+      // The property, not `setSavePath`: assigning it is what suppresses the
+      // save dialog, and the method spelling is deprecated on this Electron.
+      item.savePath = savePath;
+      const record = {
+        id: `dl-${(downloadSeq += 1)}`,
+        tabId: tab ? tab.id : null,
+        url: item.getURL(),
+        filename: path.basename(savePath),
+        path: savePath,
+        state: "progressing",
+        receivedBytes: 0,
+        totalBytes: item.getTotalBytes(),
+        startedAt: Date.now(),
+        // Kept so a removal can stop a transfer still in flight — a record-less
+        // download writing to disk would be the one thing worse than either.
+        // Never serialized (`downloadView` whitelists), so it does not leak.
+        item,
+      };
+      let settle;
+      record.done = new Promise((resolve) => {
+        settle = resolve;
+      });
+      item.on("updated", (_e, state) => {
+        record.receivedBytes = item.getReceivedBytes();
+        record.totalBytes = item.getTotalBytes();
+        record.state = state; // 'progressing' | 'interrupted'
+        publishDownloads(false);
+      });
+      item.once("done", (_e, state) => {
+        record.receivedBytes = item.getReceivedBytes();
+        record.state = state; // 'completed' | 'cancelled' | 'interrupted'
+        settle(record);
+        publishDownloads(true);
+      });
+      downloadList.push(record);
+      publishDownloads(true);
+    });
 
   const find = (id) => {
     const tab = tabs.find((tab) => tab.id === id);
@@ -988,6 +1152,68 @@ function browserVerbs(
       }, { viewport });
     },
 
+    /**
+     * Report the newest download that began in a tab, waiting for it to finish.
+     *
+     * The model's window onto a file it just triggered: it holds the tab id, and
+     * this answers with the absolute path the file is written to, how far it has
+     * got, and — once it settles — whether it completed. Bounded like
+     * `browser_wait`, because a download can stall and a tool call must not hang
+     * on it: a timeout returns the progress so far with `pending`, so the model
+     * can ask again rather than being told nothing.
+     */
+    async browser_download(args) {
+      find(args.id); // an unknown tab is an error, never an empty answer
+      const record = [...downloadList]
+        .reverse()
+        .find((entry) => entry.tabId === args.id);
+      if (!record) return { none: true };
+      const limit = Math.min(Math.max(args.timeoutMs || 30000, 500), 120000);
+      if (record.state === "progressing") {
+        try {
+          await withTimeout(record.done, limit, "download");
+        } catch {
+          return { pending: true, ...downloadView(record) };
+        }
+      }
+      return downloadView(record);
+    },
+
+    /** Open a finished download with the system's default application. Driven
+     *  by the app's own download shelf, never the model; confined to the
+     *  downloads directory so a stray path cannot open anything else. */
+    async browser_download_open(args) {
+      const error = await shell.openPath(withinDownloads(args.path));
+      if (error) throw new Error(error);
+      return null;
+    },
+
+    /** Reveal a download in the system file manager. Same confinement. */
+    browser_download_reveal(args) {
+      shell.showItemInFolder(withinDownloads(args.path));
+      return null;
+    },
+
+    /** Drop one download from the shelf. `deleteFile` also removes it from disk;
+     *  without it the file stays and only the record goes. UI-only. */
+    browser_download_remove(args) {
+      const record = downloadList.find((entry) => entry.id === args.id);
+      if (record) removeRecord(record, args.deleteFile === true);
+      publishDownloads(true);
+      return null;
+    },
+
+    /** Empty the shelf. `deleteFile` deletes every file too; without it the
+     *  files stay on disk and only the list is cleared. UI-only. */
+    browser_download_clear(args) {
+      // A copy, because removeRecord splices the list it would iterate.
+      for (const record of [...downloadList]) {
+        removeRecord(record, args.deleteFile === true);
+      }
+      publishDownloads(true);
+      return null;
+    },
+
     /** Close one tab, and answer whether the view is gone.
      *
      *  Always `true` here. The answer is kept because the Tauri shell still has
@@ -1030,4 +1256,5 @@ module.exports = {
   BROWSER_NAVIGATED,
   BROWSER_TAB_OPENED,
   BROWSER_THUMBNAIL,
+  BROWSER_DOWNLOAD,
 };

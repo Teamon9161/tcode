@@ -369,7 +369,7 @@ function createWindow({ visibleStart }) {
 
 // ------------------------------------------------------------------- assembly
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   // GPU feature status is only available once the browser process is up. The
   // hidden-until-ready startup pattern is only used when the compositor is
   // genuinely hardware-accelerated; any software rendering (VM, RDP, disabled
@@ -408,6 +408,21 @@ app.whenReady().then(() => {
     return;
   }
 
+  // Where downloads land, resolved once from the backend before any tab can
+  // start one. The path is `~/.tcode/downloads` and `~/.tcode` is composed in a
+  // single place (`home_dir`), so this process asks rather than reconstructs it,
+  // the same way it asks what a typed address means. The OS downloads folder is
+  // only a floor for the impossible case of the backend having no home to answer
+  // with — the save handler must have somewhere to write.
+  let downloadsDir;
+  try {
+    const reply = await sidecar.call("downloads_dir", {});
+    downloadsDir = reply.error === undefined ? reply.ok : null;
+  } catch {
+    downloadsDir = null;
+  }
+  if (!downloadsDir) downloadsDir = app.getPath("downloads");
+
   // What this process answers for itself: the window it owns, and the native
   // views the browser pane is made of. Everything else is somebody else's.
   verbs = {
@@ -420,6 +435,7 @@ app.whenReady().then(() => {
       window,
       appView: view,
       emit,
+      downloadsDir,
       // The browser asks the backend what a typed address means rather than
       // deciding here — one implementation of that guesswork, with its tests
       // (`crate::address`).

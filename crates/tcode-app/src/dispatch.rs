@@ -351,9 +351,23 @@ impl Registry {
         // living in the Electron main process. See `crate::address`.
         result!(t, "resolve_url", crate::address::resolve_url[](input));
 
+        // Where the browser saves downloads. A backend command for the same
+        // reason `resolve_url` is one: the path is `~/.tcode/downloads`, and
+        // `~/.tcode` is resolved in exactly one place (`home_dir`). The shell
+        // asks once at startup and never recomputes it.
+        result!(t, "downloads_dir", c::downloads_dir[]());
+
         // Paper highlights.
-        result!(t, "paper_highlights_load", c::paper_highlights_load[supervisor](session, path));
-        result!(t, "paper_highlights_save", c::paper_highlights_save[supervisor](session, path, highlights));
+        result!(
+            t,
+            "paper_highlights_load",
+            c::paper_highlights_load[supervisor](session, path)
+        );
+        result!(
+            t,
+            "paper_highlights_save",
+            c::paper_highlights_save[supervisor](session, path, highlights)
+        );
 
         Self(t)
     }

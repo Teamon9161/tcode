@@ -27,6 +27,10 @@ export const BROWSER_TAB_OPENED = "tcode://browser-tab-opened";
 /** Mirrors `electron/browser.js::BROWSER_THUMBNAIL`. Renderer-only, transient,
  *  and revisioned so an older capture can never replace a newer page. */
 export const BROWSER_THUMBNAIL = "tcode://browser-thumbnail";
+/** Mirrors `electron/browser.js::BROWSER_DOWNLOAD`. The window's whole download
+ *  list, resent on every change — the user's own downloads and the model's
+ *  alike, because the browser is one shared instance. */
+export const BROWSER_DOWNLOAD = "tcode://browser-download";
 
 /** Mirrors `terminal::TERMINAL_OUTPUT`. Chunks of one terminal's output,
  *  coalesced on the backend — see `terminal.rs` for why a flood must not be one
@@ -66,6 +70,28 @@ export type BrowserThumbnail = {
   height: number;
   revision: number;
 };
+
+/**
+ * One download, as the shell reports it. Mirrors the record in
+ * `electron/browser.js`. `path` is the absolute location the file is written to;
+ * `tabId` is the tab it began in (`null` if it started outside any tracked tab).
+ * `state` is Chromium's own vocabulary: `progressing` while bytes arrive, then
+ * one of `completed`, `cancelled` or `interrupted`.
+ */
+export type Download = {
+  id: string;
+  tabId: string | null;
+  url: string;
+  filename: string;
+  path: string;
+  state: "progressing" | "completed" | "cancelled" | "interrupted";
+  receivedBytes: number;
+  totalBytes: number;
+  startedAt: number;
+};
+
+/** The payload of {@link BROWSER_DOWNLOAD}: the whole list, oldest first. */
+export type BrowserDownloads = { downloads: Download[] };
 
 /**
  * A chunk of a terminal's output.

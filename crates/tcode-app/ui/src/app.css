@@ -524,6 +524,170 @@ body.is-pane-dragging .pane-head {
   font-size: var(--text-xs);
 }
 
+/* ---- The download shelf ----------------------------------------------- */
+
+/* Sits between the toolbar and the page, on `--chrome` like the strips above
+   it: it is the window holding what the foreign document handed back, not part
+   of the document. In flow, never over the body — a native webview would cover
+   anything inside it. */
+.web-downloads {
+  border-top: 1px solid var(--line);
+  background: var(--chrome);
+  font-size: var(--text-xs);
+}
+.web-downloads-head {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-2) var(--s-1) var(--s-3);
+}
+.web-downloads-toggle {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  background: none;
+  color: var(--body);
+  cursor: pointer;
+}
+.web-downloads-toggle:hover {
+  color: var(--ink);
+}
+.web-downloads-chevron {
+  display: inline-flex;
+  color: var(--muted);
+}
+.web-downloads-title {
+  font-weight: var(--weight-medium);
+}
+.web-downloads-count {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+/* The list-level clear sits opposite the title; the toggle's `flex: 1` pushes
+   it to the trailing edge. */
+.web-downloads-clear {
+  flex: none;
+  padding: 1px var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--muted);
+  font-size: var(--text-2xs);
+  cursor: pointer;
+}
+.web-downloads-clear:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+
+.web-downloads-list {
+  /* Bounded so a long history scrolls inside the shelf rather than eating the
+     page: the point of the shelf is to answer a question, not to become the
+     pane. */
+  max-height: 168px;
+  margin: 0;
+  padding: 0 var(--s-2) var(--s-1);
+  overflow-y: auto;
+  list-style: none;
+}
+
+.web-download {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  padding: var(--s-1) var(--s-1);
+  border-radius: var(--r-xs);
+}
+.web-download:hover {
+  background: color-mix(in oklab, var(--ink) 6%, transparent);
+}
+.web-download-icon {
+  display: inline-flex;
+  color: var(--muted);
+}
+.web-download.is-completed .web-download-icon {
+  color: var(--brand);
+}
+.web-download.is-interrupted .web-download-icon,
+.web-download.is-cancelled .web-download-icon {
+  color: var(--danger-text);
+}
+.web-download-body {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 1px;
+}
+.web-download-name {
+  overflow: hidden;
+  color: var(--ink);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.web-download-meta {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  font-size: var(--text-2xs);
+}
+/* A hairline progress bar, only while bytes arrive. */
+.web-download-bar {
+  height: 3px;
+  margin-top: 2px;
+  border-radius: 999px;
+  background: var(--sunken);
+  overflow: hidden;
+}
+.web-download-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--brand);
+  transform-origin: left;
+  /* Scale, not width: a progress bar updates on every chunk, and animating a
+     transform keeps that off the layout path. */
+  transition: transform var(--dur-fast) var(--ease);
+}
+.web-download-actions {
+  display: flex;
+  gap: var(--s-1);
+}
+
+/* The in-place delete confirm, shown where the row's or header's controls were.
+   It never grows past the element it replaces, so it stays clear of the page
+   rectangle the native webview paints over. */
+.web-download-confirm {
+  display: flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+.web-download-choice {
+  padding: 1px var(--s-2);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--body);
+  font-size: var(--text-2xs);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.web-download-choice:hover {
+  border-color: var(--line-strong);
+  color: var(--ink);
+}
+.web-download-choice.is-danger {
+  border-color: color-mix(in oklab, var(--danger-text) 40%, var(--line));
+  color: var(--danger-text);
+}
+.web-download-choice.is-danger:hover {
+  border-color: var(--danger-text);
+  background: color-mix(in oklab, var(--danger-text) 12%, transparent);
+}
+
 .term-error {
   padding: var(--s-2) var(--s-3);
   color: var(--danger-text);

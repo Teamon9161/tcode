@@ -24,11 +24,14 @@ import {
   type Tabs,
 } from "./web";
 import {
+  BROWSER_DOWNLOAD,
   BROWSER_NAVIGATED,
   BROWSER_TAB_OPENED,
   BROWSER_THUMBNAIL,
   type AgentEvent,
+  type BrowserDownloads,
   type BrowserThumbnail,
+  type Download,
   type Navigated,
   type TabOpened,
 } from "./types";
@@ -76,6 +79,9 @@ type Snapshot = {
   live: boolean;
   /** Latest renderer-only page previews, keyed by exact tab capability. */
   thumbnails: ReadonlyMap<string, BrowserThumbnail>;
+  /** The window's downloads, oldest first — the user's own and the model's, as
+   *  the shell reports them on every change. */
+  downloads: readonly Download[];
 };
 
 const watchers = new Set<() => void>();
@@ -85,6 +91,7 @@ let state: Snapshot = {
   failure: null,
   live: false,
   thumbnails: new Map(),
+  downloads: [],
 };
 /** The pane's rectangle, as last measured. */
 let bounds: { x: number; y: number; width: number; height: number } | null = null;
@@ -122,6 +129,42 @@ export function tab(id: string) {
   return state.tabs.list.find((candidate) => candidate.id === id);
 }
 
+/** The window's downloads, referentially stable until the list changes. */
+export function downloads(): readonly Download[] {
+  return state.downloads;
+}
+
+/** Open a finished download with the OS default application. The shell confines
+ *  the path to the downloads directory, so a bad one is refused there. */
+export function openDownload(path: string) {
+  invoke("browser_download_open", { path }).catch((error) =>
+    failed("cannot open the download", error),
+  );
+}
+
+/** Reveal a download in the system file manager. */
+export function revealDownload(path: string) {
+  invoke("browser_download_reveal", { path }).catch((error) =>
+    failed("cannot reveal the download", error),
+  );
+}
+
+/** Drop one download from the shelf. `deleteFile` also removes it from disk;
+ *  otherwise only the record goes and the file stays. */
+export function removeDownload(id: string, deleteFile: boolean) {
+  invoke("browser_download_remove", { id, deleteFile }).catch((error) =>
+    failed("cannot remove the download", error),
+  );
+}
+
+/** Empty the shelf. `deleteFile` deletes every file too; otherwise the files
+ *  stay on disk and only the list is cleared. */
+export function clearDownloads(deleteFile: boolean) {
+  invoke("browser_download_clear", { deleteFile }).catch((error) =>
+    failed("cannot clear downloads", error),
+  );
+}
+
 function publish(next: Partial<Snapshot>) {
   state = { ...state, ...next };
   for (const watcher of watchers) watcher();
@@ -134,7 +177,13 @@ function failed(what: string, error: unknown) {
 /** Tests only. The app has one browser for its lifetime, so nothing else has
  *  any business emptying this. */
 export function reset() {
-  state = { tabs: NO_TABS, failure: null, live: false, thumbnails: new Map() };
+  state = {
+    tabs: NO_TABS,
+    failure: null,
+    live: false,
+    thumbnails: new Map(),
+    downloads: [],
+  };
   pendingBrowserCalls.clear();
   closedSessions.clear();
   bounds = null;
@@ -417,6 +466,13 @@ function listenOnce() {
     thumbnails.set(preview.id, preview);
     publish({ thumbnails });
   }).catch((error) => failed("cannot follow browser previews", error));
+
+  // The whole list every time, so there is no per-download reconciliation to
+  // keep in step: the shell owns the truth and resends it. It is the window's
+  // list, not a tab's — a user download and a model download share one shelf.
+  listen<BrowserDownloads>(BROWSER_DOWNLOAD, (event) => {
+    publish({ downloads: event.payload.downloads });
+  }).catch((error) => failed("cannot follow downloads", error));
 }
 
 /** Start following the browser for the window's lifetime. Idempotent, and the

@@ -9,6 +9,7 @@ import {
   PlusIcon,
   RefreshIcon,
 } from "./components/Icons";
+import { Downloads } from "./Downloads";
 import { currentTab, tabLabel, type Tab } from "./web";
 import * as browser from "./webHost";
 
@@ -383,6 +384,13 @@ export function WebPane({
       </header>
 
       {failure && <p className="web-error">{failure}</p>}
+
+      {/* The download shelf, in flow above the body: a native webview covers
+          anything drawn inside the body, so what the person must be able to
+          reach — a saved file, its progress — sits here where the OS does not
+          paint over it. Rendered only when a download exists, so the page keeps
+          the whole pane until then. */}
+      <Downloads />
 
       {/* Empty on purpose: the page is composited over this box by the OS, not
           rendered into it. Anything drawn here would be underneath a webview

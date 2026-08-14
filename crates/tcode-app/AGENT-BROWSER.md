@@ -276,10 +276,11 @@ pub trait Shell: Send + Sync {
 | `wait` | `tab, text?` | 3 | 有 `text` 等这句话出现,没有就等页面不再加载(`isLoading()` 连续两次为假)。**没有 `for` 枚举**:一个可选参数就分得开,少一个概念 |
 | `computed_style` | `tab, ref, properties` | 3 | 只读一个**最近 snapshot 实际输出且 URL 仍相同**的元素的 1–12 个白名单 CSS computed values；Rust 与壳双重校验，固定函数 + value arguments，**没有 selector / JS eval** |
 | `screenshot` | `tab, prompt?, width?, height?` | 3 | `capturePage()`；后台 tab 先在 app cover 下做 bounded render recovery（见 Phase 0 第 1b 条第三次修正），不改变 current。`width`/`height` 必须成对且受限，临时 viewport 也在 app cover 下完成并恢复真实窗格尺寸。只有 provider 同时支持 vision 与 tool-result image block 才直回图片；当前 Anthropic 与 Codex Responses 走这条，OpenAI Chat Completions 的文本 `tool` role 改走 live vision role 的隔离请求并回围栏内文字。没有可用 vision route 才在 capture 前拒绝并指向 `snapshot`。 |
+| `download` | `tab` | 4 | 报告这个 tab 最近一次下载：**这台机器上的绝对路径** + 状态 + 大小。像 `wait` 一样 bounded——还在下就回 `pending` 让模型再问，绝不挂住。免审：它只回报一次已经通过 click/navigate 审批、且落在 `~/.tcode/downloads` 沙箱里的下载（见下面"下载"节） |
 
 **`ref` 三种写法都收**(`ref_44` / `"44"` / `44`)。零猜测原则最小的一次应用:替代方案是模型花一个 turn 试出这工具要哪一种。
 
-多 action 单 schema 的代价这下真的到场了(13 个 action)。缓解还是那两条——description 按"看"和"做"分段列参数,错误信息自愈("先 snapshot,那也是 ref 的来源")。拆不拆等真看到模型在参数上出错再说,现在拆是猜。
+多 action 单 schema 的代价这下真的到场了(14 个 action)。缓解还是那两条——description 按"看"和"做"分段列参数,错误信息自愈("先 snapshot,那也是 ref 的来源")。拆不拆等真看到模型在参数上出错再说,现在拆是猜。
 
 **不给原始 `cdp` 逃生口。** ChatGPT 那份建议留一个,这里第一版不留:它会立刻变成模型的默认工具(什么都能干),然后语义层永远等不到反馈——真实用例会全部藏在 `Runtime.evaluate` 里,而我们看不到。真需要时再加,加的时候要审批,并且挂在 `/dogfood` 后面(`SlashCommand::hidden()` 的同一条理由)。
 
@@ -385,6 +386,36 @@ ChatGPT 那份把"agent 直接用你的 work session"当卖点，方向是对的
 - **模型这边零猜测**：tool description 里加了一句——用户消息里出现 `browser tab <id> (<url>)` 就是用户在把自己的 tab 交过来，照常用那个 id、从 `snapshot` 开始。少了这句，模型看到一串 UUID 未必知道那是能用的。
 
 自然接上的一点：交过来的 tab 这工具**从没看过**，所以 `seen` 里没有它的 host，`click`/`type` 会先要求 snapshot——正是权限那节要的行为，不用额外写一行。
+
+## 下载（✅ 已完成）
+
+**它解决的真实问题**：模型点了"下载"或直接 navigate 到一个文件后，浏览器把字节写到了某处，但没有把**路径、状态、或任何 shell 够得着的位置**交回来——于是"下没下成功"只能靠额外扫目录去猜。这正是这个功能相对 `web_fetch`/`shell` 的价值判据（那条贯穿全文的支点）在下载上的一次成立：一个要**登录后**、要**点一下按钮**才给的文件，`web_fetch` 与 `curl` 都拿不到；能拿到的只有屏幕上这个带着用户登录态的浏览器。所以它属于这里。
+
+**用户也要能正常下载。** 浏览器是窗口级共享的一个实例，用户在可见窗格里点链接和模型驱动后台 tab，走的是同一条路：一个 partition 上一个 `will-download`，两边都进。**没有 agent-only 的下载**——文件属于浏览器，不属于点它的那个页面，所以它们进同一个架子。
+
+### 落盘：一个窗口级目录，不按项目分
+
+`~/.tcode/downloads/`，由后端 `downloads_dir` 命令解析一次交给壳（`main.js` 启动时问，壳自己绝不拼 `~/.tcode` 路径——根 `CLAUDE.md` 那条）。
+
+**为什么是窗口级而不是 per-project**：浏览器是一个共享实例，用户的手动下载**不属于任何会话**，工作目录还能中途切换（`change_folder`）——没有"哪个项目"可以键。放在 `~/.tcode` 下所以永远不落进工作区变成 git 噪音，跨切目录稳定所以在下的文件不会丢家。选它还顺带删掉了一整套复杂度：不需要按调用注入目录、不需要 arming、不会 stale。（早期设计里认真考虑过 per-project + 兜底，被这条否掉了。）
+
+### will-download：自动接收，是唯一的结构成本处
+
+后台 agent tab 没人来回答 Chromium 的保存对话框，用户那边有 app 自己的下载架子——所以一律自动接收（设 `item.savePath` 即抑制对话框），写进上面那个目录，并按窗口记一张列表（每条带它起源的 tabId）。
+
+**信任边界在文件名**：`item.getFilename()` 是服务器给的，属数据不属路径（信任边界那节）。所以先剥成单个路径分量（去 C0 控制字符 + `path.basename`），`../../etc/passwd` 落地成 `passwd`，逃不出下载目录；重名走 `report (1).pdf` 式避让，不覆盖已有文件。这跟 snapshot 的围栏是同一类防线——能用结构挡的不退化成 prompt 纪律。
+
+### `download` action：只回报，像 `wait` 一样 bounded
+
+模型持 tab id，`browser_download` 回报该 tab **最近一次**下载的绝对路径、进度、以及落定后的状态（Chromium 自己的词汇：`progressing` → `completed`/`cancelled`/`interrupted`）。还在下就 bounded 等一会儿，超时回 `pending` + 当前进度让模型再问，绝不挂住一个 tool call。什么都没下过回 `none`，是一句平常的话不是错误。
+
+**免审，判据和 snapshot/wait 同一条**：触发下载的那次 click/navigate 本就走过 `interact`/`navigate` 审批，字节的去处是 `~/.tcode` 沙箱、不可执行、不在工作区；`download` 自己只是"回报一件已经发生的事"，在**别人的**服务器上不留痕迹。所以它落在"其余全部免审"那一类里，和 snapshot/wait 一样——不额外加一个 descriptor，也就不会让"读一个下载结果"变成一次审批。
+
+### 用户这边：一个共享的下载架子
+
+壳每次变化重发整张列表（`BROWSER_DOWNLOAD`），前端不做 per-download 对账——真相在壳，壳负责重发。架子（`Downloads.tsx`）挂在工具栏与页面之间的**正常流里**：原生 webview 会盖住 body 里画的任何东西，所以"人必须够得着的东西"（保存的文件、进度）坐在这儿。只有存在下载时才渲染，页面在那之前占满整个窗格。完成的条给"打开"/"在文件夹中显示"两个动作，两者都经壳里的 `withinDownloads` 限定在下载目录内，一个越界路径在那里被拒——即使渲染进程被攻陷也开不了别处。
+
+**删除也在这儿，而"只删记录 vs 连文件删"是点击当下的显式选择，不是持久开关**：`browser_download_remove({id, deleteFile})` 删一条，`browser_download_clear({deleteFile})` 清空；`deleteFile` 为真才 `fs.rmSync`（同样过 `withinDownloads`），删的是进行中的条会先 `item.cancel()`——一条没有记录还在写盘的下载比两者都糟。为什么不用持久的"删文件模式"开关：开着忘了就会把下一次误删。为什么用**就地确认**而不是下拉菜单：菜单往下弹一旦超过架子自身高度就落进页面矩形，被原生 webview 盖住看不见（这条约束贯穿整个浏览器窗格）；所以点删除时，那一行（或表头）在它**已占的空间内**把控件换成 `保留文件 | 删除文件 | ✕` 两个选项，永远不画在够不着的地方。这半是 UI-only，模型不删下载——`browser_download` 只回报。
 
 **Phase 5（多半不做）** — 多 profile。做之前先问有没有人真的想要第二个登录态。
 

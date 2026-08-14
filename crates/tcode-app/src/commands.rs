@@ -327,6 +327,22 @@ pub async fn project_list() -> Result<ProjectList, String> {
         .map_err(|error| format!("cannot read the project list: {error}"))
 }
 
+/// The absolute directory the window's browser saves downloads into, created if
+/// it does not exist yet.
+///
+/// A backend command and not an Electron-side computation on purpose: the path
+/// is `~/.tcode/downloads`, and `~/.tcode` is resolved through
+/// [`tcode_core::home_dir`] in exactly one place (`TCODE_HOME` and the legacy
+/// project-id folding both live there). The Electron shell resolves it once at
+/// startup and hands it to the download handler, the same way it asks the
+/// backend what a typed address means rather than reimplementing that judgement.
+pub fn downloads_dir() -> Result<String, String> {
+    let dir = tcode_core::store::downloads_dir().ok_or("cannot locate the home directory")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("cannot create the downloads directory: {error}"))?;
+    Ok(dir.to_string_lossy().into_owned())
+}
+
 /// One bounded page of resumable conversations inside a project. `before` is
 /// the previous page's cursor; keeping it separate from [`project_list`] avoids
 /// parsing history for folders the reader never expands.
@@ -2060,17 +2076,20 @@ fn paper_highlights_file(
     let handle = supervisor
         .get(session)
         .ok_or_else(|| format!("session '{session}' is not open"))?;
-    let home = tcode_core::home_dir()
-        .ok_or_else(|| "cannot determine home directory".to_string())?;
+    let home =
+        tcode_core::home_dir().ok_or_else(|| "cannot determine home directory".to_string())?;
     let cwd = handle.cwd();
-    let project_dir = tcode_core::store::project_dir_in(
-        &home,
-        &cwd.to_string_lossy(),
-    );
+    let project_dir = tcode_core::store::project_dir_in(&home, &cwd.to_string_lossy());
     let paper_dir = project_dir.join("paper");
     let slug: String = path
         .chars()
-        .map(|c| if c.is_alphanumeric() || c == '.' { c } else { '_' })
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     Ok(paper_dir.join(format!("{slug}.json")))
 }
@@ -2084,10 +2103,9 @@ pub fn paper_highlights_load(
     if !file.exists() {
         return Ok(serde_json::Value::Array(vec![]));
     }
-    let data = std::fs::read_to_string(&file)
-        .map_err(|e| format!("cannot read highlights: {e}"))?;
-    serde_json::from_str(&data)
-        .map_err(|e| format!("invalid highlights file: {e}"))
+    let data =
+        std::fs::read_to_string(&file).map_err(|e| format!("cannot read highlights: {e}"))?;
+    serde_json::from_str(&data).map_err(|e| format!("invalid highlights file: {e}"))
 }
 
 pub fn paper_highlights_save(
@@ -2103,8 +2121,7 @@ pub fn paper_highlights_save(
     }
     let data = serde_json::to_string_pretty(&highlights)
         .map_err(|e| format!("cannot serialize highlights: {e}"))?;
-    std::fs::write(&file, data)
-        .map_err(|e| format!("cannot write highlights: {e}"))?;
+    std::fs::write(&file, data).map_err(|e| format!("cannot write highlights: {e}"))?;
     Ok(())
 }
 

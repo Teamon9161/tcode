@@ -621,6 +621,12 @@ impl Tool for BrowserTool {
          `text` to wait for; without it, waits for the page to stop loading), \
          `back` / `forward` / `reload` (`tab`), `close` (`tab`).\n\
          \n\
+         Downloads: after a click or a navigation that saves a file, `download` \
+         (`tab`) reports where it landed — an absolute path on this machine you \
+         can then `read` or hand to `shell` — its size, and whether it finished. \
+         It waits briefly for a download still in flight; call it again to keep \
+         waiting.\n\
+         \n\
          A `ref` comes from a snapshot of the page as it is now. After anything \
          that changes the page — a click, a navigation — snapshot again rather \
          than reusing old refs."
@@ -634,7 +640,7 @@ impl Tool for BrowserTool {
                     "type": "string",
                     "enum": [
                         "open", "navigate", "snapshot", "computed_style", "screenshot",
-                        "click", "type", "scroll", "wait",
+                        "click", "type", "scroll", "wait", "download",
                         "back", "forward", "reload", "close"
                     ],
                     "description": "What to do"
@@ -830,7 +836,7 @@ impl Tool for BrowserTool {
 /// cannot be added to the schema and left out of the sentence a model reads
 /// when it guesses wrong.
 const ACTIONS: &str = "open, navigate, snapshot, computed_style, screenshot, click, type, scroll, \
-                       wait, back, forward, reload, close";
+                       wait, download, back, forward, reload, close";
 
 impl BrowserTool {
     fn output(tab: &str, content: impl Into<String>) -> ToolOutput {
@@ -1137,6 +1143,47 @@ impl BrowserTool {
                     },
                 ))
             }
+            Some("download") => {
+                let tab = tab_of(input)?;
+                let reply = self.call("browser_download", json!({ "id": tab })).await?;
+                if reply["none"].as_bool() == Some(true) {
+                    return Ok(Self::output(
+                        tab,
+                        format!(
+                            "no download has started in tab {tab}. A download begins when you \
+                             navigate straight to a file or click something that saves one — do \
+                             that first, then ask again."
+                        ),
+                    ));
+                }
+                let filename = reply["filename"].as_str().unwrap_or("the file");
+                // The absolute path is the whole point of the action: a place on
+                // this machine `read` and `shell` can reach, closing the gap the
+                // browser used to leave when a click saved a file nobody could find.
+                let path = reply["path"].as_str().unwrap_or_default();
+                let state = reply["state"].as_str().unwrap_or("unknown");
+                let received = reply["receivedBytes"].as_i64().unwrap_or(0);
+                let total = reply["totalBytes"].as_i64().unwrap_or(0);
+                let size = download_size(received, total);
+                let message = if reply["pending"].as_bool() == Some(true) {
+                    format!(
+                        "tab {tab} is still downloading \"{filename}\" ({size}). It is being \
+                         written to this path on this machine:\n{path}\nCall download again to \
+                         keep waiting for it to finish."
+                    )
+                } else if state == "completed" {
+                    format!(
+                        "tab {tab} downloaded \"{filename}\" ({size}). It is saved on this \
+                         machine at:\n{path}\nRead it with `read`, or work on it with `shell`."
+                    )
+                } else {
+                    format!(
+                        "tab {tab}'s download of \"{filename}\" ended as {state} after {received} \
+                         bytes. The file at {path} may be incomplete."
+                    )
+                };
+                Ok(Self::output(tab, message))
+            }
             Some(action @ ("back" | "forward")) => {
                 let tab = tab_of(input)?;
                 let delta = if action == "back" { -1 } else { 1 };
@@ -1193,6 +1240,33 @@ impl BrowserTool {
     fn forget(&self, tab: &str) {
         self.seen.lock().expect("browser hosts").remove(tab);
         self.clear_refs(tab);
+    }
+}
+
+/// A byte count in the largest unit that keeps it short.
+fn humanize(bytes: i64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes.max(0) as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{} B", bytes.max(0))
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// How much of a download to report. While it is in flight and the server
+/// declared a length, both halves are worth saying; once it is done, or the
+/// length is unknown, one number is the honest one.
+fn download_size(received: i64, total: i64) -> String {
+    if total > 0 && total != received {
+        format!("{} of {}", humanize(received), humanize(total))
+    } else {
+        humanize(received.max(total))
     }
 }
 

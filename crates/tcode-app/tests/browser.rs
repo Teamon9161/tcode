@@ -1038,3 +1038,92 @@ fn acting_never_takes_the_trusted_read_fast_path() {
         );
     }
 }
+
+// -------------------------------------------------------------------- download
+
+/// The point of the action: a click or a navigation saved a file, and this hands
+/// the model an absolute path on the machine it can then `read` or `shell` — the
+/// gap the browser used to leave when a download landed somewhere invisible.
+#[tokio::test]
+async fn download_reports_where_a_finished_file_landed() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "filename": "report.pdf",
+        "path": "/home/x/.tcode/downloads/report.pdf",
+        "state": "completed",
+        "receivedBytes": 2048,
+        "totalBytes": 2048,
+    }))]);
+    let tool = BrowserTool::new(shell.clone(), None);
+
+    let out = run(&tool, json!({ "action": "download", "tab": "t" })).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(
+        out.content.contains("/home/x/.tcode/downloads/report.pdf"),
+        "{}",
+        out.content
+    );
+    assert!(out.content.contains("report.pdf"), "{}", out.content);
+    assert!(out.content.contains("2.0 KB"), "{}", out.content);
+    assert!(out.content.contains("read"), "{}", out.content);
+
+    let (method, args) = shell.calls().remove(0);
+    assert_eq!(method, "browser_download");
+    assert_eq!(args["id"], "t");
+}
+
+/// A download still running is bounded like `wait`: the model gets the progress
+/// so far and is told to ask again, never a hung tool call.
+#[tokio::test]
+async fn a_running_download_reports_progress_and_asks_to_keep_waiting() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "pending": true,
+        "filename": "big.zip",
+        "path": "/d/big.zip",
+        "state": "progressing",
+        "receivedBytes": 1024,
+        "totalBytes": 4096,
+    }))]);
+    let tool = BrowserTool::new(shell, None);
+
+    let out = run(&tool, json!({ "action": "download", "tab": "t" })).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("still downloading"), "{}", out.content);
+    assert!(out.content.contains("1.0 KB of 4.0 KB"), "{}", out.content);
+    assert!(out.content.contains("/d/big.zip"), "{}", out.content);
+}
+
+/// Nothing to report is a plain answer, not an error: a model that guessed a
+/// download had started learns it has not and what to do instead.
+#[tokio::test]
+async fn download_says_so_when_the_tab_has_saved_nothing() {
+    let shell = FakeShell::answering(vec![Ok(json!({ "none": true }))]);
+    let tool = BrowserTool::new(shell, None);
+
+    let out = run(&tool, json!({ "action": "download", "tab": "t" })).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("no download"), "{}", out.content);
+}
+
+/// An interrupted transfer is reported as such, and the path is still named so
+/// the model can inspect what did arrive rather than assume the file is whole.
+#[tokio::test]
+async fn an_interrupted_download_is_reported_as_incomplete() {
+    let shell = FakeShell::answering(vec![Ok(json!({
+        "filename": "half.iso",
+        "path": "/d/half.iso",
+        "state": "interrupted",
+        "receivedBytes": 512,
+        "totalBytes": 4096,
+    }))]);
+    let tool = BrowserTool::new(shell, None);
+
+    let out = run(&tool, json!({ "action": "download", "tab": "t" })).await;
+
+    assert!(!out.is_error, "{}", out.content);
+    assert!(out.content.contains("interrupted"), "{}", out.content);
+    assert!(out.content.contains("may be incomplete"), "{}", out.content);
+    assert!(out.content.contains("/d/half.iso"), "{}", out.content);
+}

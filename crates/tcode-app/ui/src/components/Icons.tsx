@@ -31,6 +31,15 @@ export const FolderIcon = (props: IconProps) => (
   </Glyph>
 );
 
+/** An arrow into a tray: the platform's word for a download. */
+export const DownloadIcon = (props: IconProps) => (
+  <Glyph {...props}>
+    <path d="M12 3.5v10.5" />
+    <path d="m7.5 9.5 4.5 4.5 4.5-4.5" />
+    <path d="M4.5 19.5h15" />
+  </Glyph>
+);
+
 /** Three dots: the platform's word for "the rest of this thing's actions".
  *  Filled rather than stroked — at 14px a 2.2 stroke around a 1-unit circle is a
  *  smudge, and the mark has to read as three separate dots or it reads as

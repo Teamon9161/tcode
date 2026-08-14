@@ -1,7 +1,14 @@
 const assert = require("node:assert/strict");
 const test = require("node:test");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
 
-const { browserVerbs, BROWSER_THUMBNAIL } = require("./browser");
+const {
+  browserVerbs,
+  BROWSER_THUMBNAIL,
+  BROWSER_DOWNLOAD,
+} = require("./browser");
 
 function fakeImage(width = 800, height = 600) {
   return {
@@ -57,8 +64,24 @@ class FakeWebContentsView {
 function harness(renderTimeout = 10, thumbnailDelay = 120) {
   FakeWebContentsView.instances = [];
   const events = [];
+  // Captures the `will-download` handler so a test can fire it with a fake
+  // DownloadItem, the way the partition would when a page starts a download.
   const partition = {
     setPermissionRequestHandler() {},
+    on(event, handler) {
+      if (event === "will-download") this.willDownload = handler;
+    },
+  };
+  const downloadsDir = fs.mkdtempSync(path.join(os.tmpdir(), "tcode-dl-"));
+  const shellCalls = [];
+  const shell = {
+    openPath: async (target) => {
+      shellCalls.push(["open", target]);
+      return "";
+    },
+    showItemInFolder(target) {
+      shellCalls.push(["reveal", target]);
+    },
   };
   const appView = {
     name: "app",
@@ -85,10 +108,12 @@ function harness(renderTimeout = 10, thumbnailDelay = 120) {
       appView,
       emit(name, payload) { events.push({ name, payload }); },
       resolveUrl: async (url) => url,
+      downloadsDir,
     },
     {
       WebContentsView: FakeWebContentsView,
       session: { fromPartition: () => partition },
+      shell,
       renderTimeout,
       thumbnailDelay,
     },
@@ -97,7 +122,46 @@ function harness(renderTimeout = 10, thumbnailDelay = 120) {
     rect: { x: 0, y: 0, width: 800, height: 600 },
     select: true,
   });
-  return { verbs, first, view: FakeWebContentsView.instances[0], appView, children, events };
+  return {
+    verbs,
+    first,
+    view: FakeWebContentsView.instances[0],
+    appView,
+    children,
+    events,
+    partition,
+    downloadsDir,
+    shellCalls,
+  };
+}
+
+/** A minimal stand-in for Electron's DownloadItem: it remembers the save path
+ *  the handler assigns, and lets a test drive `updated`/`done` by hand. */
+function fakeDownloadItem({ filename = "report.pdf", url = "https://x/report.pdf", total = 100 } = {}) {
+  const listeners = { updated: [], done: [] };
+  let received = 0;
+  return {
+    savePath: null,
+    getFilename: () => filename,
+    getURL: () => url,
+    getTotalBytes: () => total,
+    getReceivedBytes: () => received,
+    on(event, handler) {
+      listeners[event].push(handler);
+    },
+    once(event, handler) {
+      listeners[event].push(handler);
+    },
+    // Test drivers.
+    progress(bytes) {
+      received = bytes;
+      listeners.updated.forEach((handler) => handler({}, "progressing"));
+    },
+    finish(state = "completed", bytes = total) {
+      received = bytes;
+      listeners.done.forEach((handler) => handler({}, state));
+    },
+  };
 }
 
 function expectShownAt(view, rect) {
@@ -530,4 +594,145 @@ test("an in-flight thumbnail is discarded when its exact tab closes", async () =
   await new Promise((resolve) => setTimeout(resolve, 10));
 
   assert.equal(events.filter((event) => event.name === BROWSER_THUMBNAIL).length, 0);
+});
+
+// ---- Downloads ----------------------------------------------------------
+
+test("a download is saved under the downloads directory and reported to its tab", async () => {
+  const { verbs, first, view, partition, downloadsDir, events } = harness();
+  const item = fakeDownloadItem({ filename: "report.pdf", total: 2048 });
+
+  partition.willDownload({}, item, view.webContents);
+  assert.equal(path.dirname(item.savePath), downloadsDir);
+  assert.equal(path.basename(item.savePath), "report.pdf");
+
+  item.progress(1024);
+  item.finish("completed", 2048);
+
+  const report = await verbs.browser_download({ id: first });
+  assert.equal(report.state, "completed");
+  assert.equal(report.path, item.savePath);
+  assert.equal(report.filename, "report.pdf");
+  assert.equal(report.tabId, first);
+  assert.equal(report.receivedBytes, 2048);
+  assert.ok(events.some((event) => event.name === BROWSER_DOWNLOAD));
+});
+
+test("a server filename cannot escape the downloads directory", () => {
+  const { view, partition, downloadsDir } = harness();
+  const item = fakeDownloadItem({ filename: "../../etc/passwd" });
+
+  partition.willDownload({}, item, view.webContents);
+  assert.equal(path.dirname(item.savePath), downloadsDir);
+  assert.equal(path.basename(item.savePath), "passwd");
+});
+
+test("a second download with a taken name does not overwrite the first", () => {
+  const { view, partition } = harness();
+  const first = fakeDownloadItem({ filename: "report.pdf" });
+  partition.willDownload({}, first, view.webContents);
+  // The real DownloadItem would have written the file; the fake does not, so
+  // create it to prove uniquePath steps around what is already on disk.
+  fs.writeFileSync(first.savePath, "one");
+
+  const second = fakeDownloadItem({ filename: "report.pdf" });
+  partition.willDownload({}, second, view.webContents);
+
+  assert.notEqual(second.savePath, first.savePath);
+  assert.equal(path.basename(second.savePath), "report (1).pdf");
+});
+
+test("browser_download reports none when the tab has saved nothing", async () => {
+  const { verbs, first } = harness();
+  const report = await verbs.browser_download({ id: first });
+  assert.deepEqual(report, { none: true });
+});
+
+test("browser_download returns pending progress when a download is still running", async () => {
+  const { verbs, first, view, partition } = harness();
+  const item = fakeDownloadItem({ filename: "big.zip", total: 4096 });
+  partition.willDownload({}, item, view.webContents);
+  item.progress(1024);
+
+  const report = await verbs.browser_download({ id: first, timeoutMs: 500 });
+  assert.equal(report.pending, true);
+  assert.equal(report.receivedBytes, 1024);
+  assert.equal(report.state, "progressing");
+});
+
+test("open and reveal are confined to the downloads directory", async () => {
+  const { verbs, view, partition, shellCalls } = harness();
+  const item = fakeDownloadItem({ filename: "report.pdf" });
+  partition.willDownload({}, item, view.webContents);
+
+  verbs.browser_download_reveal({ path: item.savePath });
+  assert.deepEqual(shellCalls.at(-1), ["reveal", path.resolve(item.savePath)]);
+
+  await assert.rejects(
+    () => verbs.browser_download_open({ path: "/etc/passwd" }),
+    /not in the downloads directory/,
+  );
+});
+
+test("removing a download drops the record and can leave the file on disk", () => {
+  const { verbs, view, partition, events } = harness();
+  const item = fakeDownloadItem({ filename: "keep.pdf" });
+  partition.willDownload({}, item, view.webContents);
+  item.finish("completed", 100);
+  fs.writeFileSync(item.savePath, "bytes");
+  const { id } = events.at(-1).payload.downloads.at(-1);
+
+  verbs.browser_download_remove({ id, deleteFile: false });
+
+  assert.equal(fs.existsSync(item.savePath), true, "record-only removal keeps the file");
+  assert.deepEqual(events.at(-1).payload.downloads, [], "the record is gone");
+});
+
+test("removing a download with deleteFile also unlinks it", () => {
+  const { verbs, view, partition, events } = harness();
+  const item = fakeDownloadItem({ filename: "gone.pdf" });
+  partition.willDownload({}, item, view.webContents);
+  item.finish("completed", 100);
+  fs.writeFileSync(item.savePath, "bytes");
+  const { id } = events.at(-1).payload.downloads.at(-1);
+
+  verbs.browser_download_remove({ id, deleteFile: true });
+
+  assert.equal(fs.existsSync(item.savePath), false, "the file was deleted");
+  assert.deepEqual(events.at(-1).payload.downloads, []);
+});
+
+test("removing a running download cancels the transfer", () => {
+  const { verbs, view, partition, events } = harness();
+  let cancelled = false;
+  const item = fakeDownloadItem({ filename: "big.zip", total: 4096 });
+  item.cancel = () => {
+    cancelled = true;
+  };
+  partition.willDownload({}, item, view.webContents);
+  item.progress(1024);
+  const { id } = events.at(-1).payload.downloads.at(-1);
+
+  verbs.browser_download_remove({ id, deleteFile: false });
+
+  assert.equal(cancelled, true, "an in-flight transfer is stopped, not left record-less");
+  assert.deepEqual(events.at(-1).payload.downloads, []);
+});
+
+test("clearing empties the shelf, optionally deleting the files", () => {
+  const { verbs, view, partition, events } = harness();
+  const a = fakeDownloadItem({ filename: "a.pdf" });
+  const b = fakeDownloadItem({ filename: "b.pdf" });
+  partition.willDownload({}, a, view.webContents);
+  a.finish("completed", 100);
+  fs.writeFileSync(a.savePath, "a");
+  partition.willDownload({}, b, view.webContents);
+  b.finish("completed", 100);
+  fs.writeFileSync(b.savePath, "b");
+
+  verbs.browser_download_clear({ deleteFile: true });
+
+  assert.equal(fs.existsSync(a.savePath), false);
+  assert.equal(fs.existsSync(b.savePath), false);
+  assert.deepEqual(events.at(-1).payload.downloads, []);
 });
