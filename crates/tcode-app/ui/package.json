@@ -1,7 +1,7 @@
 {
   "name": "tcode-ui",
   "private": true,
-  "version": "0.1.27",
+  "version": "0.1.28",
   "type": "module",
   "scripts": {
     "build:sandbox": "node scripts/build-sandbox.mjs",
