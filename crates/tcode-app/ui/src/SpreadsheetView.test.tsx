@@ -9,11 +9,58 @@ const mocks = vi.hoisted(() => ({
   ironCalc: vi.fn(),
 }));
 
+const frames: FrameRequestCallback[] = [];
+vi.stubGlobal("requestAnimationFrame", (frame: FrameRequestCallback) => {
+  frames.push(frame);
+  return frames.length;
+});
+vi.stubGlobal("cancelAnimationFrame", (id: number) => {
+  frames[id - 1] = () => {};
+});
+
+class FakeResizeObserver {
+  static instances: FakeResizeObserver[] = [];
+
+  observed: Element[] = [];
+
+  constructor(private readonly callback: ResizeObserverCallback) {
+    FakeResizeObserver.instances.push(this);
+  }
+
+  observe(element: Element) {
+    this.observed.push(element);
+  }
+
+  unobserve(element: Element) {
+    this.observed = this.observed.filter((item) => item !== element);
+  }
+
+  disconnect() {
+    this.observed = [];
+  }
+
+  resize(width: number, height: number) {
+    const target = this.observed[0];
+    if (!target) return;
+    this.callback(
+      [
+        {
+          target,
+          contentRect: DOMRectReadOnly.fromRect({ width, height }),
+        } as ResizeObserverEntry,
+      ],
+      this as unknown as ResizeObserver,
+    );
+  }
+}
+
+vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+
 vi.mock("@ipc", () => ({ invoke: mocks.invoke }));
 vi.mock("@ironcalc/workbook", () => ({
   init: mocks.init,
   Model: { from_bytes: mocks.fromBytes },
-  IronCalc: (props: { canEdit: boolean }) => {
+  IronCalc: (props: { canEdit: boolean; rootContainer?: HTMLElement | null }) => {
     mocks.ironCalc(props);
     return <div data-ironcalc data-can-edit={String(props.canEdit)} />;
   },
@@ -38,9 +85,20 @@ async function draw(path: string) {
   });
 }
 
+async function flushFrames() {
+  await act(async () => {
+    for (const frame of frames.splice(0)) frame(0);
+  });
+}
+
 async function flush() {
   await act(async () => {
     await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+  await flushFrames();
+  await act(async () => {
     await Promise.resolve();
   });
 }
@@ -54,6 +112,8 @@ describe("SpreadsheetView", () => {
     mocks.init.mockReset();
     mocks.fromBytes.mockReset();
     mocks.ironCalc.mockReset();
+    frames.length = 0;
+    FakeResizeObserver.instances = [];
     mocks.init.mockResolvedValue(undefined);
     mocks.invoke.mockResolvedValue("AAE=");
     mocks.fromBytes.mockReturnValue({ free: vi.fn(), toBytes: vi.fn(() => new Uint8Array()) });
@@ -100,5 +160,23 @@ describe("SpreadsheetView", () => {
     });
     expect(mocks.ironCalc).toHaveBeenCalledWith(expect.objectContaining({ canEdit: true }));
     expect(container.textContent).not.toContain("read-only");
+  });
+
+  it("rerenders IronCalc when the pane changes size", async () => {
+    await draw("book.xlsx");
+    await flush();
+
+    const body = container.querySelector<HTMLElement>(".spreadsheet-body");
+    expect(body).not.toBeNull();
+    expect(mocks.ironCalc).toHaveBeenCalledWith(expect.objectContaining({ rootContainer: body }));
+
+    mocks.ironCalc.mockClear();
+    const observer = FakeResizeObserver.instances.find((item) => item.observed.includes(body!));
+    expect(observer).toBeDefined();
+
+    observer?.resize(1200, 640);
+    await flushFrames();
+
+    expect(mocks.ironCalc).toHaveBeenCalledWith(expect.objectContaining({ rootContainer: body }));
   });
 });

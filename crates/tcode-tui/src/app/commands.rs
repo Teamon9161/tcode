@@ -762,7 +762,9 @@ impl App {
         self.state_store.update(move |state| state.voice = Some(on));
         if !on {
             self.voice.turn_off();
-            crate::set_key_release_reporting(false);
+            crate::set_key_enhancements(
+                crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            );
             self.notice = Some(("voice off".into(), Instant::now()));
             return;
         }
@@ -775,8 +777,13 @@ impl App {
     pub(super) fn start_voice(&mut self, announce: bool) {
         // Ask for key-release reporting *before* starting: on terminals that
         // need the kitty protocol, the gesture the confirmation line describes
-        // depends on whether the request was honoured.
-        crate::set_key_release_reporting(true);
+        // depends on whether the request was honoured. The disambiguation
+        // flag rides along — it is already on from startup, and pushing the
+        // combined set is what keeps both active.
+        crate::set_key_enhancements(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | crossterm::event::KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        );
         // The backend is a separate download, so the first `/voice on` on a
         // machine has nothing to start. Fetch it here rather than making the
         // user read instructions and come back.

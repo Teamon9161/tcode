@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@ipc";
 import { init, Model, IronCalc } from "@ironcalc/workbook";
 import "@ironcalc/workbook/style.css";
@@ -15,6 +15,53 @@ let wasmReady: Promise<unknown> | null = null;
 function ensureWasm(): Promise<unknown> {
   if (!wasmReady) wasmReady = init();
   return wasmReady;
+}
+
+function useResizeInvalidation(element: HTMLElement | null): void {
+  const [, setRevision] = useState(0);
+
+  useEffect(() => {
+    if (!element) return;
+
+    let frame = 0;
+    let lastSize = "";
+    const schedule = (width: number, height: number) => {
+      const nextSize = `${Math.round(width)}x${Math.round(height)}`;
+      if (nextSize === lastSize) return;
+      lastSize = nextSize;
+      if (frame) cancelAnimationFrame(frame);
+      frame = requestAnimationFrame(() => {
+        frame = 0;
+        setRevision((at) => at + 1);
+      });
+    };
+    const measure = () => {
+      const box = element.getBoundingClientRect();
+      schedule(box.width, box.height);
+    };
+
+    if (typeof ResizeObserver === "undefined") {
+      measure();
+      window.addEventListener("resize", measure);
+      return () => {
+        window.removeEventListener("resize", measure);
+        if (frame) cancelAnimationFrame(frame);
+      };
+    }
+
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[0]?.contentRect;
+      if (box) schedule(box.width, box.height);
+      else measure();
+    });
+    observer.observe(element);
+    measure();
+
+    return () => {
+      observer.disconnect();
+      if (frame) cancelAnimationFrame(frame);
+    };
+  }, [element]);
 }
 
 const THEME: Record<string, string> = {
@@ -55,7 +102,8 @@ export function SpreadsheetView({ path }: { path: string }) {
   const [status, setStatus] = useState<Status>({ kind: "loading", detail: "preparing spreadsheet" });
   const extension = extensionOf(path);
   const convertedPreview = extension === "xls" || extension === "csv" || extension === "tsv";
-  const containerRef = useRef<HTMLDivElement>(null);
+  const [containerElement, setContainerElement] = useState<HTMLDivElement | null>(null);
+  useResizeInvalidation(containerElement);
 
   useEffect(() => {
     let live = true;
@@ -138,13 +186,15 @@ export function SpreadsheetView({ path }: { path: string }) {
       {status.kind === "loading" && <p className="inspect-empty">{status.detail}…</p>}
 
       {model && status.kind === "ready" && (
-        <div className="spreadsheet-body" ref={containerRef}>
-          <IronCalc
-            model={model}
-            canEdit={editable}
-            themeVariables={THEME}
-            rootContainer={containerRef.current}
-          />
+        <div className="spreadsheet-body" ref={setContainerElement}>
+          {containerElement && (
+            <IronCalc
+              model={model}
+              canEdit={editable}
+              themeVariables={THEME}
+              rootContainer={containerElement}
+            />
+          )}
         </div>
       )}
     </div>

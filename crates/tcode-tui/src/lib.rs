@@ -39,6 +39,7 @@ use std::sync::Arc;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -141,14 +142,23 @@ pub struct TuiConfig {
     pub voice_install: VoiceInstall,
 }
 
-/// Whether we asked the terminal to report key releases, so teardown only
-/// pops what it pushed. A global because `restore_terminal` also runs from the
-/// panic hook, where no `App` is reachable.
-static KEY_RELEASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The kitty-protocol flags we last asked the terminal to apply. A global
+/// because `restore_terminal` also runs from the panic hook, where no `App`
+/// is reachable; it is also what lets teardown push a full reset even when
+/// voice was on at exit — a pop would only unwind one stack level.
+static KEY_ENHANCEMENT_FLAGS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
 
-/// Ask for (or stop asking for) key-release events — what push-to-talk needs
-/// to know the key was let go. Both platforms need asking, for unrelated
-/// reasons, so both live here.
+/// Ask the terminal to apply `flags` from the kitty keyboard protocol, or to
+/// disable it entirely (`empty`). Each change *pushes* the full new state —
+/// the protocol's flag stack makes "replace with this" a push — so the
+/// terminal's effective flags are always exactly the last set we asked for,
+/// and teardown pushes `empty` no matter how many toggles happened.
+///
+/// This is unconditional because the prompt editor's newline is Enter with
+/// Shift held, and a terminal cannot express that modifier in the legacy
+/// encoding: shift+enter is byte-for-byte the same `\r` as plain enter unless
+/// `DISAMBIGUATE_ESCAPE_CODES` is active. Voice then layers
+/// `REPORT_EVENT_TYPES` on top when push-to-talk is on.
 ///
 /// **Windows.** crossterm reads `INPUT_RECORD`s, and under a pseudoconsole
 /// (Windows Terminal, VS Code) those records are *synthesised* by ConPTY from
@@ -159,50 +169,40 @@ static KEY_RELEASES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// us: crossterm never enables `ENABLE_VIRTUAL_TERMINAL_INPUT`, so the console
 /// still hands us records, only now faithful ones. Terminals that do not
 /// understand the request ignore it, and `Voice` detects the manufactured
-/// release and falls back to a toggle.
-///
-/// **Elsewhere.** The kitty keyboard protocol, requesting *only*
-/// `REPORT_EVENT_TYPES`: the disambiguation flags would change how every other
-/// key is encoded, which is too much to trade for dictation.
-pub(crate) fn set_key_release_reporting(on: bool) {
+/// release and falls back to a toggle. The disambiguation flag is irrelevant
+/// there — console records carry modifier state natively.
+pub(crate) fn set_key_enhancements(flags: KeyboardEnhancementFlags) {
     use std::sync::atomic::Ordering;
 
+    let value = flags.bits();
+    let old = KEY_ENHANCEMENT_FLAGS.swap(value, Ordering::SeqCst);
+    if old == value {
+        return;
+    }
     #[cfg(windows)]
     {
-        if on == KEY_RELEASES.swap(on, Ordering::SeqCst) {
-            return;
+        const RELEASE_BIT: u8 = KeyboardEnhancementFlags::REPORT_EVENT_TYPES.bits();
+        let releases_on = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
+        let releases_off = (old & RELEASE_BIT) != 0;
+        if releases_on != releases_off {
+            let request = if releases_on { "\x1b[?9001h" } else { "\x1b[?9001l" };
+            let mut out = stdout();
+            let _ = out.write_all(request.as_bytes());
+            let _ = out.flush();
         }
-        let request = if on { "\x1b[?9001h" } else { "\x1b[?9001l" };
-        let mut out = stdout();
-        let _ = out.write_all(request.as_bytes());
-        let _ = out.flush();
     }
     #[cfg(not(windows))]
     {
-        if on {
-            if !KEY_RELEASES.swap(true, Ordering::SeqCst) {
-                let _ = write_key_release_reporting(&mut stdout(), true);
-            }
-        } else if KEY_RELEASES.swap(false, Ordering::SeqCst) {
-            let _ = write_key_release_reporting(&mut stdout(), false);
-        }
+        let _ = write_key_enhancements(&mut stdout(), flags);
     }
 }
 
 #[cfg(not(windows))]
-fn write_key_release_reporting(output: &mut impl Write, on: bool) -> std::io::Result<()> {
-    use crossterm::event::{
-        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
-    };
-
-    if on {
-        execute!(
-            output,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
-        )
-    } else {
-        execute!(output, PopKeyboardEnhancementFlags)
-    }
+fn write_key_enhancements(
+    output: &mut impl Write,
+    flags: KeyboardEnhancementFlags,
+) -> std::io::Result<()> {
+    execute!(output, PushKeyboardEnhancementFlags(flags))
 }
 
 #[cfg(unix)]
@@ -231,6 +231,12 @@ pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyh
         EnableMouseCapture,
         SetCursorStyle::SteadyBar,
     )?;
+    // Ask the terminal to report Enter/Tab/Backspace/Escape with their
+    // modifiers: shift+enter is the prompt editor's newline, and the legacy
+    // encoding cannot express it. Terminals without kitty-protocol support
+    // ignore the request and keep sending legacy codes, so this is a strict
+    // improvement wherever it lands.
+    set_key_enhancements(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES);
 
     // Restore the terminal on panic, then let the default hook print.
     let default_hook = std::panic::take_hook();
@@ -252,7 +258,9 @@ pub async fn run(agent: Arc<Agent>, session: Session, config: TuiConfig) -> anyh
 fn restore_terminal() {
     // A keyboard mode we pushed must not outlive us: it is the terminal's
     // state, not ours, and a stale one breaks the shell we hand back to.
-    set_key_release_reporting(false);
+    // Push a full reset rather than popping — voice may be on at exit, in
+    // which case one pop would only unwind to the always-on disambiguation.
+    set_key_enhancements(KeyboardEnhancementFlags::empty());
     let mut output = stdout();
     restore_terminal_output(&mut output);
     discard_terminal_input();
@@ -273,7 +281,7 @@ fn restore_terminal_output(output: &mut impl Write) {
 mod tests {
     use super::restore_terminal_output;
     #[cfg(not(windows))]
-    use super::write_key_release_reporting;
+    use super::write_key_enhancements;
 
     #[cfg(not(windows))]
     #[test]
@@ -291,12 +299,27 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn key_release_reporting_does_not_issue_a_terminal_capability_query() {
-        let mut output = Vec::new();
-        write_key_release_reporting(&mut output, true).unwrap();
-        write_key_release_reporting(&mut output, false).unwrap();
+    fn key_enhancements_write_only_the_protocol_push_never_a_capability_query() {
+        use crossterm::event::KeyboardEnhancementFlags;
 
-        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[>2u\x1b[<1u");
+        let mut output = Vec::new();
+        write_key_enhancements(
+            &mut output,
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        )
+        .unwrap();
+        write_key_enhancements(
+            &mut output,
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
+        )
+        .unwrap();
+        write_key_enhancements(&mut output, KeyboardEnhancementFlags::empty()).unwrap();
+
+        // Baseline disambiguation, voice layers release reporting on top, and
+        // teardown resets to nothing — never a Device Attributes query whose
+        // reply could leak into the shell.
+        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[>1u\x1b[>3u\x1b[>0u");
     }
 
     #[cfg(windows)]

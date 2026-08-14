@@ -17,11 +17,16 @@ const DEFAULT_MATCH_LIMIT: usize = 200;
 /// transcripts, data blobs) cannot flood the context. head_limit bounds the
 /// match *count*; this bounds the *bytes* per match.
 const MAX_LINE_BYTES: usize = 512;
-/// grep never reads files larger than this — content search over multi-MB
-/// files is both slow and useless. This still admits ordinary source files
-/// when a narrow glob selects them. Applies to grep only, not glob (name
-/// search must still find large files).
+/// grep never reads directory-scanned files larger than this — content search
+/// across multi-MB files is both slow and usually useless. This still admits
+/// ordinary source files when a narrow glob selects them. Applies to grep only,
+/// not glob (name search must still find large files).
 const MAX_FILE_BYTES: u64 = 512 * 1024;
+/// A larger cap for a `path` that resolves to one exact file. At that point the
+/// search is intentional and still bounded by head_limit, per-line caps,
+/// context caps, redaction, and the wall-clock deadline, so using grep is safer
+/// than forcing the model through shell for a generated dependency bundle.
+const MAX_EXPLICIT_FILE_BYTES: u64 = 10 * 1024 * 1024;
 /// Ceiling on -A/-B/-C context so a wide window over many matches cannot
 /// balloon the (un-gated) grep output.
 const MAX_CONTEXT: u64 = 30;
@@ -358,9 +363,10 @@ impl Tool for GrepTool {
          surrounding code with `context` (-C, both sides), `before` (-B) or \
          `after` (-A) — one search with context often gives you enough to \
          edit without a follow-up read. Filter files with `glob`; cap matches \
-         with head_limit (default 200) and page with offset. Skips files over \
-         512 KiB and built/cache directories; reports oversized skips when \
-         they explain an empty result."
+         with head_limit (default 200) and page with offset. Skips directory-scanned \
+         files over 512 KiB; explicit file paths can search up to 10 MiB. \
+         Skips built/cache directories and reports oversized skips when they \
+         explain an empty result."
     }
 
     fn input_schema(&self) -> Value {
@@ -458,6 +464,12 @@ impl Tool for GrepTool {
             let timed_out = AtomicBool::new(false);
             let start = Instant::now();
 
+            let explicit_file = base.metadata().is_ok_and(|metadata| metadata.is_file());
+            let max_file_bytes = if explicit_file {
+                MAX_EXPLICIT_FILE_BYTES
+            } else {
+                MAX_FILE_BYTES
+            };
             let prune_report = Arc::new(PruneReport::default());
             walk_builder(
                 &base,
@@ -504,7 +516,7 @@ impl Tool for GrepTool {
                     }
                     if entry
                         .metadata()
-                        .is_ok_and(|metadata| metadata.len() > MAX_FILE_BYTES)
+                        .is_ok_and(|metadata| metadata.len() > max_file_bytes)
                     {
                         skipped_oversized.fetch_add(1, Ordering::Relaxed);
                         return WalkState::Continue;
@@ -631,9 +643,17 @@ impl Tool for GrepTool {
                     format!("no matches for /{pattern}/ ({files} files scanned{glob_note})");
                 if skipped_oversized > 0 {
                     let noun = if skipped_oversized == 1 { "file" } else { "files" };
+                    let guidance = if explicit_file {
+                        "use shell for an unbounded search".to_string()
+                    } else {
+                        format!(
+                            "set `path` to a specific file up to {} KiB, or use shell for an unbounded search",
+                            MAX_EXPLICIT_FILE_BYTES / 1024
+                        )
+                    };
                     m.push_str(&format!(
-                        "\n[{skipped_oversized} {noun} over {} KiB skipped — narrow `path` and use `read`, or use shell for an unbounded search]",
-                        MAX_FILE_BYTES / 1024
+                        "\n[{skipped_oversized} {noun} over {} KiB skipped — {guidance}]",
+                        max_file_bytes / 1024
                     ));
                 }
                 if let Some(note) = &prune_note {
@@ -1054,7 +1074,39 @@ mod tests {
         let out = grep(&dir, json!({ "pattern": "TARGET", "glob": "large.rs" })).await;
         assert!(out.starts_with("no matches for /TARGET/ (0 files scanned, glob large.rs)"));
         assert!(out.contains("[1 file over 512 KiB skipped"), "{out}");
+        assert!(
+            out.contains("set `path` to a specific file up to 10240 KiB"),
+            "{out}"
+        );
         assert!(out.contains("[.gitignore entries are excluded]"), "{out}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_searches_explicit_files_over_the_directory_size_limit() {
+        let dir = scratch("explicit-large", "");
+        let content = format!("{}\nTARGET\n", "x".repeat(MAX_FILE_BYTES as usize));
+        std::fs::write(dir.join("large.rs"), content).unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET", "path": "large.rs" })).await;
+        assert_eq!(out, "large.rs:\n2: TARGET");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn grep_reports_explicit_files_over_their_larger_size_limit() {
+        let dir = scratch("explicit-too-large", "");
+        let content = format!("{}\nTARGET\n", "x".repeat(MAX_EXPLICIT_FILE_BYTES as usize));
+        std::fs::write(dir.join("large.rs"), content).unwrap();
+
+        let out = grep(&dir, json!({ "pattern": "TARGET", "path": "large.rs" })).await;
+        assert!(
+            out.starts_with("no matches for /TARGET/ (0 files scanned)"),
+            "{out}"
+        );
+        assert!(out.contains("[1 file over 10240 KiB skipped"), "{out}");
+        assert!(out.contains("use shell for an unbounded search"), "{out}");
+        assert!(!out.contains("narrow `path`"), "{out}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -1565,7 +1565,7 @@ impl App {
         match ev {
             Event::Key(key) if self.update_pointer_ctrl_from_key(key) => {}
             // Releases are reported on Windows always, and elsewhere only once
-            // voice asks for them (`crate::set_key_release_reporting`). Nothing
+            // voice asks for them (`crate::set_key_enhancements`). Nothing
             // but push-to-talk has any use for them.
             // The arm swallows every release, not just the one voice wants —
             // which is why clippy's suggestion (fold `matches_release` into the
@@ -2169,6 +2169,27 @@ mod tests {
         assert!(app.deferred_submit.is_none());
         assert!(app.editor.is_empty());
         assert!(app.frame().contains("keys and commands"));
+    }
+
+    #[test]
+    fn shift_enter_inserts_a_newline_instead_of_submitting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = harness::app(dir.path(), 90, 40);
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::NONE,
+        )));
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::SHIFT,
+        )));
+        app.on_term_event(Event::Key(KeyEvent::new(
+            KeyCode::Char('b'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(app.editor.text(), "a\nb");
+        assert!(app.deferred_submit.is_none());
+        assert!(matches!(app.phase, Phase::Idle));
     }
 
     #[test]
