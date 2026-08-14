@@ -185,7 +185,11 @@ pub(crate) fn set_key_enhancements(flags: KeyboardEnhancementFlags) {
         let releases_on = flags.contains(KeyboardEnhancementFlags::REPORT_EVENT_TYPES);
         let releases_off = (old & RELEASE_BIT) != 0;
         if releases_on != releases_off {
-            let request = if releases_on { "\x1b[?9001h" } else { "\x1b[?9001l" };
+            let request = if releases_on {
+                "\x1b[?9001h"
+            } else {
+                "\x1b[?9001l"
+            };
             let mut out = stdout();
             let _ = out.write_all(request.as_bytes());
             let _ = out.flush();
@@ -319,7 +323,10 @@ mod tests {
         // Baseline disambiguation, voice layers release reporting on top, and
         // teardown resets to nothing — never a Device Attributes query whose
         // reply could leak into the shell.
-        assert_eq!(String::from_utf8(output).unwrap(), "\x1b[>1u\x1b[>3u\x1b[>0u");
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "\x1b[>1u\x1b[>3u\x1b[>0u"
+        );
     }
 
     #[cfg(windows)]
