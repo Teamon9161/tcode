@@ -359,7 +359,10 @@ impl Tool for GrepTool {
         "Search file contents with a regex (ripgrep engine, respects \
          .gitignore). Look for several symbols in one call with alternation — \
          `foo|bar|baz` beats three searches. An all-lowercase pattern matches \
-         case-insensitively; any uppercase in it makes the match exact. Pull \
+         case-insensitively; any uppercase in it makes the match exact. Pass \
+         fixed=true to search the pattern as a literal string (nothing to \
+         escape). Set files_only=true to list just the matching files with \
+         their match counts — the cheap first pass of a broad survey. Pull \
          surrounding code with `context` (-C, both sides), `before` (-B) or \
          `after` (-A) — one search with context often gives you enough to \
          edit without a follow-up read. Filter files with `glob`; cap matches \
@@ -377,6 +380,8 @@ impl Tool for GrepTool {
                 "path": { "type": "string", "description": "Directory or file to search (default: cwd)" },
                 "glob": { "type": "string", "description": "Filter files, e.g. *.rs or src/**/*.toml" },
                 "case_insensitive": { "type": "boolean", "description": "Force case-insensitive; only needed to widen a pattern that contains uppercase" },
+                "fixed": { "type": "boolean", "description": "Treat pattern as a literal string, not a regex (nothing to escape)" },
+                "files_only": { "type": "boolean", "description": "List matching files with their match counts instead of matched lines" },
                 "context": { "type": "integer", "description": "Context lines on both sides of each match (-C)" },
                 "before": { "type": "integer", "description": "Context lines before each match (-B); overrides context" },
                 "after": { "type": "integer", "description": "Context lines after each match (-A); overrides context" },
@@ -414,10 +419,15 @@ impl Tool for GrepTool {
         // uppercase-bearing one stays exact. `case_insensitive` still wins
         // outright (it short-circuits in grep-regex), so explicit intent is
         // never overridden — this only fills in the case the model would
-        // otherwise discover by searching twice.
+        // otherwise discover by searching twice. `fixed` makes the pattern a
+        // literal needle (ripgrep -F): nothing to escape, and smart case still
+        // applies to it.
+        let fixed = input["fixed"].as_bool().unwrap_or(false);
+        let files_only = input["files_only"].as_bool().unwrap_or(false);
         let matcher = match RegexMatcherBuilder::new()
             .case_insensitive(input["case_insensitive"].as_bool().unwrap_or(false))
             .case_smart(true)
+            .fixed_strings(fixed)
             .build(pattern)
         {
             Ok(m) => m,
@@ -537,6 +547,51 @@ impl Tool for GrepTool {
             let mut groups = groups.into_inner().unwrap();
             // Parallel walk yields files out of order; sort for stable output.
             groups.sort_by(|a, b| a.file.cmp(&b.file).then(a.first.cmp(&b.first)));
+
+            // Survey mode (`files_only=true`): one line per matching file with
+            // its TRUE match count — no per-file cap (nothing is rendered, so
+            // nothing can crowd anything out) and no matched lines.
+            // head_limit/offset page files here. An empty result falls through
+            // to the ordinary no-matches answer and its notes.
+            if files_only && !groups.is_empty() {
+                let mut list: Vec<(String, usize)> = Vec::new();
+                for g in &groups {
+                    match list.last_mut() {
+                        Some((file, count)) if *file == g.file => *count += g.matches,
+                        _ => list.push((g.file.clone(), g.matches)),
+                    }
+                }
+                let total_files = list.len();
+                if offset >= total_files {
+                    return format!(
+                        "offset={offset} is past the last of {total_files} matching files for /{pattern}/{glob_note} — lower offset or drop it"
+                    );
+                }
+                let page = &list[offset..offset.saturating_add(limit).min(total_files)];
+                let mut out = page
+                    .iter()
+                    .map(|(file, count)| format!("{file} ({count})"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                if timed_out.load(Ordering::Relaxed) {
+                    out.push_str(&format!(
+                        "\n[search timed out after {}s — partial results; narrow the path or glob]",
+                        SEARCH_DEADLINE.as_secs()
+                    ));
+                } else if total_files > offset + page.len() {
+                    out.push_str(&format!(
+                        "\n[{total_files} files match; showing {}-{} — set offset={} for more]",
+                        offset + 1,
+                        offset + page.len(),
+                        offset + page.len()
+                    ));
+                }
+                if let Some(note) = prune_report.note() {
+                    out.push('\n');
+                    out.push_str(&note);
+                }
+                return out;
+            }
 
             // Apply the per-file cap before paging, so head_limit/offset count
             // the matches actually reachable through this tool and paging stays
@@ -1035,6 +1090,62 @@ mod tests {
         )
         .await;
         assert_eq!(after, "a.rs:\n3: TARGET\n4- line4\n5- line5");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fixed_searches_the_pattern_literally_under_smart_case() {
+        let dir = scratch("fixed", "call foo(bar) here\nFOO(BAR) upper\n");
+        // Metacharacters are plain text; an all-lowercase needle still folds.
+        let both = grep(&dir, json!({ "pattern": "foo(bar", "fixed": true })).await;
+        assert_eq!(both, "a.rs:\n1: call foo(bar) here\n2: FOO(BAR) upper");
+        let exact = grep(&dir, json!({ "pattern": "FOO(BAR", "fixed": true })).await;
+        assert_eq!(exact, "a.rs:\n2: FOO(BAR) upper");
+        let none = grep(&dir, json!({ "pattern": "foo(baz", "fixed": true })).await;
+        assert!(none.starts_with("no matches for /foo(baz/"), "{none}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn files_only_surveys_true_counts_and_pages_by_files() {
+        let dir = std::env::temp_dir().join(format!("tcode-grep-{}-survey", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut crowded = String::new();
+        for i in 0..MAX_MATCHES_PER_FILE + 5 {
+            crowded.push_str(&format!("TARGET {i}\n"));
+        }
+        std::fs::write(dir.join("many.txt"), &crowded).unwrap();
+        std::fs::write(dir.join("one.txt"), "TARGET once\n").unwrap();
+
+        // True counts — 35 is over the per-file cap, which does not apply here.
+        let survey = grep(&dir, json!({ "pattern": "TARGET", "files_only": true })).await;
+        assert_eq!(survey, "many.txt (35)\none.txt (1)");
+        let paged = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "files_only": true, "head_limit": 1 }),
+        )
+        .await;
+        assert_eq!(
+            paged,
+            "many.txt (35)\n[2 files match; showing 1-1 — set offset=1 for more]"
+        );
+        let second = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "files_only": true, "offset": 1 }),
+        )
+        .await;
+        assert_eq!(second, "one.txt (1)");
+        let past = grep(
+            &dir,
+            json!({ "pattern": "TARGET", "files_only": true, "offset": 9 }),
+        )
+        .await;
+        assert!(
+            past.starts_with("offset=9 is past the last of 2 matching files for /TARGET/"),
+            "{past}"
+        );
+        let none = grep(&dir, json!({ "pattern": "NOPE_XYZ", "files_only": true })).await;
+        assert!(none.starts_with("no matches for /NOPE_XYZ/"), "{none}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
